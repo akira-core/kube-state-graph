@@ -171,6 +171,77 @@ func (s *GraphSuite) TestNodeIPAddressFallback() {
 		"InternalIP fallback when no ExternalIP row exists")
 }
 
+// TestNodeReadyStatusAttribute — ingest kube_node_status_condition for dedicated
+// nodes: one Ready (status=true active), one Unknown (status=unknown active —
+// kubelet lost contact), and one with NO Ready series; assert /v1/graph sets each
+// node's typed data.ready_status, that Unknown is DISTINCT from omitted, and that
+// the status never leaks into labels. Dedicated `ready-probe-*` node names avoid
+// the shared-VM series leak into other suite tests (which assert on worker-0).
+func (s *GraphSuite) TestNodeReadyStatusAttribute() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	// Real KSM emits all three status rows per condition with value 1 for the
+	// active one; replicate that so the resolver's active-row pick is exercised.
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_node_info dummy
+kube_node_info{cluster="cluster-alpha",node="ready-probe-ready",test=%q} 1 %d
+kube_node_info{cluster="cluster-alpha",node="ready-probe-unknown",test=%q} 1 %d
+kube_node_info{cluster="cluster-alpha",node="ready-probe-nocond",test=%q} 1 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="true",test=%q} 1 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="false",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="unknown",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="true",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="false",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="unknown",test=%q} 1 %d
+`,
+		disc, t1, disc, t1, disc, t1,
+		disc, t1, disc, t1, disc, t1,
+		disc, t1, disc, t1, disc, t1,
+	))
+	s.Require().True(s.WaitForSeries(`kube_node_status_condition{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_node_status_condition")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body struct {
+		Elements struct {
+			Nodes []struct {
+				Data struct {
+					ID          string            `json:"id"`
+					Type        string            `json:"type"`
+					ReadyStatus string            `json:"ready_status"`
+					Labels      map[string]string `json:"labels"`
+				} `json:"data"`
+			} `json:"nodes"`
+		} `json:"elements"`
+	}
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	status := map[string]string{}
+	present := map[string]bool{}
+	for _, n := range body.Elements.Nodes {
+		if n.Data.Type != "node" {
+			continue
+		}
+		present[n.Data.ID] = true
+		status[n.Data.ID] = n.Data.ReadyStatus
+		s.NotContains(n.Data.Labels, "ready_status", "ready_status must not be a label")
+		s.NotContains(n.Data.Labels, "condition", "condition must not be a label")
+		s.NotContains(n.Data.Labels, "status", "status must not be a label")
+	}
+
+	s.Equal(graph.ReadyStatusReady, status["cluster-alpha/ready-probe-ready"],
+		"active status=true → Ready")
+	s.Equal(graph.ReadyStatusUnknown, status["cluster-alpha/ready-probe-unknown"],
+		"active status=unknown → Unknown (kubelet lost contact)")
+	s.Require().True(present["cluster-alpha/ready-probe-nocond"],
+		"node with no Ready series is still present")
+	s.Empty(status["cluster-alpha/ready-probe-nocond"],
+		"no Ready series → ready_status omitted, DISTINCT from Unknown")
+}
+
 func (s *GraphSuite) TestNameFilter_PodAnchor() {
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("name", "checkout") }))

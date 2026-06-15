@@ -57,3 +57,30 @@ func TestApplicationAndContainers_OnlyPodsCarryThem(t *testing.T) {
 		assert.Nilf(t, n.Containers(), "%T must return nil Containers", n)
 	}
 }
+
+// TestReadyStatus_OnlyK8sNodesCarryIt — the ReadyStatus() accessor returns the
+// node's resolved Ready-condition status for a K8sNode and "" for every other
+// node kind (and a node with no observed Ready-condition data). It is a typed
+// attribute consumed by the serialiser, never a label.
+func TestReadyStatus_OnlyK8sNodesCarryIt(t *testing.T) {
+	ready := &K8sNode{IDValue: "c/w", NameValue: "w", ReadyStatusValue: ReadyStatusReady}
+	assert.Equal(t, ReadyStatusReady, ready.ReadyStatus())
+
+	for _, want := range []string{ReadyStatusReady, ReadyStatusNotReady, ReadyStatusUnknown} {
+		n := &K8sNode{IDValue: "c/w", ReadyStatusValue: want}
+		assert.Equal(t, want, n.ReadyStatus())
+	}
+
+	bare := &K8sNode{IDValue: "c/w2", NameValue: "w2"}
+	assert.Empty(t, bare.ReadyStatus(), "node with no Ready-condition data returns empty")
+
+	others := []GraphNode{
+		&PodNode{IDValue: "c/u"},
+		&PVCNode{IDValue: "c/n/claim"},
+		&ServiceNode{IDValue: "c/n/s"},
+		&ExternalNode{IDValue: "external/x"},
+	}
+	for _, n := range others {
+		assert.Emptyf(t, n.ReadyStatus(), "%T must return empty ReadyStatus", n)
+	}
+}

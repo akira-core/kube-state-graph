@@ -114,6 +114,9 @@
                     "parent": {
                         "type": "string"
                     },
+                    "ready_status": {
+                        "type": "string"
+                    },
                     "type": {
                         "type": "string"
                     }

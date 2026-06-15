@@ -76,6 +76,8 @@ components:
           $ref: '#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.Owner'
         parent:
           type: string
+        ready_status:
+          type: string
         type:
           type: string
       type: object

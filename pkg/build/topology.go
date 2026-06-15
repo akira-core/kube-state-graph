@@ -123,6 +123,8 @@ type topologyVectors struct {
 	PVCInfo model.Vector
 	// Pod container list resolution (name/image per container).
 	PodContainerInfo model.Vector
+	// K8s node Ready-status resolution (kube_node_status_condition).
+	NodeStatus model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -179,6 +181,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
 	g.Go(fetch(promql.QPVCInfo, &v.PVCInfo))
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
+	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
@@ -197,6 +200,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 		string(promql.QReplicaSetOwner):        len(v.ReplicaSetOwner),
 		string(promql.QPVCInfo):                len(v.PVCInfo),
 		string(promql.QPodContainerInfo):       len(v.PodContainerInfo),
+		string(promql.QNodeStatusCondition):    len(v.NodeStatus),
 	}
 	return t, nil
 }
@@ -238,6 +242,11 @@ func parseTopology(v topologyVectors) Topology {
 	// owner but independently of the controller pick (it is a pod-level fact).
 	podContainers := resolvePodContainers(v.PodContainerInfo, mc)
 	podApplications := resolvePodApplications(v.PodOwner)
+
+	// K8s node Ready-status resolution. Built up-front so the per-node assembly
+	// below can set each node's typed ReadyStatus attribute (never a label).
+	// Keyed (cluster, node) — the same key the node IP / label joins use.
+	nodeReady := resolveNodeReadyStatus(v.NodeStatus, mc)
 
 	// Node IP map: (cluster, node-name) -> {ExternalIP, InternalIP}.
 	// ExternalIP is preferred at assembly; InternalIP is the fallback for
@@ -321,10 +330,11 @@ func parseTopology(v topologyVectors) Topology {
 			ips = []string{ip}
 		}
 		nodes = append(nodes, &graph.K8sNode{
-			IDValue:        graph.K8sNodeID(cluster, nodeName),
-			NameValue:      nodeName,
-			LabelsValue:    labels,
-			IPAddressValue: ips,
+			IDValue:          graph.K8sNodeID(cluster, nodeName),
+			NameValue:        nodeName,
+			LabelsValue:      labels,
+			IPAddressValue:   ips,
+			ReadyStatusValue: nodeReady[[2]string{cluster, nodeName}],
 		})
 		clusters[cluster] = struct{}{}
 	}
@@ -807,6 +817,73 @@ func resolvePVCStorageClass(vec model.Vector, mc missingClusterCounts) map[pvcKe
 			continue
 		}
 		out[key] = sc
+	}
+	return out
+}
+
+// readyStatusFromLabel maps a kube_node_status_condition `status` label
+// (true/false/unknown for condition="Ready") to the graph ReadyStatus value.
+// Any other value yields "" so a malformed status never surfaces as a non-enum
+// attribute — the caller drops it (omit ready_status).
+func readyStatusFromLabel(status string) string {
+	switch status {
+	case "true":
+		return graph.ReadyStatusReady
+	case "false":
+		return graph.ReadyStatusNotReady
+	case "unknown":
+		return graph.ReadyStatusUnknown
+	}
+	return ""
+}
+
+// resolveNodeReadyStatus builds the (cluster, node) → Ready-status index from
+// kube_node_status_condition. For condition="Ready", kube-state-metrics emits
+// one series per status (true/false/unknown) with value 1 for the active one;
+// the reader reads the active row's `status` label and maps it to
+// ReadyStatusReady / ReadyStatusNotReady / ReadyStatusUnknown.
+//
+// The condition="Ready" selector is applied at the query layer; the condition
+// guard here is defensive against a wider selector. Only rows with value == 1
+// AND a recognised status are considered, so a 0-valued (inactive) row, or a
+// malformed status, never wins. On the defensive case where more than one row
+// is active for the same (cluster, node) — which correct KSM never emits — the
+// lexically-smallest `status` label wins, so the result is order-free (D6).
+//
+// OPTIONAL: an absent or empty vector yields an empty map and nodes carry no
+// ready_status (graceful degradation). "" (absent) is intentionally distinct
+// from ReadyStatusUnknown (kubelet lost contact). The returned map is a
+// deterministic function of the input vector; the only side effect is tallying
+// missing-cluster samples into the caller's mc accumulator.
+func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
+	// (cluster, node) → lexically-smallest active, recognised `status` label.
+	raw := make(map[[2]string]string, len(vec))
+	for _, s := range vec {
+		if string(s.Metric["condition"]) != "Ready" {
+			continue
+		}
+		if s.Value != 1 {
+			continue
+		}
+		status := string(s.Metric["status"])
+		if readyStatusFromLabel(status) == "" {
+			continue
+		}
+		cluster := mc.bucket(promql.QNodeStatusCondition, string(s.Metric["cluster"]))
+		node := string(s.Metric["node"])
+		if node == "" {
+			continue
+		}
+		key := [2]string{cluster, node}
+		if cur, ok := raw[key]; ok && cur <= status {
+			continue
+		}
+		raw[key] = status
+	}
+
+	out := make(map[[2]string]string, len(raw))
+	for key, status := range raw {
+		out[key] = readyStatusFromLabel(status)
 	}
 	return out
 }

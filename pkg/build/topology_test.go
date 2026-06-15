@@ -628,3 +628,109 @@ func TestParseTopology_PVCStorageClassDeterministic(t *testing.T) {
 	assert.Equal(t, "gp2", fwd.PVCs[0].StorageClass(), "lexically-smallest storageclass wins")
 	assert.Equal(t, fwd.PVCs[0].StorageClass(), rev.PVCs[0].StorageClass(), "order-independent")
 }
+
+// TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's
+// active condition="Ready" row sets each K8s node's typed ready_status:
+// true→Ready, false→NotReady, unknown→Unknown. A node with no Ready series omits
+// the attribute (distinct from "Unknown"), a non-Ready condition is ignored, and
+// the status never leaks into labels. The metric is optional.
+func TestParseTopology_NodeReadyStatusAttribute(t *testing.T) {
+	node := func(name string) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": model.LabelValue(name)}}
+	}
+	// One series per status; value 1 = active. condition="Ready".
+	cond := func(name, status string, val model.SampleValue) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster": "c", "node": model.LabelValue(name),
+				"condition": "Ready", "status": model.LabelValue(status),
+			},
+			Value: val,
+		}
+	}
+	nodeVec := sampleVec(node("ready-0"), node("notready-0"), node("unknown-0"), node("nocond-0"))
+	condVec := sampleVec(
+		cond("ready-0", "true", 1), cond("ready-0", "false", 0), cond("ready-0", "unknown", 0),
+		cond("notready-0", "true", 0), cond("notready-0", "false", 1), cond("notready-0", "unknown", 0),
+		cond("unknown-0", "true", 0), cond("unknown-0", "false", 0), cond("unknown-0", "unknown", 1),
+		// nocond-0 has only a non-Ready condition active → ready_status must stay empty.
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "nocond-0", "condition": "MemoryPressure", "status": "true"}, Value: 1},
+	)
+
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	byName := map[string]*graph.K8sNode{}
+	for _, n := range tp.Nodes {
+		byName[n.Name()] = n
+	}
+
+	assert.Equal(t, graph.ReadyStatusReady, byName["ready-0"].ReadyStatus())
+	assert.Equal(t, graph.ReadyStatusNotReady, byName["notready-0"].ReadyStatus())
+	assert.Equal(t, graph.ReadyStatusUnknown, byName["unknown-0"].ReadyStatus(), "kubelet-lost Unknown is a real value")
+	assert.Empty(t, byName["nocond-0"].ReadyStatus(), "no Ready series (only MemoryPressure) → ready_status omitted, distinct from Unknown")
+
+	// ready status must NEVER leak into labels.
+	for _, n := range tp.Nodes {
+		for k := range n.Labels() {
+			assert.NotContainsf(t, []string{"ready_status", "status", "condition", "ready"}, k,
+				"ready status must not appear in labels for node %q", n.Name())
+		}
+	}
+
+	// Metric absent entirely → valid topology, no ready_status.
+	tp2 := parseTopology(topologyVectors{Node: nodeVec})
+	for _, n := range tp2.Nodes {
+		assert.Emptyf(t, n.ReadyStatus(), "no status series → node %q omits ready_status", n.Name())
+	}
+}
+
+// TestParseTopology_NodeReadyStatusNoActiveRowOmitted — when no condition="Ready"
+// row is active (all value 0, a pathological scrape), the node omits ready_status
+// rather than picking an inactive row.
+func TestParseTopology_NodeReadyStatusNoActiveRowOmitted(t *testing.T) {
+	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}})
+	condVec := sampleVec(
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "true"}, Value: 0},
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "false"}, Value: 0},
+	)
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	require.Len(t, tp.Nodes, 1)
+	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "no active (value==1) row → ready_status omitted")
+}
+
+// TestParseTopology_NodeReadyStatusOrderFree — the active-row pick and the
+// defensive multi-active tie-break are pure functions of the data, independent
+// of upstream vector order (D6).
+func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
+	node := model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}}
+	r := func(status string, v model.SampleValue) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": model.LabelValue(status)}, Value: v}
+	}
+
+	fwd := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 0), r("unknown", 1), r("false", 0))})
+	rev := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 0), r("unknown", 1), r("true", 0))})
+	require.Len(t, fwd.Nodes, 1)
+	require.Len(t, rev.Nodes, 1)
+	assert.Equal(t, graph.ReadyStatusUnknown, fwd.Nodes[0].ReadyStatus())
+	assert.Equal(t, fwd.Nodes[0].ReadyStatus(), rev.Nodes[0].ReadyStatus(), "active-row pick is order-independent")
+
+	// Defensive multi-active tie (correct KSM never emits this): lexically-
+	// smallest status label wins → "false" → NotReady, regardless of order.
+	tieF := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 1), r("false", 1))})
+	tieR := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 1), r("true", 1))})
+	require.Len(t, tieF.Nodes, 1)
+	require.Len(t, tieR.Nodes, 1)
+	assert.Equal(t, graph.ReadyStatusNotReady, tieF.Nodes[0].ReadyStatus(), "multi-active tie → lexically-smallest status (false) wins")
+	assert.Equal(t, tieF.Nodes[0].ReadyStatus(), tieR.Nodes[0].ReadyStatus(), "tie-break is order-free")
+}
+
+// TestParseTopology_NodeReadyStatusMissingClusterDoesNotJoin — a status row
+// whose cluster label is missing buckets to "unknown" and must NOT enrich a
+// real-cluster node (same (cluster, node)-join fragility as IPs/labels).
+func TestParseTopology_NodeReadyStatusMissingClusterDoesNotJoin(t *testing.T) {
+	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "prod", "node": "w0"}})
+	condVec := sampleVec(model.Sample{Metric: model.Metric{"node": "w0", "condition": "Ready", "status": "true"}, Value: 1})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	require.Len(t, tp.Nodes, 1)
+	assert.Equal(t, "prod/w0", tp.Nodes[0].ID())
+	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "status row missing cluster label buckets to unknown; does not join the prod node")
+}

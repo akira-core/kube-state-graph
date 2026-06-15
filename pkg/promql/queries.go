@@ -57,6 +57,17 @@ const (
 	// (never new nodes). OPTIONAL — a KSM default, no --metric-labels-allowlist
 	// required.
 	QPodContainerInfo Query = "kube_pod_container_info"
+
+	// K8s node Ready-status resolution. KSM-shaped, so prefix-aware via Renderer.
+	// kube_node_status_condition emits one series per (condition, status) with
+	// value 1 for the active combination; the topology reader reads the active
+	// condition="Ready" row's `status` label (true/false/unknown) to enrich the
+	// node's typed `ready_status` attribute (never a label, never a new node).
+	// The condition="Ready" selector is a fixed, request-invariant metric-
+	// selection contract (same class as the QNodeAddresses type selector and the
+	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
+	// absence degrades gracefully to no `ready_status`.
+	QNodeStatusCondition Query = "kube_node_status_condition"
 )
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
@@ -139,6 +150,13 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// the greatest last-sample timestamp (the current one). last_over_time
 		// would stamp every series at the eval instant, flattening recency.
 		return fmt.Sprintf(`tlast_over_time(%skube_pod_container_info[%s])`, r.Prefix, w)
+	case QNodeStatusCondition:
+		// condition="Ready" is a fixed, request-invariant metric-selection
+		// contract (anchored equality), not a caller filter — the reader reads
+		// the active row's `status` label at parse time. The four other node
+		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
+		// are never surfaced, so they are excluded here.
+		return fmt.Sprintf(`last_over_time(%skube_node_status_condition{condition="Ready"}[%s])`, r.Prefix, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
 		// the configurable prefix deliberately does NOT apply here. The metric

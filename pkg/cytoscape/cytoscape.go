@@ -49,6 +49,7 @@ type NodeData struct {
 	Owner       *graph.Owner      `json:"owner,omitempty"`
 	Application string            `json:"application,omitempty"`
 	Containers  []graph.Container `json:"containers,omitempty"`
+	ReadyStatus string            `json:"ready_status,omitempty"`
 	Labels      map[string]string `json:"labels"`
 }
 
@@ -177,6 +178,7 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				Owner:       n.Owner(),
 				Application: n.Application(),
 				Containers:  n.Containers(),
+				ReadyStatus: n.ReadyStatus(),
 				Labels:      n.Labels(),
 			},
 		})

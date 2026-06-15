@@ -54,6 +54,7 @@ curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
 | `kube_pod_info` | Pod 節點（`node` 標籤驅動 Cytoscape compound nesting） | `cluster`, `namespace`, `pod`, `uid`, `node`, `pod_ip`（→ `data.ipaddress`；不匯出 `host_ip`） | **是** |
 | `kube_node_info` | K8s node 節點 | `cluster`, `node` | **是** |
 | `kube_node_status_addresses{type="ExternalIP"}` | Node 外部 IP（→ `data.ipaddress`） | `cluster`, `node`, `address` | 選填 |
+| `kube_node_status_condition{condition="Ready"}` | Node Ready 狀態 `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`}，取 active（`status` 值為 1）那列；無 Ready 資料則省略——與 `Unknown`（kubelet 失聯）有別 | `cluster`, `node`, `condition`, `status` | 選填（缺則無 `data.ready_status`）；屬 KSM 預設 |
 | `kube_node_labels` | 傳遞 node 標籤（`kubernetes.io/*` 等） | `cluster`, `node`, `label_*` | 選填 |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC 節點、`pod-mounts-pvc` 邊 | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | 選填（無 PVC 則無相關節點／邊） |
 | `kube_pod_owner` | Pod controller-owner `data.owner` = `{kind, name}`（ReplicaSet 上溯至 Deployment；無 controller 則省略）；並經 `argocd_tracking_id` 標籤產生 `data.application`（取首個 `:` 前的片段） | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller`, `argocd_tracking_id` | 選填（缺則無 `data.owner`）。`argocd_tracking_id` 為**營運者提供**（如 `--metric-labels-allowlist`／relabel），非 KSM 預設；缺則無 `data.application` |

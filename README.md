@@ -86,6 +86,7 @@ per source cluster).
 | `kube_pod_info` | Pod nodes (`node` label drives Cytoscape `cluster > node > pod` compound nesting) | `cluster`, `namespace`, `pod`, `uid`, `node`, `pod_ip` (→ `data.ipaddress`; `host_ip` not exported) | **Yes** |
 | `kube_node_info` | K8sNode nodes | `cluster`, `node` | **Yes** |
 | `kube_node_status_addresses{type="ExternalIP"}` | Node external IP (→ `data.ipaddress`) | `cluster`, `node`, `address` | Optional |
+| `kube_node_status_condition{condition="Ready"}` | Node Ready status `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`} from the active (`status` value 1) row; omitted when no Ready data — distinct from `Unknown` (kubelet lost contact) | `cluster`, `node`, `condition`, `status` | Optional (absent ⇒ no `data.ready_status`); a KSM default |
 | `kube_node_labels` | Node label propagation (`kubernetes.io/*` etc.) | `cluster`, `node`, `label_*` | Optional |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC nodes; pod-mounts-pvc edges | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | Optional (no PVCs ⇒ no PVC nodes/edges) |
 | `kube_persistentvolumeclaim_info` | PVC StorageClass → Cytoscape `cluster > storageclass > pvc` compound nesting (never a `data` attribute or label) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass` | Optional (absent ⇒ PVCs nest under `cluster > pvc`) |
