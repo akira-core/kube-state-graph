@@ -69,8 +69,8 @@ func TestEdgeTypeServiceSelectsPod_Registered(t *testing.T) {
 	if serviceSelectsPod == nil {
 		t.Fatal("EdgeTypeServiceSelectsPod is not registered in EdgeTypes")
 	}
-	if serviceSelectsPod.MayCrossCluster {
-		t.Error("service-selects-pod must be intra-cluster (may_cross_cluster=false)")
+	if !serviceSelectsPod.MayCrossCluster {
+		t.Error("service-selects-pod may cross clusters via the same-family endpoint union (may_cross_cluster=true)")
 	}
 	if !containsNodeType(serviceSelectsPod.SourceType, NodeTypeService) {
 		t.Errorf("service-selects-pod source_type = %v, want to contain service", serviceSelectsPod.SourceType)
@@ -88,8 +88,8 @@ func TestEdgeTypeServiceSelectsPod_Registered(t *testing.T) {
 	if podCallsService == nil {
 		t.Fatal("EdgeTypePodCallsService is not registered")
 	}
-	if !podCallsService.MayCrossCluster {
-		t.Error("pod-calls-service may cross clusters via cluster-family fan-out (may_cross_cluster=true)")
+	if podCallsService.MayCrossCluster {
+		t.Error("pod-calls-service resolves to a Service node in the caller's own cluster — always intra-cluster (may_cross_cluster=false)")
 	}
 	if !containsNodeType(podCallsService.TargetType, NodeTypeService) {
 		t.Errorf("pod-calls-service target_type = %v, want to contain service", podCallsService.TargetType)

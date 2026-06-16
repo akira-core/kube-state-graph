@@ -58,36 +58,21 @@ type sgResolver struct {
 	endpointsByService map[serviceKey][]EndpointObs // service-selects-pod fan-out source
 	podByID            map[string]*graph.PodNode    // client side: cluster known from metric
 	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
-	svcCandidates      map[famSvcKey][]svcCandidate
-	svcHolderFamilies  map[nsSvcKey]holderFamily // unknown-family fallback: which LOADED family/families hold (ns, svc) — "unknown"-bucketed entries excluded
-	knownFamilies      map[string]struct{}       // family keys of every loaded cluster (excl. "unknown")
-	epVisibleClusters  map[string]struct{}       // clusters with ANY endpoint data — pruning evidence gate
+	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
 	svcEdges           map[string]*graph.Edge        // service-selects-pod, keyed by "svcID|podID"
 }
 
-// famSvcKey keys the D29 fan-out candidate index: the service identity a
-// "://" host classifies to, scoped by cluster family. Folding the family into
-// the key makes per-endpoint resolution a direct map hit and keeps the family
-// rule encoded in exactly one place (the index build).
+// famSvcKey keys the D29 candidate index: the service identity a "://" host
+// classifies to, scoped by cluster family. Folding the family into the key
+// makes per-endpoint resolution a direct map hit and keeps the family rule
+// encoded in exactly one place (the index build). The candidate slice serves
+// two roles in resolveServiceLevel: it locates the anchor cluster's own service
+// node, and its members' endpoints are unioned for the cross-cluster
+// service-selects-pod fan-out.
 type famSvcKey struct{ family, namespace, service string }
-
-// nsSvcKey keys the unknown-family fallback index: the service identity a
-// "://" host classifies to, across ALL loaded clusters regardless of family.
-type nsSvcKey struct{ namespace, service string }
-
-// holderFamily records which loaded family holds a (namespace, service): the
-// single family key, or multi=true when two-plus families hold it (ambiguous
-// for the unknown-family fallback). The candidates themselves are NOT
-// duplicated here — a unique holder family's candidate slice is exactly
-// svcCandidates[famSvcKey{family, ns, svc}] (a loaded family key can never be
-// "unknown", so that bucket contains no pseudo-cluster entries).
-type holderFamily struct {
-	family string
-	multi  bool
-}
 
 // svcCandidate is one cluster's deployment of a (namespace, service).
 type svcCandidate struct {
@@ -109,77 +94,24 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		podByID[p.ID()] = p
 	}
 
-	// Inverted index for the D29 family fan-out: (family, namespace, service)
-	// → that family's clusters deploying the service, sorted by cluster so
-	// fan-out emission is a pure function of the data, independent of map
-	// iteration order (D6). Built once per parse; per-"://"-endpoint
-	// resolution is then a single map hit. (Filtering the sorted
-	// ClustersObserved list per endpoint would also work — the index just
-	// keeps the family rule in one place.)
-	// svcHolderFamilies records, per bare (namespace, service), which loaded
-	// family/families hold it: the unknown-family fallback consults it when
-	// the anchor names no loaded family (missing "unknown"-bucketed label, or
-	// a bogus trace label). "unknown"-bucketed service entries are EXCLUDED
-	// here — the bucket is an absence of identity, so it must neither count as
-	// a holder family in the uniqueness check (one unlabelled duplicate of a
-	// prod service would flip {prod-0} to {prod-0, unknown} = ambiguous,
-	// silently disabling the fallback) nor let a bogus-label anchor resolve
-	// into the pseudo-cluster. They DO stay in svcCandidates: an "unknown"
-	// anchor's direct family hit is the only resolution a fully-unlabelled
-	// deployment has (see resolveServiceLevel for the precedence between the
-	// two). Candidates are not duplicated: a unique holder family resolves
-	// back through svcCandidates.
+	// Inverted index for D29 connection-string resolution: (family, namespace,
+	// service) → that family's clusters deploying the service, sorted by cluster
+	// so resolution is a pure function of the data, independent of map-iteration
+	// order (D6). Built once per parse; per-"://"-endpoint resolution is then a
+	// single map hit. The candidate slice serves two roles in resolveServiceLevel:
+	// it locates the anchor (caller) cluster's own service node, and its members'
+	// endpoints are unioned for the cross-cluster service-selects-pod fan-out.
+	// "unknown"-bucketed service entries (samples missing their cluster label)
+	// land under family "unknown" — its own family-of-one — so they are reachable
+	// only by an "unknown"-anchored caller and never unioned into a real cluster's
+	// fan-out (clusterFamilyKey("unknown") == "unknown" != "prod-0").
 	svcCandidates := make(map[famSvcKey][]svcCandidate, len(topology.ServicesByNameNS))
-	svcHolderFamilies := make(map[nsSvcKey]holderFamily, len(topology.ServicesByNameNS))
 	for k, obs := range topology.ServicesByNameNS {
-		family := clusterFamilyKey(k.cluster)
-		key := famSvcKey{family: family, namespace: k.namespace, service: k.service}
+		key := famSvcKey{family: clusterFamilyKey(k.cluster), namespace: k.namespace, service: k.service}
 		svcCandidates[key] = append(svcCandidates[key], svcCandidate{cluster: k.cluster, obs: obs})
-		if k.cluster != "unknown" {
-			gk := nsSvcKey{namespace: k.namespace, service: k.service}
-			if hf, seen := svcHolderFamilies[gk]; !seen {
-				svcHolderFamilies[gk] = holderFamily{family: family}
-			} else if !hf.multi && hf.family != family {
-				svcHolderFamilies[gk] = holderFamily{family: hf.family, multi: true}
-			}
-		}
 	}
 	for _, cands := range svcCandidates {
 		sort.Slice(cands, func(i, j int) bool { return cands[i].cluster < cands[j].cluster })
-	}
-
-	// knownFamilies gates the unknown-family fallback: an anchor whose family
-	// IS loaded but lacks the service keeps the external fallback (no
-	// cross-family escape), while an anchor naming NO loaded family may fall
-	// back to the unique family holding the service. The "unknown" bucket is
-	// an absence of identity, not a cluster, so it never counts as loaded —
-	// an "unknown" anchor is always eligible for the fallback.
-	knownFamilies := map[string]struct{}{}
-	addKnownFamily := func(cluster string) {
-		if cluster == "" || cluster == "unknown" {
-			return
-		}
-		knownFamilies[clusterFamilyKey(cluster)] = struct{}{}
-	}
-	for _, c := range topology.ClustersObserved {
-		addKnownFamily(c)
-	}
-	for k := range topology.ServicesByNameNS {
-		addKnownFamily(k.cluster)
-	}
-	for _, p := range topology.Pods {
-		addKnownFamily(p.Labels()["cluster"])
-	}
-
-	// epVisibleClusters is the pruning evidence gate: a cluster with ZERO
-	// EndpointsByService entries has no endpoint visibility at all (its KSM
-	// lacks the kubernetes.io/service-name endpointslice allowlist, or the
-	// join produced nothing) — for such a cluster "zero backing pods" is
-	// absence of evidence, not evidence of absence, and its candidates are
-	// never pruned.
-	epVisibleClusters := map[string]struct{}{}
-	for k := range topology.EndpointsByService {
-		epVisibleClusters[k.cluster] = struct{}{}
 	}
 
 	res := &sgResolver{
@@ -187,9 +119,6 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		podByID:            podByID,
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
-		svcHolderFamilies:  svcHolderFamilies,
-		knownFamilies:      knownFamilies,
-		epVisibleClusters:  epVisibleClusters,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
@@ -230,40 +159,40 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		// empty (no UID, no label): no edge can exist, and resolving the
 		// other side anyway would leak its materialisation side effects
 		// (service / external nodes plus service-selects-pod fan-out) as an
-		// orphan subgraph — amplified by family size under the D29 fan-out.
+		// orphan subgraph — including the cross-cluster service-selects-pod fan-out.
 		if (clientUID == "" && clientLabel == "") || (serverUID == "" && serverLabel == "") {
 			continue
 		}
 
-		// Each side resolves to a SET of node IDs: a "://" endpoint may fan out
-		// to one service node per family cluster holding the addressed
-		// (namespace, service) (D29 cluster-family fan-out); every other path
-		// yields exactly one ID, and an empty set drops the side (and with it
-		// the series — the cross product below is then empty).
+		// Each side resolves to a (possibly empty) slice of node IDs. With the
+		// localised model a "://" endpoint resolves to AT MOST ONE service node —
+		// in the caller's own (anchor) cluster — or to a single external node;
+		// every other path also yields exactly one ID, and an empty slice drops
+		// the side (and with it the series — the cross product below is empty).
 		srcIDs, srcIsPod := res.resolveClient(clientLabel, traceCluster, clientUID, clientNS)
 
-		// Family scope for the server-side "://" path prefers the
-		// UID-recovered client-pod cluster over the raw trace label: the label
-		// is frequently missing (bucketed to "unknown") or disagrees with
-		// topology (see resolveClient), and `.svc` DNS is in-cluster relative
-		// to the CALLER — whose authoritative cluster is the resolved pod's,
-		// not the label's. Falls back to the trace label when the client side
-		// is not a topology pod. Edge labels.cluster is unaffected (still the
-		// raw trace label, per D9).
-		familyCluster := traceCluster
+		// Anchor cluster for the server-side "://" path prefers the UID-recovered
+		// client-pod cluster over the raw trace label: the label is frequently
+		// missing (bucketed to "unknown") or disagrees with topology (see
+		// resolveClient), and `.svc` DNS is resolved relative to the CALLER —
+		// whose authoritative cluster is the resolved pod's, not the label's.
+		// Falls back to the trace label when the client side is not a topology
+		// pod. The "://" then resolves to a single service node in THIS cluster
+		// (iff it holds the service), per the same-cluster rule. Edge
+		// labels.cluster is unaffected (still the raw trace label, per D9).
+		anchorCluster := traceCluster
 		if srcIsPod && len(srcIDs) == 1 {
 			if pod, ok := res.podByID[srcIDs[0]]; ok {
 				if c := pod.Labels()["cluster"]; c != "" {
-					familyCluster = c
+					anchorCluster = c
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, familyCluster, serverUID, serverNS)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS)
 
-		// Cross product: any resolved source × any resolved target. The two
-		// sides' ambiguities are independent — when both are "://" sets, any
-		// family deployment of the source service may call any family
-		// deployment of the target service.
+		// Cross product: any resolved source × any resolved target. Each "://"
+		// side now resolves to at most one (local) service node, so a both-"://"
+		// series yields a single intra-cluster edge in the anchor cluster.
 		for _, srcID := range srcIDs {
 			for _, tgtID := range tgtIDs {
 				// Deterministic dedupe: multiple upstream series can resolve to the
@@ -384,13 +313,14 @@ func normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel string
 //  4. a wholly empty endpoint drops
 //
 // (Step 2, pod-UID resolution, is the caller's responsibility and only runs
-// for non-empty UIDs.) A no-UID endpoint resolves to service or external
-// nodes, never a pod. Only Stage 0 can yield more than one ID (one service
-// node per family cluster holding the addressed service); the D27 fallback
-// yields exactly one and a wholly empty endpoint yields nil (drop).
-func (r *sgResolver) resolveEmptyUID(label, familyCluster string) []string {
+// for non-empty UIDs.) A no-UID endpoint resolves to a service or external
+// node, never a pod. Every path now yields at most one ID: Stage 0 resolves to
+// the single local service node (the caller's own cluster) or one external
+// node, the D27 fallback yields one external node, and a wholly empty endpoint
+// yields nil (drop).
+func (r *sgResolver) resolveEmptyUID(label, anchorCluster string) []string {
 	if isConnString(label) {
-		return r.resolveConnString(label, familyCluster) // Stage 0 — services or external, never a pod
+		return r.resolveConnString(label, anchorCluster) // Stage 0 — service or external, never a pod
 	}
 	if label != "" {
 		return []string{r.external(label)} // D27 fallback (non-URL only)
@@ -400,10 +330,9 @@ func (r *sgResolver) resolveEmptyUID(label, familyCluster string) []string {
 
 // resolveClient resolves the client side of a service-graph series. Returns
 // (ids, isPod). isPod is true when the resolved endpoint is a pod — real or
-// synthesised from a non-empty UID; a pod is always exactly one ID, so
-// srcIsPod is uniform across the returned set. A "://" connection string
-// resolves to service or external nodes (never a pod) and is the only path
-// that can return more than one ID. The client side knows its cluster from
+// synthesised from a non-empty UID. A "://" connection string resolves to a
+// single service node in the anchor cluster, or an external node (never a pod).
+// Every path returns at most one ID. The client side knows its cluster from
 // the metric's `cluster` label.
 func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string) ([]string, bool) {
 	if podUID == "" {
@@ -429,14 +358,16 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 
 // resolveServer mirrors resolveClient. The metric does not carry server-side
 // cluster, so pod-UID resolution recovers it via the global UID index; the
-// connection-string path resolves across familyCluster's family
-// (`.svc.cluster.local` names route to any family member under mesh routing).
-// familyCluster is the caller's authoritative cluster: the UID-recovered
-// client-pod cluster when the client side resolved to a topology pod, else
-// the raw trace label (bucketed to "unknown" when missing).
-func (r *sgResolver) resolveServer(label, familyCluster, podUID, namespace string) []string {
+// connection-string path resolves to a SINGLE service node in anchorCluster
+// (the caller's own cluster), iff that cluster holds the service, then fans out
+// service-selects-pod edges that MAY cross clusters (the same-family endpoint
+// union — `.svc` names route to backing pods in any family member under mesh
+// routing). anchorCluster is the caller's authoritative cluster: the
+// UID-recovered client-pod cluster when the client side resolved to a topology
+// pod, else the raw trace label (bucketed to "unknown" when missing).
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string) []string {
 	if podUID == "" {
-		return r.resolveEmptyUID(label, familyCluster)
+		return r.resolveEmptyUID(label, anchorCluster)
 	}
 	if pod, ok := r.podByUID[podUID]; ok {
 		return []string{pod.ID()}
@@ -446,144 +377,97 @@ func (r *sgResolver) resolveServer(label, familyCluster, podUID, namespace strin
 }
 
 // resolveConnString implements D29 Stage 0 for a label containing "://". Every
-// recognised in-cluster reference resolves to Service nodes — both the
-// <service>.<namespace> form and the headless <pod-hostname>.<service>.<namespace>
-// form resolve to the same (service, namespace), looked up across
-// familyCluster's family (widened by the unknown-family fallback and narrowed
-// by endpoint-backed pruning — see resolveServiceLevel); each surviving match
-// fans out service-selects-pod edges to its own cluster's backing pods. An
-// unparseable host, a non-2/3-label name, or zero surviving candidates falls
-// back to an external node. The result is therefore never a pod — Stage 0
-// yields service nodes or a single external node.
+// recognised in-cluster reference resolves to a SINGLE Service node in the
+// caller's own (anchor) cluster — both the <service>.<namespace> form and the
+// headless <pod-hostname>.<service>.<namespace> form resolve to the same
+// (service, namespace) — provided the anchor cluster itself holds that Service
+// (see resolveServiceLevel). The resolved node fans out service-selects-pod
+// edges that MAY cross clusters (the cross-cluster endpoint union over the
+// caller's family). An unparseable host, a non-2/3-label name, or an anchor
+// cluster that does not hold the service falls back to an external node. The
+// result is therefore never a pod — Stage 0 yields a single service node or a
+// single external node.
 //
 // Deliberately NOT memoised: resolution is a url.Parse plus a couple of map
 // hits (µs-scale, dwarfed by the upstream fetch), materialisation is
 // idempotent (services / externals / svcEdges all dedupe), and a cache keyed
-// on (familyCluster, label) is exactly the kind of collision-prone state a
+// on (anchorCluster, label) is exactly the kind of collision-prone state a
 // pure per-parse function does not need.
-func (r *sgResolver) resolveConnString(label, familyCluster string) []string {
+func (r *sgResolver) resolveConnString(label, anchorCluster string) []string {
 	if host := connStringHost(label); host != "" {
 		if svc, ns, ok := classifyK8sDNS(host); ok {
-			if ids := r.resolveServiceLevel(familyCluster, ns, svc); len(ids) > 0 {
+			if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
 				return ids
 			}
 		}
 	}
-	// Unresolvable: not a parseable host, not a 2/3-label k8s .svc name, or
-	// zero candidates survive resolution (family miss without an eligible
-	// unique-family fallback) → external node (labels={}, verbatim label as
-	// name). Keeps truly-external URLs, unknown in-cluster names, and
-	// cross-family-ambiguous names visible.
+	// Unresolvable: not a parseable host, not a 2/3-label k8s .svc name, or the
+	// anchor cluster does not hold the service in its own family → external node
+	// (labels={}, verbatim label as name). Keeps truly-external URLs, unknown
+	// in-cluster names, and calls whose own cluster lacks the service visible.
 	return []string{r.external(label)}
 }
 
-// resolveServiceLevel resolves a `<service>.<namespace>` record to service
-// nodes (materialising their service-selects-pod edges), scoped to
-// familyCluster's FAMILY: every cluster whose clusterFamilyKey equals
-// familyCluster's AND which holds the (namespace, service) materialises its
-// own service node — familyCluster itself is not special, just a family
-// member. Candidates come from the per-parse svcCandidates index (sorted by
-// cluster at build, so the result is a pure function of the data — D6
-// determinism).
+// resolveServiceLevel resolves a `<service>.<namespace>` record to a SINGLE
+// service node in the caller's OWN (anchor) cluster, per the localised
+// connection-string model: pod→service is intra-cluster, service→pod MAY cross
+// clusters. The endpoint resolves iff the anchor cluster itself holds the
+// (namespace, service) — i.e. the anchor is one of the family candidates. Steps:
 //
-// Two refinements on the raw family lookup:
-//   - Unknown-family fallback: when the anchor's family is not the family of
-//     ANY loaded cluster (the "unknown" bucket, or a bogus trace label), the
-//     (namespace, service) is looked up across all LOADED clusters and
-//     resolves iff exactly one family holds it (two-plus families is
-//     ambiguous → nil → external). When NO loaded cluster holds the name, an
-//     "unknown" anchor keeps its direct family hit on "unknown"-bucketed
-//     service entries — the only resolution a fully-unlabelled deployment
-//     has; identified holders always shadow that pseudo-cluster hit. A LOADED
-//     family that merely lacks the service does NOT escape across families.
-//   - Endpoint-backed pruning: candidates with zero backing pods are skipped
-//     when at least one candidate is endpoint-backed (a fleet-wide Service
-//     object whose pods run in one cluster must not fan out edges to its
-//     endpointless siblings). Unbackedness counts only as evidence in
-//     clusters with endpoint visibility (see endpointBacked); all-unbacked
-//     candidate sets resolve unpruned.
+//  1. cands = svcCandidates[famSvcKey{family(anchor), ns, svc}] — every
+//     same-family cluster holding the service, sorted by cluster (D6).
+//  2. The anchor cluster must appear among cands; if not, return nil and the
+//     caller falls back to an external node. This single membership test
+//     uniformly covers an anchor whose own cluster lacks the service (a family
+//     sibling holding it is NOT enough — a same-named local Service is a mesh
+//     precondition), an "unknown"/empty/bogus anchor naming no holder in its
+//     own family, AND preserves the fully-unlabelled single-cluster case
+//     (clusterFamilyKey("unknown") == "unknown" is a family-of-one, so an
+//     "unknown"-bucketed service makes "unknown" a legitimate holder). There is
+//     NO cross-family fallback.
+//  3. Materialise ONE service node, in the anchor cluster, from its OWN
+//     ServiceObs (anchor's cluster_ip / headless status).
+//  4. Fan out service-selects-pod edges from that single node to the UNION of
+//     backing pods across ALL cands' EndpointsByService entries — every
+//     same-family cluster holding the service. These edges MAY cross clusters
+//     (a local service node selecting a backing pod in a family sibling),
+//     reflecting service-mesh endpoint aggregation where each cluster's KSM
+//     observes only its OWN EndpointSlices. There is NO endpoint-backed pruning:
+//     a sibling with the Service but zero endpoints contributes no edge, and a
+//     service with zero endpoints anywhere still materialises its (single) node
+//     — an operator signal.
 //
-// An empty result means the endpoint is unresolvable and the caller falls
-// back to an external node.
-func (r *sgResolver) resolveServiceLevel(familyCluster, ns, svc string) []string {
-	family := clusterFamilyKey(familyCluster)
-	cands := r.svcCandidates[famSvcKey{family: family, namespace: ns, service: svc}]
-	if _, known := r.knownFamilies[family]; !known {
-		// Unanchorable anchor. A non-empty cands here can only be
-		// "unknown"-bucketed entries (a loaded family's key would be known) —
-		// identified holders take precedence over that pseudo-cluster hit.
-		if holders, anyLoaded := r.loadedUniqueFamilyHolders(ns, svc); anyLoaded {
-			cands = holders
-		}
-	}
-	cands = r.endpointBacked(cands, ns, svc)
-	ids := make([]string, 0, len(cands))
-	for _, cand := range cands {
-		ids = append(ids, r.materializeService(cand.cluster, ns, svc, cand.obs))
-	}
-	return ids
-}
-
-// loadedUniqueFamilyHolders implements the unknown-family fallback lookup:
-// the LOADED clusters holding (namespace, service) — "unknown"-bucketed
-// entries are excluded at svcHolderFamilies build time. anyLoaded reports
-// whether any loaded cluster holds the name at all; holders is non-nil ONLY
-// when they all belong to a single family (two-plus families is ambiguous —
-// no anchor exists to disambiguate — and resolves to nil → external). A
-// unique holder family's candidates are exactly its svcCandidates bucket
-// (already sorted at build; a loaded family key is never "unknown", so the
-// bucket holds no pseudo-cluster entries) — the uniqueness check is an
-// order-free set property (D6).
-func (r *sgResolver) loadedUniqueFamilyHolders(ns, svc string) ([]svcCandidate, bool) {
-	hf, ok := r.svcHolderFamilies[nsSvcKey{namespace: ns, service: svc}]
-	if !ok {
-		return nil, false
-	}
-	if hf.multi {
-		return nil, true // held by ≥2 families: ambiguous
-	}
-	return r.svcCandidates[famSvcKey{family: hf.family, namespace: ns, service: svc}], true
-}
-
-// endpointBacked applies endpoint-backed pruning: when at least one candidate
-// has backing pods in its own cluster's EndpointsByService entry, candidates
-// PROVABLY without backing pods are dropped (no service node, no edge, no
-// fan-out). "Provably" requires endpoint visibility: a candidate whose whole
-// cluster has zero endpoint data (epVisibleClusters miss — endpointslice
-// allowlist absent there, staged rollout, join failure) is KEPT, because its
-// zero is absence of evidence, not evidence of absence. When NO candidate is
-// backed the full set is returned unchanged — a known service with zero
-// endpoints anywhere still materialises (deliberate operator signal), and
-// deployments without the kubernetes.io/service-name endpointslice allowlist
-// keep full connection-string resolution. Pure order-preserving filter over a
-// sorted slice (D6).
-func (r *sgResolver) endpointBacked(cands []svcCandidate, ns, svc string) []svcCandidate {
-	anyBacked := false
-	for _, c := range cands {
-		if len(r.endpointsByService[serviceKey{c.cluster, ns, svc}]) > 0 {
-			anyBacked = true
+// Returns the single-element slice [anchorSvcID], or nil (→ external).
+func (r *sgResolver) resolveServiceLevel(anchorCluster, ns, svc string) []string {
+	cands := r.svcCandidates[famSvcKey{family: clusterFamilyKey(anchorCluster), namespace: ns, service: svc}]
+	var anchor *svcCandidate
+	for i := range cands {
+		if cands[i].cluster == anchorCluster {
+			anchor = &cands[i]
 			break
 		}
 	}
-	if !anyBacked {
-		return cands
+	if anchor == nil {
+		return nil // anchor cluster does not hold the service → external
 	}
-	kept := make([]svcCandidate, 0, len(cands))
-	for _, c := range cands {
-		if len(r.endpointsByService[serviceKey{c.cluster, ns, svc}]) > 0 {
-			kept = append(kept, c)
-			continue
-		}
-		if _, visible := r.epVisibleClusters[c.cluster]; !visible {
-			kept = append(kept, c)
+	id := r.materializeServiceNode(anchorCluster, ns, svc, anchor.obs)
+	// Cross-cluster service-selects-pod fan-out: union backing pods across every
+	// same-family cluster holding the service. cands is sorted, addServiceEdge
+	// dedupes by (svcID, podID), and SortEdges canonicalises the final order, so
+	// the result is a pure function of the data regardless of arrival order (D6).
+	for _, cand := range cands {
+		for _, ep := range r.endpointsByService[serviceKey{cand.cluster, ns, svc}] {
+			r.addServiceEdge(id, ep.Pod.ID(), ns)
 		}
 	}
-	return kept
+	return []string{id}
 }
 
-// materializeService creates (once) a ServiceNode and its service-selects-pod
-// edges to every backing pod in the topology endpoint index.
-func (r *sgResolver) materializeService(cluster, ns, svc string, obs ServiceObs) string {
+// materializeServiceNode creates (once) a ServiceNode for the resolved service
+// in its own cluster. Idempotent and edge-free: the service-selects-pod fan-out
+// is driven by the caller (resolveServiceLevel) so a single local node can fan
+// out across same-family clusters.
+func (r *sgResolver) materializeServiceNode(cluster, ns, svc string, obs ServiceObs) string {
 	id := graph.ServiceID(cluster, ns, svc)
 	if _, ok := r.services[id]; ok {
 		return id
@@ -597,9 +481,6 @@ func (r *sgResolver) materializeService(cluster, ns, svc string, obs ServiceObs)
 		NameValue:      svc,
 		LabelsValue:    map[string]string{"cluster": cluster, "namespace": ns},
 		IPAddressValue: ips,
-	}
-	for _, ep := range r.endpointsByService[serviceKey{cluster, ns, svc}] {
-		r.addServiceEdge(id, ep.Pod.ID(), ns)
 	}
 	return id
 }

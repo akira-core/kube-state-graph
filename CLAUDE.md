@@ -123,57 +123,52 @@ live under `openspec/specs/`.
   per-pod resolution; a `"://"` endpoint is never a pod:
   - **2 labels** `<service>.<namespace>` and **3 labels**
     `<pod>.<service>.<namespace>` (headless per-pod) both → the addressed
-    `(namespace, service)`, resolved by **cluster-family fan-out**: the
-    `(namespace, service)` is looked up in the `ServicesByNameNS` of **every
-    loaded cluster in the caller's family** — two clusters are in one family
-    iff their names are equal after replacing every maximal digit run with a
-    single `0` sentinel (`prod-03` ↔ `prod-12` match; `staging-1` ≠ `prod-1`;
-    digit-free names form exact-name singleton families; the sentinel being a
-    digit makes the mapping collision-free without escaping). The family is
-    anchored on the **UID-recovered client-pod cluster** when the client side
-    resolved to a topology pod (the trace `cluster` label is frequently
-    missing or wrong), falling back to the raw trace label otherwise; edge
-    `labels.cluster` always stays the raw trace label (D9). The anchor cluster
-    is not special — just a family member. **Unknown-family fallback**: when
-    the anchor's family is not the family of ANY loaded cluster (the
-    `"unknown"` missing-label bucket, or a bogus trace label — the bucket
-    never counts as a loaded cluster), the `(namespace, service)` is looked up
-    across the LOADED clusters (`"unknown"`-bucketed service entries are NOT
-    holders — one unlabelled duplicate must neither flip a uniquely-held name
-    to ambiguous nor resolve a bogus anchor into the pseudo-cluster) and
-    resolves iff exactly ONE family holds it, REPLACING any primary-lookup hit
-    on `"unknown"`-bucketed entries (multi-family names are ambiguous →
-    external); when NO loaded cluster holds the name, an `"unknown"` anchor
-    keeps its primary hit on `"unknown"`-bucketed entries — a fully-unlabelled
-    deployment retains resolution within its own pseudo-cluster; a LOADED
-    family that merely lacks the service never escapes cross-family.
-    **Endpoint-backed pruning** is then applied to the chosen candidates:
-    candidates PROVABLY without backing pods — zero endpoints while their own
-    cluster has endpoint data for some service (a cluster with zero endpoint
-    data anywhere is spared: allowlist gaps are absence of evidence, not
-    evidence of absence) — are skipped (no service node, no edge, no fan-out)
-    whenever at least one candidate is endpoint-backed; when NO candidate is
-    backed, all materialise unpruned — so a known service with zero backing
-    endpoints anywhere still materialises its service node(s) with no fan-out
-    edges, and deployments without the endpointslice allowlist keep full
-    resolution. **Each surviving** family cluster materialises its
-    own `type="service"` node
-    (`id="<cluster>/<namespace>/<service>"`, `labels={cluster,namespace}`,
-    `ipaddress=[cluster_ip]` unless headless `cluster_ip="None"`) plus on-demand
-    `service-selects-pod` edges (service → pod, always intra-cluster within the
-    resolved service's own cluster) fanning out to each backing pod, and yields
-    one `pod-calls-service` edge per match (one series → N edges; such edges
-    MAY be cross-cluster). Candidate clusters are iterated in sorted order;
-    pruning is a deterministic filter and the fallback's uniqueness check is
-    order-free (determinism). The family rule (`build.clusterFamilyKey`), the
-    fallback, and the pruning are hardcoded pure functions — no knob, no PromQL
-    change (filtering is in-memory at resolution, preserving "no filters pushed
-    to PromQL"). The 3-label form drops the leading pod-hostname and resolves
-    as its parent service. When BOTH sides of a series are `"://"` labels
-    resolving to service sets, the cross product of edges is emitted.
-  - **unresolvable** (host not a 2/3-label `.svc` name, or zero candidates
-    survive — the anchor's loaded family lacks the service, or an unanchorable
-    series' name is held by zero or by two-plus families) → an `external` node
+    `(namespace, service)`, resolved to a **SINGLE `type="service"` node in the
+    caller's own (anchor) cluster** (pod→svc is same-cluster only). The anchor
+    is the **UID-recovered client-pod cluster** when the client side resolved to
+    a topology pod (the trace `cluster` label is frequently missing or wrong),
+    falling back to the raw trace label otherwise; edge `labels.cluster` always
+    stays the raw trace label (D9). The endpoint resolves **iff the anchor
+    cluster itself holds the `(namespace, service)`** in `ServicesByNameNS` — a
+    same-named local Service is a service-mesh precondition (Istio multi-primary
+    / Cilium Cluster Mesh keep the Service in *every* cluster; cross-cluster is
+    endpoint aggregation), so a family sibling holding it is **not** enough.
+    This single anchor-membership test uniformly covers an anchor whose own
+    cluster lacks the Service, an `"unknown"`/empty/bogus anchor, **and** the
+    fully-unlabelled single-cluster case — `clusterFamilyKey("unknown") =
+    "unknown"` is a family-of-one, so an `"unknown"`-bucketed Service makes
+    `"unknown"` a legitimate holder. There is **NO unknown-family fallback and
+    NO cross-family resolution**. The anchor materialises **one** node
+    (`id="<anchor>/<namespace>/<service>"`, `labels={cluster,namespace}`,
+    `ipaddress=[cluster_ip]` from the anchor's own `kube_service_info` unless
+    headless `cluster_ip="None"`) and yields **one** `pod-calls-service` edge
+    (always intra-cluster — **`may_cross_cluster: false`**). **Cross-cluster
+    `service-selects-pod` fan-out**: from that single node, one edge is emitted
+    per backing pod across the **UNION of `EndpointsByService` over every
+    same-family cluster holding the same-named Service** — two clusters are in
+    one family iff their names are equal after replacing every maximal digit run
+    with a single `0` sentinel (`prod-03` ↔ `prod-12` match; `staging-1` ≠
+    `prod-1`; digit-free names form exact-name singleton families; the sentinel
+    being a digit makes the mapping collision-free without escaping). These
+    `service-selects-pod` edges **MAY cross clusters** (**`may_cross_cluster:
+    true`**) — a local service node selecting a backing pod in a family sibling,
+    reflecting service-mesh endpoint aggregation (each cluster's KSM observes
+    only its OWN EndpointSlices, so the cross-cluster endpoint set is rebuilt by
+    unioning over the family). There is **no endpoint-backed pruning**: a
+    sibling holding the Service with zero endpoints contributes no edge, and a
+    service with zero endpoints anywhere still materialises its single (local)
+    node — an operator signal. Candidates are iterated in sorted order, the
+    anchor-membership test and the endpoint union are order-free, and
+    `service-selects-pod` edges dedupe by `(service-node, pod)` (determinism).
+    The family rule (`build.clusterFamilyKey`) and the membership/union logic
+    are hardcoded pure functions — no knob, no PromQL change (filtering is
+    in-memory at resolution, preserving "no filters pushed to PromQL"). The
+    3-label form drops the leading pod-hostname and resolves as its parent
+    service. When BOTH sides of a series are `"://"` labels, each resolves to a
+    single local node in the (shared) anchor cluster, so one intra-cluster edge
+    is emitted between them.
+  - **unresolvable** (host not a 2/3-label `.svc` name, or the anchor cluster
+    does not itself hold the service in its own family) → an `external` node
     (`id="external/<label>"`, `labels={}`) with the verbatim label as `name`.
   - A series with a **wholly empty side** (no UID, no label) is dropped before
     any resolution — the other side's `"://"` label must not leak service /
@@ -186,10 +181,11 @@ live under `openspec/specs/`.
   that endpoint is promoted to `external/<label>` (no cluster prefix; `labels={}`)
   instead of dropping the edge. Per-endpoint resolution order:
   (1) connection-string resolution (`"://"` in the label, empty UID) →
-  one `service` node per surviving candidate cluster (+ each cluster's own
-  `service-selects-pod` fan-out) or `external` on zero surviving candidates,
-  per the D29 cluster-family rule above incl. its unknown-family fallback and
-  endpoint-backed pruning (never a pod);
+  a single `service` node in the caller's own (anchor) cluster (iff that
+  cluster holds the service), with a cross-cluster `service-selects-pod`
+  endpoint union over the same-family clusters holding it, or `external` when
+  the anchor cluster lacks the service, per the D29 same-cluster rule above
+  (never a pod; no unknown-family fallback, no endpoint-backed pruning);
   (2) UID-based pod resolution / synth-pod fallback (only when UID is non-empty);
   (3) missing-UID human-label fallback (this rule) → external with `labels={}`
   (**only for non-`"://"` labels**);
@@ -249,11 +245,12 @@ live under `openspec/specs/`.
   registry shared with the builder. Adding an edge type = update both the
   builder and the registry in the same change; the API can never list a type
   the builder cannot produce. Current edge types include `pod-calls-pod`,
-  `pod-calls-service` (emitted when a `"://"` connection-string resolves to
-  in-cluster service nodes via the D29 cluster-family fan-out; MAY be
-  cross-cluster — `may_cross_cluster: true`), and `service-selects-pod`
-  (directed service → pod, always intra-cluster within the resolved service's
-  own cluster; emitted on demand by the D29 connection-string resolution).
+  `pod-calls-service` (emitted when a `"://"` connection-string resolves to a
+  service node in the caller's OWN cluster; always intra-cluster —
+  `may_cross_cluster: false`), and `service-selects-pod` (directed service →
+  pod, emitted on demand by the D29 connection-string resolution; the local
+  service node fans out across same-family clusters holding the same-named
+  Service, so it MAY be cross-cluster — `may_cross_cluster: true`).
 - **API-key auth is the only HTTP auth in v1.** Header is `X-API-Key`. Keys
   come from `--api-keys-file` (K8s `Secret` mount, hot-reloaded) or
   `--api-keys`. Empty keyset = auth disabled (dev default). Open paths

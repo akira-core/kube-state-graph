@@ -108,7 +108,7 @@ per container (a recency pick that is accurate for near-now windows; see
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `traces_service_graph_request_total` | `pod-calls-pod` / `pod-calls-service` edges (intra- and cross-cluster) | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` | Optional (no series ⇒ no call edges) |
+| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` | Optional (no series ⇒ no call edges) |
 
 Wrapped in `rate(traces_service_graph_request_total[<window>]) @ <end>`. Each
 series carries a single `cluster` external label representing the trace source
@@ -120,13 +120,19 @@ so the lookup is unambiguous. Edges are only emitted when both endpoints
 resolve. When an endpoint's pod-UID label is empty, the human-readable
 `client`/`server` label is resolved by built-in **connection-string detection**
 (no knob): a label containing the literal `://` is parsed as a URL — an
-in-cluster `<service>.<namespace>.svc` name becomes a `type="service"` node
-(with on-demand `service-selects-pod` edges fanning out to its backing pods). A
-headless `<pod>.<service>.<namespace>.svc` name resolves to the **same** service
-node (the leading pod-hostname is dropped) and fans out the same way — a `://`
-endpoint is never a specific pod. An unresolvable URL becomes an `external` node.
-A non-URL label (no `://`) also becomes an `external` node via the missing pod-UID
-human-label fallback.
+in-cluster `<service>.<namespace>.svc` name becomes a **single** `type="service"`
+node **in the caller's own cluster** (so `pod-calls-service` is always
+intra-cluster), provided that cluster holds the same-named Service. That service
+node then fans out on-demand `service-selects-pod` edges to its backing pods
+across **every same-family cluster** holding the same-named Service — so
+`service-selects-pod` **may cross clusters**, modelling multi-cluster
+service-mesh endpoint aggregation (clusters are one family when their names
+match after collapsing digit runs, e.g. `prod-1` ↔ `prod-2`). A headless
+`<pod>.<service>.<namespace>.svc` name resolves to the **same** service node (the
+leading pod-hostname is dropped) — a `://` endpoint is never a specific pod. An
+unresolvable URL, or one whose caller cluster does not hold the Service, becomes
+an `external` node. A non-URL label (no `://`) also becomes an `external` node
+via the missing pod-UID human-label fallback.
 
 The `servicegraph` connector's **virtual peers** — `client="user"` (an
 uninstrumented caller) and `unknown` (an unresolved peer) — are dropped at the
