@@ -836,10 +836,12 @@ func resolvePVCStorageClass(vec model.Vector, mc missingClusterCounts) map[pvcKe
 	return out
 }
 
-// readyStatusFromLabel maps a kube_node_status_condition `status` label
-// (true/false/unknown for condition="Ready") to the graph ReadyStatus value.
-// Any other value yields "" so a malformed status never surfaces as a non-enum
-// attribute — the caller drops it (omit ready_status).
+// readyStatusFromLabel maps a kube_node_status_condition `status` label to the
+// graph ReadyStatus value. The caller canonicalises casing to lowercase first
+// (the contract does not pin status-label casing — stock KSM lowercases, a
+// raw-enum exporter emits "True"/"False"/"Unknown"), so this matches the
+// lowercase forms. Any other value yields "" so a malformed status never
+// surfaces as a non-enum attribute — the caller drops it (omit ready_status).
 func readyStatusFromLabel(status string) string {
 	switch status {
 	case "true":
@@ -880,7 +882,13 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 		if s.Value != 1 {
 			continue
 		}
-		status := string(s.Metric["status"])
+		// Canonicalise casing at the read site so the guard, the lexical
+		// tie-break below, and the final mapping all operate on one casing. The
+		// `status` value casing is NOT pinned by the KSM-shaped contract: stock
+		// kube-state-metrics lowercases it (addConditionMetrics → strings.ToLower),
+		// but an exporter that re-publishes the raw Kubernetes v1.ConditionStatus
+		// enum verbatim emits "True"/"False"/"Unknown" — both must resolve.
+		status := strings.ToLower(string(s.Metric["status"]))
 		if readyStatusFromLabel(status) == "" {
 			continue
 		}

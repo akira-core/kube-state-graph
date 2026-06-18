@@ -697,6 +697,40 @@ func TestParseTopology_NodeReadyStatusNoActiveRowOmitted(t *testing.T) {
 	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "no active (value==1) row → ready_status omitted")
 }
 
+// TestParseTopology_NodeReadyStatusCaseInsensitive — the `status` label casing
+// is NOT pinned by the KSM-shaped contract. Stock kube-state-metrics lowercases
+// it (addConditionMetrics → strings.ToLower → "true"/"false"/"unknown"), but an
+// exporter that re-publishes the raw Kubernetes v1.ConditionStatus enum verbatim
+// emits the capitalised "True"/"False"/"Unknown". The resolver MUST accept both
+// (real-world bug: every node's ready_status was silently dropped because the
+// upstream carried "True").
+func TestParseTopology_NodeReadyStatusCaseInsensitive(t *testing.T) {
+	node := func(name string) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": model.LabelValue(name)}}
+	}
+	cond := func(name, status string, val model.SampleValue) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "node": model.LabelValue(name),
+			"condition": "Ready", "status": model.LabelValue(status),
+		}, Value: val}
+	}
+	nodeVec := sampleVec(node("ready-0"), node("notready-0"), node("unknown-0"))
+	// Capitalised raw-enum casing (k8s v1.ConditionStatus), not KSM lowercase.
+	condVec := sampleVec(
+		cond("ready-0", "True", 1), cond("ready-0", "False", 0), cond("ready-0", "Unknown", 0),
+		cond("notready-0", "True", 0), cond("notready-0", "False", 1), cond("notready-0", "Unknown", 0),
+		cond("unknown-0", "True", 0), cond("unknown-0", "False", 0), cond("unknown-0", "Unknown", 1),
+	)
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	byName := map[string]*graph.K8sNode{}
+	for _, n := range tp.Nodes {
+		byName[n.Name()] = n
+	}
+	assert.Equal(t, graph.ReadyStatusReady, byName["ready-0"].ReadyStatus(), `"True" → Ready`)
+	assert.Equal(t, graph.ReadyStatusNotReady, byName["notready-0"].ReadyStatus(), `"False" → NotReady`)
+	assert.Equal(t, graph.ReadyStatusUnknown, byName["unknown-0"].ReadyStatus(), `"Unknown" → Unknown`)
+}
+
 // TestParseTopology_NodeReadyStatusOrderFree — the active-row pick and the
 // defensive multi-active tie-break are pure functions of the data, independent
 // of upstream vector order (D6).

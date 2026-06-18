@@ -61,8 +61,10 @@ const (
 	// K8s node Ready-status resolution. KSM-shaped, so prefix-aware via Renderer.
 	// kube_node_status_condition emits one series per (condition, status) with
 	// value 1 for the active combination; the topology reader reads the active
-	// condition="Ready" row's `status` label (true/false/unknown) to enrich the
-	// node's typed `ready_status` attribute (never a label, never a new node).
+	// condition="Ready" row's `status` label (true/false/unknown, matched
+	// case-insensitively — a raw-enum exporter emits True/False/Unknown) to
+	// enrich the node's typed `ready_status` attribute (never a label, never a
+	// new node).
 	// The condition="Ready" selector is a fixed, request-invariant metric-
 	// selection contract (same class as the QNodeAddresses type selector and the
 	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
