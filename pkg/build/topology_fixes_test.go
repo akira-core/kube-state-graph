@@ -6,6 +6,8 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/marz32one/kube-state-graph/pkg/graph"
 )
 
 // TestParseTopology_PVCBindingDeduped — a pod mounting one claim through two
@@ -55,6 +57,52 @@ func TestParseTopology_K8sNodeClusterLabelNotClobbered(t *testing.T) {
 	assert.Equal(t, "prod", labels["cluster"],
 		"contract labels.cluster must not be clobbered by an operator node label")
 	assert.Equal(t, "ingress", labels["app"], "non-colliding KSM labels still merge")
+}
+
+// TestParseTopology_K8sNodeDeduped — kube_node_info can return more than one
+// series for the same (cluster, node): two KSM scrape targets (HA, or a rollout
+// still inside the last_over_time window) carry different instance/pod target
+// labels, and a kubelet / OS upgrade churns kubelet_version / os_image within
+// the window. Every node attribute (labels, IP, ready_status) is sourced from
+// (cluster, node)-keyed join maps, so duplicate series describe the identical
+// node — they MUST collapse to one K8sNode here rather than minting same-ID
+// duplicates that flood NewGraph with "duplicate node ID" warnings. Distinct
+// nodes must still survive.
+func TestParseTopology_K8sNodeDeduped(t *testing.T) {
+	nodeVec := sampleVec(
+		model.Sample{Metric: model.Metric{
+			"cluster": "prod", "node": "worker-0",
+			"kubelet_version": "v1.29.4", "instance": "10.0.0.1:8080",
+		}, Value: 1},
+		model.Sample{Metric: model.Metric{
+			"cluster": "prod", "node": "worker-0",
+			"kubelet_version": "v1.29.5", "instance": "10.0.0.2:8080",
+		}, Value: 1},
+		model.Sample{Metric: model.Metric{
+			"cluster": "prod", "node": "worker-1",
+		}, Value: 1},
+	)
+	condVec := sampleVec(model.Sample{Metric: model.Metric{
+		"cluster": "prod", "node": "worker-0", "condition": "Ready", "status": "true",
+	}, Value: 1})
+
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+
+	require.Len(t, tp.Nodes, 2,
+		"duplicate (cluster,node) series must collapse to one node; distinct nodes survive")
+
+	byID := map[string]*graph.K8sNode{}
+	for _, n := range tp.Nodes {
+		_, dup := byID[n.ID()]
+		require.False(t, dup, "no duplicate node IDs may leave parseTopology: %s", n.ID())
+		byID[n.ID()] = n
+	}
+	w0 := byID["prod/worker-0"]
+	require.NotNil(t, w0, "the deduped node survives")
+	assert.Equal(t, graph.ReadyStatusReady, w0.ReadyStatus(),
+		"dedup must not drop the (cluster,node)-keyed ready_status")
+	assert.Equal(t, "prod", w0.Labels()["cluster"])
+	require.NotNil(t, byID["prod/worker-1"], "the distinct node is not collapsed")
 }
 
 // TestParseTopology_PodIPNotInheritedFromOldUID — when a pod is recreated

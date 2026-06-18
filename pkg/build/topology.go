@@ -307,16 +307,31 @@ func parseTopology(v topologyVectors) Topology {
 		clusters[cluster] = struct{}{}
 	}
 
-	// K8s nodes.
+	// K8s nodes. Deduped by (cluster, node): kube_node_info can return multiple
+	// series for one node — two KSM scrape targets (HA, or a rollout still inside
+	// the last_over_time window) carry different instance/pod target labels, and a
+	// kubelet / OS upgrade churns kubelet_version / os_image within the window.
+	// Every node attribute below is sourced from (cluster, node)-keyed join maps
+	// (nodeLabels / nodeIPs / nodeReady), so duplicate series describe the
+	// identical node; collapsing them here (first occurrence wins — the node is a
+	// pure function of the order-free join maps, so the winner is deterministic
+	// regardless of vector order, D6) keeps same-ID K8sNodes from flooding
+	// NewGraph with "duplicate node ID" warnings.
 	nodes := make([]*graph.K8sNode, 0, len(v.Node))
+	seenNodes := make(map[[2]string]struct{}, len(v.Node))
 	for _, s := range v.Node {
 		cluster := mc.bucket(promql.QNodeInfo, string(s.Metric["cluster"]))
 		nodeName := string(s.Metric["node"])
 		if nodeName == "" {
 			continue
 		}
+		key := [2]string{cluster, nodeName}
+		if _, dup := seenNodes[key]; dup {
+			continue
+		}
+		seenNodes[key] = struct{}{}
 		labels := map[string]string{}
-		for k, v := range nodeLabels[[2]string{cluster, nodeName}] {
+		for k, v := range nodeLabels[key] {
 			labels[k] = v
 		}
 		// Contract keys win: set AFTER the KSM-derived merge. An operator node
@@ -326,7 +341,7 @@ func parseTopology(v topologyVectors) Topology {
 		// relies on.
 		labels["cluster"] = cluster
 		var ips []string
-		if ip := nodeIPs[[2]string{cluster, nodeName}].pick(); ip != "" {
+		if ip := nodeIPs[key].pick(); ip != "" {
 			ips = []string{ip}
 		}
 		nodes = append(nodes, &graph.K8sNode{
@@ -334,7 +349,7 @@ func parseTopology(v topologyVectors) Topology {
 			NameValue:        nodeName,
 			LabelsValue:      labels,
 			IPAddressValue:   ips,
-			ReadyStatusValue: nodeReady[[2]string{cluster, nodeName}],
+			ReadyStatusValue: nodeReady[key],
 		})
 		clusters[cluster] = struct{}{}
 	}
