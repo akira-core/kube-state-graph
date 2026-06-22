@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -63,6 +64,40 @@ type sgResolver struct {
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
 	svcEdges           map[string]*graph.Edge        // service-selects-pod, keyed by "svcID|podID"
+
+	// Debug-only evidence accumulators (no effect on the emitted graph). Counted
+	// while resolving each endpoint and surfaced as an aggregated summary at the
+	// end of parseServiceGraph; per-endpoint detail is emitted at slog.Debug.
+	extReasons map[string]int // external-fallback count keyed by reason
+	shadowed   int            // "://" labels skipped because a UID was populated
+}
+
+// sgTrace carries the identity of the service-graph series currently being
+// resolved, threaded into the resolver purely so the debug logs can name WHICH
+// upstream metric fell back (and why). It never influences resolution.
+type sgTrace struct {
+	side                               string // "client" | "server" — which endpoint is being resolved
+	label                              string // this side's raw client/server label
+	clientLabel, serverLabel           string
+	clientUID, serverUID, traceCluster string
+}
+
+// noteExternal records (for the aggregated summary) and logs one endpoint that
+// fell back to an external node, tagged with the precise reason and the full
+// series identity so an operator can grep the offending metric out of the logs.
+func (r *sgResolver) noteExternal(reason string, t sgTrace, attrs ...any) {
+	r.extReasons[reason]++
+	args := append([]any{
+		"reason", reason,
+		"side", t.side,
+		"label", t.label,
+		"client", t.clientLabel,
+		"server", t.serverLabel,
+		"client_uid", t.clientUID,
+		"server_uid", t.serverUID,
+		"trace_cluster", t.traceCluster,
+	}, attrs...)
+	slog.Debug("service-graph endpoint fell back to external", args...)
 }
 
 // famSvcKey keys the D29 candidate index: the service identity a "://" host
@@ -123,6 +158,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
 		svcEdges:           map[string]*graph.Edge{},
+		extReasons:         map[string]int{},
 	}
 
 	// Dedup pod-calls-pod by (srcID, tgtID). Multiple upstream series can
@@ -161,15 +197,28 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		// (service / external nodes plus service-selects-pod fan-out) as an
 		// orphan subgraph — including the cross-cluster service-selects-pod fan-out.
 		if (clientUID == "" && clientLabel == "") || (serverUID == "" && serverLabel == "") {
+			slog.Debug("service-graph series dropped (one side wholly empty: no UID and no label)",
+				"client", clientLabel, "server", serverLabel,
+				"client_uid", clientUID, "server_uid", serverUID, "trace_cluster", traceCluster)
 			continue
 		}
+
+		// Series identity threaded into the resolver for debug logging only.
+		base := sgTrace{
+			clientLabel: clientLabel, serverLabel: serverLabel,
+			clientUID: clientUID, serverUID: serverUID, traceCluster: traceCluster,
+		}
+		ctClient := base
+		ctClient.side, ctClient.label = "client", clientLabel
+		ctServer := base
+		ctServer.side, ctServer.label = "server", serverLabel
 
 		// Each side resolves to a (possibly empty) slice of node IDs. With the
 		// localised model a "://" endpoint resolves to AT MOST ONE service node —
 		// in the caller's own (anchor) cluster — or to a single external node;
 		// every other path also yields exactly one ID, and an empty slice drops
 		// the side (and with it the series — the cross product below is empty).
-		srcIDs, srcIsPod := res.resolveClient(clientLabel, traceCluster, clientUID, clientNS)
+		srcIDs, srcIsPod := res.resolveClient(clientLabel, traceCluster, clientUID, clientNS, ctClient)
 
 		// Anchor cluster for the server-side "://" path prefers the UID-recovered
 		// client-pod cluster over the raw trace label: the label is frequently
@@ -188,7 +237,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -251,6 +300,15 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 	}
 
 	mc.warn()
+
+	// Aggregated, low-volume evidence headline (per-endpoint detail is at Debug).
+	// Emitted only when something actually fell back, so a clean parse stays quiet.
+	if len(res.externals) > 0 || res.shadowed > 0 {
+		slog.Info("service-graph resolution fallbacks",
+			"external_nodes", len(res.externals),
+			"external_fallback_events", res.extReasons,
+			"conn_string_shadowed_by_uid", res.shadowed)
+	}
 
 	return out
 }
@@ -318,12 +376,13 @@ func normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel string
 // the single local service node (the caller's own cluster) or one external
 // node, the D27 fallback yields one external node, and a wholly empty endpoint
 // yields nil (drop).
-func (r *sgResolver) resolveEmptyUID(label, anchorCluster string) []string {
+func (r *sgResolver) resolveEmptyUID(label, anchorCluster string, t sgTrace) []string {
 	if isConnString(label) {
-		return r.resolveConnString(label, anchorCluster) // Stage 0 — service or external, never a pod
+		return r.resolveConnString(label, anchorCluster, t) // Stage 0 — service or external, never a pod
 	}
 	if label != "" {
-		return []string{r.external(label)} // D27 fallback (non-URL only)
+		r.noteExternal("missing_uid_nonurl_label", t, "anchor_cluster", anchorCluster) // D27 fallback (non-URL only)
+		return []string{r.external(label)}
 	}
 	return nil // drop
 }
@@ -334,9 +393,22 @@ func (r *sgResolver) resolveEmptyUID(label, anchorCluster string) []string {
 // single service node in the anchor cluster, or an external node (never a pod).
 // Every path returns at most one ID. The client side knows its cluster from
 // the metric's `cluster` label.
-func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string) ([]string, bool) {
+func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string, t sgTrace) ([]string, bool) {
 	if podUID == "" {
-		return r.resolveEmptyUID(label, traceCluster), false
+		return r.resolveEmptyUID(label, traceCluster, t), false
+	}
+	// A populated UID short-circuits connection-string resolution (D29 order):
+	// a "://" label on this side is therefore SKIPPED and the endpoint resolves
+	// to a pod, never the service it names. Surfaced as debug evidence because it
+	// is the usual reason a "://" peer resolves on one side (empty UID) but
+	// collapses to a pod on the other (populated UID).
+	if isConnString(label) {
+		r.shadowed++
+		slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)",
+			"reason", "conn_string_shadowed_by_uid", "side", t.side, "label", label,
+			"pod_uid", podUID, "trace_cluster", traceCluster,
+			"client", t.clientLabel, "server", t.serverLabel,
+			"client_uid", t.clientUID, "server_uid", t.serverUID)
 	}
 	id := graph.PodID(traceCluster, podUID)
 	if _, ok := r.podByID[id]; ok {
@@ -365,9 +437,23 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 // routing). anchorCluster is the caller's authoritative cluster: the
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
-func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string) []string {
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace) []string {
 	if podUID == "" {
-		return r.resolveEmptyUID(label, anchorCluster)
+		return r.resolveEmptyUID(label, anchorCluster, t)
+	}
+	// As in resolveClient: a populated server_k8s_pod_uid SKIPS connection-string
+	// resolution, so a "://" server label never maps to its service node (it
+	// collapses onto the UID's pod, or a synth pod when the UID is unknown to
+	// topology). This is the most common cause of a "://" peer resolving as a
+	// service on the client side yet falling through on the server side.
+	if isConnString(label) {
+		r.shadowed++
+		_, known := r.podByUID[podUID]
+		slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)",
+			"reason", "conn_string_shadowed_by_uid", "side", t.side, "label", label,
+			"pod_uid", podUID, "uid_known_to_topology", known, "anchor_cluster", anchorCluster,
+			"client", t.clientLabel, "server", t.serverLabel,
+			"client_uid", t.clientUID, "server_uid", t.serverUID, "trace_cluster", t.traceCluster)
 	}
 	if pod, ok := r.podByUID[podUID]; ok {
 		return []string{pod.ID()}
@@ -393,18 +479,37 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 // idempotent (services / externals / svcEdges all dedupe), and a cache keyed
 // on (anchorCluster, label) is exactly the kind of collision-prone state a
 // pure per-parse function does not need.
-func (r *sgResolver) resolveConnString(label, anchorCluster string) []string {
-	if host := connStringHost(label); host != "" {
-		if svc, ns, ok := classifyK8sDNS(host); ok {
-			if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
-				return ids
-			}
-		}
+func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) []string {
+	// Each early return below is a distinct, separately-logged external-fallback
+	// reason so an operator can tell exactly why a "://" peer did not resolve.
+	host := connStringHost(label)
+	if host == "" {
+		// url.Parse produced no host: opaque double-scheme (e.g. "jdbc:postgresql://…")
+		// or otherwise unparseable authority.
+		r.noteExternal("conn_host_unparseable", t, "anchor_cluster", anchorCluster)
+		return []string{r.external(label)}
 	}
-	// Unresolvable: not a parseable host, not a 2/3-label k8s .svc name, or the
-	// anchor cluster does not hold the service in its own family → external node
-	// (labels={}, verbatim label as name). Keeps truly-external URLs, unknown
-	// in-cluster names, and calls whose own cluster lacks the service visible.
+	svc, ns, ok := classifyK8sDNS(host)
+	if !ok {
+		// Host is not a 2/3-label Kubernetes .svc DNS name (single-label short
+		// name, 4+-label custom/mesh domain, IP literal, comma-joined multi-host…).
+		r.noteExternal("conn_host_not_k8s_dns", t, "host", host, "anchor_cluster", anchorCluster)
+		return []string{r.external(label)}
+	}
+	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
+		slog.Debug("service-graph :// resolved to service node",
+			"side", t.side, "label", label, "service", svc, "namespace", ns,
+			"anchor_cluster", anchorCluster, "service_id", ids[0],
+			"client", t.clientLabel, "server", t.serverLabel)
+		return ids
+	}
+	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
+	// hold that Service in its own family (same-cluster precondition; a family
+	// sibling holding it is not enough) → external node (labels={}, verbatim
+	// label as name).
+	r.noteExternal("anchor_cluster_lacks_service", t,
+		"service", svc, "namespace", ns, "host", host,
+		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
 	return []string{r.external(label)}
 }
 
