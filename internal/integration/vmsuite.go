@@ -38,6 +38,14 @@ const VMImage = "victoriametrics/victoria-metrics:v1.107.0"
 type VMSuite struct {
 	suite.Suite
 
+	// HTTPAuthUsername / HTTPAuthPassword, when both non-empty, start the
+	// container with `-httpAuth.username` / `-httpAuth.password` so every VM
+	// endpoint except the exempt `/health` requires basic auth. Embedding
+	// suites set them BEFORE calling VMSuite.SetupSuite. The suite's own
+	// helpers (readiness, ingest, series polling) authenticate automatically.
+	HTTPAuthUsername string
+	HTTPAuthPassword string
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	container testcontainers.Container
@@ -76,8 +84,16 @@ func (s *VMSuite) SetupSuite() {
 		// default retention is 1 month, so once real time passes fixedNow+1mo it
 		// rejects the samples as "too small timestamp ... outside the retention"
 		// and every query returns empty — a wall-clock time-bomb. 100y removes it.
+		// `/health` is exempt from -httpAuth.* in VM's httpserver, so the
+		// readiness wait below works for auth-enabled containers too.
 		Cmd:        []string{"-search.latencyOffset=0s", "-retentionPeriod=100y"},
 		WaitingFor: wait.ForHTTP("/health").WithPort("8428/tcp").WithStartupTimeout(60 * time.Second),
+	}
+	if s.HTTPAuthUsername != "" {
+		req.Cmd = append(req.Cmd,
+			"-httpAuth.username="+s.HTTPAuthUsername,
+			"-httpAuth.password="+s.HTTPAuthPassword,
+		)
 	}
 	c, err := testcontainers.GenericContainer(s.ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -108,13 +124,26 @@ func (s *VMSuite) TearDownSuite() {
 // VMURL returns the base URL of the running VictoriaMetrics instance.
 func (s *VMSuite) VMURL() string { return s.vmURL }
 
+// vmGet issues a GET against the VM container, attaching the suite's basic
+// auth credentials when the container was started with -httpAuth.*.
+func (s *VMSuite) vmGet(rawURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if s.HTTPAuthUsername != "" {
+		req.SetBasicAuth(s.HTTPAuthUsername, s.HTTPAuthPassword)
+	}
+	return http.DefaultClient.Do(req)
+}
+
 // WaitForReady polls VM's `up{}` (effectively, /-/ready) until it answers or
 // the budget is exhausted.
 func (s *VMSuite) WaitForReady(budget time.Duration) {
 	s.T().Helper()
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(s.vmURL + "/-/ready") //nolint:noctx // best-effort readiness probe
+		resp, err := s.vmGet(s.vmURL + "/-/ready")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
 			return
@@ -134,6 +163,9 @@ func (s *VMSuite) IngestExpFmt(exposition string) {
 	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost,
 		s.vmURL+"/api/v1/import/prometheus", strings.NewReader(exposition))
 	s.Require().NoError(err)
+	if s.HTTPAuthUsername != "" {
+		req.SetBasicAuth(s.HTTPAuthUsername, s.HTTPAuthPassword)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	s.Require().NoError(err)
 	defer func() { _ = resp.Body.Close() }()
@@ -165,7 +197,7 @@ func (s *VMSuite) WaitForSeries(query string, evalTime time.Time, budget time.Du
 		v.Set("nocache", "1")
 		probeURL := s.vmURL + "/api/v1/query?" + v.Encode()
 		lastURL = probeURL
-		resp, err := http.Get(probeURL) //nolint:noctx,gosec // test-only poll loop against ephemeral container URL
+		resp, err := s.vmGet(probeURL)
 		if err != nil {
 			lastErr = err
 			time.Sleep(200 * time.Millisecond)
@@ -218,7 +250,11 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 
 	logger := observability.NewLogger(cfg.LogLevel)
 	metrics := observability.NewMetrics()
-	prom, err := promql.New(cfg.PromURL, metrics)
+	var promOpts []promql.Option
+	if cfg.PromUsername != "" {
+		promOpts = append(promOpts, promql.WithBasicAuth(cfg.PromUsername, cfg.PromPassword))
+	}
+	prom, err := promql.New(cfg.PromURL, metrics, promOpts...)
 	s.Require().NoError(err)
 
 	ks := auth.NewKeySet()

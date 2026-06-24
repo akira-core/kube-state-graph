@@ -33,7 +33,12 @@ const (
 	// Pod controller-owner resolution (D34). KSM-shaped, so prefix-aware via
 	// Renderer. kube_pod_owner gives a pod's owner refs; kube_replicaset_owner
 	// resolves a ReplicaSet owner up to its owning Deployment (the ReplicaSet is
-	// skipped). Both are KSM defaults (no --metric-labels-allowlist required).
+	// skipped). The owner_kind/owner_name/owner_is_controller labels are KSM
+	// defaults (no --metric-labels-allowlist required). NOTE: the optional
+	// `argocd_tracking_id` label the application resolver reads off kube_pod_owner
+	// (resolvePodApplications) is NOT a KSM default — it is operator-provided
+	// (e.g. via --metric-labels-allowlist or a relabel); absence degrades
+	// gracefully to no `application` attribute. See design.md D-A4.
 	QPodOwner        Query = "kube_pod_owner"
 	QReplicaSetOwner Query = "kube_replicaset_owner"
 
@@ -44,6 +49,27 @@ const (
 	// (never to materialise new ones). OPTIONAL — a KSM default, no
 	// --metric-labels-allowlist required.
 	QPVCInfo Query = "kube_persistentvolumeclaim_info"
+
+	// Pod container list resolution. KSM-shaped, so prefix-aware via Renderer.
+	// kube_pod_container_info emits one series per container carrying the
+	// `container` (name) and `image` labels; joined on (cluster, namespace, pod)
+	// to enrich existing pod nodes with their typed `containers` attribute
+	// (never new nodes). OPTIONAL — a KSM default, no --metric-labels-allowlist
+	// required.
+	QPodContainerInfo Query = "kube_pod_container_info"
+
+	// K8s node Ready-status resolution. KSM-shaped, so prefix-aware via Renderer.
+	// kube_node_status_condition emits one series per (condition, status) with
+	// value 1 for the active combination; the topology reader reads the active
+	// condition="Ready" row's `status` label (true/false/unknown, matched
+	// case-insensitively — a raw-enum exporter emits True/False/Unknown) to
+	// enrich the node's typed `ready_status` attribute (never a label, never a
+	// new node).
+	// The condition="Ready" selector is a fixed, request-invariant metric-
+	// selection contract (same class as the QNodeAddresses type selector and the
+	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
+	// absence degrades gracefully to no `ready_status`.
+	QNodeStatusCondition Query = "kube_node_status_condition"
 )
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
@@ -99,8 +125,10 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 	case QNodeInfo:
 		return fmt.Sprintf(`last_over_time(%skube_node_info[%s])`, r.Prefix, w)
 	case QNodeAddresses:
-		// External IP only; topology reader filters further if needed.
-		return fmt.Sprintf(`last_over_time(%skube_node_status_addresses{type="ExternalIP"}[%s])`, r.Prefix, w)
+		// ExternalIP preferred, InternalIP fallback; anchored alternation
+		// selects exactly the two types — the topology reader applies the
+		// preference at parse time.
+		return fmt.Sprintf(`last_over_time(%skube_node_status_addresses{type=~"ExternalIP|InternalIP"}[%s])`, r.Prefix, w)
 	case QPVCBindings:
 		return fmt.Sprintf(`last_over_time(%skube_pod_spec_volumes_persistentvolumeclaims_info[%s])`, r.Prefix, w)
 	case QNodeLabels:
@@ -117,6 +145,20 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(%skube_replicaset_owner[%s])`, r.Prefix, w)
 	case QPVCInfo:
 		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_info[%s])`, r.Prefix, w)
+	case QPodContainerInfo:
+		// tlast_over_time (MetricsQL) — value is each series' last-sample timestamp
+		// (unix seconds). A container that changed image in the window has one
+		// series per image (image is a label); the resolver picks the image with
+		// the greatest last-sample timestamp (the current one). last_over_time
+		// would stamp every series at the eval instant, flattening recency.
+		return fmt.Sprintf(`tlast_over_time(%skube_pod_container_info[%s])`, r.Prefix, w)
+	case QNodeStatusCondition:
+		// condition="Ready" is a fixed, request-invariant metric-selection
+		// contract (anchored equality), not a caller filter — the reader reads
+		// the active row's `status` label at parse time. The four other node
+		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
+		// are never surfaced, so they are excluded here.
+		return fmt.Sprintf(`last_over_time(%skube_node_status_condition{condition="Ready"}[%s])`, r.Prefix, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
 		// the configurable prefix deliberately does NOT apply here. The metric

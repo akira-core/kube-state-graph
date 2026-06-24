@@ -144,3 +144,67 @@ func TestValidate_MetricPrefix(t *testing.T) {
 		})
 	}
 }
+
+// Upstream basic-auth credentials are env-only (D-A1) and must be configured
+// as a pair (D-A2); validation errors must never echo the configured values
+// (D-A5).
+func TestParse_PromBasicAuth_EnvPair(t *testing.T) {
+	env := map[string]string{
+		"KSG_PROM_USERNAME": "ksg",
+		"KSG_PROM_PASSWORD": "s3cret",
+	}
+	cfg, err := Parse(nil, func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err)
+	assert.Equal(t, "ksg", cfg.PromUsername)
+	assert.Equal(t, "s3cret", cfg.PromPassword)
+}
+
+func TestParse_PromBasicAuth_DefaultUnset(t *testing.T) {
+	cfg, err := Parse(nil, func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	assert.Empty(t, cfg.PromUsername)
+	assert.Empty(t, cfg.PromPassword)
+}
+
+func TestValidate_PromBasicAuth_HalfConfiguredRejected(t *testing.T) {
+	cases := map[string]Config{
+		"username only": func() Config { c := Defaults(); c.PromUsername = "ksg"; return c }(),
+		"password only": func() Config { c := Defaults(); c.PromPassword = "s3cret-value"; return c }(),
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.Validate()
+			require.Error(t, err, "half-configured credentials must be rejected")
+			assert.Contains(t, err.Error(), "KSG_PROM_USERNAME", "error should name both env vars")
+			assert.Contains(t, err.Error(), "KSG_PROM_PASSWORD", "error should name both env vars")
+			assert.NotContains(t, err.Error(), "ksg", "error must not echo the username")
+			assert.NotContains(t, err.Error(), "s3cret-value", "error must not echo the password")
+		})
+	}
+}
+
+// RFC 7617 forbids ':' in basic-auth user-ids — SetBasicAuth would silently
+// shift everything after the colon into the password, turning a typo into a
+// permanent upstream 401. Validation fails fast without echoing the value.
+func TestValidate_PromBasicAuth_ColonInUsernameRejected(t *testing.T) {
+	cfg := Defaults()
+	cfg.PromUsername = "team:reader"
+	cfg.PromPassword = "s3cret-value"
+
+	err := cfg.Validate()
+	require.Error(t, err, "username containing ':' must be rejected")
+	assert.Contains(t, err.Error(), "KSG_PROM_USERNAME")
+	assert.NotContains(t, err.Error(), "team:reader", "error must not echo the username")
+	assert.NotContains(t, err.Error(), "s3cret-value", "error must not echo the password")
+}
+
+// Credentials are deliberately env-only: no --prom-username / --prom-password
+// flags exist, so flag parsing must reject them as unknown (D-A1).
+func TestParse_PromBasicAuth_NoFlagsRegistered(t *testing.T) {
+	for _, arg := range []string{"--prom-username=x", "--prom-password=x"} {
+		t.Run(arg, func(t *testing.T) {
+			_, err := Parse([]string{arg}, func(string) (string, bool) { return "", false })
+			require.Error(t, err, "credential flags must not exist")
+		})
+	}
+}

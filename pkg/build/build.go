@@ -67,7 +67,16 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 
 	// Outside-retention check: zero pods + healthy upstream ⇒ retention miss.
 	if len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
-		if up, _ := b.upProbe(ctx); up {
+		up, probeErr := b.upProbe(ctx)
+		if probeErr != nil {
+			// A failed probe must not fail the build (control flow / status
+			// mapping unchanged — that is a spec-level decision), but it must
+			// leave a server-side trace: without it a probe error or timeout
+			// degrades to a silent 200 empty graph with zero signal.
+			slog.WarnContext(ctx, "up probe failed; outside-retention classification skipped",
+				"error", probeErr)
+		}
+		if up {
 			startStr := end.Add(-window).UTC().Format(time.RFC3339)
 			endStr := end.UTC().Format(time.RFC3339)
 			podRaw := topology.RawSeriesCount[string(promql.QPodInfo)]
@@ -110,19 +119,15 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// Cross-cluster status is derived from the resolved endpoint nodes'
 	// `cluster` labels, since edges only carry the trace-source cluster
 	// (Option A: the metric does not stamp server-side cluster; it is
-	// recovered via the topology pod-UID index at parse time).
+	// recovered via the topology pod-UID index at parse time). Any edge type
+	// counts — pod-calls-service edges may cross clusters via the D29
+	// cluster-family fan-out. One EdgeCountByType scan feeds both the log/span
+	// total (sum of the "true" buckets) and the self-metric gauges.
+	edgeCounts := g.EdgeCountByType()
 	crossCluster := 0
-	for _, e := range g.Edges {
-		if e.Type != graph.EdgeTypePodCallsPod {
-			continue
-		}
-		src, srcOK := g.NodesByID[e.Source]
-		tgt, tgtOK := g.NodesByID[e.Target]
-		if !srcOK || !tgtOK {
-			continue
-		}
-		if src.Labels()["cluster"] != tgt.Labels()["cluster"] {
-			crossCluster++
+	for k, n := range edgeCounts {
+		if k[1] == "true" {
+			crossCluster += n
 		}
 	}
 	slog.InfoContext(ctx, "graph built",
@@ -137,7 +142,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// Self-metrics: observational gauges for last build (no-op when unset).
 	if b.metrics != nil {
 		b.metrics.SetGraphNodeCounts(g.NodeCountByKind())
-		b.metrics.SetGraphEdgeCounts(g.EdgeCountByType())
+		b.metrics.SetGraphEdgeCounts(edgeCounts)
 		b.metrics.SetClustersObserved(len(topology.ClustersObserved))
 	}
 
@@ -171,6 +176,12 @@ func classifyReadError(span trace.Span, what string, err error) error {
 
 func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*graph.Edge) {
 	// Nodes: pods + k8s nodes + pvcs + synthesised pods + services + externals.
+	// ORDER IS LOAD-BEARING: graph.NewGraph dedupes colliding node IDs
+	// keep-first (ServiceID mirrors PVCID keying, so a Service and a PVC
+	// sharing (cluster, namespace, name) mint byte-identical IDs), so the
+	// authoritative topology nodes MUST be appended before the on-demand
+	// service-graph nodes. Reordering these appends silently flips the
+	// collision winner — see TestAssemble_TopologyWinsIDCollision.
 	total := len(topology.Pods) + len(topology.Nodes) + len(topology.PVCs) +
 		len(sg.SynthPods) + len(sg.ServiceNodes) + len(sg.ExternalNodes)
 	nodes := make([]graph.GraphNode, 0, total)

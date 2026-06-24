@@ -15,6 +15,7 @@ import (
 	"github.com/marz32one/kube-state-graph/internal/config"
 	"github.com/marz32one/kube-state-graph/pkg/clock"
 	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
+	"github.com/marz32one/kube-state-graph/pkg/graph"
 )
 
 // fixedNow is the absolute timestamp anchor every fixture and query uses.
@@ -59,6 +60,8 @@ kube_pod_info{cluster="cluster-beta",namespace="billing",pod="payments",uid="bet
 kube_node_info{cluster="cluster-alpha",node="worker-0",test=%q} 1 %d
 kube_node_info{cluster="cluster-beta",node="worker-0",test=%q} 1 %d
 kube_node_status_addresses{cluster="cluster-alpha",node="worker-0",type="ExternalIP",address="203.0.113.10",test=%q} 1 %d
+kube_node_status_addresses{cluster="cluster-alpha",node="worker-0",type="InternalIP",address="10.0.0.7",test=%q} 1 %d
+kube_node_status_addresses{cluster="cluster-beta",node="worker-0",type="InternalIP",address="10.0.1.7",test=%q} 1 %d
 traces_service_graph_request_total{client="checkout",server="cart",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="alpha-2",client_k8s_namespace_name="shop",server_k8s_namespace_name="shop",connection_type="virtual_node",test=%q} 0 %d
 traces_service_graph_request_total{client="checkout",server="cart",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="alpha-2",client_k8s_namespace_name="shop",server_k8s_namespace_name="shop",connection_type="virtual_node",test=%q} %g %d
 traces_service_graph_request_total{client="checkout",server="payments",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="beta-1",client_k8s_namespace_name="shop",server_k8s_namespace_name="billing",connection_type="virtual_node",test=%q} 0 %d
@@ -68,6 +71,7 @@ traces_service_graph_request_total{client="https://payments.partner.example/api"
 `,
 		disc, t1, disc, t1, disc, t1,
 		disc, t1, disc, t1, disc, t1,
+		disc, t1, disc, t1,
 		disc, t0, disc, v(rateCheckoutCart), t1,
 		disc, t0, disc, v(rateCheckoutPayments), t1,
 		disc, t0, disc, v(rateExternalToCheckout), t1,
@@ -78,25 +82,6 @@ traces_service_graph_request_total{client="https://payments.partner.example/api"
 	s.Require().True(
 		s.WaitForSeries(`rate(traces_service_graph_request_total{test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
 		"VM did not observe non-zero service-graph rate")
-}
-
-func (s *GraphSuite) graphURL(srv string, configureQuery func(url.Values)) string {
-	q := url.Values{}
-	q.Set("start", strconv.FormatInt(fixedNow.Add(-5*time.Minute).Unix(), 10))
-	q.Set("end", strconv.FormatInt(fixedNow.Unix(), 10))
-	if configureQuery != nil {
-		configureQuery(q)
-	}
-	return srv + "/v1/graph?" + q.Encode()
-}
-
-func (s *GraphSuite) httpGet(rawURL string) *http.Response {
-	s.T().Helper()
-	req, err := http.NewRequestWithContext(s.T().Context(), http.MethodGet, rawURL, nil)
-	s.Require().NoError(err)
-	resp, err := http.DefaultClient.Do(req)
-	s.Require().NoError(err)
-	return resp
 }
 
 func (s *GraphSuite) TestSingleClusterGraph() {
@@ -145,6 +130,116 @@ func (s *GraphSuite) TestCrossClusterEdgePresent() {
 	s.Contains(bodyStr, `"cluster":"cluster-alpha"`)
 	s.NotContains(bodyStr, `"client_cluster"`, "v1 edges must not carry client_cluster")
 	s.NotContains(bodyStr, `"server_cluster"`, "v1 edges must not carry server_cluster")
+}
+
+// TestNodeIPAddressFallback — K8s node ipaddress resolution against real
+// ingested kube_node_status_addresses series: cluster-alpha/worker-0 has both
+// ExternalIP and InternalIP rows (ExternalIP wins); cluster-beta/worker-0 has
+// only an InternalIP row (fallback surfaces it). IPs never appear in labels.
+func (s *GraphSuite) TestNodeIPAddressFallback() {
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body struct {
+		Elements struct {
+			Nodes []struct {
+				Data struct {
+					ID        string            `json:"id"`
+					Type      string            `json:"type"`
+					IPAddress []string          `json:"ipaddress"`
+					Labels    map[string]string `json:"labels"`
+				} `json:"data"`
+			} `json:"nodes"`
+		} `json:"elements"`
+	}
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	ips := map[string][]string{}
+	for _, n := range body.Elements.Nodes {
+		if n.Data.Type != "node" {
+			continue
+		}
+		ips[n.Data.ID] = n.Data.IPAddress
+		s.NotContains(n.Data.Labels, "external_ip", "labels.external_ip must not be emitted")
+		s.NotContains(n.Data.Labels, "internal_ip", "labels.internal_ip must not be emitted")
+	}
+	s.Equal([]string{"203.0.113.10"}, ips["cluster-alpha/worker-0"],
+		"ExternalIP wins when both address types present")
+	s.Equal([]string{"10.0.1.7"}, ips["cluster-beta/worker-0"],
+		"InternalIP fallback when no ExternalIP row exists")
+}
+
+// TestNodeReadyStatusAttribute — ingest kube_node_status_condition for dedicated
+// nodes: one Ready (status=true active), one Unknown (status=unknown active —
+// kubelet lost contact), and one with NO Ready series; assert /v1/graph sets each
+// node's typed data.ready_status, that Unknown is DISTINCT from omitted, and that
+// the status never leaks into labels. Dedicated `ready-probe-*` node names avoid
+// the shared-VM series leak into other suite tests (which assert on worker-0).
+func (s *GraphSuite) TestNodeReadyStatusAttribute() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	// Real KSM emits all three status rows per condition with value 1 for the
+	// active one; replicate that so the resolver's active-row pick is exercised.
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_node_info dummy
+kube_node_info{cluster="cluster-alpha",node="ready-probe-ready",test=%q} 1 %d
+kube_node_info{cluster="cluster-alpha",node="ready-probe-unknown",test=%q} 1 %d
+kube_node_info{cluster="cluster-alpha",node="ready-probe-nocond",test=%q} 1 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="true",test=%q} 1 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="false",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-ready",condition="Ready",status="unknown",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="true",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="false",test=%q} 0 %d
+kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",condition="Ready",status="unknown",test=%q} 1 %d
+`,
+		disc, t1, disc, t1, disc, t1,
+		disc, t1, disc, t1, disc, t1,
+		disc, t1, disc, t1, disc, t1,
+	))
+	s.Require().True(s.WaitForSeries(`kube_node_status_condition{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_node_status_condition")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body struct {
+		Elements struct {
+			Nodes []struct {
+				Data struct {
+					ID          string            `json:"id"`
+					Type        string            `json:"type"`
+					ReadyStatus string            `json:"ready_status"`
+					Labels      map[string]string `json:"labels"`
+				} `json:"data"`
+			} `json:"nodes"`
+		} `json:"elements"`
+	}
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	status := map[string]string{}
+	present := map[string]bool{}
+	for _, n := range body.Elements.Nodes {
+		if n.Data.Type != "node" {
+			continue
+		}
+		present[n.Data.ID] = true
+		status[n.Data.ID] = n.Data.ReadyStatus
+		s.NotContains(n.Data.Labels, "ready_status", "ready_status must not be a label")
+		s.NotContains(n.Data.Labels, "condition", "condition must not be a label")
+		s.NotContains(n.Data.Labels, "status", "status must not be a label")
+	}
+
+	s.Equal(graph.ReadyStatusReady, status["cluster-alpha/ready-probe-ready"],
+		"active status=true → Ready")
+	s.Equal(graph.ReadyStatusUnknown, status["cluster-alpha/ready-probe-unknown"],
+		"active status=unknown → Unknown (kubelet lost contact)")
+	s.Require().True(present["cluster-alpha/ready-probe-nocond"],
+		"node with no Ready series is still present")
+	s.Empty(status["cluster-alpha/ready-probe-nocond"],
+		"no Ready series → ready_status omitted, DISTINCT from Unknown")
 }
 
 func (s *GraphSuite) TestNameFilter_PodAnchor() {
@@ -232,6 +327,86 @@ kube_replicaset_owner{cluster="cluster-alpha",namespace="shop",replicaset="check
 	cart, ok := podByName("cart")
 	s.Require().True(ok, "cart pod node must be present")
 	s.Nil(cart.Owner, "pod with no owner series must omit data.owner")
+}
+
+// TestPodApplicationAndContainersAttributes — ingest kube_pod_container_info
+// (two containers) and a kube_pod_owner carrying an argocd_tracking_id for a
+// dedicated pod; assert /v1/graph sets the pod node's typed data.application
+// (segment before the first ":") and ordered data.containers, neither leaking
+// into labels, while a sibling pod with no such series omits both. The pods
+// live in a dedicated namespace ("appcat") so the owner/container series cannot
+// collide with the shared `checkout`/`cart` fixtures other tests assert on.
+//
+// COVERAGE NOTE: this exercises one image per container, so it does NOT cover the
+// tlast_over_time argmax-by-recency "latest image wins" path — at the suite's
+// fixedNow (~6 weeks before the container's real clock) VM returns only one
+// image-variant per container regardless of rollup, so the multi-image case is
+// unverifiable here (see design.md D-A4). The recency/argmax logic is covered by
+// TestParseTopology_PodContainersLatestImageWins / _TieIsDeterministic (unit,
+// deterministic vectors); that tlast_over_time stamps s.Value with the
+// last-sample timestamp was verified by manual probe against VM v1.107.0.
+func (s *GraphSuite) TestPodApplicationAndContainersAttributes() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",uid="alpha-app-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-bare",uid="alpha-app-2",node="worker-0",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",argocd_tracking_id="storefront:apps/Deployment:appcat/ksg",test=%q} 1 %d
+kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="app",image="reg/ksg:1.4",test=%q} 1 %d
+kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="istio-proxy",image="reg/proxy:0.9",test=%q} 1 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+	s.Require().True(s.WaitForSeries(`kube_pod_container_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_pod_container_info")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	type container struct {
+		Name  string `json:"name"`
+		Image string `json:"image"`
+	}
+	type podData struct {
+		Name        string            `json:"name"`
+		Type        string            `json:"type"`
+		Application string            `json:"application"`
+		Containers  []container       `json:"containers"`
+		Labels      map[string]string `json:"labels"`
+	}
+	var body struct {
+		Elements struct {
+			Nodes []struct {
+				Data podData `json:"data"`
+			} `json:"nodes"`
+		} `json:"elements"`
+	}
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	podByName := func(name string) (podData, bool) {
+		for _, n := range body.Elements.Nodes {
+			if n.Data.Type == "pod" && n.Data.Name == name {
+				return n.Data, true
+			}
+		}
+		return podData{}, false
+	}
+
+	enriched, ok := podByName("ksg-enriched")
+	s.Require().True(ok, "enriched pod node must be present")
+	s.Equal("storefront", enriched.Application, "data.application = segment before the first ':'")
+	s.Equal([]container{
+		{Name: "app", Image: "reg/ksg:1.4"},
+		{Name: "istio-proxy", Image: "reg/proxy:0.9"},
+	}, enriched.Containers, "data.containers ordered by (name, image)")
+	_, appInLabels := enriched.Labels["application"]
+	_, trackInLabels := enriched.Labels["argocd_tracking_id"]
+	s.False(appInLabels || trackInLabels, "application must NOT appear inside labels")
+
+	bare, ok := podByName("ksg-bare")
+	s.Require().True(ok, "bare pod node must be present")
+	s.Empty(bare.Application, "pod with no argocd label omits data.application")
+	s.Nil(bare.Containers, "pod with no container series omits data.containers")
 }
 
 func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {
@@ -428,6 +603,201 @@ traces_service_graph_request_total{client="checkout",server="https://selfloop-sv
 		"resolved service fans out to its backing pod")
 }
 
+// TestConnStringFamilyFanoutCrossCluster exercises the localised D29 model
+// end-to-end against a real VM: the client pod lives in prod-1, which holds the
+// addressed Service (the mesh precondition), and prod-2 — a same-family cluster
+// (both normalise to "prod-0") — holds the same-named Service with its own
+// backing pod. The "://" resolves to a SINGLE service node in the caller's own
+// cluster (prod-1) with an intra-cluster pod-calls-service edge; its
+// service-selects-pod fan-out unions the prod-0 family's backing pods, reaching
+// BOTH prod-1's pod (intra-cluster) AND prod-2's pod (cross-cluster).
+func (s *GraphSuite) TestConnStringFamilyFanoutCrossCluster() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="prod-1",namespace="shop",pod="fanout-client",uid="fam-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="prod-1",namespace="shop",pod="fanout-nats-1",uid="fam-n1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="prod-2",namespace="shop",pod="fanout-nats-0",uid="fam-n2",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-1",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-2",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="prod-1",namespace="shop",service="fanout-svc",cluster_ip="10.96.0.87",test=%q} 1 %d
+kube_service_info{cluster="prod-2",namespace="shop",service="fanout-svc",cluster_ip="10.96.0.88",test=%q} 1 %d
+kube_endpointslice_labels{cluster="prod-1",namespace="shop",endpointslice="fanout-svc-p1",label_kubernetes_io_service_name="fanout-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="prod-1",namespace="shop",endpointslice="fanout-svc-p1",targetref_kind="Pod",targetref_name="fanout-nats-1",targetref_namespace="shop",test=%q} 1 %d
+kube_endpointslice_labels{cluster="prod-2",namespace="shop",endpointslice="fanout-svc-x1",label_kubernetes_io_service_name="fanout-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="prod-2",namespace="shop",endpointslice="fanout-svc-x1",targetref_kind="Pod",targetref_name="fanout-nats-0",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="fanout-client",server="nats://fanout-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="fam-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="fanout-client",server="nats://fanout-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="fam-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(s.WaitForSeries(`count(kube_service_info{service="fanout-svc",test=`+strconv.Quote(disc)+`}) == 2`, fixedNow, 30*time.Second),
+		"VM did not observe BOTH fanout kube_service_info rows")
+	s.Require().True(s.WaitForSeries(`count(kube_endpointslice_labels{label_kubernetes_io_service_name="fanout-svc",test=`+strconv.Quote(disc)+`}) == 2`, fixedNow, 30*time.Second),
+		"VM did not observe both fanout endpointslice label rows")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// EXACTLY ONE service node — in the caller's own cluster (prod-1).
+	s.Contains(bodyStr, `"id":"prod-1/shop/fanout-svc"`,
+		"the connection string resolves to a single service node in the caller's own cluster")
+	s.NotContains(bodyStr, `"id":"prod-2/shop/fanout-svc"`,
+		"no service node materialises in the family sibling — pod-calls-service is same-cluster only")
+	// Intra-cluster pod-calls-service edge from the prod-1 pod to the prod-1 node.
+	s.Contains(bodyStr, `"target":"prod-1/shop/fanout-svc"`,
+		"pod-calls-service targets the caller's own cluster's service node")
+	s.Contains(bodyStr, `"source":"prod-1/fam-1"`)
+	s.NotContains(bodyStr, `external/nats://fanout-svc.shop.svc:4222`,
+		"a family-resolved connection string must not also produce an external node")
+	// Cross-cluster service-selects-pod fan-out: the prod-1 service node reaches
+	// BOTH prod-1's backing pod (intra) and prod-2's backing pod (cross-cluster).
+	s.Contains(bodyStr, `"target":"prod-1/fam-n1"`,
+		"service-selects-pod fans out to the local backing pod")
+	s.Contains(bodyStr, `"target":"prod-2/fam-n2"`,
+		"service-selects-pod fans out CROSS-CLUSTER to the family sibling's backing pod")
+}
+
+// TestConnStringOutOfFamilyServiceFallsBackToExternal is the family-scoping
+// negative: the addressed Service exists ONLY in staging-1, whose family key
+// ("staging-0") differs from the trace source prod-1 ("prod-0"). The
+// connection string must NOT resolve cross-family and falls back to the
+// external/<label> node (D-C).
+func (s *GraphSuite) TestConnStringOutOfFamilyServiceFallsBackToExternal() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="prod-1",namespace="shop",pod="outfam-client",uid="outfam-1",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-1",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="staging-1",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="staging-1",namespace="shop",service="outfam-svc",cluster_ip="10.96.0.99",test=%q} 1 %d
+traces_service_graph_request_total{client="outfam-client",server="nats://outfam-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="outfam-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="outfam-client",server="nats://outfam-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="outfam-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(s.WaitForSeries(`kube_service_info{service="outfam-svc",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested out-of-family kube_service_info")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.NotContains(bodyStr, `staging-1/shop/outfam-svc`,
+		"an out-of-family cluster's service must NOT be resolved for a prod-1 trace")
+	s.Contains(bodyStr, `"id":"external/nats://outfam-svc.shop.svc:4222"`,
+		"zero family matches must fall back to the external/<label> node")
+}
+
+// TestConnStringFamilyEndpointlessAnchorFansOutToSibling exercises the
+// localised model when the caller's OWN cluster holds the Service object but
+// has no local backing pods, while a same-family sibling does. The eps-svc
+// Service exists in BOTH prod clusters; only prod-2 has a backing pod (the mesh
+// routes the DNS name there). The anchor (prod-1) still materialises its single
+// local service node (materialisation is gated on Service-object presence, not
+// endpoints), and its service-selects-pod fan-out reaches ONLY prod-2's backing
+// pod — a cross-cluster edge.
+func (s *GraphSuite) TestConnStringFamilyEndpointlessAnchorFansOutToSibling() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="prod-1",namespace="shop",pod="eps-client",uid="eps-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="prod-2",namespace="shop",pod="eps-nats-0",uid="eps-n2",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-1",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-2",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="prod-1",namespace="shop",service="eps-svc",cluster_ip="10.96.1.88",test=%q} 1 %d
+kube_service_info{cluster="prod-2",namespace="shop",service="eps-svc",cluster_ip="10.96.2.88",test=%q} 1 %d
+kube_endpointslice_labels{cluster="prod-2",namespace="shop",endpointslice="eps-svc-x1",label_kubernetes_io_service_name="eps-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="prod-2",namespace="shop",endpointslice="eps-svc-x1",targetref_kind="Pod",targetref_name="eps-nats-0",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="eps-client",server="nats://eps-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="eps-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="eps-client",server="nats://eps-svc.shop.svc:4222",cluster="prod-1",client_k8s_pod_uid="eps-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	// Gate the series the assertions depend on: BOTH kube_service_info rows (the
+	// prod-1 anchor must provably hold the Service), the prod-2 endpointslice
+	// join, and a non-zero trace rate.
+	s.Require().True(s.WaitForSeries(`count(kube_service_info{service="eps-svc",test=`+strconv.Quote(disc)+`}) == 2`, fixedNow, 30*time.Second),
+		"VM did not observe BOTH eps-svc kube_service_info rows")
+	s.Require().True(s.WaitForSeries(`kube_endpointslice_labels{endpointslice="eps-svc-x1",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the prod-2 eps-svc endpointslice labels")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="eps-client",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe a non-zero eps trace rate")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// The anchor's local node materialises despite zero local endpoints.
+	s.Contains(bodyStr, `"id":"prod-1/shop/eps-svc"`,
+		"the anchor cluster's service node materialises on Service-object presence")
+	s.NotContains(bodyStr, `"id":"prod-2/shop/eps-svc"`,
+		"no service node materialises in the sibling — pod-calls-service is same-cluster only")
+	s.Contains(bodyStr, `"target":"prod-1/shop/eps-svc"`)
+	// The only backing pod is in prod-2 → a cross-cluster service-selects-pod edge.
+	s.Contains(bodyStr, `"target":"prod-2/eps-n2"`,
+		"service-selects-pod fans out cross-cluster to the only backing pod (in prod-2)")
+	s.NotContains(bodyStr, `external/nats://eps-svc.shop.svc:4222`,
+		"a resolved connection string must not produce an external node")
+}
+
+// TestConnStringUnanchorableFallsBackToExternal exercises the removal of the
+// unknown-family fallback end-to-end against a real VM: the service-graph series
+// carries NO cluster label (bucketed to "unknown") and its client side is a
+// non-pod human label, so the anchor is the "unknown" pseudo-cluster. The
+// addressed Service is held ONLY by prod-2 — not by "unknown" — and there is NO
+// cross-family fallback, so the "://" server stays external (a caller with no
+// own-cluster Service cannot resolve a local service node).
+//
+// The fixture uses a test-unique namespace (uffb-ns) on top of the unique
+// service name to shrink shared-VM blast radius (every test's series persist;
+// the API does not filter on the `test` discriminator).
+func (s *GraphSuite) TestConnStringUnanchorableFallsBackToExternal() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="prod-2",namespace="uffb-ns",pod="uffb-nats-0",uid="uffb-n2",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="prod-2",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="prod-2",namespace="uffb-ns",service="uffb-svc",cluster_ip="10.96.3.88",test=%q} 1 %d
+kube_endpointslice_labels{cluster="prod-2",namespace="uffb-ns",endpointslice="uffb-svc-x1",label_kubernetes_io_service_name="uffb-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="prod-2",namespace="uffb-ns",endpointslice="uffb-svc-x1",targetref_kind="Pod",targetref_name="uffb-nats-0",targetref_namespace="uffb-ns",test=%q} 1 %d
+traces_service_graph_request_total{client="uffb-admin",server="nats://uffb-svc.uffb-ns.svc:4222",client_k8s_pod_uid="",server_k8s_pod_uid="",client_k8s_namespace_name="",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="uffb-admin",server="nats://uffb-svc.uffb-ns.svc:4222",client_k8s_pod_uid="",server_k8s_pod_uid="",client_k8s_namespace_name="",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(s.WaitForSeries(`kube_service_info{service="uffb-svc",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested uffb kube_service_info")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="uffb-admin",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe a non-zero uffb trace rate")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// No cross-family fallback: the unanchorable caller cannot resolve a service
+	// it does not hold in its own (pseudo-)cluster.
+	s.NotContains(bodyStr, `prod-2/uffb-ns/uffb-svc`,
+		"the removed unknown-family fallback must NOT resolve a foreign family's service")
+	s.Contains(bodyStr, `"id":"external/nats://uffb-svc.uffb-ns.svc:4222"`,
+		"an unanchorable connection string falls back to the external/<label> node")
+	s.Contains(bodyStr, `"source":"external/uffb-admin"`,
+		"the non-pod client side stays an external node")
+}
+
 // TestSentinelPeersExcludedAtQueryLayer exercises design.md D30 end-to-end
 // against a real VM: the servicegraph connector's virtual peers (client="user",
 // server="unknown") are dropped by the anchored selector matchers
@@ -502,6 +872,20 @@ func (s *GraphSuite) TestEdgeTypesCatalogue() {
 	for _, et := range []string{"pod-mounts-pvc", "pod-calls-pod", "pod-calls-service", "service-selects-pod"} {
 		s.Contains(string(body), et)
 	}
+
+	// may_cross_cluster contract (localised model): pod-calls-service resolves to
+	// a Service node in the caller's OWN cluster — always intra-cluster — while
+	// service-selects-pod fans out across same-family clusters and MAY cross.
+	var catalogue struct {
+		EdgeTypes []graph.EdgeTypeDefinition `json:"edge_types"`
+	}
+	s.Require().NoError(json.Unmarshal(body, &catalogue))
+	got := map[graph.EdgeType]bool{}
+	for _, et := range catalogue.EdgeTypes {
+		got[et.Type] = et.MayCrossCluster
+	}
+	s.False(got["pod-calls-service"], "pod-calls-service resolves to a local service node — always intra-cluster")
+	s.True(got["service-selects-pod"], "service-selects-pod may cross clusters via the same-family endpoint union")
 }
 
 // TestPodMountsPVCEdgePresent (F8) closes the integration gap for the

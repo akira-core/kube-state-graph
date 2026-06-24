@@ -35,7 +35,7 @@ import (
 //	@Description
 //	@Description	**Node types**: `pod`, `node`, `pvc`, `service`, `external`, plus the presentation-only `cluster` and `storageclass` compound group nodes synthesised by the Cytoscape serialiser (`cluster > node > pod`, `cluster > storageclass > pvc`). **Edge types**: `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`.
 //	@Description
-//	@Description	**Endpoint resolution**: for a call endpoint whose pod UID is empty, the `client`/`server` label is inspected for a `://` connection string (no operator knob — detection is hardcoded). When present, the URL host is parsed (an optional `.svc.<domain>` suffix is stripped): both a `<service>.<namespace>` host and a headless `<pod>.<service>.<namespace>` host resolve to the same `service` node (`<cluster>/<ns>/<service>`) plus on-demand `service-selects-pod` edges to each backing pod — the call edge is then typed `pod-calls-service`; an unresolvable host yields an `external` node (`external/<value>`). A non-URL missing-UID label also yields an `external` node. Calls whose target is not a service stay typed `pod-calls-pod`.
+//	@Description	**Endpoint resolution**: for a call endpoint whose pod UID is empty, the `client`/`server` label is inspected for a `://` connection string (no operator knob — detection is hardcoded). When present, the URL host is parsed (an optional `.svc.<domain>` suffix is stripped): both a `<service>.<namespace>` host and a headless `<pod>.<service>.<namespace>` host resolve to the addressed `(namespace, service)`, looked up across every loaded cluster in the caller's family (cluster names equal after normalising digit runs; anchored on the UID-recovered client-pod cluster when available, else the trace-source label). Each surviving family cluster materialises its own `service` node (`<cluster>/<ns>/<service>`) plus on-demand `service-selects-pod` edges to its own cluster's backing pods, and yields one `pod-calls-service` edge per match — such edges MAY cross clusters. Candidates provably without backing pods (zero endpoints in an endpoint-visible cluster) are pruned when an endpoint-backed sibling exists; an anchor naming no loaded family falls back to the single loaded family holding the service (multi-family names are ambiguous and stay external). Zero surviving candidates yield an `external` node (`external/<value>`). A non-URL missing-UID label also yields an `external` node. Calls whose target is not a service stay typed `pod-calls-pod`. See `/v1/edge-types` for the authoritative per-type catalogue.
 //	@Description
 //	@Description	Example: `GET /v1/graph?start=2026-05-05T11:00:00Z&end=2026-05-05T12:00:00Z&cluster=prod-eu&namespace=payments&edge_type=pod-calls-pod`
 //	@Description
@@ -47,7 +47,7 @@ import (
 //	@Description	  "clusters": ["prod-eu", "prod-us"],
 //	@Description	  "elements": {
 //	@Description	    "nodes": [
-//	@Description	      { "data": { "id": "prod-eu/8f8d4f1a-...-89ab", "type": "pod",  "name": "checkout-7d9f6c8b8-abcde", "owner": { "kind": "Deployment", "name": "checkout" }, "labels": { "cluster": "prod-eu", "namespace": "payments" } } },
+//	@Description	      { "data": { "id": "prod-eu/8f8d4f1a-...-89ab", "type": "pod",  "name": "checkout-7d9f6c8b8-abcde", "owner": { "kind": "Deployment", "name": "checkout" }, "application": "checkout", "containers": [ { "name": "app", "image": "reg.example/checkout:1.4" }, { "name": "istio-proxy", "image": "reg.example/proxy:0.9" } ], "labels": { "cluster": "prod-eu", "namespace": "payments" } } },
 //	@Description	      { "data": { "id": "prod-eu/ip-10-0-1-23",     "type": "node", "name": "ip-10-0-1-23.ec2.internal", "labels": { "cluster": "prod-eu" } } }
 //	@Description	    ],
 //	@Description	    "edges": [
@@ -84,7 +84,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 	}
 	g, err := s.runBuild(c.Request.Context(), req)
 	if err != nil {
-		mapBuildError(c, err)
+		s.mapBuildError(c, err)
 		return
 	}
 
@@ -198,11 +198,21 @@ func (s *Server) handleClusters(c *gin.Context) {
 
 	clusters, err := s.discoverClusters(ctx)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			writeError(c, http.StatusGatewayTimeout, "timeout", err.Error())
-			return
+		// Classify into the typed build.Reason and delegate, so the
+		// status/reason/redaction contract lives in exactly one switch
+		// (mapBuildError): canceled → 499, deadline → 504 with the static
+		// build-authored message, anything else → sanitised 502 — the raw
+		// error embeds the internal VictoriaMetrics URL/host/IP and is kept
+		// server-side only.
+		switch {
+		case errors.Is(err, context.Canceled):
+			err = build.NewError(build.ReasonCanceled, "request canceled", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			err = build.NewError(build.ReasonTimeout, "cluster discovery timed out", err)
+		default:
+			err = build.NewError(build.ReasonUpstream, "cluster discovery failed", err)
 		}
-		writeError(c, http.StatusBadGateway, "upstream", err.Error())
+		s.mapBuildError(c, err)
 		return
 	}
 	body := clustersBody{
@@ -249,10 +259,10 @@ func (s *Server) discoverClusters(ctx context.Context) ([]ClusterInfo, error) {
 //	@Description	|---|---|---|---|
 //	@Description	| `pod-mounts-pvc` | pod → pvc | yes | no |
 //	@Description	| `pod-calls-pod` | pod \| service \| external → pod \| external | yes | yes |
-//	@Description	| `pod-calls-service` | pod \| service \| external → service | yes | no |
+//	@Description	| `pod-calls-service` | pod \| service \| external → service | yes | yes |
 //	@Description	| `service-selects-pod` | service → pod | yes | no |
 //	@Description
-//	@Description	A call endpoint whose pod UID is empty and whose `client`/`server` label is a `://` connection string is resolved (detection hardcoded, no operator knob) to a `service` node (when it names an in-cluster Service — the call edge is then `pod-calls-service`) or an `external` node otherwise; a non-URL missing-UID label resolves to an `external` node. `service-selects-pod` edges are materialised on demand from `service` nodes to their backing pods.
+//	@Description	A call endpoint whose pod UID is empty and whose `client`/`server` label is a `://` connection string is resolved (detection hardcoded, no operator knob) against every loaded cluster in the caller's family (cluster names equal after normalising digit runs; anchored on the UID-recovered client-pod cluster when available, else the trace-source label): each surviving family cluster holding the addressed Service yields a `service` node and a `pod-calls-service` edge (which may therefore cross clusters). Candidates provably without backing pods (zero endpoints in an endpoint-visible cluster) are pruned when an endpoint-backed sibling exists; an anchor naming no loaded family falls back to the single loaded family holding the Service (multi-family names are ambiguous and stay external). Zero surviving candidates yield an `external` node. A non-URL missing-UID label resolves to an `external` node. `service-selects-pod` edges are materialised on demand from `service` nodes to their own cluster's backing pods.
 //	@Description
 //	@Description	</details>
 //	@Tags			discovery

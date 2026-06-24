@@ -1,0 +1,139 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "prod-1",
+    "prod-2"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/prod-1",
+          "name": "prod-1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster/prod-2",
+          "name": "prod-2",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "prod-1/p1",
+          "name": "checkout",
+          "type": "pod",
+          "parent": "cluster/prod-1",
+          "labels": {
+            "cluster": "prod-1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "prod-1/messaging/nats",
+          "name": "nats",
+          "type": "service",
+          "parent": "cluster/prod-1",
+          "ipaddress": [
+            "10.1.0.5"
+          ],
+          "labels": {
+            "cluster": "prod-1",
+            "namespace": "messaging"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "prod-2/messaging/nats",
+          "name": "nats",
+          "type": "service",
+          "parent": "cluster/prod-2",
+          "ipaddress": [
+            "10.2.0.5"
+          ],
+          "labels": {
+            "cluster": "prod-2",
+            "namespace": "messaging"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "prod-1/n1",
+          "name": "nats-0",
+          "type": "pod",
+          "parent": "cluster/prod-1",
+          "labels": {
+            "cluster": "prod-1",
+            "namespace": "messaging"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "prod-2/n2",
+          "name": "nats-0",
+          "type": "pod",
+          "parent": "cluster/prod-2",
+          "labels": {
+            "cluster": "prod-2",
+            "namespace": "messaging"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "71d09d29-7d15-5702-89ff-56af492a6587",
+          "type": "pod-calls-service",
+          "source": "prod-1/p1",
+          "target": "prod-1/messaging/nats",
+          "labels": {
+            "cluster": "prod-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "372faea0-d37d-509e-8560-2fc5ed033dc6",
+          "type": "pod-calls-service",
+          "source": "prod-1/p1",
+          "target": "prod-2/messaging/nats",
+          "labels": {
+            "cluster": "prod-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "76207941-0df1-5dc3-9039-e509a3c73fa5",
+          "type": "service-selects-pod",
+          "source": "prod-1/messaging/nats",
+          "target": "prod-1/n1",
+          "labels": {
+            "namespace": "messaging"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "7453e84e-2cab-594d-9b66-52af7d8de1d6",
+          "type": "service-selects-pod",
+          "source": "prod-2/messaging/nats",
+          "target": "prod-2/n2",
+          "labels": {
+            "namespace": "messaging"
+          }
+        }
+      }
+    ]
+  }
+}

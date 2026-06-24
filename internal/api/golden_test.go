@@ -25,6 +25,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"single-cluster":       buildSingleCluster(),
 		"two-cluster-cross":    buildTwoClusterCross(),
 		"with-service":         buildWithService(),
+		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
@@ -97,6 +98,30 @@ func buildWithService() graph.View {
 		graph.NewEdge(graph.EdgeTypeServiceSelectsPod, svc.IDValue, pay0.IDValue, map[string]string{"namespace": "shop"}),
 	}
 	return graph.View{Nodes: []graph.GraphNode{pod, svc, pay0}, Edges: edges}
+}
+
+// buildFamilyFanout snapshots the D29 cluster-family fan-out: a client pod in
+// prod-1 dials a `<service>.<namespace>.svc` connection string for a Service
+// deployed in BOTH prod-1 and prod-2 (one family: digit runs normalise to
+// "prod-0"). Each family cluster's service node materialises, the single
+// upstream series yields one pod-calls-service edge per match — the prod-2
+// edge is cross-cluster (source labels.cluster=prod-1, target
+// labels.cluster=prod-2) — and each service fans out service-selects-pod only
+// to its own cluster's backing pod. Both call edges carry
+// labels.cluster=prod-1 (the client side is a pod).
+func buildFamilyFanout() graph.View {
+	pod := &graph.PodNode{IDValue: "prod-1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "shop"}}
+	svc1 := &graph.ServiceNode{IDValue: "prod-1/messaging/nats", NameValue: "nats", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "messaging"}, IPAddressValue: []string{"10.1.0.5"}}
+	svc2 := &graph.ServiceNode{IDValue: "prod-2/messaging/nats", NameValue: "nats", LabelsValue: map[string]string{"cluster": "prod-2", "namespace": "messaging"}, IPAddressValue: []string{"10.2.0.5"}}
+	nats1 := &graph.PodNode{IDValue: "prod-1/n1", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "messaging"}}
+	nats2 := &graph.PodNode{IDValue: "prod-2/n2", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "prod-2", "namespace": "messaging"}}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodCallsService, pod.IDValue, svc1.IDValue, map[string]string{"cluster": "prod-1"}),
+		graph.NewEdge(graph.EdgeTypePodCallsService, pod.IDValue, svc2.IDValue, map[string]string{"cluster": "prod-1"}),
+		graph.NewEdge(graph.EdgeTypeServiceSelectsPod, svc1.IDValue, nats1.IDValue, map[string]string{"namespace": "messaging"}),
+		graph.NewEdge(graph.EdgeTypeServiceSelectsPod, svc2.IDValue, nats2.IDValue, map[string]string{"namespace": "messaging"}),
+	}
+	return graph.View{Nodes: []graph.GraphNode{pod, svc1, svc2, nats1, nats2}, Edges: edges}
 }
 
 // buildWithStorageClass snapshots the StorageClass compound grouping: a PVC

@@ -30,6 +30,15 @@ type Config struct {
 	// query). Empty (the default) preserves stock kube-state-metrics behaviour.
 	// See design.md D26.
 	MetricPrefix string
+	// PromUsername / PromPassword are optional HTTP Basic Auth credentials for
+	// the upstream VictoriaMetrics endpoint. Env-only (KSG_PROM_USERNAME /
+	// KSG_PROM_PASSWORD) — deliberately NO CLI flags, since credential-carrying
+	// flags leak through process listings and container specs. Both must be set
+	// together or both left empty; Validate rejects a half-configured pair.
+	// Rotation requires a restart (no hot reload). See
+	// openspec/changes/add-prom-basic-auth/design.md D-A1/D-A2.
+	PromUsername string
+	PromPassword string
 }
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
@@ -47,6 +56,8 @@ func Defaults() Config {
 		APIKeysReloadInterval: 30 * time.Second,
 		LogLevel:              "info",
 		MetricPrefix:          "",
+		PromUsername:          "",
+		PromPassword:          "",
 	}
 }
 
@@ -99,6 +110,9 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	}
 
 	getStr("KSG_PROM_URL", &cfg.PromURL)
+	// Env-only by design — no matching flags are registered in Parse (D-A1).
+	getStr("KSG_PROM_USERNAME", &cfg.PromUsername)
+	getStr("KSG_PROM_PASSWORD", &cfg.PromPassword)
 	getStr("KSG_LISTEN_ADDR", &cfg.ListenAddr)
 	if err := getDur("KSG_BUILD_TIMEOUT", &cfg.BuildTimeout); err != nil {
 		return err
@@ -124,6 +138,18 @@ func (c Config) Validate() error {
 	u, err := url.Parse(c.PromURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("prom-url is not a valid URL: %q", c.PromURL)
+	}
+	// Upstream basic-auth credentials must be configured as a pair. The error
+	// names the env vars only — never echo the configured values (D-A2/D-A5).
+	if (c.PromUsername == "") != (c.PromPassword == "") {
+		return errors.New("KSG_PROM_USERNAME and KSG_PROM_PASSWORD must be set together (or both left unset)")
+	}
+	// RFC 7617 forbids ':' in basic-auth user-ids: SetBasicAuth encodes
+	// user+":"+pass, so a colon silently shifts everything after it into the
+	// password and every upstream request 401s with no client-visible hint
+	// (the raw 401 detail is redacted to server logs). Fail fast at startup.
+	if strings.Contains(c.PromUsername, ":") {
+		return errors.New("KSG_PROM_USERNAME must not contain ':' (RFC 7617 basic-auth user-id)")
 	}
 	if c.ListenAddr == "" {
 		return errors.New("listen-addr is required")

@@ -45,6 +45,12 @@ type Providers struct {
 // overrides this when set.
 const ServiceName = "kube-state-graph"
 
+// noopShutdown is the Shutdown used whenever there is nothing to flush — the
+// disabled path and every Init error path — so callers may invoke
+// Providers.Shutdown unconditionally without a nil-func panic, even when they
+// treated the Init error as non-fatal.
+func noopShutdown(context.Context) error { return nil }
+
 // Init configures the OpenTelemetry global TracerProvider, LoggerProvider, and
 // text-map propagator. Reads only OTel-standard environment variables.
 //
@@ -55,7 +61,7 @@ func Init(ctx context.Context, version string) (Providers, error) {
 	enabled := exporterEnabled()
 	res, err := buildResource(ctx, version)
 	if err != nil {
-		return Providers{}, fmt.Errorf("build resource: %w", err)
+		return Providers{Shutdown: noopShutdown}, fmt.Errorf("build resource: %w", err)
 	}
 
 	if !enabled {
@@ -68,18 +74,18 @@ func Init(ctx context.Context, version string) (Providers, error) {
 			Tracer:   tp,
 			Logger:   lp,
 			Enabled:  false,
-			Shutdown: func(context.Context) error { return nil },
+			Shutdown: noopShutdown,
 		}, nil
 	}
 
 	traceExporter, err := newTraceExporter(ctx)
 	if err != nil {
-		return Providers{}, fmt.Errorf("trace exporter: %w", err)
+		return Providers{Shutdown: noopShutdown}, fmt.Errorf("trace exporter: %w", err)
 	}
 	logExporter, err := newLogExporter(ctx)
 	if err != nil {
 		_ = traceExporter.Shutdown(ctx)
-		return Providers{}, fmt.Errorf("log exporter: %w", err)
+		return Providers{Shutdown: noopShutdown}, fmt.Errorf("log exporter: %w", err)
 	}
 
 	tp := sdktrace.NewTracerProvider(

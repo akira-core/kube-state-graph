@@ -314,6 +314,246 @@ func TestParseTopology_PodOwnerDeterministic(t *testing.T) {
 	assert.Equal(t, forward.Pods[0].Owner().Name, reverse.Pods[0].Owner().Name, "order-independent")
 }
 
+// TestParseTopology_PodContainersAttribute — the container list is resolved
+// from kube_pod_container_info onto the typed Containers attribute (never
+// labels), ordered by (name, image); a pod with no container series carries
+// nil; the metric absent entirely degrades gracefully.
+func TestParseTopology_PodContainersAttribute(t *testing.T) {
+	pod := func(ns, name, uid string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns),
+			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
+		}}
+	}
+	ctr := func(ns, name, container, image string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": model.LabelValue(name),
+			"container": model.LabelValue(container), "image": model.LabelValue(image),
+		}}
+	}
+
+	podVec := sampleVec(
+		pod("shop", "checkout-1", "u1"), // two containers
+		pod("shop", "bare-1", "u2"),     // no container series
+	)
+	// Deliberately not in (name, image) order to prove the sort.
+	ctrVec := sampleVec(
+		ctr("shop", "checkout-1", "sidecar", "reg/proxy:0.9"),
+		ctr("shop", "checkout-1", "app", "reg/app:1.2"),
+	)
+
+	tp := parseTopology(topologyVectors{Pod: podVec, PodContainerInfo: ctrVec})
+	byName := map[string]*graph.PodNode{}
+	for _, p := range tp.Pods {
+		byName[p.Name()] = p
+	}
+
+	require.NotNil(t, byName["checkout-1"])
+	assert.Equal(t, []graph.Container{
+		{Name: "app", Image: "reg/app:1.2"},
+		{Name: "sidecar", Image: "reg/proxy:0.9"},
+	}, byName["checkout-1"].Containers(), "containers ordered by (name, image)")
+	assert.Nil(t, byName["bare-1"].Containers(), "pod with no container series carries nil")
+
+	// container/image must NEVER leak into labels.
+	for _, p := range tp.Pods {
+		for k := range p.Labels() {
+			assert.NotContainsf(t, []string{"container", "containers", "image"}, k,
+				"container data must not appear in labels for pod %q", p.Name())
+		}
+	}
+
+	// Container metric absent entirely → valid topology, no containers.
+	tp2 := parseTopology(topologyVectors{Pod: podVec})
+	for _, p := range tp2.Pods {
+		assert.Nilf(t, p.Containers(), "no container series → pod %q carries nil containers", p.Name())
+	}
+}
+
+// TestParseTopology_PodContainersLatestImageWins — when one container reports
+// two images in the window (a mid-window image change: each image is a distinct
+// series), the image last SEEN latest wins. The sample VALUE carries the
+// tlast_over_time last-sample timestamp; the resolver argmaxes over it. The newer
+// image is lexically LARGER here, proving the pick is by recency, not lexical.
+func TestParseTopology_PodContainersLatestImageWins(t *testing.T) {
+	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w0"}}
+	// Value = last-sample timestamp (tlast_over_time output).
+	ctr := func(container, image string, lastSeen model.SampleValue) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster": "c", "namespace": "n", "pod": "p",
+				"container": model.LabelValue(container), "image": model.LabelValue(image),
+			},
+			Value: lastSeen,
+		}
+	}
+	older := ctr("app", "reg/app:1.0", 100)
+	newer := ctr("app", "reg/app:2.0", 200) // seen later AND lexically larger
+	z := ctr("zzz", "reg/z:1.0", 150)
+
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(older, newer, z)})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(z, newer, older)})
+
+	require.Len(t, forward.Pods, 1)
+	want := []graph.Container{{Name: "app", Image: "reg/app:2.0"}, {Name: "zzz", Image: "reg/z:1.0"}}
+	assert.Equal(t, want, forward.Pods[0].Containers(), "latest-seen image wins (not lexical), sorted by name")
+	assert.Equal(t, forward.Pods[0].Containers(), reverse.Pods[0].Containers(), "order-independent")
+}
+
+// TestParseTopology_PodContainersTieIsDeterministic — when two images for one
+// container share the same last-sample timestamp (co-scraped), the lexically-
+// smallest image breaks the tie deterministically, independent of upstream order.
+func TestParseTopology_PodContainersTieIsDeterministic(t *testing.T) {
+	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w0"}}
+	ctr := func(image string) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "container": "app", "image": model.LabelValue(image)},
+			Value:  100, // identical last-seen timestamp
+		}
+	}
+	a := ctr("reg/app:1.0")
+	b := ctr("reg/app:2.0")
+
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(a, b)})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(b, a)})
+
+	require.Len(t, forward.Pods, 1)
+	assert.Equal(t, []graph.Container{{Name: "app", Image: "reg/app:1.0"}}, forward.Pods[0].Containers(),
+		"equal last-seen → lexically-smallest image wins")
+	assert.Equal(t, forward.Pods[0].Containers(), reverse.Pods[0].Containers(), "order-independent")
+}
+
+// TestParseTopology_PodContainersSkipsEmptyImage — a kube_pod_container_info
+// series with an empty image label must NOT win the per-container slot (it
+// carries no information and, even with a later last-seen timestamp, must not
+// mask a populated sibling); a container with only an empty-image series is
+// omitted entirely.
+func TestParseTopology_PodContainersSkipsEmptyImage(t *testing.T) {
+	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w0"}}
+	ctr := func(container, image string, lastSeen model.SampleValue) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster": "c", "namespace": "n", "pod": "p",
+				"container": model.LabelValue(container), "image": model.LabelValue(image),
+			},
+			Value: lastSeen,
+		}
+	}
+	// "app" has an empty-image series seen LATER (200) than its populated one (100);
+	// the empty must still not win. "side" has only an empty-image series.
+	vec := sampleVec(ctr("app", "", 200), ctr("app", "reg/app:1.4", 100), ctr("side", "", 150))
+	tp := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: vec})
+
+	require.Len(t, tp.Pods, 1)
+	assert.Equal(t, []graph.Container{{Name: "app", Image: "reg/app:1.4"}}, tp.Pods[0].Containers(),
+		"empty image must not win even if seen later; container with only an empty image is dropped")
+}
+
+// TestParseTopology_PodApplicationAttribute — the ArgoCD Application is parsed
+// from the argocd_tracking_id label on kube_pod_owner (segment before the first
+// ":"), surfaced on the typed Application attribute (never labels); a value with
+// no ":" is verbatim; absent label → empty.
+func TestParseTopology_PodApplicationAttribute(t *testing.T) {
+	pod := func(name, uid string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
+		}}
+	}
+	owner := func(name, tracking string) model.Sample {
+		m := model.Metric{
+			"cluster": "c", "namespace": "shop", "pod": model.LabelValue(name),
+			"owner_kind": "DaemonSet", "owner_name": "rs", "owner_is_controller": "true",
+		}
+		if tracking != "" {
+			m["argocd_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+
+	podVec := sampleVec(
+		pod("checkout-1", "u1"), // full tracking-id
+		pod("bare-1", "u2"),     // tracking-id with no colon
+		pod("plain-1", "u3"),    // no argocd label
+		pod("colon-1", "u4"),    // tracking-id beginning with ":" → empty segment
+	)
+	ownerVec := sampleVec(
+		owner("checkout-1", "checkout:apps/Deployment:shop/checkout"),
+		owner("bare-1", "billing"),
+		owner("plain-1", ""),
+		owner("colon-1", ":apps/Deployment:shop/x"),
+	)
+
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec})
+	byName := map[string]*graph.PodNode{}
+	for _, p := range tp.Pods {
+		byName[p.Name()] = p
+	}
+
+	assert.Equal(t, "checkout", byName["checkout-1"].Application(), "segment before the first ':'")
+	assert.Equal(t, "billing", byName["bare-1"].Application(), "value with no ':' is verbatim")
+	assert.Empty(t, byName["plain-1"].Application(), "no argocd label → empty Application")
+	assert.Empty(t, byName["colon-1"].Application(), "leading ':' → empty segment → no Application (absent, not present-but-empty)")
+
+	// argocd_tracking_id / application must NEVER leak into labels.
+	for _, p := range tp.Pods {
+		_, hasTrack := p.Labels()["argocd_tracking_id"]
+		_, hasApp := p.Labels()["application"]
+		assert.Falsef(t, hasTrack || hasApp, "application must not appear in labels for pod %q", p.Name())
+	}
+
+	// Owner series absent entirely → valid topology, no application.
+	tp2 := parseTopology(topologyVectors{Pod: podVec})
+	for _, p := range tp2.Pods {
+		assert.Emptyf(t, p.Application(), "no owner series → pod %q carries no application", p.Name())
+	}
+}
+
+// TestParseTopology_PodApplicationDeterministic — on a per-pod collision the
+// lexically-smallest non-empty tracking-id wins, independent of vector order.
+func TestParseTopology_PodApplicationDeterministic(t *testing.T) {
+	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w0"}}
+	owner := func(tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "n", "pod": "p",
+			"owner_kind": "DaemonSet", "owner_name": "rs", "owner_is_controller": "true",
+			"argocd_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+	a := owner("alpha:apps/Deployment:n/alpha")
+	b := owner("beta:apps/Deployment:n/beta")
+
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(a, b)})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(b, a)})
+
+	require.Len(t, forward.Pods, 1)
+	assert.Equal(t, "alpha", forward.Pods[0].Application(), "lexically-smallest tracking-id wins")
+	assert.Equal(t, forward.Pods[0].Application(), reverse.Pods[0].Application(), "order-independent")
+}
+
+// TestParseTopology_PodApplicationFromNonControllerRow — the Application is read
+// independently of the controller-owner pick: a pod whose argocd_tracking_id
+// appears ONLY on a non-controller kube_pod_owner row (owner_is_controller other
+// than "true") still resolves its Application. This guards the documented reason
+// resolvePodApplications does not filter on owner_is_controller (unlike
+// resolvePodOwners), so a copy-pasted controller-only skip would fail here.
+func TestParseTopology_PodApplicationFromNonControllerRow(t *testing.T) {
+	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "shop", "pod": "checkout", "uid": "u1", "node": "w0"}}
+	// Only a non-controller owner row carries the tracking-id (no controller row).
+	owner := model.Sample{Metric: model.Metric{
+		"cluster": "c", "namespace": "shop", "pod": "checkout",
+		"owner_kind": "Node", "owner_name": "w0", "owner_is_controller": "false",
+		"argocd_tracking_id": "storefront:apps/Deployment:shop/checkout",
+	}}
+
+	tp := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(owner)})
+	require.Len(t, tp.Pods, 1)
+	assert.Equal(t, "storefront", tp.Pods[0].Application(),
+		"Application resolves even when no kube_pod_owner row is a controller")
+	// The non-controller row must not produce a controller owner.
+	assert.Nil(t, tp.Pods[0].Owner(), "non-controller row must not set an owner")
+}
+
 // TestParseTopology_NoServiceSeriesYieldsEmptyIndexes — absence of
 // service/endpointslice series (KSM without those resources) yields empty
 // indexes and never errors.
@@ -387,4 +627,144 @@ func TestParseTopology_PVCStorageClassDeterministic(t *testing.T) {
 	require.Len(t, rev.PVCs, 1)
 	assert.Equal(t, "gp2", fwd.PVCs[0].StorageClass(), "lexically-smallest storageclass wins")
 	assert.Equal(t, fwd.PVCs[0].StorageClass(), rev.PVCs[0].StorageClass(), "order-independent")
+}
+
+// TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's
+// active condition="Ready" row sets each K8s node's typed ready_status:
+// true→Ready, false→NotReady, unknown→Unknown. A node with no Ready series omits
+// the attribute (distinct from "Unknown"), a non-Ready condition is ignored, and
+// the status never leaks into labels. The metric is optional.
+func TestParseTopology_NodeReadyStatusAttribute(t *testing.T) {
+	node := func(name string) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": model.LabelValue(name)}}
+	}
+	// One series per status; value 1 = active. condition="Ready".
+	cond := func(name, status string, val model.SampleValue) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster": "c", "node": model.LabelValue(name),
+				"condition": "Ready", "status": model.LabelValue(status),
+			},
+			Value: val,
+		}
+	}
+	nodeVec := sampleVec(node("ready-0"), node("notready-0"), node("unknown-0"), node("nocond-0"))
+	condVec := sampleVec(
+		cond("ready-0", "true", 1), cond("ready-0", "false", 0), cond("ready-0", "unknown", 0),
+		cond("notready-0", "true", 0), cond("notready-0", "false", 1), cond("notready-0", "unknown", 0),
+		cond("unknown-0", "true", 0), cond("unknown-0", "false", 0), cond("unknown-0", "unknown", 1),
+		// nocond-0 has only a non-Ready condition active → ready_status must stay empty.
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "nocond-0", "condition": "MemoryPressure", "status": "true"}, Value: 1},
+	)
+
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	byName := map[string]*graph.K8sNode{}
+	for _, n := range tp.Nodes {
+		byName[n.Name()] = n
+	}
+
+	assert.Equal(t, graph.ReadyStatusReady, byName["ready-0"].ReadyStatus())
+	assert.Equal(t, graph.ReadyStatusNotReady, byName["notready-0"].ReadyStatus())
+	assert.Equal(t, graph.ReadyStatusUnknown, byName["unknown-0"].ReadyStatus(), "kubelet-lost Unknown is a real value")
+	assert.Empty(t, byName["nocond-0"].ReadyStatus(), "no Ready series (only MemoryPressure) → ready_status omitted, distinct from Unknown")
+
+	// ready status must NEVER leak into labels.
+	for _, n := range tp.Nodes {
+		for k := range n.Labels() {
+			assert.NotContainsf(t, []string{"ready_status", "status", "condition", "ready"}, k,
+				"ready status must not appear in labels for node %q", n.Name())
+		}
+	}
+
+	// Metric absent entirely → valid topology, no ready_status.
+	tp2 := parseTopology(topologyVectors{Node: nodeVec})
+	for _, n := range tp2.Nodes {
+		assert.Emptyf(t, n.ReadyStatus(), "no status series → node %q omits ready_status", n.Name())
+	}
+}
+
+// TestParseTopology_NodeReadyStatusNoActiveRowOmitted — when no condition="Ready"
+// row is active (all value 0, a pathological scrape), the node omits ready_status
+// rather than picking an inactive row.
+func TestParseTopology_NodeReadyStatusNoActiveRowOmitted(t *testing.T) {
+	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}})
+	condVec := sampleVec(
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "true"}, Value: 0},
+		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "false"}, Value: 0},
+	)
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	require.Len(t, tp.Nodes, 1)
+	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "no active (value==1) row → ready_status omitted")
+}
+
+// TestParseTopology_NodeReadyStatusCaseInsensitive — the `status` label casing
+// is NOT pinned by the KSM-shaped contract. Stock kube-state-metrics lowercases
+// it (addConditionMetrics → strings.ToLower → "true"/"false"/"unknown"), but an
+// exporter that re-publishes the raw Kubernetes v1.ConditionStatus enum verbatim
+// emits the capitalised "True"/"False"/"Unknown". The resolver MUST accept both
+// (real-world bug: every node's ready_status was silently dropped because the
+// upstream carried "True").
+func TestParseTopology_NodeReadyStatusCaseInsensitive(t *testing.T) {
+	node := func(name string) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": model.LabelValue(name)}}
+	}
+	cond := func(name, status string, val model.SampleValue) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "node": model.LabelValue(name),
+			"condition": "Ready", "status": model.LabelValue(status),
+		}, Value: val}
+	}
+	nodeVec := sampleVec(node("ready-0"), node("notready-0"), node("unknown-0"))
+	// Capitalised raw-enum casing (k8s v1.ConditionStatus), not KSM lowercase.
+	condVec := sampleVec(
+		cond("ready-0", "True", 1), cond("ready-0", "False", 0), cond("ready-0", "Unknown", 0),
+		cond("notready-0", "True", 0), cond("notready-0", "False", 1), cond("notready-0", "Unknown", 0),
+		cond("unknown-0", "True", 0), cond("unknown-0", "False", 0), cond("unknown-0", "Unknown", 1),
+	)
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	byName := map[string]*graph.K8sNode{}
+	for _, n := range tp.Nodes {
+		byName[n.Name()] = n
+	}
+	assert.Equal(t, graph.ReadyStatusReady, byName["ready-0"].ReadyStatus(), `"True" → Ready`)
+	assert.Equal(t, graph.ReadyStatusNotReady, byName["notready-0"].ReadyStatus(), `"False" → NotReady`)
+	assert.Equal(t, graph.ReadyStatusUnknown, byName["unknown-0"].ReadyStatus(), `"Unknown" → Unknown`)
+}
+
+// TestParseTopology_NodeReadyStatusOrderFree — the active-row pick and the
+// defensive multi-active tie-break are pure functions of the data, independent
+// of upstream vector order (D6).
+func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
+	node := model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}}
+	r := func(status string, v model.SampleValue) model.Sample {
+		return model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": model.LabelValue(status)}, Value: v}
+	}
+
+	fwd := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 0), r("unknown", 1), r("false", 0))})
+	rev := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 0), r("unknown", 1), r("true", 0))})
+	require.Len(t, fwd.Nodes, 1)
+	require.Len(t, rev.Nodes, 1)
+	assert.Equal(t, graph.ReadyStatusUnknown, fwd.Nodes[0].ReadyStatus())
+	assert.Equal(t, fwd.Nodes[0].ReadyStatus(), rev.Nodes[0].ReadyStatus(), "active-row pick is order-independent")
+
+	// Defensive multi-active tie (correct KSM never emits this): lexically-
+	// smallest status label wins → "false" → NotReady, regardless of order.
+	tieF := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 1), r("false", 1))})
+	tieR := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 1), r("true", 1))})
+	require.Len(t, tieF.Nodes, 1)
+	require.Len(t, tieR.Nodes, 1)
+	assert.Equal(t, graph.ReadyStatusNotReady, tieF.Nodes[0].ReadyStatus(), "multi-active tie → lexically-smallest status (false) wins")
+	assert.Equal(t, tieF.Nodes[0].ReadyStatus(), tieR.Nodes[0].ReadyStatus(), "tie-break is order-free")
+}
+
+// TestParseTopology_NodeReadyStatusMissingClusterDoesNotJoin — a status row
+// whose cluster label is missing buckets to "unknown" and must NOT enrich a
+// real-cluster node (same (cluster, node)-join fragility as IPs/labels).
+func TestParseTopology_NodeReadyStatusMissingClusterDoesNotJoin(t *testing.T) {
+	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "prod", "node": "w0"}})
+	condVec := sampleVec(model.Sample{Metric: model.Metric{"node": "w0", "condition": "Ready", "status": "true"}, Value: 1})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	require.Len(t, tp.Nodes, 1)
+	assert.Equal(t, "prod/w0", tp.Nodes[0].ID())
+	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "status row missing cluster label buckets to unknown; does not join the prod node")
 }

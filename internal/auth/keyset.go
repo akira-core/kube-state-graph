@@ -7,9 +7,15 @@
 // stored set on every call so neither match latency nor early exit leaks key
 // count or position.
 //
-// File-backed key sets support hot reload via Reload(): a background ticker
-// re-reads the file and atomically swaps the active set, so a Kubernetes
-// Secret rotation is picked up without a process restart.
+// File-backed key sets support hot reload: LoadFile performs the initial
+// (startup) load, where an empty file is the documented auth-disabled dev
+// default; ReloadFile is for subsequent re-reads and refuses to replace a
+// non-empty active set with an empty one, so a truncated or comment-only file
+// observed mid-rotation cannot silently disable authentication. The package
+// provides no ticker of its own — cmd/kube-state-graph runs a background loop
+// that calls ReloadFile periodically, and each successful call atomically
+// swaps the active set so a Kubernetes Secret rotation is picked up without a
+// process restart.
 package auth
 
 import (
@@ -36,7 +42,10 @@ func NewKeySet() *KeySet {
 }
 
 // LoadFile reads keys from path (one per line, blanks + `#` comments
-// stripped) and atomically replaces the active set.
+// stripped) and atomically replaces the active set. Intended for the initial
+// startup load only: an empty file yields an empty set (the documented
+// auth-disabled dev default). For periodic re-reads use ReloadFile, which
+// fails closed instead.
 func (ks *KeySet) LoadFile(path string) error {
 	keys, err := readKeyFile(path)
 	if err != nil {
@@ -44,6 +53,55 @@ func (ks *KeySet) LoadFile(path string) error {
 	}
 	ks.keys.Store(&keys)
 	return nil
+}
+
+// ReloadFile re-reads keys from path and atomically replaces the active set,
+// failing closed on an empty result: when the file parses to ZERO keys while
+// the currently active set is non-empty, the active set is kept and an error
+// is returned — an empty/comment-only/truncated file observed mid-rotation
+// must not silently disable authentication on a live server. Replacing an
+// empty set with an empty set is not an error.
+//
+// The returned changed flag reports whether the new SET of keys differs from
+// the previous one (order-insensitive — a reorder-only rewrite is not a
+// change). Count comparison is not enough: the common rotation shape swaps N
+// old keys for N new ones, and the caller's "keys reloaded" log must fire for
+// it. Key values never leave this package.
+func (ks *KeySet) ReloadFile(path string) (changed bool, err error) {
+	keys, err := readKeyFile(path)
+	if err != nil {
+		return false, err
+	}
+	old := ks.keys.Load()
+	if len(keys) == 0 && old != nil && len(*old) > 0 {
+		return false, fmt.Errorf("refusing to replace %d active keys with an empty key set from %s", len(*old), path)
+	}
+	ks.keys.Store(&keys)
+	return !sameKeySet(old, keys), nil
+}
+
+// sameKeySet reports whether old (nillable snapshot) and next hold the same
+// keys as sets. Both slices are already deduplicated by their loaders, so a
+// length check plus one-way membership suffices. Not constant-time — both
+// operands are server-held, never attacker input.
+func sameKeySet(old *[]string, next []string) bool {
+	var prev []string
+	if old != nil {
+		prev = *old
+	}
+	if len(prev) != len(next) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(prev))
+	for _, k := range prev {
+		seen[k] = struct{}{}
+	}
+	for _, k := range next {
+		if _, ok := seen[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // LoadCSV parses comma-separated keys (whitespace trimmed; blanks dropped)

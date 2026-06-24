@@ -41,13 +41,16 @@ type Node struct {
 // NodeData is the serialised form of a graph node (plus synthetic cluster
 // group nodes and the presentation-only parent field).
 type NodeData struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Type      string            `json:"type"`
-	Parent    string            `json:"parent,omitempty"`
-	IPAddress []string          `json:"ipaddress,omitempty"`
-	Owner     *graph.Owner      `json:"owner,omitempty"`
-	Labels    map[string]string `json:"labels"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	Parent      string            `json:"parent,omitempty"`
+	IPAddress   []string          `json:"ipaddress,omitempty"`
+	Owner       *graph.Owner      `json:"owner,omitempty"`
+	Application string            `json:"application,omitempty"`
+	Containers  []graph.Container `json:"containers,omitempty"`
+	ReadyStatus string            `json:"ready_status,omitempty"`
+	Labels      map[string]string `json:"labels"`
 }
 
 // Edge wraps an edge's data in the Cytoscape `{ "data": {...} }` shape.
@@ -167,13 +170,16 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	for _, n := range view.Nodes {
 		body.Elements.Nodes = append(body.Elements.Nodes, Node{
 			Data: NodeData{
-				ID:        n.ID(),
-				Name:      n.Name(),
-				Type:      string(n.Type()),
-				Parent:    compoundParent(n, present),
-				IPAddress: n.IPAddress(),
-				Owner:     n.Owner(),
-				Labels:    n.Labels(),
+				ID:          n.ID(),
+				Name:        n.Name(),
+				Type:        string(n.Type()),
+				Parent:      compoundParent(n, present),
+				IPAddress:   n.IPAddress(),
+				Owner:       n.Owner(),
+				Application: n.Application(),
+				Containers:  n.Containers(),
+				ReadyStatus: n.ReadyStatus(),
+				Labels:      n.Labels(),
 			},
 		})
 	}

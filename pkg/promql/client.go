@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	promapi "github.com/prometheus/client_golang/api"
@@ -30,17 +32,80 @@ type Client struct {
 	metrics Metrics
 }
 
+// Option configures optional Client behaviour at construction time.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	username string
+	password string
+}
+
+// WithBasicAuth attaches HTTP Basic Auth credentials to outbound upstream
+// requests addressed to the configured upstream host. Empty username and
+// password is a no-op. The credential values are held on the transport only —
+// they are never logged, attached to spans, or included in error messages.
+func WithBasicAuth(username, password string) Option {
+	return func(o *clientOptions) {
+		o.username = username
+		o.password = password
+	}
+}
+
+// basicAuthTransport sets an Authorization: Basic header on a clone of each
+// request (RoundTrippers must not mutate the caller's request) and delegates
+// to the inner transport. The header is added ONLY for requests addressed to
+// the configured upstream host: net/http strips Authorization when following
+// a cross-host redirect, and stamping per-hop at the transport layer would
+// silently re-attach the credentials below that protection — so a redirect
+// to a foreign host must pass through unauthenticated.
+type basicAuthTransport struct {
+	inner    http.RoundTripper
+	host     string // only requests to this host carry credentials
+	username string
+	password string
+}
+
+func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.EqualFold(req.URL.Host, t.host) {
+		return t.inner.RoundTrip(req)
+	}
+	clone := req.Clone(req.Context())
+	clone.SetBasicAuth(t.username, t.password)
+	return t.inner.RoundTrip(clone)
+}
+
+// newTransport assembles the outbound transport chain: otelhttp → basicAuth
+// (when credentials are configured) → base. The traced request is the final
+// authenticated one; otelhttp records method/URL/status only, never headers.
+// authHost scopes the credentials to the configured upstream host (see
+// basicAuthTransport).
+func newTransport(o clientOptions, authHost string, base http.RoundTripper) http.RoundTripper {
+	rt := base
+	if o.username != "" || o.password != "" {
+		rt = &basicAuthTransport{inner: rt, host: authHost, username: o.username, password: o.password}
+	}
+	return otelhttp.NewTransport(rt)
+}
+
 // New constructs a Client targeting the supplied URL. metrics may be nil
 // (no-op). The HTTP transport is wrapped with otelhttp so outbound PromQL
 // requests propagate W3C traceparent headers and emit a client span per call.
-func New(promURL string, metrics Metrics) (*Client, error) {
+func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
+	var o clientOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	u, err := url.Parse(promURL)
+	if err != nil {
+		return nil, fmt.Errorf("prom url: %w", err)
+	}
 	base := &http.Transport{
 		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     30 * time.Second,
 	}
 	c, err := promapi.NewClient(promapi.Config{
 		Address:      promURL,
-		RoundTripper: otelhttp.NewTransport(base),
+		RoundTripper: newTransport(o, u.Host, base),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prometheus client: %w", err)
@@ -74,7 +139,19 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 			c.metrics.ObserveQueryDuration(name, time.Since(start).Seconds())
 		}
 	}()
-	val, _, err := c.api.Query(ctx, query, ts)
+	val, warns, err := c.api.Query(ctx, query, ts)
+	if len(warns) > 0 {
+		// VictoriaMetrics signals truncated / partial responses (e.g. a
+		// -search.* limit hit) via the warnings return; dropping them hides
+		// silent data truncation. Logged regardless of err so a partial
+		// response that still errors keeps both signals. Only the query name
+		// and upstream warning text are logged — never credentials or the
+		// upstream URL.
+		slog.WarnContext(ctx, "upstream query returned warnings",
+			"query_name", name,
+			"warnings", warns,
+		)
+	}
 	if err != nil {
 		if c.metrics != nil {
 			c.metrics.IncQueryFailure(name)

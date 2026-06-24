@@ -68,7 +68,9 @@ func New(cfg config.Config, builder *build.Builder, prom promql.Querier, m *obse
 func (s *Server) Handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(s.requestIDMiddleware(), s.loggingMiddleware())
+	// Order matters: recovery is innermost so a recovered panic's 500 is still
+	// observed by loggingMiddleware's deferred access-log + metric bookkeeping.
+	r.Use(s.requestIDMiddleware(), s.loggingMiddleware(), s.recoveryMiddleware())
 
 	v1 := r.Group("/" + APIVersion)
 	v1.Use(
@@ -132,32 +134,37 @@ var quietLogPaths = map[string]struct{}{
 // by the registered route set.
 const unmatchedPath = "<unmatched>"
 
-// loggingMiddleware emits one slog line per request.
+// loggingMiddleware emits one slog line per request. The post-Next bookkeeping
+// runs in a defer so a panic propagating from inner middleware (recovery is
+// innermost and normally converts handler panics to a 500, but a panic raised
+// by middleware between logging and recovery would bypass it) can never
+// silently skip the access log and the HTTP-requests metric.
 func (s *Server) loggingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		c.Next()
-		duration := time.Since(start)
-		status := c.Writer.Status()
-		path := c.FullPath()
-		if path == "" {
-			path = unmatchedPath
-		}
-		if _, quiet := quietLogPaths[path]; quiet && status < 400 {
+		defer func() {
+			duration := time.Since(start)
+			status := c.Writer.Status()
+			path := c.FullPath()
+			if path == "" {
+				path = unmatchedPath
+			}
+			// Count every request exactly once, before the quiet-path branch —
+			// one Inc site, not a copy per branch.
 			s.metrics.HTTPRequests.WithLabelValues(path, statusClass(status)).Inc()
-			return
-		}
-		clusters := c.Request.URL.Query()["cluster"]
-
-		s.logger.InfoContext(c.Request.Context(), "http",
-			"method", c.Request.Method,
-			"path", path,
-			"status", status,
-			"duration_ms", duration.Milliseconds(),
-			"request_id", c.GetString("request_id"),
-			"clusters", clusters,
-		)
-		s.metrics.HTTPRequests.WithLabelValues(path, statusClass(status)).Inc()
+			if _, quiet := quietLogPaths[path]; quiet && status < 400 {
+				return
+			}
+			s.logger.InfoContext(c.Request.Context(), "http",
+				"method", c.Request.Method,
+				"path", path,
+				"status", status,
+				"duration_ms", duration.Milliseconds(),
+				"request_id", c.GetString("request_id"),
+				"clusters", c.Request.URL.Query()["cluster"],
+			)
+		}()
+		c.Next()
 	}
 }
 

@@ -41,7 +41,9 @@ cluster N: kube-state-metrics ──┤
   `-search.maxSamplesPerQuery`). The serialiser produces a deterministic body
   (`apiVersion`, `clusters`, `elements` only — no echoed time fields). Pod,
   node, and service IPs appear on the top-level `ipaddress` attribute, not in
-  `labels`.
+  `labels`. Pods additionally carry typed `data` attributes — `owner`
+  (`{kind, name}`), `application` (the ArgoCD Application), and `containers`
+  (`[{name, image}]`) — all `omitempty` and never inside `labels`.
 
 ## Quick start
 
@@ -84,23 +86,29 @@ per source cluster).
 | `kube_pod_info` | Pod nodes (`node` label drives Cytoscape `cluster > node > pod` compound nesting) | `cluster`, `namespace`, `pod`, `uid`, `node`, `pod_ip` (→ `data.ipaddress`; `host_ip` not exported) | **Yes** |
 | `kube_node_info` | K8sNode nodes | `cluster`, `node` | **Yes** |
 | `kube_node_status_addresses{type="ExternalIP"}` | Node external IP (→ `data.ipaddress`) | `cluster`, `node`, `address` | Optional |
+| `kube_node_status_condition{condition="Ready"}` | Node Ready status `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`} from the active (`status` value 1) row; omitted when no Ready data — distinct from `Unknown` (kubelet lost contact) | `cluster`, `node`, `condition`, `status` | Optional (absent ⇒ no `data.ready_status`); a KSM default |
 | `kube_node_labels` | Node label propagation (`kubernetes.io/*` etc.) | `cluster`, `node`, `label_*` | Optional |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC nodes; pod-mounts-pvc edges | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | Optional (no PVCs ⇒ no PVC nodes/edges) |
 | `kube_persistentvolumeclaim_info` | PVC StorageClass → Cytoscape `cluster > storageclass > pvc` compound nesting (never a `data` attribute or label) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass` | Optional (absent ⇒ PVCs nest under `cluster > pvc`) |
-| `kube_pod_owner` | Pod controller-owner attribute `data.owner` = `{kind, name}` (ReplicaSet skipped to its Deployment; omitted when no controller owner) | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller` | Optional (absent ⇒ no `data.owner`) |
+| `kube_pod_owner` | Pod controller-owner attribute `data.owner` = `{kind, name}` (ReplicaSet skipped to its Deployment; omitted when no controller owner); also the pod ArgoCD Application `data.application` (segment before the first `:` of the `argocd_tracking_id` label) | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller`, `argocd_tracking_id` | Optional (absent ⇒ no `data.owner`). `argocd_tracking_id` is **operator-provided** (e.g. `--metric-labels-allowlist` / relabel), NOT a KSM default; absent ⇒ no `data.application` |
 | `kube_replicaset_owner` | Resolves a ReplicaSet pod-owner up to its owning Deployment | `cluster`, `namespace`, `replicaset`, `owner_kind`, `owner_name` | Optional (absent ⇒ ReplicaSet kept as owner) |
+| `kube_pod_container_info` | Pod container list `data.containers` = `[{name, image}]`, sorted by `(name, image)`; on a mid-window image change the latest-seen image wins per container | `cluster`, `namespace`, `pod`, `container`, `image` | Optional (absent ⇒ no `data.containers`); a KSM default |
 | `kube_service_info` | Service nodes for `://` connection-string resolution (D29); `cluster_ip` (headless `None` ⇒ no `data.ipaddress`) | `cluster`, `namespace`, `service`, `cluster_ip` | Optional (absent ⇒ `://` endpoints fall back to `external`) |
 | `kube_endpointslice_endpoints` | Service → backing-pod fan-out (`service-selects-pod` edges) | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | Optional |
 | `kube_endpointslice_labels` | Joins an EndpointSlice to its owning Service | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | Optional — **requires** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` (NOT a KSM default); absent ⇒ no `service-selects-pod` resolution |
 
 Each is wrapped in `last_over_time(<metric>[<window>]) @ <end>` so the result
-reflects the most recent value within the requested `[start, end]` window.
+reflects the most recent value within the requested `[start, end]` window — except
+`kube_pod_container_info`, which uses `tlast_over_time(...)` so each per-image
+series carries its last-sample timestamp, letting the reader pick the latest image
+per container (a recency pick that is accurate for near-now windows; see
+`design.md` D-A4 for the far-past-window caveat).
 
 ### Service-graph metric — produced by [Tempo](https://grafana.com/docs/tempo/latest/metrics-generator/service_graphs/) or compatible generator
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `traces_service_graph_request_total` | `pod-calls-pod` / `pod-calls-service` edges (intra- and cross-cluster) | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` | Optional (no series ⇒ no call edges) |
+| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` | Optional (no series ⇒ no call edges) |
 
 Wrapped in `rate(traces_service_graph_request_total[<window>]) @ <end>`. Each
 series carries a single `cluster` external label representing the trace source
@@ -112,13 +120,19 @@ so the lookup is unambiguous. Edges are only emitted when both endpoints
 resolve. When an endpoint's pod-UID label is empty, the human-readable
 `client`/`server` label is resolved by built-in **connection-string detection**
 (no knob): a label containing the literal `://` is parsed as a URL — an
-in-cluster `<service>.<namespace>.svc` name becomes a `type="service"` node
-(with on-demand `service-selects-pod` edges fanning out to its backing pods). A
-headless `<pod>.<service>.<namespace>.svc` name resolves to the **same** service
-node (the leading pod-hostname is dropped) and fans out the same way — a `://`
-endpoint is never a specific pod. An unresolvable URL becomes an `external` node.
-A non-URL label (no `://`) also becomes an `external` node via the missing pod-UID
-human-label fallback.
+in-cluster `<service>.<namespace>.svc` name becomes a **single** `type="service"`
+node **in the caller's own cluster** (so `pod-calls-service` is always
+intra-cluster), provided that cluster holds the same-named Service. That service
+node then fans out on-demand `service-selects-pod` edges to its backing pods
+across **every same-family cluster** holding the same-named Service — so
+`service-selects-pod` **may cross clusters**, modelling multi-cluster
+service-mesh endpoint aggregation (clusters are one family when their names
+match after collapsing digit runs, e.g. `prod-1` ↔ `prod-2`). A headless
+`<pod>.<service>.<namespace>.svc` name resolves to the **same** service node (the
+leading pod-hostname is dropped) — a `://` endpoint is never a specific pod. An
+unresolvable URL, or one whose caller cluster does not hold the Service, becomes
+an `external` node. A non-URL label (no `://`) also becomes an `external` node
+via the missing pod-UID human-label fallback.
 
 The `servicegraph` connector's **virtual peers** — `client="user"` (an
 uninstrumented caller) and `unknown` (an unresolved peer) — are dropped at the
@@ -164,6 +178,28 @@ service-graph behaviour.
 | `--api-keys-reload-interval`    | `KSG_API_KEYS_RELOAD_INTERVAL`   | `30s`                | How often `--api-keys-file` is re-read. Set to `0` to disable hot reload. |
 | `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug | info | warn | error`. |
 | `--metric-prefix`               | `KSG_METRIC_PREFIX`              | (empty)              | Additive prefix prepended to every kube-state-metrics-shaped series the topology reader queries (e.g. `o11y_` → `o11y_kube_pod_info`). Does **not** affect `traces_service_graph_request_total` or `up{}`. The metric-name suffix and per-series label set are a fixed contract any compatible exporter must honour. |
+| —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
+| —                               | `KSG_PROM_PASSWORD`              | (empty)              | HTTP Basic Auth password for the upstream. Env-only, paired with `KSG_PROM_USERNAME` — setting exactly one of the two fails startup. Rotation requires a restart (no hot reload); changing a Secret-backed env var in a Deployment triggers a rollout anyway. |
+
+### Upstream basic auth
+
+When VictoriaMetrics is protected by basic auth (`-httpAuth.*`, vmauth, or an
+authenticating reverse proxy), set both env vars — in Kubernetes, source them
+from a `Secret`:
+
+```yaml
+env:
+  - name: KSG_PROM_USERNAME
+    valueFrom:
+      secretKeyRef: { name: ksg-upstream-auth, key: username }
+  - name: KSG_PROM_PASSWORD
+    valueFrom:
+      secretKeyRef: { name: ksg-upstream-auth, key: password }
+```
+
+Every upstream request (topology, service-graph, cluster discovery, the
+`/readyz` probe) then carries `Authorization: Basic …`. The credential values
+never appear in logs, traces, metrics, or error responses.
 
 ## Documentation
 

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 )
 
@@ -36,6 +37,19 @@ func NewScope(clusters, namespaces, edgeTypes, names []string, root string, dept
 	}
 	if depth > MaxTraversalDepth {
 		return Scope{}, errors.New("depth exceeds maximum")
+	}
+	// Validate edge types against the single in-code registry (EdgeTypes) so a
+	// typo like "pod-calls-pods" is an error, not a scope that silently
+	// filters every edge out. Living here (not in the HTTP parser) gives D32
+	// embedders constructing scopes directly the same guard. Empty values are
+	// skipped — edgeTypeSet drops them, keeping a bare `edge_type=` a no-op.
+	for _, et := range edgeTypes {
+		if et == "" {
+			continue
+		}
+		if !ValidEdgeType(EdgeType(et)) {
+			return Scope{}, fmt.Errorf("unknown edge_type %q", et)
+		}
 	}
 	if root != "" {
 		if depth == 0 {

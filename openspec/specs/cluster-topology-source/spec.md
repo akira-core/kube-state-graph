@@ -23,19 +23,25 @@ The topology reader SHALL consume at minimum the following `kube-state-metrics` 
 
 - `kube_pod_info{cluster, namespace, pod, uid, node, pod_ip, host_ip, ...}` (`pod_ip` and `host_ip` are surfaced when present)
 - `kube_node_info{cluster, node, ...}`
-- `kube_node_status_addresses{cluster, node, type="ExternalIP", address, ...}`
+- `kube_node_status_addresses{cluster, node, type=~"ExternalIP|InternalIP", address, ...}` (the anchored alternation selects exactly the two address types; ExternalIP is preferred and InternalIP is the fallback for the node `ipaddress` attribute)
 - `kube_pod_spec_volumes_persistentvolumeclaims_info{cluster, namespace, pod, volume, claim_name, ...}`
 - `kube_node_labels{cluster, node, label_*, ...}`
 - `kube_service_info{cluster, namespace, service, cluster_ip, ...}` (OPTIONAL — feeds the service/endpoint indexes)
 - `kube_endpointslice_endpoints{cluster, namespace, endpointslice, address, targetref_kind, targetref_name, targetref_namespace, ...}` (OPTIONAL — feeds the service/endpoint indexes)
 - `kube_endpointslice_labels{cluster, namespace, endpointslice, label_kubernetes_io_service_name, ...}` (OPTIONAL — joins each slice back to its owning service)
-- `kube_pod_owner{cluster, namespace, pod, owner_kind, owner_name, owner_is_controller, ...}` (OPTIONAL — feeds the pod controller-owner labels)
+- `kube_pod_owner{cluster, namespace, pod, owner_kind, owner_name, owner_is_controller, argocd_tracking_id, ...}` (OPTIONAL — feeds the pod controller-owner labels and, via the `argocd_tracking_id` label, the pod ArgoCD Application attribute)
 - `kube_replicaset_owner{cluster, namespace, replicaset, owner_kind, owner_name, ...}` (OPTIONAL — resolves a ReplicaSet pod owner up to its owning Deployment)
 - `kube_persistentvolumeclaim_info{cluster, namespace, persistentvolumeclaim, storageclass, ...}` (OPTIONAL — feeds PVC StorageClass resolution and the StorageClass compound grouping)
+- `kube_pod_container_info{cluster, namespace, pod, uid, container, image, ...}` (OPTIONAL — feeds the per-pod container list attribute; one series per container)
+- `kube_node_status_condition{cluster, node, condition="Ready", status, ...}` (OPTIONAL — feeds the K8s node `ready_status` attribute; the `condition="Ready"` selector is a fixed, request-invariant metric-selection contract, and the `status` label carries `true`/`false`/`unknown` **matched case-insensitively** — stock kube-state-metrics lowercases the value, but an exporter re-publishing the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown` — with the active row's sample value being `1`)
 
 The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes.
 
 `kube_persistentvolumeclaim_info` is likewise OPTIONAL: when absent — or when no series matches a given PVC — the reader SHALL still build a valid topology, the affected PVC entities carry no resolved StorageClass, and the Cytoscape serialiser nests those PVCs directly under their cluster group (`cluster > pvc`) instead of a StorageClass group.
+
+`kube_pod_container_info` is likewise OPTIONAL: when absent — or when no series matches a given pod — the reader SHALL still build a valid topology, the affected pod entities carry no `containers` attribute, and the build does not fail. The `argocd_tracking_id` label on `kube_pod_owner` is likewise OPTIONAL: when absent, the affected pod entities carry no `application` attribute and the build does not fail.
+
+`kube_node_status_condition` is likewise OPTIONAL: when absent — or when no `condition="Ready"` series matches a given node — the reader SHALL still build a valid topology, the affected K8s node entities carry no `ready_status` attribute, and the build does not fail.
 
 #### Scenario: All families queried
 
@@ -57,6 +63,16 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 - **WHEN** the upstream contains `kube_pod_spec_volumes_persistentvolumeclaims_info` but no `kube_persistentvolumeclaim_info` series for the window
 - **THEN** the reader produces a valid topology in which every PVC entity has an empty StorageClass, the build does not fail, and the serialiser nests every PVC directly under its cluster group
 
+#### Scenario: Container info metric absent
+
+- **WHEN** the upstream contains `kube_pod_info` but no `kube_pod_container_info` series for the window
+- **THEN** the reader produces a valid topology in which every pod entity carries no `containers` attribute, and the build does not fail
+
+#### Scenario: Node status-condition metric absent
+
+- **WHEN** the upstream contains `kube_node_info` but no `kube_node_status_condition` series for the window
+- **THEN** the reader produces a valid topology in which every K8s node entity carries no `ready_status` attribute, and the build does not fail
+
 ### Requirement: Service and endpoint indexes
 
 When the optional `kube_service_info`, `kube_endpointslice_endpoints`, and `kube_endpointslice_labels` families are present, the topology reader SHALL build two lookup INDEXES that the pod-service-graph reader consults to resolve `"://"` connection-string endpoints. The reader SHALL build INDEXES ONLY — it SHALL NOT emit `service` nodes or `service-selects-pod` edges into the graph wholesale. Those are materialised ON DEMAND by the pod-service-graph reader, for referenced services only, to avoid graph bloat.
@@ -75,7 +91,7 @@ The two indexes are:
 
 The topology reader SHALL prepend a single configurable prefix to every `kube_*` series name it queries, so deployments using a fork of kube-state-metrics or a custom exporter that re-publishes the same series under an organisational prefix (e.g. `o11y_kube_pod_info`) can be supported without forking the API server. The prefix SHALL be sourced from the `KSG_METRIC_PREFIX` environment variable or the `--metric-prefix` flag (flag wins over env when both are set). The default value SHALL be the empty string, preserving stock kube-state-metrics behaviour. The prefix SHALL be additive — appended verbatim before the existing series name; the existing `kube_*` suffix and the upstream label-name contract (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `label_*`, etc.) are unchanged. The prefix SHALL be validated against the Prometheus metric-name charset `^[a-zA-Z_:][a-zA-Z0-9_:]*$` when non-empty; an invalid value SHALL fail server startup. The trailing underscore (if any) is the operator's responsibility — the server does not inject one.
 
-The same prefix SHALL apply to every kube-state-metrics-shaped series the reader consumes: `kube_pod_info`, `kube_node_info`, `kube_node_status_addresses`, `kube_pod_spec_volumes_persistentvolumeclaims_info`, `kube_node_labels`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_pod_owner`, `kube_replicaset_owner`, `kube_persistentvolumeclaim_info`, and the `kube_node_info`-backed cluster discovery query. The upstream label-name contract those series carry is unchanged (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `storageclass`, `label_*`, `service`, `cluster_ip`, `endpointslice`, `address`, `hostname`, `targetref_kind`, `targetref_name`, `targetref_namespace`, `label_kubernetes_io_service_name`, etc.). The prefix SHALL NOT be applied to `traces_service_graph_request_total` (which is produced by a different exporter family) nor to the Prometheus-native `up{}` readiness probe.
+The same prefix SHALL apply to every kube-state-metrics-shaped series the reader consumes: `kube_pod_info`, `kube_node_info`, `kube_node_status_addresses`, `kube_pod_spec_volumes_persistentvolumeclaims_info`, `kube_node_labels`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_pod_owner`, `kube_replicaset_owner`, `kube_persistentvolumeclaim_info`, `kube_pod_container_info`, `kube_node_status_condition`, and the `kube_node_info`-backed cluster discovery query. The upstream label-name contract those series carry is unchanged (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `storageclass`, `container`, `image`, `argocd_tracking_id`, `condition`, `status`, `label_*`, `service`, `cluster_ip`, `endpointslice`, `address`, `hostname`, `targetref_kind`, `targetref_name`, `targetref_namespace`, `label_kubernetes_io_service_name`, etc.). The prefix SHALL NOT be applied to `traces_service_graph_request_total` (which is produced by a different exporter family) nor to the Prometheus-native `up{}` readiness probe.
 
 #### Scenario: Default empty prefix preserves stock series names
 
@@ -85,7 +101,7 @@ The same prefix SHALL apply to every kube-state-metrics-shaped series the reader
 #### Scenario: Custom prefix from environment
 
 - **WHEN** the server starts with `KSG_METRIC_PREFIX=o11y_`
-- **THEN** the issued topology PromQL contains `last_over_time(o11y_kube_pod_info[<window>])`, `last_over_time(o11y_kube_node_info[<window>])`, `last_over_time(o11y_kube_node_status_addresses{type="ExternalIP"}[<window>])`, `last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[<window>])`, `last_over_time(o11y_kube_node_labels[<window>])`, `last_over_time(o11y_kube_service_info[<window>])`, `last_over_time(o11y_kube_endpointslice_endpoints[<window>])`, `last_over_time(o11y_kube_endpointslice_labels[<window>])`, and `last_over_time(o11y_kube_persistentvolumeclaim_info[<window>])`, AND the cluster-discovery query becomes `group by (cluster) (last_over_time(o11y_kube_node_info[<lookback>]))`
+- **THEN** the issued topology PromQL contains `last_over_time(o11y_kube_pod_info[<window>])`, `last_over_time(o11y_kube_node_info[<window>])`, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[<window>])`, `last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[<window>])`, `last_over_time(o11y_kube_node_labels[<window>])`, `last_over_time(o11y_kube_service_info[<window>])`, `last_over_time(o11y_kube_endpointslice_endpoints[<window>])`, `last_over_time(o11y_kube_endpointslice_labels[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_info[<window>])`, `tlast_over_time(o11y_kube_pod_container_info[<window>])` (the container query uses `tlast_over_time` so each image-variant series' value is its last-sample timestamp — see the "Pod container list attribute" requirement and design.md D-A4), and `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[<window>])`, AND the cluster-discovery query becomes `group by (cluster) (last_over_time(o11y_kube_node_info[<lookback>]))`
 
 #### Scenario: Prefix does not affect service-graph or probe queries
 
@@ -139,7 +155,7 @@ The reader SHALL produce topology entities whose stable identifiers are cluster-
 Every emitted topology entity SHALL carry the canonical fields consumed by the graph API: `id`, `name`, `type`, `labels`, and `ipaddress` (for pods and K8s nodes). The reader SHALL set these as follows:
 
 - For pods: `name` = the `pod` label of `kube_pod_info`; `type` = `"pod"`; `labels` includes `cluster`, `namespace`, `node` (cluster-scoped node ID), and any K8s pod labels available from `kube_pod_labels` for that pod (added under their original keys). `ipaddress` = `[pod_ip]` from `kube_pod_info.pod_ip` when surfaced; otherwise empty / omitted. The `host_ip` series label is intentionally not surfaced on the pod entity — the node's IP is exposed only via the K8s node entity. When kube-state-metrics emits multiple `kube_pod_info` series for the same pod-UID with evolving label sets (e.g. earlier scrapes that lack `node` or `pod_ip`), the reader SHALL merge labels across same-UID samples and pick the newest non-empty `pod_ip` so the emitted entity reflects the most informative observation. When `kube_pod_owner` is available, the pod entity additionally carries a typed nullable `owner` attribute (`{kind, name}`, serialised as `data.owner`, NOT a label) for the pod's controller owner (with the ReplicaSet skipped to the owning Deployment) — see the "Pod controller-owner attribute with ReplicaSet skip" requirement; `owner` is omitted entirely when the pod has no controller owner.
-- For K8s nodes: `name` = the `node` label of `kube_node_info`; `type` = `"node"`; `labels` includes `cluster` and any node labels from `kube_node_labels` for that node (the `label_*=` series translates to entries under their original key with the `label_` prefix removed). `ipaddress` = `[external_ip]` from `kube_node_status_addresses{type="ExternalIP"}` when surfaced; otherwise empty / omitted. IPs SHALL NOT be carried inside `labels`.
+- For K8s nodes: `name` = the `node` label of `kube_node_info`; `type` = `"node"`; `labels` includes `cluster` and any node labels from `kube_node_labels` for that node (the `label_*=` series translates to entries under their original key with the `label_` prefix removed). `ipaddress` = `[external_ip]` from `kube_node_status_addresses{type="ExternalIP"}` when surfaced, falling back to `[internal_ip]` from `kube_node_status_addresses{type="InternalIP"}` when the node has no ExternalIP row; omitted only when neither address type is surfaced. An ExternalIP row SHALL always win over an InternalIP row regardless of upstream vector order. Within each address type, duplicate `(cluster, node)` samples SHALL resolve to the lexically-smallest address, so the emitted IP is a pure function of the data (determinism). Address types other than `ExternalIP` / `InternalIP` SHALL be ignored. IPs SHALL NOT be carried inside `labels`.
 - For PVCs: `name` = the `claim_name` label of `kube_pod_spec_volumes_persistentvolumeclaims_info`; `type` = `"pvc"`; `labels` includes `cluster`, `namespace`, and `volume`. `ipaddress` is not emitted.
 
 #### Scenario: Pod entity canonical fields
@@ -161,6 +177,21 @@ Every emitted topology entity SHALL carry the canonical fields consumed by the g
 
 - **WHEN** `kube_node_status_addresses{cluster="cluster-alpha", node="worker-0", type="ExternalIP", address="203.0.113.10"}` is present
 - **THEN** the emitted K8s node entity has `ipaddress=["203.0.113.10"]` and `labels.external_ip` is not present
+
+#### Scenario: K8s node falls back to InternalIP when no ExternalIP exists
+
+- **WHEN** the only `kube_node_status_addresses` rows for `(cluster="cluster-alpha", node="worker-0")` carry `type="InternalIP"` (e.g. `address="10.0.0.7"`)
+- **THEN** the emitted K8s node entity has `ipaddress=["10.0.0.7"]` and neither `labels.internal_ip` nor `labels.external_ip` is present
+
+#### Scenario: ExternalIP wins over InternalIP regardless of vector order
+
+- **WHEN** `(cluster="cluster-alpha", node="worker-0")` has both `kube_node_status_addresses{type="InternalIP", address="10.0.0.7"}` and `kube_node_status_addresses{type="ExternalIP", address="203.0.113.10"}` rows, in any upstream order
+- **THEN** the emitted K8s node entity has `ipaddress=["203.0.113.10"]`
+
+#### Scenario: K8s node with no address rows omits ipaddress
+
+- **WHEN** `(cluster="cluster-alpha", node="worker-0")` has no `kube_node_status_addresses` row of type `ExternalIP` or `InternalIP`
+- **THEN** the emitted K8s node entity carries no `ipaddress`
 
 #### Scenario: K8s node labels flattened
 
@@ -259,4 +290,141 @@ The topology reader SHALL resolve each PVC's StorageClass from `kube_persistentv
 
 - **WHEN** the upstream reports two `kube_persistentvolumeclaim_info` series for the same `(cluster, namespace, claim)` with `storageclass="gp3"` and `storageclass="gp2"`
 - **THEN** the reader resolves the PVC's StorageClass to `gp2` (the lexically smallest) deterministically across rebuilds
+
+### Requirement: Optional basic-auth credentials for the upstream endpoint
+
+The server SHALL support optional HTTP Basic Auth credentials for the single upstream Prometheus-compatible endpoint, sourced **exclusively** from the environment variables `KSG_PROM_USERNAME` and `KSG_PROM_PASSWORD`. No CLI flag SHALL exist for either value — credential-carrying flags leak through process listings and container specs; this is a deliberate exception to the env+flag dual-track configuration convention.
+
+When both variables are set (non-empty), every outbound HTTP request to the upstream — topology queries, the service-graph query, the cluster-discovery query, and the `/readyz` `up` probe — SHALL carry an `Authorization: Basic` header for those credentials. When both are unset, requests SHALL carry no `Authorization` header and behaviour is unchanged from an unauthenticated deployment.
+
+Setting exactly one of the two variables (non-empty) SHALL fail server startup with a validation error that names both environment variables but does NOT echo either value.
+
+The credential values SHALL NOT appear in any log line, trace span attribute, metric label, error message, or HTTP response body. Rotation requires a process restart — there is no hot reload for upstream credentials.
+
+#### Scenario: Credentials applied to all upstream queries
+
+- **WHEN** the server starts with `KSG_PROM_USERNAME=ksg` and `KSG_PROM_PASSWORD=s3cret` and serves a `/v1/graph` request
+- **THEN** every upstream HTTP request issued for the build (topology fan-out, service-graph, and any cluster-discovery or readiness query) carries `Authorization: Basic` for `ksg:s3cret`
+
+#### Scenario: No credentials configured
+
+- **WHEN** the server starts with neither `KSG_PROM_USERNAME` nor `KSG_PROM_PASSWORD` set
+- **THEN** upstream requests carry no `Authorization` header and startup validation passes
+
+#### Scenario: Half-configured credentials rejected at startup
+
+- **WHEN** the server starts with `KSG_PROM_USERNAME=ksg` and no `KSG_PROM_PASSWORD` (or vice versa)
+- **THEN** `config.Validate` returns an error naming `KSG_PROM_USERNAME` and `KSG_PROM_PASSWORD`, the error does not contain the configured value, and the process exits non-zero before binding the listener
+
+#### Scenario: No CLI flag exists for credentials
+
+- **WHEN** the server is started with `--prom-username=x` or `--prom-password=x`
+- **THEN** flag parsing fails with an unknown-flag error, because credentials are env-only
+
+#### Scenario: Credentials never logged
+
+- **WHEN** the server runs with credentials configured at any log level, including `debug`, and upstream queries succeed or fail
+- **THEN** no emitted log line, span attribute, or error string contains the configured username or password
+
+### Requirement: Pod container list attribute
+
+The topology reader SHALL resolve each pod's **container list** from `kube_pod_container_info`, queried as `tlast_over_time(kube_pod_container_info[w])` so each series' value is its last-sample timestamp, and surface it on the pod entity as a typed, nullable `containers` attribute — an ordered list of `{name, image}` objects — serialised as `data.containers` (`omitempty`) and **never inside `labels`**. For each series matching a pod by `(cluster, namespace, pod)`, the reader SHALL emit one list element with `name` taken from the `container` label and `image` taken from the `image` label.
+
+The list SHALL be ordered deterministically by `(name, image)` so the emitted entity is byte-identical across rebuilds. The reader SHALL skip any series whose `image` label is empty (it carries no information and must not mask a populated sibling). When a single container reports more than one non-empty `image` in the window — a mid-window image change, where each image is a DISTINCT series — the reader SHALL pick the image with the **greatest last-sample timestamp** (the current image), breaking exact-timestamp ties by the lexically-smallest `image` (determinism). `kube_pod_container_info` is OPTIONAL: when absent, or when no series matches a given pod, the reader SHALL emit a nil `containers` so `data.containers` is omitted entirely — it SHALL NOT emit an empty array or any container key in `labels`. This requirement introduces NO new node or edge type — the container list is a typed attribute on the existing `type="pod"` node (the same precedent as the `ipaddress` and `owner` attributes), keeping `labels` a strict `map[string]string` of typological metadata.
+
+Note (design.md D-A4): the latest-image pick is reliable only for query windows near the real wall clock (the dominant case). For windows far in the past VictoriaMetrics returns only one image-variant series per container regardless of rollup, so the reader surfaces whatever single variant VM returns — never worse than a fixed deterministic pick.
+
+#### Scenario: Pod with multiple containers
+
+- **WHEN** `kube_pod_container_info{cluster="cluster-alpha", namespace="shop", pod="checkout-1", container="app", image="reg/app:1.2"}` and `kube_pod_container_info{cluster="cluster-alpha", namespace="shop", pod="checkout-1", container="sidecar", image="reg/proxy:0.9"}` are present
+- **THEN** the emitted pod entity has `containers=[{name:"app", image:"reg/app:1.2"}, {name:"sidecar", image:"reg/proxy:0.9"}]` (ordered by `(name, image)`) and no container key in `labels`
+
+#### Scenario: Container list ordering is deterministic
+
+- **WHEN** the container series for a pod arrive in any upstream order
+- **THEN** the emitted `containers` list is ordered by `(name, image)` and is byte-identical to the list produced by the same series in any other order
+
+#### Scenario: Container changed image in the window — latest wins
+
+- **WHEN** a single container has two `kube_pod_container_info` series for the same `(cluster, namespace, pod, container)` with different `image` values, the older `reg/app:1.0` last seen earlier and the newer `reg/app:2.0` last seen later (its `tlast_over_time` value is greater)
+- **THEN** the emitted container carries `reg/app:2.0` (the image seen latest), regardless of upstream order and even though it is lexically larger; on an exact last-seen tie the lexically-smallest image wins deterministically
+
+#### Scenario: Empty image is skipped
+
+- **WHEN** a container has both an empty-`image` series and a populated one (e.g. `image=""` and `image="reg/app:1.4"`), and another container has only an empty-`image` series
+- **THEN** the first container carries `image="reg/app:1.4"` (the empty image does not win the slot) and the empty-only container is omitted from `containers` entirely
+
+#### Scenario: Pod with no container info
+
+- **WHEN** no `kube_pod_container_info` series matches a given pod (e.g. a synthesised service-graph pod, or the metric absent for that pod)
+- **THEN** the emitted pod entity has a nil `containers` (`data.containers` omitted entirely) and carries no container key in `labels`
+
+#### Scenario: Container metric absent entirely
+
+- **WHEN** the upstream contains `kube_pod_info` but no `kube_pod_container_info` series for the window
+- **THEN** the reader produces a valid topology with no `containers` on any pod and does not fail the build
+
+### Requirement: Pod ArgoCD Application attribute
+
+The topology reader SHALL resolve each pod's **ArgoCD Application** from the `argocd_tracking_id` label carried on its `kube_pod_owner` series and surface it on the pod entity as a typed, nullable `application` attribute (a string), serialised as `data.application` (`omitempty`) and **never inside `labels`**. The reader SHALL read the `argocd_tracking_id` label value independently of which `kube_pod_owner` row wins the controller-owner pick (the Application is a pod-level fact that must survive even when no row is a controller).
+
+The Application name SHALL be the substring of the `argocd_tracking_id` value **before the first `:`** (ArgoCD annotation-based tracking-id form `<app>:<group>/<kind>:<namespace>/<name>`); when the value contains no `:`, the **entire value** SHALL be surfaced verbatim. When more than one distinct non-empty `argocd_tracking_id` value is observed across a pod's `kube_pod_owner` rows, the reader SHALL pick the **lexically-smallest non-empty** value so the emitted entity is deterministic and order-free. When the label is absent or empty for a pod, the reader SHALL emit a nil `application` so `data.application` is omitted entirely — it SHALL NOT emit an empty string or any application key in `labels`. The `argocd_tracking_id` label is OPTIONAL: when no `kube_pod_owner` series carries it, the reader SHALL build a valid topology with no `application` on any pod and SHALL NOT fail the build. This requirement introduces NO new node or edge type — the Application is a typed attribute on the existing `type="pod"` node (the same precedent as the `owner` attribute), keeping `labels` a strict `map[string]string` of typological metadata.
+
+#### Scenario: Pod with a full ArgoCD tracking-id
+
+- **WHEN** `kube_pod_owner{cluster="cluster-alpha", namespace="shop", pod="checkout-1", owner_kind="ReplicaSet", owner_name="checkout-7f9c", owner_is_controller="true", argocd_tracking_id="checkout:apps/Deployment:shop/checkout"}` is present
+- **THEN** the emitted pod entity has `application="checkout"` (the segment before the first `:`) and no `argocd_tracking_id` key in `labels`
+
+#### Scenario: Pod with a bare Application name (no colon)
+
+- **WHEN** a pod's `kube_pod_owner` series carries `argocd_tracking_id="checkout"` (no `:`)
+- **THEN** the emitted pod entity has `application="checkout"` (the verbatim value)
+
+#### Scenario: Pod with no ArgoCD label
+
+- **WHEN** no `kube_pod_owner` series for a pod carries a non-empty `argocd_tracking_id` label
+- **THEN** the emitted pod entity has a nil `application` (`data.application` omitted entirely) and carries no application key in `labels`
+
+#### Scenario: ArgoCD label absent entirely
+
+- **WHEN** the upstream contains `kube_pod_owner` series but none carry an `argocd_tracking_id` label for the window
+- **THEN** the reader produces a valid topology with no `application` on any pod and does not fail the build
+
+### Requirement: K8s node Ready-status attribute
+
+The topology reader SHALL resolve each K8s node's **Ready status** from `kube_node_status_condition{condition="Ready"}`, queried as `last_over_time(kube_node_status_condition{condition="Ready"}[w])`, and surface it on the K8s node entity as a typed, nullable `ready_status` attribute (a string), serialised as `data.ready_status` (`omitempty`) and **never inside `labels`**. The `condition="Ready"` selector is a fixed, request-invariant metric-selection contract (the same precedent as the node-address `type` selector) — it is applied at the query layer for every build and is NOT a caller filter, preserving the "no caller filters pushed to PromQL" contract.
+
+For each `(cluster, node)`, the reader SHALL read the `status` label of the **active** `condition="Ready"` series — the series whose sample value is `1` — and map it **case-insensitively**: `true` → `"Ready"`, `false` → `"NotReady"`, `unknown` → `"Unknown"`. The `status`-label casing is NOT pinned by the KSM-shaped contract: stock kube-state-metrics lowercases the value (`addConditionMetrics` → `strings.ToLower`), but an exporter that re-publishes the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown`; the reader SHALL canonicalise casing (to lowercase) at the read site so both forms resolve and the guard, tie-break, and mapping all operate on one casing. When more than one `condition="Ready"` series is active for the same `(cluster, node)` (a defensive case that does not occur in correct kube-state-metrics output, where exactly one Ready status is active at a time), the reader SHALL pick the lexically-smallest (canonicalised) `status` label so the emitted value is deterministic and order-free.
+
+**Absence is distinct from `"Unknown"`.** The reader SHALL emit a nil `ready_status` — so `data.ready_status` is omitted entirely — when the metric is absent, when a node has no `condition="Ready"` series, or when no Ready series is active. It SHALL NOT emit an empty string, and SHALL NOT substitute `"Unknown"` for missing data. The literal `"Unknown"` value SHALL be reserved for the genuine Kubernetes state in which the Ready condition's `status` label is `unknown` (the node's kubelet has stopped reporting). `kube_node_status_condition` is OPTIONAL: when absent the reader SHALL build a valid topology with no `ready_status` on any node and SHALL NOT fail the build. This requirement introduces NO new node or edge type — the Ready status is a typed attribute on the existing `type="node"` node (the same precedent as the `ipaddress` attribute), keeping `labels` a strict `map[string]string` of typological metadata.
+
+#### Scenario: Ready node
+
+- **WHEN** `kube_node_status_condition{cluster="cluster-alpha", node="worker-0", condition="Ready", status="true"}` has sample value `1` (and the `status="false"`/`status="unknown"` rows have value `0`)
+- **THEN** the emitted K8s node entity has `ready_status="Ready"` and no status key in `labels`
+
+#### Scenario: NotReady node
+
+- **WHEN** the active `condition="Ready"` series for `(cluster="cluster-alpha", node="worker-0")` carries `status="false"` (value `1`)
+- **THEN** the emitted K8s node entity has `ready_status="NotReady"`
+
+#### Scenario: Unknown node (kubelet lost contact)
+
+- **WHEN** the active `condition="Ready"` series for `(cluster="cluster-alpha", node="worker-0")` carries `status="unknown"` (value `1`)
+- **THEN** the emitted K8s node entity has `ready_status="Unknown"`, which is distinct from a node that carries no `ready_status` at all
+
+#### Scenario: Node with no Ready condition omits ready_status
+
+- **WHEN** a node has no `condition="Ready"` series, or no Ready series is active for the window
+- **THEN** the emitted K8s node entity has a nil `ready_status` (`data.ready_status` omitted entirely) and carries no status key in `labels`
+
+#### Scenario: Status-condition value is order-free
+
+- **WHEN** the three `condition="Ready"` status rows for a node arrive in any upstream order
+- **THEN** the emitted `ready_status` is decided by the active (value `1`) row and is byte-identical regardless of upstream order
+
+#### Scenario: Raw-enum (capitalised) status casing resolves
+
+- **WHEN** the active `condition="Ready"` series for `(cluster="cluster-alpha", node="worker-0")` carries `status="True"` (value `1`) — the raw Kubernetes `v1.ConditionStatus` casing an exporter may emit instead of the lowercase form stock kube-state-metrics produces
+- **THEN** the emitted K8s node entity has `ready_status="Ready"` (the reader matches the `status` label case-insensitively), and likewise `status="False"` → `"NotReady"` and `status="Unknown"` → `"Unknown"`
 

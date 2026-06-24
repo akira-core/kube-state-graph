@@ -130,12 +130,12 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 
 The `name` parameter SHALL match `n.Name()` by exact string equality across **every** node type (`PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`) — a single `?name=` value matches a pod, a K8s node, a PVC, a service, or an external node with the same name. Names are not globally unique (pods and K8s nodes can share a name; PVCs and services can repeat across namespaces); all matches SHALL be returned.
 
-**Edge retention rule (unified across all filters).** An edge SHALL be retained when at least one resolved endpoint is in scope after node filtering. When exactly one endpoint is in scope, the missing endpoint SHALL be re-added from the freshly built graph's node index provided it passes the non-cluster filters (namespace check; types without a namespace label pass through). This single rule covers (a) anchoring on a named node and visualising its incident edges with their partner endpoints, and (b) cross-cluster `pod-calls-pod` edges where only `cluster` narrows scope and the partner pod lives outside the in-scope cluster set.
+**Edge retention rule (unified across all filters).** An edge SHALL be retained when at least one resolved endpoint is in scope after node filtering. When exactly one endpoint is in scope, the missing endpoint SHALL be re-added from the freshly built graph's node index provided it passes the non-cluster filters (namespace check; types without a namespace label pass through). This single rule is edge-type-agnostic and covers (a) anchoring on a named node and visualising its incident edges with their partner endpoints, and (b) cross-cluster edges where only `cluster` narrows scope and the partner endpoint lives outside the in-scope cluster set — a `pod-calls-pod` edge whose server pod was resolved via the global pod-UID index, or a `service-selects-pod` edge from a local service node to a backing pod that runs in a family-sibling cluster (`pod-calls-service` edges are always intra-cluster and never need cross-cluster re-hydration).
 
 #### Scenario: Cluster filter narrows result
 
 - **WHEN** the freshly built graph contains pods in `cluster-alpha` and `cluster-beta` and a client sends `?cluster=cluster-alpha`
-- **THEN** the response contains pod nodes only for `cluster-alpha`, plus any cross-cluster edge endpoints in `cluster-beta` that participate in an edge to `cluster-alpha`
+- **THEN** the response contains pod nodes only for `cluster-alpha`, plus any cross-cluster edge endpoints (pod nodes reached by a `pod-calls-pod` or `service-selects-pod` edge) in `cluster-beta` that participate in an edge to `cluster-alpha`
 
 #### Scenario: Namespace filter combined with cluster
 
@@ -237,26 +237,31 @@ The server SHALL expose `GET /v1/edge-types` that returns the static catalogue o
 #### Scenario: pod-calls-service catalogue entry
 
 - **WHEN** a client inspects the catalogue entry for `pod-calls-service`
-- **THEN** its `directed` field is `true`, its `may_cross_cluster` field is `false`, its `source_type` is an array containing `"pod"` and `"external"`, its `target_type` is `"service"` (or `["service"]`), and its `labels` array enumerates an entry whose `name` is `cluster` with `value_type: "string"` (omitted when the client side is non-pod)
+- **THEN** its `directed` field is `true`, its `may_cross_cluster` field is `false` (a `"://"` connection string resolves to a service node in the caller's OWN cluster, so a `pod-calls-service` edge always connects a source to a service node in the same cluster and is never cross-cluster), its `source_type` is an array containing `"pod"` and `"external"`, its `target_type` is `"service"` (or `["service"]`), and its `labels` array enumerates an entry whose `name` is `cluster` with `value_type: "string"` (omitted when the client side is non-pod)
 
 #### Scenario: service-selects-pod catalogue entry
 
 - **WHEN** a client inspects the catalogue entry for `service-selects-pod`
-- **THEN** its `directed` field is `true`, its `may_cross_cluster` field is `false`, its `source_type` is `["service"]` (or `"service"`), and its `target_type` is `["pod"]` (or `"pod"`)
+- **THEN** its `directed` field is `true`, its `may_cross_cluster` field is `true` (a local service node fans out to backing pods across same-family clusters holding the same-named Service, so the edge may connect a service to a pod in a different cluster of the caller's family), its `source_type` is `["service"]` (or `"service"`), and its `target_type` is `["pod"]` (or `"pod"`)
 
 ### Requirement: Cross-cluster edge representation
 
-When the freshly built graph contains a `pod-calls-pod` edge whose source-node cluster differs from its target-node cluster, the API SHALL emit it as a single edge carrying `labels.cluster` (the trace source / client-side cluster) and SHALL include both endpoint nodes in the response `elements.nodes` whenever the projection scope includes either endpoint's cluster. Consumers detect cross-cluster status by comparing the `labels.cluster` of the edge's resolved source and target nodes — not from edge labels.
+When the freshly built graph contains a `pod-calls-pod` or `service-selects-pod` edge whose source-node cluster differs from its target-node cluster, the API SHALL emit it as a single edge and SHALL include both endpoint nodes in the response `elements.nodes` whenever the projection scope includes either endpoint's cluster. Consumers detect cross-cluster status by comparing the `labels.cluster` of the edge's resolved source and target nodes — not from edge labels. A `pod-calls-pod` edge carries `labels.cluster` (the trace source / client-side cluster, present iff the client side resolved to a pod); a `service-selects-pod` edge carries no `cluster` key (its source is a service node, which is cluster-scoped via its own `labels.cluster`). A `pod-calls-service` edge is ALWAYS intra-cluster (the addressed service resolves to a node in the caller's own cluster), so it never participates in cross-cluster re-hydration. These rules apply to `pod-calls-pod` edges (server-side pod recovered via the global pod-UID index) and `service-selects-pod` edges (a local service node selecting a backing pod that runs in a family-sibling cluster, per connection-string resolution's cross-cluster endpoint union).
 
 #### Scenario: Cross-cluster edge with both clusters in scope
 
-- **WHEN** a client requests `?cluster=cluster-alpha&cluster=cluster-beta` for a window containing a cross-cluster edge whose client pod is in `cluster-alpha` and server pod is in `cluster-beta`
+- **WHEN** a client requests `?cluster=cluster-alpha&cluster=cluster-beta` for a window containing a cross-cluster `pod-calls-pod` edge whose client pod is in `cluster-alpha` and server pod is in `cluster-beta`
 - **THEN** the response contains both endpoint pod nodes and one edge with `labels.cluster: "cluster-alpha"`, where the source node's `labels.cluster` is `"cluster-alpha"` and the target node's `labels.cluster` is `"cluster-beta"`
 
 #### Scenario: Cross-cluster edge with one cluster in scope
 
-- **WHEN** a client requests `?cluster=cluster-alpha` and a cross-cluster edge exists from a pod in `cluster-alpha` to a pod in `cluster-beta`
+- **WHEN** a client requests `?cluster=cluster-alpha` and a cross-cluster `pod-calls-pod` edge exists from a pod in `cluster-alpha` to a pod in `cluster-beta`
 - **THEN** the response contains the `cluster-alpha` endpoint, the `cluster-beta` endpoint (so the edge resolves), and the edge with `labels.cluster: "cluster-alpha"`; the cross-cluster status is detected by comparing the two endpoint nodes' `labels.cluster` values
+
+#### Scenario: Cross-cluster service-selects-pod edge from the local service node's endpoint union
+
+- **WHEN** clusters `prod-1` and `prod-2` (family `prod-0`) both hold a `payments` service in namespace `payments-ns`, a pod in `prod-1` emits a `"://"` connection string addressing it (so resolution materialises ONE `prod-1/payments-ns/payments` service node whose `service-selects-pod` fan-out unions both clusters' backing pods), and a client requests a projection scope that includes `prod-1` or `prod-2` (or both)
+- **THEN** the response contains the single `pod-calls-service` edge from the `prod-1` pod node to the `prod-1/payments-ns/payments` service node (intra-cluster), plus the `service-selects-pod` edges from that service node to each backing pod; a `service-selects-pod` edge whose target pod runs in `prod-2` is cross-cluster, with both endpoint nodes present in `elements.nodes`, and its cross-cluster status derived by comparing the source service node's `labels.cluster` (`"prod-1"`) with the target pod node's `labels.cluster` (`"prod-2"`) — not from any edge label
 
 ### Requirement: Deterministic response body
 
@@ -276,11 +281,11 @@ The serialiser SHALL maintain determinism by sorting `view.Nodes` and `view.Edge
 Every `data` object for a node in the Cytoscape response SHALL expose a top-level `ipaddress` field of type `string[]` with `omitempty` semantics:
 
 - `type="pod"` nodes SHALL carry the pod's IP from `kube_pod_info.pod_ip` (single-element slice) when the source metric surfaces it, and omit the field otherwise.
-- `type="node"` nodes SHALL carry the K8s node's `ExternalIP` from `kube_node_status_addresses` (single-element slice) when present, and omit the field otherwise.
+- `type="node"` nodes SHALL carry the K8s node's `ExternalIP` from `kube_node_status_addresses` (single-element slice) when present, falling back to the node's `InternalIP` (single-element slice) when no ExternalIP row exists, and omit the field only when neither address type is present. An ExternalIP SHALL always win over an InternalIP regardless of upstream sample order.
 - `type="service"` nodes SHALL carry the service's `cluster_ip` from `kube_service_info` (single-element slice) when `cluster_ip` is not `"None"`, and omit the field for headless services (`cluster_ip="None"`) or when the metric does not surface it.
 - `type="pvc"` and `type="external"` nodes SHALL NOT emit the `ipaddress` field.
 
-The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHALL NOT appear on any node entry — they are replaced by the typed `ipaddress` attribute and the node entry respectively.
+The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHALL NOT appear on any node entry — they are replaced by the typed `ipaddress` attribute and the node entry respectively. A `labels.internal_ip` key SHALL NOT appear either — the InternalIP fallback surfaces only via `ipaddress`.
 
 #### Scenario: Pod entry carries pod IP on ipaddress
 
@@ -291,6 +296,16 @@ The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHAL
 
 - **WHEN** `kube_node_status_addresses{type="ExternalIP",address="203.0.113.10"}` is present for a K8s node
 - **THEN** the corresponding `type="node"` entry carries `data.ipaddress: ["203.0.113.10"]` and `data.labels.external_ip` is not present
+
+#### Scenario: Node entry falls back to InternalIP on ipaddress
+
+- **WHEN** a K8s node has no `kube_node_status_addresses{type="ExternalIP"}` row but `kube_node_status_addresses{type="InternalIP",address="10.0.0.7"}` is present
+- **THEN** the corresponding `type="node"` entry carries `data.ipaddress: ["10.0.0.7"]` and neither `data.labels.internal_ip` nor `data.labels.external_ip` is present
+
+#### Scenario: ExternalIP preferred over InternalIP
+
+- **WHEN** a K8s node has both an `ExternalIP` row (`address="203.0.113.10"`) and an `InternalIP` row (`address="10.0.0.7"`) in `kube_node_status_addresses`
+- **THEN** the corresponding `type="node"` entry carries `data.ipaddress: ["203.0.113.10"]`
 
 #### Scenario: Service entry carries cluster IP on ipaddress
 
@@ -304,13 +319,44 @@ The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHAL
 
 #### Scenario: ipaddress omitted when source metric does not surface it
 
-- **WHEN** a pod's `kube_pod_info` series omits `pod_ip`, or a K8s node has no `ExternalIP` row in `kube_node_status_addresses`
+- **WHEN** a pod's `kube_pod_info` series omits `pod_ip`, or a K8s node has neither an `ExternalIP` nor an `InternalIP` row in `kube_node_status_addresses`
 - **THEN** the corresponding node's `data` object does not include an `ipaddress` field
 
 #### Scenario: PVC and external nodes never carry ipaddress
 
 - **WHEN** the response contains nodes of `type="pvc"` or `type="external"`
 - **THEN** those node `data` objects do not include an `ipaddress` field
+
+### Requirement: Node `ready_status` attribute
+
+Every `data` object for a `type="node"` node in the Cytoscape response SHALL expose a top-level `ready_status` field of type `string` with `omitempty` semantics, carrying the node's Kubernetes Ready-condition status derived from `kube_node_status_condition{condition="Ready"}` (see cluster-topology-source Requirement: K8s node Ready-status attribute):
+
+- The value SHALL be exactly one of `"Ready"`, `"NotReady"`, or `"Unknown"`.
+- The field SHALL be omitted entirely when the source metric is absent, when the node has no `condition="Ready"` series, or when no status row is active — a node with no Ready-condition data carries no `ready_status` key, NOT `ready_status: ""` and NOT `ready_status: "Unknown"`.
+- The literal `"Unknown"` SHALL appear only for the genuine Kubernetes state where the Ready condition's `status` label is `unknown` (kubelet not reporting); it is never a stand-in for missing data.
+- `type="pod"`, `type="service"`, `type="pvc"`, and `type="external"` nodes SHALL NOT emit the `ready_status` field.
+
+The Ready status SHALL NOT appear inside `labels` (which remain a strict `map[string]string` of typological metadata) — it is a typed attribute, the same precedent as `ipaddress` and `owner`.
+
+#### Scenario: Ready node carries ready_status
+
+- **WHEN** a K8s node's active `kube_node_status_condition{condition="Ready"}` series carries `status="true"`
+- **THEN** the corresponding `type="node"` entry carries `data.ready_status: "Ready"` and no `ready_status` key in `data.labels`
+
+#### Scenario: NotReady node carries ready_status
+
+- **WHEN** a K8s node's active Ready-condition series carries `status="false"`
+- **THEN** the corresponding `type="node"` entry carries `data.ready_status: "NotReady"`
+
+#### Scenario: Unknown is distinct from omitted
+
+- **WHEN** node A's active Ready-condition series carries `status="unknown"` and node B has no `kube_node_status_condition` series at all
+- **THEN** node A's entry carries `data.ready_status: "Unknown"` while node B's `data` object does not include a `ready_status` field
+
+#### Scenario: Non-node types never carry ready_status
+
+- **WHEN** the response contains nodes of `type="pod"`, `type="service"`, `type="pvc"`, or `type="external"`
+- **THEN** those node `data` objects do not include a `ready_status` field
 
 ### Requirement: API-key authentication on `/v1/*` and `/debug/*`
 
@@ -511,4 +557,51 @@ There is no `pod-runs-on-node` edge. The pod→node relationship SHALL be expres
 
 - **WHEN** the response contains a `type="external"` node
 - **THEN** that node's `data` has no `parent` field, and no cluster group node is synthesised for an endpoint carrying no `cluster` label
+
+### Requirement: Pod `application` and `containers` attributes
+
+Every `data` object for a `type="pod"` node in the Cytoscape response SHALL be
+able to expose two additional top-level attributes with `omitempty` semantics,
+both **outside `labels`** (which stays a strict `map[string]string`):
+
+- `application` — a `string`, the pod's ArgoCD Application name as resolved by the
+  `cluster-topology-source` capability. Emitted only when the pod has a resolved
+  Application; omitted entirely otherwise (never an empty string).
+- `containers` — an array of objects `[{ name: string, image: string }]`, one per
+  container, as resolved by the `cluster-topology-source` capability and ordered
+  deterministically by `(name, image)`. Emitted only when the pod has at least one
+  resolved container; omitted entirely otherwise (never an empty array).
+
+These attributes SHALL appear only on `type="pod"` nodes. `type="node"`,
+`type="pvc"`, `type="service"`, `type="external"`, and the synthesised
+`type="cluster"` / `type="storageclass"` group nodes SHALL NOT emit `application`
+or `containers`. The attributes SHALL NOT appear inside `labels`, and SHALL NOT be
+encoded as numbers or booleans. Because both are `omitempty`, a pod with neither a
+resolved Application nor container info produces a `data` object byte-identical to
+the pre-change shape.
+
+#### Scenario: Pod node carries application when resolved
+
+- **WHEN** the response contains a pod node whose `kube_pod_owner` series carried an `argocd_tracking_id` resolving to Application `checkout`
+- **THEN** the corresponding `type="pod"` node carries `data.application: "checkout"` and `data.labels` contains no `argocd_tracking_id` / `application` key
+
+#### Scenario: Pod node carries containers when resolved
+
+- **WHEN** the response contains a pod node whose `kube_pod_container_info` series listed containers `app` (`reg/app:1.2`) and `sidecar` (`reg/proxy:0.9`)
+- **THEN** the corresponding `type="pod"` node carries `data.containers: [{"name":"app","image":"reg/app:1.2"},{"name":"sidecar","image":"reg/proxy:0.9"}]` ordered by `(name, image)` and `data.labels` contains no container key
+
+#### Scenario: Pod node omits application and containers when unresolved
+
+- **WHEN** the response contains a pod node with no resolved ArgoCD Application and no container info
+- **THEN** the corresponding `type="pod"` node's `data` object includes neither an `application` field nor a `containers` field
+
+#### Scenario: Non-pod nodes never carry application or containers
+
+- **WHEN** the response contains nodes of `type="node"`, `type="pvc"`, `type="service"`, or `type="external"`
+- **THEN** those node `data` objects include neither an `application` field nor a `containers` field
+
+#### Scenario: Deterministic body with new attributes
+
+- **WHEN** the same pod (same Application and container set) is produced by two consecutive builds for the same time bucket
+- **THEN** the pod node's `data.application` and `data.containers` are byte-identical between the two builds, with `data.containers` ordered by `(name, image)`
 

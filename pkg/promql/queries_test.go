@@ -42,7 +42,7 @@ func TestRender_ServiceGraphExcludesSentinelPeers(t *testing.T) {
 
 func TestRender_NodeAddressesIncludesExternalIPSelector(t *testing.T) {
 	got := Render(QNodeAddresses, time.Minute)
-	assert.Contains(t, got, `type="ExternalIP"`)
+	assert.Contains(t, got, `type=~"ExternalIP|InternalIP"`)
 }
 
 // TestRenderer_PrefixApplied covers the additive metric-name prefix knob
@@ -57,7 +57,7 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 	}{
 		{"pod-info", QPodInfo, time.Minute, "last_over_time(o11y_kube_pod_info[1m])"},
 		{"node-info", QNodeInfo, time.Minute, "last_over_time(o11y_kube_node_info[1m])"},
-		{"node-addresses", QNodeAddresses, time.Minute, `last_over_time(o11y_kube_node_status_addresses{type="ExternalIP"}[1m])`},
+		{"node-addresses", QNodeAddresses, time.Minute, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[1m])`},
 		{"pvc-bindings", QPVCBindings, time.Minute, "last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[1m])"},
 		{"node-labels", QNodeLabels, time.Minute, "last_over_time(o11y_kube_node_labels[1m])"},
 		{"service-info", QServiceInfo, time.Minute, "last_over_time(o11y_kube_service_info[1m])"},
@@ -66,6 +66,8 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 		{"pod-owner", QPodOwner, time.Minute, "last_over_time(o11y_kube_pod_owner[1m])"},
 		{"replicaset-owner", QReplicaSetOwner, time.Minute, "last_over_time(o11y_kube_replicaset_owner[1m])"},
 		{"pvc-info", QPVCInfo, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])"},
+		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(o11y_kube_pod_container_info[1m])"},
+		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
 		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
 	}
 	r := Renderer{Prefix: "o11y_"}
@@ -112,6 +114,36 @@ func TestRender_PVCInfoPrefixAware(t *testing.T) {
 		"Query constant stays the bare metric name for stable query/query_name dimensions")
 	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])",
 		Renderer{Prefix: "o11y_"}.Render(QPVCInfo, time.Minute))
+}
+
+// TestRender_PodContainerInfoPrefixAware pins the new kube_pod_container_info
+// query (per-container name/image). It uses tlast_over_time (NOT last_over_time)
+// so each image-variant series carries its last-sample timestamp as the value,
+// letting the resolver pick the latest image per container. The Query constant
+// stays the bare metric name (stable self-metric dimension); prefix-aware via
+// Renderer like every other KSM-shaped series.
+func TestRender_PodContainerInfoPrefixAware(t *testing.T) {
+	assert.Equal(t, "tlast_over_time(kube_pod_container_info[1m])", Render(QPodContainerInfo, time.Minute))
+	assert.Equal(t, "kube_pod_container_info", string(QPodContainerInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "tlast_over_time(o11y_kube_pod_container_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QPodContainerInfo, time.Minute))
+}
+
+// TestRender_NodeStatusConditionPrefixAware pins the new
+// kube_node_status_condition query: bare by default (stable self-metric
+// dimension), prefix-aware via Renderer, and carrying the fixed condition="Ready"
+// metric-selection contract (not a caller filter) — the four other node
+// conditions are never surfaced.
+func TestRender_NodeStatusConditionPrefixAware(t *testing.T) {
+	got := Render(QNodeStatusCondition, time.Minute)
+	assert.Equal(t, `last_over_time(kube_node_status_condition{condition="Ready"}[1m])`, got)
+	assert.Contains(t, got, `condition="Ready"`)
+	assert.NotContains(t, got, "cluster=~", "PromQL must not push cluster filtering")
+	assert.Equal(t, "kube_node_status_condition", string(QNodeStatusCondition),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`,
+		Renderer{Prefix: "o11y_"}.Render(QNodeStatusCondition, time.Minute))
 }
 
 func TestFormatDuration(t *testing.T) {

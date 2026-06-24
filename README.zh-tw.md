@@ -23,7 +23,7 @@ cluster N: kube-state-metrics ──┤
 - Join 成多叢集圖，節點鍵為帶叢集範圍的 pod UID 與 node 名稱。
 - 回傳 Cytoscape.js JSON（`/v1/graph`）。
 - 提供叢集探索（`/v1/clusters`）與靜態邊類型目錄（`/v1/edge-types`）。
-- 每次請求都重新建圖——v1 **不附帶 in-process result cache、singleflight，也不發 HTTP cache validator**（無 `ETag` / `If-None-Match` / `304`）。後續分散式部署的水平擴展 cache 機制留待另案。`start` / `end` 接受 RFC 3339 或 Unix 秒，server 僅強制 `end > start`，其後原樣 pass through 給上游 PromQL——**不做** bucketing、alignment、視窗上限或未來時間擋板；bounded query cost 交由 VictoriaMetrics 搜尋限制負責。序列化輸出為確定性 body，僅含 `apiVersion`、`clusters`、`elements`；pod／node／service 的 IP 在頂層 `ipaddress`，不在 `labels`。
+- 每次請求都重新建圖——v1 **不附帶 in-process result cache、singleflight，也不發 HTTP cache validator**（無 `ETag` / `If-None-Match` / `304`）。後續分散式部署的水平擴展 cache 機制留待另案。`start` / `end` 接受 RFC 3339 或 Unix 秒，server 僅強制 `end > start`，其後原樣 pass through 給上游 PromQL——**不做** bucketing、alignment、視窗上限或未來時間擋板；bounded query cost 交由 VictoriaMetrics 搜尋限制負責。序列化輸出為確定性 body，僅含 `apiVersion`、`clusters`、`elements`；pod／node／service 的 IP 在頂層 `ipaddress`，不在 `labels`。Pod 另帶具型別的 `data` 屬性——`owner`（`{kind, name}`）、`application`（ArgoCD 應用）、`containers`（`[{name, image}]`）——皆 `omitempty` 且絕不在 `labels`。
 
 ## 快速開始
 
@@ -54,18 +54,23 @@ curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
 | `kube_pod_info` | Pod 節點（`node` 標籤驅動 Cytoscape compound nesting） | `cluster`, `namespace`, `pod`, `uid`, `node`, `pod_ip`（→ `data.ipaddress`；不匯出 `host_ip`） | **是** |
 | `kube_node_info` | K8s node 節點 | `cluster`, `node` | **是** |
 | `kube_node_status_addresses{type="ExternalIP"}` | Node 外部 IP（→ `data.ipaddress`） | `cluster`, `node`, `address` | 選填 |
+| `kube_node_status_condition{condition="Ready"}` | Node Ready 狀態 `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`}，取 active（`status` 值為 1）那列；無 Ready 資料則省略——與 `Unknown`（kubelet 失聯）有別 | `cluster`, `node`, `condition`, `status` | 選填（缺則無 `data.ready_status`）；屬 KSM 預設 |
 | `kube_node_labels` | 傳遞 node 標籤（`kubernetes.io/*` 等） | `cluster`, `node`, `label_*` | 選填 |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC 節點、`pod-mounts-pvc` 邊 | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | 選填（無 PVC 則無相關節點／邊） |
+| `kube_pod_owner` | Pod controller-owner `data.owner` = `{kind, name}`（ReplicaSet 上溯至 Deployment；無 controller 則省略）；並經 `argocd_tracking_id` 標籤產生 `data.application`（取首個 `:` 前的片段） | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller`, `argocd_tracking_id` | 選填（缺則無 `data.owner`）。`argocd_tracking_id` 為**營運者提供**（如 `--metric-labels-allowlist`／relabel），非 KSM 預設；缺則無 `data.application` |
+| `kube_pod_container_info` | Pod 容器清單 `data.containers` = `[{name, image}]`，依 `(name, image)` 排序；視窗內換 image 時每容器取最新觀測到的 image | `cluster`, `namespace`, `pod`, `container`, `image` | 選填（缺則無 `data.containers`）；屬 KSM 預設 |
 
-各指標以 `last_over_time(<metric>[<window>]) @ <end>` 包裝，反映請求視窗 `[start, end]` 內最後觀測值。
+各指標以 `last_over_time(<metric>[<window>]) @ <end>` 包裝，反映請求視窗 `[start, end]` 內最後觀測值——惟 `kube_pod_container_info` 改用 `tlast_over_time(...)`，使每條 per-image series 帶其最後 sample 時間戳,供解析器挑出每容器最新的 image（近期視窗準確；遠期視窗的限制見 `design.md` D-A4）。
+
+> 註：上表為精簡版,尚缺數個既有指標列（`kube_replicaset_owner`、`kube_persistentvolumeclaim_info`、`kube_service_info`、`kube_endpointslice_*`）——完整清單以英文 [README.md](README.md) 為準。
 
 ### Service graph 指標 — 由 [Tempo](https://grafana.com/docs/tempo/latest/metrics-generator/service_graphs/) 或相容產生器產出
 
 | 指標 | 用途 | 會讀的標籤 | 必填？ |
 |---|---|---|---|
-| `traces_service_graph_request_total` | `pod-calls-pod` / `pod-calls-service` 邊（叢集內與跨叢集） | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` 等 | 選填（無 series 則無呼叫邊） |
+| `traces_service_graph_request_total` | `pod-calls-pod`（叢集內／跨叢集）、`pod-calls-service`（叢集內）、`service-selects-pod`（可跨叢集）邊 | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` 等 | 選填（無 series 則無呼叫邊） |
 
-以 `rate(traces_service_graph_request_total[<window>]) @ <end>` 評估。每條 series 帶單一 `cluster` external label，代表追蹤來源（通常是執行 Tempo metrics-generator 的 cluster），即呼叫的 **client 端** cluster。**Server 端** cluster 由 build 時把 `server_k8s_pod_uid` 對全域 topology pod-UID index join 還原——K8s pod UID 在實務上跨 cluster 唯一，lookup 可明確還原。僅在兩端都能解析時才輸出邊。當某端的 pod-UID 標籤為空時，會用內建的**連線字串判斷**（無旗標可調）解析其 `client`／`server` 人類可讀標籤：含字面 `://` 的標籤視為 URL——叢集內 `<service>.<namespace>.svc` 名稱會成為 `type="service"` 節點（並隨需產生指向其後端 pod 的 `service-selects-pod` fan-out 邊），呼叫邊類型為 `pod-calls-service`。headless 的 `<pod>.<service>.<namespace>.svc` 名稱會解析為**相同的** service 節點（丟棄前導 pod-hostname）並以相同方式 fan-out——`://` endpoint 永不為特定 pod。無法解析的 URL 則成為 `external` 節點；非 URL（不含 `://`）的標籤則經 missing pod-UID human-label fallback 亦成為 `external` 節點。
+以 `rate(traces_service_graph_request_total[<window>]) @ <end>` 評估。每條 series 帶單一 `cluster` external label，代表追蹤來源（通常是執行 Tempo metrics-generator 的 cluster），即呼叫的 **client 端** cluster。**Server 端** cluster 由 build 時把 `server_k8s_pod_uid` 對全域 topology pod-UID index join 還原——K8s pod UID 在實務上跨 cluster 唯一，lookup 可明確還原。僅在兩端都能解析時才輸出邊。當某端的 pod-UID 標籤為空時，會用內建的**連線字串判斷**（無旗標可調）解析其 `client`／`server` 人類可讀標籤：含字面 `://` 的標籤視為 URL——叢集內 `<service>.<namespace>.svc` 名稱會解析為**呼叫端自己 cluster 中的單一** `type="service"` 節點（因此 `pod-calls-service` 永遠為叢集內），前提是該 cluster 持有同名 Service。該 service 節點再隨需 fan-out `service-selects-pod` 邊，指向**同 family 中每個持有同名 Service 的 cluster** 的後端 pod——因此 `service-selects-pod` **可跨叢集**，對應多叢集 service mesh 的端點聚合（cluster 名稱在壓縮數字串後相同即同 family，例如 `prod-1` ↔ `prod-2`）。headless 的 `<pod>.<service>.<namespace>.svc` 名稱會解析為**相同的** service 節點（丟棄前導 pod-hostname）——`://` endpoint 永不為特定 pod。無法解析的 URL、或呼叫端 cluster 未持有該 Service 時，則成為 `external` 節點；非 URL（不含 `://`）的標籤則經 missing pod-UID human-label fallback 亦成為 `external` 節點。
 
 `servicegraph` connector 產生的**虛擬節點**——`client="user"`（未被 instrument 的呼叫端）與 `unknown`（無法解析的對端）——會在 query 層直接排除（`client!~"user|unknown",server!~"user|unknown"`），不會出現為任何節點或邊。比對為精確且大小寫敏感，因此 host 只是「包含」`user` 的 `://` 連線字串不受影響。
 

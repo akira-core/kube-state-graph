@@ -82,6 +82,26 @@ func TestSlogHandler_TraceCorrelation(t *testing.T) {
 	require.NotContains(t, line, "trace_id")
 }
 
+// TestInit_ErrorPathReturnsCallableShutdown forces Init's buildResource error
+// path via a malformed OTEL_RESOURCE_ATTRIBUTES (a pair with no `=` makes the
+// fromEnv resource detector fail) and asserts the returned Providers still
+// carries a callable no-op Shutdown — main calls Shutdown unconditionally even
+// when it treated the Init error as non-fatal.
+func TestInit_ErrorPathReturnsCallableShutdown(t *testing.T) {
+	clearOTELEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "missing-equals-sign")
+
+	providers, err := Init(t.Context(), "test")
+	require.Error(t, err, "malformed OTEL_RESOURCE_ATTRIBUTES must surface an Init error")
+	require.NotNil(t, providers.Shutdown, "error-path Providers must carry a callable Shutdown")
+	require.NoError(t, providers.Shutdown(context.Background()))
+
+	// Also safe with an already-cancelled context (mirrors SIGTERM teardown).
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, providers.Shutdown(cancelled))
+}
+
 func clearOTELEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{

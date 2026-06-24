@@ -89,6 +89,45 @@ func TestGraphEndpoint_HappyPath(t *testing.T) {
 	assert.Empty(t, nodeIPs, "happy fixture provides no ExternalIP for the node")
 }
 
+// TestGraphEndpoint_NodeInternalIPFallback — a node whose only
+// kube_node_status_addresses rows are InternalIP surfaces that address on
+// data.ipaddress; no IP ever appears in labels.
+func TestGraphEndpoint_NodeInternalIPFallback(t *testing.T) {
+	fixtures := happyFixtures()
+	fixtures["last_over_time(kube_node_status_addresses"] = vec(map[string]string{
+		"cluster": "test",
+		"node":    "node-a",
+		"type":    "InternalIP",
+		"address": "10.0.0.7",
+	})
+	s := newServerWithMocks(t, newMockQuerier(t, fixtures), nil)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	end := time.Now().UTC()
+	start := end.Add(-15 * time.Minute)
+	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+
+	var nodeIPs []string
+	for _, n := range body.Elements.Nodes {
+		if n.Data.Type == "node" {
+			nodeIPs = n.Data.IPAddress
+			_, hasInternalIP := n.Data.Labels["internal_ip"]
+			_, hasExternalIP := n.Data.Labels["external_ip"]
+			assert.False(t, hasInternalIP, "labels.internal_ip must not be emitted")
+			assert.False(t, hasExternalIP, "labels.external_ip must not be emitted")
+		}
+	}
+	assert.Equal(t, []string{"10.0.0.7"}, nodeIPs,
+		"InternalIP must surface on data.ipaddress when no ExternalIP exists")
+}
+
 func TestGraphEndpoint_OutsideRetention_ReturnsError(t *testing.T) {
 	// All topology queries return empty + up probe returns one sample
 	// → outside_retention.

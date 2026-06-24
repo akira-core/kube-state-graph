@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -78,10 +79,19 @@ func run() error {
 		"api_timeout", cfg.APITimeout,
 		"metric_prefix", cfg.MetricPrefix,
 		"otlp_enabled", telemetryProviders.Enabled,
+		// Boolean only — the credential values themselves are never logged.
+		"prom_basic_auth", cfg.PromUsername != "",
 	)
 
 	metrics := observability.NewMetrics()
-	promClient, err := promql.New(cfg.PromURL, metrics)
+	// Upstream basic auth is env-only (KSG_PROM_USERNAME / KSG_PROM_PASSWORD);
+	// config.Validate guarantees the pair is set together or not at all. The
+	// startup log above must never carry the credential values.
+	var promOpts []promql.Option
+	if cfg.PromUsername != "" {
+		promOpts = append(promOpts, promql.WithBasicAuth(cfg.PromUsername, cfg.PromPassword))
+	}
+	promClient, err := promql.New(cfg.PromURL, metrics, promOpts...)
 	if err != nil {
 		return fmt.Errorf("promql client: %w", err)
 	}
@@ -120,17 +130,32 @@ func run() error {
 		return err
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The drain window must cover the slowest legitimate in-flight request, so
+	// derive it from the server's own WriteTimeout (with a 10s floor for very
+	// short build timeouts) instead of re-deriving the formula.
+	shutdownTimeout := max(httpSrv.WriteTimeout, 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// Telemetry shutdown MUST run even when the HTTP drain fails — otherwise
+	// buffered OTLP spans/logs are dropped. Collect both errors.
+	var errs []error
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+		logger.Error("http server shutdown failed", "err", err)
+		errs = append(errs, fmt.Errorf("shutdown: %w", err))
 	}
-	if err := telemetryProviders.Shutdown(shutdownCtx); err != nil {
+	// The telemetry flush gets its OWN budget: a timed-out drain has exhausted
+	// shutdownCtx, and the OTel SDK Shutdowns bail immediately on an expired
+	// context — exporting nothing in exactly the abnormal-shutdown case whose
+	// spans/logs matter most (including the drain-failure record just emitted).
+	telCtx, telCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer telCancel()
+	if err := telemetryProviders.Shutdown(telCtx); err != nil {
 		// Bypass the slog OTLP bridge — providers are tearing down.
 		fmt.Fprintf(os.Stderr, "otlp shutdown timed out: %v\n", err)
-		return fmt.Errorf("otlp shutdown: %w", err)
+		errs = append(errs, fmt.Errorf("otlp shutdown: %w", err))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // loadAPIKeys returns a populated KeySet (file or CSV) or an empty one when
@@ -169,9 +194,34 @@ func reloadAPIKeys(ctx context.Context, ks *auth.KeySet, path string, interval t
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := ks.LoadFile(path); err != nil {
-				logger.Error("api keys reload failed", "path", path, "err", err)
-			}
+			reloadAPIKeysOnce(ks, path, logger)
 		}
+	}
+}
+
+// reloadAPIKeysOnce performs one reload tick. It runs on a bare goroutine
+// with no recover above it, so a panic here would kill the whole process —
+// recover, log, and let the next tick retry instead.
+func reloadAPIKeysOnce(ks *auth.KeySet, path string, logger *slog.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("api keys reload panicked",
+				"path", path,
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	// ReloadFile fails closed: an empty/comment-only/truncated file cannot
+	// wipe a non-empty active set — the error below then surfaces every
+	// interval until the file is fixed. The changed flag is set-based, so the
+	// common same-count rotation (N old keys → N new keys) still logs.
+	changed, err := ks.ReloadFile(path)
+	if err != nil {
+		logger.Error("api keys reload failed", "path", path, "err", err)
+		return
+	}
+	if changed {
+		logger.Info("api keys reloaded", "path", path, "keys", ks.Snapshot())
 	}
 }
