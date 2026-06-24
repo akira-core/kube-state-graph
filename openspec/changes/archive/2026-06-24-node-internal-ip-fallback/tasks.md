@@ -11,10 +11,10 @@
 
 ## 3. API surface verification
 
-- [ ] 3.1 Component test in `internal/api`: node `data.ipaddress` carries InternalIP fallback; `labels.internal_ip` / `labels.external_ip` never emitted; refresh goldens only if fixtures change
-- [ ] 3.2 Integration fixture in `internal/integration`: add InternalIP series (one node InternalIP-only, one node both) and assert emitted `ipaddress`
+- [x] 3.1 Component test in `internal/api`: node `data.ipaddress` carries InternalIP fallback; `labels.internal_ip` / `labels.external_ip` never emitted; refresh goldens only if fixtures change
+- [x] 3.2 Integration fixture in `internal/integration`: add InternalIP series (one node InternalIP-only, one node both) and assert emitted `ipaddress`
 
 ## 4. Docs / spec sync
 
-- [ ] 4.1 Update CLAUDE.md `ipaddress` load-bearing rule (K8sNode: ExternalIP, falls back to InternalIP) and `pkg/graph/node.go` doc comment
-- [ ] 4.2 Run `make build vet lint test`; `openspec verify "node-internal-ip-fallback"`
+- [x] 4.1 Update CLAUDE.md `ipaddress` load-bearing rule (K8sNode: ExternalIP, falls back to InternalIP) and `pkg/graph/node.go` doc comment
+- [x] 4.2 Run `make build vet lint test`; `openspec validate "node-internal-ip-fallback"` (`openspec verify` is not a subcommand in this CLI version — `validate` is the equivalent)
