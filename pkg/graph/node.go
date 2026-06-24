@@ -18,8 +18,8 @@ const (
 // Implementations expose the canonical wire fields directly so the API
 // serialiser can iterate without type switches. IPAddress carries the
 // observed IPv4/IPv6 strings for nodes that have them (pods → pod_ip,
-// K8s nodes → ExternalIP, services → cluster_ip); other node kinds
-// return nil.
+// K8s nodes → ExternalIP, falling back to InternalIP when no ExternalIP
+// row exists; services → cluster_ip); other node kinds return nil.
 type GraphNode interface {
 	ID() string
 	Name() string
