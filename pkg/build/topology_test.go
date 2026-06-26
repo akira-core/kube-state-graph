@@ -736,6 +736,30 @@ func TestResolveServiceApplications(t *testing.T) {
 	assert.Equal(t, "checkout", tp.ServiceApplications[serviceKey{"c", "shop", "checkout"}])
 }
 
+// TestResolveApplications_MalformedSiblingDoesNotSuppressValid — when one series
+// for a key has an empty leading segment (":apps/...", which derives to "") and a
+// sibling is valid, the valid Application must survive. The malformed value sorts
+// lexically below the valid one (':' = 0x3A < letters), so a naive smallest-raw
+// pick would let it win and then drop the key — this guards against that.
+func TestResolveApplications_MalformedSiblingDoesNotSuppressValid(t *testing.T) {
+	ann := func(svc, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop", "service": model.LabelValue(svc),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+	fwd := resolveServiceApplications(sampleVec(
+		ann("checkout", ":apps/Deployment:shop/x"),                // malformed: empty leading segment
+		ann("checkout", "checkout:apps/Deployment:shop/checkout"), // valid
+	), missingClusterCounts{})
+	rev := resolveServiceApplications(sampleVec(
+		ann("checkout", "checkout:apps/Deployment:shop/checkout"),
+		ann("checkout", ":apps/Deployment:shop/x"),
+	), missingClusterCounts{})
+	assert.Equal(t, "checkout", fwd[serviceKey{"c", "shop", "checkout"}], "valid Application survives a malformed sibling")
+	assert.Equal(t, fwd[serviceKey{"c", "shop", "checkout"}], rev[serviceKey{"c", "shop", "checkout"}], "order-independent")
+}
+
 // TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's
 // active condition="Ready" row sets each K8s node's typed ready_status:
 // true→Ready, false→NotReady, unknown→Unknown. A node with no Ready series omits

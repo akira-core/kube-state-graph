@@ -907,7 +907,13 @@ func resolveApplications[K comparable](vec model.Vector, label string, keyOf fun
 	out := make(map[K]string, len(vec))
 	for _, s := range vec {
 		raw := string(s.Metric[model.LabelName(label)])
-		if raw == "" {
+		// Skip a value whose derived Application would be empty — an empty
+		// tracking-id, or an empty leading segment like ":apps/..." — BEFORE the
+		// min-pick. Otherwise a malformed sibling could win the lexically-smallest
+		// race (':' = 0x3A sorts below every letter/digit) and suppress a valid
+		// Application for the same key. Among the surviving (non-empty-app) series
+		// the smallest raw tracking-id still wins (the documented tie-break).
+		if raw == "" || argoAppName(raw) == "" {
 			continue
 		}
 		key, ok := keyOf(s.Metric)
@@ -918,13 +924,9 @@ func resolveApplications[K comparable](vec model.Vector, label string, keyOf fun
 			out[key] = raw
 		}
 	}
+	// Every surviving raw has a non-empty Application; derive it in place.
 	for key, raw := range out {
-		app := argoAppName(raw)
-		if app == "" {
-			delete(out, key)
-			continue
-		}
-		out[key] = app
+		out[key] = argoAppName(raw)
 	}
 	return out
 }

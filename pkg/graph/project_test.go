@@ -240,6 +240,60 @@ func TestProject_NameFilter_MatchesUnreferencedInfraNode(t *testing.T) {
 	assert.False(t, ids["c/worker-0"], "non-named node not pulled in")
 }
 
+// A traversal anchored on a podless infra node (?root=<node>) must still return
+// that node — it is the explicit focus and is in the reachable set, so the
+// reference-pruning must not drop it (else the view would be empty, while a pod
+// root returns at least itself).
+func TestProject_RootAnchorOnPodlessInfraNode(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+	}
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
+
+	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-1"], "podless node used as ?root= anchor must be returned, not pruned to empty")
+
+	// Sanity: rooting at the host node reaches its pod via the pod-to-node reverse edge.
+	v2 := Project(g, Scope{Root: "c/worker-0", Depth: 2, Direction: DirectionBoth})
+	ids2 := map[string]bool{}
+	for _, n := range v2.Nodes {
+		ids2[n.ID()] = true
+	}
+	assert.True(t, ids2["c/worker-0"], "host node root present")
+	assert.True(t, ids2["c/p1"], "pod reached from the node root via pod-to-node")
+}
+
+// The traversal-anchor exception must NOT leak past an active name filter: a
+// ?root=<infra>&name=<other> request drops the infra root (symmetric with a pod
+// root, which the name filter also drops), while ?name=<that-node> admits it.
+func TestProject_RootAnchorRespectsNameFilter(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // podless
+	}
+	g := NewGraph(all, nil, time.Now())
+
+	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"other": {}}})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.False(t, ids["c/worker-1"], "infra root excluded by a non-matching name filter (no leak past ?name=)")
+
+	v2 := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"worker-1": {}}})
+	ids2 := map[string]bool{}
+	for _, n := range v2.Nodes {
+		ids2[n.ID()] = true
+	}
+	assert.True(t, ids2["c/worker-1"], "infra root admitted when the name filter names it")
+}
+
 // multiClusterPodSampleGraph extends sampleGraph with a `payments` pod in
 // cluster-alpha so the `pod=payments` filter can match across clusters
 // (cluster-alpha and cluster-beta) and we can assert AND/OR semantics with

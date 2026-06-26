@@ -121,6 +121,12 @@ func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[strin
 			continue
 		}
 		out[id] = n
+		// The reference sets feed only the default infra-admission path; under a
+		// name filter infraNodePassesFilters returns on the name branch and never
+		// consults them, so skip the population work entirely.
+		if scope.NameFilterActive() {
+			continue
+		}
 		switch n.Type() {
 		case NodeTypePod:
 			if hn := n.Labels()["node"]; hn != "" {
@@ -193,12 +199,20 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 // connected to in-scope workload — a node hosting no in-scope pod (and a
 // StorageClass backing no in-scope PVC) is dropped, not surfaced as an orphan.
 //
-// The ONE exception is an explicit name filter: ?name=<infra-node> matches the
-// node by Name() and admits it regardless of whether it is referenced (a node
-// with zero pods, or a StorageClass with zero PVCs, is still directly
-// queryable). A name filter that does not name this node drops it here; if it is
-// instead the host of a named pod (or backs a named PVC), it re-enters the view
-// as that edge's re-added partner in filterEdges, not via this predicate.
+// Two exceptions admit an infra node that is referenced by nothing, applied in
+// this order so ?root= and ?name= compose consistently across node kinds:
+//   - a name filter narrows FIRST: a ?name= request admits the node iff its
+//     Name() is named — so ?root=<infra>&name=<other> drops the infra root just
+//     as it drops a pod root, not leaking the anchor past the name filter; then
+//   - the explicit traversal anchor (scope.Root) is admitted when no name filter
+//     narrows it — a ?root=<infra-node> request focuses on that exact node, and
+//     traverse() already selected it as reachable, so it must not be pruned as
+//     an "orphan" (a podless K8s node or PVC-less StorageClass used as the root
+//     would otherwise yield an EMPTY view).
+//
+// A name filter that does not name this node drops it here; if it is instead the
+// host of a named pod (or backs a named PVC), it re-enters the view as that
+// edge's re-added partner in filterEdges, not via this predicate.
 //
 // The cluster filter applies first and exactly as for other node types (the
 // node's own labels carry cluster). See design.md D6.
@@ -209,13 +223,19 @@ func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]stru
 			return false
 		}
 	}
-	// Explicit name match is the exception — a named infra node surfaces even
-	// when referenced by no in-scope element.
+	// Name filter narrows FIRST — a non-matching name drops even the traversal
+	// anchor, symmetric with a pod root (which nodePassesFilters drops on a
+	// non-matching name), so ?root= and ?name= compose consistently.
 	if scope.NameFilterActive() {
 		_, named := scope.Names[n.Name()]
 		return named
 	}
-	// Default (no name filter): admit iff referenced by an in-scope element.
+	// The explicit traversal anchor is admitted when no name filter narrows it
+	// (it is the focus of the query and is already in the reachable set).
+	if scope.Root != "" && n.ID() == scope.Root {
+		return true
+	}
+	// Default: admit iff referenced by an in-scope element.
 	_, ok := referenced[n.ID()]
 	return ok
 }
