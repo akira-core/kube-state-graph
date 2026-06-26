@@ -2,9 +2,12 @@
 // into the deterministic Cytoscape.js response body served at /v1/graph. It is
 // part of the reusable graph engine: an embedding application calls Serialise
 // to obtain the exact same wire shape kube-state-graph emits, with no HTTP or
-// JSON round-trip. The serialiser is presentation-only — it adds synthetic
-// cluster group nodes and data.parent compound nesting (design.md D31) without
-// touching the core graph types.
+// JSON round-trip. The serialiser is presentation-only — it synthesises the
+// cluster / namespace / application / controller compound group nodes and the
+// data.parent nesting (design.md D6, which supersedes the D31 cluster>node>pod
+// grouping) without touching the core graph types. StorageClass is a real
+// graph node (not synthesised), and the pod→node and pvc→storageclass
+// relationships are edges, not nesting.
 package cytoscape
 
 import (
@@ -38,8 +41,9 @@ type Node struct {
 	Data NodeData `json:"data"`
 }
 
-// NodeData is the serialised form of a graph node (plus synthetic cluster
-// group nodes and the presentation-only parent field).
+// NodeData is the serialised form of a graph node (plus the synthetic cluster /
+// namespace / application / controller group nodes and the presentation-only
+// parent field).
 type NodeData struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
@@ -50,6 +54,8 @@ type NodeData struct {
 	Application string            `json:"application,omitempty"`
 	Containers  []graph.Container `json:"containers,omitempty"`
 	ReadyStatus string            `json:"ready_status,omitempty"`
+	Provisioner string            `json:"provisioner,omitempty"`
+	Parameters  map[string]string `json:"parameters,omitempty"`
 	Labels      map[string]string `json:"labels"`
 }
 
@@ -67,30 +73,42 @@ type EdgeData struct {
 	Labels map[string]string `json:"labels"`
 }
 
-// nodeTypeCluster is the synthetic node type used for Cytoscape compound
-// grouping. Cluster group nodes exist only in the Cytoscape presentation (to
-// satisfy data.parent references); they are not graph.GraphNodes. See
-// design.md D31.
-const nodeTypeCluster = "cluster"
+// Synthetic compound group-node types. These exist only in the Cytoscape
+// presentation (to satisfy data.parent references); they are not
+// graph.GraphNodes. See design.md D6.
+const (
+	nodeTypeCluster     = "cluster"
+	nodeTypeNamespace   = "namespace"
+	nodeTypeApplication = "application"
+	nodeTypeController  = "controller"
+)
 
-// nodeTypeStorageClass is the synthetic node type for the StorageClass compound
-// group. Like cluster groups these exist only in the Cytoscape presentation (to
-// satisfy a PVC's data.parent); they are not graph.GraphNodes. See design.md.
-const nodeTypeStorageClass = "storageclass"
-
-// clusterParentID is the synthetic group-node id for a cluster.
+// Synthetic group-node id constructors. Each id encodes its full ancestry path
+// so the compound tree is unambiguous by construction (a node has exactly one
+// parent) and no data.parent can dangle.
 func clusterParentID(cluster string) string { return "cluster/" + cluster }
 
-// storageClassParentID is the synthetic group-node id for a (cluster,
-// StorageClass) pair. StorageClass names are DNS-1123 subdomains (no "/"), so
-// the id is unambiguous against namespace-scoped PVC ids.
-func storageClassParentID(cluster, sc string) string {
-	return cluster + "/storageclass/" + sc
+func namespaceParentID(cluster, ns string) string {
+	return cluster + "/namespace/" + ns
 }
 
-// scKey identifies a synthesised StorageClass group by its (cluster,
-// StorageClass) pair.
-type scKey struct{ cluster, sc string }
+func applicationParentID(cluster, ns, app string) string {
+	return namespaceParentID(cluster, ns) + "/application/" + app
+}
+
+// controllerParentID nests under the application group when the pod has a
+// resolved Application, else directly under the namespace group.
+func controllerParentID(cluster, ns, app, kind, name string) string {
+	base := namespaceParentID(cluster, ns)
+	if app != "" {
+		base = applicationParentID(cluster, ns, app)
+	}
+	return base + "/controller/" + kind + "/" + name
+}
+
+type nsKey struct{ cluster, ns string }
+type appKey struct{ cluster, ns, app string }
+type ctrlKey struct{ cluster, ns, app, kind, name string }
 
 // Serialise renders a projected view into the deterministic Cytoscape body.
 // The view supplies the in-scope nodes and edges; the response `clusters` field
@@ -102,83 +120,108 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		APIVersion: APIVersion,
 	}
 
-	// Index emitted node ids so a pod's parent (its K8s node) is referenced
-	// only when that node is actually present in elements.nodes — a data.parent
-	// pointing at an absent node would dangle in Cytoscape. Collect the
-	// distinct clusters to synthesise group nodes for.
-	present := make(map[string]struct{}, len(view.Nodes))
+	// Collect the synthetic compound groups to synthesise, derived per node from
+	// its own attributes so each pod independently produces its full parent
+	// chain — the path-encoded ids then make the tree dangling-free. cluster
+	// groups come from every node's cluster; namespace groups from any
+	// pod/service/pvc; application/controller groups from pods only.
 	clusterSeen := map[string]struct{}{}
-	// StorageClass compound groups: one synthetic group node per (cluster,
-	// StorageClass) pair carried by an emitted PVC with a resolved StorageClass.
-	// Derived from the same emitted node set as the cluster groups, so a PVC's
-	// data.parent can never dangle.
-	scSeen := map[scKey]struct{}{}
+	nsSeen := map[nsKey]struct{}{}
+	appSeen := map[appKey]struct{}{}
+	ctrlSeen := map[ctrlKey]struct{}{}
 	for _, n := range view.Nodes {
-		present[n.ID()] = struct{}{}
-		c := n.Labels()["cluster"]
+		labels := n.Labels()
+		c := labels["cluster"]
 		if c != "" {
 			clusterSeen[c] = struct{}{}
 		}
-		if n.Type() == graph.NodeTypePVC {
-			if sc := n.StorageClass(); sc != "" && c != "" {
-				scSeen[scKey{c, sc}] = struct{}{}
+		switch n.Type() {
+		case graph.NodeTypePod:
+			ns := labels["namespace"]
+			if c == "" || ns == "" {
+				continue // synthesised/cluster-less pod: falls back to cluster group
 			}
+			nsSeen[nsKey{c, ns}] = struct{}{}
+			app := n.Application()
+			if app != "" {
+				appSeen[appKey{c, ns, app}] = struct{}{}
+			}
+			if o := n.Owner(); o != nil {
+				ctrlSeen[ctrlKey{c, ns, app, o.Kind, o.Name}] = struct{}{}
+			}
+		case graph.NodeTypeService, graph.NodeTypePVC:
+			if ns := labels["namespace"]; c != "" && ns != "" {
+				nsSeen[nsKey{c, ns}] = struct{}{}
+			}
+		default:
+			// node / storageclass / external: only the cluster group (collected
+			// above) applies; no workload group is derived from them.
 		}
 	}
 
 	// The top-level `clusters` describes the RESPONSE: it lists the clusters
 	// present in the projected view (including cross-cluster partners re-added by
-	// projection), not every cluster in upstream VictoriaMetrics. Under a
-	// `?cluster=` / `?name=` filter this keeps `clusters` consistent with
-	// `elements` instead of advertising clusters with zero nodes in the body.
+	// projection), not every cluster in upstream VictoriaMetrics.
 	sortedClusters := slices.Sorted(maps.Keys(clusterSeen))
 	body.Clusters = append(make([]string, 0, len(sortedClusters)), sortedClusters...)
 
-	body.Elements.Nodes = make([]Node, 0, len(view.Nodes)+len(clusterSeen)+len(scSeen))
+	body.Elements.Nodes = make([]Node, 0,
+		len(view.Nodes)+len(clusterSeen)+len(nsSeen)+len(appSeen)+len(ctrlSeen))
 
-	// Synthetic cluster group nodes first, sorted by name (determinism, D6).
+	// Synthetic group nodes in tier order (cluster, namespace, application,
+	// controller), each tier sorted by id, before the real nodes (determinism, D6).
 	for _, c := range sortedClusters {
-		body.Elements.Nodes = append(body.Elements.Nodes, Node{
-			Data: NodeData{
-				ID:     clusterParentID(c),
-				Name:   c,
-				Type:   nodeTypeCluster,
-				Labels: map[string]string{},
-			},
-		})
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
+			clusterParentID(c), c, nodeTypeCluster, ""))
 	}
-
-	// StorageClass group nodes next, after the cluster groups and before the
-	// real nodes, ordered by (cluster, storageclass) (determinism). Each nests
-	// under its cluster group and carries no labels — its cluster identity lives
-	// in its id and parent.
-	sortedSC := slices.SortedFunc(maps.Keys(scSeen), func(a, b scKey) int {
-		return cmp.Or(cmp.Compare(a.cluster, b.cluster), cmp.Compare(a.sc, b.sc))
+	nsKeys := slices.SortedFunc(maps.Keys(nsSeen), func(a, b nsKey) int {
+		return cmp.Compare(namespaceParentID(a.cluster, a.ns), namespaceParentID(b.cluster, b.ns))
 	})
-	for _, k := range sortedSC {
-		body.Elements.Nodes = append(body.Elements.Nodes, Node{
-			Data: NodeData{
-				ID:     storageClassParentID(k.cluster, k.sc),
-				Name:   k.sc,
-				Type:   nodeTypeStorageClass,
-				Parent: clusterParentID(k.cluster),
-				Labels: map[string]string{},
-			},
-		})
+	for _, k := range nsKeys {
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
+			namespaceParentID(k.cluster, k.ns), k.ns, nodeTypeNamespace, clusterParentID(k.cluster)))
+	}
+	appKeys := slices.SortedFunc(maps.Keys(appSeen), func(a, b appKey) int {
+		return cmp.Compare(applicationParentID(a.cluster, a.ns, a.app), applicationParentID(b.cluster, b.ns, b.app))
+	})
+	for _, k := range appKeys {
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
+			applicationParentID(k.cluster, k.ns, k.app), k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns)))
+	}
+	ctrlKeys := slices.SortedFunc(maps.Keys(ctrlSeen), func(a, b ctrlKey) int {
+		return cmp.Compare(
+			controllerParentID(a.cluster, a.ns, a.app, a.kind, a.name),
+			controllerParentID(b.cluster, b.ns, b.app, b.kind, b.name))
+	})
+	for _, k := range ctrlKeys {
+		parent := namespaceParentID(k.cluster, k.ns)
+		if k.app != "" {
+			parent = applicationParentID(k.cluster, k.ns, k.app)
+		}
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
+			controllerParentID(k.cluster, k.ns, k.app, k.kind, k.name), k.name, nodeTypeController, parent))
 	}
 
 	for _, n := range view.Nodes {
+		var provisioner string
+		var parameters map[string]string
+		if info := n.StorageClassInfo(); info != nil {
+			provisioner = info.Provisioner
+			parameters = info.Parameters
+		}
 		body.Elements.Nodes = append(body.Elements.Nodes, Node{
 			Data: NodeData{
 				ID:          n.ID(),
 				Name:        n.Name(),
 				Type:        string(n.Type()),
-				Parent:      compoundParent(n, present),
+				Parent:      compoundParent(n),
 				IPAddress:   n.IPAddress(),
 				Owner:       n.Owner(),
 				Application: n.Application(),
 				Containers:  n.Containers(),
 				ReadyStatus: n.ReadyStatus(),
+				Provisioner: provisioner,
+				Parameters:  parameters,
 				Labels:      n.Labels(),
 			},
 		})
@@ -199,45 +242,52 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	return body
 }
 
-// compoundParent returns the Cytoscape data.parent for a node, per design D31
-// and the StorageClass grouping design:
+// groupNode builds a synthetic compound group node DTO (labels {}, no ipaddress).
+func groupNode(id, name, typ, parent string) Node {
+	return Node{Data: NodeData{
+		ID:     id,
+		Name:   name,
+		Type:   typ,
+		Parent: parent,
+		Labels: map[string]string{},
+	}}
+}
+
+// compoundParent returns the Cytoscape data.parent for a real node, per the
+// design D6 workload hierarchy:
 //
-//	pod          → its K8s node (labels.node) when present in the view,
-//	               else its cluster group, else "" (unknown cluster)
-//	pvc          → its StorageClass group (<cluster>/storageclass/<sc>) when it
-//	               has a resolved StorageClass, else its cluster group
-//	node/service → its cluster group (cluster/<cluster>)
+//	pod          → its controller group when it has a resolved owner,
+//	               else its application group when it has a resolved Application,
+//	               else its namespace group (skip-absent-levels); a cluster-less
+//	               or namespace-less pod falls back to its cluster group, else ""
+//	service, pvc → its namespace group (cluster > namespace > {service, pvc})
+//	node, sc     → its cluster group (cluster > {node, storageclass})
 //	external     → "" (no cluster identity)
-func compoundParent(n graph.GraphNode, present map[string]struct{}) string {
+//
+// The pod→node and pvc→storageclass relationships are edges, not nesting.
+func compoundParent(n graph.GraphNode) string {
 	labels := n.Labels()
+	c := labels["cluster"]
 	switch n.Type() {
 	case graph.NodeTypePod:
-		// A pod nests under its scheduling K8s node (labels.node) when that node
-		// is present in the view; otherwise it falls through to its cluster group.
-		if node := labels["node"]; node != "" {
-			if _, ok := present[node]; ok {
-				return node
+		if ns := labels["namespace"]; c != "" && ns != "" {
+			app := n.Application()
+			if o := n.Owner(); o != nil {
+				return controllerParentID(c, ns, app, o.Kind, o.Name)
 			}
+			if app != "" {
+				return applicationParentID(c, ns, app)
+			}
+			return namespaceParentID(c, ns)
 		}
-	case graph.NodeTypePVC:
-		// A PVC with a resolved StorageClass nests under its StorageClass group
-		// (cluster > storageclass > pvc); otherwise it falls through to its
-		// cluster group (cluster > pvc). The group node is synthesised from the
-		// same emitted PVC set, so it is guaranteed present — mirroring the
-		// cluster-group invariant.
-		if sc := n.StorageClass(); sc != "" {
-			if c := labels["cluster"]; c != "" {
-				return storageClassParentID(c, sc)
-			}
+	case graph.NodeTypeService, graph.NodeTypePVC:
+		if ns := labels["namespace"]; c != "" && ns != "" {
+			return namespaceParentID(c, ns)
 		}
 	default:
-		// node / service / external: fall through to the cluster-group fallback
-		// below (external carries no cluster label, so it gets no parent).
+		// node / storageclass / external: cluster-group fallback below.
 	}
-	// node / service — and any pod whose node is out of scope, or any PVC with no
-	// StorageClass — nest under their cluster group. external nodes carry no
-	// cluster label (labels={}), so they fall through to no parent.
-	if c := labels["cluster"]; c != "" {
+	if c != "" {
 		return clusterParentID(c)
 	}
 	return ""

@@ -111,7 +111,16 @@
                     "owner": {
                         "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.Owner"
                     },
+                    "parameters": {
+                        "additionalProperties": {
+                            "type": "string"
+                        },
+                        "type": "object"
+                    },
                     "parent": {
+                        "type": "string"
+                    },
+                    "provisioner": {
                         "type": "string"
                     },
                     "ready_status": {
@@ -139,14 +148,18 @@
                     "pod-mounts-pvc",
                     "pod-calls-pod",
                     "pod-calls-service",
-                    "service-selects-pod"
+                    "service-selects-pod",
+                    "pod-to-node",
+                    "pvc-to-storageclass"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
                     "EdgeTypePodMountsPVC",
                     "EdgeTypePodCallsPod",
                     "EdgeTypePodCallsService",
-                    "EdgeTypeServiceSelectsPod"
+                    "EdgeTypeServiceSelectsPod",
+                    "EdgeTypePodToNode",
+                    "EdgeTypePVCToStorageClass"
                 ]
             },
             "github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeDefinition": {
@@ -207,7 +220,8 @@
                     "node",
                     "pvc",
                     "service",
-                    "external"
+                    "external",
+                    "storageclass"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
@@ -215,7 +229,8 @@
                     "NodeTypeK8sNode",
                     "NodeTypePVC",
                     "NodeTypeService",
-                    "NodeTypeExternal"
+                    "NodeTypeExternal",
+                    "NodeTypeStorageClass"
                 ]
             },
             "github_com_marz32one_kube-state-graph_pkg_graph.Owner": {

@@ -933,22 +933,27 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 	s.True(found, "pod-mounts-pvc edge checkout→checkout-data must be present")
 }
 
-// TestPVCStorageClassGroupNesting — ingest a PVC binding plus a matching
-// kube_persistentvolumeclaim_info storageclass against a real VictoriaMetrics,
-// then assert the response carries a type="storageclass" group node and the PVC
-// nests under it (cluster > storageclass > pvc). End-to-end coverage of the
-// StorageClass resolution + compound grouping.
-func (s *GraphSuite) TestPVCStorageClassGroupNesting() {
+// TestPVCStorageClassNodeAndEdge — ingest a PVC binding, its matching
+// kube_persistentvolumeclaim_info storageclass, and a kube_storageclass_info
+// series (provisioner + NetApp/Ceph parameter labels) against a real
+// VictoriaMetrics, then assert the response carries a REAL type="storageclass"
+// node (with typed provisioner/parameters, labels {cluster}, nested under its
+// cluster group), the PVC nests under its NAMESPACE group, and a
+// pvc-to-storageclass edge links them. End-to-end coverage of the new
+// StorageClass design (supersedes the old cluster > storageclass > pvc grouping).
+func (s *GraphSuite) TestPVCStorageClassNodeAndEdge() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="mongo-data",volume="data",test=%q} 1 %d
 # HELP kube_persistentvolumeclaim_info dummy
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="mongo-data",storageclass="gp3-ssd",test=%q} 1 %d
-`, disc, t1, disc, t1))
+# HELP kube_storageclass_info dummy
+kube_storageclass_info{cluster="cluster-alpha",storageclass="gp3-ssd",provisioner="ebs.csi.aws.com",storagePools="aggr1",fsType="ext4",test=%q} 1 %d
+`, disc, t1, disc, t1, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`kube_persistentvolumeclaim_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
-		"VM did not observe ingested kube_persistentvolumeclaim_info")
+		s.WaitForSeries(`kube_storageclass_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_storageclass_info")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -963,25 +968,39 @@ kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persist
 		byID[n.Data.ID] = n.Data
 	}
 
-	grp, ok := byID["cluster-alpha/storageclass/gp3-ssd"]
-	s.Require().True(ok, "storageclass group node must be present")
-	s.Equal("storageclass", grp.Type)
-	s.Equal("gp3-ssd", grp.Name)
-	s.Equal("cluster/cluster-alpha", grp.Parent, "storageclass group nests under its cluster group")
-	s.Empty(grp.Labels, "storageclass group carries no labels")
+	sc, ok := byID["cluster-alpha/storageclass/gp3-ssd"]
+	s.Require().True(ok, "real storageclass node must be present")
+	s.Equal("storageclass", sc.Type)
+	s.Equal("gp3-ssd", sc.Name)
+	s.Equal("cluster/cluster-alpha", sc.Parent, "storageclass node nests under its cluster group")
+	s.Equal(map[string]string{"cluster": "cluster-alpha"}, sc.Labels, "labels stay {cluster}")
+	s.Equal("ebs.csi.aws.com", sc.Provisioner)
+	s.Equal("aggr1", sc.Parameters["pool"])
+	s.Equal("ext4", sc.Parameters["fs"])
 
 	pvc, ok := byID["cluster-alpha/shop/mongo-data"]
 	s.Require().True(ok, "pvc node must be present")
-	s.Equal("cluster-alpha/storageclass/gp3-ssd", pvc.Parent,
-		"pvc nests under its storageclass group (cluster > storageclass > pvc)")
+	s.Equal("cluster-alpha/namespace/shop", pvc.Parent,
+		"pvc nests under its namespace group (pvc→storageclass is an edge now)")
 	_, hasLabel := pvc.Labels["storageclass"]
 	s.False(hasLabel, "storageclass must not leak into pvc labels")
+
+	var found bool
+	for _, e := range body.Elements.Edges {
+		if e.Data.Type == "pvc-to-storageclass" &&
+			e.Data.Source == "cluster-alpha/shop/mongo-data" &&
+			e.Data.Target == "cluster-alpha/storageclass/gp3-ssd" {
+			found = true
+		}
+	}
+	s.True(found, "expected a pvc-to-storageclass edge from the PVC to the StorageClass node")
 }
 
-// TestPVCWithoutStorageClassFallsBackToCluster — a PVC binding with NO matching
-// kube_persistentvolumeclaim_info series nests directly under its cluster group
-// (cluster > pvc), exercising the graceful-degradation path end-to-end.
-func (s *GraphSuite) TestPVCWithoutStorageClassFallsBackToCluster() {
+// TestPVCWithoutStorageClassNestsUnderNamespace — a PVC binding with NO matching
+// kube_persistentvolumeclaim_info series nests under its NAMESPACE group and
+// emits no pvc-to-storageclass edge, exercising the graceful-degradation path
+// end-to-end.
+func (s *GraphSuite) TestPVCWithoutStorageClassNestsUnderNamespace() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
@@ -1007,8 +1026,16 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 		}
 	}
 	s.Require().NotNil(pvc, "pvc node must be present")
-	s.Equal("cluster/cluster-alpha", pvc.Parent,
-		"a PVC with no resolved StorageClass falls back to its cluster group")
+	s.Equal("cluster-alpha/namespace/shop", pvc.Parent,
+		"a PVC with no resolved StorageClass nests under its namespace group")
+	// This class-less PVC emits no pvc-to-storageclass edge of its own (other
+	// PVCs in the shared suite topology may have StorageClasses, so the check is
+	// scoped to this PVC's id).
+	for _, e := range body.Elements.Edges {
+		if e.Data.Source == "cluster-alpha/shop/legacy-data" {
+			s.NotEqual("pvc-to-storageclass", e.Data.Type, "no pvc-to-storageclass edge for a class-less PVC")
+		}
+	}
 }
 
 // TestMetricPrefix_ResolvesPrefixedSeries covers design.md D26 end-to-end

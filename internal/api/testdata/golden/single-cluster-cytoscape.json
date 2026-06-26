@@ -15,6 +15,15 @@
       },
       {
         "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
           "id": "cluster-alpha/worker-0",
           "name": "worker-0",
           "type": "node",
@@ -29,7 +38,7 @@
           "id": "cluster-alpha/p1",
           "name": "checkout",
           "type": "pod",
-          "parent": "cluster-alpha/worker-0",
+          "parent": "cluster-alpha/namespace/shop",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "shop",

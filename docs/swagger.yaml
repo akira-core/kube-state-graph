@@ -74,7 +74,13 @@ components:
           type: string
         owner:
           $ref: '#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.Owner'
+        parameters:
+          additionalProperties:
+            type: string
+          type: object
         parent:
+          type: string
+        provisioner:
           type: string
         ready_status:
           type: string
@@ -94,12 +100,16 @@ components:
       - pod-calls-pod
       - pod-calls-service
       - service-selects-pod
+      - pod-to-node
+      - pvc-to-storageclass
       type: string
       x-enum-varnames:
       - EdgeTypePodMountsPVC
       - EdgeTypePodCallsPod
       - EdgeTypePodCallsService
       - EdgeTypeServiceSelectsPod
+      - EdgeTypePodToNode
+      - EdgeTypePVCToStorageClass
     github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeDefinition:
       properties:
         description:
@@ -142,6 +152,7 @@ components:
       - pvc
       - service
       - external
+      - storageclass
       type: string
       x-enum-varnames:
       - NodeTypePod
@@ -149,6 +160,7 @@ components:
       - NodeTypePVC
       - NodeTypeService
       - NodeTypeExternal
+      - NodeTypeStorageClass
     github_com_marz32one_kube-state-graph_pkg_graph.Owner:
       properties:
         kind:

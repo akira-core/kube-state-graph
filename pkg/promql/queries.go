@@ -50,6 +50,15 @@ const (
 	// --metric-labels-allowlist required.
 	QPVCInfo Query = "kube_persistentvolumeclaim_info"
 
+	// StorageClass node resolution. KSM-shaped, so prefix-aware via Renderer.
+	// kube_storageclass_info carries the native `provisioner` label plus the
+	// operator-allowlisted NetApp/Ceph parameter labels (storagePools/pool,
+	// fsType/fsName, ClusterID, selector) that materialise the real
+	// type="storageclass" node and its typed provisioner/parameters attributes.
+	// OPTIONAL — absence degrades gracefully to bare StorageClass nodes
+	// (referenced by a PVC but carrying no provisioner/parameters).
+	QStorageClassInfo Query = "kube_storageclass_info"
+
 	// Pod container list resolution. KSM-shaped, so prefix-aware via Renderer.
 	// kube_pod_container_info emits one series per container carrying the
 	// `container` (name) and `image` labels; joined on (cluster, namespace, pod)
@@ -145,6 +154,8 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(%skube_replicaset_owner[%s])`, r.Prefix, w)
 	case QPVCInfo:
 		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_info[%s])`, r.Prefix, w)
+	case QStorageClassInfo:
+		return fmt.Sprintf(`last_over_time(%skube_storageclass_info[%s])`, r.Prefix, w)
 	case QPodContainerInfo:
 		// tlast_over_time (MetricsQL) — value is each series' last-sample timestamp
 		// (unix seconds). A container that changed image in the window has one

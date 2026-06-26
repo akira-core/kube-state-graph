@@ -66,6 +66,7 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 		{"pod-owner", QPodOwner, time.Minute, "last_over_time(o11y_kube_pod_owner[1m])"},
 		{"replicaset-owner", QReplicaSetOwner, time.Minute, "last_over_time(o11y_kube_replicaset_owner[1m])"},
 		{"pvc-info", QPVCInfo, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])"},
+		{"storageclass-info", QStorageClassInfo, time.Minute, "last_over_time(o11y_kube_storageclass_info[1m])"},
 		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(o11y_kube_pod_container_info[1m])"},
 		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
 		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
@@ -114,6 +115,17 @@ func TestRender_PVCInfoPrefixAware(t *testing.T) {
 		"Query constant stays the bare metric name for stable query/query_name dimensions")
 	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])",
 		Renderer{Prefix: "o11y_"}.Render(QPVCInfo, time.Minute))
+}
+
+// TestRender_StorageClassInfoPrefixAware pins the new kube_storageclass_info
+// query: bare by default (stable self-metric dimension), prefix-aware via
+// Renderer like every other KSM-shaped series.
+func TestRender_StorageClassInfoPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_storageclass_info[1m])", Render(QStorageClassInfo, time.Minute))
+	assert.Equal(t, "kube_storageclass_info", string(QStorageClassInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_storageclass_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QStorageClassInfo, time.Minute))
 }
 
 // TestRender_PodContainerInfoPrefixAware pins the new kube_pod_container_info

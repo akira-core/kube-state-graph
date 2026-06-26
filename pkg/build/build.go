@@ -183,6 +183,7 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	// service-graph nodes. Reordering these appends silently flips the
 	// collision winner — see TestAssemble_TopologyWinsIDCollision.
 	total := len(topology.Pods) + len(topology.Nodes) + len(topology.PVCs) +
+		len(topology.StorageClasses) +
 		len(sg.SynthPods) + len(sg.ServiceNodes) + len(sg.ExternalNodes)
 	nodes := make([]graph.GraphNode, 0, total)
 	for _, p := range topology.Pods {
@@ -193,6 +194,9 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	}
 	for _, pv := range topology.PVCs {
 		nodes = append(nodes, pv)
+	}
+	for _, sc := range topology.StorageClasses {
+		nodes = append(nodes, sc)
 	}
 	for _, p := range sg.SynthPods {
 		nodes = append(nodes, p)

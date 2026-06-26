@@ -63,10 +63,11 @@ type EndpointObs struct {
 // Topology is the typed result of reading kube-state-metrics-style series for
 // a single time window across all clusters in scope.
 type Topology struct {
-	Pods    []*graph.PodNode
-	Nodes   []*graph.K8sNode
-	PVCs    []*graph.PVCNode
-	PodPVCs []PodPVCBinding
+	Pods           []*graph.PodNode
+	Nodes          []*graph.K8sNode
+	PVCs           []*graph.PVCNode
+	StorageClasses []*graph.StorageClassNode
+	PodPVCs        []PodPVCBinding
 
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
@@ -121,6 +122,8 @@ type topologyVectors struct {
 	ReplicaSetOwner model.Vector
 	// PVC StorageClass resolution.
 	PVCInfo model.Vector
+	// StorageClass node resolution (provisioner + NetApp/Ceph parameters).
+	StorageClassInfo model.Vector
 	// Pod container list resolution (name/image per container).
 	PodContainerInfo model.Vector
 	// K8s node Ready-status resolution (kube_node_status_condition).
@@ -180,6 +183,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 	g.Go(fetch(promql.QPodOwner, &v.PodOwner))
 	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
 	g.Go(fetch(promql.QPVCInfo, &v.PVCInfo))
+	g.Go(fetch(promql.QStorageClassInfo, &v.StorageClassInfo))
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	if err := g.Wait(); err != nil {
@@ -199,6 +203,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 		string(promql.QPodOwner):               len(v.PodOwner),
 		string(promql.QReplicaSetOwner):        len(v.ReplicaSetOwner),
 		string(promql.QPVCInfo):                len(v.PVCInfo),
+		string(promql.QStorageClassInfo):       len(v.StorageClassInfo),
 		string(promql.QPodContainerInfo):       len(v.PodContainerInfo),
 		string(promql.QNodeStatusCondition):    len(v.NodeStatus),
 	}
@@ -235,6 +240,12 @@ func parseTopology(v topologyVectors) Topology {
 	// can set each PVC's StorageClass (consumed by the Cytoscape serialiser for
 	// compound grouping — never a label, never serialised).
 	pvcStorageClass := resolvePVCStorageClass(v.PVCInfo, mc)
+
+	// StorageClass node attributes (provisioner + NetApp/Ceph parameters) from
+	// kube_storageclass_info, keyed (cluster, storageclass). Built up-front; the
+	// StorageClass nodes are materialised after the PVC slice exists (so a
+	// PVC-referenced-but-absent class can be back-filled bare).
+	scInfo := resolveStorageClassInfo(v.StorageClassInfo, mc)
 
 	// Pod container list + ArgoCD Application resolution. Both feed typed pod
 	// attributes (never labels) set during the per-pod assembly below. The
@@ -525,6 +536,47 @@ func parseTopology(v topologyVectors) Topology {
 		clusters[cluster] = struct{}{}
 	}
 
+	// StorageClass nodes (real, from kube_storageclass_info). Every observed
+	// StorageClass becomes a node; a StorageClass referenced by an emitted PVC
+	// but absent from the info metric is materialised bare (nil InfoValue, no
+	// provisioner/parameters) so its pvc-to-storageclass edge has a target.
+	// Attributed nodes win over bare on the same (cluster, name) via scSeen.
+	// Sorted by ID so the slice — and hence NewGraph keep-first dedup — is a pure
+	// function of the data (D6 determinism).
+	storageClasses := make([]*graph.StorageClassNode, 0, len(scInfo))
+	scSeen := make(map[storageClassKey]bool, len(scInfo))
+	for key, info := range scInfo {
+		storageClasses = append(storageClasses, &graph.StorageClassNode{
+			IDValue:     graph.StorageClassID(key.cluster, key.name),
+			NameValue:   key.name,
+			LabelsValue: map[string]string{"cluster": key.cluster},
+			InfoValue:   info,
+		})
+		scSeen[key] = true
+		clusters[key.cluster] = struct{}{}
+	}
+	for _, pv := range pvcs {
+		sc := pv.StorageClassValue
+		if sc == "" {
+			continue
+		}
+		key := storageClassKey{pv.LabelsValue["cluster"], sc}
+		if scSeen[key] {
+			continue
+		}
+		scSeen[key] = true
+		storageClasses = append(storageClasses, &graph.StorageClassNode{
+			IDValue:     graph.StorageClassID(key.cluster, key.name),
+			NameValue:   key.name,
+			LabelsValue: map[string]string{"cluster": key.cluster},
+			InfoValue:   nil,
+		})
+		clusters[key.cluster] = struct{}{}
+	}
+	sort.SliceStable(storageClasses, func(i, j int) bool {
+		return storageClasses[i].ID() < storageClasses[j].ID()
+	})
+
 	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.
 	servicesByNameNS := map[serviceKey]ServiceObs{}
 	for _, s := range v.Service {
@@ -603,6 +655,7 @@ func parseTopology(v topologyVectors) Topology {
 		Pods:               pods,
 		Nodes:              nodes,
 		PVCs:               pvcs,
+		StorageClasses:     storageClasses,
 		PodPVCs:            bindings,
 		PodsByUID:          podsByUID,
 		ServicesByNameNS:   servicesByNameNS,
@@ -832,6 +885,88 @@ func resolvePVCStorageClass(vec model.Vector, mc missingClusterCounts) map[pvcKe
 			continue
 		}
 		out[key] = sc
+	}
+	return out
+}
+
+// storageClassKey identifies a StorageClass by its cluster-scoped name. The
+// name is cluster-scoped (StorageClass names are not globally unique).
+type storageClassKey struct{ cluster, name string }
+
+// resolveStorageClassInfo builds the (cluster, storageclass) → typed
+// provisioner/parameters index from kube_storageclass_info. The result
+// materialises real StorageClass nodes; it does not enrich any existing node.
+//
+// The `provisioner` parameter comes from the native KSM `provisioner` label.
+// The `parameters` object carries the operator-allowlisted NetApp/Ceph values,
+// each resolved "first non-empty source label wins" PER SERIES
+// (storagePools→pool, fsType→fsName, ClusterID, selector), then the
+// lexically-smallest non-empty value ACROSS series so the emitted node is a
+// pure function of the data (D6 determinism). The native reclaim_policy /
+// volume_binding_mode fields are out of scope and never read.
+//
+// OPTIONAL: an absent or empty vector yields an empty map (all referenced
+// StorageClass nodes are then materialised bare by the caller). The only side
+// effect is tallying missing-cluster samples into the caller's mc accumulator.
+func resolveStorageClassInfo(vec model.Vector, mc missingClusterCounts) map[storageClassKey]*graph.StorageClassInfo {
+	type acc struct {
+		provisioner, pool, fs, clusterID, selector string
+	}
+	pick := func(cur *string, val string) {
+		if val == "" {
+			return
+		}
+		if *cur == "" || val < *cur {
+			*cur = val
+		}
+	}
+	firstNonEmpty := func(primary, fallback string) string {
+		if primary != "" {
+			return primary
+		}
+		return fallback
+	}
+
+	raw := make(map[storageClassKey]*acc, len(vec))
+	for _, s := range vec {
+		name := string(s.Metric["storageclass"])
+		if name == "" {
+			continue
+		}
+		cluster := mc.bucket(promql.QStorageClassInfo, string(s.Metric["cluster"]))
+		key := storageClassKey{cluster, name}
+		a := raw[key]
+		if a == nil {
+			a = &acc{}
+			raw[key] = a
+		}
+		pick(&a.provisioner, string(s.Metric["provisioner"]))
+		pick(&a.pool, firstNonEmpty(string(s.Metric["storagePools"]), string(s.Metric["pool"])))
+		pick(&a.fs, firstNonEmpty(string(s.Metric["fsType"]), string(s.Metric["fsName"])))
+		pick(&a.clusterID, string(s.Metric["ClusterID"]))
+		pick(&a.selector, string(s.Metric["selector"]))
+	}
+
+	out := make(map[storageClassKey]*graph.StorageClassInfo, len(raw))
+	for key, a := range raw {
+		params := map[string]string{}
+		if a.pool != "" {
+			params["pool"] = a.pool
+		}
+		if a.fs != "" {
+			params["fs"] = a.fs
+		}
+		if a.clusterID != "" {
+			params["cluster_id"] = a.clusterID
+		}
+		if a.selector != "" {
+			params["selector"] = a.selector
+		}
+		info := &graph.StorageClassInfo{Provisioner: a.provisioner}
+		if len(params) > 0 {
+			info.Parameters = params
+		}
+		out[key] = info
 	}
 	return out
 }

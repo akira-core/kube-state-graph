@@ -91,16 +91,19 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 
 func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[string]GraphNode {
 	out := make(map[string]GraphNode, len(g.NodesByID))
-	// K8sNode admission is deferred: a K8s node carries no namespace label, so
-	// under a namespace filter it is retained iff some in-scope pod is scheduled
-	// on it (labels.node). We first resolve every other node — recording the
-	// host-node ids of the pods that survived — then admit the K8s nodes that
-	// host one of them. hostNodes is only needed under a namespace filter, so it
-	// is left nil (and unpopulated) otherwise. See design.md D31.
+	// K8sNode and StorageClassNode admission is deferred: neither carries a
+	// namespace label, so under a namespace filter each is retained iff
+	// referenced by an in-scope element — a K8s node hosts an in-scope pod
+	// (labels.node), a StorageClass backs an in-scope PVC (its StorageClass()).
+	// We first resolve every other node — recording the referenced ids — then
+	// admit the deferred infra nodes whose id was referenced. The reference sets
+	// are only needed under a namespace filter, so they are left nil otherwise.
+	// See design.md D6 (supersedes the K8s-node-only D31 rule).
 	var deferred []GraphNode
-	var hostNodes map[string]struct{}
+	var hostNodes, referencedSC map[string]struct{}
 	if len(scope.Namespaces) > 0 {
 		hostNodes = map[string]struct{}{}
+		referencedSC = map[string]struct{}{}
 	}
 	for id, n := range g.NodesByID {
 		if reachable != nil {
@@ -108,23 +111,38 @@ func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[strin
 				continue
 			}
 		}
-		t := n.Type()
-		if t == NodeTypeK8sNode {
+		switch n.Type() {
+		case NodeTypeK8sNode, NodeTypeStorageClass:
 			deferred = append(deferred, n)
 			continue
+		default:
+			// pod / pvc / service / external are admitted directly below.
 		}
 		if !nodePassesFilters(n, scope) {
 			continue
 		}
 		out[id] = n
-		if hostNodes != nil && t == NodeTypePod {
-			if hn := n.Labels()["node"]; hn != "" {
-				hostNodes[hn] = struct{}{}
+		if hostNodes != nil {
+			switch n.Type() {
+			case NodeTypePod:
+				if hn := n.Labels()["node"]; hn != "" {
+					hostNodes[hn] = struct{}{}
+				}
+			case NodeTypePVC:
+				if sc := n.StorageClass(); sc != "" {
+					referencedSC[StorageClassID(n.Labels()["cluster"], sc)] = struct{}{}
+				}
+			default:
+				// other in-scope types reference no deferred infra node.
 			}
 		}
 	}
 	for _, n := range deferred {
-		if !k8sNodePassesFilters(n, scope, hostNodes) {
+		referenced := hostNodes
+		if n.Type() == NodeTypeStorageClass {
+			referenced = referencedSC
+		}
+		if !infraNodePassesFilters(n, scope, referenced) {
 			continue
 		}
 		out[n.ID()] = n
@@ -146,10 +164,11 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 	if len(scope.Namespaces) > 0 {
 		// ExternalNode is cluster-unscoped (no namespace label) and only ever
 		// enters a view as the re-added partner of a pod-calls-pod edge, so it
-		// is exempt from the namespace match. K8sNode is also namespace-less but
-		// is admitted separately by k8sNodePassesFilters (host-of-in-scope-pod
-		// rule), so it never reaches this predicate. Every other node type must
-		// match the requested namespace.
+		// is exempt from the namespace match. K8sNode and StorageClassNode are
+		// also namespace-less but are admitted separately by
+		// infraNodePassesFilters (referenced-by-in-scope rule), so they never
+		// reach this predicate. Every other node type must match the requested
+		// namespace.
 		switch n.Type() {
 		case NodeTypeExternal:
 			// pass-through
@@ -167,14 +186,17 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 	return true
 }
 
-// k8sNodePassesFilters decides whether a K8sNode is admitted to a view. K8s
-// nodes carry no namespace label, so namespace scoping is expressed indirectly:
-// under a namespace filter a node is kept iff hostNodes contains its id — i.e.
-// some pod that survived the namespace filter is scheduled on it (labels.node).
-// With no namespace filter, the node is kept (subject to cluster / name), so
-// the full-topology view still lists every node. cluster and name filters apply
-// exactly as for other node types (a node's own labels carry cluster and name).
-func k8sNodePassesFilters(n GraphNode, scope Scope, hostNodes map[string]struct{}) bool {
+// infraNodePassesFilters decides whether a cluster-scoped infrastructure node
+// (a K8sNode or a StorageClassNode) is admitted to a view. Neither carries a
+// namespace label, so namespace scoping is expressed indirectly: under a
+// namespace filter the node is kept iff `referenced` contains its id — i.e.
+// some in-scope element references it (a pod scheduled on a K8s node via
+// labels.node, or a PVC backed by a StorageClass via its StorageClass()). With
+// no namespace filter, the node is kept (subject to cluster / name), so the
+// full-topology view still lists every infra node. cluster and name filters
+// apply exactly as for other node types (the node's own labels carry cluster,
+// and Name() carries the name). See design.md D6.
+func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
 		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
@@ -187,7 +209,7 @@ func k8sNodePassesFilters(n GraphNode, scope Scope, hostNodes map[string]struct{
 		}
 	}
 	if len(scope.Namespaces) > 0 {
-		if _, ok := hostNodes[n.ID()]; !ok {
+		if _, ok := referenced[n.ID()]; !ok {
 			return false
 		}
 	}

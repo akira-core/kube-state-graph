@@ -14,6 +14,8 @@ const (
 	EdgeTypePodCallsPod       EdgeType = "pod-calls-pod"
 	EdgeTypePodCallsService   EdgeType = "pod-calls-service"
 	EdgeTypeServiceSelectsPod EdgeType = "service-selects-pod"
+	EdgeTypePodToNode         EdgeType = "pod-to-node"
+	EdgeTypePVCToStorageClass EdgeType = "pvc-to-storageclass"
 )
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are

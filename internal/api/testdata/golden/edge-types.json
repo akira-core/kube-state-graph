@@ -78,6 +78,32 @@
           "description": "Namespace of the service and its backing pod (optional)."
         }
       ]
+    },
+    {
+      "type": "pod-to-node",
+      "description": "Pod is scheduled on a Kubernetes node, derived from the pod's `node` label (kube_pod_info). Emitted for every scheduled pod. Always intra-cluster (the node is in the pod's own cluster).",
+      "source_type": [
+        "pod"
+      ],
+      "target_type": [
+        "node"
+      ],
+      "directed": true,
+      "may_cross_cluster": false,
+      "labels": null
+    },
+    {
+      "type": "pvc-to-storageclass",
+      "description": "PVC is provisioned by a StorageClass, derived from the PVC's resolved `storageclass` (kube_persistentvolumeclaim_info) joined to the StorageClass node (kube_storageclass_info, bare-synthesised when absent). Emitted for every PVC with a resolved StorageClass. Always intra-cluster.",
+      "source_type": [
+        "pvc"
+      ],
+      "target_type": [
+        "storageclass"
+      ],
+      "directed": true,
+      "may_cross_cluster": false,
+      "labels": null
     }
   ]
 }

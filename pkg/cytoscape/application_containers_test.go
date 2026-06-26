@@ -55,6 +55,9 @@ func TestSerialiseCytoscape_ApplicationAndContainers(t *testing.T) {
 	assert.Contains(t, s, `"application":"checkout"`)
 	assert.Contains(t, s, `"containers":[{"name":"app","image":"reg/app:1.2"},{"name":"sidecar","image":"reg/proxy:0.9"}]`,
 		"containers serialise as an ordered array of {name, image} objects")
-	assert.Equal(t, 1, strings.Count(s, `"application"`), "application omitted (omitempty) for the bare pod")
-	assert.Equal(t, 1, strings.Count(s, `"containers"`), "containers omitted (omitempty) for the bare pod")
+	// Count the data-field keys specifically: a synthetic application group node
+	// carries "type":"application" but no "application":<value> field, so the
+	// trailing colon isolates the pod attribute from the group-node type.
+	assert.Equal(t, 1, strings.Count(s, `"application":`), "application omitted (omitempty) for the bare pod")
+	assert.Equal(t, 1, strings.Count(s, `"containers":`), "containers omitted (omitempty) for the bare pod")
 }
