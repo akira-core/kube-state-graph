@@ -47,9 +47,17 @@ func TestProperty_NoDanglingParent(t *testing.T) {
 					NameValue:         fmt.Sprintf("claim-%d-%d", c, v),
 					LabelsValue:       map[string]string{"cluster": cl, "namespace": "ns-0"},
 					StorageClassValue: "gp3",
+					// Service/PVC also resolve an Application → they may synthesise an
+					// application group even when no pod carries it; the no-dangling-parent
+					// invariant must still hold (path-encoded ids).
+					ApplicationValue: apps[r.Intn(len(apps))],
 				})
 			}
-			nodes = append(nodes, &graph.ServiceNode{IDValue: graph.ServiceID(cl, "ns-0", "svc"), NameValue: "svc", LabelsValue: map[string]string{"cluster": cl, "namespace": "ns-0"}})
+			nodes = append(nodes, &graph.ServiceNode{
+				IDValue: graph.ServiceID(cl, "ns-0", "svc"), NameValue: "svc",
+				LabelsValue:      map[string]string{"cluster": cl, "namespace": "ns-0"},
+				ApplicationValue: apps[r.Intn(len(apps))],
+			})
 		}
 		nodes = append(nodes, &graph.ExternalNode{IDValue: graph.ExternalID("admin"), NameValue: "admin", LabelsValue: map[string]string{}})
 

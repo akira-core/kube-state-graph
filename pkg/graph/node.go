@@ -33,11 +33,14 @@ type GraphNode interface {
 	// owning Deployment (see build/topology). All other node kinds, and pods
 	// with no controller owner, return nil.
 	Owner() *Owner
-	// Application is the pod's ArgoCD Application name, resolved from the
-	// argocd_tracking_id label on kube_pod_owner (the segment before the first
-	// ":"). Surfaced as a top-level attribute, never inside Labels. Only pods
-	// carry one; every other node kind, and a pod with no ArgoCD Application,
-	// returns "".
+	// Application is the node's ArgoCD Application name (the segment before the
+	// first ":" of the tracking-id value). For pods it is resolved from the
+	// argocd_tracking_id label on kube_pod_owner; for services and PVCs from the
+	// annotation_argocd_argoproj_io_tracking_id label on kube_service_annotations /
+	// kube_persistentvolumeclaim_annotations. Surfaced as a top-level attribute,
+	// never inside Labels. Only pods, services, and PVCs carry one; K8s nodes,
+	// externals, StorageClass nodes, and any pod/service/PVC with no ArgoCD
+	// Application, return "".
 	Application() string
 	// Containers is the pod's container list ({name, image}), resolved from
 	// kube_pod_container_info and ordered by (name, image). Surfaced as a
@@ -168,6 +171,7 @@ type PVCNode struct {
 	NameValue         string
 	LabelsValue       map[string]string
 	StorageClassValue string
+	ApplicationValue  string
 }
 
 func (p *PVCNode) ID() string                          { return p.IDValue }
@@ -176,7 +180,7 @@ func (p *PVCNode) Type() NodeType                      { return NodeTypePVC }
 func (p *PVCNode) Labels() map[string]string           { return p.LabelsValue }
 func (p *PVCNode) IPAddress() []string                 { return nil }
 func (p *PVCNode) Owner() *Owner                       { return nil }
-func (p *PVCNode) Application() string                 { return "" }
+func (p *PVCNode) Application() string                 { return p.ApplicationValue }
 func (p *PVCNode) Containers() []Container             { return nil }
 func (p *PVCNode) ReadyStatus() string                 { return "" }
 func (p *PVCNode) StorageClass() string                { return p.StorageClassValue }
@@ -190,10 +194,11 @@ func (p *PVCNode) isGraphNode()                        {}
 // service's `cluster_ip` (single-element slice) when it is not the headless
 // sentinel `"None"`; headless services carry nil.
 type ServiceNode struct {
-	IDValue        string
-	NameValue      string
-	LabelsValue    map[string]string
-	IPAddressValue []string
+	IDValue          string
+	NameValue        string
+	LabelsValue      map[string]string
+	IPAddressValue   []string
+	ApplicationValue string
 }
 
 func (s *ServiceNode) ID() string                          { return s.IDValue }
@@ -202,7 +207,7 @@ func (s *ServiceNode) Type() NodeType                      { return NodeTypeServ
 func (s *ServiceNode) Labels() map[string]string           { return s.LabelsValue }
 func (s *ServiceNode) IPAddress() []string                 { return s.IPAddressValue }
 func (s *ServiceNode) Owner() *Owner                       { return nil }
-func (s *ServiceNode) Application() string                 { return "" }
+func (s *ServiceNode) Application() string                 { return s.ApplicationValue }
 func (s *ServiceNode) Containers() []Container             { return nil }
 func (s *ServiceNode) ReadyStatus() string                 { return "" }
 func (s *ServiceNode) StorageClass() string                { return "" }

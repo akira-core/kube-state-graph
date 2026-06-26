@@ -182,10 +182,10 @@ The server SHALL expose `GET /v1/edge-types` that returns the static catalogue o
 
 **Cluster group node.** For each distinct `labels.cluster` value present on an emitted node, the serialiser SHALL emit one `{ data: { id: "cluster/<cluster>", name: "<cluster>", type: "cluster", labels: {} } }` with no `parent` and no `ipaddress`.
 
-**Synthesised workload group nodes.** Derived **per emitted `type="pod"` node** from its `labels.namespace`, its resolved `data.application`, and its resolved `data.owner` (`{kind, name}`). Each group node's `id` encodes its full ancestry path, so it has exactly one parent (the tree is unambiguous by construction and no `data.parent` can dangle):
+**Synthesised workload group nodes.** Derived from each emitted real node's own attributes: `namespace` and `application` groups from any `type="pod"`, `type="service"`, or `type="pvc"` node (via its `labels.namespace` and its resolved `data.application`); `controller` groups from `type="pod"` nodes only (via the pod's resolved `data.owner` `{kind, name}`). Each group node's `id` encodes its full ancestry path, so it has exactly one parent (the tree is unambiguous by construction and no `data.parent` can dangle):
 
 - **namespace** — `{ id: "<cluster>/namespace/<ns>", name: "<ns>", type: "namespace", labels: {}, parent: "cluster/<cluster>" }`
-- **application** (emitted only for pods with a resolved Application) — `{ id: "<cluster>/namespace/<ns>/application/<app>", name: "<app>", type: "application", labels: {}, parent: "<cluster>/namespace/<ns>" }`
+- **application** (emitted for any pod, service, or PVC with a resolved Application) — `{ id: "<cluster>/namespace/<ns>/application/<app>", name: "<app>", type: "application", labels: {}, parent: "<cluster>/namespace/<ns>" }`
 - **controller** (emitted only for pods with a resolved owner) — `{ id: "<cluster>/namespace/<ns>/application/<app>/controller/<kind>/<name>", ... , parent: <the application group id> }` when the pod also has a resolved Application, otherwise `{ id: "<cluster>/namespace/<ns>/controller/<kind>/<name>", ... , parent: "<cluster>/namespace/<ns>" }`. `name` is `<name>`, `type` is `"controller"`, `labels` is `{}`.
 
 All synthesised group nodes carry `labels: {}` and no `ipaddress`, and SHALL be emitted in tier order (cluster, then namespace, then application, then controller), each tier ordered by `id`, before the non-group nodes, so the body stays byte-deterministic.
@@ -193,7 +193,7 @@ All synthesised group nodes carry `labels: {}` and no `ipaddress`, and SHALL be 
 **`data.parent` assignment** (skip-absent-levels):
 
 - `type="pod"` → its controller group id when the pod has a resolved owner; else its application group id when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>`. (Every pod with a namespace always has at least the namespace group.)
-- `type="service"`, `type="pvc"` → its namespace group id `<cluster>/namespace/<ns>`.
+- `type="service"`, `type="pvc"` → its application group id `<cluster>/namespace/<ns>/application/<app>` when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>` (skip-absent-levels). Services and PVCs SHALL NOT nest under a `controller` group.
 - `type="node"`, `type="storageclass"` → `cluster/<labels.cluster>`.
 - `type="external"` → omitted (no cluster identity).
 
@@ -221,10 +221,20 @@ This requirement **supersedes** the prior `cluster > node > pod` and `cluster > 
 - **WHEN** a pod in `cluster-alpha` namespace `shop` has neither a resolved Application nor a resolved owner
 - **THEN** the pod's `data.parent` equals `cluster-alpha/namespace/shop` (the namespace group)
 
-#### Scenario: Service and PVC nested under namespace
+#### Scenario: Service and PVC nested under namespace when no Application
 
-- **WHEN** the response contains a `type="service"` node and a `type="pvc"` node in `cluster-alpha` namespace `shop`
+- **WHEN** the response contains a `type="service"` node and a `type="pvc"` node in `cluster-alpha` namespace `shop`, neither with a resolved ArgoCD Application
 - **THEN** each carries `data.parent="cluster-alpha/namespace/shop"`, and neither is the `parent` of any pod
+
+#### Scenario: Service and PVC nested under application when resolved
+
+- **WHEN** the response contains a `type="service"` node and a `type="pvc"` node in `cluster-alpha` namespace `shop`, each with `data.application="checkout"`
+- **THEN** each carries `data.parent="cluster-alpha/namespace/shop/application/checkout"`, the `cluster-alpha/namespace/shop/application/checkout` application group node (parent `cluster-alpha/namespace/shop`) is synthesised, and neither the service nor the PVC nests under a `controller` group
+
+#### Scenario: Application group synthesised from a service/PVC even with no pod in it
+
+- **WHEN** the only node carrying `data.application="checkout"` in `cluster-alpha` namespace `shop` is a `type="service"` node (no pod resolves that Application)
+- **THEN** the response still contains the `cluster-alpha/namespace/shop/application/checkout` application group node with `parent="cluster-alpha/namespace/shop"`, and no `controller` group is synthesised under it
 
 #### Scenario: Node and StorageClass nested under cluster
 
@@ -243,34 +253,47 @@ This requirement **supersedes** the prior `cluster > node > pod` and `cluster > 
 
 ### Requirement: Pod `application` and `containers` attributes
 
-Every `data` object for a `type="pod"` node in the Cytoscape response SHALL be
-able to expose two additional top-level attributes with `omitempty` semantics,
-both **outside `labels`** (which stays a strict `map[string]string`):
+Every `data` object for a `type="pod"`, `type="service"`, or `type="pvc"` node SHALL be able to expose an `application` attribute, and every `type="pod"` node SHALL additionally be able to expose a `containers` attribute, all with `omitempty` semantics and all **outside `labels`** (which stays a strict `map[string]string`):
 
-- `application` — a `string`, the pod's ArgoCD Application name as resolved by the
-  `cluster-topology-source` capability. Emitted only when the pod has a resolved
-  Application; omitted entirely otherwise (never an empty string). This attribute is
-  **retained** alongside the synthesised `type="application"` group node (which is
-  derived from this same value — see "Cytoscape compound node grouping"); the two
-  representations are complementary and an existing consumer reading `data.application`
-  is unaffected.
+- `application` — a `string`, the node's ArgoCD Application name as resolved by the
+  `cluster-topology-source` capability: for `type="pod"` from the `argocd_tracking_id`
+  label on `kube_pod_owner`, and for `type="service"` / `type="pvc"` from the
+  `annotation_argocd_argoproj_io_tracking_id` label on `kube_service_annotations` /
+  `kube_persistentvolumeclaim_annotations` (see "Service and PVC ArgoCD Application
+  resolution"). Emitted only when the node has a resolved Application; omitted entirely
+  otherwise (never an empty string). This attribute is **complementary** to the
+  synthesised `type="application"` group node (which is derived from this same value —
+  see "Cytoscape compound node grouping"); an existing consumer reading
+  `data.application` on a pod is unaffected (additive on services and PVCs).
 - `containers` — an array of objects `[{ name: string, image: string }]`, one per
   container, as resolved by the `cluster-topology-source` capability and ordered
-  deterministically by `(name, image)`. Emitted only when the pod has at least one
-  resolved container; omitted entirely otherwise (never an empty array).
+  deterministically by `(name, image)`. Emitted only on `type="pod"` nodes and only
+  when the pod has at least one resolved container; omitted entirely otherwise (never
+  an empty array).
 
-These attributes SHALL appear only on `type="pod"` nodes. `type="node"`,
-`type="pvc"`, `type="service"`, `type="external"`, `type="storageclass"`, and the
-synthesised `type="cluster"` / `type="namespace"` / `type="application"` /
-`type="controller"` group nodes SHALL NOT emit `application` or `containers`. The
-attributes SHALL NOT appear inside `labels`, and SHALL NOT be encoded as numbers or
-booleans. Because both are `omitempty`, a pod with neither a resolved Application nor
-container info produces a `data` object byte-identical to the pre-change shape.
+The `application` attribute SHALL appear only on `type="pod"`, `type="service"`, and
+`type="pvc"` nodes. The `containers` attribute SHALL appear only on `type="pod"`
+nodes. `type="node"`, `type="external"`, `type="storageclass"`, and the synthesised
+`type="cluster"` / `type="namespace"` / `type="application"` / `type="controller"`
+group nodes SHALL NOT emit `application` or `containers`. The attributes SHALL NOT
+appear inside `labels`, and SHALL NOT be encoded as numbers or booleans. Because both
+are `omitempty`, a node with neither a resolved Application nor container info produces
+a `data` object byte-identical to the pre-change shape.
 
 #### Scenario: Pod node carries application when resolved
 
 - **WHEN** the response contains a pod node whose `kube_pod_owner` series carried an `argocd_tracking_id` resolving to Application `checkout`
 - **THEN** the corresponding `type="pod"` node carries `data.application: "checkout"` and `data.labels` contains no `argocd_tracking_id` / `application` key
+
+#### Scenario: Service node carries application when resolved
+
+- **WHEN** the response contains a service node whose `kube_service_annotations` series carried `annotation_argocd_argoproj_io_tracking_id` resolving to Application `checkout`
+- **THEN** the corresponding `type="service"` node carries `data.application: "checkout"` and `data.labels` contains no `annotation_argocd_argoproj_io_tracking_id` / `application` key
+
+#### Scenario: PVC node carries application when resolved
+
+- **WHEN** the response contains a PVC node whose `kube_persistentvolumeclaim_annotations` series carried `annotation_argocd_argoproj_io_tracking_id` resolving to Application `mongo`
+- **THEN** the corresponding `type="pvc"` node carries `data.application: "mongo"` and `data.labels` contains no `annotation_argocd_argoproj_io_tracking_id` / `application` key
 
 #### Scenario: Pod node carries containers when resolved
 
@@ -282,9 +305,14 @@ container info produces a `data` object byte-identical to the pre-change shape.
 - **WHEN** the response contains a pod node with no resolved ArgoCD Application and no container info
 - **THEN** the corresponding `type="pod"` node's `data` object includes neither an `application` field nor a `containers` field
 
-#### Scenario: Non-pod nodes never carry application or containers
+#### Scenario: Service and PVC omit application when unresolved
 
-- **WHEN** the response contains nodes of `type="node"`, `type="pvc"`, `type="service"`, `type="external"`, or `type="storageclass"`
+- **WHEN** the response contains a service node and a PVC node with no resolved ArgoCD Application
+- **THEN** neither node's `data` object includes an `application` field, and neither includes a `containers` field
+
+#### Scenario: Node, external, and storageclass never carry application or containers
+
+- **WHEN** the response contains nodes of `type="node"`, `type="external"`, or `type="storageclass"`
 - **THEN** those node `data` objects include neither an `application` field nor a `containers` field
 
 #### Scenario: Deterministic body with new attributes

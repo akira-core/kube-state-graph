@@ -94,6 +94,13 @@ type Topology struct {
 	ServicesByNameNS   map[serviceKey]ServiceObs
 	EndpointsByService map[serviceKey][]EndpointObs
 
+	// ServiceApplications indexes (cluster, namespace, service) → ArgoCD
+	// Application name (from kube_service_annotations' tracking-id). ServiceNodes
+	// are materialised on demand by the service-graph reader, so it consumes this
+	// index to set each node's Application (PVC applications are set directly on
+	// the PVCNode at topology assembly instead). Empty when the metric is absent.
+	ServiceApplications map[serviceKey]string
+
 	ClustersObserved []string // sorted unique cluster values
 
 	// RawSeriesCount records how many raw upstream series each topology query
@@ -128,6 +135,9 @@ type topologyVectors struct {
 	PodContainerInfo model.Vector
 	// K8s node Ready-status resolution (kube_node_status_condition).
 	NodeStatus model.Vector
+	// Service / PVC ArgoCD Application resolution (annotation tracking-id).
+	ServiceAnnotations model.Vector
+	PVCAnnotations     model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -186,6 +196,8 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 	g.Go(fetch(promql.QStorageClassInfo, &v.StorageClassInfo))
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
+	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
+	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
@@ -206,6 +218,8 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 		string(promql.QStorageClassInfo):       len(v.StorageClassInfo),
 		string(promql.QPodContainerInfo):       len(v.PodContainerInfo),
 		string(promql.QNodeStatusCondition):    len(v.NodeStatus),
+		string(promql.QServiceAnnotations):     len(v.ServiceAnnotations),
+		string(promql.QPVCAnnotations):         len(v.PVCAnnotations),
 	}
 	return t, nil
 }
@@ -253,6 +267,13 @@ func parseTopology(v topologyVectors) Topology {
 	// owner but independently of the controller pick (it is a pod-level fact).
 	podContainers := resolvePodContainers(v.PodContainerInfo, mc)
 	podApplications := resolvePodApplications(v.PodOwner)
+
+	// Service / PVC ArgoCD Application resolution (annotation tracking-id). Built
+	// up-front: the PVC index enriches each PVC at the per-PVC assembly below; the
+	// service index is threaded into the service-graph reader (service nodes are
+	// materialised there, on demand). Both reuse the pod's segment-before-":" parse.
+	pvcApplications := resolvePVCApplications(v.PVCAnnotations, mc)
+	serviceApplications := resolveServiceApplications(v.ServiceAnnotations, mc)
 
 	// K8s node Ready-status resolution. Built up-front so the per-node assembly
 	// below can set each node's typed ReadyStatus attribute (never a label).
@@ -508,6 +529,7 @@ func parseTopology(v topologyVectors) Topology {
 				NameValue:         claim,
 				LabelsValue:       map[string]string{"cluster": cluster, "namespace": ns},
 				StorageClassValue: pvcStorageClass[pvcKey{cluster, ns, claim}],
+				ApplicationValue:  pvcApplications[pvcKey{cluster, ns, claim}],
 			}
 			pvcByID[id] = node
 			pvcs = append(pvcs, node)
@@ -652,15 +674,16 @@ func parseTopology(v topologyVectors) Topology {
 	mc.warn()
 
 	return Topology{
-		Pods:               pods,
-		Nodes:              nodes,
-		PVCs:               pvcs,
-		StorageClasses:     storageClasses,
-		PodPVCs:            bindings,
-		PodsByUID:          podsByUID,
-		ServicesByNameNS:   servicesByNameNS,
-		EndpointsByService: endpointsByService,
-		ClustersObserved:   clusterList,
+		Pods:                pods,
+		Nodes:               nodes,
+		PVCs:                pvcs,
+		StorageClasses:      storageClasses,
+		PodPVCs:             bindings,
+		PodsByUID:           podsByUID,
+		ServicesByNameNS:    servicesByNameNS,
+		EndpointsByService:  endpointsByService,
+		ServiceApplications: serviceApplications,
+		ClustersObserved:    clusterList,
 	}
 }
 
@@ -819,31 +842,84 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 // row with a missing cluster label is therefore bucketed silently — an
 // acceptable diagnostic gap, not a wrong-output one.)
 func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
-	// Accumulate the lexically-smallest non-empty tracking-id per pod
-	// (deterministic), then derive each Application in place — the tie-break is on
-	// the raw value, so one map suffices (mirrors resolvePVCStorageClass).
-	out := make(map[podNameKey]string, len(ownerVec))
-	for _, s := range ownerVec {
-		raw := string(s.Metric["argocd_tracking_id"])
-		pod := string(s.Metric["pod"])
-		if raw == "" || pod == "" {
+	// kube_pod_owner's missing-cluster tally is owned by resolvePodOwners (the
+	// controller pick reads the SAME vector), so this pass buckets without
+	// re-tallying — hence bucketCluster, not mc.bucket.
+	return resolveApplications(ownerVec, "argocd_tracking_id", func(m model.Metric) (podNameKey, bool) {
+		pod := string(m["pod"])
+		if pod == "" {
+			return podNameKey{}, false
+		}
+		return podNameKey{bucketCluster(string(m["cluster"])), string(m["namespace"]), pod}, true
+	})
+}
+
+// resolveServiceApplications builds the (cluster, namespace, service) → ArgoCD
+// Application index from kube_service_annotations'
+// annotation_argocd_argoproj_io_tracking_id label (KSM's sanitised form of the
+// argocd.argoproj.io/tracking-id annotation). OPTIONAL: an absent/empty vector
+// yields an empty map (services carry no Application). Deterministic per
+// "absent when empty" (lexically-smallest raw tracking-id wins on collision).
+func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[serviceKey]string {
+	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
+		svc := string(m["service"])
+		if svc == "" {
+			return serviceKey{}, false
+		}
+		return serviceKey{mc.bucket(promql.QServiceAnnotations, string(m["cluster"])), string(m["namespace"]), svc}, true
+	})
+}
+
+// resolvePVCApplications builds the (cluster, namespace, claim) → ArgoCD
+// Application index from kube_persistentvolumeclaim_annotations' tracking-id
+// label, keyed identically to resolvePVCStorageClass so the per-PVC assembly
+// can join it. OPTIONAL/graceful and deterministic like the service variant.
+func resolvePVCApplications(vec model.Vector, mc missingClusterCounts) map[pvcKey]string {
+	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
+		claim := string(m["persistentvolumeclaim"])
+		if claim == "" {
+			return pvcKey{}, false
+		}
+		return pvcKey{mc.bucket(promql.QPVCAnnotations, string(m["cluster"])), string(m["namespace"]), claim}, true
+	})
+}
+
+// argoAppName extracts the ArgoCD Application from a tracking-id value: the
+// segment before the first ":" (ArgoCD <app>:<group>/<kind>:<ns>/<name> form);
+// a value with no ":" is verbatim, an empty leading segment yields "".
+func argoAppName(raw string) string {
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
+// resolveApplications builds a key → ArgoCD Application index from a vector
+// carrying a tracking-id under `label`. For each key it keeps the
+// lexically-smallest non-empty raw tracking-id (the tie-break is on the raw
+// value, so one map suffices — deterministic), then derives the Application in
+// place (argoAppName), dropping keys whose Application is empty so the map stays
+// "absent when empty" (never present-but-""). keyOf returns (key, false) to skip
+// a series (e.g. missing name label). Shared by the pod / service / PVC
+// resolvers, which differ only in their key type, name label, and tracking
+// label.
+func resolveApplications[K comparable](vec model.Vector, label string, keyOf func(model.Metric) (K, bool)) map[K]string {
+	out := make(map[K]string, len(vec))
+	for _, s := range vec {
+		raw := string(s.Metric[model.LabelName(label)])
+		if raw == "" {
 			continue
 		}
-		key := podNameKey{bucketCluster(string(s.Metric["cluster"])), string(s.Metric["namespace"]), pod}
+		key, ok := keyOf(s.Metric)
+		if !ok {
+			continue
+		}
 		if cur, ok := out[key]; !ok || raw < cur {
 			out[key] = raw
 		}
 	}
-
-	// Application is the segment before the first ":" (ArgoCD
-	// <app>:<group>/<kind>:<ns>/<name> form); a value with no ":" stays verbatim.
-	// A value whose segment is empty (e.g. ":apps/...") yields no Application — drop
-	// the key so the map stays "absent when empty" (never present-but-"").
 	for key, raw := range out {
-		app := raw
-		if i := strings.IndexByte(raw, ':'); i >= 0 {
-			app = raw[:i]
-		}
+		app := argoAppName(raw)
 		if app == "" {
 			delete(out, key)
 			continue

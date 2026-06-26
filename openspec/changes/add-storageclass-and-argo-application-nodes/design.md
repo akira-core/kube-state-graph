@@ -165,6 +165,34 @@ Add `QStorageClassInfo = "kube_storageclass_info"` (bare constant) + a prefixed 
 
 **Why:** byte-identical output for identical `(window, filters, upstream-data)` is the D6 contract that golden/property tests enforce.
 
+### D11: Service & PVC ArgoCD Application from `*_annotations` tracking-id metrics (extension, 2026-06-26)
+
+Extend the workload hierarchy so `service` and `pvc` nodes also nest under the `application` group. Source the Application from two new OPTIONAL topology reads:
+
+- `kube_service_annotations` joined `(cluster, namespace, service)` → service entity.
+- `kube_persistentvolumeclaim_annotations` joined `(cluster, namespace, persistentvolumeclaim)` → PVC entity (the PVC entity's claim name derives from `kube_pod_spec_volumes_persistentvolumeclaims_info`'s `claim_name`, same key as PVC StorageClass resolution).
+
+Both carry `annotation_argocd_argoproj_io_tracking_id` — kube-state-metrics' sanitised form of the `argocd.argoproj.io/tracking-id` annotation (`.`/`/` → `_`), gated on the operator's `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id],persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`. The value is the Argo tracking-id `<app>:<group>/<kind>:<ns>/<name>`, so the Application is the **segment before the first `:`** — the **identical parse** to `resolvePodApplications` (no `:` → verbatim; empty leading segment → no Application). Per-entity collision picks the **lexically-smallest raw tracking-id** (mirrors the pod resolver; one map suffices). Resolution lives in `pkg/build/topology.go` (e.g. `resolveServiceApplications` / `resolvePVCApplications`, factored to share the pod's segment-before-`:` derivation), keyed via `bucketCluster` for missing-cluster. Two new `Q*` constants + prefixed `Renderer` cases (`last_over_time(<prefix>kube_*_annotations[<w>])`) join the `KSG_METRIC_PREFIX` family (14 → 16). PVC application resolves at topology assembly (PVC nodes are topology-built); **service** application is threaded into the connection-string resolver, since service nodes are materialised there (graph-api "Service node payload"), via a `(cluster, namespace, service) → app` index built in `ReadTopology`.
+
+**Why:** the operator reasons about storage and service objects under the same ArgoCD-app axis as pods. ArgoCD's default tracking method is `annotation+label`; the annotation form is the canonical, collision-free tracking-id (the `app.kubernetes.io/instance` label is truncated to 63 chars and ambiguous), and it reuses the pod value grammar verbatim.
+
+**Alternatives considered:**
+- **`app.kubernetes.io/instance` label via `kube_*_labels`** — *rejected (user chose annotations):* the instance label is truncated/ambiguous and is a different value grammar; the annotation tracking-id reuses the pod parse exactly.
+- **A new dedicated `application` index keyed independently of the existing entities** — *rejected:* the entities already carry `(cluster, namespace, name)`; a join on that key is the minimal addition.
+
+### D12: `Application()` widens to pod/service/pvc; `data.application` surfaces on all three (supersedes D9 scope)
+
+The sealed `graph.GraphNode.Application() string` accessor — previously meaningful only on `PodNode` — now also returns a resolved value on `ServiceNode` and `PVCNode` (still `""` for `K8sNode`, `ExternalNode`, `StorageClassNode`). **No new interface method.** Because the serialiser already emits `Application: n.Application()` for every node under `omitempty` (`pkg/cytoscape/cytoscape.go`), `data.application` surfaces on service and PVC nodes automatically once their `Application()` is non-empty — and it drives the `application` compound-group nesting for those nodes. The cytoscape `appSeen` collection and `compoundParent` are extended to derive the application group from any pod/service/pvc with a resolved Application (the `application` group id `applicationParentID(cluster, ns, app)` is already namespace-scoped, so it composes for service/pvc verbatim); `controller` groups stay pod-only.
+
+**Why:** widening the existing accessor + the already-`omitempty` DTO field is the smallest coherent change — no gating logic, no new method, no new node attribute plumbing. Surfacing `data.application` on service/pvc is strictly additive (omitempty) and makes the *why* of a service's application nesting legible at the node, mirroring the pod precedent (D9, which surfaced both attribute and group).
+
+**Alternatives considered:**
+- **Parent-only (service/pvc use `Application()` for the compound parent but suppress `data.application`)** — *rejected:* requires gating the serialiser's already-uniform `Application` emission to pods only, more code for a strictly-less-useful result; the path-encoded group id already exposes the app name, so the attribute is a free, consistent superset.
+
+**Projection:** none required — `application`/`namespace` groups are serialiser-only DTOs (not core nodes, not in projection/traversal); service & PVC already carry `namespace`, so the `?namespace=` filter is unaffected, and `?name=` matches real nodes only.
+
+**Determinism:** the application group set is the union of app keys across pods/services/pvcs, still emitted in the fixed tier order sorted by id (D10) — byte-stable.
+
 ## Risks / Trade-offs
 
 - **[Golden/contract churn]** Pod and PVC `data.parent` change, two edge types and a real `storageclass` node type appear, and the synthesised `storageclass` group disappears. → Regenerate goldens (`go test ./internal/api -update -run Golden`) and OpenAPI (`make docs`); call the parent/edge changes out in the changelog as a behaviour (not wire-schema) change. The `{apiVersion, clusters, elements}` shape and determinism are unchanged.
@@ -173,6 +201,8 @@ Add `QStorageClassInfo = "kube_storageclass_info"` (bare constant) + a prefixed 
 - **[Controller split across apps]** A controller whose pods carry different `argocd_tracking_id`s yields multiple app-scoped controller groups. → Rare; the path-encoding makes it deterministic and dangling-free rather than ambiguous.
 - **[Namespace filter drops infra nodes]** Without D6, `?namespace=` would strip all `node`/`storageclass` nodes and dangle their edges. → D6 retention rule mirrors the existing K8s-node rule; covered by new projection tests.
 - **[Operator allowlist missing]** `kube_storageclass_info` params (`storagePools`, `fsType`, `ClusterID`, `selector`, …) and `argocd_tracking_id` are operator `--metric-labels-allowlist` responsibilities. → OPTIONAL/graceful: missing labels → omitted attributes / no application group; no build failure (D8).
+- **[Service/PVC application allowlist (D11)]** `kube_service_annotations` / `kube_persistentvolumeclaim_annotations` require `--metric-annotations-allowlist` for the `argocd.argoproj.io/tracking-id` annotation; without it (or for non-Argo objects) the metric is absent. → OPTIONAL/graceful: no service/pvc `application` attribute, those nodes nest under their namespace group; no build failure.
+- **[Golden churn from service/PVC re-parenting (D11/D12)]** A service/PVC with a resolved Application moves `data.parent` from its namespace group to the new application group, and a new `application` group may be synthesised from a service/pvc with no pod in it. → Regenerate goldens; behaviour (not wire-schema) change; the no-application case is byte-identical to today.
 
 ## Migration Plan
 

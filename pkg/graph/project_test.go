@@ -173,8 +173,8 @@ func TestProject_NamespaceFilter_KeepsHostingK8sNode(t *testing.T) {
 }
 
 // A K8sNode hosting no pod at all can never have an in-scope pod, so it drops
-// under a namespace filter — but is retained when no namespace filter is set
-// (no regression to the full-topology view).
+// under a namespace filter (and, per the generalised D6 rule, under no filter
+// too — see TestProject_NoFilter_DropsUnreferencedInfraNodes).
 func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
@@ -190,14 +190,54 @@ func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 	}
 	assert.True(t, ids["c/worker-0"], "node hosting the in-scope pod is retained")
 	assert.False(t, ids["c/worker-1"], "podless node drops under a namespace filter")
+}
 
-	// Sanity: with no namespace filter both nodes remain (full-topology view).
-	vAll := Project(g, Scope{})
-	idsAll := map[string]bool{}
-	for _, n := range vAll.Nodes {
-		idsAll[n.ID()] = true
+// Generalised D6: an infra node (K8s node or StorageClass) referenced by NO
+// in-scope element is dropped from EVERY request shape — including the
+// default no-filter view. A node only appears as the host of a pod in the graph.
+func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+		&PVCNode{IDValue: "c/shop/data", NameValue: "data", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop"}, StorageClassValue: "gp3"},
+		&StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}},       // backs data
+		&StorageClassNode{IDValue: StorageClassID("c", "unused"), NameValue: "unused", LabelsValue: map[string]string{"cluster": "c"}}, // backs nothing
 	}
-	assert.True(t, idsAll["c/worker-1"], "podless node retained when no namespace filter is set")
+	edges := []*Edge{
+		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
+		NewEdge(EdgeTypePVCToStorageClass, "c/shop/data", StorageClassID("c", "gp3"), nil),
+	}
+	g := NewGraph(all, edges, time.Now())
+
+	v := Project(g, Scope{})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-0"], "node hosting an in-graph pod is retained")
+	assert.True(t, ids[StorageClassID("c", "gp3")], "StorageClass backing an in-graph PVC is retained")
+	assert.False(t, ids["c/worker-1"], "podless node dropped from the no-filter view")
+	assert.False(t, ids[StorageClassID("c", "unused")], "PVC-less StorageClass dropped from the no-filter view")
+}
+
+// The name-filter exception: ?name=<infra-node> surfaces a referenced-by-nothing
+// node directly, even though the default view hides it.
+func TestProject_NameFilter_MatchesUnreferencedInfraNode(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+	}
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
+
+	v := Project(g, Scope{Names: map[string]struct{}{"worker-1": {}}})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-1"], "explicit ?name=<podless-node> still returns the node")
+	assert.False(t, ids["c/worker-0"], "non-named node not pulled in")
 }
 
 // multiClusterPodSampleGraph extends sampleGraph with a `payments` pod in

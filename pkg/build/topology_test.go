@@ -629,6 +629,113 @@ func TestParseTopology_PVCStorageClassDeterministic(t *testing.T) {
 	assert.Equal(t, fwd.PVCs[0].StorageClass(), rev.PVCs[0].StorageClass(), "order-independent")
 }
 
+// TestParseTopology_PVCApplicationAttribute — the PVC ArgoCD Application is
+// parsed from the annotation_argocd_argoproj_io_tracking_id label on
+// kube_persistentvolumeclaim_annotations (segment before the first ":"), joined
+// on (cluster, namespace, claim) and surfaced on the typed Application attribute
+// (never labels). Covers: full tracking-id, no-colon verbatim, absent → empty,
+// empty leading segment → empty, and the annotation metric absent entirely.
+func TestParseTopology_PVCApplicationAttribute(t *testing.T) {
+	binding := func(ns, claim string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": "p",
+			"persistentvolumeclaim": model.LabelValue(claim),
+		}}
+	}
+	ann := func(ns, claim, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns),
+			"persistentvolumeclaim":                     model.LabelValue(claim),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+
+	pvcVec := sampleVec(
+		binding("db", "data-mongo"), // full tracking-id → mongo
+		binding("db", "data-redis"), // no-colon verbatim → cache
+		binding("db", "data-plain"), // no annotation → empty
+		binding("db", "data-colon"), // leading ":" → empty segment → empty
+	)
+	annVec := sampleVec(
+		ann("db", "data-mongo", "mongo:apps/StatefulSet:db/mongo"),
+		ann("db", "data-redis", "cache"),
+		ann("db", "data-colon", ":apps/Deployment:db/x"),
+	)
+
+	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCAnnotations: annVec})
+	byID := map[string]*graph.PVCNode{}
+	for _, p := range tp.PVCs {
+		byID[p.ID()] = p
+	}
+
+	assert.Equal(t, "mongo", byID["c/db/data-mongo"].Application(), "segment before the first ':'")
+	assert.Equal(t, "cache", byID["c/db/data-redis"].Application(), "value with no ':' is verbatim")
+	assert.Empty(t, byID["c/db/data-plain"].Application(), "no annotation → empty Application")
+	assert.Empty(t, byID["c/db/data-colon"].Application(), "leading ':' → empty segment → no Application")
+
+	for _, p := range tp.PVCs {
+		_, hasTrack := p.Labels()["annotation_argocd_argoproj_io_tracking_id"]
+		_, hasApp := p.Labels()["application"]
+		assert.Falsef(t, hasTrack || hasApp, "application must not appear in labels for PVC %q", p.ID())
+	}
+
+	// Annotation metric absent entirely → valid topology, no application.
+	tp2 := parseTopology(topologyVectors{PVC: pvcVec})
+	for _, p := range tp2.PVCs {
+		assert.Emptyf(t, p.Application(), "no annotation series → PVC %q carries no application", p.ID())
+	}
+}
+
+// TestResolveServiceApplications — the (cluster, namespace, service) → ArgoCD
+// Application index from kube_service_annotations: parse before ":", no-colon
+// verbatim, empty leading segment dropped, lexically-smallest tracking-id wins
+// on collision, missing cluster bucketed to "unknown", and parseTopology
+// surfaces the index on Topology.ServiceApplications.
+func TestResolveServiceApplications(t *testing.T) {
+	ann := func(cluster, ns, svc, tracking string) model.Sample {
+		m := model.Metric{"namespace": model.LabelValue(ns), "service": model.LabelValue(svc)}
+		if cluster != "" {
+			m["cluster"] = model.LabelValue(cluster)
+		}
+		if tracking != "" {
+			m["annotation_argocd_argoproj_io_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+
+	got := resolveServiceApplications(sampleVec(
+		ann("c", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+		ann("c", "shop", "web", "web"),             // no colon → verbatim
+		ann("c", "shop", "noapp", ""),              // no annotation → absent
+		ann("c", "shop", "colon", ":apps/x"),       // empty leading segment → dropped
+		ann("", "shop", "orphan", "orphan:apps/x"), // missing cluster → "unknown"
+	), missingClusterCounts{})
+
+	assert.Equal(t, "checkout", got[serviceKey{"c", "shop", "checkout"}])
+	assert.Equal(t, "web", got[serviceKey{"c", "shop", "web"}])
+	assert.Equal(t, "orphan", got[serviceKey{"unknown", "shop", "orphan"}], "missing cluster bucketed to unknown")
+	_, hasNoApp := got[serviceKey{"c", "shop", "noapp"}]
+	_, hasColon := got[serviceKey{"c", "shop", "colon"}]
+	assert.False(t, hasNoApp, "absent annotation → no entry")
+	assert.False(t, hasColon, "empty leading segment → no entry")
+
+	// Collision: lexically-smallest raw tracking-id wins, order-independent.
+	fwd := resolveServiceApplications(sampleVec(
+		ann("c", "n", "s", "beta:apps/x"), ann("c", "n", "s", "alpha:apps/x"),
+	), missingClusterCounts{})
+	rev := resolveServiceApplications(sampleVec(
+		ann("c", "n", "s", "alpha:apps/x"), ann("c", "n", "s", "beta:apps/x"),
+	), missingClusterCounts{})
+	assert.Equal(t, "alpha", fwd[serviceKey{"c", "n", "s"}], "lexically-smallest tracking-id wins")
+	assert.Equal(t, fwd[serviceKey{"c", "n", "s"}], rev[serviceKey{"c", "n", "s"}], "order-independent")
+
+	// parseTopology surfaces the index on Topology.ServiceApplications.
+	tp := parseTopology(topologyVectors{ServiceAnnotations: sampleVec(
+		ann("c", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+	)})
+	assert.Equal(t, "checkout", tp.ServiceApplications[serviceKey{"c", "shop", "checkout"}])
+}
+
 // TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's
 // active condition="Ready" row sets each K8s node's typed ready_status:
 // true→Ready, false→NotReady, unknown→Unknown. A node with no Ready series omits

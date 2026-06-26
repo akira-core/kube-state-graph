@@ -150,8 +150,13 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				ctrlSeen[ctrlKey{c, ns, app, o.Kind, o.Name}] = struct{}{}
 			}
 		case graph.NodeTypeService, graph.NodeTypePVC:
-			if ns := labels["namespace"]; c != "" && ns != "" {
-				nsSeen[nsKey{c, ns}] = struct{}{}
+			ns := labels["namespace"]
+			if c == "" || ns == "" {
+				continue // cluster-less / namespace-less service/pvc: falls back to cluster group
+			}
+			nsSeen[nsKey{c, ns}] = struct{}{}
+			if app := n.Application(); app != "" {
+				appSeen[appKey{c, ns, app}] = struct{}{}
 			}
 		default:
 			// node / storageclass / external: only the cluster group (collected
@@ -260,7 +265,11 @@ func groupNode(id, name, typ, parent string) Node {
 //	               else its application group when it has a resolved Application,
 //	               else its namespace group (skip-absent-levels); a cluster-less
 //	               or namespace-less pod falls back to its cluster group, else ""
-//	service, pvc → its namespace group (cluster > namespace > {service, pvc})
+//	service, pvc → its application group when it has a resolved Application,
+//	               else its namespace group (skip-absent-levels:
+//	               cluster > namespace > [application >] {service, pvc}); a
+//	               cluster-less or namespace-less service/pvc falls back to its
+//	               cluster group, else ""
 //	node, sc     → its cluster group (cluster > {node, storageclass})
 //	external     → "" (no cluster identity)
 //
@@ -282,6 +291,9 @@ func compoundParent(n graph.GraphNode) string {
 		}
 	case graph.NodeTypeService, graph.NodeTypePVC:
 		if ns := labels["namespace"]; c != "" && ns != "" {
+			if app := n.Application(); app != "" {
+				return applicationParentID(c, ns, app)
+			}
 			return namespaceParentID(c, ns)
 		}
 	default:

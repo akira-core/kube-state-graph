@@ -200,8 +200,16 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 	s.Require().True(s.WaitForSeries(`kube_node_status_condition{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_node_status_condition")
 
+	// These probe nodes host no pod, so the default view hides them (generalised
+	// D6: a no-filter response only carries nodes referenced by an in-scope pod).
+	// `ready_status` still surfaces — fetch each node directly via ?name= (the
+	// name-filter exception admits a podless infra node by name).
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
-	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
+		q.Add("name", "ready-probe-ready")
+		q.Add("name", "ready-probe-unknown")
+		q.Add("name", "ready-probe-nocond")
+	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
 
@@ -407,6 +415,70 @@ kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enri
 	s.Require().True(ok, "bare pod node must be present")
 	s.Empty(bare.Application, "pod with no argocd label omits data.application")
 	s.Nil(bare.Containers, "pod with no container series omits data.containers")
+}
+
+// TestServiceAndPVCApplicationNesting — ingest kube_persistentvolumeclaim_annotations
+// (a PVC) and kube_service_annotations (a connection-string-resolved service),
+// each carrying annotation_argocd_argoproj_io_tracking_id, and assert /v1/graph
+// (1) sets the typed data.application on the service AND PVC nodes (segment before
+// the first ":", never in labels) and (2) nests both under the synthesised
+// application compound group cluster > namespace > application > {service, pvc}.
+// The objects live in a dedicated namespace ("argons") so they cannot collide
+// with the shared shop fixtures. The service materialises via the D29
+// connection-string path (checkout pod → https://argo-svc.argons.svc...), whose
+// anchor cluster (cluster-alpha, recovered from the client pod UID) holds the
+// same-named service, so the service node is created in cluster-alpha.
+func (s *GraphSuite) TestServiceAndPVCApplicationNesting() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argons",pod="argo-pod",claim_name="argo-data",test=%q} 1 %d
+kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argons",persistentvolumeclaim="argo-data",annotation_argocd_argoproj_io_tracking_id="argowf:apps/StatefulSet:argons/argowf",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="argons",service="argo-svc",cluster_ip="10.96.0.50",test=%q} 1 %d
+kube_service_annotations{cluster="cluster-alpha",namespace="argons",service="argo-svc",annotation_argocd_argoproj_io_tracking_id="argowf:apps/StatefulSet:argons/argowf",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+	s.Require().True(s.WaitForSeries(`kube_service_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_service_annotations")
+	s.Require().True(s.WaitForSeries(`kube_persistentvolumeclaim_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_persistentvolumeclaim_annotations")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{server=~"https://argo-svc.*",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe the argo-svc connection-string trace")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	const appGroup = "cluster-alpha/namespace/argons/application/argowf"
+
+	pvc, ok := byID["cluster-alpha/argons/argo-data"]
+	s.Require().True(ok, "PVC node must be present")
+	s.Equal("argowf", pvc.Application, "PVC data.application = segment before the first ':'")
+	s.Equal(appGroup, pvc.Parent, "PVC nests under its application group")
+	_, pvcAppLabel := pvc.Labels["application"]
+	_, pvcTrackLabel := pvc.Labels["annotation_argocd_argoproj_io_tracking_id"]
+	s.False(pvcAppLabel || pvcTrackLabel, "PVC application must NOT appear inside labels")
+
+	svc, ok := byID["cluster-alpha/argons/argo-svc"]
+	s.Require().True(ok, "service node must be present (resolved from the connection string)")
+	s.Equal("service", svc.Type)
+	s.Equal("argowf", svc.Application, "service data.application = segment before the first ':'")
+	s.Equal(appGroup, svc.Parent, "service nests under its application group")
+
+	grp, ok := byID[appGroup]
+	s.Require().True(ok, "the application group node must be synthesised")
+	s.Equal("application", grp.Type)
+	s.Equal("cluster-alpha/namespace/argons", grp.Parent, "application group nests under its namespace group")
 }
 
 func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {

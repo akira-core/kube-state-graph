@@ -60,6 +60,7 @@ type sgResolver struct {
 	podByID            map[string]*graph.PodNode    // client side: cluster known from metric
 	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
+	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
@@ -154,6 +155,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		podByID:            podByID,
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
+		serviceApps:        topology.ServiceApplications,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
@@ -582,10 +584,11 @@ func (r *sgResolver) materializeServiceNode(cluster, ns, svc string, obs Service
 		ips = []string{obs.ClusterIP}
 	}
 	r.services[id] = &graph.ServiceNode{
-		IDValue:        id,
-		NameValue:      svc,
-		LabelsValue:    map[string]string{"cluster": cluster, "namespace": ns},
-		IPAddressValue: ips,
+		IDValue:          id,
+		NameValue:        svc,
+		LabelsValue:      map[string]string{"cluster": cluster, "namespace": ns},
+		IPAddressValue:   ips,
+		ApplicationValue: r.serviceApps[serviceKey{cluster, ns, svc}],
 	}
 	return id
 }

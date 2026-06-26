@@ -18,6 +18,8 @@ The topology reader SHALL consume at minimum the following `kube-state-metrics` 
 - `kube_storageclass_info{cluster, storageclass, provisioner, storagePools, pool, fsType, fsName, ClusterID, selector, ...}` (OPTIONAL — feeds the real `type="storageclass"` node, its `provisioner` attribute, and its `parameters` object of NetApp/Ceph backing-storage values; the parameter labels are the operator's `--metric-labels-allowlist` responsibility)
 - `kube_pod_container_info{cluster, namespace, pod, uid, container, image, ...}` (OPTIONAL — feeds the per-pod container list attribute; one series per container)
 - `kube_node_status_condition{cluster, node, condition="Ready", status, ...}` (OPTIONAL — feeds the K8s node `ready_status` attribute; the `condition="Ready"` selector is a fixed, request-invariant metric-selection contract, and the `status` label carries `true`/`false`/`unknown` **matched case-insensitively** — stock kube-state-metrics lowercases the value, but an exporter re-publishing the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown` — with the active row's sample value being `1`)
+- `kube_persistentvolumeclaim_annotations{cluster, namespace, persistentvolumeclaim, annotation_argocd_argoproj_io_tracking_id, ...}` (OPTIONAL — feeds the PVC ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label is kube-state-metrics' sanitised form of the `argocd.argoproj.io/tracking-id` annotation and requires the operator's `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`)
+- `kube_service_annotations{cluster, namespace, service, annotation_argocd_argoproj_io_tracking_id, ...}` (OPTIONAL — feeds the service ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label requires the operator's `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]`)
 
 The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes.
 
@@ -28,6 +30,8 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 `kube_pod_container_info` is likewise OPTIONAL: when absent — or when no series matches a given pod — the reader SHALL still build a valid topology, the affected pod entities carry no `containers` attribute, and the build does not fail. The `argocd_tracking_id` label on `kube_pod_owner` is likewise OPTIONAL: when absent, the affected pod entities carry no `application` attribute and the build does not fail.
 
 `kube_node_status_condition` is likewise OPTIONAL: when absent — or when no `condition="Ready"` series matches a given node — the reader SHALL still build a valid topology, the affected K8s node entities carry no `ready_status` attribute, and the build does not fail.
+
+`kube_persistentvolumeclaim_annotations` and `kube_service_annotations` are likewise OPTIONAL: when absent — or when no series matches a given `(cluster, namespace, claim)` / `(cluster, namespace, service)`, or its `annotation_argocd_argoproj_io_tracking_id` label is empty — the reader SHALL still build a valid topology, the affected PVC / service entities carry no `application` attribute and nest under their namespace group, and the build does not fail.
 
 #### Scenario: All families queried
 
@@ -64,11 +68,16 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 - **WHEN** the upstream contains `kube_node_info` but no `kube_node_status_condition` series for the window
 - **THEN** the reader produces a valid topology in which every K8s node entity carries no `ready_status` attribute, and the build does not fail
 
+#### Scenario: PVC/service annotation metrics absent
+
+- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` and `kube_service_info` but no `kube_persistentvolumeclaim_annotations` or `kube_service_annotations` series for the window
+- **THEN** the reader produces a valid topology in which every PVC and service entity carries no `application` attribute and nests under its namespace group, and the build does not fail
+
 ### Requirement: Configurable upstream metric-name prefix
 
 The topology reader SHALL prepend a single configurable prefix to every `kube_*` series name it queries, so deployments using a fork of kube-state-metrics or a custom exporter that re-publishes the same series under an organisational prefix (e.g. `o11y_kube_pod_info`) can be supported without forking the API server. The prefix SHALL be sourced from the `KSG_METRIC_PREFIX` environment variable or the `--metric-prefix` flag (flag wins over env when both are set). The default value SHALL be the empty string, preserving stock kube-state-metrics behaviour. The prefix SHALL be additive — appended verbatim before the existing series name; the existing `kube_*` suffix and the upstream label-name contract (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `label_*`, etc.) are unchanged. The prefix SHALL be validated against the Prometheus metric-name charset `^[a-zA-Z_:][a-zA-Z0-9_:]*$` when non-empty; an invalid value SHALL fail server startup. The trailing underscore (if any) is the operator's responsibility — the server does not inject one.
 
-The same prefix SHALL apply to every kube-state-metrics-shaped series the reader consumes: `kube_pod_info`, `kube_node_info`, `kube_node_status_addresses`, `kube_pod_spec_volumes_persistentvolumeclaims_info`, `kube_node_labels`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_pod_owner`, `kube_replicaset_owner`, `kube_persistentvolumeclaim_info`, `kube_storageclass_info`, `kube_pod_container_info`, `kube_node_status_condition`, and the `kube_node_info`-backed cluster discovery query. The upstream label-name contract those series carry is unchanged (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `storageclass`, `provisioner`, `storagePools`, `pool`, `fsType`, `fsName`, `ClusterID`, `selector`, `container`, `image`, `argocd_tracking_id`, `condition`, `status`, `label_*`, `service`, `cluster_ip`, `endpointslice`, `address`, `hostname`, `targetref_kind`, `targetref_name`, `targetref_namespace`, `label_kubernetes_io_service_name`, etc.). The prefix SHALL NOT be applied to `traces_service_graph_request_total` (which is produced by a different exporter family) nor to the Prometheus-native `up{}` readiness probe.
+The same prefix SHALL apply to every kube-state-metrics-shaped series the reader consumes: `kube_pod_info`, `kube_node_info`, `kube_node_status_addresses`, `kube_pod_spec_volumes_persistentvolumeclaims_info`, `kube_node_labels`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_pod_owner`, `kube_replicaset_owner`, `kube_persistentvolumeclaim_info`, `kube_storageclass_info`, `kube_pod_container_info`, `kube_node_status_condition`, `kube_persistentvolumeclaim_annotations`, `kube_service_annotations`, and the `kube_node_info`-backed cluster discovery query. The upstream label-name contract those series carry is unchanged (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `storageclass`, `provisioner`, `storagePools`, `pool`, `fsType`, `fsName`, `ClusterID`, `selector`, `container`, `image`, `argocd_tracking_id`, `annotation_argocd_argoproj_io_tracking_id`, `condition`, `status`, `label_*`, `service`, `cluster_ip`, `endpointslice`, `address`, `hostname`, `targetref_kind`, `targetref_name`, `targetref_namespace`, `label_kubernetes_io_service_name`, etc.). The prefix SHALL NOT be applied to `traces_service_graph_request_total` (which is produced by a different exporter family) nor to the Prometheus-native `up{}` readiness probe.
 
 #### Scenario: Default empty prefix preserves stock series names
 
@@ -78,7 +87,7 @@ The same prefix SHALL apply to every kube-state-metrics-shaped series the reader
 #### Scenario: Custom prefix from environment
 
 - **WHEN** the server starts with `KSG_METRIC_PREFIX=o11y_`
-- **THEN** the issued topology PromQL contains `last_over_time(o11y_kube_pod_info[<window>])`, `last_over_time(o11y_kube_node_info[<window>])`, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[<window>])`, `last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[<window>])`, `last_over_time(o11y_kube_node_labels[<window>])`, `last_over_time(o11y_kube_service_info[<window>])`, `last_over_time(o11y_kube_endpointslice_endpoints[<window>])`, `last_over_time(o11y_kube_endpointslice_labels[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_info[<window>])`, `last_over_time(o11y_kube_storageclass_info[<window>])`, `tlast_over_time(o11y_kube_pod_container_info[<window>])` (the container query uses `tlast_over_time` so each image-variant series' value is its last-sample timestamp — see the "Pod container list attribute" requirement and design.md D-A4), and `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[<window>])`, AND the cluster-discovery query becomes `group by (cluster) (last_over_time(o11y_kube_node_info[<lookback>]))`
+- **THEN** the issued topology PromQL contains `last_over_time(o11y_kube_pod_info[<window>])`, `last_over_time(o11y_kube_node_info[<window>])`, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[<window>])`, `last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[<window>])`, `last_over_time(o11y_kube_node_labels[<window>])`, `last_over_time(o11y_kube_service_info[<window>])`, `last_over_time(o11y_kube_endpointslice_endpoints[<window>])`, `last_over_time(o11y_kube_endpointslice_labels[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_info[<window>])`, `last_over_time(o11y_kube_storageclass_info[<window>])`, `tlast_over_time(o11y_kube_pod_container_info[<window>])` (the container query uses `tlast_over_time` so each image-variant series' value is its last-sample timestamp — see the "Pod container list attribute" requirement and design.md D-A4), `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_annotations[<window>])`, `last_over_time(o11y_kube_service_annotations[<window>])`, AND the cluster-discovery query becomes `group by (cluster) (last_over_time(o11y_kube_node_info[<lookback>]))`
 
 #### Scenario: Prefix does not affect service-graph or probe queries
 
@@ -212,3 +221,43 @@ These two edges replace the previous compound-nesting representation of the pod�
 
 - **WHEN** the same `pod-to-node` or `pvc-to-storageclass` relationship is produced by two consecutive builds for the same window
 - **THEN** the edge `id` (UUIDv5 over `<type>|<source>|<target>`) is byte-identical between the two builds
+
+### Requirement: Service and PVC ArgoCD Application resolution
+
+The topology reader SHALL resolve an ArgoCD Application name for service and PVC entities from the `annotation_argocd_argoproj_io_tracking_id` label, read from `kube_service_annotations` (joined on `(cluster, namespace, service)` to the service entity) and `kube_persistentvolumeclaim_annotations` (joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity, where the PVC entity derives its claim name from the `claim_name` label of `kube_pod_spec_volumes_persistentvolumeclaims_info`). A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
+
+The Application name SHALL be derived **identically to the pod ArgoCD Application** (graph-api "Pod, Service, and PVC `application` attribute"): it is the segment of the tracking-id value **before the first `:`** (ArgoCD `<app>:<group>/<kind>:<ns>/<name>` form); a value with no `:` is taken verbatim; a value whose leading segment is empty resolves to **no** Application (the entity is absent from the application index, never present-but-empty).
+
+`kube_service_annotations` and `kube_persistentvolumeclaim_annotations` are OPTIONAL: when absent, when no series matches a given entity, or when the matched series has an empty `annotation_argocd_argoproj_io_tracking_id` label, that entity SHALL carry no Application name and the build SHALL NOT fail. When the upstream reports more than one non-empty tracking-id for a single entity, the reader SHALL pick deterministically (the lexically smallest raw tracking-id value, mirroring the pod resolver) so the resolved Application is byte-stable across rebuilds.
+
+The resolved Application name SHALL be surfaced on the service / PVC node's typed `application` attribute (graph-api "Pod, Service, and PVC `application` attribute") and SHALL drive the node's `application` compound-group nesting (graph-api "Cytoscape compound node grouping"). It SHALL NOT be added to the entity's `labels` map.
+
+#### Scenario: Service Application resolved from tracking-id annotation
+
+- **WHEN** the upstream provides `kube_service_info{cluster="cluster-alpha", namespace="shop", service="checkout"}` and `kube_service_annotations{cluster="cluster-alpha", namespace="shop", service="checkout", annotation_argocd_argoproj_io_tracking_id="checkout:apps/Deployment:shop/checkout"}`
+- **THEN** the `cluster-alpha/shop/checkout` service entity resolves Application `checkout`, with no `application` / `argocd_tracking_id` key in its `labels`
+
+#### Scenario: PVC Application resolved from tracking-id annotation
+
+- **WHEN** the upstream provides a PVC entity `cluster-alpha/db/data-mongo-0` and `kube_persistentvolumeclaim_annotations{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:db/mongo"}`
+- **THEN** the `cluster-alpha/db/data-mongo-0` PVC entity resolves Application `mongo`
+
+#### Scenario: Tracking-id with no colon is verbatim
+
+- **WHEN** a service's `annotation_argocd_argoproj_io_tracking_id` is `web` (no `:`)
+- **THEN** the service resolves Application `web`
+
+#### Scenario: Empty leading segment yields no Application
+
+- **WHEN** a PVC's `annotation_argocd_argoproj_io_tracking_id` is `:apps/Deployment:ns/x` (empty leading segment)
+- **THEN** the PVC carries no Application name and nests under its namespace group
+
+#### Scenario: Deterministic pick on duplicate tracking-id series
+
+- **WHEN** two `kube_service_annotations` series for `(cluster-alpha, shop, checkout)` carry `annotation_argocd_argoproj_io_tracking_id="b-app:..."` and `="a-app:..."`
+- **THEN** the service resolves Application `a-app` (from the lexically smallest raw tracking-id) deterministically across rebuilds
+
+#### Scenario: Service/PVC without a tracking-id annotation
+
+- **WHEN** a service or PVC has no matching annotation series, or its `annotation_argocd_argoproj_io_tracking_id` label is empty
+- **THEN** that entity carries no Application name, nests under its namespace group, and the build does not fail

@@ -147,6 +147,60 @@ func TestSerialiseCytoscape_Parents(t *testing.T) {
 	}
 }
 
+// Service and PVC nest under their application group when an ArgoCD Application
+// is resolved (skip-absent → namespace otherwise); the application group is
+// synthesised even when no pod carries that Application, and neither nests under
+// a controller group.
+func TestSerialiseCytoscape_ServicePVCUnderApplication(t *testing.T) {
+	svc := &graph.ServiceNode{
+		IDValue: "c1/shop/payments", NameValue: "payments",
+		LabelsValue:      map[string]string{"cluster": "c1", "namespace": "shop"},
+		ApplicationValue: "checkout",
+	}
+	pvc := &graph.PVCNode{
+		IDValue: "c1/shop/data", NameValue: "data",
+		LabelsValue:      map[string]string{"cluster": "c1", "namespace": "shop"},
+		ApplicationValue: "checkout",
+	}
+
+	nodes := cyNodesByID(cy(t, []graph.GraphNode{svc, pvc}, nil))
+
+	nsID := "c1/namespace/shop"
+	appID := "c1/namespace/shop/application/checkout"
+
+	// The application group is synthesised from the service/pvc (no pod present).
+	require.Contains(t, nodes, appID)
+	assert.Equal(t, "application", nodes[appID].Type)
+	assert.Equal(t, nsID, nodes[appID].Parent)
+
+	assert.Equal(t, appID, nodes["c1/shop/payments"].Parent, "service nests under its application group")
+	assert.Equal(t, appID, nodes["c1/shop/data"].Parent, "pvc nests under its application group")
+
+	// data.application surfaces on the service/pvc nodes (via the omitempty DTO).
+	assert.Equal(t, "checkout", nodes["c1/shop/payments"].Application)
+	assert.Equal(t, "checkout", nodes["c1/shop/data"].Application)
+
+	// No controller group is synthesised under the application for a service/pvc.
+	for id := range nodes {
+		assert.NotContains(t, id, "/controller/", "service/pvc must not produce a controller group")
+	}
+}
+
+// A service with an Application but no namespace falls back to the cluster group
+// (no namespace ⇒ no application group can be path-encoded).
+func TestSerialiseCytoscape_ServiceApplicationWithoutNamespaceFallsBack(t *testing.T) {
+	svc := &graph.ServiceNode{
+		IDValue: "c1/x", NameValue: "x",
+		LabelsValue:      map[string]string{"cluster": "c1"},
+		ApplicationValue: "checkout",
+	}
+	nodes := cyNodesByID(cy(t, []graph.GraphNode{svc}, nil))
+	assert.Equal(t, "cluster/c1", nodes["c1/x"].Parent)
+	for id := range nodes {
+		assert.NotContains(t, id, "/application/", "no application group without a namespace")
+	}
+}
+
 // End-to-end (project → serialise): under a namespace filter the host K8s node
 // is retained because it hosts an in-scope pod (D6), and the pod nests under its
 // namespace group while the node parents to the cluster group.

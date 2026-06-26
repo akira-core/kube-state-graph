@@ -69,6 +69,8 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 		{"storageclass-info", QStorageClassInfo, time.Minute, "last_over_time(o11y_kube_storageclass_info[1m])"},
 		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(o11y_kube_pod_container_info[1m])"},
 		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
+		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(o11y_kube_service_annotations[1m])"},
+		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])"},
 		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
 	}
 	r := Renderer{Prefix: "o11y_"}
@@ -156,6 +158,29 @@ func TestRender_NodeStatusConditionPrefixAware(t *testing.T) {
 		"Query constant stays the bare metric name for stable query/query_name dimensions")
 	assert.Equal(t, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`,
 		Renderer{Prefix: "o11y_"}.Render(QNodeStatusCondition, time.Minute))
+}
+
+// TestRender_ServiceAnnotationsPrefixAware pins the new kube_service_annotations
+// query (carrying annotation_argocd_argoproj_io_tracking_id for the service
+// ArgoCD Application). Bare by default (stable self-metric dimension), prefix-aware
+// via Renderer like every other KSM-shaped series.
+func TestRender_ServiceAnnotationsPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_service_annotations[1m])", Render(QServiceAnnotations, time.Minute))
+	assert.Equal(t, "kube_service_annotations", string(QServiceAnnotations),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_service_annotations[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QServiceAnnotations, time.Minute))
+}
+
+// TestRender_PVCAnnotationsPrefixAware pins the new
+// kube_persistentvolumeclaim_annotations query (carrying
+// annotation_argocd_argoproj_io_tracking_id for the PVC ArgoCD Application).
+func TestRender_PVCAnnotationsPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_persistentvolumeclaim_annotations[1m])", Render(QPVCAnnotations, time.Minute))
+	assert.Equal(t, "kube_persistentvolumeclaim_annotations", string(QPVCAnnotations),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QPVCAnnotations, time.Minute))
 }
 
 func TestFormatDuration(t *testing.T) {

@@ -79,6 +79,19 @@ const (
 	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
 	// absence degrades gracefully to no `ready_status`.
 	QNodeStatusCondition Query = "kube_node_status_condition"
+
+	// Service / PVC ArgoCD Application resolution. KSM-shaped, so prefix-aware via
+	// Renderer. kube_service_annotations / kube_persistentvolumeclaim_annotations
+	// carry the `annotation_argocd_argoproj_io_tracking_id` label — KSM's sanitised
+	// form of the argocd.argoproj.io/tracking-id annotation — whose value uses the
+	// same <app>:<group>/<kind>:<ns>/<name> grammar as the pod's argocd_tracking_id,
+	// so the Application is the segment before the first ":". Joined on
+	// (cluster, namespace, service) / (cluster, namespace, persistentvolumeclaim) to
+	// enrich existing service / PVC nodes (never new nodes). OPTIONAL — the
+	// annotation label requires the operator's --metric-annotations-allowlist;
+	// absence degrades gracefully to no `application` attribute.
+	QServiceAnnotations Query = "kube_service_annotations"
+	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
 )
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
@@ -170,6 +183,10 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
 		// are never surfaced, so they are excluded here.
 		return fmt.Sprintf(`last_over_time(%skube_node_status_condition{condition="Ready"}[%s])`, r.Prefix, w)
+	case QServiceAnnotations:
+		return fmt.Sprintf(`last_over_time(%skube_service_annotations[%s])`, r.Prefix, w)
+	case QPVCAnnotations:
+		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_annotations[%s])`, r.Prefix, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
 		// the configurable prefix deliberately does NOT apply here. The metric
