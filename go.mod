@@ -1,4 +1,4 @@
-module github.com/marz32one/kube-state-graph
+module github.com/akira-core/kube-state-graph
 
 go 1.25.0
 

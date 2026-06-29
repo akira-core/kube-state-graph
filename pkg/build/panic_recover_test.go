@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/promql"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // A panic on one of ReadTopology's errgroup goroutines must surface as a

@@ -28,13 +28,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/marz32one/kube-state-graph/internal/api"
-	"github.com/marz32one/kube-state-graph/internal/auth"
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/internal/observability"
-	"github.com/marz32one/kube-state-graph/internal/telemetry"
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/internal/api"
+	"github.com/akira-core/kube-state-graph/internal/auth"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/observability"
+	"github.com/akira-core/kube-state-graph/internal/telemetry"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // version is the build-time service version. Override with

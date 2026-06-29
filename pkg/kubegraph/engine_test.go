@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/kubegraph"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // ParseValues is the single source of truth for the /v1/graph request contract,

@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/marz32one/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/config"
 )
 
 // Credentials for the auth-enabled VictoriaMetrics container. Test-only values.

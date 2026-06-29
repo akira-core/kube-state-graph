@@ -4,15 +4,15 @@
 
 BIN_DIR := bin
 BIN     := $(BIN_DIR)/kube-state-graph
-PKG     := github.com/marz32one/kube-state-graph
+PKG     := github.com/akira-core/kube-state-graph
 # Recursive (=) so $(VERSION), defined below, resolves at use time. Injects the
 # build version into main.version (→ OTel service.version) like the container.
 LDFLAGS = -s -w -X main.version=$(VERSION)
 
 # Container image settings. Override on the command line, e.g.:
-#   make docker-push REGISTRY=docker.io IMAGE_REPO=marz32one/kube-state-graph VERSION=v0.2.0
+#   make docker-push REGISTRY=docker.io IMAGE_REPO=akira-core/kube-state-graph VERSION=v0.2.0
 REGISTRY      ?= docker.io
-IMAGE_REPO    ?= marz32one/kube-state-graph
+IMAGE_REPO    ?= akira-core/kube-state-graph
 IMAGE         ?= $(REGISTRY)/$(IMAGE_REPO)
 VERSION       ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)

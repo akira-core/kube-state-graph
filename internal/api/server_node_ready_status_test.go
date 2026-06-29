@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // TestGraphEndpoint_NodeReadyStatus — end-to-end the K8s node carries

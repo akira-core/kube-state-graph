@@ -15,9 +15,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // TestServer_MetricPrefix_AppliedToTopologyQueries asserts that when the

@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/marz32one/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/build"
 )
 
 // statusClientClosedRequest is the non-standard 499 (nginx convention) returned

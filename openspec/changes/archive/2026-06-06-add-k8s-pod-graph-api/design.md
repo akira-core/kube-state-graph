@@ -940,9 +940,9 @@ Alternatives considered:
 
 The graph-building stack — node / edge types, the multi-cluster `Build`, the `Project` projection, the PromQL `Querier` abstraction + `Renderer`, the `Clock`, and the Cytoscape serialiser — is promoted from `internal/` to a public `pkg/` tree so that **other Go modules can import the exact same graph engine in-process** instead of calling `GET /v1/graph` over HTTP and re-deserialising the JSON. `kube-state-graph` itself is refactored to consume its own `pkg/` (single source of truth — not a fork, not a vendored copy); the server in `internal/api` becomes a thin HTTP / auth shell over the `pkg/` engine.
 
-The first consumer is **`graph-api-gateway`** (a separate module, `github.com/marz32one/graph-api-gateway`), which today calls ksg over HTTP, decodes the body into its own `CytoscapeGraph` structs, then merges a second **switch (network-topology) graph** by IP (its own design D9). It replaces that HTTP-plus-decode hop with the embedded `pkg/` engine: it builds the kube graph in-process and obtains the identical Cytoscape DTO with zero JSON round-trip, keeping its IP-reconcile + merge pipeline (and the external switch backend) unchanged.
+The first consumer is **`graph-api-gateway`** (a separate module, `github.com/akira-core/graph-api-gateway`), which today calls ksg over HTTP, decodes the body into its own `CytoscapeGraph` structs, then merges a second **switch (network-topology) graph** by IP (its own design D9). It replaces that HTTP-plus-decode hop with the embedded `pkg/` engine: it builds the kube graph in-process and obtains the identical Cytoscape DTO with zero JSON round-trip, keeping its IP-reconcile + merge pipeline (and the external switch backend) unchanged.
 
-**Package layout** (all under the existing `github.com/marz32one/kube-state-graph` module — same module, made importable by lifting out of `internal/`):
+**Package layout** (all under the existing `github.com/akira-core/kube-state-graph` module — same module, made importable by lifting out of `internal/`):
 
 | pkg | Origin | Public surface |
 |---|---|---|
@@ -968,7 +968,7 @@ Why:
 
 Alternatives considered:
 
-- **Separate shared repo / module** (e.g. `github.com/marz32one/graph-builder`) imported by both ksg and the gateway (rejected for now — most decoupled, but adds a third repo, an independent release cadence, and version-bump choreography a co-located two-project setup does not need. The `pkg/` boundary is clean enough that extracting it to its own module later, if a third consumer appears, is a non-breaking move).
+- **Separate shared repo / module** (e.g. `github.com/akira-core/graph-builder`) imported by both ksg and the gateway (rejected for now — most decoupled, but adds a third repo, an independent release cadence, and version-bump choreography a co-located two-project setup does not need. The `pkg/` boundary is clean enough that extracting it to its own module later, if a third consumer appears, is a non-breaking move).
 - **Literal copy / vendor of `pkg/` into the gateway** (rejected — the framing was "same logic", and a copy drifts: every bug fix and contract change would have to be applied twice, defeating the single-source-of-truth goal).
 - **Consumer operates on the native `*graph.Graph` end-to-end** instead of the Cytoscape DTO (rejected — the switch graph arrives from an external HTTP backend as Cytoscape JSON, so it must be decoded into *some* DTO regardless; converting it into native `graph` types would require an escape hatch through the `GraphNode` seal (D11) plus an extra conversion — i.e. **more** work than merging at the DTO layer the gateway already uses).
 

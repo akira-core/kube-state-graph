@@ -12,13 +12,13 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	authmocks "github.com/marz32one/kube-state-graph/internal/auth/mocks"
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/internal/observability"
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	clockmocks "github.com/marz32one/kube-state-graph/pkg/clock/mocks"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	authmocks "github.com/akira-core/kube-state-graph/internal/auth/mocks"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/observability"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	clockmocks "github.com/akira-core/kube-state-graph/pkg/clock/mocks"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // TestHandleClusters_UsesInjectedClock proves the discovery handler queries

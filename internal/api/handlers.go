@@ -12,12 +12,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/marz32one/kube-state-graph/internal/telemetry"
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	"github.com/marz32one/kube-state-graph/pkg/graph"
-	"github.com/marz32one/kube-state-graph/pkg/kubegraph"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/internal/telemetry"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // ----- /v1/graph (Cytoscape.js) ---------------------------------------------

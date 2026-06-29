@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // ParseError is a typed request-parsing failure. Reason is a stable,

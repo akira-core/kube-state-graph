@@ -9,13 +9,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
-	"github.com/marz32one/kube-state-graph/internal/auth"
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/internal/observability"
-	"github.com/marz32one/kube-state-graph/internal/telemetry"
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	"github.com/marz32one/kube-state-graph/pkg/clock"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/internal/auth"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/observability"
+	"github.com/akira-core/kube-state-graph/internal/telemetry"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/clock"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 
 	"log/slog"
 )

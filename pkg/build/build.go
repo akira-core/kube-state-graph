@@ -12,9 +12,9 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/marz32one/kube-state-graph/pkg/clock"
-	"github.com/marz32one/kube-state-graph/pkg/graph"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/pkg/clock"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // tracer is obtained from the global provider; it is a no-op until an

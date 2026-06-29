@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/internal/testlog"
+	"github.com/akira-core/kube-state-graph/pkg/internal/testlog"
 )
 
 // captureClientLogs is the shared slog-capture helper (pkg/internal/testlog).

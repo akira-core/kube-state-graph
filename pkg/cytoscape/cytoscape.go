@@ -15,7 +15,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // APIVersion is the value stamped on the body's apiVersion field (design.md D14).

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
 )
 
 // TestGraphEndpoint_MissingClientUID_PromotesToExternal exercises the

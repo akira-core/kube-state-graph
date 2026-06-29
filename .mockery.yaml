@@ -17,12 +17,12 @@ resolve-type-alias: false
 issue-845-fix: true
 
 packages:
-  github.com/marz32one/kube-state-graph/pkg/promql:
+  github.com/akira-core/kube-state-graph/pkg/promql:
     interfaces:
       Querier:
-  github.com/marz32one/kube-state-graph/internal/auth:
+  github.com/akira-core/kube-state-graph/internal/auth:
     interfaces:
       Validator:
-  github.com/marz32one/kube-state-graph/pkg/clock:
+  github.com/akira-core/kube-state-graph/pkg/clock:
     interfaces:
       Clock:

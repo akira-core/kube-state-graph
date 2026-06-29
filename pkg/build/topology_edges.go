@@ -1,6 +1,6 @@
 package build
 
-import "github.com/marz32one/kube-state-graph/pkg/graph"
+import "github.com/akira-core/kube-state-graph/pkg/graph"
 
 // TopologyEdges synthesises the topology relationship edges from a parsed
 // Topology: pod-mounts-pvc, pod-to-node, and pvc-to-storageclass. Edge IDs are
