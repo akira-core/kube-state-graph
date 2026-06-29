@@ -226,11 +226,13 @@ These two edges replace the previous compound-nesting representation of the pod�
 
 The topology reader SHALL resolve an ArgoCD Application name for service and PVC entities from the `annotation_argocd_argoproj_io_tracking_id` label, read from `kube_service_annotations` (joined on `(cluster, namespace, service)` to the service entity) and `kube_persistentvolumeclaim_annotations` (joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity, where the PVC entity derives its claim name from the `claim_name` label of `kube_pod_spec_volumes_persistentvolumeclaims_info`). A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
 
-The Application name SHALL be derived **identically to the pod ArgoCD Application** (graph-api "Pod, Service, and PVC `application` attribute"): it is the segment of the tracking-id value **before the first `:`** (ArgoCD `<app>:<group>/<kind>:<ns>/<name>` form); a value with no `:` is taken verbatim; a value whose leading segment is empty resolves to **no** Application (the entity is absent from the application index, never present-but-empty).
+The Application name SHALL be derived **identically to the pod ArgoCD Application** (graph-api "Pod `application` and `containers` attributes"): it is the segment of the tracking-id value **before the first `:`** (ArgoCD `<app>:<group>/<kind>:<ns>/<name>` form); a value with no `:` is taken verbatim; a value whose leading segment is empty resolves to **no** Application (the entity is absent from the application index, never present-but-empty).
 
 `kube_service_annotations` and `kube_persistentvolumeclaim_annotations` are OPTIONAL: when absent, when no series matches a given entity, or when the matched series has an empty `annotation_argocd_argoproj_io_tracking_id` label, that entity SHALL carry no Application name and the build SHALL NOT fail. When the upstream reports more than one non-empty tracking-id for a single entity, the reader SHALL pick deterministically (the lexically smallest raw tracking-id value, mirroring the pod resolver) so the resolved Application is byte-stable across rebuilds.
 
-The resolved Application name SHALL be surfaced on the service / PVC node's typed `application` attribute (graph-api "Pod, Service, and PVC `application` attribute") and SHALL drive the node's `application` compound-group nesting (graph-api "Cytoscape compound node grouping"). It SHALL NOT be added to the entity's `labels` map.
+The resolved Application name SHALL be surfaced on the service / PVC node's typed `application` attribute (graph-api "Pod `application` and `containers` attributes") and SHALL drive the node's `application` compound-group nesting (graph-api "Cytoscape compound node grouping"). It SHALL NOT be added to the entity's `labels` map.
+
+For **PVC** entities specifically, when this annotation path resolves no Application (the annotation series is absent, unmatched, empty, or its leading segment is empty), a fallback MAY still resolve one by inheritance from a mounting pod — see "PVC ArgoCD Application inheritance from mounting pod". This fallback never applies to service entities.
 
 #### Scenario: Service Application resolved from tracking-id annotation
 
@@ -257,7 +259,44 @@ The resolved Application name SHALL be surfaced on the service / PVC node's type
 - **WHEN** two `kube_service_annotations` series for `(cluster-alpha, shop, checkout)` carry `annotation_argocd_argoproj_io_tracking_id="b-app:..."` and `="a-app:..."`
 - **THEN** the service resolves Application `a-app` (from the lexically smallest raw tracking-id) deterministically across rebuilds
 
-#### Scenario: Service/PVC without a tracking-id annotation
+#### Scenario: Service/PVC without a tracking-id annotation and no inheritance
 
-- **WHEN** a service or PVC has no matching annotation series, or its `annotation_argocd_argoproj_io_tracking_id` label is empty
+- **WHEN** a service has no matching annotation series (or an empty `annotation_argocd_argoproj_io_tracking_id` label), or a PVC has neither a matching/non-empty annotation series **nor** a mounting pod with a resolved Application
 - **THEN** that entity carries no Application name, nests under its namespace group, and the build does not fail
+
+### Requirement: PVC ArgoCD Application inheritance from mounting pod
+
+When a PVC entity has **no** ArgoCD Application resolved from its own annotation (the "Service and PVC ArgoCD Application resolution" path produced none — the `kube_persistentvolumeclaim_annotations` series is absent, unmatched, has an empty `annotation_argocd_argoproj_io_tracking_id` label, or that label's leading segment is empty), the topology reader SHALL attempt to **inherit** an Application from the pods that mount the PVC. For every `pod-mounts-pvc` edge incident to the PVC (source = a pod entity, target = the PVC entity), the mounting pod's own resolved Application (the pod ArgoCD Application from the `argocd_tracking_id` label on `kube_pod_owner`) is a candidate. The PVC SHALL inherit the **lexically-smallest non-empty** candidate Application; a mounting pod with no resolved Application contributes no candidate.
+
+Inheritance is a strictly-ordered **fallback**: a PVC's own annotation-resolved Application ALWAYS wins and SHALL NEVER be overridden by inheritance. Inheritance fires **only** for a PVC that would otherwise carry no Application.
+
+The inherited Application SHALL be surfaced and SHALL drive grouping **identically** to an annotation-resolved one — it is baked onto the PVC node's typed `application` attribute (graph-api "Pod `application` and `containers` attributes") and drives the PVC's `application` compound-group nesting (graph-api "Cytoscape compound node grouping"), so the wire output is **indistinguishable** from a natively-resolved PVC Application. The inherited value SHALL NOT be added to the PVC's `labels` map.
+
+Because `pod-mounts-pvc` is always intra-cluster and a pod mounts a PVC in its own namespace, inheritance NEVER crosses cluster or namespace — the inherited Application's compound group (`<cluster>/namespace/<ns>/application/<app>`) nests under the PVC's own namespace.
+
+Inheritance SHALL be resolved at build time over the fully-assembled graph (all pod entities and all `pod-mounts-pvc` edges present), **before** any projection/filter is applied, so a `?cluster=` / `?namespace=` / `?name=` filter that would drop the mounting pod from a given response SHALL NOT change the PVC's resolved Application (the value is computed once over the full graph, never recomputed per request — consistent with "build once, project many"). The result SHALL depend only on the **set** of mounting pods and their resolved Applications (selected by the lexically-smallest rule), independent of edge iteration order, so it is byte-stable across rebuilds. A PVC with no incident `pod-mounts-pvc` edge, or whose every mounting pod has no resolved Application, SHALL carry no Application and SHALL nest under its namespace group; the build SHALL NOT fail.
+
+#### Scenario: PVC inherits the mounting pod's Application
+
+- **WHEN** a PVC `cluster-alpha/shop/checkout-data` has no `kube_persistentvolumeclaim_annotations` tracking-id annotation and a pod `cluster-alpha/<uid>` resolving Application `checkout` mounts it via a `pod-mounts-pvc` edge
+- **THEN** the `cluster-alpha/shop/checkout-data` PVC entity resolves Application `checkout`, surfaced on its `application` attribute (no `application` / `argocd_tracking_id` key in `labels`), and nesting it under the `cluster-alpha/namespace/shop/application/checkout` compound group
+
+#### Scenario: Own annotation wins over inheritance
+
+- **WHEN** a PVC resolves Application `mongo` from its own `annotation_argocd_argoproj_io_tracking_id` AND is mounted by a pod resolving Application `checkout`
+- **THEN** the PVC keeps Application `mongo` (its own annotation) and never inherits `checkout`
+
+#### Scenario: Deterministic lexically-smallest pick across multiple mounting pods
+
+- **WHEN** a PVC with no own annotation is mounted by two pods resolving Applications `b-app` and `a-app`
+- **THEN** the PVC inherits `a-app` (the lexically smallest non-empty candidate) deterministically across rebuilds, independent of edge iteration order
+
+#### Scenario: Mounting pod with no Application yields no inheritance
+
+- **WHEN** a PVC with no own annotation is mounted only by pods that have no resolved Application
+- **THEN** the PVC carries no Application, nests under its namespace group, and the build does not fail
+
+#### Scenario: Inheritance is resolved before projection
+
+- **WHEN** a PVC inherits Application `checkout` from its mounting pod at build time
+- **THEN** the PVC node's `application` attribute is `checkout` in the response under any filter projection, because inheritance is resolved over the full graph before projection and is not recomputed per request

@@ -481,6 +481,59 @@ traces_service_graph_request_total{client="checkout",server="https://argo-svc.ar
 	s.Equal("cluster-alpha/namespace/argons", grp.Parent, "application group nests under its namespace group")
 }
 
+// TestPVCInheritsApplicationFromMountingPod — D13: a PVC with NO tracking-id
+// annotation of its own inherits the ArgoCD Application of the pod that mounts
+// it (via the pod-mounts-pvc binding), surfacing data.application and nesting
+// under the inherited application group — indistinguishable from an
+// annotation-sourced value. A PVC carrying its OWN annotation keeps it (own
+// wins over inheritance). Objects live in a dedicated namespace ("argoinh") so
+// they cannot collide with the shared fixtures.
+func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",uid="inh-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",uid="own-1",node="worker-0",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",owner_kind="Deployment",owner_name="inh",owner_is_controller="true",argocd_tracking_id="checkout:apps/Deployment:argoinh/checkout",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_kind="Deployment",owner_name="own",owner_is_controller="true",argocd_tracking_id="web:apps/Deployment:argoinh/web",test=%q} 1 %d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",claim_name="inh-data",test=%q} 1 %d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",claim_name="own-data",test=%q} 1 %d
+kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argoinh",persistentvolumeclaim="own-data",annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:argoinh/mongo",test=%q} 1 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_pod_spec_volumes_persistentvolumeclaims_info")
+	s.Require().True(s.WaitForSeries(`kube_pod_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_pod_owner")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	// Inherited: app-less PVC adopts its mounting pod's Application "checkout".
+	inh, ok := byID["cluster-alpha/argoinh/inh-data"]
+	s.Require().True(ok, "inherited PVC node must be present")
+	s.Equal("checkout", inh.Application, "PVC inherits its mounting pod's Application")
+	s.Equal("cluster-alpha/namespace/argoinh/application/checkout", inh.Parent,
+		"inherited PVC nests under the mounting pod's application group")
+	_, inhAppLabel := inh.Labels["application"]
+	s.False(inhAppLabel, "inherited application must NOT appear inside labels")
+
+	// Own-wins: PVC with its own annotation keeps "mongo", not the pod's "web".
+	own, ok := byID["cluster-alpha/argoinh/own-data"]
+	s.Require().True(ok, "own-annotation PVC node must be present")
+	s.Equal("mongo", own.Application, "PVC's own annotation wins over inheritance")
+	s.Equal("cluster-alpha/namespace/argoinh/application/mongo", own.Parent,
+		"own-annotation PVC nests under its own application group")
+}
+
 func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("edge_type", "pod-calls-pod") }))
@@ -983,15 +1036,18 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 	var body cytoscape.Body
 	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
 
+	// Look the PVC up by its exact ID rather than "first pvc node": the
+	// integration suite shares one VictoriaMetrics, so sibling tests may have
+	// ingested other PVCs (sorting before this one) into the same response.
 	var pvc *cytoscape.NodeData
 	for i := range body.Elements.Nodes {
-		if body.Elements.Nodes[i].Data.Type == "pvc" {
+		if body.Elements.Nodes[i].Data.ID == "cluster-alpha/shop/checkout-data" {
 			pvc = &body.Elements.Nodes[i].Data
 			break
 		}
 	}
-	s.Require().NotNil(pvc, "pvc node must be present in the response")
-	s.Equal("cluster-alpha/shop/checkout-data", pvc.ID)
+	s.Require().NotNil(pvc, "checkout-data pvc node must be present in the response")
+	s.Equal("pvc", pvc.Type)
 	s.Equal("checkout-data", pvc.Name)
 
 	var found bool

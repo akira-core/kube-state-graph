@@ -558,6 +558,33 @@ func parseTopology(v topologyVectors) Topology {
 		clusters[cluster] = struct{}{}
 	}
 
+	// PVC ArgoCD Application inheritance (D13): a PVC with no Application of its
+	// own inherits the lexically-smallest Application among the pods that mount
+	// it, so an unannotated PVC still nests under its workload's application
+	// group. The PVC's own annotation (set above from pvcApplications) ALWAYS
+	// wins — this pass only fills app-less PVCs — and runs before graph.NewGraph
+	// freezes the nodes. Pure function of the (binding set, pod Applications), so
+	// order-independent and byte-stable (D6).
+	podAppByID := make(map[string]string, len(pods))
+	for _, p := range pods {
+		if p.ApplicationValue == "" {
+			continue
+		}
+		// Lexically-smallest wins on the (improbable) same-ID pod collision —
+		// the same tie-break as addPodToIndex, so the join key is order-free (D6).
+		if cur, ok := podAppByID[p.IDValue]; !ok || p.ApplicationValue < cur {
+			podAppByID[p.IDValue] = p.ApplicationValue
+		}
+	}
+	inherited := pvcInheritedApps(bindings, podAppByID)
+	for _, pvc := range pvcs {
+		if pvc.ApplicationValue == "" {
+			if app := inherited[pvc.IDValue]; app != "" {
+				pvc.ApplicationValue = app
+			}
+		}
+	}
+
 	// StorageClass nodes (real, from kube_storageclass_info). Every observed
 	// StorageClass becomes a node; a StorageClass referenced by an emitted PVC
 	// but absent from the info metric is materialised bare (nil InfoValue, no
@@ -882,6 +909,28 @@ func resolvePVCApplications(vec model.Vector, mc missingClusterCounts) map[pvcKe
 		}
 		return pvcKey{mc.bucket(promql.QPVCAnnotations, string(m["cluster"])), string(m["namespace"]), claim}, true
 	})
+}
+
+// pvcInheritedApps computes, per PVC ID, the ArgoCD Application a PVC may
+// inherit from the pods that mount it (D13): the lexically-smallest non-empty
+// Application across all its mounting pods (from the pod-PVC bindings, joined to
+// each pod's already-resolved Application via podApp keyed by pod ID). A PVC
+// whose mounting pods all carry no Application is absent from the result. The
+// accumulation is a pure min over the binding set, so it is independent of
+// binding order (D6 determinism). The caller applies this only to PVCs that have
+// no Application of their own, so an own annotation always wins.
+func pvcInheritedApps(bindings []PodPVCBinding, podApp map[string]string) map[string]string {
+	out := make(map[string]string)
+	for _, b := range bindings {
+		app := podApp[b.PodID]
+		if app == "" {
+			continue
+		}
+		if cur, ok := out[b.PVCID]; !ok || app < cur {
+			out[b.PVCID] = app
+		}
+	}
+	return out
 }
 
 // argoAppName extracts the ArgoCD Application from a tracking-id value: the

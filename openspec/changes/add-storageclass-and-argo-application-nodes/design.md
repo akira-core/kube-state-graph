@@ -193,6 +193,25 @@ The sealed `graph.GraphNode.Application() string` accessor — previously meanin
 
 **Determinism:** the application group set is the union of app keys across pods/services/pvcs, still emitted in the fixed tier order sorted by id (D10) — byte-stable.
 
+### D13: PVC inherits its mounting pod's ArgoCD Application when it has none of its own (extension, 2026-06-29)
+
+When a PVC's own annotation path (D11) resolves **no** Application, the build derives one from the pods that mount it. The PVC entity, the pod entities, and the pod application index (`resolvePodApplications`) are all available at topology assembly; the pod↔PVC mount relationship comes from the **same** `kube_pod_spec_volumes_persistentvolumeclaims_info` vector that already produces the PVC entities and the `pod-mounts-pvc` edges, keyed `(cluster, namespace, pod)`. A single assembly-time pass:
+
+1. For each PVC with an empty resolved Application, gather every mounting pod (the mount vector rows for the PVC's `(cluster, namespace, claim)`).
+2. Look each mounting pod up in the pod application index (`(cluster, namespace, pod)` → app) and collect the **non-empty** Applications.
+3. Set the PVC's `ApplicationValue` to the **lexically-smallest** of that set; leave it empty when the set is empty.
+
+A PVC's **own** annotation-resolved Application (D11) **always wins** — inheritance fires only for an otherwise-app-less PVC. The inherited value is written to `PVCNode.ApplicationValue` **before** `graph.NewGraph` freezes the graph (so it never mutates an immutable node) and **before** any projection, and it surfaces through the existing `Application()` accessor — therefore `data.application` and the `application`-group nesting treat it **identically** to an annotation-sourced value (the user's "bake into `Application()` — both" choice).
+
+**Why:** an ArgoCD-managed workload routinely owns a PVC that carries no tracking-id annotation of its own (the annotation is on the workload, not always propagated to the claim). Grouping such a PVC with its workload's Application is what the operator expects, and the mounting pod is the authoritative signal of which workload owns the storage. Reusing the mount vector + the already-built pod application index means **no new upstream query, no new metric, no new node/edge type, and no serialiser or projection change** — the smallest possible addition. The lexically-smallest tie-break mirrors every other collision rule in the codebase (D2, D11), keeping output byte-stable.
+
+**Determinism / projection:** the result depends only on the **set** of mounting pods and their resolved Applications (selected lexically-smallest), independent of vector/edge iteration order, so it is byte-stable across rebuilds (D10). Inheritance is resolved once over the full graph at assembly, never per request, so it is unaffected by `?cluster=` / `?namespace=` / `?name=` projection (consistent with "build once, project many" and a future cache). Because `pod-mounts-pvc` is intra-cluster and a pod mounts a PVC in its own namespace, the inherited app never crosses cluster or namespace — the `<cluster>/namespace/<ns>/application/<app>` group composes verbatim under the PVC's own namespace.
+
+**Alternatives considered:**
+- **Walk the built `pod-mounts-pvc` edges + `PodNode.Application()` after `TopologyEdges`** — *equivalent result, rejected as the spec'd mechanism:* it would require a post-edge mutation of PVC nodes (or a second node-build pass) for no behavioural gain; joining the mount vector to the pod application index at assembly is simpler and provably the same set. (Implementations MAY use either; the spec pins only the resolved value.)
+- **Inherit at serialise time (group-only, leave `data.application` empty)** — *rejected (user chose "bake into `Application()` — both"):* would require a serialiser-only group-hint diverging from `Application()`, more code for a strictly-less-useful, inconsistent result.
+- **Propagate in the other direction (pod inherits PVC app)** — *rejected:* the pod is the workload identity; storage inherits from workload, not the reverse.
+
 ## Risks / Trade-offs
 
 - **[Golden/contract churn]** Pod and PVC `data.parent` change, two edge types and a real `storageclass` node type appear, and the synthesised `storageclass` group disappears. → Regenerate goldens (`go test ./internal/api -update -run Golden`) and OpenAPI (`make docs`); call the parent/edge changes out in the changelog as a behaviour (not wire-schema) change. The `{apiVersion, clusters, elements}` shape and determinism are unchanged.
@@ -203,6 +222,9 @@ The sealed `graph.GraphNode.Application() string` accessor — previously meanin
 - **[Operator allowlist missing]** `kube_storageclass_info` params (`storagePools`, `fsType`, `ClusterID`, `selector`, …) and `argocd_tracking_id` are operator `--metric-labels-allowlist` responsibilities. → OPTIONAL/graceful: missing labels → omitted attributes / no application group; no build failure (D8).
 - **[Service/PVC application allowlist (D11)]** `kube_service_annotations` / `kube_persistentvolumeclaim_annotations` require `--metric-annotations-allowlist` for the `argocd.argoproj.io/tracking-id` annotation; without it (or for non-Argo objects) the metric is absent. → OPTIONAL/graceful: no service/pvc `application` attribute, those nodes nest under their namespace group; no build failure.
 - **[Golden churn from service/PVC re-parenting (D11/D12)]** A service/PVC with a resolved Application moves `data.parent` from its namespace group to the new application group, and a new `application` group may be synthesised from a service/pvc with no pod in it. → Regenerate goldens; behaviour (not wire-schema) change; the no-application case is byte-identical to today.
+
+- **[Inherited PVC application is indistinguishable from a declared one (D13)]** A PVC nesting under an `application` group may have inherited the app from its mounting pod rather than declaring it via annotation; the wire output carries no marker of provenance (the user's chosen "bake into `Application()`" semantics). → Intended — the grouping is the product goal; if provenance is ever needed it is an additive future attribute, not a wire break. The no-mounting-pod / app-less-pod case is byte-identical to today.
+- **[Golden churn from PVC inheritance (D13)]** A previously app-less PVC that mounts an ArgoCD pod now moves `data.parent` from its namespace group to the inherited `application` group and gains `data.application`. → Regenerate goldens; behaviour (not wire-schema) change; a PVC with its own annotation, or with no app-bearing mounting pod, is unaffected.
 
 ## Migration Plan
 

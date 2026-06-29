@@ -686,6 +686,105 @@ func TestParseTopology_PVCApplicationAttribute(t *testing.T) {
 	}
 }
 
+// TestPVCInheritedApps — the pure inheritance helper: per PVC, the
+// lexically-smallest non-empty ArgoCD Application among its mounting pods,
+// order-independent; a PVC whose mounting pods carry no Application is absent.
+func TestPVCInheritedApps(t *testing.T) {
+	bindings := []PodPVCBinding{
+		{PodID: "c/uA", PVCID: "c/ns/X"},
+		{PodID: "c/uB", PVCID: "c/ns/X"},
+		{PodID: "c/uC", PVCID: "c/ns/Y"},
+	}
+	// uA→b-app, uB→a-app both mount X; uC (no app) mounts Y.
+	podApp := map[string]string{"c/uA": "b-app", "c/uB": "a-app"}
+
+	got := pvcInheritedApps(bindings, podApp)
+	assert.Equal(t, "a-app", got["c/ns/X"], "lexically-smallest non-empty mounting-pod app wins")
+	_, hasY := got["c/ns/Y"]
+	assert.False(t, hasY, "PVC whose only mounting pod has no app gets no inherited app")
+
+	rev := pvcInheritedApps([]PodPVCBinding{bindings[2], bindings[1], bindings[0]}, podApp)
+	assert.Equal(t, got, rev, "result independent of binding order")
+}
+
+// TestParseTopology_PVCInheritsApplicationFromMountingPod — end-to-end: an
+// app-less PVC inherits the lexically-smallest Application of the pods that
+// mount it (D13); a PVC with its own annotation keeps it (own wins); a PVC whose
+// only mounting pod has no Application stays app-less; the inherited value never
+// leaks into labels.
+func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
+	podInfo := func(name, uid string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
+		}}
+	}
+	owner := func(name, tracking string) model.Sample {
+		m := model.Metric{
+			"cluster": "c", "namespace": "shop", "pod": model.LabelValue(name),
+			"owner_kind": "Deployment", "owner_name": "d", "owner_is_controller": "true",
+		}
+		if tracking != "" {
+			m["argocd_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+	mount := func(name, claim string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"pod": model.LabelValue(name), "persistentvolumeclaim": model.LabelValue(claim),
+		}}
+	}
+	pvcAnn := func(claim, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"persistentvolumeclaim":                     model.LabelValue(claim),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+
+	podVec := sampleVec(
+		podInfo("checkout-a", "ua"), // app checkout
+		podInfo("checkout-b", "ub"), // app billing (billing < checkout)
+		podInfo("noapp", "un"),      // no app
+		podInfo("declarer", "ud"),   // app web; mounts a PVC carrying its OWN annotation
+	)
+	ownerVec := sampleVec(
+		owner("checkout-a", "checkout:apps/Deployment:shop/checkout"),
+		owner("checkout-b", "billing:apps/Deployment:shop/billing"),
+		owner("noapp", ""),
+		owner("declarer", "web:apps/Deployment:shop/web"),
+	)
+	// shared:   mounted by checkout-a (checkout) + checkout-b (billing) → inherits billing
+	// lonely:   mounted by noapp only → stays app-less
+	// declared: mounted by declarer (web) but has own annotation mongo → keeps mongo
+	pvcVec := sampleVec(
+		mount("checkout-a", "shared"),
+		mount("checkout-b", "shared"),
+		mount("noapp", "lonely"),
+		mount("declarer", "declared"),
+	)
+	annVec := sampleVec(
+		pvcAnn("declared", "mongo:apps/StatefulSet:shop/mongo"),
+	)
+
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, PVC: pvcVec, PVCAnnotations: annVec})
+	byID := map[string]*graph.PVCNode{}
+	for _, p := range tp.PVCs {
+		byID[p.ID()] = p
+	}
+
+	require.Contains(t, byID, "c/shop/shared")
+	require.Contains(t, byID, "c/shop/lonely")
+	require.Contains(t, byID, "c/shop/declared")
+	assert.Equal(t, "billing", byID["c/shop/shared"].Application(), "app-less PVC inherits lexically-smallest mounting-pod Application")
+	assert.Empty(t, byID["c/shop/lonely"].Application(), "PVC whose only mounting pod has no Application stays app-less")
+	assert.Equal(t, "mongo", byID["c/shop/declared"].Application(), "PVC's own annotation wins over inheritance")
+
+	_, hasApp := byID["c/shop/shared"].Labels()["application"]
+	assert.False(t, hasApp, "inherited application must not appear in labels")
+}
+
 // TestResolveServiceApplications — the (cluster, namespace, service) → ArgoCD
 // Application index from kube_service_annotations: parse before ":", no-colon
 // verbatim, empty leading segment dropped, lexically-smallest tracking-id wins
