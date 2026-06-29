@@ -356,15 +356,23 @@ kube_replicaset_owner{cluster="cluster-alpha",namespace="shop",replicaset="check
 func (s *GraphSuite) TestPodApplicationAndContainersAttributes() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	// A pod-calls-pod edge ksg-enriched→ksg-bare keeps both pods connected (so
+	// they survive the default prune) without adding owner/container/application
+	// data — ksg-bare must still report no application and no containers.
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",uid="alpha-app-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-bare",uid="alpha-app-2",node="worker-0",test=%q} 1 %d
 kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",argocd_tracking_id="storefront:apps/Deployment:appcat/ksg",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="app",image="reg/ksg:1.4",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="istio-proxy",image="reg/proxy:0.9",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 60 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_container_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_container_info")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="ksg-enriched",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero ksg-enriched→ksg-bare service-graph rate")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -432,14 +440,19 @@ func (s *GraphSuite) TestServiceAndPVCApplicationNesting() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
-	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
+	// argo-pod is a real, connectivity-connected pod (it calls argo-svc via the
+	// connection string), so under the default prune it and the argo-data PVC it
+	// mounts survive. Its kube_pod_info also lets the volume binding resolve the
+	// pod name → uid, wiring the pod-mounts-pvc edge that drives PVC retention.
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="argons",pod="argo-pod",uid="argo-1",node="worker-0",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argons",pod="argo-pod",claim_name="argo-data",test=%q} 1 %d
 kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argons",persistentvolumeclaim="argo-data",annotation_argocd_argoproj_io_tracking_id="argowf:apps/StatefulSet:argons/argowf",test=%q} 1 %d
 kube_service_info{cluster="cluster-alpha",namespace="argons",service="argo-svc",cluster_ip="10.96.0.50",test=%q} 1 %d
 kube_service_annotations{cluster="cluster-alpha",namespace="argons",service="argo-svc",annotation_argocd_argoproj_io_tracking_id="argowf:apps/StatefulSet:argons/argowf",test=%q} 1 %d
-traces_service_graph_request_total{client="checkout",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
-traces_service_graph_request_total{client="checkout",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+traces_service_graph_request_total{client="argo-pod",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="argo-1",server_k8s_pod_uid="",client_k8s_namespace_name="argons",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="argo-pod",server="https://argo-svc.argons.svc.cluster.local/api",cluster="cluster-alpha",client_k8s_pod_uid="argo-1",server_k8s_pod_uid="",client_k8s_namespace_name="argons",server_k8s_namespace_name="",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_service_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_service_annotations")
 	s.Require().True(s.WaitForSeries(`kube_persistentvolumeclaim_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
@@ -491,6 +504,10 @@ traces_service_graph_request_total{client="checkout",server="https://argo-svc.ar
 func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	// inh-pod and own-pod are wired together by a pod-calls-pod edge so both
+	// survive the default connectivity prune (and with them the PVCs they
+	// mount); the two monotonic samples let rate() recover a non-zero rate.
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",uid="inh-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",uid="own-1",node="worker-0",test=%q} 1 %d
@@ -499,11 +516,15 @@ kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_k
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",claim_name="inh-data",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",claim_name="own-data",test=%q} 1 %d
 kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argoinh",persistentvolumeclaim="own-data",annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:argoinh/mongo",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 60 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_spec_volumes_persistentvolumeclaims_info")
 	s.Require().True(s.WaitForSeries(`kube_pod_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_owner")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="inh-pod",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero inh-pod→own-pod service-graph rate")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -1176,18 +1197,31 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 func (s *GraphSuite) TestMetricPrefix_ResolvesPrefixedSeries() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
 
+	// The service-graph metric is never metric-prefixed (D26), so this
+	// (unprefixed) edge keeps prefixed-pod connectivity-connected — without it
+	// the default prune would drop the only pod and the assertion would see an
+	// empty graph. server="ext" (no UID, non-"://") resolves to an external node.
 	exposition := fmt.Sprintf(`# HELP o11y_kube_pod_info dummy
 o11y_kube_pod_info{cluster="cluster-prefix",namespace="ops",pod="prefixed-pod",uid="prefix-uid-1",node="worker-x",test=%q} 1 %d
 o11y_kube_node_info{cluster="cluster-prefix",node="worker-x",test=%q} 1 %d
+traces_service_graph_request_total{cluster="cluster-prefix",client="prefixed-pod",server="ext",client_k8s_pod_uid="prefix-uid-1",server_k8s_pod_uid="",test=%q} 0 %d
+traces_service_graph_request_total{cluster="cluster-prefix",client="prefixed-pod",server="ext",client_k8s_pod_uid="prefix-uid-1",server_k8s_pod_uid="",test=%q} 60 %d
 `,
 		disc, t1,
+		disc, t1,
+		disc, t0,
 		disc, t1,
 	)
 	s.IngestExpFmt(exposition)
 	s.Require().True(
 		s.WaitForSeries(`o11y_kube_pod_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested o11y_kube_pod_info",
+	)
+	s.Require().True(
+		s.WaitForSeries(`rate(traces_service_graph_request_total{cluster="cluster-prefix"}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero prefixed-pod service-graph rate",
 	)
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {

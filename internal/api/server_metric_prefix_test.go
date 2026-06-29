@@ -39,6 +39,9 @@ func TestServer_MetricPrefix_AppliedToTopologyQueries(t *testing.T) {
 			"cluster": "test",
 			"node":    "node-a",
 		}),
+		// The service-graph metric is never prefixed (D26); this edge keeps
+		// web-1 connectivity-connected so it survives the default prune.
+		"traces_service_graph_request_total": serviceGraphConnectsWeb1(),
 	}
 	s := newServerWithMocks(t, newMockQuerier(t, prefixFixtures), func(c *config.Config) {
 		c.MetricPrefix = "o11y_"

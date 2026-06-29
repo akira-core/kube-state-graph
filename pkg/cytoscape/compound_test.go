@@ -207,7 +207,11 @@ func TestSerialiseCytoscape_ServiceApplicationWithoutNamespaceFallsBack(t *testi
 func TestSerialiseCytoscape_NamespaceFilterKeepsHostNode(t *testing.T) {
 	pod := &graph.PodNode{IDValue: "c1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "c1", "namespace": "shop", "node": "c1/worker-0"}}
 	node := &graph.K8sNode{IDValue: "c1/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c1"}}
-	g := graph.NewGraph([]graph.GraphNode{pod, node}, nil, time.Now())
+	// p1 calls an external endpoint so it is connectivity-connected and survives
+	// the default projection prune; the test isolates host-node retention.
+	ext := &graph.ExternalNode{IDValue: graph.ExternalID("api"), NameValue: "api"}
+	edges := []*graph.Edge{graph.NewEdge(graph.EdgeTypePodCallsPod, "c1/p1", ext.ID(), map[string]string{"cluster": "c1"})}
+	g := graph.NewGraph([]graph.GraphNode{pod, node, ext}, edges, time.Now())
 
 	view := graph.Project(g, graph.Scope{Namespaces: map[string]struct{}{"shop": {}}})
 	nodes := cyNodesByID(Serialise(g, view))

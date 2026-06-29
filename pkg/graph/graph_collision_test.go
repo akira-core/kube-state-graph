@@ -67,8 +67,17 @@ func TestNewGraph_DuplicateNodeID_ProjectionEmitsOnlyFirst(t *testing.T) {
 		NameValue:   "postgres",
 		LabelsValue: map[string]string{"cluster": "alpha", "namespace": "db"},
 	}
+	// A connectivity-connected pod mounts the colliding PVC so it survives the
+	// default projection prune; the assertion is about ID-collision dedup, not
+	// pruning.
+	pod := &PodNode{IDValue: "alpha/pod", NameValue: "pod", LabelsValue: map[string]string{"cluster": "alpha", "namespace": "db"}}
+	peer := &PodNode{IDValue: "alpha/peer", NameValue: "peer", LabelsValue: map[string]string{"cluster": "alpha", "namespace": "db"}}
+	edges := []*Edge{
+		NewEdge(EdgeTypePodCallsPod, "alpha/pod", "alpha/peer", map[string]string{"cluster": "alpha"}),
+		NewEdge(EdgeTypePodMountsPVC, "alpha/pod", id, nil),
+	}
 
-	g := NewGraph([]GraphNode{pvc, svc}, nil, time.Unix(0, 0))
+	g := NewGraph([]GraphNode{pvc, svc, pod, peer}, edges, time.Unix(0, 0))
 	view := Project(g, Scope{})
 
 	var matches []GraphNode

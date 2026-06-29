@@ -7,12 +7,17 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// scGraph builds a small graph with a pod, its node, two PVCs in different
+// scGraph builds a small graph with two pods, their node, two PVCs in different
 // namespaces, their StorageClasses, and the pod-to-node / pvc-to-storageclass /
-// pod-mounts-pvc edges that wire them.
+// pod-mounts-pvc edges that wire them. p1 (shop) and p2 (db) are
+// connectivity-connected via a pod-calls-pod edge so the default projection
+// retains them and the PVCs they mount — the assertions below then exercise the
+// orthogonal D6 infra-admission rule (a StorageClass is kept iff some in-scope
+// PVC references it).
 func scGraph() *Graph {
 	nodes := []GraphNode{
 		&PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}},
+		&PodNode{IDValue: "cluster-alpha/p2", NameValue: "billing", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db", "node": "cluster-alpha/worker-0"}},
 		&K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}},
 		&PVCNode{IDValue: "cluster-alpha/shop/claim-a", NameValue: "claim-a", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}, StorageClassValue: "gp3"},
 		&PVCNode{IDValue: "cluster-alpha/db/claim-b", NameValue: "claim-b", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}, StorageClassValue: "gp2"},
@@ -20,8 +25,11 @@ func scGraph() *Graph {
 		&StorageClassNode{IDValue: StorageClassID("cluster-alpha", "gp2"), NameValue: "gp2", LabelsValue: map[string]string{"cluster": "cluster-alpha"}},
 	}
 	edges := []*Edge{
+		NewEdge(EdgeTypePodCallsPod, "cluster-alpha/p1", "cluster-alpha/p2", map[string]string{"cluster": "cluster-alpha"}),
 		NewEdge(EdgeTypePodToNode, "cluster-alpha/p1", "cluster-alpha/worker-0", nil),
+		NewEdge(EdgeTypePodToNode, "cluster-alpha/p2", "cluster-alpha/worker-0", nil),
 		NewEdge(EdgeTypePodMountsPVC, "cluster-alpha/p1", "cluster-alpha/shop/claim-a", nil),
+		NewEdge(EdgeTypePodMountsPVC, "cluster-alpha/p2", "cluster-alpha/db/claim-b", nil),
 		NewEdge(EdgeTypePVCToStorageClass, "cluster-alpha/shop/claim-a", StorageClassID("cluster-alpha", "gp3"), nil),
 		NewEdge(EdgeTypePVCToStorageClass, "cluster-alpha/db/claim-b", StorageClassID("cluster-alpha", "gp2"), nil),
 	}

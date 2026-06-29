@@ -22,8 +22,24 @@ func Project(g *Graph, scope Scope) View {
 	}
 
 	reachable := traverse(g, scope)
-	nodes := filterNodes(g, scope, reachable)
-	edges := filterEdges(g, scope, nodes, reachable)
+
+	// Default-projection connectivity prune: every response carries only pods
+	// that sit on a connectivity edge (pod-calls-pod / pod-calls-service /
+	// service-selects-pod) and the infra that hangs off them — an edgeless pod,
+	// the node hosting only edgeless pods, a PVC mounted only by edgeless pods,
+	// and a StorageClass backing only such PVCs are dropped. The exclusion set
+	// is a pure function of the graph (scope-independent), so it is computed once
+	// and consulted in both filterNodes (skip) and filterEdges (no partner
+	// re-add). It is suppressed under an explicit name filter or a root-anchored
+	// traversal: those are the on-demand escape hatches that surface a specific
+	// edgeless element (symmetric with the D6 infra-node name/root exception).
+	var excluded map[string]struct{}
+	if reachable == nil && !scope.NameFilterActive() {
+		excluded = connectivityExcluded(g)
+	}
+
+	nodes := filterNodes(g, scope, reachable, excluded)
+	edges := filterEdges(g, scope, nodes, reachable, excluded)
 
 	out := View{
 		Nodes: make([]GraphNode, 0, len(nodes)),
@@ -89,7 +105,60 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 	return visited
 }
 
-func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[string]GraphNode {
+// connectivityExcluded returns the set of pod and PVC node IDs that the
+// default projection drops because they sit on no connectivity edge:
+//   - a pod is excluded iff it is not an endpoint of any pod-calls-pod /
+//     pod-calls-service / service-selects-pod edge;
+//   - a PVC is excluded iff none of the pods that mount it (pod-mounts-pvc) is
+//     itself connectivity-connected.
+//
+// It is a pure function of g (independent of any Scope), so the result is stable
+// across requests and reusable by a future cache. K8s nodes and StorageClasses
+// are NOT listed here — they are already reference-gated by infraNodePassesFilters
+// (a node hosting only excluded pods, or a StorageClass backing only excluded
+// PVCs, falls out for free once those pods/PVCs are gone).
+func connectivityExcluded(g *Graph) map[string]struct{} {
+	connectedPods := make(map[string]struct{})
+	pvcMounters := make(map[string][]string)
+	for _, e := range g.Edges {
+		switch e.Type {
+		case EdgeTypePodCallsPod, EdgeTypePodCallsService, EdgeTypeServiceSelectsPod:
+			// Endpoints of a connectivity edge are connected. A non-pod endpoint
+			// (a service) may land in the set too — harmless, since the set is
+			// only ever queried for pod and pod-mounter IDs.
+			connectedPods[e.Source] = struct{}{}
+			connectedPods[e.Target] = struct{}{}
+		case EdgeTypePodMountsPVC:
+			pvcMounters[e.Target] = append(pvcMounters[e.Target], e.Source)
+		}
+	}
+
+	excluded := make(map[string]struct{})
+	for id, n := range g.NodesByID {
+		switch n.Type() {
+		case NodeTypePod:
+			if _, ok := connectedPods[id]; !ok {
+				excluded[id] = struct{}{}
+			}
+		case NodeTypePVC:
+			kept := false
+			for _, podID := range pvcMounters[id] {
+				if _, ok := connectedPods[podID]; ok {
+					kept = true
+					break
+				}
+			}
+			if !kept {
+				excluded[id] = struct{}{}
+			}
+		default:
+			// node / storageclass / service / external are not connectivity-pruned.
+		}
+	}
+	return excluded
+}
+
+func filterNodes(g *Graph, scope Scope, reachable, excluded map[string]struct{}) map[string]GraphNode {
 	out := make(map[string]GraphNode, len(g.NodesByID))
 	// K8sNode and StorageClassNode admission is deferred: neither carries a
 	// namespace label, so each is retained iff referenced by an in-scope element
@@ -107,6 +176,15 @@ func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[strin
 	for id, n := range g.NodesByID {
 		if reachable != nil {
 			if _, ok := reachable[id]; !ok {
+				continue
+			}
+		}
+		// Connectivity prune (default projection only; nil under name/traversal).
+		// An excluded pod/PVC is dropped before any other admission so it never
+		// feeds the deferred infra reference sets — its host node / backing
+		// StorageClass then prunes for free via infraNodePassesFilters.
+		if excluded != nil {
+			if _, ex := excluded[id]; ex {
 				continue
 			}
 		}
@@ -240,7 +318,7 @@ func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]stru
 	return ok
 }
 
-func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable map[string]struct{}) []*Edge {
+func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable, excluded map[string]struct{}) []*Edge {
 	out := make([]*Edge, 0, len(g.Edges))
 	// Snapshot the in-scope set at entry. Re-adds during this pass MUST NOT
 	// promote a re-added partner into a new in-scope anchor, otherwise name
@@ -280,7 +358,7 @@ func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable ma
 				continue
 			}
 		}
-		if !readdEdgePartners(g, e, nodes, srcOK, tgtOK, scope, nodePassesNonClusterFilters) {
+		if !readdEdgePartners(g, e, nodes, srcOK, tgtOK, scope, excluded, nodePassesNonClusterFilters) {
 			continue
 		}
 		out = append(out, e)
@@ -297,9 +375,18 @@ func readdEdgePartners(
 	nodes map[string]GraphNode,
 	srcOK, tgtOK bool,
 	scope Scope,
+	excluded map[string]struct{},
 	pred func(GraphNode, Scope) bool,
 ) bool {
+	// A connectivity-excluded endpoint must stay excluded: re-adding it here
+	// (e.g. the pruned pod of a pod-to-node edge whose node survived via another
+	// pod) would resurrect what the default prune dropped. A partner missing only
+	// because of a cluster/namespace filter is NOT in excluded, so legitimate
+	// cross-cluster partner preservation is unaffected.
 	if !srcOK {
+		if _, ex := excluded[e.Source]; ex {
+			return false
+		}
 		partner, ok := g.NodesByID[e.Source]
 		if !ok || !pred(partner, scope) {
 			return false
@@ -307,6 +394,9 @@ func readdEdgePartners(
 		nodes[e.Source] = partner
 	}
 	if !tgtOK {
+		if _, ex := excluded[e.Target]; ex {
+			return false
+		}
 		partner, ok := g.NodesByID[e.Target]
 		if !ok || !pred(partner, scope) {
 			return false

@@ -176,12 +176,15 @@ func TestProject_NamespaceFilter_KeepsHostingK8sNode(t *testing.T) {
 // under a namespace filter (and, per the generalised D6 rule, under no filter
 // too — see TestProject_NoFilter_DropsUnreferencedInfraNodes).
 func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
+	// p1 and p2 are connectivity-connected (pod-calls-pod) so they survive the
+	// default prune; the test isolates the D6 podless-node rule.
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&PodNode{IDValue: "c/p2", NameValue: "api", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
 	}
-	g := NewGraph(all, nil, time.Now())
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"})}, time.Now())
 
 	v := Project(g, Scope{Namespaces: map[string]struct{}{"shop": {}}})
 	ids := map[string]bool{}
@@ -196,16 +199,23 @@ func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 // in-scope element is dropped from EVERY request shape — including the
 // default no-filter view. A node only appears as the host of a pod in the graph.
 func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
+	// p1 is connectivity-connected (pod-calls-pod with p2) and mounts the `data`
+	// PVC, so both survive the default prune; the test isolates the D6
+	// unreferenced-infra rule (worker-1 hosts nothing, `unused` backs nothing).
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
-		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1
+		&PodNode{IDValue: "c/p2", NameValue: "api", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1+p2
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
 		&PVCNode{IDValue: "c/shop/data", NameValue: "data", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop"}, StorageClassValue: "gp3"},
 		&StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}},       // backs data
 		&StorageClassNode{IDValue: StorageClassID("c", "unused"), NameValue: "unused", LabelsValue: map[string]string{"cluster": "c"}}, // backs nothing
 	}
 	edges := []*Edge{
+		NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"}),
 		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
+		NewEdge(EdgeTypePodToNode, "c/p2", "c/worker-0", nil),
+		NewEdge(EdgeTypePodMountsPVC, "c/p1", "c/shop/data", nil),
 		NewEdge(EdgeTypePVCToStorageClass, "c/shop/data", StorageClassID("c", "gp3"), nil),
 	}
 	g := NewGraph(all, edges, time.Now())

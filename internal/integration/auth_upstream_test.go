@@ -41,12 +41,22 @@ func (s *UpstreamAuthSuite) SetupSuite() {
 	s.VMSuite.SetupSuite()
 
 	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	// The default projection keeps only connectivity-connected pods, so the
+	// checkout pod needs a service-graph edge or it is pruned from the graph.
+	// Two monotonic samples (t0, t1=t0+60s) let rate() recover a non-zero rate;
+	// server="ext-api" (no UID, non-"://") resolves to an external node and a
+	// pod-calls-pod edge that keeps checkout connected.
 	s.IngestExpFmt(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-auth",namespace="shop",pod="checkout",uid="auth-1",node="worker-0"} 1 ` + strconv.FormatInt(t1, 10) + `
 kube_node_info{cluster="cluster-auth",node="worker-0"} 1 ` + strconv.FormatInt(t1, 10) + `
+traces_service_graph_request_total{cluster="cluster-auth",client="checkout",server="ext-api",client_k8s_pod_uid="auth-1",server_k8s_pod_uid=""} 0 ` + strconv.FormatInt(t0, 10) + `
+traces_service_graph_request_total{cluster="cluster-auth",client="checkout",server="ext-api",client_k8s_pod_uid="auth-1",server_k8s_pod_uid=""} 60 ` + strconv.FormatInt(t1, 10) + `
 `)
 	s.Require().True(s.WaitForSeries(`kube_pod_info{cluster="cluster-auth"}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_info")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{cluster="cluster-auth"}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero service-graph rate")
 }
 
 // Credentialed build succeeds end-to-end against the auth-enabled upstream.

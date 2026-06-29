@@ -126,7 +126,7 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 
 ### Requirement: Filter parameters
 
-`GET /v1/graph` SHALL accept the optional, repeatable filter parameters `cluster`, `namespace`, `edge_type`, `name`. Filters SHALL be applied at response time as a projection over the freshly built graph. Empty filter SHALL return the full multi-cluster graph for the time window. Multiple values for the same parameter SHALL be OR-combined; different parameters SHALL be AND-combined. An unknown filter value SHALL NOT cause an error.
+`GET /v1/graph` SHALL accept the optional, repeatable filter parameters `cluster`, `namespace`, `edge_type`, `name`. Filters SHALL be applied at response time as a projection over the freshly built graph. Empty filter SHALL return the **connectivity-connected subgraph** of the full multi-cluster graph for the time window (the default connectivity prune — see the "Default projection prunes connectivity-disconnected workload" requirement below); it is NOT the full topology inventory. Multiple values for the same parameter SHALL be OR-combined; different parameters SHALL be AND-combined. An unknown filter value SHALL NOT cause an error.
 
 The `name` parameter SHALL match `n.Name()` by exact string equality across **every** node type (`PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`) — a single `?name=` value matches a pod, a K8s node, a PVC, a service, or an external node with the same name. Names are not globally unique (pods and K8s nodes can share a name; PVCs and services can repeat across namespaces); all matches SHALL be returned.
 
@@ -191,6 +191,32 @@ The `name` parameter SHALL match `n.Name()` by exact string equality across **ev
 
 - **WHEN** a client sends `?name=does-not-exist`
 - **THEN** the response is 200 with empty `elements.nodes` and `elements.edges`
+
+### Requirement: Default projection prunes connectivity-disconnected workload
+
+`GET /v1/graph` SHALL, on every request that does NOT carry a `name` filter or a traversal root (`root`), return only the workload that participates in the connectivity graph. A `pod` node SHALL be retained iff it is an endpoint of at least one connectivity edge (`pod-calls-pod`, `pod-calls-service`, or `service-selects-pod`). A `pvc` node SHALL be retained iff at least one of the pods that mount it (`pod-mounts-pvc`) is itself retained by that rule; consequently a PVC with no mounting pod at all SHALL be dropped. A `node` (K8s host) and a `storageclass` SHALL be retained iff referenced by a retained element (a pod scheduled on the node, a PVC backed by the StorageClass) — the existing reference-driven infra-admission rule, now operating over the connectivity-pruned pod/PVC set. `service` and `external` nodes are connectivity-born (only ever materialised as edge endpoints) and SHALL NOT be pruned by this rule. The prune SHALL be a pure, scope-independent function of the freshly built graph, applied uniformly for the no-filter, `cluster`, and `namespace` request shapes, and SHALL NOT resurrect a pruned pod/PVC through the edge-retention partner re-add. The full multi-cluster graph SHALL still be built upstream; the prune is a projection concern only.
+
+`GET /v1/graph` SHALL suppress the prune under two on-demand escape hatches: an explicit `name` filter SHALL surface a matched element even when it is connectivity-disconnected, and a `root`-anchored traversal SHALL return its reachable set verbatim regardless of connectivity.
+
+#### Scenario: Edgeless pod and its dependents are pruned from the default view
+
+- **WHEN** the freshly built graph contains a pod `idle` that is on no connectivity edge (only a `pod-to-node` edge to host `worker-9` and a `pod-mounts-pvc` edge to PVC `idle-data`, where `worker-9` and `idle-data` are referenced by nothing else) and a client sends no filters
+- **THEN** the response omits the `idle` pod, the `worker-9` node, the `idle-data` PVC, and any StorageClass that backs only `idle-data`
+
+#### Scenario: Connectivity-connected workload is retained with its infra
+
+- **WHEN** a pod `web` is an endpoint of a `pod-calls-pod` edge, is scheduled on `worker-0`, and mounts PVC `web-data` backed by StorageClass `fast`, and a client sends no filters
+- **THEN** the response contains `web`, `worker-0`, `web-data`, and `fast`
+
+#### Scenario: Name filter surfaces an otherwise-pruned edgeless pod
+
+- **WHEN** the freshly built graph contains a connectivity-disconnected pod `idle` and a client sends `?name=idle`
+- **THEN** the response contains the `idle` pod node (the prune is suppressed by the explicit name filter)
+
+#### Scenario: Namespace filter still prunes edgeless workload
+
+- **WHEN** a namespace `shop` contains both a connectivity-connected pod `web` and an edgeless pod `idle`, and a client sends `?namespace=shop`
+- **THEN** the response contains `web` but omits `idle`
 
 ### Requirement: Partial-graph traversal
 
