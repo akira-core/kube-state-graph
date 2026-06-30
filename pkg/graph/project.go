@@ -130,6 +130,12 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 			connectedPods[e.Target] = struct{}{}
 		case EdgeTypePodMountsPVC:
 			pvcMounters[e.Target] = append(pvcMounters[e.Target], e.Source)
+		case EdgeTypePodToNode, EdgeTypePVCToStorageClass:
+			// Infra edges (pod→node, pvc→storageclass) are NOT connectivity edges:
+			// they never make a pod or PVC connectivity-connected. Their endpoints
+			// (K8s nodes / StorageClasses) are reference-gated by
+			// infraNodePassesFilters, not by this set. Listed explicitly to keep
+			// the switch exhaustive over graph.EdgeType.
 		}
 	}
 
