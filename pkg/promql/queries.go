@@ -101,28 +101,28 @@ const ClusterDiscoveryLookback = time.Hour
 // serviceGraphSentinelSelector excludes the servicegraph connector's virtual
 // peers from the service-graph series at the query layer (design.md D30): an
 // uninstrumented caller surfaces as client="user", an unresolved peer as
-// "unknown". These carry no pod UID and resolve to no actionable node.
-//
-// PromQL / MetricsQL `!~` is a fully-anchored RE2 match, so this drops a series
-// only when the WHOLE client/server value is exactly "user" or "unknown"
-// (case-sensitive). A connection-string label like "http://user/..." is NOT
-// excluded (it is not equal to "user"), so D29 resolution is unaffected. The
-// two matchers are ANDed in the selector, so a series is dropped when EITHER
-// endpoint is a sentinel. The set is fixed — no operator knob (consistent with
+// "unknown", neither carrying a pod UID. `!~` is a fully-anchored RE2 match, so
+// a series is dropped only when the WHOLE client/server value equals a sentinel
+// (case-sensitive) — a "http://user/..." connection string is unaffected, so
+// D29 resolution is untouched. The set is fixed, no operator knob (as with
 // D29's removal of KSG_OTHERS_NAME_PATTERN).
 //
-// Dropping the WHOLE series is safe (no empty-UID gating needed): by the
-// connector's contract a sentinel client/server value never co-occurs with a
-// populated *_k8s_pod_uid — the virtual node exists precisely because there was
-// no instrumented (hence no pod-identified) peer — so no real pod-resolved edge
-// is ever discarded by this matcher.
+// The two matchers are independent (resolve-unknown-server-peer-labels D1). The
+// client matcher excludes both sentinels: by the connector's contract a
+// sentinel client never co-occurs with a populated pod UID, so dropping the
+// whole series upstream discards no real pod-resolved edge, and an unresolved
+// caller carries no identity worth recovering anyway. The server matcher is
+// narrowed to `server!~"user"` so a literal server="unknown" reaches Go, where
+// the "Unknown-server peer-label enrichment" branch resolves it from the
+// client-recorded peer-address labels (client_net_peer_name /
+// client_server_address), or drops it. This is not a general relaxation: every
+// server="unknown" outside that narrow trigger is still dropped in Go with the
+// identical no-node/no-edge outcome as the old exclusion — see
+// resolveUnknownServerPeer in pkg/build/servicegraph.go.
 //
-// When the deferred numeric service-graph metrics
-// (traces_service_graph_request_failed_total,
-// traces_service_graph_request_server_seconds_bucket) are queried in a future
-// revision, they MUST reuse this fragment so the edge set stays consistent
-// across metric families.
-const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user|unknown"`
+// Deferred numeric service-graph metrics (traces_service_graph_request_failed_total,
+// _server_seconds_bucket) MUST reuse this fragment so the edge set stays consistent.
+const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 
 // Renderer renders Query templates to PromQL strings, optionally prepending
 // Prefix to every kube-state-metrics-shaped metric name. The prefix is

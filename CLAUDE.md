@@ -221,18 +221,52 @@ live under `openspec/specs/`.
   to an instrumented span — an uninstrumented caller as `client="user"`, an
   unresolved peer as `"unknown"`. The service-graph selector drops these
   **upstream** via anchored negative matchers —
-  `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user|unknown"}[w])`
-  — so the series never reach the resolver: no node (`pod` / synth / `service` /
-  `external`) and no edge is produced for a `user` / `unknown` peer.
-  PromQL `!~` is fully anchored, so the match is **exact** and **case-sensitive**
-  (a `http://user/...` connection string is NOT excluded — it is not equal to
-  `user`). Applied to both `client` and `server` (either side matching drops the
-  series). This is a fixed selector contract on the `client` / `server` labels
-  only — it does NOT touch the `cluster="unknown"` bucketing (a different label).
-  The matcher fragment lives in `promql.serviceGraphSentinelSelector`; the
-  `QServiceGraphTotal` constant stays the bare metric name so `query_name`
-  self-metric / span dimensions are unchanged. Deferred numeric service-graph
-  metrics MUST reuse the same fragment when added.
+  `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[w])`
+  — so a `client="user"`/`"unknown"` series never reaches the resolver: no node
+  (`pod` / synth / `service` / `external`) and no edge is produced for it. The
+  **server-side matcher is narrower** (`server!~"user"` only —
+  resolve-unknown-server-peer-labels D1): a `server="unknown"` series now
+  reaches Go, but the reader still drops it (same outward result: no node, no
+  edge) **UNLESS** the "Unknown-server peer-label enrichment" rule below
+  applies — every `server="unknown"` case outside that rule's narrow trigger
+  (client unresolved, or the server UID itself resolves) is **byte-for-byte
+  unchanged** from the old blanket exclusion. PromQL `!~` is fully anchored, so
+  the match is **exact** and **case-sensitive** (a `http://user/...` connection
+  string is NOT excluded — it is not equal to `user`). This is a fixed
+  selector contract on the `client` / `server` labels only — it does NOT touch
+  the `cluster="unknown"` bucketing (a different label). The matcher fragment
+  lives in `promql.serviceGraphSentinelSelector`; the `QServiceGraphTotal`
+  constant stays the bare metric name so `query_name` self-metric / span
+  dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
+  the same fragment when added.
+- **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
+  D1–D3, hardcoded — no knob): the one carve-out from the D30 outcome above.
+  When `client_k8s_pod_uid` resolves to a **real topology pod** (never a
+  synthesised one) AND the server side has no resolvable pod (UID empty, or
+  present but absent from `Topology.PodsByUID`) AND the raw `server` label is
+  exactly `"unknown"`, `resolveServer` dispatches to the new
+  `resolveUnknownServerPeer` instead of the generic empty-UID
+  (`resolveEmptyUID`, which owns the D27 fallback) or synth-pod path — never
+  both, for this literal value. It reads `client_net_peer_name` (checked
+  first) then `client_server_address` (checked second; an optional trailing
+  `:<port>` is best-effort stripped via `net.SplitHostPort`) and classifies
+  whichever is non-empty first via the same `classifyK8sDNS` grammar D29
+  connection-string resolution uses (2-label `<service>.<namespace>`, 3-label
+  headless `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped),
+  **plus one grammar extension scoped to this rule only**: a single dot-free,
+  non-IP-literal label is treated as a bare short Service name resolved in the
+  **client pod's own namespace**. A successful classification resolves via the
+  existing `resolveServiceLevel(anchorCluster, ns, svc)` — anchor = the
+  already-resolved client pod's own cluster (no anchor-recovery fallback chain
+  needed here, unlike D29) — with the same anchor-membership test and
+  cross-cluster `service-selects-pod` fan-out. An unresolvable classification,
+  or a `resolveServiceLevel` miss, falls back to `external/<raw_peer_address>`
+  (the RAW, unstripped value — same convention as every other external
+  fallback). Neither label present, or the client did not resolve to a real
+  pod, drops the endpoint (no node, no edge) — **identical outward behaviour
+  to the pre-change blanket exclusion**. This is the invariant the loosened
+  selector must never violate: it must never leak a `external/unknown` node
+  via the generic D27 path for a case outside this rule's trigger.
 - **Server-side pod resolution** uses `Topology.PodsByUID` — a global pod-UID
   index built from all loaded clusters. Service-graph metrics carry only the
   trace-source `cluster` (client side); the server side's cluster is recovered
@@ -241,7 +275,7 @@ live under `openspec/specs/`.
   label) follow the missing-UID fallback above; UIDs present but unknown
   to topology become synth pods with `cluster=""` (server-side cluster
   unknown).
-- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The one fixed exception is the D30 sentinel matcher (`client!~"user|unknown",server!~"user|unknown"`) on the service-graph selector — it is a **request-invariant metric-selection contract**, not a caller filter, so it never varies per request and does not break the projection-over-graph contract a future cache relies on.
+- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The one fixed exception is the D30 sentinel matcher (`client!~"user|unknown",server!~"user"` — the server side narrowed by resolve-unknown-server-peer-labels D1) on the service-graph selector — it is a **request-invariant metric-selection contract**, not a caller filter, so it never varies per request and does not break the projection-over-graph contract a future cache relies on.
 - **`/v1/edge-types` reads from `graph.EdgeTypes` only** — a single in-code
   registry shared with the builder. Adding an edge type = update both the
   builder and the registry in the same change; the API can never list a type
