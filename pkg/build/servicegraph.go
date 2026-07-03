@@ -68,6 +68,7 @@ type sgResolver struct {
 	podByID            map[string]*graph.PodNode    // client side: cluster known from metric
 	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
+	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
 	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
@@ -124,6 +125,16 @@ type svcCandidate struct {
 	obs     ServiceObs
 }
 
+// ipKey keys the resolve-unknown-server-ip-peer reverse index: a Service's
+// ClusterIP, scoped to a single cluster. Deliberately NOT family-scoped like
+// famSvcKey — a ClusterIP is a per-cluster address assigned from that
+// cluster's own (often overlapping) Service CIDR, so matching it across
+// clusters risks resolving to the wrong Service. The identification lookup
+// is anchor-cluster-only; once a (namespace, service) is identified, the
+// existing family-wide resolveServiceLevel still governs the
+// service-selects-pod fan-out.
+type ipKey struct{ cluster, ip string }
+
 func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
@@ -158,11 +169,35 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		sort.Slice(cands, func(i, j int) bool { return cands[i].cluster < cands[j].cluster })
 	}
 
+	// Reverse ClusterIP index for the resolve-unknown-server-ip-peer bare
+	// IP-literal classification step: (cluster, ClusterIP) -> the Service
+	// deployed at that address in that cluster. Skips headless ("None") and
+	// empty ClusterIP values — neither is a matchable literal. On a same-
+	// cluster duplicate ClusterIP (a data anomaly Kubernetes itself prevents,
+	// but the index build stays defensive), the lexically-smaller
+	// (namespace, service) wins — deterministic, independent of map-
+	// iteration order (D6).
+	ipIndex := make(map[ipKey]serviceKey, len(topology.ServicesByNameNS))
+	for k, obs := range topology.ServicesByNameNS {
+		if obs.ClusterIP == "" || obs.ClusterIP == "None" {
+			continue
+		}
+		ik := ipKey{cluster: k.cluster, ip: obs.ClusterIP}
+		if existing, ok := ipIndex[ik]; ok {
+			if k.namespace > existing.namespace ||
+				(k.namespace == existing.namespace && k.service >= existing.service) {
+				continue
+			}
+		}
+		ipIndex[ik] = k
+	}
+
 	res := &sgResolver{
 		endpointsByService: topology.EndpointsByService,
 		podByID:            podByID,
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
+		ipIndex:            ipIndex,
 		serviceApps:        topology.ServiceApplications,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
@@ -531,6 +566,22 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNe
 	if !ok {
 		if svc, ok = classifyBareShortName(host); ok {
 			ns = clientNamespace
+		}
+	}
+	if !ok {
+		// resolve-unknown-server-ip-peer: a bare IP literal (no DNS grammar
+		// match, not a bare short name) is looked up against the anchor
+		// cluster's OWN ClusterIP set only — never a family sibling, since a
+		// ClusterIP is a per-cluster address that can legitimately collide
+		// across unrelated clusters' Service CIDRs (see ipKey doc comment).
+		if ip := net.ParseIP(host); ip != nil {
+			if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: host}]; hit {
+				svc, ns, ok = sk.service, sk.namespace, true
+			} else {
+				r.noteExternal("unknown_server_peer_ip_literal_no_match", t,
+					"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+				return []string{r.external(value)}
+			}
 		}
 	}
 	if !ok {

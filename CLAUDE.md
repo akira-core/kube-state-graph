@@ -253,9 +253,24 @@ live under `openspec/specs/`.
   whichever is non-empty first via the same `classifyK8sDNS` grammar D29
   connection-string resolution uses (2-label `<service>.<namespace>`, 3-label
   headless `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped),
-  **plus one grammar extension scoped to this rule only**: a single dot-free,
-  non-IP-literal label is treated as a bare short Service name resolved in the
-  **client pod's own namespace**. A successful classification resolves via the
+  **plus two grammar extensions scoped to this rule only**: (1) a single
+  dot-free, non-IP-literal label is treated as a bare short Service name
+  resolved in the **client pod's own namespace**; (2) (resolve-unknown-server-ip-peer)
+  when neither the DNS grammar nor the bare-short-name form matches AND the
+  host is a valid IP literal (`net.ParseIP`), it is looked up as a Service
+  `ClusterIP` **within the already-resolved client pod's own (anchor) cluster
+  only** — never a family sibling, since a `ClusterIP` is a per-cluster
+  address that can legitimately collide across unrelated clusters' Service
+  CIDRs (unlike a Service DNS name, which is a mesh-wide convention the
+  family union already handles). The reverse index (`(cluster, ClusterIP) →
+  Service`) is built once per parse from `topology.ServicesByNameNS`,
+  skipping empty/`"None"` ClusterIP; on a same-cluster duplicate `ClusterIP`
+  (a data anomaly Kubernetes itself prevents), the lexically-smaller
+  `(namespace, service)` wins. Once identified via IP, resolution proceeds
+  through the SAME `resolveServiceLevel` call as every other classification
+  path below — including its normal family-wide `service-selects-pod`
+  fan-out — only the identification lookup itself is anchor-scoped. A
+  successful classification resolves via the
   existing `resolveServiceLevel(anchorCluster, ns, svc)` — anchor = the
   already-resolved client pod's own cluster (no anchor-recovery fallback chain
   needed here, unlike D29) — with the same anchor-membership test and
