@@ -681,6 +681,149 @@ func TestParseServiceGraph_UnknownServerPeerLabel_ServerUIDPresentButUnresolved(
 	assert.Empty(t, res.SynthPods, "no synth pod minted for the stale UID — enrichment wins over the synth-pod fallback")
 }
 
+// sampleTopologyIPFamily gives two family-sibling clusters (prod-1, prod-2,
+// family "prod-0") each deploying their own "payments" service in namespace
+// "shop", at DIFFERENT ClusterIPs — resolve-unknown-server-ip-peer's
+// anchor-cluster-only IP lookup must never cross this family boundary.
+func sampleTopologyIPFamily() Topology {
+	clientPod := &graph.PodNode{IDValue: "prod-1/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "shop"}}
+	p1a := &graph.PodNode{IDValue: "prod-1/p1a", NameValue: "payments-0", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "shop"}}
+	p2a := &graph.PodNode{IDValue: "prod-2/p2a", NameValue: "payments-0", LabelsValue: map[string]string{"cluster": "prod-2", "namespace": "shop"}}
+	return Topology{
+		Pods:      []*graph.PodNode{clientPod, p1a, p2a},
+		PodsByUID: map[string]*graph.PodNode{"abc": clientPod},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"prod-1", "shop", "payments"}: {ClusterIP: "10.1.0.5"},
+			{"prod-2", "shop", "payments"}: {ClusterIP: "10.2.0.5"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"prod-1", "shop", "payments"}: {{Pod: p1a}},
+			{"prod-2", "shop", "payments"}: {{Pod: p2a}},
+		},
+	}
+}
+
+// sampleTopologyIPDuplicate is a defensive fixture: two Services in the SAME
+// cluster share one ClusterIP (an anomaly Kubernetes itself prevents), used
+// to assert the lexically-smaller (namespace, service) wins deterministically.
+func sampleTopologyIPDuplicate() Topology {
+	clientPod := &graph.PodNode{IDValue: "cluster-alpha/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	alphaPod := &graph.PodNode{IDValue: "cluster-alpha/a1", NameValue: "alpha-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "ops"}}
+	zetaPod := &graph.PodNode{IDValue: "cluster-alpha/z1", NameValue: "zeta-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "ops"}}
+	return Topology{
+		Pods:      []*graph.PodNode{clientPod, alphaPod, zetaPod},
+		PodsByUID: map[string]*graph.PodNode{"abc": clientPod},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"cluster-alpha", "ops", "zeta"}:  {ClusterIP: "172.20.10.5"},
+			{"cluster-alpha", "ops", "alpha"}: {ClusterIP: "172.20.10.5"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"cluster-alpha", "ops", "zeta"}:  {{Pod: zetaPod}},
+			{"cluster-alpha", "ops", "alpha"}: {{Pod: alphaPod}},
+		},
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralResolvesService(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                "checkout",
+			"server":                "unknown",
+			"cluster":               "cluster-alpha",
+			"client_k8s_pod_uid":    "abc",
+			"server_k8s_pod_uid":    "",
+			"client_server_address": "10.0.0.5",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "bare IP literal matches the anchor cluster's own ClusterIP")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+
+	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
+	require.Len(t, ssp, 2, "normal service-selects-pod fan-out still applies once the Service is identified")
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralWithPort(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":               "checkout",
+			"server":               "unknown",
+			"cluster":              "cluster-alpha",
+			"client_k8s_pod_uid":   "abc",
+			"server_k8s_pod_uid":   "",
+			"client_net_peer_name": "10.0.0.5:8080",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "port suffix stripped before IP-literal matching")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralFamilySiblingNotMatched(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                "checkout",
+			"server":                "unknown",
+			"cluster":               "prod-1",
+			"client_k8s_pod_uid":    "abc",
+			"server_k8s_pod_uid":    "",
+			"client_server_address": "10.2.0.5", // prod-2's ClusterIP, not prod-1's
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyIPFamily())
+
+	require.Len(t, res.ExternalNodes, 1, "IP lookup is anchor-cluster-only — a family sibling's ClusterIP does not match")
+	assert.Equal(t, "external/10.2.0.5", res.ExternalNodes[0].IDValue)
+	assert.Empty(t, res.ServiceNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralNoMatch(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":               "checkout",
+			"server":               "unknown",
+			"cluster":              "cluster-alpha",
+			"client_k8s_pod_uid":   "abc",
+			"server_k8s_pod_uid":   "",
+			"client_net_peer_name": "192.0.2.55",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ExternalNodes, 1)
+	assert.Equal(t, "external/192.0.2.55", res.ExternalNodes[0].IDValue)
+	assert.Empty(t, res.ServiceNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralDuplicateClusterIP(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                "checkout",
+			"server":                "unknown",
+			"cluster":               "cluster-alpha",
+			"client_k8s_pod_uid":    "abc",
+			"server_k8s_pod_uid":    "",
+			"client_server_address": "172.20.10.5",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyIPDuplicate())
+
+	require.Len(t, res.ServiceNodes, 1, "duplicate ClusterIP resolves deterministically")
+	assert.Equal(t, "cluster-alpha/ops/alpha", res.ServiceNodes[0].IDValue, "lexically-smaller (namespace, service) wins: alpha < zeta")
+}
+
 func TestParseServiceGraph_GhostFallback_ServerUIDUnknown(t *testing.T) {
 	vec := sampleVec(model.Sample{
 		Metric: model.Metric{
