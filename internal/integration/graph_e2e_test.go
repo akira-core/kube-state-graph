@@ -1187,6 +1187,59 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 	}
 }
 
+// TestPVCNetAppTridentLabels — ingest a PVC binding, its
+// kube_persistentvolumeclaim_info series carrying `volumename` (the bound PV
+// name), and the two NetApp Trident custom-resource series
+// (kube_tridentvolume_info: name → backendUUID; kube_tridentbackend_info:
+// backendUUID → svm) against a real VictoriaMetrics, then assert the PVC node
+// carries BOTH additive labels (`volumename`, `svm`) while a second PVC whose
+// PV has no Trident rows carries `volumename` only — the svm key absent, never
+// empty. End-to-end coverage of the Trident label chain including graceful
+// partial-chain degradation.
+func (s *GraphSuite) TestPVCNetAppTridentLabels() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="trident-data",volume="data",test=%q} 1 %d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="plain-nas-data",volume="scratch",test=%q} 1 %d
+# HELP kube_persistentvolumeclaim_info dummy
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="trident-data",storageclass="netapp-nas",volumename="pvc-9f3a-trident",test=%q} 1 %d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="plain-nas-data",storageclass="netapp-nas",volumename="pvc-0000-plain",test=%q} 1 %d
+# HELP kube_tridentvolume_info dummy
+kube_tridentvolume_info{cluster="cluster-alpha",name="pvc-9f3a-trident",backendUUID="be-1234",test=%q} 1 %d
+# HELP kube_tridentbackend_info dummy
+kube_tridentbackend_info{cluster="cluster-alpha",backendUUID="be-1234",svm="svm-prod",test=%q} 1 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+	s.Require().True(
+		s.WaitForSeries(`kube_tridentbackend_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_tridentbackend_info")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	trident, ok := byID["cluster-alpha/shop/trident-data"]
+	s.Require().True(ok, "trident-backed pvc node must be present")
+	s.Equal("pvc-9f3a-trident", trident.Labels["volumename"], "bound PV name surfaces as labels.volumename")
+	s.Equal("svm-prod", trident.Labels["svm"], "Trident chain resolves labels.svm")
+	s.Equal("data", trident.Labels["volume"], "pod-spec volume key coexists with volumename")
+
+	plain, ok := byID["cluster-alpha/shop/plain-nas-data"]
+	s.Require().True(ok, "plain pvc node must be present")
+	s.Equal("pvc-0000-plain", plain.Labels["volumename"], "volumename resolves without Trident rows")
+	_, hasSVM := plain.Labels["svm"]
+	s.False(hasSVM, "a PV with no Trident rows must omit the svm key entirely")
+}
+
 // TestMetricPrefix_ResolvesPrefixedSeries covers design.md D26 end-to-end
 // against a real VictoriaMetrics container: ingest a topology under an
 // `o11y_`-prefixed metric-name family, start the API with

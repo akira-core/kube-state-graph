@@ -71,6 +71,8 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
 		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(o11y_kube_service_annotations[1m])"},
 		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])"},
+		{"tridentvolume-info", QTridentVolumeInfo, time.Minute, "last_over_time(o11y_kube_tridentvolume_info[1m])"},
+		{"tridentbackend-info", QTridentBackendInfo, time.Minute, "last_over_time(o11y_kube_tridentbackend_info[1m])"},
 		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
 	}
 	r := Renderer{Prefix: "o11y_"}
@@ -181,6 +183,23 @@ func TestRender_PVCAnnotationsPrefixAware(t *testing.T) {
 		"Query constant stays the bare metric name for stable query/query_name dimensions")
 	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])",
 		Renderer{Prefix: "o11y_"}.Render(QPVCAnnotations, time.Minute))
+}
+
+// TestRender_TridentPrefixAware pins the two NetApp Trident custom-resource
+// queries (kube_tridentvolume_info / kube_tridentbackend_info — the PVC
+// volumename→backendUUID→svm label chain). Bare by default (stable self-metric
+// dimension), prefix-aware via Renderer like every other KSM-shaped series.
+func TestRender_TridentPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_tridentvolume_info[1m])", Render(QTridentVolumeInfo, time.Minute))
+	assert.Equal(t, "last_over_time(kube_tridentbackend_info[1m])", Render(QTridentBackendInfo, time.Minute))
+	assert.Equal(t, "kube_tridentvolume_info", string(QTridentVolumeInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "kube_tridentbackend_info", string(QTridentBackendInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_tridentvolume_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QTridentVolumeInfo, time.Minute))
+	assert.Equal(t, "last_over_time(o11y_kube_tridentbackend_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QTridentBackendInfo, time.Minute))
 }
 
 func TestFormatDuration(t *testing.T) {

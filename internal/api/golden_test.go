@@ -27,6 +27,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"with-service":         buildWithService(),
 		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
+		"with-netapp-trident":  buildWithNetAppTrident(),
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 	}
@@ -157,6 +158,39 @@ func buildWithStorageClass() graph.View {
 		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcGP3.IDValue, sc.IDValue, nil),
 	}
 	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone, sc}, Edges: edges}
+}
+
+// buildWithNetAppTrident snapshots the NetApp Trident PVC label chain: a PVC
+// whose bound PV name (`labels.volumename`, from kube_persistentvolumeclaim_info)
+// and serving SVM (`labels.svm`, via kube_tridentvolume_info →
+// kube_tridentbackend_info) surface as plain additive labels — no
+// data.volumename / data.svm typed fields — coexisting with the pod-spec
+// `volume` key. A second PVC with an unresolved chain carries neither key
+// (absent, never empty-string).
+func buildWithNetAppTrident() graph.View {
+	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	pvcTrident := &graph.PVCNode{
+		IDValue:   "cluster-alpha/db/data-mongo-0",
+		NameValue: "data-mongo-0",
+		LabelsValue: map[string]string{
+			"cluster": "cluster-alpha", "namespace": "db",
+			"volume": "data", "volumename": "pvc-9f3a", "svm": "svm-prod",
+		},
+		StorageClassValue: "netapp-nas",
+	}
+	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	sc := &graph.StorageClassNode{
+		IDValue:     graph.StorageClassID("cluster-alpha", "netapp-nas"),
+		NameValue:   "netapp-nas",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
+		InfoValue:   &graph.StorageClassInfo{Provisioner: "csi.trident.netapp.io", Parameters: map[string]string{"pool": "aggr1", "fs": "nfs"}},
+	}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcTrident.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcPlain.IDValue, map[string]string{"claim_name": "scratch"}),
+		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcTrident.IDValue, sc.IDValue, nil),
+	}
+	return graph.View{Nodes: []graph.GraphNode{pod, pvcTrident, pvcPlain, sc}, Edges: edges}
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

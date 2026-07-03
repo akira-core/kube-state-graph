@@ -92,6 +92,22 @@ const (
 	// absence degrades gracefully to no `application` attribute.
 	QServiceAnnotations Query = "kube_service_annotations"
 	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
+
+	// NetApp Trident PVC SVM resolution. KSM-shaped, so prefix-aware via
+	// Renderer — but NOT stock kube-state-metrics: both series come from a KSM
+	// custom-resource-state config over the Trident `tridentvolumes` /
+	// `tridentbackends` CRDs (or a compatible exporter). Fixed label contract,
+	// case-sensitive and verbatim: kube_tridentvolume_info carries `name` (the
+	// TridentVolume CR name, which equals the bound PV name under Trident's
+	// naming) and `backendUUID`; kube_tridentbackend_info carries `backendUUID`
+	// and `svm`. Chained from kube_persistentvolumeclaim_info's `volumename`
+	// label to enrich existing PVC nodes with `volumename` / `svm` labels
+	// (never new nodes, never new edges). OPTIONAL — absent on clusters without
+	// Trident or without the custom-resource-state config; every broken link of
+	// the chain degrades to omitting the affected label(s), never a build
+	// failure.
+	QTridentVolumeInfo  Query = "kube_tridentvolume_info"
+	QTridentBackendInfo Query = "kube_tridentbackend_info"
 )
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
@@ -187,6 +203,10 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(%skube_service_annotations[%s])`, r.Prefix, w)
 	case QPVCAnnotations:
 		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_annotations[%s])`, r.Prefix, w)
+	case QTridentVolumeInfo:
+		return fmt.Sprintf(`last_over_time(%skube_tridentvolume_info[%s])`, r.Prefix, w)
+	case QTridentBackendInfo:
+		return fmt.Sprintf(`last_over_time(%skube_tridentbackend_info[%s])`, r.Prefix, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
 		// the configurable prefix deliberately does NOT apply here. The metric
