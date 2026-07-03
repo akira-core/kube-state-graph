@@ -79,10 +79,11 @@ Server-side service-graph resolution change; implemented test-first against
       `-run TestQuer` (selector rendering) green.
 - [x] 6.2 `go vet ./...` clean; `make lint` 0 issues (pre-existing, unrelated `exhaustive`
       finding in `pkg/graph/project.go` confirmed via `git stash` to predate this change).
-- [ ] 6.3 Affected integration subset green against a real VM (the new fixture from 4.1,
+- [x] 6.3 Affected integration subset green against a real VM (the new fixture from 4.1,
       plus existing service-graph / sentinel-exclusion integration tests for regressions).
-      NOT run here — Docker daemon unavailable in this environment
-      (`internal/integration.SkipIfDockerUnavailable` skips locally); deferred to CI.
+      Ran full `TestGraphSuite` (Docker available) — 27/27 subtests PASS, incl.
+      `TestUnknownServerPeerLabelResolvesToServiceNode` and
+      `TestSentinelPeersExcludedAtQueryLayer` (532.35s total).
 - [x] 6.4 Full `make test` (race + shuffle) green locally — Docker-gated integration suite
       skipped (no daemon available), will run full on CI per the documented test-layer table.
 - [x] 6.5 `openspec validate "resolve-unknown-server-peer-labels"` passes.
