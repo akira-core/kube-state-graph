@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -14,6 +15,13 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
+
+// sentinelUnknown is the literal server-label value the D30 query-layer
+// exclusion no longer drops on the server side (resolve-unknown-server-peer-labels
+// D1). A no-op everywhere except the two resolveServer branches that route it
+// to resolveUnknownServerPeer instead of the generic empty-UID / synth-pod
+// fallbacks.
+const sentinelUnknown = "unknown"
 
 // ServiceGraphResult is the typed output of the pod-service-graph reader.
 type ServiceGraphResult struct {
@@ -190,6 +198,12 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
+		// Peer-address labels recorded on the CLIENT span (OTel semconv
+		// client.net.peer.name / client.server.address), consulted only when
+		// server=="unknown" and the client resolves to a real pod — see
+		// resolveUnknownServerPeer.
+		clientNetPeerName := string(s.Metric["client_net_peer_name"])
+		clientServerAddress := string(s.Metric["client_server_address"])
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -231,15 +245,22 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		// pod. The "://" then resolves to a single service node in THIS cluster
 		// (iff it holds the service), per the same-cluster rule. Edge
 		// labels.cluster is unaffected (still the raw trace label, per D9).
+		//
+		// clientPod is also the trigger signal for the unknown-server peer-label
+		// enrichment: it is non-nil ONLY when the client side resolved to a REAL
+		// topology pod (res.podByID never indexes a synthesised pod), matching
+		// this requirement's "not a synthesised pod" trigger condition.
 		anchorCluster := traceCluster
+		var clientPod *graph.PodNode
 		if srcIsPod && len(srcIDs) == 1 {
 			if pod, ok := res.podByID[srcIDs[0]]; ok {
+				clientPod = pod
 				if c := pod.Labels()["cluster"]; c != "" {
 					anchorCluster = c
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, clientNetPeerName, clientServerAddress)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -439,15 +460,28 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 // routing). anchorCluster is the caller's authoritative cluster: the
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
-func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace) []string {
+//
+// clientPod, clientNetPeerName, and clientServerAddress feed ONLY the
+// resolve-unknown-server-peer-labels enrichment: whenever the raw server label
+// is literally "unknown" AND no real topology pod is found for it (UID empty,
+// or UID present but absent from the global pod-UID index), resolution routes
+// to resolveUnknownServerPeer instead of resolveEmptyUID or the synth-pod
+// fallback below — D1's explicit carve-out, so the loosened server!~"user"
+// selector does not leak external/unknown noise via the generic paths.
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string) []string {
 	if podUID == "" {
+		if label == sentinelUnknown {
+			return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+		}
 		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
 	// As in resolveClient: a populated server_k8s_pod_uid SKIPS connection-string
 	// resolution, so a "://" server label never maps to its service node (it
 	// collapses onto the UID's pod, or a synth pod when the UID is unknown to
 	// topology). This is the most common cause of a "://" peer resolving as a
-	// service on the client side yet falling through on the server side.
+	// service on the client side yet falling through on the server side. Never
+	// fires for label == "unknown" — isConnString("unknown") is false — so this
+	// evidence path and the enrichment branch below are mutually exclusive.
 	if isConnString(label) {
 		r.shadowed++
 		_, known := r.podByUID[podUID]
@@ -460,8 +494,92 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 	if pod, ok := r.podByUID[podUID]; ok {
 		return []string{pod.ID()}
 	}
+	if label == sentinelUnknown {
+		return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+	}
 	r.synthPod(graph.PodID("", podUID), "", namespace, podUID) // server cluster unknown
 	return []string{graph.PodID("", podUID)}
+}
+
+// resolveUnknownServerPeer implements the "Unknown-server peer-label
+// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3): the
+// narrow carve-out that lets a literal server="unknown" endpoint resolve via
+// the client-recorded peer-address labels client_net_peer_name /
+// client_server_address instead of being unconditionally dropped — but only
+// when the client side already resolved to a REAL (non-synthesised) topology
+// pod, so the anchor cluster is unambiguous. clientPod nil (client
+// unresolved, or resolved only to a synth pod) and "neither label present"
+// both drop the endpoint (nil), byte-for-byte identical to the outcome under
+// the old server!~"user|unknown" query-layer exclusion.
+func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string, t sgTrace) []string {
+	if clientPod == nil {
+		return nil // client side did not resolve to a real topology pod
+	}
+	value := clientNetPeerName
+	if value == "" {
+		value = clientServerAddress
+	}
+	if value == "" {
+		return nil // neither client_net_peer_name nor client_server_address present
+	}
+
+	anchorCluster := clientPod.Labels()["cluster"]
+	clientNamespace := clientPod.Labels()["namespace"]
+
+	host := stripPeerAddressPort(value)
+	svc, ns, ok := classifyK8sDNS(host)
+	if !ok {
+		if svc, ok = classifyBareShortName(host); ok {
+			ns = clientNamespace
+		}
+	}
+	if !ok {
+		r.noteExternal("unknown_server_peer_not_k8s_dns", t,
+			"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+		return []string{r.external(value)}
+	}
+	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
+		slog.Debug("service-graph unknown-server peer-label resolved to service node",
+			"side", t.side, "peer_address", value, "service", svc, "namespace", ns,
+			"anchor_cluster", anchorCluster, "service_id", ids[0],
+			"client", t.clientLabel, "server", t.serverLabel)
+		return ids
+	}
+	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
+	// hold that Service in its own family — external, not dropped (mirrors
+	// resolveConnString's anchor_cluster_lacks_service outcome).
+	r.noteExternal("unknown_server_peer_anchor_lacks_service", t,
+		"service", svc, "namespace", ns, "host", host, "peer_address", value,
+		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
+	return []string{r.external(value)}
+}
+
+// stripPeerAddressPort best-effort strips a trailing ":<port>" suffix from a
+// client_net_peer_name / client_server_address value (resolve-unknown-server-peer-labels
+// D2 step 1). net.SplitHostPort fails on a plain hostname/IP with no port (no
+// colon) or on an unbracketed IPv6 literal (ambiguous colon) — either failure
+// falls back to the raw, unstripped value.
+func stripPeerAddressPort(value string) string {
+	host, _, err := net.SplitHostPort(value)
+	if err != nil {
+		return value
+	}
+	return host
+}
+
+// classifyBareShortName reports whether host is a bare, dot-free Service short
+// name — the resolve-unknown-server-peer-labels D2 step-3 grammar extension
+// over classifyK8sDNS, scoped to the unknown-server peer-label enrichment
+// trigger only (connection-string resolution does NOT gain this grammar). A
+// multi-label host or an IP literal (IPv4 or IPv6) is never a bare short name.
+func classifyBareShortName(host string) (service string, ok bool) {
+	if host == "" || strings.Contains(host, ".") {
+		return "", false
+	}
+	if net.ParseIP(host) != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // resolveConnString implements D29 Stage 0 for a label containing "://". Every
