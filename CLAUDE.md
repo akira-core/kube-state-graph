@@ -282,6 +282,62 @@ live under `openspec/specs/`.
   to the pre-change blanket exclusion**. This is the invariant the loosened
   selector must never violate: it must never leak a `external/unknown` node
   via the generic D27 path for a case outside this rule's trigger.
+- **Istio route resolution of global FQDN peers**
+  (translate-global-fqdn-to-k8s-service, OPT-IN — off by default): the ONE
+  step added to the enrichment above. When `--route-store-dsn` /
+  `KSG_ROUTE_STORE_DSN` is set, every point where `resolveUnknownServerPeer`
+  would emit an external node first consults an Istio route-resolution engine:
+  which Kubernetes Service did the anchor cluster's Gateway + VirtualService
+  config route `(host, "/", port)` to during the request's own `[start, end]`?
+  A hit resolves through the SAME `resolveServiceLevel` as every other path
+  (anchor-membership test, one service node, `pod-calls-service` edge,
+  family-wide `service-selects-pod` fan-out); any miss/error degrades to the
+  existing external node — route resolution can NEVER fail a build. Key facts:
+  **(1) The trigger is ALL THREE external branches**, not just "not k8s DNS" —
+  `classifyK8sDNS` splits on dots, so a global FQDN like `api.example.com`
+  (3 labels) is *successfully* classified (service `example`, namespace `com`)
+  and reaches external via the anchor-lacks-service branch; wiring only the
+  unclassifiable branch makes the feature a silent no-op for its motivating
+  case. **(2) I/O stays out of the parse** (D6): `ReadServiceGraph` runs a pure
+  prescan (`collectRouteQueries`, sharing `classifyPeerHost` /
+  `lookupClientPod` / `anchorHolds` with the parse so the two cannot drift),
+  resolves the deduped keys serially (each bounded by
+  `--route-resolve-timeout`), and hands `parseServiceGraphRoutes` a prefetched
+  index — nil index ⇒ byte-for-byte pre-change output. **(3) Listener port
+  precedence** (D5): the `:<port>` on the peer-address value (now returned by
+  `splitPeerAddressPort`, no longer discarded) → the optional
+  `client_server_port` / `client_net_peer_port` dimension → default **443**
+  (a :443-only Gateway or an httpsRedirect :80 stub is the common ingress
+  shape; a wrong port fails as "no listener" — logged distinctly as
+  `route_engine_no_listener_on_port` — never as a wrong destination).
+  **(4) Optional `client_dns_answers` dimension** carries destination IPs:
+  present ⇒ the ClickHouse IP 3-hop narrows candidate Gateways
+  (traffic_simulation); absent ⇒ the host resolves over all the cluster's
+  Gateways (config_only). **(5) The engine** (`pkg/route`) loads a versioned,
+  **cluster-scoped, read-only** ClickHouse window (written by the
+  metadata-exporter repo; schema drift fails fast at startup; reads use the
+  no-FINAL pattern — `valid_to` NEVER filtered in SQL, client-side dedup per
+  version slot by max ingest_seq, overlap checked post-dedup — because the
+  exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
+  opts into SQL-side pruning for update-close writers ONLY; time operands are
+  `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
+  bare `spec.gateways` names bind same-namespace gateways — see design
+  "production reader compatibility"),
+  slices it at version boundaries in memory, translates one gateway's scoped config via
+  in-process istiod (`ConfigGenerator`, no istiod pod, no Kubernetes client —
+  see the client-go rule) and matches with the native `router_check_tool`
+  binary (`--router-check-bin`; copied into the image from the Envoy tools
+  image; ~50–60 ms per distinct config — v1 is deliberately serial/uncached).
+  **(6) Containment** (D1, dependency hygiene, distinct from the client-go
+  rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
+  import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,
+  so `graph-api-gateway` never inherits istio/ClickHouse —
+  `make check-route-containment` enforces this in CI. No new node type, edge
+  type, attribute, or `labels` key; the destination's port/subset are parsed
+  and discarded. Tests: `pkg/build/routeprescan_test.go`,
+  `pkg/route/*_test.go`, `internal/integration/route_e2e_test.go`
+  (`TestRouteSuite` needs `router_check_tool` — set `KSG_ROUTER_CHECK_BIN`;
+  `TestRouteStoreSuite` needs only Docker), and the `-tags oracle` sweep.
 - **Server-side pod resolution** uses `Topology.PodsByUID` — a global pod-UID
   index built from all loaded clusters. Service-graph metrics carry only the
   trace-source `cluster` (client side); the server side's cluster is recovered
@@ -456,18 +512,31 @@ changes, start a new change and update the relevant promoted spec
 - Errors returned to HTTP carry a typed `build.Reason` mapped to a fixed
   status + `reason` string in `internal/api/errors.go`. Adding new failure
   modes means adding both a `Reason` constant and an entry in `mapBuildError`.
-- Don't import `k8s.io/client-go` or any Kubernetes API into the API server.
-  All cluster facts come from VictoriaMetrics. Informers were considered and
-  rejected — see D1 / D16. Tests and harness tooling are exempt.
+- Don't **talk to the Kubernetes API** from the API server — no client-go
+  clients, no informers, no watches, no kubeconfig, no per-cluster RBAC. All
+  cluster facts come from VictoriaMetrics (topology, service graph) or the
+  versioned Istio-config store (route resolution). The rule's reasons
+  (archived design D1 / D16): informers only know the *current* state and
+  cannot answer this API's historical `?start=&end=` contract, and
+  multi-cluster would need N watch streams + per-cluster RBAC. **Linking a
+  library that transitively vendors Kubernetes types is NOT a violation;
+  constructing a Kubernetes client is** (translate-global-fqdn-to-k8s-service
+  D0) — `pkg/route` links `istio.io/istio` (→ `k8s.io/client-go` types) purely
+  as an in-memory translation library and never dials an apiserver. Tests and
+  harness tooling are exempt.
 - Don't add dependencies casually. Current direct deps: Gin, Prometheus
   client_golang, google/uuid, golang.org/x/sync, testify v1.11.x (test-only,
   also drives mockery-generated mocks), testcontainers-go (integration
   test-only), swaggo/swag/v2 (codegen tool, not imported at runtime),
   vektra/mockery v2.x (codegen tool tracked via go.mod `tool` directive,
-  not imported at runtime, not linked into the production binary), and the
+  not imported at runtime, not linked into the production binary), the
   OpenTelemetry Go SDK family (`go.opentelemetry.io/otel`, `sdk`, `sdk/log`,
   OTLP gRPC + HTTP exporters for `otlptrace` and `otlplog`, `semconv/v1.27.0`,
-  `contrib/...otelgin`, `contrib/...otelhttp`, `contrib/bridges/otelslog`).
+  `contrib/...otelgin`, `contrib/...otelhttp`, `contrib/bridges/otelslog`),
+  and — **contained to `pkg/route` + `cmd/` only** (see the route-resolution
+  bullet) — `istio.io/istio` + `istio.io/api` (pinned; in-process istiod
+  translation), `ClickHouse/clickhouse-go/v2` (route store), and
+  `envoyproxy/go-control-plane/envoy` (RouteConfiguration protos).
   Adding more requires a design-doc note.
 - Production code MUST NOT carry test-only fields, methods, or constructors.
   Inject substitutable behaviour via the small interfaces in

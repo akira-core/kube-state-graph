@@ -1,4 +1,4 @@
-.PHONY: build test vet lint vuln ci cover docs check-docs clean \
+.PHONY: build test vet lint vuln ci cover docs check-docs check-route-containment clean \
         docker-build docker-push docker-buildx docker-run docker-docs docker-docs-stop \
         init init-go init-tools init-hooks doctor mocks verify-mocks tools-versions
 
@@ -155,12 +155,28 @@ vuln:
 	    go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...; \
 	fi
 
+## Dependency-containment check (translate-global-fqdn-to-k8s-service D1):
+## pkg/build declares only the RouteResolver interface; the heavy engine lives
+## in pkg/route. If pkg/kubegraph (or pkg/build) ever reaches k8s.io/client-go
+## or pkg/route, an embedder of the graph engine would silently inherit istio +
+## ClickHouse — fail the build instead.
+check-route-containment:
+	@if go list -deps ./pkg/kubegraph ./pkg/build | grep -q '^k8s.io/client-go'; then \
+	    echo "FAIL: pkg/kubegraph or pkg/build links k8s.io/client-go — the pkg/route containment rule is broken"; \
+	    exit 1; \
+	fi
+	@if go list -deps ./pkg/kubegraph ./pkg/build | grep -q 'kube-state-graph/pkg/route'; then \
+	    echo "FAIL: pkg/kubegraph or pkg/build imports pkg/route — only cmd/ may link the route engine"; \
+	    exit 1; \
+	fi
+	@echo "route-engine containment OK (pkg/kubegraph and pkg/build never reach pkg/route or client-go)"
+
 ## Full local CI mirror — runs the same checks as the five GitHub Actions jobs
 ## in .github/workflows/ci.yml (lint, vuln, test, docs-drift, mocks-drift), in
 ## order. Invoked by the pre-push hook (see `make init-hooks`). Run directly to
 ## reproduce CI locally before pushing.
-ci: lint vuln test check-docs verify-mocks
-	@echo "ci: all checks passed (lint + vuln + test + docs + mocks)"
+ci: lint vuln test check-docs verify-mocks check-route-containment
+	@echo "ci: all checks passed (lint + vuln + test + docs + mocks + containment)"
 
 cover:
 	go test ./... -coverprofile=coverage.out -covermode=atomic

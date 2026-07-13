@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +31,27 @@ type Config struct {
 	// query). Empty (the default) preserves stock kube-state-metrics behaviour.
 	// See design.md D26.
 	MetricPrefix string
+	// RouteStoreDSN is the ClickHouse DSN of the versioned Istio-config store
+	// backing global-FQDN route resolution (translate-global-fqdn-to-k8s-service).
+	// Empty (the default) disables the feature entirely: no store is dialed, no
+	// RouteResolver is constructed, and the service-graph reader behaves
+	// byte-for-byte as it did before route resolution existed.
+	RouteStoreDSN string
+	// RouterCheckBin is the path to the native Envoy router_check_tool binary
+	// the route engine execs for route matching. Verified executable at
+	// startup when RouteStoreDSN is set; ignored otherwise.
+	RouterCheckBin string
+	// RouteResolveTimeout bounds each individual route-engine call made during
+	// a build's pre-parse resolution pass. Zero means each call inherits only
+	// the build deadline (--build-timeout).
+	RouteResolveTimeout time.Duration
+	// RouteStoreUniqueRows enables the route store's pruned read mode: the
+	// valid_to predicate is pushed back into SQL, so closed versions are
+	// skipped server-side. ONLY safe when the exporter writes one physical
+	// row per version (closeMode=update, after historical convergence);
+	// enabling it against the default rewrite-close exporter resurrects
+	// stale open rows — see pkg/route/store's CH doc. Default false.
+	RouteStoreUniqueRows bool
 	// PromUsername / PromPassword are optional HTTP Basic Auth credentials for
 	// the upstream VictoriaMetrics endpoint. Env-only (KSG_PROM_USERNAME /
 	// KSG_PROM_PASSWORD) — deliberately NO CLI flags, since credential-carrying
@@ -56,6 +78,10 @@ func Defaults() Config {
 		APIKeysReloadInterval: 30 * time.Second,
 		LogLevel:              "info",
 		MetricPrefix:          "",
+		RouteStoreDSN:         "",
+		RouterCheckBin:        "/usr/local/bin/router_check_tool",
+		RouteResolveTimeout:   5 * time.Second,
+		RouteStoreUniqueRows:  false,
 		PromUsername:          "",
 		PromPassword:          "",
 	}
@@ -78,6 +104,10 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.APIKeys, "api-keys", cfg.APIKeys, "Comma-separated list of accepted API keys. Used when --api-keys-file is unset.")
 	fs.DurationVar(&cfg.APIKeysReloadInterval, "api-keys-reload-interval", cfg.APIKeysReloadInterval, "How often to re-read --api-keys-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error.")
+	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://user:pass@host:9000/routing). Empty (default) disables route resolution entirely.")
+	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
+	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
+	fs.BoolVar(&cfg.RouteStoreUniqueRows, "route-store-unique-rows", cfg.RouteStoreUniqueRows, "Enable the route store's pruned read mode (server-side valid_to filtering). ONLY when the exporter guarantees one physical row per version (closeMode=update); never against the default rewrite-close exporter.")
 	fs.StringVar(&cfg.MetricPrefix, "metric-prefix", cfg.MetricPrefix, "Additive prefix prepended to every kube-state-metrics-shaped series name the topology reader queries (e.g. \"o11y_\" → o11y_kube_pod_info). Empty (default) preserves stock kube-state-metrics behaviour. Trailing underscore is the operator's responsibility — none is injected. Does not affect traces_service_graph_request_total or up{}.")
 
 	if err := fs.Parse(args); err != nil {
@@ -127,6 +157,18 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	}
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
 	getStr("KSG_METRIC_PREFIX", &cfg.MetricPrefix)
+	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
+	getStr("KSG_ROUTER_CHECK_BIN", &cfg.RouterCheckBin)
+	if err := getDur("KSG_ROUTE_RESOLVE_TIMEOUT", &cfg.RouteResolveTimeout); err != nil {
+		return err
+	}
+	if v, ok := lookup("KSG_ROUTE_STORE_UNIQUE_ROWS"); ok {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid KSG_ROUTE_STORE_UNIQUE_ROWS=%q: must be a boolean", v)
+		}
+		cfg.RouteStoreUniqueRows = b
+	}
 	return nil
 }
 
@@ -170,6 +212,15 @@ func (c Config) Validate() error {
 	}
 	if c.MetricPrefix != "" && !metricPrefixPattern.MatchString(c.MetricPrefix) {
 		return fmt.Errorf("invalid metric-prefix %q: must match %s", c.MetricPrefix, metricPrefixPattern)
+	}
+	// Route-resolution knobs are only meaningful with a store DSN; the binary
+	// path itself is verified executable at startup (matchcheck.NewRunner), not
+	// here — Validate stays filesystem-free.
+	if c.RouteStoreDSN != "" && c.RouterCheckBin == "" {
+		return errors.New("router-check-bin is required when route-store-dsn is set")
+	}
+	if c.RouteResolveTimeout < 0 {
+		return errors.New("route-resolve-timeout must be >= 0 (0 inherits the build deadline)")
 	}
 	return nil
 }

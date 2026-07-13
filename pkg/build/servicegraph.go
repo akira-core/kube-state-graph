@@ -40,6 +40,14 @@ type ServiceGraphResult struct {
 // with ReadTopology; the metric-name prefix is NOT applied to
 // traces_service_graph_request_total (different exporter family, design.md
 // D26), so r is effectively a no-op here today.
+//
+// resolver is the optional Istio route-resolution engine
+// (translate-global-fqdn-to-k8s-service): when non-nil, a pure prescan
+// collects the unknown-server endpoints that would fall to external nodes,
+// resolves them here — where ctx and the window exist — and hands the answers
+// to the parse as a prefetched index, keeping parseServiceGraphRoutes free of
+// I/O (design D2). resolveTimeout bounds each engine call (zero = ctx only).
+// A nil resolver skips the prescan entirely: pre-change behaviour.
 func ReadServiceGraph(
 	ctx context.Context,
 	q promql.Querier,
@@ -47,6 +55,8 @@ func ReadServiceGraph(
 	window time.Duration,
 	end time.Time,
 	topology Topology,
+	resolver RouteResolver,
+	resolveTimeout time.Duration,
 ) (ServiceGraphResult, error) {
 	vec, err := q.Instant(ctx,
 		string(promql.QServiceGraphTotal),
@@ -56,7 +66,12 @@ func ReadServiceGraph(
 	if err != nil {
 		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
 	}
-	return parseServiceGraph(vec, topology), nil
+	var routes routeIndex
+	if resolver != nil {
+		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
+			collectRouteQueries(vec, topology), end.Add(-window), end)
+	}
+	return parseServiceGraphRoutes(vec, topology, routes), nil
 }
 
 // sgResolver carries the per-build dedupe maps and topology indexes used to
@@ -70,6 +85,7 @@ type sgResolver struct {
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
 	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
 	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
+	routes             routeIndex                   // prefetched route-engine answers (nil = engine off)
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
@@ -135,15 +151,19 @@ type svcCandidate struct {
 // service-selects-pod fan-out.
 type ipKey struct{ cluster, ip string }
 
+// parseServiceGraph is the route-index-free form: the ~70 direct test call
+// sites and any parse without a RouteResolver go through here. Identical to
+// parseServiceGraphRoutes with a nil index — i.e. the pre-change behaviour,
+// byte for byte.
 func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
-	if len(vec) == 0 {
-		return ServiceGraphResult{}
-	}
+	return parseServiceGraphRoutes(vec, topology, nil)
+}
 
-	// Per-metric tally of samples missing the `cluster` label; surfaced as one
-	// aggregated warn at the end of the parse.
-	mc := missingClusterCounts{}
-
+// newSGResolver builds the per-parse resolver: the immutable topology indexes
+// every resolution path consults. Shared by parseServiceGraphRoutes and the
+// collectRouteQueries prescan so both classify endpoints over identical
+// indexes (design D2).
+func newSGResolver(topology Topology) *sgResolver {
 	podByID := make(map[string]*graph.PodNode, len(topology.Pods))
 	for _, p := range topology.Pods {
 		podByID[p.ID()] = p
@@ -192,7 +212,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		ipIndex[ik] = k
 	}
 
-	res := &sgResolver{
+	return &sgResolver{
 		endpointsByService: topology.EndpointsByService,
 		podByID:            podByID,
 		podByUID:           topology.PodsByUID,
@@ -205,6 +225,24 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		svcEdges:           map[string]*graph.Edge{},
 		extReasons:         map[string]int{},
 	}
+}
+
+// parseServiceGraphRoutes is parseServiceGraph plus a prefetched route-engine
+// index (nil = engine off). The index is consulted only inside
+// resolveUnknownServerPeer, at the points that would otherwise emit an
+// external node; resolution stays a pure function of (vec, topology, routes) —
+// all I/O happened before this call (design D2).
+func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIndex) ServiceGraphResult {
+	if len(vec) == 0 {
+		return ServiceGraphResult{}
+	}
+
+	// Per-metric tally of samples missing the `cluster` label; surfaced as one
+	// aggregated warn at the end of the parse.
+	mc := missingClusterCounts{}
+
+	res := newSGResolver(topology)
+	res.routes = routes
 
 	// Dedup pod-calls-pod by (srcID, tgtID). Multiple upstream series can
 	// resolve to the same edge identity — most commonly when `connection_type`
@@ -233,12 +271,12 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
-		// Peer-address labels recorded on the CLIENT span (OTel semconv
-		// client.net.peer.name / client.server.address), consulted only when
-		// server=="unknown" and the client resolves to a real pod — see
-		// resolveUnknownServerPeer.
-		clientNetPeerName := string(s.Metric["client_net_peer_name"])
-		clientServerAddress := string(s.Metric["client_server_address"])
+		// Peer dimensions recorded on the CLIENT span (OTel semconv
+		// client.net.peer.name / client.server.address, plus the optional
+		// client_dns_answers / client_server_port / client_net_peer_port added
+		// for route resolution), consulted only when server=="unknown" and the
+		// client resolves to a real pod — see resolveUnknownServerPeer.
+		peer := peerLabelsOf(s.Metric)
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -295,7 +333,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, clientNetPeerName, clientServerAddress)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, peer)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -468,22 +506,75 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 			"client", t.clientLabel, "server", t.serverLabel,
 			"client_uid", t.clientUID, "server_uid", t.serverUID)
 	}
-	id := graph.PodID(traceCluster, podUID)
-	if _, ok := r.podByID[id]; ok {
-		return []string{id}, true
-	}
-	// The trace's `cluster` label is frequently missing (bucketed to "unknown")
-	// or disagrees with the client pod's real topology cluster, so the
-	// cluster-scoped podByID lookup misses even though the pod exists. Recover
-	// the real pod via the global UID index — symmetric with resolveServer —
-	// before minting a ghost, otherwise every client pod in a no-cluster-label
-	// deployment would duplicate as an "unknown/<uid>" synth node. Only
-	// synthesise when the UID is unknown to BOTH indexes.
-	if pod, ok := r.podByUID[podUID]; ok {
+	if pod := r.lookupClientPod(traceCluster, podUID); pod != nil {
 		return []string{pod.ID()}, true
 	}
+	id := graph.PodID(traceCluster, podUID)
 	r.synthPod(id, traceCluster, namespace, podUID)
 	return []string{id}, true
+}
+
+// lookupClientPod finds the REAL topology pod for a client endpoint: first the
+// cluster-scoped id (trace cluster + UID), then the global UID index — the
+// trace's `cluster` label is frequently missing (bucketed to "unknown") or
+// disagrees with the client pod's real topology cluster, so the cluster-scoped
+// lookup can miss even though the pod exists; recovering via the UID index
+// (symmetric with resolveServer) avoids minting an "unknown/<uid>" ghost for
+// every client pod of a no-cluster-label deployment. nil when the UID is empty
+// or unknown to BOTH indexes — the synth-pod fallback is the caller's
+// (resolveClient's) concern. Shared with the collectRouteQueries prescan so
+// the prescan's real-client-pod trigger test cannot drift from resolution's.
+func (r *sgResolver) lookupClientPod(traceCluster, podUID string) *graph.PodNode {
+	if podUID == "" {
+		return nil
+	}
+	if pod, ok := r.podByID[graph.PodID(traceCluster, podUID)]; ok {
+		return pod
+	}
+	if pod, ok := r.podByUID[podUID]; ok {
+		return pod
+	}
+	return nil
+}
+
+// classifyPeerHost runs the in-cluster classification ladder of the
+// unknown-server enrichment over a port-stripped host: the Kubernetes .svc DNS
+// grammar, the bare short Service name (resolved in the client pod's own
+// namespace), and the anchor-cluster ClusterIP literal. classified=false means
+// no grammar produced a service identity. Pure over the resolver's immutable
+// indexes — no materialisation — so the collectRouteQueries prescan shares it
+// with resolveUnknownServerPeer (design D2's anti-drift extraction).
+func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster string) (ns, svc string, classified bool) {
+	if s, n, ok := classifyK8sDNS(host); ok {
+		return n, s, true
+	}
+	if s, ok := classifyBareShortName(host); ok {
+		return clientNamespace, s, true
+	}
+	// resolve-unknown-server-ip-peer: a bare IP literal is looked up against
+	// the anchor cluster's OWN ClusterIP set only — never a family sibling,
+	// since a ClusterIP is a per-cluster address that can legitimately collide
+	// across unrelated clusters' Service CIDRs (see ipKey doc comment).
+	if net.ParseIP(host) != nil {
+		if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: host}]; hit {
+			return sk.namespace, sk.service, true
+		}
+	}
+	return "", "", false
+}
+
+// anchorHolds reports whether the anchor cluster itself deploys (ns, svc) —
+// the same membership test resolveServiceLevel applies before materialising a
+// service node. Used by the prescan to skip endpoints the in-cluster ladder
+// already resolves (route resolution runs ONLY where the parse would fall to
+// an external node).
+func (r *sgResolver) anchorHolds(anchorCluster, ns, svc string) bool {
+	for _, cand := range r.svcCandidates[famSvcKey{family: clusterFamilyKey(anchorCluster), namespace: ns, service: svc}] {
+		if cand.cluster == anchorCluster {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveServer mirrors resolveClient. The metric does not carry server-side
@@ -496,17 +587,17 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
 //
-// clientPod, clientNetPeerName, and clientServerAddress feed ONLY the
-// resolve-unknown-server-peer-labels enrichment: whenever the raw server label
-// is literally "unknown" AND no real topology pod is found for it (UID empty,
-// or UID present but absent from the global pod-UID index), resolution routes
-// to resolveUnknownServerPeer instead of resolveEmptyUID or the synth-pod
-// fallback below — D1's explicit carve-out, so the loosened server!~"user"
-// selector does not leak external/unknown noise via the generic paths.
-func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string) []string {
+// clientPod and peer feed ONLY the resolve-unknown-server-peer-labels
+// enrichment: whenever the raw server label is literally "unknown" AND no real
+// topology pod is found for it (UID empty, or UID present but absent from the
+// global pod-UID index), resolution routes to resolveUnknownServerPeer instead
+// of resolveEmptyUID or the synth-pod fallback below — D1's explicit
+// carve-out, so the loosened server!~"user" selector does not leak
+// external/unknown noise via the generic paths.
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, peer peerLabels) []string {
 	if podUID == "" {
 		if label == sentinelUnknown {
-			return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+			return r.resolveUnknownServerPeer(clientPod, peer, t)
 		}
 		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
@@ -530,7 +621,7 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 		return []string{pod.ID()}
 	}
 	if label == sentinelUnknown {
-		return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+		return r.resolveUnknownServerPeer(clientPod, peer, t)
 	}
 	r.synthPod(graph.PodID("", podUID), "", namespace, podUID) // server cluster unknown
 	return []string{graph.PodID("", podUID)}
@@ -546,14 +637,20 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 // unresolved, or resolved only to a synth pod) and "neither label present"
 // both drop the endpoint (nil), byte-for-byte identical to the outcome under
 // the old server!~"user|unknown" query-layer exclusion.
-func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string, t sgTrace) []string {
+//
+// translate-global-fqdn-to-k8s-service adds ONE step: at EVERY point below
+// that would emit an external node — no grammar matched, an IP literal with
+// no ClusterIP hit, AND a classified (ns, svc) the anchor cluster does not
+// hold (the branch a global FQDN like api.example.com actually takes, design
+// D3) — the prefetched route-engine index is consulted first via
+// routeExternal. A route hit resolves through the same resolveServiceLevel as
+// every other path; a miss (or the engine being off) falls to the external
+// node exactly as before.
+func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer peerLabels, t sgTrace) []string {
 	if clientPod == nil {
 		return nil // client side did not resolve to a real topology pod
 	}
-	value := clientNetPeerName
-	if value == "" {
-		value = clientServerAddress
-	}
+	value := peer.value()
 	if value == "" {
 		return nil // neither client_net_peer_name nor client_server_address present
 	}
@@ -561,33 +658,35 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNe
 	anchorCluster := clientPod.Labels()["cluster"]
 	clientNamespace := clientPod.Labels()["namespace"]
 
-	host := stripPeerAddressPort(value)
-	svc, ns, ok := classifyK8sDNS(host)
-	if !ok {
-		if svc, ok = classifyBareShortName(host); ok {
-			ns = clientNamespace
+	host, _ := splitPeerAddressPort(value)
+	// The same key derivation the collectRouteQueries prescan used, so the
+	// index lookup can never miss for key-derivation reasons (ok is guaranteed
+	// here: value is non-empty).
+	key, _ := peerRouteKey(anchorCluster, peer)
+
+	// routeExternal is the shared external fallback: consult the route index
+	// first; only when it does not save the endpoint, record the classify
+	// reason (unless the index already recorded a route_engine_* reason for
+	// this endpoint) and emit the external node.
+	routeExternal := func(reason string, attrs ...any) []string {
+		ids, noted := r.routeIndexResolve(key, value, reason, t)
+		if len(ids) > 0 {
+			return ids
 		}
-	}
-	if !ok {
-		// resolve-unknown-server-ip-peer: a bare IP literal (no DNS grammar
-		// match, not a bare short name) is looked up against the anchor
-		// cluster's OWN ClusterIP set only — never a family sibling, since a
-		// ClusterIP is a per-cluster address that can legitimately collide
-		// across unrelated clusters' Service CIDRs (see ipKey doc comment).
-		if ip := net.ParseIP(host); ip != nil {
-			if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: host}]; hit {
-				svc, ns, ok = sk.service, sk.namespace, true
-			} else {
-				r.noteExternal("unknown_server_peer_ip_literal_no_match", t,
-					"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
-				return []string{r.external(value)}
-			}
+		if !noted {
+			r.noteExternal(reason, t, attrs...)
 		}
-	}
-	if !ok {
-		r.noteExternal("unknown_server_peer_not_k8s_dns", t,
-			"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
 		return []string{r.external(value)}
+	}
+
+	ns, svc, classified := r.classifyPeerHost(host, clientNamespace, anchorCluster)
+	if !classified {
+		if net.ParseIP(host) != nil {
+			return routeExternal("unknown_server_peer_ip_literal_no_match",
+				"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+		}
+		return routeExternal("unknown_server_peer_not_k8s_dns",
+			"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
 	}
 	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
 		slog.Debug("service-graph unknown-server peer-label resolved to service node",
@@ -599,23 +698,9 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNe
 	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
 	// hold that Service in its own family — external, not dropped (mirrors
 	// resolveConnString's anchor_cluster_lacks_service outcome).
-	r.noteExternal("unknown_server_peer_anchor_lacks_service", t,
+	return routeExternal("unknown_server_peer_anchor_lacks_service",
 		"service", svc, "namespace", ns, "host", host, "peer_address", value,
 		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
-	return []string{r.external(value)}
-}
-
-// stripPeerAddressPort best-effort strips a trailing ":<port>" suffix from a
-// client_net_peer_name / client_server_address value (resolve-unknown-server-peer-labels
-// D2 step 1). net.SplitHostPort fails on a plain hostname/IP with no port (no
-// colon) or on an unbracketed IPv6 literal (ambiguous colon) — either failure
-// falls back to the raw, unstripped value.
-func stripPeerAddressPort(value string) string {
-	host, _, err := net.SplitHostPort(value)
-	if err != nil {
-		return value
-	}
-	return host
 }
 
 // classifyBareShortName reports whether host is a bare, dot-free Service short
