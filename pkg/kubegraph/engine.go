@@ -32,6 +32,14 @@ type Options struct {
 	Clock clock.Clock
 	// Metrics records last-build observational gauges; nil means no-op.
 	Metrics build.Metrics
+	// RouteResolver mirrors build.Options.RouteResolver: an optional Istio
+	// route-resolution engine for global-FQDN server="unknown" peers. Nil
+	// (the default) disables the feature. An embedder that wants it imports
+	// pkg/route itself and passes the resolver in — kubegraph deliberately
+	// does not import pkg/route (design D1 dependency containment).
+	RouteResolver build.RouteResolver
+	// RouteResolveTimeout mirrors build.Options.RouteResolveTimeout.
+	RouteResolveTimeout time.Duration
 }
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
@@ -50,8 +58,10 @@ func New(q promql.Querier, opts Options) *Engine {
 		clk = clock.System{}
 	}
 	b := build.New(q, build.Options{
-		MetricPrefix: opts.MetricPrefix,
-		APITimeout:   opts.APITimeout,
+		MetricPrefix:        opts.MetricPrefix,
+		APITimeout:          opts.APITimeout,
+		RouteResolver:       opts.RouteResolver,
+		RouteResolveTimeout: opts.RouteResolveTimeout,
 	}, opts.Metrics, clk)
 	return &Engine{builder: b, q: q, clk: clk}
 }

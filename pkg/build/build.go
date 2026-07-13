@@ -108,7 +108,8 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		}
 	}
 
-	sg, err := ReadServiceGraph(ctx, b.q, b.r, window, end, topology)
+	sg, err := ReadServiceGraph(ctx, b.q, b.r, window, end, topology,
+		b.opts.RouteResolver, b.opts.RouteResolveTimeout)
 	if err != nil {
 		return nil, classifyReadError(span, "service-graph read failed", err)
 	}

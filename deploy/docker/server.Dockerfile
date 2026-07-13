@@ -25,8 +25,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
         -o /out/kube-state-graph ./cmd/kube-state-graph
 
+# ---- router_check_tool stage ---------------------------------------------
+# Envoy's router_check_tool ships prebuilt in the official tools image; route
+# resolution (--route-store-dsn) execs it as a native binary — no docker, no
+# Envoy process at runtime. The tag pins the Envoy version the linked
+# istio.io/istio release generates RouteConfigurations for.
+FROM envoyproxy/envoy:tools-v1.34-latest AS envoy-tools
+
 # ---- runtime stage -------------------------------------------------------
-FROM gcr.io/distroless/static:nonroot
+# distroless/cc (not /static): router_check_tool is a dynamically linked C++
+# binary needing glibc + libstdc++. The Go server itself stays CGO_ENABLED=0.
+FROM gcr.io/distroless/cc:nonroot
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -41,6 +50,7 @@ LABEL org.opencontainers.image.title="kube-state-graph" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 COPY --from=build /out/kube-state-graph /usr/local/bin/kube-state-graph
+COPY --from=envoy-tools /usr/local/bin/router_check_tool /usr/local/bin/router_check_tool
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/kube-state-graph"]

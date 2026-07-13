@@ -223,11 +223,24 @@ func (s *VMSuite) WaitForSeries(query string, evalTime time.Time, budget time.Du
 type APIOption func(*apiOptions)
 
 type apiOptions struct {
-	clk clock.Clock
+	clk                 clock.Clock
+	routeResolver       build.RouteResolver
+	routeResolveTimeout time.Duration
 }
 
 // WithClock pins the server's Clock dependency. nil falls back to clock.System.
 func WithClock(clk clock.Clock) APIOption { return func(o *apiOptions) { o.clk = clk } }
+
+// WithRouteResolver injects an Istio route-resolution engine into the
+// in-process server's build pipeline (translate-global-fqdn-to-k8s-service).
+// Mirrors how cmd/kube-state-graph wires pkg/route when --route-store-dsn is
+// set; nil (the default) keeps the feature off.
+func WithRouteResolver(rr build.RouteResolver, perCallTimeout time.Duration) APIOption {
+	return func(o *apiOptions) {
+		o.routeResolver = rr
+		o.routeResolveTimeout = perCallTimeout
+	}
+}
 
 // StartAPIServer constructs an in-process API server pointed at the running
 // VictoriaMetrics container, wraps it in httptest.NewServer, and returns the
@@ -264,7 +277,12 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 	if cfg.APIKeysFile != "" {
 		s.Require().NoError(ks.LoadFile(cfg.APIKeysFile))
 	}
-	builder := build.New(prom, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, o.clk)
+	builder := build.New(prom, build.Options{
+		MetricPrefix:        cfg.MetricPrefix,
+		APITimeout:          cfg.APITimeout,
+		RouteResolver:       o.routeResolver,
+		RouteResolveTimeout: o.routeResolveTimeout,
+	}, metrics, o.clk)
 	srv := api.New(cfg, builder, prom, metrics, logger, ks, o.clk)
 
 	httpSrv := httptest.NewServer(srv.Handler())
