@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // TestParseTopology_PodRestartCollapsesToLatestUID — when the same
@@ -627,6 +627,236 @@ func TestParseTopology_PVCStorageClassDeterministic(t *testing.T) {
 	require.Len(t, rev.PVCs, 1)
 	assert.Equal(t, "gp2", fwd.PVCs[0].StorageClass(), "lexically-smallest storageclass wins")
 	assert.Equal(t, fwd.PVCs[0].StorageClass(), rev.PVCs[0].StorageClass(), "order-independent")
+}
+
+// TestParseTopology_PVCApplicationAttribute — the PVC ArgoCD Application is
+// parsed from the annotation_argocd_argoproj_io_tracking_id label on
+// kube_persistentvolumeclaim_annotations (segment before the first ":"), joined
+// on (cluster, namespace, claim) and surfaced on the typed Application attribute
+// (never labels). Covers: full tracking-id, no-colon verbatim, absent → empty,
+// empty leading segment → empty, and the annotation metric absent entirely.
+func TestParseTopology_PVCApplicationAttribute(t *testing.T) {
+	binding := func(ns, claim string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": "p",
+			"persistentvolumeclaim": model.LabelValue(claim),
+		}}
+	}
+	ann := func(ns, claim, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns),
+			"persistentvolumeclaim":                     model.LabelValue(claim),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+
+	pvcVec := sampleVec(
+		binding("db", "data-mongo"), // full tracking-id → mongo
+		binding("db", "data-redis"), // no-colon verbatim → cache
+		binding("db", "data-plain"), // no annotation → empty
+		binding("db", "data-colon"), // leading ":" → empty segment → empty
+	)
+	annVec := sampleVec(
+		ann("db", "data-mongo", "mongo:apps/StatefulSet:db/mongo"),
+		ann("db", "data-redis", "cache"),
+		ann("db", "data-colon", ":apps/Deployment:db/x"),
+	)
+
+	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCAnnotations: annVec})
+	byID := map[string]*graph.PVCNode{}
+	for _, p := range tp.PVCs {
+		byID[p.ID()] = p
+	}
+
+	assert.Equal(t, "mongo", byID["c/db/data-mongo"].Application(), "segment before the first ':'")
+	assert.Equal(t, "cache", byID["c/db/data-redis"].Application(), "value with no ':' is verbatim")
+	assert.Empty(t, byID["c/db/data-plain"].Application(), "no annotation → empty Application")
+	assert.Empty(t, byID["c/db/data-colon"].Application(), "leading ':' → empty segment → no Application")
+
+	for _, p := range tp.PVCs {
+		_, hasTrack := p.Labels()["annotation_argocd_argoproj_io_tracking_id"]
+		_, hasApp := p.Labels()["application"]
+		assert.Falsef(t, hasTrack || hasApp, "application must not appear in labels for PVC %q", p.ID())
+	}
+
+	// Annotation metric absent entirely → valid topology, no application.
+	tp2 := parseTopology(topologyVectors{PVC: pvcVec})
+	for _, p := range tp2.PVCs {
+		assert.Emptyf(t, p.Application(), "no annotation series → PVC %q carries no application", p.ID())
+	}
+}
+
+// TestPVCInheritedApps — the pure inheritance helper: per PVC, the
+// lexically-smallest non-empty ArgoCD Application among its mounting pods,
+// order-independent; a PVC whose mounting pods carry no Application is absent.
+func TestPVCInheritedApps(t *testing.T) {
+	bindings := []PodPVCBinding{
+		{PodID: "c/uA", PVCID: "c/ns/X"},
+		{PodID: "c/uB", PVCID: "c/ns/X"},
+		{PodID: "c/uC", PVCID: "c/ns/Y"},
+	}
+	// uA→b-app, uB→a-app both mount X; uC (no app) mounts Y.
+	podApp := map[string]string{"c/uA": "b-app", "c/uB": "a-app"}
+
+	got := pvcInheritedApps(bindings, podApp)
+	assert.Equal(t, "a-app", got["c/ns/X"], "lexically-smallest non-empty mounting-pod app wins")
+	_, hasY := got["c/ns/Y"]
+	assert.False(t, hasY, "PVC whose only mounting pod has no app gets no inherited app")
+
+	rev := pvcInheritedApps([]PodPVCBinding{bindings[2], bindings[1], bindings[0]}, podApp)
+	assert.Equal(t, got, rev, "result independent of binding order")
+}
+
+// TestParseTopology_PVCInheritsApplicationFromMountingPod — end-to-end: an
+// app-less PVC inherits the lexically-smallest Application of the pods that
+// mount it (D13); a PVC with its own annotation keeps it (own wins); a PVC whose
+// only mounting pod has no Application stays app-less; the inherited value never
+// leaks into labels.
+func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
+	podInfo := func(name, uid string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
+		}}
+	}
+	owner := func(name, tracking string) model.Sample {
+		m := model.Metric{
+			"cluster": "c", "namespace": "shop", "pod": model.LabelValue(name),
+			"owner_kind": "Deployment", "owner_name": "d", "owner_is_controller": "true",
+		}
+		if tracking != "" {
+			m["argocd_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+	mount := func(name, claim string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"pod": model.LabelValue(name), "persistentvolumeclaim": model.LabelValue(claim),
+		}}
+	}
+	pvcAnn := func(claim, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop",
+			"persistentvolumeclaim":                     model.LabelValue(claim),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+
+	podVec := sampleVec(
+		podInfo("checkout-a", "ua"), // app checkout
+		podInfo("checkout-b", "ub"), // app billing (billing < checkout)
+		podInfo("noapp", "un"),      // no app
+		podInfo("declarer", "ud"),   // app web; mounts a PVC carrying its OWN annotation
+	)
+	ownerVec := sampleVec(
+		owner("checkout-a", "checkout:apps/Deployment:shop/checkout"),
+		owner("checkout-b", "billing:apps/Deployment:shop/billing"),
+		owner("noapp", ""),
+		owner("declarer", "web:apps/Deployment:shop/web"),
+	)
+	// shared:   mounted by checkout-a (checkout) + checkout-b (billing) → inherits billing
+	// lonely:   mounted by noapp only → stays app-less
+	// declared: mounted by declarer (web) but has own annotation mongo → keeps mongo
+	pvcVec := sampleVec(
+		mount("checkout-a", "shared"),
+		mount("checkout-b", "shared"),
+		mount("noapp", "lonely"),
+		mount("declarer", "declared"),
+	)
+	annVec := sampleVec(
+		pvcAnn("declared", "mongo:apps/StatefulSet:shop/mongo"),
+	)
+
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, PVC: pvcVec, PVCAnnotations: annVec})
+	byID := map[string]*graph.PVCNode{}
+	for _, p := range tp.PVCs {
+		byID[p.ID()] = p
+	}
+
+	require.Contains(t, byID, "c/shop/shared")
+	require.Contains(t, byID, "c/shop/lonely")
+	require.Contains(t, byID, "c/shop/declared")
+	assert.Equal(t, "billing", byID["c/shop/shared"].Application(), "app-less PVC inherits lexically-smallest mounting-pod Application")
+	assert.Empty(t, byID["c/shop/lonely"].Application(), "PVC whose only mounting pod has no Application stays app-less")
+	assert.Equal(t, "mongo", byID["c/shop/declared"].Application(), "PVC's own annotation wins over inheritance")
+
+	_, hasApp := byID["c/shop/shared"].Labels()["application"]
+	assert.False(t, hasApp, "inherited application must not appear in labels")
+}
+
+// TestResolveServiceApplications — the (cluster, namespace, service) → ArgoCD
+// Application index from kube_service_annotations: parse before ":", no-colon
+// verbatim, empty leading segment dropped, lexically-smallest tracking-id wins
+// on collision, missing cluster bucketed to "unknown", and parseTopology
+// surfaces the index on Topology.ServiceApplications.
+func TestResolveServiceApplications(t *testing.T) {
+	ann := func(cluster, ns, svc, tracking string) model.Sample {
+		m := model.Metric{"namespace": model.LabelValue(ns), "service": model.LabelValue(svc)}
+		if cluster != "" {
+			m["cluster"] = model.LabelValue(cluster)
+		}
+		if tracking != "" {
+			m["annotation_argocd_argoproj_io_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+
+	got := resolveServiceApplications(sampleVec(
+		ann("c", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+		ann("c", "shop", "web", "web"),             // no colon → verbatim
+		ann("c", "shop", "noapp", ""),              // no annotation → absent
+		ann("c", "shop", "colon", ":apps/x"),       // empty leading segment → dropped
+		ann("", "shop", "orphan", "orphan:apps/x"), // missing cluster → "unknown"
+	), missingClusterCounts{})
+
+	assert.Equal(t, "checkout", got[serviceKey{"c", "shop", "checkout"}])
+	assert.Equal(t, "web", got[serviceKey{"c", "shop", "web"}])
+	assert.Equal(t, "orphan", got[serviceKey{"unknown", "shop", "orphan"}], "missing cluster bucketed to unknown")
+	_, hasNoApp := got[serviceKey{"c", "shop", "noapp"}]
+	_, hasColon := got[serviceKey{"c", "shop", "colon"}]
+	assert.False(t, hasNoApp, "absent annotation → no entry")
+	assert.False(t, hasColon, "empty leading segment → no entry")
+
+	// Collision: lexically-smallest raw tracking-id wins, order-independent.
+	fwd := resolveServiceApplications(sampleVec(
+		ann("c", "n", "s", "beta:apps/x"), ann("c", "n", "s", "alpha:apps/x"),
+	), missingClusterCounts{})
+	rev := resolveServiceApplications(sampleVec(
+		ann("c", "n", "s", "alpha:apps/x"), ann("c", "n", "s", "beta:apps/x"),
+	), missingClusterCounts{})
+	assert.Equal(t, "alpha", fwd[serviceKey{"c", "n", "s"}], "lexically-smallest tracking-id wins")
+	assert.Equal(t, fwd[serviceKey{"c", "n", "s"}], rev[serviceKey{"c", "n", "s"}], "order-independent")
+
+	// parseTopology surfaces the index on Topology.ServiceApplications.
+	tp := parseTopology(topologyVectors{ServiceAnnotations: sampleVec(
+		ann("c", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+	)})
+	assert.Equal(t, "checkout", tp.ServiceApplications[serviceKey{"c", "shop", "checkout"}])
+}
+
+// TestResolveApplications_MalformedSiblingDoesNotSuppressValid — when one series
+// for a key has an empty leading segment (":apps/...", which derives to "") and a
+// sibling is valid, the valid Application must survive. The malformed value sorts
+// lexically below the valid one (':' = 0x3A < letters), so a naive smallest-raw
+// pick would let it win and then drop the key — this guards against that.
+func TestResolveApplications_MalformedSiblingDoesNotSuppressValid(t *testing.T) {
+	ann := func(svc, tracking string) model.Sample {
+		return model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop", "service": model.LabelValue(svc),
+			"annotation_argocd_argoproj_io_tracking_id": model.LabelValue(tracking),
+		}}
+	}
+	fwd := resolveServiceApplications(sampleVec(
+		ann("checkout", ":apps/Deployment:shop/x"),                // malformed: empty leading segment
+		ann("checkout", "checkout:apps/Deployment:shop/checkout"), // valid
+	), missingClusterCounts{})
+	rev := resolveServiceApplications(sampleVec(
+		ann("checkout", "checkout:apps/Deployment:shop/checkout"),
+		ann("checkout", ":apps/Deployment:shop/x"),
+	), missingClusterCounts{})
+	assert.Equal(t, "checkout", fwd[serviceKey{"c", "shop", "checkout"}], "valid Application survives a malformed sibling")
+	assert.Equal(t, fwd[serviceKey{"c", "shop", "checkout"}], rev[serviceKey{"c", "shop", "checkout"}], "order-independent")
 }
 
 // TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's

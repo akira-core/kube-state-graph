@@ -5,7 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	ksgdocs "github.com/marz32one/kube-state-graph/docs"
+	ksgdocs "github.com/akira-core/kube-state-graph/docs"
 )
 
 // scalarHTML is the Scalar API Reference UI, loaded from the official CDN.

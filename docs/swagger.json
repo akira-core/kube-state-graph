@@ -1,7 +1,7 @@
 {
     "components": {
         "schemas": {
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.Body": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.Body": {
                 "properties": {
                     "apiVersion": {
                         "type": "string"
@@ -14,20 +14,20 @@
                         "uniqueItems": false
                     },
                     "elements": {
-                        "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.Elements"
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Elements"
                     }
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.Edge": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.Edge": {
                 "properties": {
                     "data": {
-                        "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.EdgeData"
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.EdgeData"
                     }
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.EdgeData": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.EdgeData": {
                 "properties": {
                     "id": {
                         "type": "string"
@@ -50,18 +50,18 @@
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.Elements": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.Elements": {
                 "properties": {
                     "edges": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.Edge"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Edge"
                         },
                         "type": "array",
                         "uniqueItems": false
                     },
                     "nodes": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.Node"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Node"
                         },
                         "type": "array",
                         "uniqueItems": false
@@ -69,22 +69,22 @@
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.Node": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.Node": {
                 "properties": {
                     "data": {
-                        "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.NodeData"
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.NodeData"
                     }
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_cytoscape.NodeData": {
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.NodeData": {
                 "properties": {
                     "application": {
                         "type": "string"
                     },
                     "containers": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.Container"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Container"
                         },
                         "type": "array",
                         "uniqueItems": false
@@ -109,9 +109,18 @@
                         "type": "string"
                     },
                     "owner": {
-                        "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.Owner"
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Owner"
+                    },
+                    "parameters": {
+                        "additionalProperties": {
+                            "type": "string"
+                        },
+                        "type": "object"
                     },
                     "parent": {
+                        "type": "string"
+                    },
+                    "provisioner": {
                         "type": "string"
                     },
                     "ready_status": {
@@ -123,7 +132,7 @@
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.Container": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.Container": {
                 "properties": {
                     "image": {
                         "type": "string"
@@ -134,22 +143,26 @@
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.EdgeType": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.EdgeType": {
                 "enum": [
                     "pod-mounts-pvc",
                     "pod-calls-pod",
                     "pod-calls-service",
-                    "service-selects-pod"
+                    "service-selects-pod",
+                    "pod-to-node",
+                    "pvc-to-storageclass"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
                     "EdgeTypePodMountsPVC",
                     "EdgeTypePodCallsPod",
                     "EdgeTypePodCallsService",
-                    "EdgeTypeServiceSelectsPod"
+                    "EdgeTypeServiceSelectsPod",
+                    "EdgeTypePodToNode",
+                    "EdgeTypePVCToStorageClass"
                 ]
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeDefinition": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition": {
                 "properties": {
                     "description": {
                         "type": "string"
@@ -159,7 +172,7 @@
                     },
                     "labels": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeLabel"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeLabel"
                         },
                         "type": "array",
                         "uniqueItems": false
@@ -169,25 +182,25 @@
                     },
                     "source_type": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.NodeType"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.NodeType"
                         },
                         "type": "array",
                         "uniqueItems": false
                     },
                     "target_type": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.NodeType"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.NodeType"
                         },
                         "type": "array",
                         "uniqueItems": false
                     },
                     "type": {
-                        "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.EdgeType"
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.EdgeType"
                     }
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeLabel": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeLabel": {
                 "properties": {
                     "description": {
                         "type": "string"
@@ -201,13 +214,14 @@
                 },
                 "type": "object"
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.NodeType": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.NodeType": {
                 "enum": [
                     "pod",
                     "node",
                     "pvc",
                     "service",
-                    "external"
+                    "external",
+                    "storageclass"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
@@ -215,10 +229,11 @@
                     "NodeTypeK8sNode",
                     "NodeTypePVC",
                     "NodeTypeService",
-                    "NodeTypeExternal"
+                    "NodeTypeExternal",
+                    "NodeTypeStorageClass"
                 ]
             },
-            "github_com_marz32one_kube-state-graph_pkg_graph.Owner": {
+            "github_com_akira-core_kube-state-graph_pkg_graph.Owner": {
                 "properties": {
                     "kind": {
                         "type": "string"
@@ -259,7 +274,7 @@
                     },
                     "edge_types": {
                         "items": {
-                            "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_graph.EdgeTypeDefinition"
+                            "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition"
                         },
                         "type": "array",
                         "uniqueItems": false
@@ -668,7 +683,7 @@
                         "content": {
                             "application/json": {
                                 "schema": {
-                                    "$ref": "#/components/schemas/github_com_marz32one_kube-state-graph_pkg_cytoscape.Body"
+                                    "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Body"
                                 }
                             }
                         },

@@ -66,8 +66,13 @@ func TestRenderer_PrefixApplied(t *testing.T) {
 		{"pod-owner", QPodOwner, time.Minute, "last_over_time(o11y_kube_pod_owner[1m])"},
 		{"replicaset-owner", QReplicaSetOwner, time.Minute, "last_over_time(o11y_kube_replicaset_owner[1m])"},
 		{"pvc-info", QPVCInfo, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])"},
+		{"storageclass-info", QStorageClassInfo, time.Minute, "last_over_time(o11y_kube_storageclass_info[1m])"},
 		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(o11y_kube_pod_container_info[1m])"},
 		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
+		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(o11y_kube_service_annotations[1m])"},
+		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])"},
+		{"tridentvolume-info", QTridentVolumeInfo, time.Minute, "last_over_time(o11y_kube_tridentvolume_info[1m])"},
+		{"tridentbackend-info", QTridentBackendInfo, time.Minute, "last_over_time(o11y_kube_tridentbackend_info[1m])"},
 		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
 	}
 	r := Renderer{Prefix: "o11y_"}
@@ -116,6 +121,17 @@ func TestRender_PVCInfoPrefixAware(t *testing.T) {
 		Renderer{Prefix: "o11y_"}.Render(QPVCInfo, time.Minute))
 }
 
+// TestRender_StorageClassInfoPrefixAware pins the new kube_storageclass_info
+// query: bare by default (stable self-metric dimension), prefix-aware via
+// Renderer like every other KSM-shaped series.
+func TestRender_StorageClassInfoPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_storageclass_info[1m])", Render(QStorageClassInfo, time.Minute))
+	assert.Equal(t, "kube_storageclass_info", string(QStorageClassInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_storageclass_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QStorageClassInfo, time.Minute))
+}
+
 // TestRender_PodContainerInfoPrefixAware pins the new kube_pod_container_info
 // query (per-container name/image). It uses tlast_over_time (NOT last_over_time)
 // so each image-variant series carries its last-sample timestamp as the value,
@@ -144,6 +160,46 @@ func TestRender_NodeStatusConditionPrefixAware(t *testing.T) {
 		"Query constant stays the bare metric name for stable query/query_name dimensions")
 	assert.Equal(t, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`,
 		Renderer{Prefix: "o11y_"}.Render(QNodeStatusCondition, time.Minute))
+}
+
+// TestRender_ServiceAnnotationsPrefixAware pins the new kube_service_annotations
+// query (carrying annotation_argocd_argoproj_io_tracking_id for the service
+// ArgoCD Application). Bare by default (stable self-metric dimension), prefix-aware
+// via Renderer like every other KSM-shaped series.
+func TestRender_ServiceAnnotationsPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_service_annotations[1m])", Render(QServiceAnnotations, time.Minute))
+	assert.Equal(t, "kube_service_annotations", string(QServiceAnnotations),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_service_annotations[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QServiceAnnotations, time.Minute))
+}
+
+// TestRender_PVCAnnotationsPrefixAware pins the new
+// kube_persistentvolumeclaim_annotations query (carrying
+// annotation_argocd_argoproj_io_tracking_id for the PVC ArgoCD Application).
+func TestRender_PVCAnnotationsPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_persistentvolumeclaim_annotations[1m])", Render(QPVCAnnotations, time.Minute))
+	assert.Equal(t, "kube_persistentvolumeclaim_annotations", string(QPVCAnnotations),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QPVCAnnotations, time.Minute))
+}
+
+// TestRender_TridentPrefixAware pins the two NetApp Trident custom-resource
+// queries (kube_tridentvolume_info / kube_tridentbackend_info — the PVC
+// volumename→backendUUID→svm label chain). Bare by default (stable self-metric
+// dimension), prefix-aware via Renderer like every other KSM-shaped series.
+func TestRender_TridentPrefixAware(t *testing.T) {
+	assert.Equal(t, "last_over_time(kube_tridentvolume_info[1m])", Render(QTridentVolumeInfo, time.Minute))
+	assert.Equal(t, "last_over_time(kube_tridentbackend_info[1m])", Render(QTridentBackendInfo, time.Minute))
+	assert.Equal(t, "kube_tridentvolume_info", string(QTridentVolumeInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "kube_tridentbackend_info", string(QTridentBackendInfo),
+		"Query constant stays the bare metric name for stable query/query_name dimensions")
+	assert.Equal(t, "last_over_time(o11y_kube_tridentvolume_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QTridentVolumeInfo, time.Minute))
+	assert.Equal(t, "last_over_time(o11y_kube_tridentbackend_info[1m])",
+		Renderer{Prefix: "o11y_"}.Render(QTridentBackendInfo, time.Minute))
 }
 
 func TestFormatDuration(t *testing.T) {

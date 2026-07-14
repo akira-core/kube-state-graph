@@ -15,9 +15,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // TestServer_MetricPrefix_AppliedToTopologyQueries asserts that when the
@@ -39,6 +39,9 @@ func TestServer_MetricPrefix_AppliedToTopologyQueries(t *testing.T) {
 			"cluster": "test",
 			"node":    "node-a",
 		}),
+		// The service-graph metric is never prefixed (D26); this edge keeps
+		// web-1 connectivity-connected so it survives the default prune.
+		"traces_service_graph_request_total": serviceGraphConnectsWeb1(),
 	}
 	s := newServerWithMocks(t, newMockQuerier(t, prefixFixtures), func(c *config.Config) {
 		c.MetricPrefix = "o11y_"

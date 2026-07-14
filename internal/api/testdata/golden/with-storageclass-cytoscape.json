@@ -15,10 +15,28 @@
       },
       {
         "data": {
-          "id": "cluster-alpha/storageclass/gp3",
-          "name": "gp3",
-          "type": "storageclass",
+          "id": "cluster-alpha/namespace/db",
+          "name": "db",
+          "type": "namespace",
           "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/db/application/mongo",
+          "name": "mongo",
+          "type": "application",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/db/application/mongo/controller/StatefulSet/mongo",
+          "name": "mongo",
+          "type": "controller",
+          "parent": "cluster-alpha/namespace/db/application/mongo",
           "labels": {}
         }
       },
@@ -38,7 +56,12 @@
           "id": "cluster-alpha/p1",
           "name": "mongo-0",
           "type": "pod",
-          "parent": "cluster-alpha/worker-0",
+          "parent": "cluster-alpha/namespace/db/application/mongo/controller/StatefulSet/mongo",
+          "owner": {
+            "kind": "StatefulSet",
+            "name": "mongo"
+          },
+          "application": "mongo",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db",
@@ -51,7 +74,7 @@
           "id": "cluster-alpha/db/data-mongo-0",
           "name": "data-mongo-0",
           "type": "pvc",
-          "parent": "cluster-alpha/storageclass/gp3",
+          "parent": "cluster-alpha/namespace/db",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db",
@@ -64,15 +87,40 @@
           "id": "cluster-alpha/db/legacy",
           "name": "legacy",
           "type": "pvc",
-          "parent": "cluster/cluster-alpha",
+          "parent": "cluster-alpha/namespace/db",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db"
           }
         }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/storageclass/gp3",
+          "name": "gp3",
+          "type": "storageclass",
+          "parent": "cluster/cluster-alpha",
+          "provisioner": "ebs.csi.aws.com",
+          "parameters": {
+            "fs": "ext4",
+            "pool": "aggr1"
+          },
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
       }
     ],
     "edges": [
+      {
+        "data": {
+          "id": "b7907bfd-4f08-5a4f-b8b8-bbac465b1f33",
+          "type": "pod-to-node",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/worker-0",
+          "labels": {}
+        }
+      },
       {
         "data": {
           "id": "64198393-9529-53f1-b4fe-d6ffad8bd939",
@@ -93,6 +141,15 @@
           "labels": {
             "claim_name": "legacy"
           }
+        }
+      },
+      {
+        "data": {
+          "id": "3752911a-89e2-5f7a-a578-b47c5fec9bbc",
+          "type": "pvc-to-storageclass",
+          "source": "cluster-alpha/db/data-mongo-0",
+          "target": "cluster-alpha/storageclass/gp3",
+          "labels": {}
         }
       }
     ]

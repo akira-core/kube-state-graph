@@ -34,7 +34,7 @@ ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="kube-state-graph" \
       org.opencontainers.image.description="Multi-cluster pod / node / PVC graph API for Kubernetes." \
-      org.opencontainers.image.source="https://github.com/marz32one/kube-state-graph" \
+      org.opencontainers.image.source="https://github.com/akira-core/kube-state-graph" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \

@@ -1,0 +1,115 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/db",
+          "name": "db",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/p1",
+          "name": "mongo-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/db/data-mongo-0",
+          "name": "data-mongo-0",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db",
+            "svm": "svm-prod",
+            "volume": "data",
+            "volumename": "pvc-9f3a"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/db/scratch",
+          "name": "scratch",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/storageclass/netapp-nas",
+          "name": "netapp-nas",
+          "type": "storageclass",
+          "parent": "cluster/cluster-alpha",
+          "provisioner": "csi.trident.netapp.io",
+          "parameters": {
+            "fs": "nfs",
+            "pool": "aggr1"
+          },
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "64198393-9529-53f1-b4fe-d6ffad8bd939",
+          "type": "pod-mounts-pvc",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/db/data-mongo-0",
+          "labels": {
+            "claim_name": "data-mongo-0"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "016fc590-790c-5ebc-a67a-dcd54002029b",
+          "type": "pod-mounts-pvc",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/db/scratch",
+          "labels": {
+            "claim_name": "scratch"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "f52ecc98-5acd-5db5-8ba2-fb64d9e64afc",
+          "type": "pvc-to-storageclass",
+          "source": "cluster-alpha/db/data-mongo-0",
+          "target": "cluster-alpha/storageclass/netapp-nas",
+          "labels": {}
+        }
+      }
+    ]
+  }
+}

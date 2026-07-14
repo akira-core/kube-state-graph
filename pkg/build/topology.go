@@ -14,8 +14,8 @@ import (
 	"github.com/prometheus/common/model"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // PodPVCBinding records that a pod mounts a specific PVC. The reader emits
@@ -63,10 +63,11 @@ type EndpointObs struct {
 // Topology is the typed result of reading kube-state-metrics-style series for
 // a single time window across all clusters in scope.
 type Topology struct {
-	Pods    []*graph.PodNode
-	Nodes   []*graph.K8sNode
-	PVCs    []*graph.PVCNode
-	PodPVCs []PodPVCBinding
+	Pods           []*graph.PodNode
+	Nodes          []*graph.K8sNode
+	PVCs           []*graph.PVCNode
+	StorageClasses []*graph.StorageClassNode
+	PodPVCs        []PodPVCBinding
 
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
@@ -92,6 +93,13 @@ type Topology struct {
 	//   EndpointsByService — (cluster, namespace, service) → backing pods
 	ServicesByNameNS   map[serviceKey]ServiceObs
 	EndpointsByService map[serviceKey][]EndpointObs
+
+	// ServiceApplications indexes (cluster, namespace, service) → ArgoCD
+	// Application name (from kube_service_annotations' tracking-id). ServiceNodes
+	// are materialised on demand by the service-graph reader, so it consumes this
+	// index to set each node's Application (PVC applications are set directly on
+	// the PVCNode at topology assembly instead). Empty when the metric is absent.
+	ServiceApplications map[serviceKey]string
 
 	ClustersObserved []string // sorted unique cluster values
 
@@ -121,10 +129,18 @@ type topologyVectors struct {
 	ReplicaSetOwner model.Vector
 	// PVC StorageClass resolution.
 	PVCInfo model.Vector
+	// StorageClass node resolution (provisioner + NetApp/Ceph parameters).
+	StorageClassInfo model.Vector
 	// Pod container list resolution (name/image per container).
 	PodContainerInfo model.Vector
 	// K8s node Ready-status resolution (kube_node_status_condition).
 	NodeStatus model.Vector
+	// Service / PVC ArgoCD Application resolution (annotation tracking-id).
+	ServiceAnnotations model.Vector
+	PVCAnnotations     model.Vector
+	// NetApp Trident PVC SVM resolution (volumename → backendUUID → svm).
+	TridentVolume  model.Vector
+	TridentBackend model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -180,8 +196,13 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 	g.Go(fetch(promql.QPodOwner, &v.PodOwner))
 	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
 	g.Go(fetch(promql.QPVCInfo, &v.PVCInfo))
+	g.Go(fetch(promql.QStorageClassInfo, &v.StorageClassInfo))
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
+	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
+	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
+	g.Go(fetch(promql.QTridentVolumeInfo, &v.TridentVolume))
+	g.Go(fetch(promql.QTridentBackendInfo, &v.TridentBackend))
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
@@ -199,8 +220,13 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 		string(promql.QPodOwner):               len(v.PodOwner),
 		string(promql.QReplicaSetOwner):        len(v.ReplicaSetOwner),
 		string(promql.QPVCInfo):                len(v.PVCInfo),
+		string(promql.QStorageClassInfo):       len(v.StorageClassInfo),
 		string(promql.QPodContainerInfo):       len(v.PodContainerInfo),
 		string(promql.QNodeStatusCondition):    len(v.NodeStatus),
+		string(promql.QServiceAnnotations):     len(v.ServiceAnnotations),
+		string(promql.QPVCAnnotations):         len(v.PVCAnnotations),
+		string(promql.QTridentVolumeInfo):      len(v.TridentVolume),
+		string(promql.QTridentBackendInfo):     len(v.TridentBackend),
 	}
 	return t, nil
 }
@@ -231,10 +257,24 @@ func parseTopology(v topologyVectors) Topology {
 	// each pod's typed Owner attribute (never a label).
 	podOwners := resolvePodOwners(v.PodOwner, v.ReplicaSetOwner, mc)
 
-	// PVC StorageClass resolution. Built up-front so the per-PVC assembly below
-	// can set each PVC's StorageClass (consumed by the Cytoscape serialiser for
-	// compound grouping — never a label, never serialised).
-	pvcStorageClass := resolvePVCStorageClass(v.PVCInfo, mc)
+	// PVC info resolution (StorageClass + bound PV name). Built up-front so the
+	// per-PVC assembly below can set each PVC's StorageClass (drives the
+	// pvc-to-storageclass edge — never a label) and its `volumename` label (the
+	// bound PV name, rooting the Trident svm chain below).
+	pvcInfo := resolvePVCInfo(v.PVCInfo, mc)
+
+	// NetApp Trident svm chain: (cluster, PV name) → backendUUID → svm. Both
+	// indexes are built up-front; the per-PVC assembly joins them off the
+	// resolved volumename to set the PVC's `svm` label. OPTIONAL — absent
+	// Trident metrics leave both maps empty and the labels off.
+	tridentBackendByPV := resolveTridentVolumeBackends(v.TridentVolume, mc)
+	tridentSVMByBackend := resolveTridentBackendSVMs(v.TridentBackend, mc)
+
+	// StorageClass node attributes (provisioner + NetApp/Ceph parameters) from
+	// kube_storageclass_info, keyed (cluster, storageclass). Built up-front; the
+	// StorageClass nodes are materialised after the PVC slice exists (so a
+	// PVC-referenced-but-absent class can be back-filled bare).
+	scInfo := resolveStorageClassInfo(v.StorageClassInfo, mc)
 
 	// Pod container list + ArgoCD Application resolution. Both feed typed pod
 	// attributes (never labels) set during the per-pod assembly below. The
@@ -242,6 +282,13 @@ func parseTopology(v topologyVectors) Topology {
 	// owner but independently of the controller pick (it is a pod-level fact).
 	podContainers := resolvePodContainers(v.PodContainerInfo, mc)
 	podApplications := resolvePodApplications(v.PodOwner)
+
+	// Service / PVC ArgoCD Application resolution (annotation tracking-id). Built
+	// up-front: the PVC index enriches each PVC at the per-PVC assembly below; the
+	// service index is threaded into the service-graph reader (service nodes are
+	// materialised there, on demand). Both reuse the pod's segment-before-":" parse.
+	pvcApplications := resolvePVCApplications(v.PVCAnnotations, mc)
+	serviceApplications := resolveServiceApplications(v.ServiceAnnotations, mc)
 
 	// K8s node Ready-status resolution. Built up-front so the per-node assembly
 	// below can set each node's typed ReadyStatus attribute (never a label).
@@ -492,11 +539,28 @@ func parseTopology(v topologyVectors) Topology {
 		id := graph.PVCID(cluster, ns, claim)
 		node, seen := pvcByID[id]
 		if !seen {
+			attrs := pvcInfo[pvcKey{cluster, ns, claim}]
+			labels := map[string]string{"cluster": cluster, "namespace": ns}
+			// Bound PV name and NetApp Trident SVM, as additive labels. Each
+			// key is set only when its value resolved non-empty — never an
+			// empty-string label — and svm is impossible without volumename
+			// (the chain is rooted at the PV name). `volumename` (the bound PV)
+			// is distinct from the `volume` key below (the pod-spec volume
+			// name); both may coexist on one PVC.
+			if attrs.volumeName != "" {
+				labels["volumename"] = attrs.volumeName
+				if uuid := tridentBackendByPV[[2]string{cluster, attrs.volumeName}]; uuid != "" {
+					if svm := tridentSVMByBackend[[2]string{cluster, uuid}]; svm != "" {
+						labels["svm"] = svm
+					}
+				}
+			}
 			node = &graph.PVCNode{
 				IDValue:           id,
 				NameValue:         claim,
-				LabelsValue:       map[string]string{"cluster": cluster, "namespace": ns},
-				StorageClassValue: pvcStorageClass[pvcKey{cluster, ns, claim}],
+				LabelsValue:       labels,
+				StorageClassValue: attrs.storageClass,
+				ApplicationValue:  pvcApplications[pvcKey{cluster, ns, claim}],
 			}
 			pvcByID[id] = node
 			pvcs = append(pvcs, node)
@@ -524,6 +588,74 @@ func parseTopology(v topologyVectors) Topology {
 		}
 		clusters[cluster] = struct{}{}
 	}
+
+	// PVC ArgoCD Application inheritance (D13): a PVC with no Application of its
+	// own inherits the lexically-smallest Application among the pods that mount
+	// it, so an unannotated PVC still nests under its workload's application
+	// group. The PVC's own annotation (set above from pvcApplications) ALWAYS
+	// wins — this pass only fills app-less PVCs — and runs before graph.NewGraph
+	// freezes the nodes. Pure function of the (binding set, pod Applications), so
+	// order-independent and byte-stable (D6).
+	podAppByID := make(map[string]string, len(pods))
+	for _, p := range pods {
+		if p.ApplicationValue == "" {
+			continue
+		}
+		// Lexically-smallest wins on the (improbable) same-ID pod collision —
+		// the same tie-break as addPodToIndex, so the join key is order-free (D6).
+		if cur, ok := podAppByID[p.IDValue]; !ok || p.ApplicationValue < cur {
+			podAppByID[p.IDValue] = p.ApplicationValue
+		}
+	}
+	inherited := pvcInheritedApps(bindings, podAppByID)
+	for _, pvc := range pvcs {
+		if pvc.ApplicationValue == "" {
+			if app := inherited[pvc.IDValue]; app != "" {
+				pvc.ApplicationValue = app
+			}
+		}
+	}
+
+	// StorageClass nodes (real, from kube_storageclass_info). Every observed
+	// StorageClass becomes a node; a StorageClass referenced by an emitted PVC
+	// but absent from the info metric is materialised bare (nil InfoValue, no
+	// provisioner/parameters) so its pvc-to-storageclass edge has a target.
+	// Attributed nodes win over bare on the same (cluster, name) via scSeen.
+	// Sorted by ID so the slice — and hence NewGraph keep-first dedup — is a pure
+	// function of the data (D6 determinism).
+	storageClasses := make([]*graph.StorageClassNode, 0, len(scInfo))
+	scSeen := make(map[storageClassKey]bool, len(scInfo))
+	for key, info := range scInfo {
+		storageClasses = append(storageClasses, &graph.StorageClassNode{
+			IDValue:     graph.StorageClassID(key.cluster, key.name),
+			NameValue:   key.name,
+			LabelsValue: map[string]string{"cluster": key.cluster},
+			InfoValue:   info,
+		})
+		scSeen[key] = true
+		clusters[key.cluster] = struct{}{}
+	}
+	for _, pv := range pvcs {
+		sc := pv.StorageClassValue
+		if sc == "" {
+			continue
+		}
+		key := storageClassKey{pv.LabelsValue["cluster"], sc}
+		if scSeen[key] {
+			continue
+		}
+		scSeen[key] = true
+		storageClasses = append(storageClasses, &graph.StorageClassNode{
+			IDValue:     graph.StorageClassID(key.cluster, key.name),
+			NameValue:   key.name,
+			LabelsValue: map[string]string{"cluster": key.cluster},
+			InfoValue:   nil,
+		})
+		clusters[key.cluster] = struct{}{}
+	}
+	sort.SliceStable(storageClasses, func(i, j int) bool {
+		return storageClasses[i].ID() < storageClasses[j].ID()
+	})
 
 	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.
 	servicesByNameNS := map[serviceKey]ServiceObs{}
@@ -600,14 +732,16 @@ func parseTopology(v topologyVectors) Topology {
 	mc.warn()
 
 	return Topology{
-		Pods:               pods,
-		Nodes:              nodes,
-		PVCs:               pvcs,
-		PodPVCs:            bindings,
-		PodsByUID:          podsByUID,
-		ServicesByNameNS:   servicesByNameNS,
-		EndpointsByService: endpointsByService,
-		ClustersObserved:   clusterList,
+		Pods:                pods,
+		Nodes:               nodes,
+		PVCs:                pvcs,
+		StorageClasses:      storageClasses,
+		PodPVCs:             bindings,
+		PodsByUID:           podsByUID,
+		ServicesByNameNS:    servicesByNameNS,
+		EndpointsByService:  endpointsByService,
+		ServiceApplications: serviceApplications,
+		ClustersObserved:    clusterList,
 	}
 }
 
@@ -766,36 +900,113 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 // row with a missing cluster label is therefore bucketed silently — an
 // acceptable diagnostic gap, not a wrong-output one.)
 func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
-	// Accumulate the lexically-smallest non-empty tracking-id per pod
-	// (deterministic), then derive each Application in place — the tie-break is on
-	// the raw value, so one map suffices (mirrors resolvePVCStorageClass).
-	out := make(map[podNameKey]string, len(ownerVec))
-	for _, s := range ownerVec {
-		raw := string(s.Metric["argocd_tracking_id"])
-		pod := string(s.Metric["pod"])
-		if raw == "" || pod == "" {
+	// kube_pod_owner's missing-cluster tally is owned by resolvePodOwners (the
+	// controller pick reads the SAME vector), so this pass buckets without
+	// re-tallying — hence bucketCluster, not mc.bucket.
+	return resolveApplications(ownerVec, "argocd_tracking_id", func(m model.Metric) (podNameKey, bool) {
+		pod := string(m["pod"])
+		if pod == "" {
+			return podNameKey{}, false
+		}
+		return podNameKey{bucketCluster(string(m["cluster"])), string(m["namespace"]), pod}, true
+	})
+}
+
+// resolveServiceApplications builds the (cluster, namespace, service) → ArgoCD
+// Application index from kube_service_annotations'
+// annotation_argocd_argoproj_io_tracking_id label (KSM's sanitised form of the
+// argocd.argoproj.io/tracking-id annotation). OPTIONAL: an absent/empty vector
+// yields an empty map (services carry no Application). Deterministic per
+// "absent when empty" (lexically-smallest raw tracking-id wins on collision).
+func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[serviceKey]string {
+	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
+		svc := string(m["service"])
+		if svc == "" {
+			return serviceKey{}, false
+		}
+		return serviceKey{mc.bucket(promql.QServiceAnnotations, string(m["cluster"])), string(m["namespace"]), svc}, true
+	})
+}
+
+// resolvePVCApplications builds the (cluster, namespace, claim) → ArgoCD
+// Application index from kube_persistentvolumeclaim_annotations' tracking-id
+// label, keyed identically to resolvePVCInfo so the per-PVC assembly
+// can join it. OPTIONAL/graceful and deterministic like the service variant.
+func resolvePVCApplications(vec model.Vector, mc missingClusterCounts) map[pvcKey]string {
+	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
+		claim := string(m["persistentvolumeclaim"])
+		if claim == "" {
+			return pvcKey{}, false
+		}
+		return pvcKey{mc.bucket(promql.QPVCAnnotations, string(m["cluster"])), string(m["namespace"]), claim}, true
+	})
+}
+
+// pvcInheritedApps computes, per PVC ID, the ArgoCD Application a PVC may
+// inherit from the pods that mount it (D13): the lexically-smallest non-empty
+// Application across all its mounting pods (from the pod-PVC bindings, joined to
+// each pod's already-resolved Application via podApp keyed by pod ID). A PVC
+// whose mounting pods all carry no Application is absent from the result. The
+// accumulation is a pure min over the binding set, so it is independent of
+// binding order (D6 determinism). The caller applies this only to PVCs that have
+// no Application of their own, so an own annotation always wins.
+func pvcInheritedApps(bindings []PodPVCBinding, podApp map[string]string) map[string]string {
+	out := make(map[string]string)
+	for _, b := range bindings {
+		app := podApp[b.PodID]
+		if app == "" {
 			continue
 		}
-		key := podNameKey{bucketCluster(string(s.Metric["cluster"])), string(s.Metric["namespace"]), pod}
+		if cur, ok := out[b.PVCID]; !ok || app < cur {
+			out[b.PVCID] = app
+		}
+	}
+	return out
+}
+
+// argoAppName extracts the ArgoCD Application from a tracking-id value: the
+// segment before the first ":" (ArgoCD <app>:<group>/<kind>:<ns>/<name> form);
+// a value with no ":" is verbatim, an empty leading segment yields "".
+func argoAppName(raw string) string {
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
+// resolveApplications builds a key → ArgoCD Application index from a vector
+// carrying a tracking-id under `label`. For each key it keeps the
+// lexically-smallest non-empty raw tracking-id (the tie-break is on the raw
+// value, so one map suffices — deterministic), then derives the Application in
+// place (argoAppName), dropping keys whose Application is empty so the map stays
+// "absent when empty" (never present-but-""). keyOf returns (key, false) to skip
+// a series (e.g. missing name label). Shared by the pod / service / PVC
+// resolvers, which differ only in their key type, name label, and tracking
+// label.
+func resolveApplications[K comparable](vec model.Vector, label string, keyOf func(model.Metric) (K, bool)) map[K]string {
+	out := make(map[K]string, len(vec))
+	for _, s := range vec {
+		raw := string(s.Metric[model.LabelName(label)])
+		// Skip a value whose derived Application would be empty — an empty
+		// tracking-id, or an empty leading segment like ":apps/..." — BEFORE the
+		// min-pick. Otherwise a malformed sibling could win the lexically-smallest
+		// race (':' = 0x3A sorts below every letter/digit) and suppress a valid
+		// Application for the same key. Among the surviving (non-empty-app) series
+		// the smallest raw tracking-id still wins (the documented tie-break).
+		if raw == "" || argoAppName(raw) == "" {
+			continue
+		}
+		key, ok := keyOf(s.Metric)
+		if !ok {
+			continue
+		}
 		if cur, ok := out[key]; !ok || raw < cur {
 			out[key] = raw
 		}
 	}
-
-	// Application is the segment before the first ":" (ArgoCD
-	// <app>:<group>/<kind>:<ns>/<name> form); a value with no ":" stays verbatim.
-	// A value whose segment is empty (e.g. ":apps/...") yields no Application — drop
-	// the key so the map stays "absent when empty" (never present-but-"").
+	// Every surviving raw has a non-empty Application; derive it in place.
 	for key, raw := range out {
-		app := raw
-		if i := strings.IndexByte(raw, ':'); i >= 0 {
-			app = raw[:i]
-		}
-		if app == "" {
-			delete(out, key)
-			continue
-		}
-		out[key] = app
+		out[key] = argoAppName(raw)
 	}
 	return out
 }
@@ -806,32 +1017,189 @@ func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
 // persistentvolumeclaim.
 type pvcKey struct{ cluster, namespace, claim string }
 
-// resolvePVCStorageClass builds the (cluster, namespace, persistentvolumeclaim) →
-// storageclass index from kube_persistentvolumeclaim_info. The result enriches
-// PVC nodes that already exist (from the pod→PVC binding metric); it never
-// materialises a PVC on its own.
+// pvcInfoAttrs carries the per-PVC values read off
+// kube_persistentvolumeclaim_info: the StorageClass name (drives the
+// pvc-to-storageclass edge) and the bound PersistentVolume name from the
+// `volumename` label (surfaced as the PVC `volumename` label and rooting the
+// NetApp Trident svm join chain). The zero value means "nothing resolved".
+type pvcInfoAttrs struct {
+	storageClass string
+	volumeName   string
+}
+
+// resolvePVCInfo builds the (cluster, namespace, persistentvolumeclaim) →
+// {storageclass, volumename} index from kube_persistentvolumeclaim_info. The
+// result enriches PVC nodes that already exist (from the pod→PVC binding
+// metric); it never materialises a PVC on its own.
 //
-// OPTIONAL: an absent or empty vector yields an empty map and PVCs carry no
-// StorageClass (graceful degradation). The returned map is a deterministic
-// function of the input vector — on a duplicate (cluster, namespace, claim)
-// the lexically-smallest storageclass wins, so the emitted grouping is stable
-// across rebuilds (D6 determinism). The only side effect is tallying
+// The two fields are resolved per-field independently — a series may carry
+// `volumename` without `storageclass` and vice versa, and an empty value never
+// masks a populated sibling series. OPTIONAL: an absent or empty vector yields
+// an empty map and PVCs carry no StorageClass and no volumename (graceful
+// degradation). The returned map is a deterministic function of the input
+// vector — on a duplicate (cluster, namespace, claim) the lexically-smallest
+// non-empty value wins PER FIELD, so the emitted grouping and labels are
+// stable across rebuilds (D6 determinism). The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolvePVCStorageClass(vec model.Vector, mc missingClusterCounts) map[pvcKey]string {
-	out := make(map[pvcKey]string, len(vec))
+func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInfoAttrs {
+	pick := func(cur *string, val string) {
+		if val == "" {
+			return
+		}
+		if *cur == "" || val < *cur {
+			*cur = val
+		}
+	}
+	out := make(map[pvcKey]pvcInfoAttrs, len(vec))
 	for _, s := range vec {
 		cluster := mc.bucket(promql.QPVCInfo, string(s.Metric["cluster"]))
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])
-		sc := string(s.Metric["storageclass"])
-		if claim == "" || sc == "" {
+		if claim == "" {
 			continue
 		}
 		key := pvcKey{cluster, ns, claim}
-		if cur, ok := out[key]; ok && cur <= sc {
+		attrs := out[key]
+		pick(&attrs.storageClass, string(s.Metric["storageclass"]))
+		pick(&attrs.volumeName, string(s.Metric["volumename"]))
+		out[key] = attrs
+	}
+	return out
+}
+
+// resolveTridentVolumeBackends builds the (cluster, name) → backendUUID index
+// from kube_tridentvolume_info, the NetApp Trident custom-resource series
+// whose `name` label is the TridentVolume CR name — equal to the bound PV name
+// under Trident's naming — so the per-PVC assembly can chain a resolved
+// `volumename` to its backend. OPTIONAL and not stock KSM (custom-resource-
+// state config over the tridentvolumes CRD, or a compatible exporter): an
+// absent or empty vector yields an empty map and PVCs carry no svm label.
+// Series with an empty `name` or `backendUUID` are skipped; on a duplicate
+// (cluster, name) the lexically-smallest backendUUID wins (D6 determinism).
+// The only side effect is tallying missing-cluster samples into mc.
+func resolveTridentVolumeBackends(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
+	out := make(map[[2]string]string, len(vec))
+	for _, s := range vec {
+		cluster := mc.bucket(promql.QTridentVolumeInfo, string(s.Metric["cluster"]))
+		name := string(s.Metric["name"])
+		uuid := string(s.Metric["backendUUID"])
+		if name == "" || uuid == "" {
 			continue
 		}
-		out[key] = sc
+		key := [2]string{cluster, name}
+		if cur, ok := out[key]; ok && cur <= uuid {
+			continue
+		}
+		out[key] = uuid
+	}
+	return out
+}
+
+// resolveTridentBackendSVMs builds the (cluster, backendUUID) → svm index from
+// kube_tridentbackend_info, the NetApp Trident custom-resource series mapping
+// a backend UUID to the ONTAP SVM serving it — the final link of the PVC
+// volumename → backendUUID → svm label chain. OPTIONAL and not stock KSM (same
+// provenance as kube_tridentvolume_info): an absent or empty vector yields an
+// empty map and PVCs carry no svm label. Series with an empty `backendUUID` or
+// `svm` are skipped; on a duplicate (cluster, backendUUID) the
+// lexically-smallest svm wins (D6 determinism). The only side effect is
+// tallying missing-cluster samples into mc.
+func resolveTridentBackendSVMs(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
+	out := make(map[[2]string]string, len(vec))
+	for _, s := range vec {
+		cluster := mc.bucket(promql.QTridentBackendInfo, string(s.Metric["cluster"]))
+		uuid := string(s.Metric["backendUUID"])
+		svm := string(s.Metric["svm"])
+		if uuid == "" || svm == "" {
+			continue
+		}
+		key := [2]string{cluster, uuid}
+		if cur, ok := out[key]; ok && cur <= svm {
+			continue
+		}
+		out[key] = svm
+	}
+	return out
+}
+
+// storageClassKey identifies a StorageClass by its cluster-scoped name. The
+// name is cluster-scoped (StorageClass names are not globally unique).
+type storageClassKey struct{ cluster, name string }
+
+// resolveStorageClassInfo builds the (cluster, storageclass) → typed
+// provisioner/parameters index from kube_storageclass_info. The result
+// materialises real StorageClass nodes; it does not enrich any existing node.
+//
+// The `provisioner` parameter comes from the native KSM `provisioner` label.
+// The `parameters` object carries the operator-allowlisted NetApp/Ceph values,
+// each resolved "first non-empty source label wins" PER SERIES
+// (storagePools→pool, fsType→fsName, ClusterID, selector), then the
+// lexically-smallest non-empty value ACROSS series so the emitted node is a
+// pure function of the data (D6 determinism). The native reclaim_policy /
+// volume_binding_mode fields are out of scope and never read.
+//
+// OPTIONAL: an absent or empty vector yields an empty map (all referenced
+// StorageClass nodes are then materialised bare by the caller). The only side
+// effect is tallying missing-cluster samples into the caller's mc accumulator.
+func resolveStorageClassInfo(vec model.Vector, mc missingClusterCounts) map[storageClassKey]*graph.StorageClassInfo {
+	type acc struct {
+		provisioner, pool, fs, clusterID, selector string
+	}
+	pick := func(cur *string, val string) {
+		if val == "" {
+			return
+		}
+		if *cur == "" || val < *cur {
+			*cur = val
+		}
+	}
+	firstNonEmpty := func(primary, fallback string) string {
+		if primary != "" {
+			return primary
+		}
+		return fallback
+	}
+
+	raw := make(map[storageClassKey]*acc, len(vec))
+	for _, s := range vec {
+		name := string(s.Metric["storageclass"])
+		if name == "" {
+			continue
+		}
+		cluster := mc.bucket(promql.QStorageClassInfo, string(s.Metric["cluster"]))
+		key := storageClassKey{cluster, name}
+		a := raw[key]
+		if a == nil {
+			a = &acc{}
+			raw[key] = a
+		}
+		pick(&a.provisioner, string(s.Metric["provisioner"]))
+		pick(&a.pool, firstNonEmpty(string(s.Metric["storagePools"]), string(s.Metric["pool"])))
+		pick(&a.fs, firstNonEmpty(string(s.Metric["fsType"]), string(s.Metric["fsName"])))
+		pick(&a.clusterID, string(s.Metric["ClusterID"]))
+		pick(&a.selector, string(s.Metric["selector"]))
+	}
+
+	out := make(map[storageClassKey]*graph.StorageClassInfo, len(raw))
+	for key, a := range raw {
+		params := map[string]string{}
+		if a.pool != "" {
+			params["pool"] = a.pool
+		}
+		if a.fs != "" {
+			params["fs"] = a.fs
+		}
+		if a.clusterID != "" {
+			params["cluster_id"] = a.clusterID
+		}
+		if a.selector != "" {
+			params["selector"] = a.selector
+		}
+		info := &graph.StorageClassInfo{Provisioner: a.provisioner}
+		if len(params) > 0 {
+			info.Parameters = params
+		}
+		out[key] = info
 	}
 	return out
 }

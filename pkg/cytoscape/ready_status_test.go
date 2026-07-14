@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // A K8s node's Ready status is emitted as the typed data.ready_status string

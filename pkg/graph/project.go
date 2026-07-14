@@ -22,8 +22,24 @@ func Project(g *Graph, scope Scope) View {
 	}
 
 	reachable := traverse(g, scope)
-	nodes := filterNodes(g, scope, reachable)
-	edges := filterEdges(g, scope, nodes, reachable)
+
+	// Default-projection connectivity prune: every response carries only pods
+	// that sit on a connectivity edge (pod-calls-pod / pod-calls-service /
+	// service-selects-pod) and the infra that hangs off them — an edgeless pod,
+	// the node hosting only edgeless pods, a PVC mounted only by edgeless pods,
+	// and a StorageClass backing only such PVCs are dropped. The exclusion set
+	// is a pure function of the graph (scope-independent), so it is computed once
+	// and consulted in both filterNodes (skip) and filterEdges (no partner
+	// re-add). It is suppressed under an explicit name filter or a root-anchored
+	// traversal: those are the on-demand escape hatches that surface a specific
+	// edgeless element (symmetric with the D6 infra-node name/root exception).
+	var excluded map[string]struct{}
+	if reachable == nil && !scope.NameFilterActive() {
+		excluded = connectivityExcluded(g)
+	}
+
+	nodes := filterNodes(g, scope, reachable, excluded)
+	edges := filterEdges(g, scope, nodes, reachable, excluded)
 
 	out := View{
 		Nodes: make([]GraphNode, 0, len(nodes)),
@@ -89,42 +105,131 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 	return visited
 }
 
-func filterNodes(g *Graph, scope Scope, reachable map[string]struct{}) map[string]GraphNode {
-	out := make(map[string]GraphNode, len(g.NodesByID))
-	// K8sNode admission is deferred: a K8s node carries no namespace label, so
-	// under a namespace filter it is retained iff some in-scope pod is scheduled
-	// on it (labels.node). We first resolve every other node — recording the
-	// host-node ids of the pods that survived — then admit the K8s nodes that
-	// host one of them. hostNodes is only needed under a namespace filter, so it
-	// is left nil (and unpopulated) otherwise. See design.md D31.
-	var deferred []GraphNode
-	var hostNodes map[string]struct{}
-	if len(scope.Namespaces) > 0 {
-		hostNodes = map[string]struct{}{}
+// connectivityExcluded returns the set of pod and PVC node IDs that the
+// default projection drops because they sit on no connectivity edge:
+//   - a pod is excluded iff it is not an endpoint of any pod-calls-pod /
+//     pod-calls-service / service-selects-pod edge;
+//   - a PVC is excluded iff none of the pods that mount it (pod-mounts-pvc) is
+//     itself connectivity-connected.
+//
+// It is a pure function of g (independent of any Scope), so the result is stable
+// across requests and reusable by a future cache. K8s nodes and StorageClasses
+// are NOT listed here — they are already reference-gated by infraNodePassesFilters
+// (a node hosting only excluded pods, or a StorageClass backing only excluded
+// PVCs, falls out for free once those pods/PVCs are gone).
+func connectivityExcluded(g *Graph) map[string]struct{} {
+	connectedPods := make(map[string]struct{})
+	pvcMounters := make(map[string][]string)
+	for _, e := range g.Edges {
+		switch e.Type {
+		case EdgeTypePodCallsPod, EdgeTypePodCallsService, EdgeTypeServiceSelectsPod:
+			// Endpoints of a connectivity edge are connected. A non-pod endpoint
+			// (a service) may land in the set too — harmless, since the set is
+			// only ever queried for pod and pod-mounter IDs.
+			connectedPods[e.Source] = struct{}{}
+			connectedPods[e.Target] = struct{}{}
+		case EdgeTypePodMountsPVC:
+			pvcMounters[e.Target] = append(pvcMounters[e.Target], e.Source)
+		case EdgeTypePodToNode, EdgeTypePVCToStorageClass:
+			// Infra edges (pod→node, pvc→storageclass) are NOT connectivity edges:
+			// they never make a pod or PVC connectivity-connected. Their endpoints
+			// (K8s nodes / StorageClasses) are reference-gated by
+			// infraNodePassesFilters, not by this set. Listed explicitly to keep
+			// the switch exhaustive over graph.EdgeType.
+		}
 	}
+
+	excluded := make(map[string]struct{})
+	for id, n := range g.NodesByID {
+		switch n.Type() {
+		case NodeTypePod:
+			if _, ok := connectedPods[id]; !ok {
+				excluded[id] = struct{}{}
+			}
+		case NodeTypePVC:
+			kept := false
+			for _, podID := range pvcMounters[id] {
+				if _, ok := connectedPods[podID]; ok {
+					kept = true
+					break
+				}
+			}
+			if !kept {
+				excluded[id] = struct{}{}
+			}
+		default:
+			// node / storageclass / service / external are not connectivity-pruned.
+		}
+	}
+	return excluded
+}
+
+func filterNodes(g *Graph, scope Scope, reachable, excluded map[string]struct{}) map[string]GraphNode {
+	out := make(map[string]GraphNode, len(g.NodesByID))
+	// K8sNode and StorageClassNode admission is deferred: neither carries a
+	// namespace label, so each is retained iff referenced by an in-scope element
+	// — a K8s node hosts an in-scope pod (labels.node), a StorageClass backs an
+	// in-scope PVC (its StorageClass()) — or it is explicitly matched by a name
+	// filter. We first resolve every other node — recording the referenced ids —
+	// then admit the deferred infra nodes per infraNodePassesFilters. The
+	// reference sets are built for EVERY request shape (no filter, cluster,
+	// namespace) so the response only ever carries infra nodes connected to
+	// in-scope workload; an explicit ?name=<infra-node> is the one exception.
+	// See design.md D6 (generalises the namespace-only rule to all requests).
+	var deferred []GraphNode
+	hostNodes := map[string]struct{}{}
+	referencedSC := map[string]struct{}{}
 	for id, n := range g.NodesByID {
 		if reachable != nil {
 			if _, ok := reachable[id]; !ok {
 				continue
 			}
 		}
-		t := n.Type()
-		if t == NodeTypeK8sNode {
+		// Connectivity prune (default projection only; nil under name/traversal).
+		// An excluded pod/PVC is dropped before any other admission so it never
+		// feeds the deferred infra reference sets — its host node / backing
+		// StorageClass then prunes for free via infraNodePassesFilters.
+		if excluded != nil {
+			if _, ex := excluded[id]; ex {
+				continue
+			}
+		}
+		switch n.Type() {
+		case NodeTypeK8sNode, NodeTypeStorageClass:
 			deferred = append(deferred, n)
 			continue
+		default:
+			// pod / pvc / service / external are admitted directly below.
 		}
 		if !nodePassesFilters(n, scope) {
 			continue
 		}
 		out[id] = n
-		if hostNodes != nil && t == NodeTypePod {
+		// The reference sets feed only the default infra-admission path; under a
+		// name filter infraNodePassesFilters returns on the name branch and never
+		// consults them, so skip the population work entirely.
+		if scope.NameFilterActive() {
+			continue
+		}
+		switch n.Type() {
+		case NodeTypePod:
 			if hn := n.Labels()["node"]; hn != "" {
 				hostNodes[hn] = struct{}{}
 			}
+		case NodeTypePVC:
+			if sc := n.StorageClass(); sc != "" {
+				referencedSC[StorageClassID(n.Labels()["cluster"], sc)] = struct{}{}
+			}
+		default:
+			// other in-scope types reference no deferred infra node.
 		}
 	}
 	for _, n := range deferred {
-		if !k8sNodePassesFilters(n, scope, hostNodes) {
+		referenced := hostNodes
+		if n.Type() == NodeTypeStorageClass {
+			referenced = referencedSC
+		}
+		if !infraNodePassesFilters(n, scope, referenced) {
 			continue
 		}
 		out[n.ID()] = n
@@ -146,10 +251,11 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 	if len(scope.Namespaces) > 0 {
 		// ExternalNode is cluster-unscoped (no namespace label) and only ever
 		// enters a view as the re-added partner of a pod-calls-pod edge, so it
-		// is exempt from the namespace match. K8sNode is also namespace-less but
-		// is admitted separately by k8sNodePassesFilters (host-of-in-scope-pod
-		// rule), so it never reaches this predicate. Every other node type must
-		// match the requested namespace.
+		// is exempt from the namespace match. K8sNode and StorageClassNode are
+		// also namespace-less but are admitted separately by
+		// infraNodePassesFilters (referenced-by-in-scope rule), so they never
+		// reach this predicate. Every other node type must match the requested
+		// namespace.
 		switch n.Type() {
 		case NodeTypeExternal:
 			// pass-through
@@ -167,34 +273,58 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 	return true
 }
 
-// k8sNodePassesFilters decides whether a K8sNode is admitted to a view. K8s
-// nodes carry no namespace label, so namespace scoping is expressed indirectly:
-// under a namespace filter a node is kept iff hostNodes contains its id — i.e.
-// some pod that survived the namespace filter is scheduled on it (labels.node).
-// With no namespace filter, the node is kept (subject to cluster / name), so
-// the full-topology view still lists every node. cluster and name filters apply
-// exactly as for other node types (a node's own labels carry cluster and name).
-func k8sNodePassesFilters(n GraphNode, scope Scope, hostNodes map[string]struct{}) bool {
+// infraNodePassesFilters decides whether a cluster-scoped infrastructure node
+// (a K8sNode or a StorageClassNode) is admitted to a view. Neither carries a
+// namespace label, so admission is reference-driven: the node is kept iff
+// `referenced` contains its id — i.e. some in-scope element references it (a pod
+// scheduled on a K8s node via labels.node, or a PVC backed by a StorageClass via
+// its StorageClass()). This holds for EVERY request shape (no filter, cluster
+// filter, namespace filter), so the response only ever carries infra nodes
+// connected to in-scope workload — a node hosting no in-scope pod (and a
+// StorageClass backing no in-scope PVC) is dropped, not surfaced as an orphan.
+//
+// Two exceptions admit an infra node that is referenced by nothing, applied in
+// this order so ?root= and ?name= compose consistently across node kinds:
+//   - a name filter narrows FIRST: a ?name= request admits the node iff its
+//     Name() is named — so ?root=<infra>&name=<other> drops the infra root just
+//     as it drops a pod root, not leaking the anchor past the name filter; then
+//   - the explicit traversal anchor (scope.Root) is admitted when no name filter
+//     narrows it — a ?root=<infra-node> request focuses on that exact node, and
+//     traverse() already selected it as reachable, so it must not be pruned as
+//     an "orphan" (a podless K8s node or PVC-less StorageClass used as the root
+//     would otherwise yield an EMPTY view).
+//
+// A name filter that does not name this node drops it here; if it is instead the
+// host of a named pod (or backs a named PVC), it re-enters the view as that
+// edge's re-added partner in filterEdges, not via this predicate.
+//
+// The cluster filter applies first and exactly as for other node types (the
+// node's own labels carry cluster). See design.md D6.
+func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
 		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
 			return false
 		}
 	}
+	// Name filter narrows FIRST — a non-matching name drops even the traversal
+	// anchor, symmetric with a pod root (which nodePassesFilters drops on a
+	// non-matching name), so ?root= and ?name= compose consistently.
 	if scope.NameFilterActive() {
-		if _, ok := scope.Names[n.Name()]; !ok {
-			return false
-		}
+		_, named := scope.Names[n.Name()]
+		return named
 	}
-	if len(scope.Namespaces) > 0 {
-		if _, ok := hostNodes[n.ID()]; !ok {
-			return false
-		}
+	// The explicit traversal anchor is admitted when no name filter narrows it
+	// (it is the focus of the query and is already in the reachable set).
+	if scope.Root != "" && n.ID() == scope.Root {
+		return true
 	}
-	return true
+	// Default: admit iff referenced by an in-scope element.
+	_, ok := referenced[n.ID()]
+	return ok
 }
 
-func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable map[string]struct{}) []*Edge {
+func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable, excluded map[string]struct{}) []*Edge {
 	out := make([]*Edge, 0, len(g.Edges))
 	// Snapshot the in-scope set at entry. Re-adds during this pass MUST NOT
 	// promote a re-added partner into a new in-scope anchor, otherwise name
@@ -234,7 +364,7 @@ func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable ma
 				continue
 			}
 		}
-		if !readdEdgePartners(g, e, nodes, srcOK, tgtOK, scope, nodePassesNonClusterFilters) {
+		if !readdEdgePartners(g, e, nodes, srcOK, tgtOK, scope, excluded, nodePassesNonClusterFilters) {
 			continue
 		}
 		out = append(out, e)
@@ -251,9 +381,18 @@ func readdEdgePartners(
 	nodes map[string]GraphNode,
 	srcOK, tgtOK bool,
 	scope Scope,
+	excluded map[string]struct{},
 	pred func(GraphNode, Scope) bool,
 ) bool {
+	// A connectivity-excluded endpoint must stay excluded: re-adding it here
+	// (e.g. the pruned pod of a pod-to-node edge whose node survived via another
+	// pod) would resurrect what the default prune dropped. A partner missing only
+	// because of a cluster/namespace filter is NOT in excluded, so legitimate
+	// cross-cluster partner preservation is unaffected.
 	if !srcOK {
+		if _, ex := excluded[e.Source]; ex {
+			return false
+		}
 		partner, ok := g.NodesByID[e.Source]
 		if !ok || !pred(partner, scope) {
 			return false
@@ -261,6 +400,9 @@ func readdEdgePartners(
 		nodes[e.Source] = partner
 	}
 	if !tgtOK {
+		if _, ex := excluded[e.Target]; ex {
+			return false
+		}
 		partner, ok := g.NodesByID[e.Target]
 		if !ok || !pred(partner, scope) {
 			return false

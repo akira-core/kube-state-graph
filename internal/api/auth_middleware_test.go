@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/internal/auth"
+	"github.com/akira-core/kube-state-graph/internal/auth"
 )
 
 // authServer constructs a handler with the supplied API keys loaded into a

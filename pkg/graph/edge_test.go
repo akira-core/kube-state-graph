@@ -44,3 +44,28 @@ func TestNewEdge_LabelsDefaultEmpty(t *testing.T) {
 	assert.NotNil(t, e.Labels, "expected non-nil labels even when nil supplied")
 	assert.Empty(t, e.Labels)
 }
+
+// TestEdgeTypes_TopologyRelationshipEntries — the two new topology edge types
+// are registered (so /v1/edge-types advertises them and ?edge_type= accepts
+// them) with the expected directed/intra-cluster source/target contract.
+func TestEdgeTypes_TopologyRelationshipEntries(t *testing.T) {
+	assert.True(t, ValidEdgeType(EdgeTypePodToNode))
+	assert.True(t, ValidEdgeType(EdgeTypePVCToStorageClass))
+
+	byType := map[EdgeType]EdgeTypeDefinition{}
+	for _, d := range EdgeTypes {
+		byType[d.Type] = d
+	}
+
+	p2n := byType[EdgeTypePodToNode]
+	assert.True(t, p2n.Directed)
+	assert.False(t, p2n.MayCrossCluster)
+	assert.Equal(t, []NodeType{NodeTypePod}, p2n.SourceType)
+	assert.Equal(t, []NodeType{NodeTypeK8sNode}, p2n.TargetType)
+
+	p2s := byType[EdgeTypePVCToStorageClass]
+	assert.True(t, p2s.Directed)
+	assert.False(t, p2s.MayCrossCluster)
+	assert.Equal(t, []NodeType{NodeTypePVC}, p2s.SourceType)
+	assert.Equal(t, []NodeType{NodeTypeStorageClass}, p2s.TargetType)
+}

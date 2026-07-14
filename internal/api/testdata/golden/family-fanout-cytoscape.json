@@ -24,10 +24,37 @@
       },
       {
         "data": {
+          "id": "prod-1/namespace/messaging",
+          "name": "messaging",
+          "type": "namespace",
+          "parent": "cluster/prod-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "prod-1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/prod-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "prod-2/namespace/messaging",
+          "name": "messaging",
+          "type": "namespace",
+          "parent": "cluster/prod-2",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
           "id": "prod-1/p1",
           "name": "checkout",
           "type": "pod",
-          "parent": "cluster/prod-1",
+          "parent": "prod-1/namespace/shop",
           "labels": {
             "cluster": "prod-1",
             "namespace": "shop"
@@ -39,7 +66,7 @@
           "id": "prod-1/messaging/nats",
           "name": "nats",
           "type": "service",
-          "parent": "cluster/prod-1",
+          "parent": "prod-1/namespace/messaging",
           "ipaddress": [
             "10.1.0.5"
           ],
@@ -54,7 +81,7 @@
           "id": "prod-2/messaging/nats",
           "name": "nats",
           "type": "service",
-          "parent": "cluster/prod-2",
+          "parent": "prod-2/namespace/messaging",
           "ipaddress": [
             "10.2.0.5"
           ],
@@ -69,7 +96,7 @@
           "id": "prod-1/n1",
           "name": "nats-0",
           "type": "pod",
-          "parent": "cluster/prod-1",
+          "parent": "prod-1/namespace/messaging",
           "labels": {
             "cluster": "prod-1",
             "namespace": "messaging"
@@ -81,7 +108,7 @@
           "id": "prod-2/n2",
           "name": "nats-0",
           "type": "pod",
-          "parent": "cluster/prod-2",
+          "parent": "prod-2/namespace/messaging",
           "labels": {
             "cluster": "prod-2",
             "namespace": "messaging"

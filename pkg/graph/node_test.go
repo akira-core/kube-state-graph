@@ -28,32 +28,57 @@ func TestStorageClass_OnlyPVCsCarryIt(t *testing.T) {
 	}
 }
 
-// TestApplicationAndContainers_OnlyPodsCarryThem — the Application() and
-// Containers() accessors return a pod's resolved values and the zero value
-// ("" / nil) for every other node kind (and an unenriched pod). Both are typed
-// attributes consumed by the serialiser, never labels.
-func TestApplicationAndContainers_OnlyPodsCarryThem(t *testing.T) {
-	pod := &PodNode{
-		IDValue:          "c/u",
-		NameValue:        "checkout",
-		ApplicationValue: "checkout",
-		ContainersValue:  []Container{{Name: "app", Image: "reg/app:1.2"}},
-	}
+// TestApplication_PodServicePVCCarryIt — the Application() accessor returns the
+// resolved ArgoCD Application for pods, services, and PVCs (and "" when
+// unresolved), and "" for K8s nodes, externals, and StorageClass nodes. It is a
+// typed attribute consumed by the serialiser, never a label.
+func TestApplication_PodServicePVCCarryIt(t *testing.T) {
+	pod := &PodNode{IDValue: "c/u", NameValue: "checkout", ApplicationValue: "checkout"}
+	svc := &ServiceNode{IDValue: "c/n/s", NameValue: "s", ApplicationValue: "checkout"}
+	pvc := &PVCNode{IDValue: "c/n/claim", NameValue: "claim", ApplicationValue: "mongo"}
 	assert.Equal(t, "checkout", pod.Application())
+	assert.Equal(t, "checkout", svc.Application())
+	assert.Equal(t, "mongo", pvc.Application())
+
+	// Unresolved pod/service/PVC return "".
+	assert.Empty(t, (&PodNode{IDValue: "c/u2"}).Application())
+	assert.Empty(t, (&ServiceNode{IDValue: "c/n/s2"}).Application())
+	assert.Empty(t, (&PVCNode{IDValue: "c/n/claim2"}).Application())
+
+	// Node kinds that never carry an Application.
+	never := []GraphNode{
+		&K8sNode{IDValue: "c/w"},
+		&ExternalNode{IDValue: "external/x"},
+		&StorageClassNode{IDValue: StorageClassID("c", "gp3")},
+	}
+	for _, n := range never {
+		assert.Emptyf(t, n.Application(), "%T must return empty Application", n)
+	}
+}
+
+// TestContainers_OnlyPodsCarryThem — the Containers() accessor returns a pod's
+// resolved container list and nil for every other node kind (and an unenriched
+// pod). Containers stay pod-only (unlike Application, which widened to
+// service/PVC).
+func TestContainers_OnlyPodsCarryThem(t *testing.T) {
+	pod := &PodNode{
+		IDValue:         "c/u",
+		NameValue:       "checkout",
+		ContainersValue: []Container{{Name: "app", Image: "reg/app:1.2"}},
+	}
 	assert.Equal(t, []Container{{Name: "app", Image: "reg/app:1.2"}}, pod.Containers())
 
 	bare := &PodNode{IDValue: "c/u2", NameValue: "bare"}
-	assert.Empty(t, bare.Application(), "pod with no Application returns empty")
 	assert.Nil(t, bare.Containers(), "pod with no containers returns nil")
 
 	others := []GraphNode{
 		&K8sNode{IDValue: "c/w"},
-		&PVCNode{IDValue: "c/n/claim"},
-		&ServiceNode{IDValue: "c/n/s"},
+		&PVCNode{IDValue: "c/n/claim", ApplicationValue: "mongo"},
+		&ServiceNode{IDValue: "c/n/s", ApplicationValue: "checkout"},
 		&ExternalNode{IDValue: "external/x"},
+		&StorageClassNode{IDValue: StorageClassID("c", "gp3")},
 	}
 	for _, n := range others {
-		assert.Emptyf(t, n.Application(), "%T must return empty Application", n)
 		assert.Nilf(t, n.Containers(), "%T must return nil Containers", n)
 	}
 }
@@ -82,5 +107,42 @@ func TestReadyStatus_OnlyK8sNodesCarryIt(t *testing.T) {
 	}
 	for _, n := range others {
 		assert.Emptyf(t, n.ReadyStatus(), "%T must return empty ReadyStatus", n)
+	}
+}
+
+// TestStorageClassNode_PayloadAndInfo — a StorageClassNode is a cluster-scoped
+// node whose provisioner/parameters live on the typed StorageClassInfo (never
+// Labels, which stay {cluster}); a bare node returns nil StorageClassInfo, and
+// every other node kind returns nil StorageClassInfo too.
+func TestStorageClassNode_PayloadAndInfo(t *testing.T) {
+	sc := &StorageClassNode{
+		IDValue:     StorageClassID("cluster-alpha", "netapp-nas"),
+		NameValue:   "netapp-nas",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
+		InfoValue: &StorageClassInfo{
+			Provisioner: "csi.trident.netapp.io",
+			Parameters:  map[string]string{"pool": "aggr1", "fs": "nfs"},
+		},
+	}
+	assert.Equal(t, "cluster-alpha/storageclass/netapp-nas", sc.ID())
+	assert.Equal(t, NodeTypeStorageClass, sc.Type())
+	assert.Equal(t, map[string]string{"cluster": "cluster-alpha"}, sc.Labels())
+	assert.Equal(t, "csi.trident.netapp.io", sc.StorageClassInfo().Provisioner)
+	assert.Equal(t, "aggr1", sc.StorageClassInfo().Parameters["pool"])
+	assert.Nil(t, sc.IPAddress())
+	assert.Empty(t, sc.StorageClass(), "a StorageClass node does not USE a class")
+
+	bare := &StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}}
+	assert.Nil(t, bare.StorageClassInfo(), "bare StorageClass node carries no info")
+
+	others := []GraphNode{
+		&PodNode{IDValue: "c/u"},
+		&K8sNode{IDValue: "c/w"},
+		&PVCNode{IDValue: "c/n/claim"},
+		&ServiceNode{IDValue: "c/n/s"},
+		&ExternalNode{IDValue: "external/x"},
+	}
+	for _, n := range others {
+		assert.Nilf(t, n.StorageClassInfo(), "%T must return nil StorageClassInfo", n)
 	}
 }

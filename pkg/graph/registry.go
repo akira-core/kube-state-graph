@@ -86,4 +86,22 @@ var EdgeTypes = []EdgeTypeDefinition{
 			{Name: "namespace", ValueType: "string", Description: "Namespace of the service and its backing pod (optional)."},
 		},
 	},
+	{
+		Type:            EdgeTypePodToNode,
+		Description:     "Pod is scheduled on a Kubernetes node, derived from the pod's `node` label (kube_pod_info). Emitted for every scheduled pod. Always intra-cluster (the node is in the pod's own cluster).",
+		SourceType:      []NodeType{NodeTypePod},
+		TargetType:      []NodeType{NodeTypeK8sNode},
+		Directed:        true,
+		MayCrossCluster: false,
+		Labels:          nil,
+	},
+	{
+		Type:            EdgeTypePVCToStorageClass,
+		Description:     "PVC is provisioned by a StorageClass, derived from the PVC's resolved `storageclass` (kube_persistentvolumeclaim_info) joined to the StorageClass node (kube_storageclass_info, bare-synthesised when absent). Emitted for every PVC with a resolved StorageClass. Always intra-cluster.",
+		SourceType:      []NodeType{NodeTypePVC},
+		TargetType:      []NodeType{NodeTypeStorageClass},
+		Directed:        true,
+		MayCrossCluster: false,
+		Labels:          nil,
+	},
 }

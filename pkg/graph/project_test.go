@@ -173,15 +173,18 @@ func TestProject_NamespaceFilter_KeepsHostingK8sNode(t *testing.T) {
 }
 
 // A K8sNode hosting no pod at all can never have an in-scope pod, so it drops
-// under a namespace filter — but is retained when no namespace filter is set
-// (no regression to the full-topology view).
+// under a namespace filter (and, per the generalised D6 rule, under no filter
+// too — see TestProject_NoFilter_DropsUnreferencedInfraNodes).
 func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
+	// p1 and p2 are connectivity-connected (pod-calls-pod) so they survive the
+	// default prune; the test isolates the D6 podless-node rule.
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&PodNode{IDValue: "c/p2", NameValue: "api", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
 	}
-	g := NewGraph(all, nil, time.Now())
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"})}, time.Now())
 
 	v := Project(g, Scope{Namespaces: map[string]struct{}{"shop": {}}})
 	ids := map[string]bool{}
@@ -190,14 +193,115 @@ func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 	}
 	assert.True(t, ids["c/worker-0"], "node hosting the in-scope pod is retained")
 	assert.False(t, ids["c/worker-1"], "podless node drops under a namespace filter")
+}
 
-	// Sanity: with no namespace filter both nodes remain (full-topology view).
-	vAll := Project(g, Scope{})
-	idsAll := map[string]bool{}
-	for _, n := range vAll.Nodes {
-		idsAll[n.ID()] = true
+// Generalised D6: an infra node (K8s node or StorageClass) referenced by NO
+// in-scope element is dropped from EVERY request shape — including the
+// default no-filter view. A node only appears as the host of a pod in the graph.
+func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
+	// p1 is connectivity-connected (pod-calls-pod with p2) and mounts the `data`
+	// PVC, so both survive the default prune; the test isolates the D6
+	// unreferenced-infra rule (worker-1 hosts nothing, `unused` backs nothing).
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&PodNode{IDValue: "c/p2", NameValue: "api", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1+p2
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+		&PVCNode{IDValue: "c/shop/data", NameValue: "data", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop"}, StorageClassValue: "gp3"},
+		&StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}},       // backs data
+		&StorageClassNode{IDValue: StorageClassID("c", "unused"), NameValue: "unused", LabelsValue: map[string]string{"cluster": "c"}}, // backs nothing
 	}
-	assert.True(t, idsAll["c/worker-1"], "podless node retained when no namespace filter is set")
+	edges := []*Edge{
+		NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"}),
+		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
+		NewEdge(EdgeTypePodToNode, "c/p2", "c/worker-0", nil),
+		NewEdge(EdgeTypePodMountsPVC, "c/p1", "c/shop/data", nil),
+		NewEdge(EdgeTypePVCToStorageClass, "c/shop/data", StorageClassID("c", "gp3"), nil),
+	}
+	g := NewGraph(all, edges, time.Now())
+
+	v := Project(g, Scope{})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-0"], "node hosting an in-graph pod is retained")
+	assert.True(t, ids[StorageClassID("c", "gp3")], "StorageClass backing an in-graph PVC is retained")
+	assert.False(t, ids["c/worker-1"], "podless node dropped from the no-filter view")
+	assert.False(t, ids[StorageClassID("c", "unused")], "PVC-less StorageClass dropped from the no-filter view")
+}
+
+// The name-filter exception: ?name=<infra-node> surfaces a referenced-by-nothing
+// node directly, even though the default view hides it.
+func TestProject_NameFilter_MatchesUnreferencedInfraNode(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+	}
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
+
+	v := Project(g, Scope{Names: map[string]struct{}{"worker-1": {}}})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-1"], "explicit ?name=<podless-node> still returns the node")
+	assert.False(t, ids["c/worker-0"], "non-named node not pulled in")
+}
+
+// A traversal anchored on a podless infra node (?root=<node>) must still return
+// that node — it is the explicit focus and is in the reachable set, so the
+// reference-pruning must not drop it (else the view would be empty, while a pod
+// root returns at least itself).
+func TestProject_RootAnchorOnPodlessInfraNode(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
+	}
+	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
+
+	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.True(t, ids["c/worker-1"], "podless node used as ?root= anchor must be returned, not pruned to empty")
+
+	// Sanity: rooting at the host node reaches its pod via the pod-to-node reverse edge.
+	v2 := Project(g, Scope{Root: "c/worker-0", Depth: 2, Direction: DirectionBoth})
+	ids2 := map[string]bool{}
+	for _, n := range v2.Nodes {
+		ids2[n.ID()] = true
+	}
+	assert.True(t, ids2["c/worker-0"], "host node root present")
+	assert.True(t, ids2["c/p1"], "pod reached from the node root via pod-to-node")
+}
+
+// The traversal-anchor exception must NOT leak past an active name filter: a
+// ?root=<infra>&name=<other> request drops the infra root (symmetric with a pod
+// root, which the name filter also drops), while ?name=<that-node> admits it.
+func TestProject_RootAnchorRespectsNameFilter(t *testing.T) {
+	all := []GraphNode{
+		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
+		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // podless
+	}
+	g := NewGraph(all, nil, time.Now())
+
+	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"other": {}}})
+	ids := map[string]bool{}
+	for _, n := range v.Nodes {
+		ids[n.ID()] = true
+	}
+	assert.False(t, ids["c/worker-1"], "infra root excluded by a non-matching name filter (no leak past ?name=)")
+
+	v2 := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"worker-1": {}}})
+	ids2 := map[string]bool{}
+	for _, n := range v2.Nodes {
+		ids2[n.ID()] = true
+	}
+	assert.True(t, ids2["c/worker-1"], "infra root admitted when the name filter names it")
 }
 
 // multiClusterPodSampleGraph extends sampleGraph with a `payments` pod in

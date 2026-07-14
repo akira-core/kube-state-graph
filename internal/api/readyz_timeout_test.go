@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/config"
 )
 
 // errReason decodes the {error:{reason,message}} envelope.

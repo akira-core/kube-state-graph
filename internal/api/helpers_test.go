@@ -11,12 +11,12 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/internal/auth"
-	"github.com/marz32one/kube-state-graph/internal/config"
-	"github.com/marz32one/kube-state-graph/internal/observability"
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	"github.com/marz32one/kube-state-graph/pkg/clock"
-	promqlmocks "github.com/marz32one/kube-state-graph/pkg/promql/mocks"
+	"github.com/akira-core/kube-state-graph/internal/auth"
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/internal/observability"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/clock"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // fixtureSet maps a query-substring needle to the model.Vector returned when

@@ -15,10 +15,19 @@
       },
       {
         "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
           "id": "cluster-alpha/p1",
           "name": "checkout",
           "type": "pod",
-          "parent": "cluster/cluster-alpha",
+          "parent": "cluster-alpha/namespace/shop",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "shop"
@@ -30,7 +39,7 @@
           "id": "cluster-alpha/shop/payments",
           "name": "payments",
           "type": "service",
-          "parent": "cluster/cluster-alpha",
+          "parent": "cluster-alpha/namespace/shop",
           "ipaddress": [
             "10.0.0.5"
           ],
@@ -45,7 +54,7 @@
           "id": "cluster-alpha/pay0",
           "name": "payments-0",
           "type": "pod",
-          "parent": "cluster/cluster-alpha",
+          "parent": "cluster-alpha/namespace/shop",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "shop"

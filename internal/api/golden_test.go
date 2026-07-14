@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 var update = flag.Bool("update", false, "update golden files")
@@ -27,6 +27,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"with-service":         buildWithService(),
 		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
+		"with-netapp-trident":  buildWithNetAppTrident(),
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 	}
@@ -124,23 +125,72 @@ func buildFamilyFanout() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{pod, svc1, svc2, nats1, nats2}, Edges: edges}
 }
 
-// buildWithStorageClass snapshots the StorageClass compound grouping: a PVC
-// with a resolved StorageClass nests under a synthetic `type="storageclass"`
-// group node (cluster > storageclass > pvc), while a PVC with no StorageClass
-// falls back to its cluster group (cluster > pvc). The pod nests under its node
-// (cluster > node > pod) and mounts both PVCs via pod-mounts-pvc edges. The
-// StorageClass is reflected ONLY via the group node + data.parent — never as a
-// PVC attribute or label.
+// buildWithStorageClass snapshots the new StorageClass design (supersedes D31):
+// a real `type="storageclass"` node carrying its provisioner + parameters as
+// typed data attributes (labels stay {cluster}), nested under its cluster group;
+// the PVC nests under its namespace group with a `pvc-to-storageclass` edge to
+// the StorageClass node (a class-less PVC also nests under the namespace group,
+// with no such edge). The pod nests under its controller > application >
+// namespace hierarchy and links to its host node via a `pod-to-node` edge (the
+// node itself nests under the cluster group). The StorageClass surfaces as a
+// real node + edge — never as a PVC attribute or label.
 func buildWithStorageClass() graph.View {
-	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db", "node": "cluster-alpha/worker-0"}}
+	pod := &graph.PodNode{
+		IDValue:          "cluster-alpha/p1",
+		NameValue:        "mongo-0",
+		LabelsValue:      map[string]string{"cluster": "cluster-alpha", "namespace": "db", "node": "cluster-alpha/worker-0"},
+		ApplicationValue: "mongo",
+		OwnerValue:       &graph.Owner{Kind: "StatefulSet", Name: "mongo"},
+	}
 	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
 	pvcGP3 := &graph.PVCNode{IDValue: "cluster-alpha/db/data-mongo-0", NameValue: "data-mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db", "volume": "data"}, StorageClassValue: "gp3"}
 	pvcNone := &graph.PVCNode{IDValue: "cluster-alpha/db/legacy", NameValue: "legacy", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	sc := &graph.StorageClassNode{
+		IDValue:     graph.StorageClassID("cluster-alpha", "gp3"),
+		NameValue:   "gp3",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
+		InfoValue:   &graph.StorageClassInfo{Provisioner: "ebs.csi.aws.com", Parameters: map[string]string{"pool": "aggr1", "fs": "ext4"}},
+	}
 	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodToNode, pod.IDValue, node.IDValue, nil),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcGP3.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcNone.IDValue, map[string]string{"claim_name": "legacy"}),
+		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcGP3.IDValue, sc.IDValue, nil),
 	}
-	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone, sc}, Edges: edges}
+}
+
+// buildWithNetAppTrident snapshots the NetApp Trident PVC label chain: a PVC
+// whose bound PV name (`labels.volumename`, from kube_persistentvolumeclaim_info)
+// and serving SVM (`labels.svm`, via kube_tridentvolume_info →
+// kube_tridentbackend_info) surface as plain additive labels — no
+// data.volumename / data.svm typed fields — coexisting with the pod-spec
+// `volume` key. A second PVC with an unresolved chain carries neither key
+// (absent, never empty-string).
+func buildWithNetAppTrident() graph.View {
+	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	pvcTrident := &graph.PVCNode{
+		IDValue:   "cluster-alpha/db/data-mongo-0",
+		NameValue: "data-mongo-0",
+		LabelsValue: map[string]string{
+			"cluster": "cluster-alpha", "namespace": "db",
+			"volume": "data", "volumename": "pvc-9f3a", "svm": "svm-prod",
+		},
+		StorageClassValue: "netapp-nas",
+	}
+	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	sc := &graph.StorageClassNode{
+		IDValue:     graph.StorageClassID("cluster-alpha", "netapp-nas"),
+		NameValue:   "netapp-nas",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
+		InfoValue:   &graph.StorageClassInfo{Provisioner: "csi.trident.netapp.io", Parameters: map[string]string{"pool": "aggr1", "fs": "nfs"}},
+	}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcTrident.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcPlain.IDValue, map[string]string{"claim_name": "scratch"}),
+		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcTrident.IDValue, sc.IDValue, nil),
+	}
+	return graph.View{Nodes: []graph.GraphNode{pod, pvcTrident, pvcPlain, sc}, Edges: edges}
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph
@@ -158,9 +208,10 @@ func buildMissingUIDFallback() graph.View {
 // buildNameFilter snapshots the projection of a two-cluster graph through
 // `?name=checkout`. The matching pod (cluster-alpha/p1) is the anchor; the
 // cross-cluster partner pod (cluster-beta/p2) is re-added via the unified
-// edge-endpoint partner rule on the pod-calls-pod edge. The host K8s nodes
-// carry no edges (pod→node is compound nesting via labels.node only), so a
-// name-filtered view does not pull them in.
+// edge-endpoint partner rule on the pod-calls-pod edge. This fixture's graph
+// carries no pod-to-node edges, so the name-filtered view does not pull in the
+// host K8s nodes (a graph that did include them would, via the pod-to-node edge
+// re-add — see the projection unit tests).
 func buildNameFilter() graph.View {
 	a := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}}
 	b := &graph.PodNode{IDValue: "cluster-beta/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing", "node": "cluster-beta/worker-0"}}

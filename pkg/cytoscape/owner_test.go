@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marz32one/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // A pod's controller owner is emitted as the nullable top-level data.owner

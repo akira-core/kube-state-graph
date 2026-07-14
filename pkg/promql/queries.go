@@ -50,6 +50,15 @@ const (
 	// --metric-labels-allowlist required.
 	QPVCInfo Query = "kube_persistentvolumeclaim_info"
 
+	// StorageClass node resolution. KSM-shaped, so prefix-aware via Renderer.
+	// kube_storageclass_info carries the native `provisioner` label plus the
+	// operator-allowlisted NetApp/Ceph parameter labels (storagePools/pool,
+	// fsType/fsName, ClusterID, selector) that materialise the real
+	// type="storageclass" node and its typed provisioner/parameters attributes.
+	// OPTIONAL — absence degrades gracefully to bare StorageClass nodes
+	// (referenced by a PVC but carrying no provisioner/parameters).
+	QStorageClassInfo Query = "kube_storageclass_info"
+
 	// Pod container list resolution. KSM-shaped, so prefix-aware via Renderer.
 	// kube_pod_container_info emits one series per container carrying the
 	// `container` (name) and `image` labels; joined on (cluster, namespace, pod)
@@ -70,6 +79,35 @@ const (
 	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
 	// absence degrades gracefully to no `ready_status`.
 	QNodeStatusCondition Query = "kube_node_status_condition"
+
+	// Service / PVC ArgoCD Application resolution. KSM-shaped, so prefix-aware via
+	// Renderer. kube_service_annotations / kube_persistentvolumeclaim_annotations
+	// carry the `annotation_argocd_argoproj_io_tracking_id` label — KSM's sanitised
+	// form of the argocd.argoproj.io/tracking-id annotation — whose value uses the
+	// same <app>:<group>/<kind>:<ns>/<name> grammar as the pod's argocd_tracking_id,
+	// so the Application is the segment before the first ":". Joined on
+	// (cluster, namespace, service) / (cluster, namespace, persistentvolumeclaim) to
+	// enrich existing service / PVC nodes (never new nodes). OPTIONAL — the
+	// annotation label requires the operator's --metric-annotations-allowlist;
+	// absence degrades gracefully to no `application` attribute.
+	QServiceAnnotations Query = "kube_service_annotations"
+	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
+
+	// NetApp Trident PVC SVM resolution. KSM-shaped, so prefix-aware via
+	// Renderer — but NOT stock kube-state-metrics: both series come from a KSM
+	// custom-resource-state config over the Trident `tridentvolumes` /
+	// `tridentbackends` CRDs (or a compatible exporter). Fixed label contract,
+	// case-sensitive and verbatim: kube_tridentvolume_info carries `name` (the
+	// TridentVolume CR name, which equals the bound PV name under Trident's
+	// naming) and `backendUUID`; kube_tridentbackend_info carries `backendUUID`
+	// and `svm`. Chained from kube_persistentvolumeclaim_info's `volumename`
+	// label to enrich existing PVC nodes with `volumename` / `svm` labels
+	// (never new nodes, never new edges). OPTIONAL — absent on clusters without
+	// Trident or without the custom-resource-state config; every broken link of
+	// the chain degrades to omitting the affected label(s), never a build
+	// failure.
+	QTridentVolumeInfo  Query = "kube_tridentvolume_info"
+	QTridentBackendInfo Query = "kube_tridentbackend_info"
 )
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
@@ -145,6 +183,8 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(%skube_replicaset_owner[%s])`, r.Prefix, w)
 	case QPVCInfo:
 		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_info[%s])`, r.Prefix, w)
+	case QStorageClassInfo:
+		return fmt.Sprintf(`last_over_time(%skube_storageclass_info[%s])`, r.Prefix, w)
 	case QPodContainerInfo:
 		// tlast_over_time (MetricsQL) — value is each series' last-sample timestamp
 		// (unix seconds). A container that changed image in the window has one
@@ -159,6 +199,14 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
 		// are never surfaced, so they are excluded here.
 		return fmt.Sprintf(`last_over_time(%skube_node_status_condition{condition="Ready"}[%s])`, r.Prefix, w)
+	case QServiceAnnotations:
+		return fmt.Sprintf(`last_over_time(%skube_service_annotations[%s])`, r.Prefix, w)
+	case QPVCAnnotations:
+		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_annotations[%s])`, r.Prefix, w)
+	case QTridentVolumeInfo:
+		return fmt.Sprintf(`last_over_time(%skube_tridentvolume_info[%s])`, r.Prefix, w)
+	case QTridentBackendInfo:
+		return fmt.Sprintf(`last_over_time(%skube_tridentbackend_info[%s])`, r.Prefix, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
 		// the configurable prefix deliberately does NOT apply here. The metric

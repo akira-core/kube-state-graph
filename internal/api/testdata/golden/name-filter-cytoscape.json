@@ -24,10 +24,28 @@
       },
       {
         "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-beta/namespace/billing",
+          "name": "billing",
+          "type": "namespace",
+          "parent": "cluster/cluster-beta",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
           "id": "cluster-alpha/p1",
           "name": "checkout",
           "type": "pod",
-          "parent": "cluster/cluster-alpha",
+          "parent": "cluster-alpha/namespace/shop",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "shop",
@@ -40,7 +58,7 @@
           "id": "cluster-beta/p2",
           "name": "payments",
           "type": "pod",
-          "parent": "cluster/cluster-beta",
+          "parent": "cluster-beta/namespace/billing",
           "labels": {
             "cluster": "cluster-beta",
             "namespace": "billing",

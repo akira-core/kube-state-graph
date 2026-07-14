@@ -12,11 +12,11 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/marz32one/kube-state-graph/pkg/build"
-	"github.com/marz32one/kube-state-graph/pkg/clock"
-	"github.com/marz32one/kube-state-graph/pkg/cytoscape"
-	"github.com/marz32one/kube-state-graph/pkg/graph"
-	"github.com/marz32one/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/clock"
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // Options configures an Engine. Clock and Metrics are optional: a nil Clock
