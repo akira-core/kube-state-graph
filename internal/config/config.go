@@ -52,6 +52,15 @@ type Config struct {
 	// enabling it against the default rewrite-close exporter resurrects
 	// stale open rows — see pkg/route/store's CH doc. Default false.
 	RouteStoreUniqueRows bool
+	// RouteStoreUsername / RouteStorePassword are optional ClickHouse native
+	// auth credentials for the route store. Env-only (KSG_ROUTE_STORE_USERNAME /
+	// KSG_ROUTE_STORE_PASSWORD) — deliberately NO CLI flags, since
+	// credential-carrying flags leak through process listings and container
+	// specs. Both must be set together or both left empty; Validate rejects a
+	// half-configured pair. When set, they override any userinfo embedded in
+	// RouteStoreDSN at dial time. Rotation requires a restart (no hot reload).
+	RouteStoreUsername string
+	RouteStorePassword string
 	// PromUsername / PromPassword are optional HTTP Basic Auth credentials for
 	// the upstream VictoriaMetrics endpoint. Env-only (KSG_PROM_USERNAME /
 	// KSG_PROM_PASSWORD) — deliberately NO CLI flags, since credential-carrying
@@ -82,6 +91,8 @@ func Defaults() Config {
 		RouterCheckBin:        "/usr/local/bin/router_check_tool",
 		RouteResolveTimeout:   5 * time.Second,
 		RouteStoreUniqueRows:  false,
+		RouteStoreUsername:    "",
+		RouteStorePassword:    "",
 		PromUsername:          "",
 		PromPassword:          "",
 	}
@@ -104,7 +115,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.APIKeys, "api-keys", cfg.APIKeys, "Comma-separated list of accepted API keys. Used when --api-keys-file is unset.")
 	fs.DurationVar(&cfg.APIKeysReloadInterval, "api-keys-reload-interval", cfg.APIKeysReloadInterval, "How often to re-read --api-keys-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error.")
-	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://user:pass@host:9000/routing). Empty (default) disables route resolution entirely.")
+	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
 	fs.BoolVar(&cfg.RouteStoreUniqueRows, "route-store-unique-rows", cfg.RouteStoreUniqueRows, "Enable the route store's pruned read mode (server-side valid_to filtering). ONLY when the exporter guarantees one physical row per version (closeMode=update); never against the default rewrite-close exporter.")
@@ -158,6 +169,10 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
 	getStr("KSG_METRIC_PREFIX", &cfg.MetricPrefix)
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
+	// Env-only by design — no matching flags are registered in Parse
+	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
+	getStr("KSG_ROUTE_STORE_USERNAME", &cfg.RouteStoreUsername)
+	getStr("KSG_ROUTE_STORE_PASSWORD", &cfg.RouteStorePassword)
 	getStr("KSG_ROUTER_CHECK_BIN", &cfg.RouterCheckBin)
 	if err := getDur("KSG_ROUTE_RESOLVE_TIMEOUT", &cfg.RouteResolveTimeout); err != nil {
 		return err
@@ -212,6 +227,11 @@ func (c Config) Validate() error {
 	}
 	if c.MetricPrefix != "" && !metricPrefixPattern.MatchString(c.MetricPrefix) {
 		return fmt.Errorf("invalid metric-prefix %q: must match %s", c.MetricPrefix, metricPrefixPattern)
+	}
+	// Route-store credentials must be configured as a pair. The error names
+	// the env vars only — never echo the configured values.
+	if (c.RouteStoreUsername == "") != (c.RouteStorePassword == "") {
+		return errors.New("KSG_ROUTE_STORE_USERNAME and KSG_ROUTE_STORE_PASSWORD must be set together (or both left unset)")
 	}
 	// Route-resolution knobs are only meaningful with a store DSN; the binary
 	// path itself is verified executable at startup (matchcheck.NewRunner), not

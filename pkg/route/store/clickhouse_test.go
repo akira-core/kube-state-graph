@@ -4,7 +4,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -88,4 +90,40 @@ func TestPrune(t *testing.T) {
 	assert.Equal(t,
 		" AND toDateTime64('2026-05-01 10:00:00.000', 3, 'UTC') < valid_to",
 		pruned.prune(vfBase))
+}
+
+// WithAuth must override DSN-embedded (or default) credentials after ParseDSN
+// so secrets can live in env-only config rather than the DSN URL.
+func TestApplyAuth_OverridesDSNUserinfo(t *testing.T) {
+	chOpts, err := clickhouse.ParseDSN("clickhouse://embedded:oldpass@localhost:9000/routing")
+	require.NoError(t, err)
+	assert.Equal(t, "embedded", chOpts.Auth.Username)
+	assert.Equal(t, "oldpass", chOpts.Auth.Password)
+
+	applyAuth(chOpts, openConfig{username: "ksg", password: "env-secret"})
+	assert.Equal(t, "ksg", chOpts.Auth.Username)
+	assert.Equal(t, "env-secret", chOpts.Auth.Password)
+	assert.Equal(t, "routing", chOpts.Auth.Database, "database from DSN must be preserved")
+}
+
+func TestApplyAuth_EmptyUsernameLeavesDSNUntouched(t *testing.T) {
+	chOpts, err := clickhouse.ParseDSN("clickhouse://embedded:oldpass@localhost:9000/routing")
+	require.NoError(t, err)
+
+	applyAuth(chOpts, openConfig{})
+	assert.Equal(t, "embedded", chOpts.Auth.Username)
+	assert.Equal(t, "oldpass", chOpts.Auth.Password)
+}
+
+func TestWithAuth_OptionSetsOpenConfig(t *testing.T) {
+	var cfg openConfig
+	WithAuth("ksg", "s3cret")(&cfg)
+	assert.Equal(t, "ksg", cfg.username)
+	assert.Equal(t, "s3cret", cfg.password)
+}
+
+func TestWithUniqueRows_OptionSetsOpenConfig(t *testing.T) {
+	var cfg openConfig
+	WithUniqueRows()(&cfg)
+	assert.True(t, cfg.uniqueRows)
 }

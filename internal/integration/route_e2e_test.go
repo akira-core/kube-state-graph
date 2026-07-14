@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"testing"
@@ -560,4 +561,32 @@ func (s *RouteStoreSuite) TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow()
 	}
 	s.True(stale, "pruned mode against a rewrite-close writer resurrects the stale open row — the documented hazard")
 	s.Zero(st.CollapsedRows(), "the closing row was pruned in SQL, so dedup saw nothing to collapse (the alarm stays silent — why the mode is opt-in)")
+}
+
+// TestOpenWithAuthUsesEnvStyleCredentials proves the production path where
+// the DSN carries only host/db and credentials come from WithAuth (wired from
+// KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD). The password-protected
+// container rejects a credential-free Open, so a vacuous pass is impossible.
+func (s *RouteStoreSuite) TestOpenWithAuthUsesEnvStyleCredentials() {
+	ctx := context.Background()
+	freeDSN, err := stripDSNUserinfo(s.chDSN)
+	s.Require().NoError(err)
+
+	_, err = routestore.Open(ctx, freeDSN)
+	s.Require().Error(err, "password-protected ClickHouse must reject unauthenticated Open")
+
+	st, err := routestore.Open(ctx, freeDSN, routestore.WithAuth("ksg", "ksg-test"))
+	s.Require().NoError(err, "WithAuth must supply credentials after ParseDSN")
+	defer func() { _ = st.Close() }()
+}
+
+// stripDSNUserinfo returns a DSN with userinfo removed so Open + WithAuth can
+// be exercised the way production config prefers (secrets in env, not URL).
+func stripDSNUserinfo(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	u.User = nil
+	return u.String(), nil
 }
