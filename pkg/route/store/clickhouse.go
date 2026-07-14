@@ -79,21 +79,59 @@ type CH struct {
 
 var _ Store = (*CH)(nil)
 
-// Option tweaks a CH store at Open time.
-type Option func(*CH)
+// openConfig collects Option values before dial so auth can mutate chOpts
+// prior to clickhouse.Open (credentials must be set at dial time).
+type openConfig struct {
+	uniqueRows bool
+	username   string
+	password   string
+}
+
+// Option tweaks store Open behaviour (auth, pruned-read mode).
+type Option func(*openConfig)
 
 // WithUniqueRows enables the pruned read mode for update-close writers ONLY.
 // See the CH doc comment for the hazard against rewrite-close writers.
-func WithUniqueRows() Option { return func(s *CH) { s.uniqueRows = true } }
+func WithUniqueRows() Option {
+	return func(c *openConfig) { c.uniqueRows = true }
+}
 
-// Open dials ClickHouse from a DSN (e.g. "clickhouse://user:pass@host:9000/db"),
+// WithAuth overrides ClickHouse native auth credentials after ParseDSN.
+// Prefer this over embedding userinfo in the DSN so secrets stay in
+// env-only config (KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD).
+// When username is non-empty, both Username and Password on chOpts.Auth
+// are replaced (empty password is valid for some ClickHouse setups).
+func WithAuth(username, password string) Option {
+	return func(c *openConfig) {
+		c.username = username
+		c.password = password
+	}
+}
+
+// applyAuth overlays openConfig credentials onto parsed ClickHouse options.
+// Exported-for-test via the pure helper so unit tests need no live CH.
+func applyAuth(chOpts *clickhouse.Options, cfg openConfig) {
+	if cfg.username == "" {
+		return
+	}
+	chOpts.Auth.Username = cfg.username
+	chOpts.Auth.Password = cfg.password
+}
+
+// Open dials ClickHouse from a DSN (e.g. "clickhouse://host:9000/db"),
 // pings it, and validates the expected schema — failing fast on drift (design
-// D7) rather than silently returning empty windows.
+// D7) rather than silently returning empty windows. Prefer WithAuth for
+// credentials; DSN-embedded userinfo remains supported for backward compatibility.
 func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
+	var cfg openConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	chOpts, err := clickhouse.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse route-store dsn: %w", err)
 	}
+	applyAuth(chOpts, cfg)
 	conn, err := clickhouse.Open(chOpts)
 	if err != nil {
 		return nil, err
@@ -102,10 +140,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping route store: %w", err)
 	}
-	s := &CH{conn: conn}
-	for _, o := range opts {
-		o(s)
-	}
+	s := &CH{conn: conn, uniqueRows: cfg.uniqueRows}
 	if err := s.validateSchema(ctx, chOpts.Auth.Database); err != nil {
 		_ = conn.Close()
 		return nil, err

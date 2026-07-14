@@ -84,6 +84,7 @@ func run() error {
 		"otlp_enabled", telemetryProviders.Enabled,
 		// Boolean only — the credential values themselves are never logged.
 		"prom_basic_auth", cfg.PromUsername != "",
+		"route_store_auth", cfg.RouteStoreUsername != "",
 	)
 
 	metrics := observability.NewMetrics()
@@ -120,6 +121,12 @@ func run() error {
 		if cfg.RouteStoreUniqueRows {
 			storeOpts = append(storeOpts, routestore.WithUniqueRows())
 		}
+		// Route-store auth is env-only (KSG_ROUTE_STORE_USERNAME /
+		// KSG_ROUTE_STORE_PASSWORD); config.Validate guarantees the pair is
+		// set together or not at all. Credential values are never logged.
+		if cfg.RouteStoreUsername != "" {
+			storeOpts = append(storeOpts, routestore.WithAuth(cfg.RouteStoreUsername, cfg.RouteStorePassword))
+		}
 		storeCtx, storeCancel := context.WithTimeout(appCtx, 10*time.Second)
 		routeStore, err := routestore.Open(storeCtx, cfg.RouteStoreDSN, storeOpts...)
 		storeCancel()
@@ -132,6 +139,7 @@ func run() error {
 			"router_check_bin", cfg.RouterCheckBin,
 			"route_resolve_timeout", cfg.RouteResolveTimeout,
 			"route_store_unique_rows", cfg.RouteStoreUniqueRows,
+			"route_store_auth", cfg.RouteStoreUsername != "",
 		)
 	}
 
