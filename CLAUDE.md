@@ -62,7 +62,7 @@ go test ./internal/api/ -update -run Golden
 ./bin/kube-state-graph --prom-url=http://localhost:8428 --listen-addr=:8080
 ```
 
-Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.25 (`go.mod`); build toolchain pinned to `go1.26.4` via the `toolchain` directive.
+Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.25 (`go.mod`); build toolchain pinned to `go1.26.5` via the `toolchain` directive.
 
 ## Architecture (the 90 % you need to know)
 

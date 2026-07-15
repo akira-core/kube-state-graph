@@ -133,7 +133,7 @@ make doctor         # 檢查工具版本（go、golangci-lint、govulncheck、mo
 make init-hooks     # （選用）安裝 pre-commit hook（gofmt + go vet）
 ```
 
-需求：Go 1.25+。`go.mod` 中 pin 的 toolchain（目前 `go1.26.4`）會在第一次 build 時自動下載。
+需求：Go 1.25+。`go.mod` 中 pin 的 toolchain（目前 `go1.26.5`）會在第一次 build 時自動下載。
 
 ### 日常指令
 

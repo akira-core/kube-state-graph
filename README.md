@@ -238,7 +238,7 @@ make doctor         # verify toolchain (go, golangci-lint, govulncheck, mockery,
 make init-hooks     # (optional) install pre-commit hook (gofmt + go vet)
 ```
 
-Required: Go 1.25+. The toolchain pinned in `go.mod` (currently `go1.26.4`)
+Required: Go 1.25+. The toolchain pinned in `go.mod` (currently `go1.26.5`)
 will be auto-fetched by Go on first build.
 
 ### Day-to-day commands
