@@ -109,22 +109,26 @@ never calls. That is the cost this rule prevents, and it is worth preventing on 
 ```go
 // pkg/build/routeresolve.go — the ONLY thing pkg/build knows about routing.
 type RouteRequest struct {
-    Cluster    string    // anchor cluster (the client pod's own cluster)
-    Host       string    // peer FQDN, port split off
-    Path       string    // "/" today
-    Port       int       // ingress listener port; selects the RouteConfiguration
-    IPs        []string  // from client_dns_answers; empty => config_only mode
-    Start, End time.Time // the build's own window
+    CallerCluster string   // the client pod's own cluster — family key + tie-break ONLY (D10/D11)
+    Host          string   // peer FQDN, port split off
+    Path          string   // "/" today
+    Port          int      // ingress listener port; selects the RouteConfiguration
+    IPs           []string // from client_dns_answers; REQUIRED — the prescan never emits an IP-less request (D6)
+    Start, End    time.Time // the build's own window
 }
 type RouteDestination struct {
+    Cluster   string // the engine-selected ingress cluster C (D10/D11) — the parse anchors on it
     Namespace string
     Service   string
     Port      uint32 // parsed, unused in v1
     Subset    string // parsed, unused in v1
 }
-// RouteOutcome: "hit" | "no_gateway" | "no_listener_on_port" | "no_route".
+// RouteOutcome: "hit" | "no_gateway" | "no_listener_on_port" | "no_route"
+//             | "no_ingress" | "ambiguous_ingress_cluster".
 // A typed outcome (not a bool) because D5 requires the caller to log a
-// mis-derived port (no_listener_on_port) distinctly from an ordinary miss.
+// mis-derived port (no_listener_on_port) distinctly from an ordinary miss,
+// and D10 adds two pre-window outcomes (no candidate ingress cluster /
+// candidates that cannot be reduced to one).
 type RouteResolver interface {
     ResolveRoute(ctx context.Context, req RouteRequest) (RouteDestination, RouteOutcome, error)
 }
@@ -240,22 +244,33 @@ Note `gwresolve` is port-agnostic (it matches `server_hosts` regardless of port)
 still found — only the RDS route-name lookup fails. And `matchcheck.Query` stays `{Host, Path}`: the
 port selects *which* RouteConfiguration is built; it is not part of the match input.
 
-### D6 — `client_dns_answers` is optional; absent ⇒ config_only mode
+### D6 — `client_dns_answers` is REQUIRED; no IPs ⇒ the engine is never consulted (config_only removed)
 
-With a destination IP, the engine runs the ClickHouse **3-hop** (`has(ingress_ips, ip)` → ingress
-Service selector → `hasAll(pod_labels_kv, sel)` → ingress Deployment pod labels L →
-`hasAll(L, selector_kv)` → candidate Gateways) and disambiguates the host **among those candidates**
-(`gwresolve.ResolveAmong`). This is the `traffic_simulation` mode: it answers "where did this traffic
-actually land".
+*(This decision supersedes its original form, which made the label optional and fell back to a
+`config_only` mode — resolving the host over ALL the caller cluster's Gateways via a
+`LoadConfigWindow(ctx, cluster, t0, t1)` store read and `memwindow.GatewaysLiveAt`. That mode is
+removed entirely. Two reasons. First, a host-only match over one guessed cluster's gateways answers
+"which Gateway is configured to accept this host", not "where did this traffic land" — a config that
+exists in several clusters made the answer arbitrary. Second, and decisive under D10: without an IP
+there is no signal at all for ingress-cluster selection — the caller's own cluster was only ever a
+guess, and the motivating case is precisely the one where that guess is wrong.)*
 
-Without one, the engine falls back to `config_only`: resolve the host over **all** the anchor cluster's
-Gateways (`gwresolve.Resolve` / `memwindow.GatewaysLiveAt`). This answers "which Gateway is configured
-to accept this host", which can differ from where DNS actually pointed. Both are legitimate; the
-absence of the label simply costs precision, never correctness of the *config* reading.
+The destination IPs from `client_dns_answers` are now a **hard precondition** for consulting the
+engine. The prescan (`collectRouteQueries`) skips any endpoint whose parsed answer list is empty —
+the engine is never invoked, no store read happens, and the endpoint falls to today's `external`
+node via the pre-existing fallback. The parse records the distinct diagnostic reason
+`route_engine_no_ip` (only when a resolver is configured, so the log tells "engine on but this
+endpoint carried no IPs" apart from "engine off"). Graph output is byte-for-byte identical to the
+engine-off case for such endpoints.
 
-The POC's store has no IP-less window loader (`LoadTrafficWindow` is always rooted at an IP), so
-`pkg/route/store` adds `LoadConfigWindow(ctx, cluster, t0, t1)`. `memwindow.GatewaysLiveAt` already
-exists to consume it.
+With IPs present, the engine first selects the ingress cluster (D10), then runs the ClickHouse
+**3-hop** (`has(ingress_ips, ip)` → ingress Service selector → `hasAll(pod_labels_kv, sel)` →
+ingress Deployment pod labels L → `hasAll(L, selector_kv)` → candidate Gateways) within that one
+cluster and disambiguates the host **among those candidates** (`gwresolve.ResolveAmong`).
+
+`LoadConfigWindow` is deleted from `store.Store` and its ClickHouse implementation — the repo rule
+forbids production code kept only for tests, and no production path reads it any more.
+`memwindow.GatewaysLiveAt` stays: it is a pure in-memory helper with its own unit coverage.
 
 ### D7 — The route store is read-only, `cluster`-scoped, and a fixed schema contract
 
@@ -265,8 +280,16 @@ The updated POC deliberately made `BackendFQDN` / `ParseBackendHost` / `ParsePor
 metadata-exporter `spec` blob", which is exactly this contract — they port verbatim.
 
 The POC schema assumes a single Kubernetes cluster. kube-state-graph is multi-cluster by construction
-(every node id is `<cluster>/…`), so every table gains a **`cluster` column** and every query a
-`cluster = ?` predicate bound to the anchor cluster:
+(every node id is `<cluster>/…`), so every table gains a **`cluster` column** and every *window*
+query a `cluster = ?` predicate — bound to the **engine-selected ingress cluster** (D10), not to the
+caller's cluster. The **one deliberate cross-cluster read** in the whole store is the selection
+probe, `ClustersWithIngressIP(ctx, ip, t0, t1) ([]string, error)`: the distinct clusters that had an
+ingress LB Service version carrying `ip` overlapping `[t0, t1)`. It follows the same no-FINAL
+semantics as the window loads (select the dedup envelope `cluster, namespace, name, valid_from,
+valid_to, ingest_seq`; `valid_to` never filtered in SQL except under pruned mode; client-side
+`dedupLatest` then the `t0 < valid_to` overlap check; then distinct clusters, **sorted** for
+determinism). It scans `service_versions` without a cluster predicate — bounded by the small number
+of ingress LB Service versions and the `valid_from < t1` predicate:
 
 ```
 service_versions(cluster, namespace, name, valid_from, valid_to,
@@ -354,10 +377,74 @@ correctness argument rests on `router_check_tool` being Envoy's own matcher.
 `resolveUnknownServerPeer` behaves exactly as today. This is both the default and the regression net:
 the full existing suite, golden files included, must pass unchanged with the feature off.
 
-With the feature on, every failure — store error, no gateway for the host, no route matched, no listener
-on the port, per-endpoint timeout — resolves to the **existing** `external/<raw peer value>` node, with
-a distinct `noteExternal` reason (`route_engine_miss`, `route_engine_no_listener_on_port`,
+With the feature on, every failure — store error, no candidate ingress cluster, an ambiguous
+candidate set, no gateway for the host, no route matched, no listener on the port, per-endpoint
+timeout — resolves to the **existing** `external/<raw peer value>` node, with a distinct
+`noteExternal` reason (`route_engine_no_ip`, `route_engine_no_ingress`,
+`route_engine_ambiguous_ingress_cluster`, `route_engine_miss`, `route_engine_no_listener_on_port`,
 `route_engine_error`). Route resolution can never fail a build.
+
+### D10 — IP + family-first ingress-cluster selection (`pickIngressCluster`, a pure function)
+
+The caller's cluster stops being the store scope. Instead, the destination IPs pick the ingress
+cluster **C**, and the caller cluster contributes only its **family key** and a collision
+tie-break. Two clusters are in one family iff `build.ClusterFamilyKey` (the existing digit-run→`0`
+sentinel rule, now exported) maps their names to the same key — the same family rule the D29
+`service-selects-pod` fan-out already uses.
+
+Per destination IP, the store probe (D7) yields the candidate set
+`G = {clusters that had an ingress Service with that IP overlapping the window}`, and
+`F = {g ∈ G : ClusterFamilyKey(g) == ClusterFamilyKey(caller)}`. Selection:
+
+1. `|F| == 1` → C = that cluster.
+2. `|F| > 1` → C = caller if caller ∈ F, else **ambiguous** (collision-safe default).
+3. `|F| == 0 && |G| == 1` → C = that cluster (a shared ingress under a cross-family name).
+4. `|F| == 0 && |G| > 1` → C = caller if caller ∈ G, else **ambiguous**.
+5. `|G| == 0` → **no ingress**.
+
+Multi-IP (multi-A-record answers): each IP independently yields its own C_i, and **all must agree**.
+All IPs no-ingress → `no_ingress`; any IP ambiguous, any disagreement between picked clusters, or a
+mix of no-ingress and picked → `ambiguous_ingress_cluster`. Candidate sets and windows are **never
+unioned across clusters** — a window mixing two clusters' configs would let one cluster's Gateway
+match another cluster's VirtualService, which is exactly the wrong-answer class this feature must
+never produce. (The known cost: DNS answer sets that routinely include off-mesh IPs over-degrade to
+external — a watched follow-up, and always "no answer", never a wrong one.)
+
+`pickIngressCluster(caller string, perIP [][]string)` is a **pure function** in `pkg/route`
+(table-testable; ClickHouse's only job is answering "ip → []cluster"). Once C is locked, the entire
+pipeline is single-cluster: `LoadTrafficWindow(ctx, C, ip, t0, t1)` per IP (same-C union is fine) →
+memwindow → gwresolve → translate → matchcheck. No later hop may change cluster.
+
+The two selection misses surface as new `RouteOutcome`s — `no_ingress` and
+`ambiguous_ingress_cluster`. Both occur **before** any window is loaded, so the resolver's
+`outcomeRank` miss-folding (a per-segment concern) is untouched.
+
+### D11 — `RouteRequest.CallerCluster`; `RouteDestination.Cluster`; the parse anchors on C
+
+`RouteRequest.Cluster` is renamed `CallerCluster` to say what it now is: an input to the family key
+and the tie-break, never a store scope by itself. The prescan's dedupe key (`routeKey`) keeps the
+same five dimensions — caller cluster, host, path, port, joined IPs — since two callers in different
+clusters may legitimately resolve the same host to different ingress clusters.
+
+`RouteDestination` gains `Cluster` — the locked C. On a hit the parse resolves through the same
+`resolveServiceLevel(dest.Cluster, ns, svc)` as every other path (anchor-membership test in C, one
+service node in C, family-wide `service-selects-pod` fan-out anchored at C — all existing
+machinery, unchanged). A hit whose destination Service the cluster C does not hold in topology falls
+external with reason `route_engine_dest_cluster_lacks_service` (renamed from
+`…_anchor_lacks_service`; log-only contract).
+
+### D12 — `pod-calls-service` becomes `may_cross_cluster: true`
+
+With the service node anchored at C, a route-engine hit where C ≠ caller cluster produces a
+`pod-calls-service` edge whose endpoints live in different clusters. The edge-type registry entry
+(`pkg/graph/registry.go`) therefore flips to `MayCrossCluster: true`, with the description
+distinguishing the two sources: the D29 connection-string path still always materialises the service
+node in the caller's own cluster (intra-cluster by construction), while a route-engine-resolved
+endpoint anchors on the engine-selected ingress cluster, which may be a family sibling. Per-edge
+cross-cluster status is still derived by the D9 rule (comparing resolved source/target
+`labels.cluster`), so intra-cluster edges keep counting as `cross_cluster="false"` — the flag is a
+MAY, not a state. `edge-types.json` (golden) and the registry unit tests update with it; no other
+golden may change.
 
 ## Risks / Trade-offs
 
@@ -393,9 +480,22 @@ a distinct `noteExternal` reason (`route_engine_miss`, `route_engine_no_listener
   on that specific miss, retry against the Gateway's other HTTP-capable listener (a second translate +
   `router_check_tool` run).
 
-- **config_only mode is less precise than traffic_simulation.** Without `client_dns_answers` we report
-  the Gateway *configured* to accept the host, which can differ from the one DNS actually resolved to.
-  → Accepted; adding the label upgrades precision with no code change.
+- **No `client_dns_answers` ⇒ no route resolution at all** (D6). Deployments whose exporter does not
+  emit the label lose the feature entirely — the endpoint stays `external` exactly as pre-change.
+  → Accepted deliberately: without an IP the ingress cluster cannot be selected (D10), and a guessed
+  cluster is the failure mode this revision removes. Adding the label enables the feature with no
+  code change; the `route_engine_no_ip` reason makes the gap visible in logs.
+
+- **Ambiguous ingress-cluster selection over-degrades to external** (D10). An IP served in several
+  clusters with no caller membership, or multi-A answers disagreeing (including off-mesh IPs mixed
+  into the answer set), yields `ambiguous_ingress_cluster` / `no_ingress` → external.
+  → By design: never a wrong cluster, and the two reasons are distinct in logs. Watched follow-up if
+  real answer sets prove noisy.
+
+- **The `ClustersWithIngressIP` probe has no cluster predicate** — it scans every cluster's
+  `service_versions` rows for the IP.
+  → Bounded by the small ingress-LB Service version count and the `valid_from < t1` predicate; one
+  indexed scan per distinct IP per build. Acceptable for v1's serial resolution.
 
 - **Inherited POC limits**: no DestinationRule subset resolution; TLS passthrough / TCP servers have no
   HTTP RDS route and therefore always miss.

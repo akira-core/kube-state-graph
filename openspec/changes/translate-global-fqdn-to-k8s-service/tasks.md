@@ -193,3 +193,42 @@ testcontainer in group 8 seeds the schema itself, so implementation is not block
       `pkg/route/store/clickhouse_test.go` (rewrite-pair collapse both arrival orders, distinct
       slots survive, half-open overlap boundaries, dt64Lit format incl. sentinel + UTC
       normalisation, prune fragment on/off). Both route suites re-verified green end to end.
+
+## 13. IP + family-first ingress-cluster selection (config_only removal — design D6 rev, D10–D12)
+
+- [x] 13.1 Contract: rename `RouteRequest.Cluster` → `CallerCluster` (family key + tie-break only);
+      add `RouteDestination.Cluster` (the engine-selected ingress cluster); add `RouteOutcome`
+      consts `RouteNoIngress` / `RouteAmbiguousIngress`; export `build.ClusterFamilyKey`
+      (in-package call sites updated).
+- [x] 13.2 Store: add `ClustersWithIngressIP(ctx, ip, t0, t1) ([]string, error)` — the store's only
+      cross-cluster read; no-FINAL envelope select + client dedup + overlap + distinct sorted
+      clusters; prune honored under uniqueRows. DELETE `LoadConfigWindow` (interface + CH impl).
+      Register `store.Store` in `.mockery.yaml`; `make mocks`.
+- [x] 13.3 Resolver: new pure `pickIngressCluster(caller, perIP)` in `pkg/route/ingresspick.go`
+      implementing the D10 F/G table + multi-IP agreement; `ResolveRoute` probes per IP, picks C,
+      loads `LoadTrafficWindow(C, ip, …)` only, stamps `dest.Cluster = C`; `len(IPs)==0` →
+      `RouteNoIngress` (defensive); config_only branches removed from `loadWindow`/`candidatesAt`.
+- [x] 13.4 Prescan/parse: `collectRouteQueries` skips `ips == ""` keys (D6); `resolveRouteQueries`
+      returns a non-nil (possibly empty) index whenever a resolver is configured;
+      `routeIndexResolve` notes `route_engine_no_ip` for IP-less keys, maps the two new outcomes
+      to `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`, anchors hits on
+      `dest.Cluster`, and renames `route_engine_dest_anchor_lacks_service` →
+      `route_engine_dest_cluster_lacks_service`; `routeKey.cluster` → `callerCluster`.
+- [x] 13.5 Graph: `pod-calls-service` → `MayCrossCluster: true` in `pkg/graph/registry.go`
+      (description distinguishes the D29 intra-cluster source from the route-engine cross-cluster
+      source); refresh `edge-types.json` golden; update registry/count unit tests.
+- [x] 13.6 Unit tests: `pkg/route/ingresspick_test.go` table over the D10 decision tree + multi-IP
+      merge (T1–T5, T9 of the test matrix); resolver tests over a mocked store (per-IP probe,
+      miss short-circuits before window load, locked-C window scoping, probe error propagation,
+      IP-less defensive miss); prescan/parse tests (no-IP key not collected, new-outcome externals,
+      cross-cluster hit resolving `dest.Cluster ≠ caller`, renamed reason).
+- [x] 13.7 Integration: seed a second cluster corpus (`cluster-beta` ingress IP / gateway / VS /
+      backend); `TestExplicitPortRoutesViaHTTPListener` gains `client_dns_answers`; new
+      `TestNoDNSAnswersStaysExternal` and `TestCrossClusterIngressResolves`;
+      `TestConfigWindowServesIPLessMode` → `TestClustersWithIngressIPProbe`;
+      `TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow` switched to `LoadTrafficWindow`;
+      `TestEdgeTypesCatalogue` cross-cluster flag flipped.
+- [x] 13.8 Docs + verify: design.md (D6 rewritten, D7 amended, D10–D12 added), spec delta
+      (ingress-cluster selection + new scenarios), proposal.md, CLAUDE.md; `make test`, `make
+      lint`, `make check-route-containment`, `make check-docs`, both route suites, `-tags oracle`
+      sanity, `openspec validate`.

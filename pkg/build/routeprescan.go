@@ -89,8 +89,9 @@ func derivePort(hostPort string, p peerLabels) int {
 // several shapes ("10.0.0.1", "10.0.0.1,10.0.0.2", "[10.0.0.1 10.0.0.2]"), so
 // the parse is permissive: brackets stripped, split on commas/semicolons/
 // whitespace, non-IP tokens dropped, order preserved, duplicates removed.
-// Order matters only for determinism of the joined key — the resolver unions
-// the per-IP candidate sets, which is order-free.
+// Order matters only for determinism of the joined key — the resolver selects
+// one ingress cluster per IP and requires the selections to agree (design
+// D10), which is order-free.
 func parseDNSAnswers(raw string) []string {
 	raw = strings.Trim(raw, "[]")
 	if raw == "" {
@@ -114,15 +115,19 @@ func parseDNSAnswers(raw string) []string {
 
 // routeKey identifies one distinct route-resolution question within a build.
 // Start/End are deliberately absent — they are constant per build — so
-// multiple samples naming the same (cluster, host, port, IPs) share one
-// engine invocation. ips is the parsed answer list joined by "," (order
-// preserved from the label, so the key is a pure function of the sample).
+// multiple samples naming the same (caller cluster, host, port, IPs) share
+// one engine invocation. The caller cluster stays a key dimension even though
+// it no longer scopes the store (design D11): two callers in different
+// clusters may legitimately resolve the same host to different ingress
+// clusters via the family-first selection. ips is the parsed answer list
+// joined by "," (order preserved from the label, so the key is a pure
+// function of the sample).
 type routeKey struct {
-	cluster string
-	host    string
-	path    string
-	port    int
-	ips     string
+	callerCluster string
+	host          string
+	path          string
+	port          int
+	ips           string
 }
 
 // routeEntry is one resolved routeKey: the outcome (and destination on a hit)
@@ -152,11 +157,11 @@ func peerRouteKey(anchorCluster string, peer peerLabels) (routeKey, bool) {
 	}
 	host, portStr := splitPeerAddressPort(value)
 	return routeKey{
-		cluster: anchorCluster,
-		host:    host,
-		path:    "/", // the metric carries no HTTP path dimension
-		port:    derivePort(portStr, peer),
-		ips:     strings.Join(parseDNSAnswers(peer.dnsAnswers), ","),
+		callerCluster: anchorCluster,
+		host:          host,
+		path:          "/", // the metric carries no HTTP path dimension
+		port:          derivePort(portStr, peer),
+		ips:           strings.Join(parseDNSAnswers(peer.dnsAnswers), ","),
 	}, true
 }
 
@@ -167,13 +172,13 @@ func (k routeKey) request(start, end time.Time) RouteRequest {
 		ips = strings.Split(k.ips, ",")
 	}
 	return RouteRequest{
-		Cluster: k.cluster,
-		Host:    k.host,
-		Path:    k.path,
-		Port:    k.port,
-		IPs:     ips,
-		Start:   start,
-		End:     end,
+		CallerCluster: k.callerCluster,
+		Host:          k.host,
+		Path:          k.path,
+		Port:          k.port,
+		IPs:           ips,
+		Start:         start,
+		End:           end,
 	}
 }
 
@@ -190,7 +195,10 @@ func (k routeKey) request(start, end time.Time) RouteRequest {
 // Collection deliberately covers ALL THREE external branches (design D3): a
 // host no grammar matches, an IP literal with no ClusterIP hit, AND a
 // classified (namespace, service) the anchor cluster does not hold — the
-// branch a global FQDN like api.example.com actually takes.
+// branch a global FQDN like api.example.com actually takes. An endpoint with
+// no parseable client_dns_answers IP is NOT collected (design D6): the IPs
+// select the ingress cluster, so without them the engine has nothing to
+// select with — the parse records route_engine_no_ip and falls external.
 func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	if len(vec) == 0 {
 		return nil
@@ -239,6 +247,12 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 		if ns, svc, classified := r.classifyPeerHost(key.host, clientPod.Labels()["namespace"], anchorCluster); classified && r.anchorHolds(anchorCluster, ns, svc) {
 			continue
 		}
+		// Destination IPs are a precondition (design D6): without one the
+		// ingress cluster cannot be selected, so the engine is never asked —
+		// the endpoint falls external directly (route_engine_no_ip).
+		if key.ips == "" {
+			continue
+		}
 		if !seen[key] {
 			seen[key] = true
 			keys = append(keys, key)
@@ -247,8 +261,8 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	// Deterministic resolution order (D6): sorted, not vector-arrival order.
 	sort.Slice(keys, func(i, j int) bool {
 		a, b := keys[i], keys[j]
-		if a.cluster != b.cluster {
-			return a.cluster < b.cluster
+		if a.callerCluster != b.callerCluster {
+			return a.callerCluster < b.callerCluster
 		}
 		if a.host != b.host {
 			return a.host < b.host
@@ -266,8 +280,14 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 // ctx only). Errors and misses are recorded in the index — never returned —
 // so route resolution can never fail a build (design D9); the parse logs the
 // per-endpoint reason off the recorded entry.
+//
+// With a resolver configured the returned index is ALWAYS non-nil (possibly
+// empty): nil means "engine off", non-nil-empty means "engine on, nothing
+// collected". The parse uses the distinction ONLY to pick the diagnostic
+// reason for IP-less endpoints (route_engine_no_ip vs the original classify
+// reason) — graph output MUST NOT depend on it.
 func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTimeout time.Duration, keys []routeKey, start, end time.Time) routeIndex {
-	if resolver == nil || len(keys) == 0 {
+	if resolver == nil {
 		return nil
 	}
 	idx := make(routeIndex, len(keys))
@@ -280,7 +300,7 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 		cancel()
 		if err != nil {
 			slog.Debug("route-engine resolution errored (endpoint degrades to external)",
-				"cluster", k.cluster, "host", k.host, "port", k.port, "ips", k.ips, "error", err)
+				"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips, "error", err)
 			idx[k] = routeEntry{failed: true}
 			continue
 		}
@@ -303,37 +323,66 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 // classify reason too — the classify reason survives as the classify_reason
 // attribute).
 func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t sgTrace) (ids []string, noted bool) {
+	if r.routes == nil {
+		return nil, false // engine off: pre-change behaviour
+	}
+	if key.ips == "" {
+		// Design D6: no destination IPs ⇒ the prescan never asked the engine.
+		// Same outward result as engine-off (external), but with a distinct
+		// reason so the missing client_dns_answers dimension is visible.
+		r.noteExternal("route_engine_no_ip", t, "host", key.host, "port", key.port,
+			"peer_address", value, "caller_cluster", key.callerCluster,
+			"classify_reason", origReason)
+		return nil, true
+	}
 	entry, ok := r.routes[key]
 	if !ok {
-		return nil, false // engine off or endpoint not collected: pre-change behaviour
+		return nil, false // uncollected (build deadline hit): pre-change behaviour
 	}
 	switch {
 	case entry.failed:
 		r.noteExternal("route_engine_error", t, "host", key.host, "port", key.port,
-			"peer_address", value, "anchor_cluster", key.cluster, "classify_reason", origReason)
+			"peer_address", value, "caller_cluster", key.callerCluster, "classify_reason", origReason)
 	case entry.outcome == RouteHit:
-		if ids := r.resolveServiceLevel(key.cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
+		// Anchor on the engine-selected ingress cluster (design D11), which
+		// may differ from the caller's — the resulting pod-calls-service edge
+		// may cross clusters (design D12).
+		if ids := r.resolveServiceLevel(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
 				"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-				"anchor_cluster", key.cluster, "service_id", ids[0],
-				"client", t.clientLabel, "server", t.serverLabel)
+				"ingress_cluster", entry.dest.Cluster, "caller_cluster", key.callerCluster,
+				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
 			return ids, true
 		}
-		// The engine's destination is not a Service the anchor cluster holds in
-		// topology (config store and kube_service_info disagree) — external.
-		r.noteExternal("route_engine_dest_anchor_lacks_service", t,
+		// The engine's destination is not a Service the selected ingress
+		// cluster holds in topology (config store and kube_service_info
+		// disagree) — external.
+		r.noteExternal("route_engine_dest_cluster_lacks_service", t,
 			"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-			"host", key.host, "port", key.port, "anchor_cluster", key.cluster)
+			"host", key.host, "port", key.port, "ingress_cluster", entry.dest.Cluster,
+			"caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoListenerOnPort:
 		// The design-D5 mis-derived-port signature, kept distinct from an
 		// ordinary route miss so operators can spot a bad port guess.
 		r.noteExternal("route_engine_no_listener_on_port", t, "host", key.host,
-			"port", key.port, "peer_address", value, "anchor_cluster", key.cluster)
+			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
+	case entry.outcome == RouteNoIngress:
+		// Design D10: no cluster had an ingress Service with any of the
+		// destination IPs in the window.
+		r.noteExternal("route_engine_no_ingress", t, "host", key.host, "port", key.port,
+			"ips", key.ips, "peer_address", value, "caller_cluster", key.callerCluster,
+			"classify_reason", origReason)
+	case entry.outcome == RouteAmbiguousIngress:
+		// Design D10: candidates could not be reduced to one cluster
+		// (unresolvable tie or disagreeing multi-IP selections).
+		r.noteExternal("route_engine_ambiguous_ingress_cluster", t, "host", key.host,
+			"port", key.port, "ips", key.ips, "peer_address", value,
+			"caller_cluster", key.callerCluster, "classify_reason", origReason)
 	default: // RouteNoGateway / RouteNoRoute
 		r.noteExternal("route_engine_miss", t, "host", key.host, "port", key.port,
 			"outcome", string(entry.outcome), "peer_address", value,
-			"anchor_cluster", key.cluster, "classify_reason", origReason)
+			"caller_cluster", key.callerCluster, "classify_reason", origReason)
 	}
 	return nil, true
 }

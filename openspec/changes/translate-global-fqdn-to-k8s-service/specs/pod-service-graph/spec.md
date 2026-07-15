@@ -71,7 +71,9 @@ lexically-smaller `(namespace, service)` pair.
 When classification (step 5) is unresolvable, OR the anchor cluster does not hold the
 addressed Service, the reader SHALL — **before** falling back to an external node —
 consult the Istio route-resolution engine as specified in "Istio route resolution of
-global FQDN peers". This route-resolution step SHALL be reached from EVERY path that would
+global FQDN peers" (subject to that requirement's own preconditions: in particular, an
+endpoint carrying no destination IPs is NEVER consulted and falls external directly).
+This route-resolution step SHALL be reached from EVERY path that would
 otherwise produce an external node under this requirement, without exception. In
 particular, a global / ingress FQDN such as `api.example.com` is a 3-label host and is
 therefore *successfully* classified by step 2 (as service `example` in namespace `com`)
@@ -137,13 +139,18 @@ identical to its behaviour before this requirement existed. Disabled is the defa
 
 **Inputs.** For one candidate endpoint the reader SHALL supply:
 
-- the **anchor cluster** — the already-resolved client pod's own cluster;
+- the **caller cluster** — the already-resolved client pod's own cluster, used ONLY to
+  derive the cluster-family key and to break candidate ties in ingress-cluster selection;
+  it SHALL NOT by itself scope any route-store window query;
 - the **host** — the port-stripped peer address;
 - the **path** — fixed to `"/"`. The service-graph metric carries no HTTP path or route
   dimension, so no per-request path is available;
 - the **listener port** — derived as specified below;
-- the **destination IPs** — from the OPTIONAL `client_dns_answers` dimension, empty when
-  absent;
+- the **destination IPs** — from the `client_dns_answers` dimension. These are a
+  **precondition**: when the endpoint carries no parseable destination IP, the engine
+  SHALL NOT be consulted at all — no store read occurs, the endpoint falls back to the
+  external node directly, and the reader SHALL record a distinct diagnostic reason for
+  the skip (separate from every engine outcome);
 - the **time window** — the build's own `[start, end]`.
 
 **Listener-port derivation.** The port SHALL be derived by this precedence:
@@ -153,16 +160,37 @@ identical to its behaviour before this requirement existed. Disabled is the defa
    present;
 3. otherwise the default **443**.
 
-**Destination-IP handling.** When `client_dns_answers` supplies at least one IP, the engine
-SHALL narrow the candidate Gateways to those reachable from that destination IP before
-disambiguating the host among them. When it is absent, the engine SHALL resolve the host
-against all of the anchor cluster's Gateways. Both modes are valid; the absence of the
-dimension costs precision, not correctness.
+**Ingress-cluster selection.** The destination IPs select the ingress cluster; the caller
+cluster contributes only its family key and a tie-break. For each destination IP the
+engine SHALL probe the store for the candidate set `G` — the clusters that had an ingress
+Service carrying that IP overlapping the window — and derive `F`, the subset of `G` in the
+caller's cluster family (the same digit-run-collapsing family rule used by
+`service-selects-pod` fan-out). Selection per IP:
 
-**Store scoping.** Every route-store query SHALL be scoped to the anchor cluster. The
-reader SHALL be strictly read-only against the store: it SHALL NOT create schema and SHALL
-NOT write. The reader SHALL validate the expected schema at startup and fail fast on drift,
-rather than silently returning empty results.
+1. exactly one family candidate → that cluster;
+2. several family candidates → the caller's own cluster if it is among them, otherwise
+   **ambiguous**;
+3. no family candidate and exactly one global candidate → that cluster;
+4. no family candidate and several global candidates → the caller's own cluster if it is
+   among them, otherwise **ambiguous**;
+5. no candidate at all → **no ingress**.
+
+With several destination IPs, each IP SHALL be selected independently and all selections
+MUST agree on one cluster; every IP yielding "no ingress" degrades as **no ingress**, and
+any other combination — an ambiguous IP, disagreeing selections, or a mix of "no ingress"
+and a selected cluster — degrades as **ambiguous**. Candidate sets and store windows SHALL
+NEVER be unioned across clusters. Once a cluster is selected, every subsequent resolution
+step — window load, gateway narrowing, host disambiguation, translation, route matching —
+SHALL operate on that single cluster only, and the engine SHALL narrow the candidate
+Gateways to those reachable from the destination IPs within it.
+
+**Store scoping.** Every route-store *window* query SHALL be scoped to the selected
+ingress cluster. The ONLY cross-cluster store read SHALL be the ingress probe that answers
+"which clusters had an ingress Service with this IP in the window", and its result SHALL
+be deterministic (deduplicated and ordered). The reader SHALL be strictly read-only
+against the store: it SHALL NOT create schema and SHALL NOT write. The reader SHALL
+validate the expected schema at startup and fail fast on drift, rather than silently
+returning empty results.
 
 **Store-shape tolerance.** The store is written by an exporter whose version-close
 operation REWRITES the previous open row; until background merges collapse them, a stale
@@ -174,19 +202,27 @@ the query. A VirtualService binding its gateway by the bare `<name>` form (Istio
 for a gateway in the VirtualService's own namespace) SHALL bind exactly as the qualified
 `<namespace>/<name>` form does.
 
-**Resolution.** A hit yields a destination `(namespace, service)`. The reader SHALL resolve
-that pair through the SAME same-cluster Service-node resolution every other path uses —
-anchored on the anchor cluster, materialising AT MOST ONE service node iff that cluster
-holds the Service, with the same cross-cluster `service-selects-pod` fan-out. The
-destination's port and DestinationRule subset SHALL be discarded. **No new node type, no new
-edge type, no new node attribute, and no new `labels` key** are introduced.
+**Resolution.** A hit yields a destination `(cluster, namespace, service)`, where the
+cluster is the engine-selected ingress cluster. The reader SHALL resolve that triple
+through the SAME same-cluster Service-node resolution every other path uses — anchored on
+the **selected ingress cluster**, materialising AT MOST ONE service node iff that cluster
+holds the Service in topology, with the same cross-cluster `service-selects-pod` fan-out
+over its family. Because the selected cluster may differ from the caller's, the resulting
+`pod-calls-service` edge MAY cross clusters, and the edge-type registry SHALL declare
+`may_cross_cluster: true` for `pod-calls-service` (connection-string-resolved edges remain
+intra-cluster by construction; per-edge cross-cluster status is still derived by comparing
+the resolved endpoints' clusters). The destination's port and DestinationRule subset SHALL
+be discarded. **No new node type, no new edge type, no new node attribute, and no new
+`labels` key** are introduced.
 
-**Degradation.** Every failure — engine disabled, store error, no Gateway serving the host,
-no route matched, no listener on the derived port, or a resolution timeout — SHALL fall back
-to the external node specified in "Unknown-server peer-label enrichment". Route resolution
-SHALL NEVER fail a build. The reader SHALL record a distinct diagnostic reason for a
-"no listener on the derived port" outcome, separate from a "no route matched" outcome, so a
-mis-derived port is diagnosable.
+**Degradation.** Every failure — engine disabled, endpoint carrying no destination IPs,
+store error, no candidate ingress cluster for the IPs, an ambiguous candidate set, no
+Gateway serving the host, no route matched, no listener on the derived port, or a
+resolution timeout — SHALL fall back to the external node specified in "Unknown-server
+peer-label enrichment". Route resolution SHALL NEVER fail a build. The reader SHALL record
+distinct diagnostic reasons for a "no listener on the derived port" outcome (separate from
+"no route matched", so a mis-derived port is diagnosable), for a "no candidate ingress
+cluster" outcome, and for an "ambiguous ingress cluster" outcome.
 
 **Determinism.** Route resolution SHALL be performed outside the pure service-graph parse
 and its results supplied to the parse as a prefetched index, so the emitted graph remains a
@@ -195,9 +231,10 @@ deterministic function of the upstream data and the resolved destinations.
 #### Scenario: Global FQDN resolves to its routed Service
 
 - **WHEN** route resolution is enabled and a `server="unknown"` endpoint's peer address is
-  `api.example.com`, which the anchor cluster's Istio Gateway and VirtualService route to
-  Service `checkout` in namespace `shop` during the request window
-- **THEN** the reader SHALL emit a `service` node for `(anchor cluster, shop, checkout)`
+  `api.example.com` with a destination IP selecting the caller's own cluster as ingress,
+  whose Istio Gateway and VirtualService route the host to Service `checkout` in namespace
+  `shop` during the request window
+- **THEN** the reader SHALL emit a `service` node for `(selected cluster, shop, checkout)`
 - **AND** a `pod-calls-service` edge from the client pod to it
 - **AND** SHALL NOT emit `external/api.example.com`
 
@@ -214,8 +251,8 @@ deterministic function of the upstream data and the resolved destinations.
 
 #### Scenario: No listener on the derived port degrades to external
 
-- **WHEN** the anchor cluster's Gateway serves the host but declares no routable HTTP
-  listener on the derived port
+- **WHEN** the selected ingress cluster's Gateway serves the host but declares no routable
+  HTTP listener on the derived port
 - **THEN** the reader SHALL emit `external/<raw_peer_address_value>`
 - **AND** SHALL record a diagnostic reason distinct from the "no route matched" reason
 
@@ -225,11 +262,63 @@ deterministic function of the upstream data and the resolved destinations.
 - **THEN** the reader SHALL emit `external/<raw_peer_address_value>` for that endpoint
 - **AND** the build SHALL complete successfully
 
-#### Scenario: Destination IP narrows the candidate Gateways
+#### Scenario: Destination IP narrows the candidate Gateways within the selected cluster
 
-- **WHEN** `client_dns_answers` supplies a destination IP that reaches exactly one of two
-  Gateways whose server hosts both match the peer FQDN
+- **WHEN** `client_dns_answers` supplies a destination IP that, within the selected ingress
+  cluster, reaches exactly one of two Gateways whose server hosts both match the peer FQDN
 - **THEN** the reader SHALL resolve the host against that Gateway only
+
+#### Scenario: No destination IPs means the engine is not consulted
+
+- **WHEN** route resolution is enabled and a `server="unknown"` endpoint's peer address
+  would fall external, but the series carries no parseable `client_dns_answers` IP
+- **THEN** the engine SHALL NOT be consulted (no store read for this endpoint)
+- **AND** the reader SHALL emit `external/<raw_peer_address_value>` exactly as when route
+  resolution is disabled
+- **AND** SHALL record a diagnostic reason distinct from every engine outcome
+
+#### Scenario: Same-family ingress candidate wins over a cross-family one
+
+- **WHEN** a destination IP's candidate ingress clusters are one cluster in the caller's
+  family and one cluster outside it
+- **THEN** the engine SHALL select the same-family cluster
+
+#### Scenario: Caller breaks a same-family ingress-IP collision
+
+- **WHEN** a destination IP's candidate ingress clusters include the caller's own cluster
+  and a family sibling
+- **THEN** the engine SHALL select the caller's own cluster
+
+#### Scenario: Unresolvable ingress-cluster tie degrades to external
+
+- **WHEN** a destination IP's candidate ingress clusters are two family siblings, neither
+  of which is the caller's own cluster
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>`
+- **AND** the reader SHALL record the "ambiguous ingress cluster" diagnostic reason
+
+#### Scenario: No cluster serves the destination IP
+
+- **WHEN** no cluster had an ingress Service carrying any of the destination IPs during
+  the window
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>`
+- **AND** the reader SHALL record the "no candidate ingress cluster" diagnostic reason
+
+#### Scenario: Disagreeing multi-IP selections degrade to external
+
+- **WHEN** `client_dns_answers` supplies two IPs whose independent selections pick two
+  different ingress clusters
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>` with the
+  "ambiguous ingress cluster" diagnostic reason
+
+#### Scenario: Cross-cluster ingress resolves to a Service in the sibling cluster
+
+- **WHEN** the caller pod lives in cluster A and the destination IP selects ingress
+  cluster B, whose Gateway and VirtualService route the host to Service `payments` in
+  namespace `shop`, and B holds that Service in topology
+- **THEN** the reader SHALL emit the `service` node `B/shop/payments`
+- **AND** a `pod-calls-service` edge from the cluster-A client pod to it (a cross-cluster
+  edge)
+- **AND** SHALL NOT emit an external node for the peer
 
 #### Scenario: A rewritten (closed) version does not double-count
 
@@ -250,9 +339,3 @@ deterministic function of the upstream data and the resolved destinations.
   in `spec.gateways`
 - **THEN** its routes SHALL bind to that gateway exactly as a qualified
   `<namespace>/<name>` reference would
-
-#### Scenario: Missing destination IP resolves over all Gateways
-
-- **WHEN** `client_dns_answers` is absent
-- **THEN** the reader SHALL resolve the host against all of the anchor cluster's Gateways,
-  selecting the most-specific host match

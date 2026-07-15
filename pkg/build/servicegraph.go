@@ -85,7 +85,7 @@ type sgResolver struct {
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
 	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
 	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
-	routes             routeIndex                   // prefetched route-engine answers (nil = engine off)
+	routes             routeIndex                   // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
@@ -179,10 +179,10 @@ func newSGResolver(topology Topology) *sgResolver {
 	// "unknown"-bucketed service entries (samples missing their cluster label)
 	// land under family "unknown" — its own family-of-one — so they are reachable
 	// only by an "unknown"-anchored caller and never unioned into a real cluster's
-	// fan-out (clusterFamilyKey("unknown") == "unknown" != "prod-0").
+	// fan-out (ClusterFamilyKey("unknown") == "unknown" != "prod-0").
 	svcCandidates := make(map[famSvcKey][]svcCandidate, len(topology.ServicesByNameNS))
 	for k, obs := range topology.ServicesByNameNS {
-		key := famSvcKey{family: clusterFamilyKey(k.cluster), namespace: k.namespace, service: k.service}
+		key := famSvcKey{family: ClusterFamilyKey(k.cluster), namespace: k.namespace, service: k.service}
 		svcCandidates[key] = append(svcCandidates[key], svcCandidate{cluster: k.cluster, obs: obs})
 	}
 	for _, cands := range svcCandidates {
@@ -569,7 +569,7 @@ func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster strin
 // already resolves (route resolution runs ONLY where the parse would fall to
 // an external node).
 func (r *sgResolver) anchorHolds(anchorCluster, ns, svc string) bool {
-	for _, cand := range r.svcCandidates[famSvcKey{family: clusterFamilyKey(anchorCluster), namespace: ns, service: svc}] {
+	for _, cand := range r.svcCandidates[famSvcKey{family: ClusterFamilyKey(anchorCluster), namespace: ns, service: svc}] {
 		if cand.cluster == anchorCluster {
 			return true
 		}
@@ -700,7 +700,7 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	// resolveConnString's anchor_cluster_lacks_service outcome).
 	return routeExternal("unknown_server_peer_anchor_lacks_service",
 		"service", svc, "namespace", ns, "host", host, "peer_address", value,
-		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
+		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
 }
 
 // classifyBareShortName reports whether host is a bare, dot-free Service short
@@ -765,7 +765,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 	// label as name).
 	r.noteExternal("anchor_cluster_lacks_service", t,
 		"service", svc, "namespace", ns, "host", host,
-		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
+		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
 	return []string{r.external(label)}
 }
 
@@ -783,7 +783,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 //     sibling holding it is NOT enough — a same-named local Service is a mesh
 //     precondition), an "unknown"/empty/bogus anchor naming no holder in its
 //     own family, AND preserves the fully-unlabelled single-cluster case
-//     (clusterFamilyKey("unknown") == "unknown" is a family-of-one, so an
+//     (ClusterFamilyKey("unknown") == "unknown" is a family-of-one, so an
 //     "unknown"-bucketed service makes "unknown" a legitimate holder). There is
 //     NO cross-family fallback.
 //  3. Materialise ONE service node, in the anchor cluster, from its OWN
@@ -800,7 +800,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 //
 // Returns the single-element slice [anchorSvcID], or nil (→ external).
 func (r *sgResolver) resolveServiceLevel(anchorCluster, ns, svc string) []string {
-	cands := r.svcCandidates[famSvcKey{family: clusterFamilyKey(anchorCluster), namespace: ns, service: svc}]
+	cands := r.svcCandidates[famSvcKey{family: ClusterFamilyKey(anchorCluster), namespace: ns, service: svc}]
 	var anchor *svcCandidate
 	for i := range cands {
 		if cands[i].cluster == anchorCluster {

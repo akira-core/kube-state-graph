@@ -3,9 +3,11 @@
 // The metadata-exporter repo owns watch/ingest and the schema; kube-state-graph
 // only loads version windows out of it — there is deliberately no CreateSchema
 // and no inserter here (design D7). Ported from poc/route2a/internal/store with
-// one structural change: every row and every query is scoped by a `cluster`
-// column, because kube-state-graph is multi-cluster and a Gateway/VS lookup must
-// never leak across clusters.
+// one structural change: every row carries a `cluster` column and every window
+// query is scoped by it, because kube-state-graph is multi-cluster and a
+// Gateway/VS lookup must never leak across clusters. The one deliberate
+// cross-cluster read is ClustersWithIngressIP, the ingress-cluster selection
+// probe (design D10).
 package store
 
 import (
@@ -102,9 +104,8 @@ func ParsePorts(specJSON string) ([]SvcPort, error) {
 	return s.Ports, nil
 }
 
-// GatewayCand is one candidate gateway from the 3-hop or the config-only
-// gateway scan (name + server host patterns, enough to build a
-// gwresolve.Resolver).
+// GatewayCand is one candidate gateway from the IP 3-hop (name + server host
+// patterns, enough to build a gwresolve.Resolver).
 type GatewayCand struct {
 	Namespace   string
 	Name        string
@@ -145,10 +146,9 @@ type VSRow struct {
 // TrafficWindow is every resource version overlapping [t0,t1) that one load
 // pulled: the ingress Service, its Deployment, the candidate Gateways, their
 // bound VirtualServices, and the backend Services those VS route to. It is
-// loaded once (LoadTrafficWindow / LoadConfigWindow), then sliced/resolved in
-// memory (pkg/route/memwindow) with no further DB round-trips. Each row's
-// ValidTo is the materialized column value, so AsOf(t) is
-// `ValidFrom <= t < ValidTo`.
+// loaded once (LoadTrafficWindow), then sliced/resolved in memory
+// (pkg/route/memwindow) with no further DB round-trips. Each row's ValidTo is
+// the materialized column value, so AsOf(t) is `ValidFrom <= t < ValidTo`.
 type TrafficWindow struct {
 	Services []ServiceRow // ingress LB + backend destination Service versions
 	Deploys  []DeployRow
@@ -156,23 +156,27 @@ type TrafficWindow struct {
 	VSes     []VSRow
 }
 
-// Store is the read-only window loader one backend implements. Both loads are
-// scoped to a single cluster — route resolution must never mix one cluster's
-// Gateways with another's.
+// Store is the read-only window loader one backend implements. The window
+// load is scoped to a single cluster — route resolution must never mix one
+// cluster's Gateways with another's. The ONLY cross-cluster read is the
+// ingress-IP probe that feeds ingress-cluster selection (design D10).
 type Store interface {
 	Close() error
 
 	// LoadTrafficWindow fetches every resource version overlapping [t0,t1)
 	// that is reachable from destination IP in cluster (one scoped Overlap
 	// load per resource kind, using the materialized valid_to:
-	// valid_from < t1 AND t0 < valid_to). The traffic_simulation path — the
-	// caller slices and resolves the returned window in memory.
+	// valid_from < t1 AND t0 < valid_to). The caller slices and resolves the
+	// returned window in memory.
 	LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 time.Time) (TrafficWindow, error)
 
-	// LoadConfigWindow is the IP-less variant for config_only mode: every
-	// Gateway version of the cluster overlapping [t0,t1), their bound
-	// VirtualServices, and the backend Services those VS route to. Services
-	// contains only backends and Deploys stays empty — the config-only path
-	// never runs the IP 3-hop.
-	LoadConfigWindow(ctx context.Context, cluster string, t0, t1 time.Time) (TrafficWindow, error)
+	// ClustersWithIngressIP is the store's ONLY cross-cluster read: the
+	// distinct clusters that had an ingress LB Service version carrying ip
+	// overlapping [t0,t1). It feeds the ingress-cluster selection (design
+	// D10) — ClickHouse's whole job there is answering "ip → []cluster". The
+	// same no-FINAL semantics as the window load apply (valid_to never
+	// filtered in SQL except under the uniqueRows prune; client-side dedup
+	// per version slot by max ingest_seq; overlap checked post-dedup). The
+	// result is deduplicated and sorted for determinism.
+	ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error)
 }
