@@ -1,0 +1,28 @@
+name: NG Words
+
+# Scans file contents and file/directory names for the organization's NG_WORDS
+# keyword list via the shared akira-core/action-workflow composite action.
+#
+# Triggers mirror ci.yml: PRs, plus direct pushes / merges to the default branch
+# so `main` carries its own signal.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # An empty `ng-words` input is a SKIP (exit 0), not a failure — so a
+      # missing/renamed org secret makes this job pass green without scanning.
+      # Same for pull_request runs from a fork: GitHub withholds secrets there,
+      # so the input resolves empty and the scan is skipped.
+      - uses: akira-core/action-workflow@v1
+        with:
+          ng-words: ${{ secrets.NG_WORDS }}
