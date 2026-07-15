@@ -42,7 +42,7 @@
     },
     {
       "type": "pod-calls-service",
-      "description": "Service-graph call edge whose target resolves to an in-cluster Kubernetes Service node (from a '://' connection string per D29). The addressed (namespace, service) resolves to a SINGLE Service node in the caller's OWN (anchor) cluster — the UID-recovered client-pod cluster when available, else the trace-source label — and ONLY when that cluster holds the same-named Service object (a family sibling holding it is not enough; otherwise the endpoint falls back to 'external'). There is no per-family service-node fan-out and no cross-family fallback. Because the Service node always lives in the caller's own cluster, a pod-calls-service edge is ALWAYS intra-cluster. The resolved Service fans out service-selects-pod edges that MAY cross clusters (see that type). Carries labels.cluster when the client side is a pod (D9).",
+      "description": "Service-graph call edge whose target resolves to an in-cluster Kubernetes Service node. Two sources. (1) A '://' connection string (D29): the addressed (namespace, service) resolves to a SINGLE Service node in the caller's OWN (anchor) cluster — the UID-recovered client-pod cluster when available, else the trace-source label — and ONLY when that cluster holds the same-named Service object (a family sibling holding it is not enough; otherwise the endpoint falls back to 'external'). There is no per-family service-node fan-out and no cross-family fallback; this path is always intra-cluster. (2) The Istio route-resolution engine (translate-global-fqdn-to-k8s-service): a global/ingress FQDN peer resolves to the Service the selected ingress cluster's Gateway + VirtualService config routed it to — the ingress cluster is picked from the destination IPs (family-first, caller tie-break) and may be a family sibling of the caller's, so a route-engine-sourced pod-calls-service edge MAY cross clusters. Per-edge cross-cluster status is derived by comparing the resolved endpoints' labels.cluster (D9). The resolved Service fans out service-selects-pod edges that MAY cross clusters (see that type). Carries labels.cluster when the client side is a pod (D9).",
       "source_type": [
         "pod",
         "service",
@@ -52,7 +52,7 @@
         "service"
       ],
       "directed": true,
-      "may_cross_cluster": false,
+      "may_cross_cluster": true,
       "labels": [
         {
           "name": "cluster",

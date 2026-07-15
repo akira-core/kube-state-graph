@@ -447,37 +447,55 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 	}
 
 	// 4 + 5. VirtualServices bound to the candidate gateways, then the backend
-	// Services those VS route to. Shared with LoadConfigWindow.
+	// Services those VS route to.
 	if err := s.loadVSAndBackends(ctx, &w, cluster, gwRefs, t0, t1); err != nil {
 		return w, err
 	}
 	return w, nil
 }
 
-// LoadConfigWindow is the IP-less window for config_only mode: every Gateway
-// version of the cluster overlapping [t0,t1), their bound VirtualServices, and
-// the backend Services those VS route to. No ingress Service or Deployment rows
-// are loaded — the config-only path never runs the IP 3-hop.
-func (s *CH) LoadConfigWindow(ctx context.Context, cluster string, t0, t1 time.Time) (TrafficWindow, error) {
-	var w TrafficWindow
-
-	gwRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT cluster, namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
-		 FROM gw_versions
-		 WHERE cluster = ? AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
-		cluster)
+// ClustersWithIngressIP is the store's ONLY cross-cluster read (design D10):
+// the distinct clusters that had an ingress LB Service version carrying ip
+// overlapping [t0,t1). It deliberately carries no cluster predicate — that is
+// its whole job — bounded by the small number of ingress-LB Service versions
+// (has(ingress_ips, ...) only matches ingress rows) and valid_from < t1. The
+// same no-FINAL pattern as the window loads applies: only the dedup envelope
+// is selected, valid_to is never filtered in SQL (except under the uniqueRows
+// prune), the client dedups per version slot and applies the overlap check
+// after. The result is deduplicated and sorted for determinism.
+func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error) {
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(
+		`SELECT cluster, namespace, name, valid_from, valid_to, ingest_seq
+		 FROM service_versions
+		 WHERE has(ingress_ips, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+		ip)
 	if err != nil {
-		return w, fmt.Errorf("config window gateways: %w", err)
+		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
 	}
-	gwRefs, err := s.appendGateways(&w, gwRows, t0, t1)
-	if err != nil {
-		return w, err
+	var vers []versionRow
+	for rows.Next() {
+		var r versionRow
+		if err := rows.Scan(&r.cluster, &r.ns, &r.name, &r.vf, &r.vt, &r.seq); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		vers = append(vers, r)
 	}
+	if err := closeRows(rows); err != nil {
+		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
+	}
+	vers = dedupOverlapCounted(s, vers, func(r versionRow) versionRow { return r }, t0, t1)
 
-	if err := s.loadVSAndBackends(ctx, &w, cluster, gwRefs, t0, t1); err != nil {
-		return w, err
+	seen := map[string]bool{}
+	var clusters []string
+	for _, r := range vers {
+		if !seen[r.cluster] {
+			seen[r.cluster] = true
+			clusters = append(clusters, r.cluster)
+		}
 	}
-	return w, nil
+	sort.Strings(clusters)
+	return clusters, nil
 }
 
 // appendGateways drains one gw_versions result set, dedups + overlap-filters

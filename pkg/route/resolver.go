@@ -1,16 +1,21 @@
 // Package route is the concrete build.RouteResolver: the Istio route-resolution
-// engine that answers "which Kubernetes Service did the ingress config of this
-// cluster route (host, path, port) to during [start, end]?" against a
-// versioned config store written by the metadata-exporter.
+// engine that answers "which Kubernetes Service did the ingress config route
+// (host, path, port) to during [start, end]?" against a versioned config
+// store written by the metadata-exporter.
 //
-// Pipeline (ported from poc/route2a/internal/rangequery): load the window once
-// (store.LoadTrafficWindow / LoadConfigWindow) → slice it at every version
-// boundary (memwindow) → per segment, narrow candidate gateways (IP 3-hop, or
-// all live gateways in config_only mode) and disambiguate the host
-// (gwresolve) → per DISTINCT config, translate to a RouteConfiguration
-// (in-process istiod, translate) and match with Envoy's router_check_tool
-// (matchcheck). Identical-content version bumps share one translate+check via
-// the memwindow.ConfigSigAt signature cache.
+// Pipeline (ported from poc/route2a/internal/rangequery, extended by design
+// D10): probe the store per destination IP for the clusters serving it
+// (store.ClustersWithIngressIP — the one cross-cluster read) → select the
+// ingress cluster C (pickIngressCluster: family-first, caller tie-break; any
+// unresolvable case degrades, never guesses) → load C's window once
+// (store.LoadTrafficWindow per IP, unioned within C only) → slice it at every
+// version boundary (memwindow) → per segment, narrow candidate gateways (IP
+// 3-hop) and disambiguate the host (gwresolve) → per DISTINCT config,
+// translate to a RouteConfiguration (in-process istiod, translate) and match
+// with Envoy's router_check_tool (matchcheck). Identical-content version
+// bumps share one translate+check via the memwindow.ConfigSigAt signature
+// cache. Destination IPs are REQUIRED (design D6): an IP-less request misses
+// with RouteNoIngress before touching the store.
 //
 // pkg/build MUST NOT import this package (design D1); only cmd/kube-state-graph
 // or an opting-in embedder constructs a Resolver and injects it via
@@ -79,7 +84,29 @@ type segmentResult struct {
 // closest to the request's end time. Misses fold to the deepest pipeline stage
 // any segment reached (see outcomeRank).
 func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
-	w, err := r.loadWindow(ctx, req)
+	if len(req.IPs) == 0 {
+		// Defensive: the prescan never emits an IP-less request (design D6) —
+		// without a destination IP no ingress cluster can be selected.
+		return build.RouteDestination{}, build.RouteNoIngress, nil
+	}
+
+	// Design D10: select the ingress cluster from the destination IPs before
+	// touching any window. One probe per IP; the candidate sets stay separate
+	// so multi-IP answers must agree — never unioned across clusters.
+	perIP := make([][]string, len(req.IPs))
+	for i, ip := range req.IPs {
+		cands, err := r.st.ClustersWithIngressIP(ctx, ip, req.Start, req.End)
+		if err != nil {
+			return build.RouteDestination{}, build.RouteNoGateway, err
+		}
+		perIP[i] = cands
+	}
+	cluster, pickMiss, ok := pickIngressCluster(req.CallerCluster, perIP)
+	if !ok {
+		return build.RouteDestination{}, pickMiss, nil
+	}
+
+	w, err := r.loadWindow(ctx, cluster, req)
 	if err != nil {
 		return build.RouteDestination{}, build.RouteNoGateway, err
 	}
@@ -132,21 +159,23 @@ func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (bu
 	}
 
 	if hit {
+		// The destination lives in the selected ingress cluster (design D11):
+		// ParseEnvoyCluster cannot know it — the Envoy cluster string carries
+		// only (port, subset, service, namespace) — so it is stamped here.
+		hitDest.Cluster = cluster
 		return hitDest, build.RouteHit, nil
 	}
 	return build.RouteDestination{}, miss, nil
 }
 
-// loadWindow picks the load mode: destination IPs present → traffic_simulation
-// (one window per IP, rows unioned — multi-A-record DNS answers are a union of
-// candidates, design §9.2); absent → config_only over the whole cluster.
-func (r *Resolver) loadWindow(ctx context.Context, req build.RouteRequest) (store.TrafficWindow, error) {
-	if len(req.IPs) == 0 {
-		return r.st.LoadConfigWindow(ctx, req.Cluster, req.Start, req.End)
-	}
+// loadWindow loads the selected ingress cluster's window: one
+// store.LoadTrafficWindow per destination IP, rows unioned — multi-A-record
+// DNS answers are a union of candidates WITHIN the one selected cluster
+// (design §9.2 / D10; cross-cluster unions are forbidden).
+func (r *Resolver) loadWindow(ctx context.Context, cluster string, req build.RouteRequest) (store.TrafficWindow, error) {
 	var out store.TrafficWindow
 	for _, ip := range req.IPs {
-		w, err := r.st.LoadTrafficWindow(ctx, req.Cluster, ip, req.Start, req.End)
+		w, err := r.st.LoadTrafficWindow(ctx, cluster, ip, req.Start, req.End)
 		if err != nil {
 			return store.TrafficWindow{}, err
 		}
@@ -158,12 +187,9 @@ func (r *Resolver) loadWindow(ctx context.Context, req build.RouteRequest) (stor
 	return out, nil
 }
 
-// candidatesAt returns the gateway candidates for one segment: the IP 3-hop
-// union in traffic_simulation mode, every live gateway in config_only mode.
+// candidatesAt returns the gateway candidates for one segment: the union of
+// the per-IP 3-hop results within the loaded (single-cluster) window.
 func (r *Resolver) candidatesAt(mw *memwindow.Window, req build.RouteRequest, t time.Time) []store.GatewayCand {
-	if len(req.IPs) == 0 {
-		return mw.GatewaysLiveAt(t)
-	}
 	var cands []store.GatewayCand
 	seen := map[string]bool{}
 	for _, ip := range req.IPs {

@@ -136,14 +136,16 @@ live under `openspec/specs/`.
     endpoint aggregation), so a family sibling holding it is **not** enough.
     This single anchor-membership test uniformly covers an anchor whose own
     cluster lacks the Service, an `"unknown"`/empty/bogus anchor, **and** the
-    fully-unlabelled single-cluster case — `clusterFamilyKey("unknown") =
+    fully-unlabelled single-cluster case — `ClusterFamilyKey("unknown") =
     "unknown"` is a family-of-one, so an `"unknown"`-bucketed Service makes
     `"unknown"` a legitimate holder. There is **NO unknown-family fallback and
     NO cross-family resolution**. The anchor materialises **one** node
     (`id="<anchor>/<namespace>/<service>"`, `labels={cluster,namespace}`,
     `ipaddress=[cluster_ip]` from the anchor's own `kube_service_info` unless
     headless `cluster_ip="None"`) and yields **one** `pod-calls-service` edge
-    (always intra-cluster — **`may_cross_cluster: false`**). **Cross-cluster
+    (this D29 path is always intra-cluster by construction; the TYPE is
+    registered `may_cross_cluster: true` only because the route-engine path
+    below can anchor on a sibling cluster). **Cross-cluster
     `service-selects-pod` fan-out**: from that single node, one edge is emitted
     per backing pod across the **UNION of `EndpointsByService` over every
     same-family cluster holding the same-named Service** — two clusters are in
@@ -161,7 +163,8 @@ live under `openspec/specs/`.
     node — an operator signal. Candidates are iterated in sorted order, the
     anchor-membership test and the endpoint union are order-free, and
     `service-selects-pod` edges dedupe by `(service-node, pod)` (determinism).
-    The family rule (`build.clusterFamilyKey`) and the membership/union logic
+    The family rule (`build.ClusterFamilyKey`, exported so pkg/route's
+    ingress-cluster pick shares it) and the membership/union logic
     are hardcoded pure functions — no knob, no PromQL change (filtering is
     in-memory at resolution, preserving "no filters pushed to PromQL"). The
     3-label form drops the leading pod-hostname and resolves as its parent
@@ -287,12 +290,14 @@ live under `openspec/specs/`.
   step added to the enrichment above. When `--route-store-dsn` /
   `KSG_ROUTE_STORE_DSN` is set, every point where `resolveUnknownServerPeer`
   would emit an external node first consults an Istio route-resolution engine:
-  which Kubernetes Service did the anchor cluster's Gateway + VirtualService
-  config route `(host, "/", port)` to during the request's own `[start, end]`?
-  A hit resolves through the SAME `resolveServiceLevel` as every other path
-  (anchor-membership test, one service node, `pod-calls-service` edge,
-  family-wide `service-selects-pod` fan-out); any miss/error degrades to the
-  existing external node — route resolution can NEVER fail a build. Key facts:
+  which Kubernetes Service did the **engine-selected ingress cluster's** Gateway
+  + VirtualService config route `(host, "/", port)` to during the request's own
+  `[start, end]`? A hit resolves through the SAME `resolveServiceLevel` as every
+  other path — anchored on the **selected ingress cluster** (`dest.Cluster`),
+  not the caller's (membership test, one service node, `pod-calls-service`
+  edge — which therefore MAY cross clusters, family-wide `service-selects-pod`
+  fan-out); any miss/error degrades to the existing external node — route
+  resolution can NEVER fail a build. Key facts:
   **(1) The trigger is ALL THREE external branches**, not just "not k8s DNS" —
   `classifyK8sDNS` splits on dots, so a global FQDN like `api.example.com`
   (3 labels) is *successfully* classified (service `example`, namespace `com`)
@@ -310,11 +315,23 @@ live under `openspec/specs/`.
   (a :443-only Gateway or an httpsRedirect :80 stub is the common ingress
   shape; a wrong port fails as "no listener" — logged distinctly as
   `route_engine_no_listener_on_port` — never as a wrong destination).
-  **(4) Optional `client_dns_answers` dimension** carries destination IPs:
-  present ⇒ the ClickHouse IP 3-hop narrows candidate Gateways
-  (traffic_simulation); absent ⇒ the host resolves over all the cluster's
-  Gateways (config_only). **(5) The engine** (`pkg/route`) loads a versioned,
-  **cluster-scoped, read-only** ClickHouse window (written by the
+  **(4) The `client_dns_answers` dimension is REQUIRED** (D6 rev): its IPs
+  select the ingress cluster and feed the ClickHouse IP 3-hop; no parseable IP
+  ⇒ the engine is NEVER consulted (prescan skip, no store read, distinct
+  `route_engine_no_ip` reason) — config_only mode and `LoadConfigWindow` were
+  removed. **(4b) Ingress-cluster selection** (D10, `pickIngressCluster` — a
+  pure function in `pkg/route`): per IP, the store probe
+  `ClustersWithIngressIP` (the store's ONLY cross-cluster read) yields the
+  candidate clusters G; F = G ∩ caller's family (`build.ClusterFamilyKey`,
+  exported). |F|==1 → it; |F|>1 → caller if caller∈F else ambiguous; F empty
+  and |G|==1 → it; |G|>1 → caller if caller∈G else ambiguous; G empty →
+  no-ingress. Multi-IP selections must all agree or degrade ambiguous;
+  candidate sets / windows are NEVER unioned across clusters. Misses surface as
+  `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
+  `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
+  `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
+  **(5) The engine** (`pkg/route`) loads a versioned,
+  **ingress-cluster-scoped, read-only** ClickHouse window (written by the
   metadata-exporter repo; schema drift fails fast at startup; reads use the
   no-FINAL pattern — `valid_to` NEVER filtered in SQL, client-side dedup per
   version slot by max ingest_seq, overlap checked post-dedup — because the
@@ -352,8 +369,10 @@ live under `openspec/specs/`.
   builder and the registry in the same change; the API can never list a type
   the builder cannot produce. Current edge types include `pod-calls-pod`,
   `pod-calls-service` (emitted when a `"://"` connection-string resolves to a
-  service node in the caller's OWN cluster; always intra-cluster —
-  `may_cross_cluster: false`), and `service-selects-pod` (directed service →
+  service node in the caller's OWN cluster — that path stays intra-cluster —
+  OR when the route engine resolves a global FQDN to a Service in the
+  engine-selected ingress cluster, which may be a family sibling, so the type
+  is `may_cross_cluster: true`), and `service-selects-pod` (directed service →
   pod, emitted on demand by the D29 connection-string resolution; the local
   service node fans out across same-family clusters holding the same-named
   Service, so it MAY be cross-cluster — `may_cross_cluster: true`).

@@ -88,8 +88,8 @@ func TestEdgeTypeServiceSelectsPod_Registered(t *testing.T) {
 	if podCallsService == nil {
 		t.Fatal("EdgeTypePodCallsService is not registered")
 	}
-	if podCallsService.MayCrossCluster {
-		t.Error("pod-calls-service resolves to a Service node in the caller's own cluster — always intra-cluster (may_cross_cluster=false)")
+	if !podCallsService.MayCrossCluster {
+		t.Error("pod-calls-service may cross clusters: a route-engine-resolved endpoint anchors on the selected ingress cluster, which may be a family sibling of the caller's (may_cross_cluster=true)")
 	}
 	if !containsNodeType(podCallsService.TargetType, NodeTypeService) {
 		t.Errorf("pod-calls-service target_type = %v, want to contain service", podCallsService.TargetType)

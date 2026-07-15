@@ -18,9 +18,12 @@ VirtualServices, 0 mismatches against a by-construction oracle).
 
 - Add a new, **last** classification step to `resolveUnknownServerPeer`: at every point where it would
   today fall back to an `external` node, consult an **Istio route-resolution engine** with
-  `(anchor cluster, host, path, port, dst IPs, [start, end])` and, on a hit, resolve the returned
+  `(caller cluster, host, path, port, dst IPs, [start, end])` and, on a hit, resolve the returned
   destination through the existing `resolveServiceLevel` — producing an ordinary `service` node and a
-  `pod-calls-service` edge, indistinguishable from any other D29-resolved service node.
+  `pod-calls-service` edge, indistinguishable from any other D29-resolved service node. The engine
+  selects the **ingress cluster** from the destination IPs (family-first, caller tie-break — design
+  D10); the resolved service node lives in that cluster, so the `pod-calls-service` edge MAY cross
+  clusters (design D12).
 - The engine is consulted at **all three** existing external-fallback branches, not just the obvious
   one. `classifyK8sDNS` splits on dots, so a 3-label FQDN like `api.example.com` is *successfully*
   classified as service `example` in namespace `com` and only then misses in `resolveServiceLevel` —
@@ -34,10 +37,11 @@ VirtualServices, 0 mismatches against a by-construction oracle).
   `RouteConfiguration`, and route matching via the native `router_check_tool` binary. **`pkg/build`
   declares only the interface and MUST NOT import `pkg/route`**, so an embedder of `pkg/kubegraph`
   never links istio or ClickHouse.
-- Read two **new optional** service-graph dimensions, both degrading gracefully when absent:
-  `client_dns_answers` (destination IP → the Gateway 3-hop; absent ⇒ resolve the host over all the
-  cluster's Gateways) and `client_server_port` / `client_net_peer_port` (ingress listener port).
-  `stripPeerAddressPort` now **returns** the port it currently discards; port precedence is
+- Read two **new** service-graph dimensions: `client_dns_answers` (destination IPs — a
+  **precondition**: they select the ingress cluster and feed the Gateway 3-hop; absent ⇒ the engine is
+  never consulted and the endpoint stays external — design D6/D10) and the optional
+  `client_server_port` / `client_net_peer_port` (ingress listener port, degrading gracefully when
+  absent). `stripPeerAddressPort` now **returns** the port it currently discards; port precedence is
   peer-address `:port` → the optional label → default **443**.
 - **No PromQL / selector change**, no new node type, no new edge type, no new node attribute, no new
   `labels` key. The destination's port and DestinationRule subset are parsed but discarded in v1.
@@ -55,8 +59,10 @@ VirtualServices, 0 mismatches against a by-construction oracle).
 - `pod-service-graph`: extends the "Unknown-server peer-label enrichment" requirement with a
   route-resolution step that runs at every external fallback, resolving a global/ingress FQDN to the
   Kubernetes Service the Istio Gateway + VirtualService config actually routed it to over the
-  request's own time window. Adds the optional `client_dns_answers` and `client_server_port` /
-  `client_net_peer_port` dimensions and the listener-port derivation rule.
+  request's own time window. Adds the `client_dns_answers` dimension (required for engine
+  consultation; its IPs select the ingress cluster) and the optional `client_server_port` /
+  `client_net_peer_port` dimensions with the listener-port derivation rule. Relaxes the
+  `pod-calls-service` edge type to `may_cross_cluster: true`.
 
 ## Impact
 
