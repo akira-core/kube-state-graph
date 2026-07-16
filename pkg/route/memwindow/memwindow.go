@@ -99,7 +99,7 @@ func (m *Window) ResolveIPToGateways(ip string, t time.Time) []store.GatewayCand
 	found := false
 	for i := range m.w.Services {
 		r := &m.w.Services[i]
-		if asOf(r.ValidFrom, r.ValidTo, t) && contains(r.IngressIPs, ip) {
+		if asOf(r.ValidFrom, r.ValidTo, t) && r.HasIngressIP(ip) {
 			svcNS, svcSel, found = r.Namespace, r.Selector, true
 			break
 		}

@@ -264,7 +264,7 @@ var pjUnmarshal = protojson.UnmarshalOptions{DiscardUnknown: true}
 // kube-state-graph only asserts the columns it reads exist. Column names are a
 // case-sensitive contract (design.md D26 style).
 var expectedSchema = map[string][]string{
-	"service_versions": {"cluster", "namespace", "name", "valid_from", "valid_to", "ingress_ips", "selector_kv", "spec_json", "ingest_seq"},
+	"service_versions": {"cluster", "namespace", "name", "valid_from", "valid_to", "external_ips", "loadbalancer_ips", "selector_kv", "spec_json", "ingest_seq"},
 	"deploy_versions":  {"cluster", "namespace", "name", "valid_from", "valid_to", "pod_labels_kv", "ingest_seq"},
 	"gw_versions":      {"cluster", "namespace", "name", "valid_from", "valid_to", "selector_kv", "server_hosts", "spec_json", "ingest_seq"},
 	"vs_versions":      {"cluster", "namespace", "name", "valid_from", "valid_to", "bound_gateways", "spec_json", "ingest_seq"},
@@ -342,12 +342,13 @@ func svcVer(r ServiceRow) versionRow {
 func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 time.Time) (TrafficWindow, error) {
 	var w TrafficWindow
 
-	// 1. Ingress Service versions serving this IP.
+	// 1. Ingress Service versions serving this IP (either external_ips or
+	// loadbalancer_ips — either array counts).
 	svcRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT cluster, namespace, name, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
+		`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
 		 FROM service_versions
-		 WHERE cluster = ? AND has(ingress_ips, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
-		cluster, ip)
+		 WHERE cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+		cluster, ip, ip)
 	if err != nil {
 		return w, fmt.Errorf("window ingress services: %w", err)
 	}
@@ -458,17 +459,18 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 // the distinct clusters that had an ingress LB Service version carrying ip
 // overlapping [t0,t1). It deliberately carries no cluster predicate — that is
 // its whole job — bounded by the small number of ingress-LB Service versions
-// (has(ingress_ips, ...) only matches ingress rows) and valid_from < t1. The
-// same no-FINAL pattern as the window loads applies: only the dedup envelope
-// is selected, valid_to is never filtered in SQL (except under the uniqueRows
-// prune), the client dedups per version slot and applies the overlap check
-// after. The result is deduplicated and sorted for determinism.
+// (has(external_ips, ...) OR has(loadbalancer_ips, ...) only matches ingress
+// rows) and valid_from < t1. The same no-FINAL pattern as the window loads
+// applies: only the dedup envelope is selected, valid_to is never filtered in
+// SQL (except under the uniqueRows prune), the client dedups per version slot
+// and applies the overlap check after. The result is deduplicated and sorted
+// for determinism.
 func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error) {
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(
 		`SELECT cluster, namespace, name, valid_from, valid_to, ingest_seq
 		 FROM service_versions
-		 WHERE has(ingress_ips, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
-		ip)
+		 WHERE (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+		ip, ip)
 	if err != nil {
 		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
 	}
@@ -591,7 +593,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficWindow, cluster st
 	var backends []ServiceRow
 	for _, chunk := range chunkStrings(backendKeys(destHosts), hostChunk) {
 		bsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT cluster, namespace, name, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
+			`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
 			 FROM service_versions
 			 WHERE cluster = ? AND has(?, concat(namespace, '/', name)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 			cluster, chunk)
@@ -620,7 +622,7 @@ func scanServiceRow(rows driver.Rows) (ServiceRow, error) {
 	var r ServiceRow
 	var specJSON string
 	if err := rows.Scan(&r.Cluster, &r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo,
-		&r.IngressIPs, &r.Selector, &specJSON, &r.IngestSeq); err != nil {
+		&r.ExternalIPs, &r.LoadBalancerIPs, &r.Selector, &specJSON, &r.IngestSeq); err != nil {
 		return r, err
 	}
 	ports, err := ParsePorts(specJSON)

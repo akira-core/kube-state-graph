@@ -264,9 +264,10 @@ endpoint carried no IPs" apart from "engine off"). Graph output is byte-for-byte
 engine-off case for such endpoints.
 
 With IPs present, the engine first selects the ingress cluster (D10), then runs the ClickHouse
-**3-hop** (`has(ingress_ips, ip)` → ingress Service selector → `hasAll(pod_labels_kv, sel)` →
-ingress Deployment pod labels L → `hasAll(L, selector_kv)` → candidate Gateways) within that one
-cluster and disambiguates the host **among those candidates** (`gwresolve.ResolveAmong`).
+**3-hop** (`has(external_ips, ip) OR has(loadbalancer_ips, ip)` → ingress Service selector →
+`hasAll(pod_labels_kv, sel)` → ingress Deployment pod labels L → `hasAll(L, selector_kv)` →
+candidate Gateways) within that one cluster and disambiguates the host **among those candidates**
+(`gwresolve.ResolveAmong`).
 
 `LoadConfigWindow` is deleted from `store.Store` and its ClickHouse implementation — the repo rule
 forbids production code kept only for tests, and no production path reads it any more.
@@ -284,16 +285,17 @@ The POC schema assumes a single Kubernetes cluster. kube-state-graph is multi-cl
 query a `cluster = ?` predicate — bound to the **engine-selected ingress cluster** (D10), not to the
 caller's cluster. The **one deliberate cross-cluster read** in the whole store is the selection
 probe, `ClustersWithIngressIP(ctx, ip, t0, t1) ([]string, error)`: the distinct clusters that had an
-ingress LB Service version carrying `ip` overlapping `[t0, t1)`. It follows the same no-FINAL
-semantics as the window loads (select the dedup envelope `cluster, namespace, name, valid_from,
-valid_to, ingest_seq`; `valid_to` never filtered in SQL except under pruned mode; client-side
-`dedupLatest` then the `t0 < valid_to` overlap check; then distinct clusters, **sorted** for
-determinism). It scans `service_versions` without a cluster predicate — bounded by the small number
-of ingress LB Service versions and the `valid_from < t1` predicate:
+ingress LB Service version carrying `ip` in `external_ips` or `loadbalancer_ips` overlapping
+`[t0, t1)`. It follows the same no-FINAL semantics as the window loads (select the dedup envelope
+`cluster, namespace, name, valid_from, valid_to, ingest_seq`; `valid_to` never filtered in SQL except
+under pruned mode; client-side `dedupLatest` then the `t0 < valid_to` overlap check; then distinct
+clusters, **sorted** for determinism). It scans `service_versions` without a cluster predicate —
+bounded by the small number of ingress LB Service versions and the `valid_from < t1` predicate:
 
 ```
 service_versions(cluster, namespace, name, valid_from, valid_to,
-                 ingress_ips Array(String), selector_kv Array(String), spec_json, ingest_seq)
+                 external_ips Array(String), loadbalancer_ips Array(String),
+                 selector_kv Array(String), spec_json, ingest_seq)
 deploy_versions (cluster, namespace, name, valid_from, valid_to,
                  pod_labels_kv Array(String), ingest_seq)
 gw_versions     (cluster, namespace, name, valid_from, valid_to,
@@ -301,6 +303,10 @@ gw_versions     (cluster, namespace, name, valid_from, valid_to,
 vs_versions     (cluster, namespace, name, valid_from, valid_to,
                  bound_gateways Array(String), spec_json, ingest_seq)
 ```
+
+Hop-1 / the `ClustersWithIngressIP` probe match an IP when it appears in **either**
+`external_ips` or `loadbalancer_ips` (`has(external_ips, ip) OR has(loadbalancer_ips, ip)`).
+There is no combined `ingress_ips` column.
 
 Note there is **no `rev` column**: that was the POC corpus's synthetic oracle field. The production
 tables identify versions by `resource_version` + `ingest_seq` envelope columns, and the reader never

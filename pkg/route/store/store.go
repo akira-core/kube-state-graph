@@ -17,13 +17,13 @@ import (
 	"time"
 )
 
-// ServiceRow is one service_versions row (ingress LB: IngressIPs/Selector set,
-// Ports empty; backend: Ports set, IngressIPs empty). One row per Service
-// version — a backend Service's ports all live in Ports (decoded from the
-// spec_json column), so a multi-port Service is a single row, not one row per
-// port. The backend Service's identity is (Cluster, Namespace, Name); its FQDN
-// (the destination.host a VS routes to) is derived — see BackendFQDN /
-// ParseBackendHost.
+// ServiceRow is one service_versions row (ingress LB: ExternalIPs and/or
+// LoadBalancerIPs set plus Selector; Ports empty; backend: Ports set, both IP
+// arrays empty). One row per Service version — a backend Service's ports all
+// live in Ports (decoded from the spec_json column), so a multi-port Service
+// is a single row, not one row per port. The backend Service's identity is
+// (Cluster, Namespace, Name); its FQDN (the destination.host a VS routes to)
+// is derived — see BackendFQDN / ParseBackendHost.
 //
 // No Rev field on any row type: `rev` was the POC corpus's synthetic oracle
 // column. The production tables the exporter writes identify versions by
@@ -31,12 +31,29 @@ import (
 // needed a rev, and selecting it against production would fail with
 // Unknown column.
 type ServiceRow struct {
-	Cluster              string
-	Namespace, Name      string
-	ValidFrom, ValidTo   time.Time
-	IngressIPs, Selector []string
-	Ports                []SvcPort
-	IngestSeq            uint64
+	Cluster                      string
+	Namespace, Name              string
+	ValidFrom, ValidTo           time.Time
+	ExternalIPs, LoadBalancerIPs []string
+	Selector                     []string
+	Ports                        []SvcPort
+	IngestSeq                    uint64
+}
+
+// HasIngressIP reports whether ip appears in ExternalIPs or LoadBalancerIPs
+// (the hop-1 / probe match: either array counts).
+func (r ServiceRow) HasIngressIP(ip string) bool {
+	for _, a := range r.ExternalIPs {
+		if a == ip {
+			return true
+		}
+	}
+	for _, a := range r.LoadBalancerIPs {
+		if a == ip {
+			return true
+		}
+	}
+	return false
 }
 
 // SvcPort is one Service port. JSON tags match the corev1 ServiceSpec.ports
@@ -172,11 +189,12 @@ type Store interface {
 
 	// ClustersWithIngressIP is the store's ONLY cross-cluster read: the
 	// distinct clusters that had an ingress LB Service version carrying ip
-	// overlapping [t0,t1). It feeds the ingress-cluster selection (design
-	// D10) — ClickHouse's whole job there is answering "ip → []cluster". The
-	// same no-FINAL semantics as the window load apply (valid_to never
-	// filtered in SQL except under the uniqueRows prune; client-side dedup
-	// per version slot by max ingest_seq; overlap checked post-dedup). The
-	// result is deduplicated and sorted for determinism.
+	// in external_ips or loadbalancer_ips overlapping [t0,t1). It feeds the
+	// ingress-cluster selection (design D10) — ClickHouse's whole job there
+	// is answering "ip → []cluster". The same no-FINAL semantics as the
+	// window load apply (valid_to never filtered in SQL except under the
+	// uniqueRows prune; client-side dedup per version slot by max
+	// ingest_seq; overlap checked post-dedup). The result is deduplicated
+	// and sorted for determinism.
 	ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error)
 }
