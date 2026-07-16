@@ -84,6 +84,19 @@ type segmentResult struct {
 // closest to the request's end time. Misses fold to the deepest pipeline stage
 // any segment reached (see outcomeRank).
 func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
+	return r.resolve(ctx, req, r.st.ClustersWithIngressIP)
+}
+
+// ingressIPProbe answers "which clusters had an ingress Service carrying ip
+// overlapping [t0,t1)?" — the shape of store.ClustersWithIngressIP. resolve
+// takes it as a seam so a per-build scope (scopedResolver) can memoise the
+// probe without duplicating the pipeline.
+type ingressIPProbe func(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error)
+
+// resolve is ResolveRoute's body with the ingress-IP probe injected. The base
+// resolver passes r.st.ClustersWithIngressIP directly; the per-build scope
+// passes a memoising wrapper. Everything downstream is identical.
+func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe ingressIPProbe) (build.RouteDestination, build.RouteOutcome, error) {
 	if len(req.IPs) == 0 {
 		// Defensive: the prescan never emits an IP-less request (design D6) —
 		// without a destination IP no ingress cluster can be selected.
@@ -95,7 +108,7 @@ func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (bu
 	// so multi-IP answers must agree — never unioned across clusters.
 	perIP := make([][]string, len(req.IPs))
 	for i, ip := range req.IPs {
-		cands, err := r.st.ClustersWithIngressIP(ctx, ip, req.Start, req.End)
+		cands, err := probe(ctx, ip, req.Start, req.End)
 		if err != nil {
 			return build.RouteDestination{}, build.RouteNoGateway, err
 		}

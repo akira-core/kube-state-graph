@@ -113,3 +113,28 @@ const (
 type RouteResolver interface {
 	ResolveRoute(ctx context.Context, req RouteRequest) (RouteDestination, RouteOutcome, error)
 }
+
+// BuildScopedRouteResolver is an OPTIONAL upgrade interface a RouteResolver may
+// implement to mint a per-build scope carrying request-invariant memoisation.
+// The engine's ingress-cluster probe (store.ClustersWithIngressIP) depends only
+// on (ip, start, end), all constant across one build's keys, yet the base
+// resolver re-runs it once per (key, ip) — the same cross-cluster store read
+// repeated whenever keys share a destination IP. resolveRouteQueries upgrades
+// when this is implemented and drives every ResolveRoute of that build through
+// the returned scope, so identical probes collapse to one store read.
+//
+// The scope lives for exactly ONE build, is called SERIALLY (the prescan loop),
+// and therefore need NOT be safe for concurrent use — unlike the base resolver,
+// which is shared across concurrent builds and must stay stateless. A cache on
+// the shared resolver would instead grow unbounded across builds; the per-build
+// scope is the correct lifetime.
+//
+// This is an optional interface (idiomatic Go, cf. http.Flusher) so the base
+// RouteResolver contract is unchanged: a resolver that does not implement it
+// (including mocks and any embedder's resolver) runs exactly as before.
+type BuildScopedRouteResolver interface {
+	RouteResolver
+	// BuildScoped returns a resolver scoped to a single build. Callers use it
+	// for the duration of one build and then discard it.
+	BuildScoped() RouteResolver
+}

@@ -35,6 +35,48 @@ func (f *fakeRouteResolver) ResolveRoute(_ context.Context, req RouteRequest) (R
 	return f.fn(req)
 }
 
+// scopeAwareResolver implements the optional BuildScopedRouteResolver upgrade:
+// BuildScoped returns a distinct per-build resolver (scope) that records the
+// requests it saw. It lets resolveRouteQueries prove it routes every call
+// through the scope rather than the base resolver.
+type scopeAwareResolver struct {
+	fakeRouteResolver
+	scope       *fakeRouteResolver
+	scopedCalls int
+}
+
+func (s *scopeAwareResolver) BuildScoped() RouteResolver {
+	s.scopedCalls++
+	if s.scope == nil {
+		s.scope = &fakeRouteResolver{fn: s.fn}
+	}
+	return s.scope
+}
+
+// When the resolver implements BuildScopedRouteResolver, resolveRouteQueries
+// mints one scope per build and drives every ResolveRoute through it — the base
+// resolver sees nothing. A plain fakeRouteResolver (no BuildScoped) is left
+// untouched, so the non-implementing path is unchanged.
+func TestResolveRouteQueries_UpgradesToBuildScoped(t *testing.T) {
+	hit := func(RouteRequest) (RouteDestination, RouteOutcome, error) {
+		return RouteDestination{}, RouteNoIngress, nil
+	}
+	res := &scopeAwareResolver{fakeRouteResolver: fakeRouteResolver{fn: hit}}
+	keys := []routeKey{
+		{callerCluster: "cluster-alpha", host: "api.example.com", path: "/", port: 443, ips: testDNSAnswer},
+		{callerCluster: "cluster-beta", host: "other.example.com", path: "/", port: 443, ips: testDNSAnswer},
+	}
+	start, end := time.Unix(1_700_000_000, 0).UTC(), time.Unix(1_700_000_300, 0).UTC()
+
+	idx := resolveRouteQueries(context.Background(), res, 0, keys, start, end)
+
+	require.Len(t, idx, len(keys))
+	assert.Equal(t, 1, res.scopedCalls, "exactly one scope minted per build")
+	require.NotNil(t, res.scope)
+	assert.Len(t, res.scope.seen, len(keys), "every call routed through the scope")
+	assert.Empty(t, res.seen, "base resolver saw nothing once upgraded")
+}
+
 // unknownPeerSample builds one server="unknown" sample whose client resolves
 // to the real topology pod "abc" (cluster-alpha), with peer set on
 // client_net_peer_name, the default client_dns_answers IP, and any extra

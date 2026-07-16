@@ -232,3 +232,13 @@ testcontainer in group 8 seeds the schema itself, so implementation is not block
       (ingress-cluster selection + new scenarios), proposal.md, CLAUDE.md; `make test`, `make
       lint`, `make check-route-containment`, `make check-docs`, both route suites, `-tags oracle`
       sanity, `openspec validate`.
+- [x] 13.9 Perf (design D13): memoise the D10 ingress-IP probe per build. Declare optional
+      `build.BuildScopedRouteResolver` (`RouteResolver` + `BuildScoped() RouteResolver`);
+      `resolveRouteQueries` upgrades via type-assert so keys sharing a destination IP collapse to
+      one `ClustersWithIngressIP` read. `pkg/route`: factor `ResolveRoute` into
+      `resolve(ctx, req, probe)` with the probe injected; `*Resolver.BuildScoped` returns a
+      `scopedResolver` (`pkg/route/scoped.go`) memoising per `(ip, start, end)` — errors NOT
+      cached; serial, one-build lifetime (the shared `*Resolver` stays stateless). Unit tests:
+      `TestResolver_ImplementsBuildScoped`, `TestBuildScoped_ProbeMemoised`,
+      `TestBuildScoped_ProbeErrorNotCached` (pkg/route), `TestResolveRouteQueries_UpgradesToBuildScoped`
+      (pkg/build). No outcome/determinism/golden change.

@@ -290,6 +290,12 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	if resolver == nil {
 		return nil
 	}
+	// Upgrade to a per-build scope when the resolver offers one: keys sharing a
+	// destination IP then collapse to a single ingress-cluster store read
+	// (BuildScopedRouteResolver). The scope is used serially for this build only.
+	if s, ok := resolver.(BuildScopedRouteResolver); ok {
+		resolver = s.BuildScoped()
+	}
 	idx := make(routeIndex, len(keys))
 	for _, k := range keys {
 		callCtx, cancel := ctx, context.CancelFunc(func() {})
