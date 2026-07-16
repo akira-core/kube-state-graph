@@ -39,15 +39,16 @@ const CHImage = "clickhouse/clickhouse-server:25.5"
 // pkg/route/store.expectedSchema.
 var routeChDDL = []string{
 	`CREATE TABLE service_versions (
-		cluster     LowCardinality(String),
-		namespace   LowCardinality(String),
-		name        String,
-		valid_from  DateTime64(3),
-		valid_to    DateTime64(3),
-		ingress_ips Array(String),
-		selector_kv Array(String),
-		spec_json   String,
-		ingest_seq  UInt64
+		cluster           LowCardinality(String),
+		namespace         LowCardinality(String),
+		name              String,
+		valid_from        DateTime64(3),
+		valid_to          DateTime64(3),
+		external_ips      Array(String),
+		loadbalancer_ips  Array(String),
+		selector_kv       Array(String),
+		spec_json         String,
+		ingest_seq        UInt64
 	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (cluster, namespace, name, valid_from)`,
 	`CREATE TABLE deploy_versions (
 		cluster       LowCardinality(String),
@@ -89,7 +90,7 @@ var (
 )
 
 const (
-	// ingressLBIP fronts cluster-alpha's ingress gateway.
+	// ingressLBIP fronts cluster-alpha's ingress gateway (loadbalancer_ips).
 	ingressLBIP = "203.0.113.50"
 	// ingressLBIP2 fronts cluster-beta's ingress gateway — the cross-cluster
 	// selection fixture (caller in alpha, ingress in beta).
@@ -98,6 +99,9 @@ const (
 	// a rewrite before the query window: the probe must see the pair collapse
 	// (no-FINAL dedup) and report no cluster for it.
 	ingressLBIPGone = "203.0.113.70"
+	// ingressExtIP fronts cluster-alpha via external_ips only (no LB array
+	// entry) — proves the probe OR-matches either column.
+	ingressExtIP = "203.0.113.80"
 )
 
 // dt64s renders a time as the string form ClickHouse parses into DateTime64(3)
@@ -310,9 +314,14 @@ func (s *RouteSuite) seedRouteStore() {
 		s.Require().NoError(s.chConn.Exec(ctx, query, args...))
 	}
 	// Ingress LB Service (Hop 1 of the 3-hop) + ingress Deployment (Hop 2).
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+	// loadbalancer_ips carries ingressLBIP; a second Service carries
+	// ingressExtIP in external_ips only (probe OR coverage).
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{ingressLBIP}, []string{"istio=ingressgateway"}, "", uint64(1))
+		[]string{}, []string{ingressLBIP}, []string{"istio=ingressgateway"}, "", uint64(1))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "igw-ext", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{ingressExtIP}, []string{}, []string{"istio=ingressgateway"}, "", uint64(17))
 	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "igw-deploy", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"istio=ingressgateway"}, uint64(2))
@@ -345,12 +354,12 @@ func (s *RouteSuite) seedRouteStore() {
 		cluster, "istio-system", "api8080-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"public-gw-http"}, vs8080, uint64(8))
 	// Backend destination Services.
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		cluster, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{}, []string{}, backendSpec, uint64(9))
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		[]string{}, []string{}, []string{}, backendSpec, uint64(9))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		cluster, "shop", "reviews", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{}, []string{}, backendSpec, uint64(16))
+		[]string{}, []string{}, []string{}, backendSpec, uint64(16))
 
 	// cluster-beta: a family-foreign cluster fronted by ingressLBIP2 whose
 	// gateway serves cross.example.com. A caller in cluster-alpha reaches it
@@ -374,9 +383,9 @@ func (s *RouteSuite) seedRouteStore() {
 			}}},
 		}},
 	})
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		beta, "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{ingressLBIP2}, []string{"istio=ingressgateway"}, "", uint64(10))
+		[]string{}, []string{ingressLBIP2}, []string{"istio=ingressgateway"}, "", uint64(10))
 	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
 		beta, "istio-system", "igw-deploy", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"istio=ingressgateway"}, uint64(11))
@@ -386,21 +395,21 @@ func (s *RouteSuite) seedRouteStore() {
 	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
 		beta, "shop", "cross-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"istio-system/public-gw"}, vsBeta, uint64(13))
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		beta, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{}, []string{}, backendSpec, uint64(14))
+		[]string{}, []string{}, []string{}, backendSpec, uint64(14))
 
 	// cluster-gone: an ingress Service version carrying ingressLBIPGone,
 	// closed by a REWRITE (same version slot, higher ingest_seq, valid_to
 	// pulled in) two hours before fixedNow. Without the probe's client-side
 	// dedup the stale open row (far-future valid_to) would overlap the window
 	// and a dead cluster would appear to serve the IP.
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(20))
-	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(20))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(fixedNow.Add(-2*time.Hour)),
-		[]string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(21))
+		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(21))
 }
 
 // SetupTest seeds the VM fixtures every test shares: the client pod, the
@@ -648,9 +657,10 @@ func (s *RouteStoreSuite) TestTrafficWindowThreeHopAndTranslate() {
 
 // TestClustersWithIngressIPProbe covers the ingress-cluster selection probe —
 // the store's ONLY cross-cluster read (design D10): each seeded LB IP names
-// exactly its own cluster, an unknown IP names none, and a version pair whose
-// open row was closed by a rewrite BEFORE the window collapses under the
-// probe's no-FINAL dedup instead of resurrecting a dead cluster.
+// exactly its own cluster, an external_ips-only IP also matches, an unknown
+// IP names none, and a version pair whose open row was closed by a rewrite
+// BEFORE the window collapses under the probe's no-FINAL dedup instead of
+// resurrecting a dead cluster.
 func (s *RouteStoreSuite) TestClustersWithIngressIPProbe() {
 	ctx := context.Background()
 	st, err := routestore.Open(ctx, s.chDSN)
@@ -661,6 +671,11 @@ func (s *RouteStoreSuite) TestClustersWithIngressIPProbe() {
 	alpha, err := st.ClustersWithIngressIP(ctx, ingressLBIP, t0, t1)
 	s.Require().NoError(err)
 	s.Equal([]string{"cluster-alpha"}, alpha)
+
+	extOnly, err := st.ClustersWithIngressIP(ctx, ingressExtIP, t0, t1)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-alpha"}, extOnly,
+		"an IP present only in external_ips must still name its cluster")
 
 	beta, err := st.ClustersWithIngressIP(ctx, ingressLBIP2, t0, t1)
 	s.Require().NoError(err)
