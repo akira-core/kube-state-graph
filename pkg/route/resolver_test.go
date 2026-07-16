@@ -149,3 +149,59 @@ func TestResolveRoute_ProbeErrorPropagates(t *testing.T) {
 	_, _, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
 	assert.ErrorIs(t, err, probeErr)
 }
+
+// ---------------------------------------------------------------------------
+// BuildScoped: per-build memoisation of the ingress-IP probe (perf fix).
+// ---------------------------------------------------------------------------
+
+// *Resolver satisfies the optional upgrade interface, so the prescan drives
+// every ResolveRoute of a build through one scope.
+func TestResolver_ImplementsBuildScoped(t *testing.T) {
+	var _ build.BuildScopedRouteResolver = NewResolver(storemocks.NewMockStore(t), matchcheck.Runner{})
+}
+
+// Two requests in one scope sharing a destination IP probe the store ONCE:
+// ClustersWithIngressIP.Once() fails if the memo does not collapse the second
+// call. Distinct hosts/callers prove the memo keys on (ip, start, end), not on
+// the whole request. Both take the no-ingress miss path, so no window load runs.
+func TestBuildScoped_ProbeMemoised(t *testing.T) {
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return(nil, nil).Once()
+	scope := NewResolver(st, matchcheck.Runner{}).BuildScoped()
+
+	req1 := testRequest("prod-01", "198.51.100.7")
+	req1.Host = "api.example.com"
+	req2 := testRequest("prod-02", "198.51.100.7")
+	req2.Host = "other.example.com"
+
+	for _, req := range []build.RouteRequest{req1, req2} {
+		_, outcome, err := scope.ResolveRoute(context.Background(), req)
+		require.NoError(t, err)
+		assert.Equal(t, build.RouteNoIngress, outcome)
+	}
+}
+
+// A failed probe is NOT cached: a later request sharing the IP retries the
+// store. First call errors (propagated), second succeeds and proceeds into the
+// pipeline (empty window → RouteNoGateway).
+func TestBuildScoped_ProbeErrorNotCached(t *testing.T) {
+	probeErr := errors.New("store unreachable")
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return(nil, probeErr).Once()
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
+		Return(store.TrafficWindow{}, nil).Once()
+	scope := NewResolver(st, matchcheck.Runner{}).BuildScoped()
+
+	req := testRequest("prod-01", "198.51.100.7")
+
+	_, _, err := scope.ResolveRoute(context.Background(), req)
+	require.ErrorIs(t, err, probeErr)
+
+	_, outcome, err := scope.ResolveRoute(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteNoGateway, outcome)
+}

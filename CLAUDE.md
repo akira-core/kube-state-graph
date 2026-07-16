@@ -330,6 +330,15 @@ live under `openspec/specs/`.
   `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
   `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
   `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
+  The `ClustersWithIngressIP` probe is a pure function of `(ip, start, end)`
+  (constant across a build's keys), so it is **memoised per build** (D13): when
+  the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
+  (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
+  drives the whole build through one `scopedResolver` scope that caches the
+  probe by `(ip, start, end)`, collapsing keys that share a destination IP to a
+  single store read. The scope is one-build/serial (no mutex); the shared
+  `*Resolver` stays stateless (an instance cache would leak). Errors are not
+  cached; no outcome/determinism change.
   **(5) The engine** (`pkg/route`) loads a versioned,
   **ingress-cluster-scoped, read-only** ClickHouse window (written by the
   metadata-exporter repo; schema drift fails fast at startup; reads use the

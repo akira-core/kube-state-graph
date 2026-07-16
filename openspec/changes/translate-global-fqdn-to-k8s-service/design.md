@@ -446,6 +446,33 @@ cross-cluster status is still derived by the D9 rule (comparing resolved source/
 MAY, not a state. `edge-types.json` (golden) and the registry unit tests update with it; no other
 golden may change.
 
+### D13 — the ingress-IP probe is memoised per build (optional upgrade interface)
+
+The D10 ingress-cluster probe (`store.ClustersWithIngressIP`) is a pure function of `(ip, start,
+end)`, and `start`/`end` are constant across one build's keys. But `ResolveRoute` runs it once per
+`(key, ip)`: keys sharing a destination IP — the same host called from several caller clusters, or
+several hosts behind one LB IP — each repeat the identical cross-cluster ClickHouse read (`N_keys ×
+N_ips` reads where a handful of distinct IPs would do). That probe is the ONE query with no
+`cluster` predicate (its whole job is cross-cluster), so the redundancy is the most expensive to
+repeat.
+
+The fix memoises the probe **per build**, keyed `(ip, start.UnixMilli, end.UnixMilli)`. The scope is
+one build, not the resolver instance: `*route.Resolver` is shared across concurrent builds and must
+stay stateless — a cache on it would grow unbounded (a leak) and need locking. The prescan loop
+(`resolveRouteQueries`) is where all keys of one build share `(start, end)` and run serially, so the
+scope needs no mutex.
+
+Containment (D1) forbids `pkg/build` importing `pkg/route`, so `pkg/build` cannot construct the
+scope. It declares an **optional upgrade interface** instead — `BuildScopedRouteResolver` (a
+`RouteResolver` plus `BuildScoped() RouteResolver`, idiomatic Go à la `http.Flusher`).
+`resolveRouteQueries` type-asserts and, when present, drives the whole build through the returned
+scope. The base `RouteResolver` contract is unchanged: a resolver that does not implement it
+(mocks, any embedder's resolver) runs exactly as before. `pkg/route`'s `*Resolver` implements it;
+`ResolveRoute`'s body is factored into `resolve(ctx, req, probe)` with the probe injected, and the
+scope (`scopedResolver`) passes a memoising wrapper. Errors are NOT cached — a later key sharing the
+IP retries — so error behaviour is byte-identical to per-call. No outcome, determinism, or edge/node
+change: purely fewer identical store reads.
+
 ## Risks / Trade-offs
 
 - **`router_check_tool` dominates latency** (~50–60ms per invocation native; istiod translate is only
