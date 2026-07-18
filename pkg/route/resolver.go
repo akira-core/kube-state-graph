@@ -57,11 +57,15 @@ func NewResolver(st store.Store, run matchcheck.Runner) *Resolver {
 
 // outcomeRank orders miss outcomes by pipeline depth so a multi-segment window
 // reports the most informative miss: a segment that reached route matching
-// (no_route) beats one that stopped at the listener (no_listener_on_port),
-// which beats one where no gateway served the host at all.
+// (no_route) beats one whose port had servers but none serving the host
+// (no_server_for_host), which beats one that stopped at the listener port
+// (no_listener_on_port), which beats one where no gateway served the host at
+// all.
 func outcomeRank(o build.RouteOutcome) int {
 	switch o {
 	case build.RouteNoRoute:
+		return 3
+	case build.RouteNoServerForHost:
 		return 2
 	case build.RouteNoListenerOnPort:
 		return 1
@@ -126,8 +130,8 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 	mw := memwindow.New(w, req.Start, req.End)
 
 	// Per-request signature cache: identical-content version bumps (the common
-	// case) collapse to one translate+check. Port and path are constant within
-	// a request, so the config signature alone is a sound key.
+	// case) collapse to one translate+check. Port, host, and path are constant
+	// within a request, so the config signature alone is a sound key.
 	cache := map[uint64]segmentResult{}
 
 	var (
@@ -229,12 +233,21 @@ func (r *Resolver) resolveConfig(ctx context.Context, mw *memwindow.Window, gw s
 		return segmentResult{outcome: build.RouteNoGateway}, nil
 	}
 	scoped.Port = req.Port
+	// The host decides WHICH server on the port owns the RouteConfiguration
+	// (each TLS-terminated HTTPS server carries its own).
+	scoped.Host = req.Host
 
-	// A gateway that serves the host but declares no routable HTTP listener on
-	// the derived port is the D5 mis-guessed-port signature — distinct from a
-	// route miss, and cheaper to detect than an empty-RC translate round-trip.
-	if !translate.HasListenerOnPort(scoped, req.Port) {
+	// Listener gate: both misses are decided from config alone — no translate
+	// round-trip, no router_check_tool exec. A port with no routable HTTP
+	// listener is the D5 mis-guessed-port signature; a port whose servers all
+	// serve OTHER hosts is the distinct no-server-for-host miss (translating
+	// anyway could only reach RouteNoRoute — istiod builds vhosts from the
+	// server-hosts ∩ VS-hosts intersection).
+	switch _, st := translate.ListenerFor(scoped); st {
+	case translate.ListenerNoneOnPort:
 		return segmentResult{outcome: build.RouteNoListenerOnPort}, nil
+	case translate.ListenerNoServerForHost:
+		return segmentResult{outcome: build.RouteNoServerForHost}, nil
 	}
 
 	rc, err := r.tr.Translate(scoped)

@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
+	networking "istio.io/api/networking/v1alpha3"
 
 	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
@@ -46,9 +48,11 @@ func TestParseEnvoyCluster(t *testing.T) {
 }
 
 func TestOutcomeRank(t *testing.T) {
-	// no_route (deepest pipeline progress) must outrank no_listener, which
-	// outranks no_gateway — the fold reports the most informative miss.
-	assert.Greater(t, outcomeRank(build.RouteNoRoute), outcomeRank(build.RouteNoListenerOnPort))
+	// no_route (deepest pipeline progress) must outrank no_server_for_host
+	// (right port, unserved host), which outranks no_listener (wrong port),
+	// which outranks no_gateway — the fold reports the most informative miss.
+	assert.Greater(t, outcomeRank(build.RouteNoRoute), outcomeRank(build.RouteNoServerForHost))
+	assert.Greater(t, outcomeRank(build.RouteNoServerForHost), outcomeRank(build.RouteNoListenerOnPort))
 	assert.Greater(t, outcomeRank(build.RouteNoListenerOnPort), outcomeRank(build.RouteNoGateway))
 }
 
@@ -135,6 +139,65 @@ func TestResolveRoute_LockedClusterScopesWindowLoads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, build.RouteNoGateway, outcome,
 		"empty window on the selected cluster is an ordinary no-gateway miss")
+}
+
+// A gateway matched at the GATEWAY level (its ServerHosts union serves the
+// host) can still have no :port server serving it — the listener gate must
+// report RouteNoServerForHost and return BEFORE Translate and before r.run is
+// touched (the zero matchcheck.Runner would blow up otherwise, which also pins
+// that scoped.Host is actually threaded through: an unset Host would take the
+// host-agnostic escape hatch into the RC path).
+func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
+	gwSpec := &networking.Gateway{
+		Selector: map[string]string{"istio": "ingress"},
+		Servers: []*networking.Server{
+			{
+				Port:  &networking.Port{Number: 443, Name: "api", Protocol: "HTTPS"},
+				Hosts: []string{"api.example.com"},
+				Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-api"},
+			},
+			{
+				Port:  &networking.Port{Number: 443, Name: "admin", Protocol: "HTTPS"},
+				Hosts: []string{"admin.example.com"},
+				Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-admin"},
+			},
+		},
+	}
+	specJSON, err := protojson.Marshal(gwSpec)
+	require.NoError(t, err)
+
+	from, to := testStart.Add(-time.Hour), testEnd.Add(time.Hour)
+	window := store.TrafficWindow{
+		Services: []store.ServiceRow{{
+			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: from, ValidTo: to,
+			ExternalIPs: []string{"198.51.100.7"}, Selector: []string{"istio=ingress"},
+		}},
+		Deploys: []store.DeployRow{{
+			Namespace: "istio-system", Name: "ingress", ValidFrom: from, ValidTo: to,
+			PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{{
+			Namespace: "istio-system", Name: "gw-000", ValidFrom: from, ValidTo: to,
+			SelectorKV: []string{"istio=ingress"},
+			// Gateway-level union matches the request host; the per-server
+			// hosts inside SpecJSON do not.
+			ServerHosts: []string{"*.example.com"},
+			SpecJSON:    string(specJSON),
+		}},
+	}
+
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
+		Return(window, nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	req := testRequest("prod-01", "198.51.100.7")
+	req.Host = "other.example.com"
+	_, outcome, err := r.ResolveRoute(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteNoServerForHost, outcome)
 }
 
 // A probe error is an infrastructure failure: returned to the caller (which

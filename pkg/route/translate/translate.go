@@ -6,10 +6,15 @@
 // the "host+path -> service" query engine loads per gateway. Ported verbatim
 // from poc/route2a/internal/translate.
 //
-// The RouteConfiguration to build is selected by ScopedInput.Port (default 80):
-// a plain HTTP server yields "http.<port>", a TLS-terminated HTTPS server yields
-// "https.<port>.<portName>.<gwName>.<gwNamespace>" (see routeConfigNameFor). TLS
-// passthrough servers have no HTTP RDS route and resolve to a miss.
+// The RouteConfiguration to build is selected by ScopedInput.Port and
+// ScopedInput.Host (default port 80): among the servers on the port, the one
+// whose hosts most-specifically match the request host (Istio exact/wildcard
+// semantics, declaration-order independent) owns the RC — a plain HTTP server
+// yields "http.<port>[.<bind>]", a TLS-terminated HTTPS server yields
+// "https.<port>.<portName>.<gwName>.<gwNamespace>[.<bind>]" (see
+// routeConfigNameFor / rdsRouteName). TLS passthrough servers have no HTTP RDS
+// route and resolve to a miss; a port whose servers serve other hosts only is
+// the distinct ListenerNoServerForHost miss.
 //
 // istio's TEST fixture core.NewConfigGenTest is deliberately avoided: it ties a
 // stop channel to t.Cleanup and starts two long-lived goroutines. Translator
@@ -45,6 +50,8 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
+
+	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
 )
 
 // GatewayProxy identifies one ingress-gateway vantage. Labels must equal the
@@ -61,11 +68,17 @@ type GatewayProxy struct {
 // the VirtualServices bound to it) and the Services those VS route to.
 // Proxy.Labels must equal the Gateway's spec.selector so istiod attaches that
 // Gateway to the vantage. Port selects which listener's RC to build (0 => 80).
+// Host is the request FQDN — the same class of request-derived scalar as Port,
+// arriving via the same path — and picks WHICH server on the port owns the RC
+// (each TLS-terminated HTTPS server has its own). A caller resolving a real
+// request MUST set it; "" is the host-agnostic escape hatch (first server on
+// the port wins, the pre-host-aware behaviour).
 type ScopedInput struct {
 	Configs  []config.Config
 	Services []*model.Service
 	Proxy    GatewayProxy
 	Port     int
+	Host     string
 }
 
 // Translator is a process-lifetime, concurrency-safe translation core. The only
@@ -93,14 +106,14 @@ func (tr *Translator) Translate(in ScopedInput) (*route.RouteConfiguration, erro
 	if port <= 0 {
 		port = 80
 	}
-	gwCfg, ok := gatewayConfig(in.Configs)
-	if !ok {
+	if _, ok := gatewayConfig(in.Configs); !ok {
 		return nil, fmt.Errorf("translate: scoped input has no Gateway config")
 	}
-	name, ok := routeConfigNameFor(gwCfg, port)
-	if !ok {
-		// No HTTP RDS route for this listener port (no server on the port, or a
-		// TLS-passthrough server): faithfully a miss (empty RC).
+	name, st := ListenerFor(in)
+	if st != ListenerFound {
+		// No HTTP RDS route for (port, host): no server on the port, a
+		// TLS-passthrough server winning the host, or no server on the port
+		// serving the host — faithfully a miss (empty RC).
 		return &route.RouteConfiguration{Name: fmt.Sprintf("http.%d", port)}, nil
 	}
 
@@ -126,19 +139,40 @@ func (tr *Translator) Translate(in ScopedInput) (*route.RouteConfiguration, erro
 	return &route.RouteConfiguration{Name: name}, nil
 }
 
-// HasListenerOnPort reports whether the scoped input's Gateway declares a
-// routable HTTP listener on the given port — i.e. whether Translate would build
-// a real RouteConfiguration rather than an empty by-construction miss. The
-// resolver uses it to report the distinct route_engine_no_listener_on_port
-// outcome (design D5) instead of conflating a mis-derived port with an ordinary
-// route miss.
-func HasListenerOnPort(in ScopedInput, port int) bool {
+// ListenerStatus classifies ListenerFor's answer: does the scoped Gateway
+// declare a routable HTTP listener for (port, host)?
+type ListenerStatus int
+
+const (
+	// ListenerFound — a server on the port serves the host and has an HTTP
+	// RDS route; Translate would build a real RouteConfiguration.
+	ListenerFound ListenerStatus = iota
+	// ListenerNoneOnPort — no server listens on the port, or the server that
+	// wins the host on it has no HTTP RDS route (TLS passthrough, TCP). The
+	// design-D5 mis-guessed-port signature.
+	ListenerNoneOnPort
+	// ListenerNoServerForHost — servers listen on the port, but none of their
+	// hosts match the request host. Distinct from ListenerNoneOnPort so a
+	// wrong port guess is not conflated with a host the listener never
+	// served; ending here is sound — istiod builds each vhost from the
+	// intersection of server hosts and VS hosts (buildGatewayHTTPRouteConfig
+	// keeps the more specific of the two), so a host matching no server host
+	// can match no vhost either: translating anyway could only reach
+	// RouteNoRoute, slower.
+	ListenerNoServerForHost
+)
+
+// ListenerFor is the ONE RouteConfiguration-selection decision point: it
+// returns the RC name the scoped Gateway assigns (in.Port, in.Host) and the
+// tri-state listener status. Translate and the resolver's listener gate both
+// go through it, so the two can never diverge. Pure config inspection — no
+// istiod translate, no subprocess.
+func ListenerFor(in ScopedInput) (string, ListenerStatus) {
 	gwCfg, ok := gatewayConfig(in.Configs)
 	if !ok {
-		return false
+		return "", ListenerNoneOnPort
 	}
-	_, ok = routeConfigNameFor(gwCfg, port)
-	return ok
+	return routeConfigNameFor(gwCfg, in.Port, in.Host)
 }
 
 // gatewayConfig returns the single Gateway CR from a scoped input's configs.
@@ -151,34 +185,81 @@ func gatewayConfig(configs []config.Config) (config.Config, bool) {
 	return config.Config{}, false
 }
 
+// rdsRouteName is a line-for-line port of istio's (unexported)
+// gatewayRDSRouteName (pilot/pkg/model/gateway.go), INCLUDING the bind suffix:
+// "http.<port>[.<bind>]" for a plain HTTP server,
+// "https.<port>.<portName>.<gwName>.<gwNamespace>[.<bind>]" for a
+// TLS-terminated HTTPS server, "" otherwise (passthrough/TCP — no HTTP RDS
+// route). Two upstream facts to preserve on any future edit: (a) upstream uses
+// the RESOLVED portNumber for HTTP but s.Port.Number for HTTPS — here the two
+// coincide because every caller pre-filters servers on s.Port.Number == port;
+// (b) do NOT swap the HTTPS condition for gateway.IsHTTPSServerWithTLSTermination
+// — it adds a Tls != nil guard, while IsPassThroughServer returns false for
+// Tls == nil, so the two disagree on an HTTPS server with tls: nil. We mirror
+// the RC NAME rule, not the filter-chain branch.
+func rdsRouteName(s *networking.Server, port int, gwCfg config.Config) string {
+	p := protocol.Parse(s.Port.Protocol)
+	bind := ""
+	if s.Bind != "" {
+		bind = "." + s.Bind
+	}
+	if p.IsHTTP() {
+		return fmt.Sprintf("http.%d", port) + bind
+	}
+	if p == protocol.HTTPS && !gateway.IsPassThroughServer(s) {
+		return fmt.Sprintf("https.%d.%s.%s.%s", s.Port.Number, s.Port.Name, gwCfg.Name, gwCfg.Namespace) + bind
+	}
+	return ""
+}
+
 // routeConfigNameFor computes the Envoy RouteConfiguration name istiod assigns
-// the gateway server listening on `port`, mirroring istio's (unexported)
-// gatewayRDSRouteName (pilot/pkg/model/gateway.go): "http.<port>" for a plain
-// HTTP server, "https.<port>.<portName>.<gwName>.<gwNamespace>" for a
-// TLS-terminated HTTPS server. ok=false when no server listens on that port or
-// the server is TLS passthrough (no HTTP RDS route) — both a miss. port<=0 => 80.
-func routeConfigNameFor(gwCfg config.Config, port int) (string, bool) {
+// for (port, reqHost): among the servers on the port, the one whose hosts
+// most-specifically match reqHost (Istio exact/wildcard semantics via
+// gwresolve.PickHosts, declaration-order independent) owns the RC — each
+// TLS-terminated HTTPS server carries its OWN RC (one filter chain per
+// cert/SNI), plain HTTP servers share "http.<port>[.<bind>]". reqHost == "" is
+// the host-agnostic escape hatch (first server on the port). port<=0 => 80.
+//
+// The on-port server set is deliberately NOT protocol-filtered before the host
+// pick: if a TLS-passthrough server matches the host more specifically, istio
+// hands it the filter chain — it must win the selection and then report the
+// miss (no HTTP RDS route); filtering it out would invent a route Envoy never
+// serves.
+func routeConfigNameFor(gwCfg config.Config, port int, reqHost string) (string, ListenerStatus) {
 	if port <= 0 {
 		port = 80
 	}
 	gw, _ := gwCfg.Spec.(*networking.Gateway)
 	if gw == nil {
-		return "", false
+		return "", ListenerNoneOnPort
 	}
+	var onPort []*networking.Server
 	for _, s := range gw.Servers {
-		if s.GetPort() == nil || int(s.Port.Number) != port {
-			continue
+		if s.GetPort() != nil && int(s.Port.Number) == port {
+			onPort = append(onPort, s)
 		}
-		p := protocol.Parse(s.Port.Protocol)
-		switch {
-		case p.IsHTTP():
-			return fmt.Sprintf("http.%d", port), true
-		case p == protocol.HTTPS && !gateway.IsPassThroughServer(s):
-			return fmt.Sprintf("https.%d.%s.%s.%s", s.Port.Number, s.Port.Name, gwCfg.Name, gwCfg.Namespace), true
-		}
-		return "", false // matched port, but passthrough/TCP/TLS: no HTTP RDS route
 	}
-	return "", false
+	if len(onPort) == 0 {
+		return "", ListenerNoneOnPort
+	}
+	winner := onPort[0]
+	if reqHost != "" {
+		hostSets := make([][]string, len(onPort))
+		for i, s := range onPort {
+			hostSets[i] = s.Hosts
+		}
+		idx, ok := gwresolve.PickHosts(hostSets, reqHost)
+		if !ok {
+			return "", ListenerNoServerForHost
+		}
+		winner = onPort[idx]
+	}
+	name := rdsRouteName(winner, port, gwCfg)
+	if name == "" {
+		// The winning server has no HTTP RDS route (passthrough/TCP).
+		return "", ListenerNoneOnPort
+	}
+	return name, ListenerFound
 }
 
 // buildScopedEnv assembles the minimal static Environment for one gateway's

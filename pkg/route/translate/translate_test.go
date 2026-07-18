@@ -302,18 +302,20 @@ func TestTranslatePortSelectsRouteConfig(t *testing.T) {
 
 	tr := translate.NewTranslator()
 
+	// Host stays empty throughout: the host-agnostic path must keep today's
+	// byte-for-byte behaviour.
 	cases := []struct {
-		name        string
-		port        int
-		tls         networking.ServerTLSSettings_TLSmode
-		wantName    string
-		wantHit     bool // true => the /healthz route resolves to wantCluster
-		hasListener bool // expected HasListenerOnPort outcome
+		name       string
+		port       int
+		tls        networking.ServerTLSSettings_TLSmode
+		wantName   string
+		wantHit    bool // true => the /healthz route resolves to wantCluster
+		wantStatus translate.ListenerStatus
 	}{
-		{"http_80", 80, networking.ServerTLSSettings_SIMPLE, "http.80", true, true},
-		{"https_443_terminated", 443, networking.ServerTLSSettings_SIMPLE, "https.443.https.gw-000.istio-system", true, true},
-		{"unserved_8080_miss", 8080, networking.ServerTLSSettings_SIMPLE, "http.8080", false, false},
-		{"passthrough_443_miss", 443, networking.ServerTLSSettings_PASSTHROUGH, "http.443", false, false},
+		{"http_80", 80, networking.ServerTLSSettings_SIMPLE, "http.80", true, translate.ListenerFound},
+		{"https_443_terminated", 443, networking.ServerTLSSettings_SIMPLE, "https.443.https.gw-000.istio-system", true, translate.ListenerFound},
+		{"unserved_8080_miss", 8080, networking.ServerTLSSettings_SIMPLE, "http.8080", false, translate.ListenerNoneOnPort},
+		{"passthrough_443_miss", 443, networking.ServerTLSSettings_PASSTHROUGH, "http.443", false, translate.ListenerNoneOnPort},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -339,9 +341,274 @@ func TestTranslatePortSelectsRouteConfig(t *testing.T) {
 			} else if got != "" {
 				t.Errorf("/healthz cluster = %q, want miss (empty RC)", got)
 			}
-			if hl := translate.HasListenerOnPort(in, c.port); hl != c.hasListener {
-				t.Errorf("HasListenerOnPort(%d) = %v, want %v", c.port, hl, c.hasListener)
+			if _, st := translate.ListenerFor(in); st != c.wantStatus {
+				t.Errorf("ListenerFor(port=%d) status = %v, want %v", c.port, st, c.wantStatus)
 			}
 		})
+	}
+}
+
+// --- host-aware server selection fixtures -----------------------------------
+
+// tlsServer is a TLS-terminated HTTPS :443 server.
+func tlsServer(portName string, hosts []string, bind string) *networking.Server {
+	return &networking.Server{
+		Port:  &networking.Port{Number: 443, Name: portName, Protocol: "HTTPS"},
+		Hosts: hosts,
+		Bind:  bind,
+		Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-" + portName},
+	}
+}
+
+// passthroughServer is an HTTPS :443 passthrough server (no HTTP RDS route).
+// Note the zero value of ServerTLSSettings_TLSmode IS passthrough; it is
+// spelled out for the reader.
+func passthroughServer(portName string, hosts []string) *networking.Server {
+	return &networking.Server{
+		Port:  &networking.Port{Number: 443, Name: portName, Protocol: "HTTPS"},
+		Hosts: hosts,
+		Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_PASSTHROUGH},
+	}
+}
+
+// httpServer is a plain HTTP server — Tls MUST stay nil (a non-nil Tls with
+// the zero mode would silently mean passthrough).
+func httpServer(portName string, port uint32, hosts []string, bind string) *networking.Server {
+	return &networking.Server{
+		Port:  &networking.Port{Number: port, Name: portName, Protocol: "HTTP"},
+		Hosts: hosts,
+		Bind:  bind,
+	}
+}
+
+func gwWithServers(servers ...*networking.Server) config.Config {
+	return config.Config{
+		Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: "gw-000", Namespace: "istio-system"},
+		Spec: &networking.Gateway{Selector: map[string]string{"istio": "gw-000"}, Servers: servers},
+	}
+}
+
+func reversed(servers []*networking.Server) []*networking.Server {
+	out := make([]*networking.Server, len(servers))
+	for i, s := range servers {
+		out[len(servers)-1-i] = s
+	}
+	return out
+}
+
+// TestListenerForSelectsServerByHost proves RC selection is host-aware and
+// order-independent: every case runs in both declaration orders and must pick
+// the same server (Istio exact/wildcard specificity, not first-on-port).
+func TestListenerForSelectsServerByHost(t *testing.T) {
+	proxy := translate.GatewayProxy{Name: "gw-000", Namespace: "istio-system", Labels: map[string]string{"istio": "gw-000"}}
+
+	cases := []struct {
+		name       string
+		servers    []*networking.Server
+		port       int
+		host       string
+		wantName   string
+		wantStatus translate.ListenerStatus
+	}{
+		{
+			name:       "https_two_servers_admin",
+			servers:    []*networking.Server{tlsServer("api", []string{"api.example.com"}, ""), tlsServer("admin", []string{"admin.example.com"}, "")},
+			port:       443,
+			host:       "admin.example.com",
+			wantName:   "https.443.admin.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "https_two_servers_api",
+			servers:    []*networking.Server{tlsServer("api", []string{"api.example.com"}, ""), tlsServer("admin", []string{"admin.example.com"}, "")},
+			port:       443,
+			host:       "api.example.com",
+			wantName:   "https.443.api.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "exact_beats_wildcard",
+			servers:    []*networking.Server{tlsServer("wild", []string{"*.example.com"}, ""), tlsServer("api", []string{"api.example.com"}, "")},
+			port:       443,
+			host:       "api.example.com",
+			wantName:   "https.443.api.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "more_specific_wildcard_wins",
+			servers:    []*networking.Server{tlsServer("broad", []string{"*.example.com"}, ""), tlsServer("narrow", []string{"*.api.example.com"}, "")},
+			port:       443,
+			host:       "v1.api.example.com",
+			wantName:   "https.443.narrow.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "http_bind_in_name",
+			servers:    []*networking.Server{httpServer("http", 80, []string{"*"}, "10.0.0.2")},
+			port:       80,
+			host:       "api.example.com",
+			wantName:   "http.80.10.0.0.2",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "https_bind_in_name",
+			servers:    []*networking.Server{tlsServer("api", []string{"api.example.com"}, "10.0.0.1")},
+			port:       443,
+			host:       "api.example.com",
+			wantName:   "https.443.api.gw-000.istio-system.10.0.0.1",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "ns_prefixed_server_host",
+			servers:    []*networking.Server{tlsServer("api", []string{"prod/api.example.com"}, "")},
+			port:       443,
+			host:       "api.example.com",
+			wantName:   "https.443.api.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "https_no_server_for_host",
+			servers:    []*networking.Server{tlsServer("api", []string{"api.example.com"}, ""), tlsServer("admin", []string{"admin.example.com"}, "")},
+			port:       443,
+			host:       "other.example.com",
+			wantName:   "",
+			wantStatus: translate.ListenerNoServerForHost,
+		},
+		{
+			name:       "http_no_server_for_host",
+			servers:    []*networking.Server{httpServer("http", 80, []string{"api.example.com"}, "")},
+			port:       80,
+			host:       "other.example.com",
+			wantName:   "",
+			wantStatus: translate.ListenerNoServerForHost,
+		},
+		{
+			name:       "http_servers_share_rc",
+			servers:    []*networking.Server{httpServer("http-a", 80, []string{"api.example.com"}, ""), httpServer("http-b", 80, []string{"admin.example.com"}, "")},
+			port:       80,
+			host:       "admin.example.com",
+			wantName:   "http.80",
+			wantStatus: translate.ListenerFound,
+		},
+		{
+			name:       "passthrough_wins_sni",
+			servers:    []*networking.Server{passthroughServer("pass", []string{"api.example.com"}), tlsServer("wild", []string{"*.example.com"}, "")},
+			port:       443,
+			host:       "api.example.com",
+			wantName:   "",
+			wantStatus: translate.ListenerNoneOnPort,
+		},
+		{
+			name:       "no_listener_on_port",
+			servers:    []*networking.Server{tlsServer("api", []string{"api.example.com"}, "")},
+			port:       8080,
+			host:       "api.example.com",
+			wantName:   "",
+			wantStatus: translate.ListenerNoneOnPort,
+		},
+		{
+			name:       "star_catch_all",
+			servers:    []*networking.Server{tlsServer("all", []string{"*"}, ""), tlsServer("api", []string{"api.example.com"}, "")},
+			port:       443,
+			host:       "random.host.net",
+			wantName:   "https.443.all.gw-000.istio-system",
+			wantStatus: translate.ListenerFound,
+		},
+	}
+	for _, c := range cases {
+		orders := []struct {
+			name    string
+			servers []*networking.Server
+		}{
+			{"declared", c.servers},
+			{"reversed", reversed(c.servers)},
+		}
+		for _, o := range orders {
+			t.Run(c.name+"/"+o.name, func(t *testing.T) {
+				in := translate.ScopedInput{
+					Configs: []config.Config{gwWithServers(o.servers...)},
+					Proxy:   proxy,
+					Port:    c.port,
+					Host:    c.host,
+				}
+				name, st := translate.ListenerFor(in)
+				if st != c.wantStatus {
+					t.Errorf("ListenerFor status = %v, want %v", st, c.wantStatus)
+				}
+				if st == translate.ListenerFound && name != c.wantName {
+					t.Errorf("ListenerFor name = %q, want %q", name, c.wantName)
+				}
+			})
+		}
+	}
+}
+
+// TestTranslateHTTPSServerByHostEndToEnd is the case port-only selection
+// silently misses: two TLS-terminated :443 servers, each with its own VS —
+// asking for one host must yield THAT server's RC and THAT host's backend
+// cluster, in either declaration order.
+func TestTranslateHTTPSServerByHostEndToEnd(t *testing.T) {
+	const ns = "gw-000"
+	apiDH := "api-backend." + ns + ".svc.cluster.local"
+	adminDH := "admin-backend." + ns + ".svc.cluster.local"
+
+	vsFor := func(name, vhost, destHost string) config.Config {
+		return config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: name, Namespace: ns},
+			Spec: &networking.VirtualService{
+				Hosts:    []string{vhost},
+				Gateways: []string{"istio-system/gw-000"},
+				Http:     []*networking.HTTPRoute{route(nil, destHost, 8080)},
+			},
+		}
+	}
+	vsAPI := vsFor("vs-api", "api.example.com", apiDH)
+	vsAdmin := vsFor("vs-admin", "admin.example.com", adminDH)
+	services := []*model.Service{svc(apiDH, ns, 8080), svc(adminDH, ns, 8080)}
+	proxy := translate.GatewayProxy{Name: "gw-000", Namespace: "istio-system", Labels: map[string]string{"istio": "gw-000"}}
+	servers := []*networking.Server{
+		tlsServer("api", []string{"api.example.com"}, ""),
+		tlsServer("admin", []string{"admin.example.com"}, ""),
+	}
+
+	cases := []struct {
+		host, wantName, wantCluster, otherCluster string
+	}{
+		{"api.example.com", "https.443.api.gw-000.istio-system", "outbound|8080||" + apiDH, "outbound|8080||" + adminDH},
+		{"admin.example.com", "https.443.admin.gw-000.istio-system", "outbound|8080||" + adminDH, "outbound|8080||" + apiDH},
+	}
+	for _, c := range cases {
+		for _, o := range []struct {
+			name    string
+			servers []*networking.Server
+		}{
+			{"declared", servers},
+			{"reversed", reversed(servers)},
+		} {
+			t.Run(c.host+"/"+o.name, func(t *testing.T) {
+				rc := translateOK(t, translate.ScopedInput{
+					Configs:  []config.Config{gwWithServers(o.servers...), vsAPI, vsAdmin},
+					Services: services,
+					Proxy:    proxy,
+					Port:     443,
+					Host:     c.host,
+				})
+				if rc.GetName() != c.wantName {
+					t.Fatalf("rc name = %q, want %q", rc.GetName(), c.wantName)
+				}
+				clusters := map[string]bool{}
+				for _, vh := range rc.GetVirtualHosts() {
+					for _, rt := range vh.GetRoutes() {
+						clusters[rt.GetRoute().GetCluster()] = true
+					}
+				}
+				if !clusters[c.wantCluster] {
+					t.Errorf("RC %s lacks the host's own backend cluster %q (got %v)", rc.GetName(), c.wantCluster, clusters)
+				}
+				if clusters[c.otherCluster] {
+					t.Errorf("RC %s leaked the OTHER server's backend cluster %q", rc.GetName(), c.otherCluster)
+				}
+			})
+		}
 	}
 }
