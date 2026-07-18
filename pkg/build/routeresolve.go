@@ -75,10 +75,21 @@ const (
 	// reachable from the supplied destination IPs and serves the host in the
 	// window.
 	RouteNoGateway RouteOutcome = "no_gateway"
-	// RouteNoListenerOnPort — a gateway serves the host, but declares no
-	// routable HTTP listener on the derived port (unserved port, TLS
-	// passthrough, TCP). The design-D5 signature of a mis-guessed port.
+	// RouteNoListenerOnPort — a gateway serves the host, but NO server
+	// listens on the derived port at all (or the server winning the host
+	// there has no HTTP RDS route: TLS passthrough, TCP). The design-D5
+	// signature of a mis-guessed port. Mutually exclusive with
+	// RouteNoServerForHost, which fires only when servers DO listen on the
+	// port.
 	RouteNoListenerOnPort RouteOutcome = "no_listener_on_port"
+	// RouteNoServerForHost — servers listen on the derived port, but none of
+	// their hosts serve the request host (Istio exact/wildcard match). The
+	// port guess was right; the listener never served this host. Since istiod
+	// builds each vhost from the server-hosts ∩ VS-hosts intersection, such a
+	// request can match no vhost either — reported without a translate
+	// round-trip, and kept distinct from both RouteNoListenerOnPort (wrong
+	// port) and RouteNoRoute (right listener, no matching path).
+	RouteNoServerForHost RouteOutcome = "no_server_for_host"
 	// RouteNoRoute — the listener exists but no route matched the path (or
 	// the matched cluster string was not a parseable in-cluster Service).
 	RouteNoRoute RouteOutcome = "no_route"

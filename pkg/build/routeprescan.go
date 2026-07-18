@@ -373,6 +373,11 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// ordinary route miss so operators can spot a bad port guess.
 		r.noteExternal("route_engine_no_listener_on_port", t, "host", key.host,
 			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
+	case entry.outcome == RouteNoServerForHost:
+		// Servers listen on the port but none serves this host — the port
+		// guess was right, so keep it distinct from no_listener_on_port.
+		r.noteExternal("route_engine_no_server_for_host", t, "host", key.host,
+			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoIngress:
 		// Design D10: no cluster had an ingress Service with any of the
 		// destination IPs in the window.
