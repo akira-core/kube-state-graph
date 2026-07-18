@@ -248,6 +248,8 @@ func (r *Resolver) resolveConfig(ctx context.Context, mw *memwindow.Window, gw s
 		return segmentResult{outcome: build.RouteNoListenerOnPort}, nil
 	case translate.ListenerNoServerForHost:
 		return segmentResult{outcome: build.RouteNoServerForHost}, nil
+	case translate.ListenerFound:
+		// fall through to the translate + router_check_tool stages
 	}
 
 	rc, err := r.tr.Translate(scoped)

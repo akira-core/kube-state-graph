@@ -99,7 +99,11 @@ func New(gws []Gateway) *Resolver {
 // set matches). An identical winning pattern in two sets resolves to the
 // smaller index (first declared wins).
 func PickHosts(hostSets [][]string, reqHost string) (int, bool) {
-	var pats []pat
+	n := 0
+	for _, hosts := range hostSets {
+		n += len(hosts)
+	}
+	pats := make([]pat, 0, n)
 	for i, hosts := range hostSets {
 		pats = append(pats, newPats("", i, hosts)...)
 	}
