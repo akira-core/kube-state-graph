@@ -13,12 +13,12 @@ import (
 // another.
 func TestPickIngressCluster(t *testing.T) {
 	cases := []struct {
-		name    string
-		caller  string
-		perIP   [][]string
-		want    string
-		miss    build.RouteOutcome
-		wantOK  bool
+		name   string
+		caller string
+		perIP  [][]string
+		want   string
+		miss   build.RouteOutcome
+		wantOK bool
 	}{
 		// T1: single same-family candidate that is not the caller.
 		{name: "family singleton wins", caller: "prod-01",

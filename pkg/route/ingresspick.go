@@ -38,7 +38,7 @@ func pickIngressCluster(caller string, perIP [][]string) (cluster string, miss b
 	}
 
 	callerFamily := build.ClusterFamilyKey(caller)
-	picked := ""    // the agreed cluster so far
+	picked := ""     // the agreed cluster so far
 	anyPick := false // at least one IP selected a cluster
 	anyNone := false // at least one IP had no candidate
 
