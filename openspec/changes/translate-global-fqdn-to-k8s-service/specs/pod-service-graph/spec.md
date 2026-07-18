@@ -256,6 +256,23 @@ deterministic function of the upstream data and the resolved destinations.
 - **THEN** the reader SHALL emit `external/<raw_peer_address_value>`
 - **AND** SHALL record a diagnostic reason distinct from the "no route matched" reason
 
+#### Scenario: The server owning the host on the port is selected
+
+- **WHEN** the selected ingress cluster's Gateway declares two TLS-terminated HTTPS servers
+  on the derived port — one whose hosts match the peer FQDN and one whose hosts do not —
+  in either declaration order
+- **THEN** the reader SHALL resolve the request through the RouteConfiguration of the
+  server whose hosts most-specifically match the peer FQDN (Istio exact/wildcard
+  semantics, any `<ns>/` binding prefix stripped before matching)
+
+#### Scenario: No server on the derived port serves the host
+
+- **WHEN** the selected ingress cluster's Gateway declares servers on the derived port but
+  none of their hosts match the peer FQDN
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>`
+- **AND** SHALL record a diagnostic reason distinct from both the "no listener on the
+  derived port" reason and the "no route matched" reason
+
 #### Scenario: Store failure never fails the build
 
 - **WHEN** the route store is unreachable or returns an error while resolving an endpoint

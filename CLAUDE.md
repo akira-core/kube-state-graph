@@ -314,7 +314,20 @@ live under `openspec/specs/`.
   `client_server_port` / `client_net_peer_port` dimension → default **443**
   (a :443-only Gateway or an httpsRedirect :80 stub is the common ingress
   shape; a wrong port fails as "no listener" — logged distinctly as
-  `route_engine_no_listener_on_port` — never as a wrong destination).
+  `route_engine_no_listener_on_port` — never as a wrong destination). The
+  RouteConfiguration is then selected **host-aware** within the port
+  (`translate.ListenerFor`, the single tri-state decision point shared by
+  `Translate` and the resolver's listener gate): among the servers on the
+  port, the one whose `hosts` most-specifically match the request FQDN
+  (`gwresolve.PickHosts` — Istio exact/wildcard semantics, declaration-order
+  independent, `<ns>/` binding prefixes stripped) owns the RC, with
+  `server.bind` reflected in the name (`http.<port>[.<bind>]` shared by HTTP
+  servers; `https.<port>.<portName>.<gw>.<ns>[.<bind>]` per TLS-terminated
+  HTTPS server). Servers on the port that serve only OTHER hosts short-circuit
+  as `route_engine_no_server_for_host` (`RouteNoServerForHost`, ranked between
+  `no_listener_on_port` and `no_route`) without a translate round-trip —
+  istiod builds vhosts from the server-hosts ∩ VS-hosts intersection, so such
+  a request could only ever reach an empty `RouteNoRoute`.
   **(4) The `client_dns_answers` dimension is REQUIRED** (D6 rev): its IPs
   select the ingress cluster and feed the ClickHouse IP 3-hop; no parseable IP
   ⇒ the engine is NEVER consulted (prescan skip, no store read, distinct

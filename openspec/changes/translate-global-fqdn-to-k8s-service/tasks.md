@@ -242,3 +242,35 @@ testcontainer in group 8 seeds the schema itself, so implementation is not block
       `TestResolver_ImplementsBuildScoped`, `TestBuildScoped_ProbeMemoised`,
       `TestBuildScoped_ProbeErrorNotCached` (pkg/route), `TestResolveRouteQueries_UpgradesToBuildScoped`
       (pkg/build). No outcome/determinism/golden change.
+
+## 14. Host/bind-aware RouteConfiguration selection (design D5 rev)
+
+- [x] 14.1 gwresolve: `SanitizeServerHost` (strip the Istio `<ns>/` binding prefix — strip, not
+      filter; precedent `model.GetSNIHostsForServer`), pattern build/sort factored into
+      `newPats`/`sortPats` (score desc → pattern asc → idx asc, numeric), `New` sanitises its
+      hosts, and the new server-level `PickHosts(hostSets, reqHost)` shares the one comparator
+      with `Resolve`. Tests: `TestSanitizeServerHost`, `TestPickHosts` (both declaration orders,
+      identical-pattern → smaller index), `TestPickHostsIndexNotLexicographic`, and a
+      `<ns>/`-prefixed regression pin in `TestResolveMostSpecific`.
+- [x] 14.2 translate: `ScopedInput.Host`; tri-state `ListenerStatus` + `ListenerFor` (the SINGLE
+      RC-selection decision point — `Translate` and the resolver gate both go through it),
+      replacing boolean `HasListenerOnPort`; `rdsRouteName` ports `gatewayRDSRouteName` verbatim
+      INCLUDING `server.bind`; `routeConfigNameFor(gwCfg, port, reqHost)` picks the server on the
+      port whose hosts most-specifically match the request FQDN (no protocol pre-filter — a
+      passthrough server that wins the host reports the miss itself; `""` host = host-agnostic
+      escape hatch). Tests: `TestListenerForSelectsServerByHost` (every case in both declaration
+      orders), `TestTranslateHTTPSServerByHostEndToEnd` (two :443 TLS servers → each host gets its
+      OWN server's RC + backend cluster), `TestTranslatePortSelectsRouteConfig` migrated to
+      `wantStatus` with `Host` empty (host-agnostic path byte-identical).
+- [x] 14.3 build: `RouteNoServerForHost` outcome (`no_server_for_host`) + prescan reason
+      `route_engine_no_server_for_host` (same key set as `no_listener_on_port`); outcome table in
+      `routeprescan_test.go` extended.
+- [x] 14.4 resolver: `scoped.Host = req.Host`; listener gate switches on `ListenerFor` tri-state
+      (both misses decided from config alone — no translate, no `router_check_tool`);
+      `outcomeRank` no_route 3 > no_server_for_host 2 > no_listener_on_port 1 > default 0; segment
+      cache comment covers (port, host, path). Test:
+      `TestResolveRoute_HostNotServedByAnyServerOnPort` (gateway-level host match succeeds, per
+      -server :443 hosts don't — returns before `Translate`/`r.run`, pinning the `Host` threading).
+- [x] 14.5 Docs: design.md D5 rewritten (host+bind selection, `Intersection` early-exit argument,
+      three distinct miss reasons); CLAUDE.md route bullet (3) updated; spec delta scenario for
+      host-aware server selection; `openspec validate translate-global-fqdn-to-k8s-service`.
