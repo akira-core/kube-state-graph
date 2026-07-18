@@ -6,6 +6,7 @@ package gwresolve
 
 import (
 	"sort"
+	"strings"
 
 	"istio.io/istio/pkg/config/host"
 )
@@ -20,6 +21,7 @@ type pat struct {
 	gw      string
 	pattern host.Name
 	score   int // higher = more specific
+	idx     int // owning host-set index for PickHosts; New always stamps 0
 }
 
 // Resolver indexes gateway host patterns for host->gateway lookup.
@@ -36,22 +38,79 @@ func specificity(p host.Name) int {
 	return len(p) + 1_000_000 // exact host wins outright
 }
 
+// SanitizeServerHost strips the optional Istio "<ns>/" binding prefix from a
+// gateway server host ("prod/*.example.com", "./host", "*/host") so the bare
+// pattern can be matched against a client host. The precedent is istio's
+// model.GetSNIHostsForServer, which strips the prefix unconditionally before
+// SNI matching. Deliberately asymmetric with host.NamesForNamespace (which
+// FILTERS): the namespace prefix restricts which VirtualServices may bind to
+// the server, never which client hosts the server serves — so this strips,
+// it does not filter.
+func SanitizeServerHost(h string) string {
+	if _, bare, ok := strings.Cut(h, "/"); ok {
+		return bare
+	}
+	return h
+}
+
+// newPats builds the pattern rows for one host set, sanitising each host and
+// stamping the owning key/idx on every row.
+func newPats(key string, idx int, hosts []string) []pat {
+	pats := make([]pat, 0, len(hosts))
+	for _, h := range hosts {
+		p := host.Name(SanitizeServerHost(h))
+		pats = append(pats, pat{gw: key, pattern: p, score: specificity(p), idx: idx})
+	}
+	return pats
+}
+
+// sortPats orders patterns most-specific first: score desc, then pattern asc,
+// then idx asc — an identical pattern resolves to the smaller (earlier
+// declared) host set, mirroring istio's CheckDuplicates first-declared-wins.
+// The idx comparison is numeric, never stringified (else 10 would sort
+// before 2). Under New all idx are 0, so that branch is a no-op there.
+func sortPats(pats []pat) {
+	sort.SliceStable(pats, func(a, b int) bool {
+		if pats[a].score != pats[b].score {
+			return pats[a].score > pats[b].score
+		}
+		if pats[a].pattern != pats[b].pattern {
+			return pats[a].pattern < pats[b].pattern // deterministic tie-break
+		}
+		return pats[a].idx < pats[b].idx
+	})
+}
+
 // New builds a resolver over all gateways. Patterns are pre-sorted most-specific
-// first so Resolve returns on the first match.
+// first so Resolve returns on the first match. Server hosts are sanitised
+// (SanitizeServerHost), so a "<ns>/"-prefixed host still matches.
 func New(gws []Gateway) *Resolver {
 	r := &Resolver{}
 	for _, gw := range gws {
-		for _, h := range gw.Hosts {
-			r.pats = append(r.pats, pat{gw: gw.Name, pattern: host.Name(h), score: specificity(host.Name(h))})
+		r.pats = append(r.pats, newPats(gw.Name, 0, gw.Hosts)...)
+	}
+	sortPats(r.pats)
+	return r
+}
+
+// PickHosts selects, among several server host sets, the one whose hosts
+// most-specifically match reqHost — the server-level twin of Resolve, sharing
+// the same comparator. It returns the winning set's index (ok=false when no
+// set matches). An identical winning pattern in two sets resolves to the
+// smaller index (first declared wins).
+func PickHosts(hostSets [][]string, reqHost string) (int, bool) {
+	var pats []pat
+	for i, hosts := range hostSets {
+		pats = append(pats, newPats("", i, hosts)...)
+	}
+	sortPats(pats)
+	h := host.Name(reqHost)
+	for _, p := range pats {
+		if p.pattern.Matches(h) {
+			return p.idx, true
 		}
 	}
-	sort.SliceStable(r.pats, func(a, b int) bool {
-		if r.pats[a].score != r.pats[b].score {
-			return r.pats[a].score > r.pats[b].score
-		}
-		return r.pats[a].pattern < r.pats[b].pattern // deterministic tie-break
-	})
-	return r
+	return 0, false
 }
 
 // Resolve returns the gateway whose server hosts most-specifically match the
