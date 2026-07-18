@@ -192,6 +192,7 @@ func TestParseServiceGraphRoutes_IndexMissFallsExternal(t *testing.T) {
 		{"no_route", routeEntry{outcome: RouteNoRoute}},
 		{"no_gateway", routeEntry{outcome: RouteNoGateway}},
 		{"no_listener_on_port", routeEntry{outcome: RouteNoListenerOnPort}},
+		{"no_server_for_host", routeEntry{outcome: RouteNoServerForHost}},
 		{"no_ingress", routeEntry{outcome: RouteNoIngress}},
 		{"ambiguous_ingress_cluster", routeEntry{outcome: RouteAmbiguousIngress}},
 		{"engine_error", routeEntry{failed: true}},
