@@ -209,15 +209,31 @@ Consequence: **no new node type, no new edge type, no new node attribute, no new
 PromQL/selector change.** The destination `port` and `subset` are parsed and discarded — `labels` is
 strict `map[string]string`, and a typed attribute is a separate change.
 
-### D5 — Listener port: peer-address `:port` → optional label → default 443
+### D5 — Listener port: peer-address `:port` → optional label → default 443; the RouteConfiguration is selected by (port, host, bind)
 
-The updated POC is no longer hardwired to HTTP :80. `translate.ScopedInput` carries a `Port`, and
-`routeConfigNameFor(gwCfg, port)` mirrors istio's unexported `gatewayRDSRouteName`: it finds the
-Gateway **server listening on that exact port** and names the RouteConfiguration `http.<port>` for a
-plain HTTP server, or `https.<port>.<portName>.<gwName>.<gwNamespace>` for a TLS-terminated HTTPS one.
-The port is therefore a required input we must supply.
+The updated POC is no longer hardwired to HTTP :80. `translate.ScopedInput` carries a `Port` **and a
+`Host`**, and `routeConfigNameFor(gwCfg, port, reqHost)` mirrors istio's unexported
+`gatewayRDSRouteName` **in full**: among the Gateway servers listening on that exact port, the one
+whose `hosts` most-specifically match the request FQDN (via `gwresolve.PickHosts` — Istio
+exact/wildcard semantics, independent of declaration order; an identical pattern resolves to the
+first-declared server, mirroring istio's `CheckDuplicates`) **owns** the RouteConfiguration, named
+`http.<port>[.<bind>]` for a plain HTTP server (all HTTP servers on the port share it — host
+disambiguation happens inside via virtual hosts) or
+`https.<port>.<portName>.<gwName>.<gwNamespace>[.<bind>]` for a TLS-terminated HTTPS server (each
+HTTPS server carries its **own** RC — one filter chain per cert/SNI). Port-only selection is wrong on
+exactly those two axes: two TLS servers on :443 would resolve through whichever server happened to be
+declared first (usually a silent `RouteNoRoute` → false-negative external node), and a `server.bind`
+would compute a name istiod never emits. Two subtleties the implementation pins with comments and
+tests: server `hosts` may carry an Istio `<ns>/` binding prefix, which is **stripped, not filtered**,
+before matching (the prefix restricts which VirtualServices may bind, never which client hosts are
+served; precedent: `model.GetSNIHostsForServer`), and the on-port server set is **not**
+protocol-filtered before the host pick — a TLS-passthrough server that wins the host must win the
+selection and then report the miss (no HTTP RDS route), or we would invent a route Envoy never
+serves. `ListenerFor(in)` is the single tri-state decision point (`ListenerFound` /
+`ListenerNoneOnPort` / `ListenerNoServerForHost`) that both `Translate` and the resolver's listener
+gate go through, replacing the old boolean `HasListenerOnPort`.
 
-Precedence:
+The port is a required input we must supply. Precedence:
 
 1. The `:port` in the peer-address value. `stripPeerAddressPort` currently **discards** it; it now
    returns it. (Every existing caller keeps using the host alone, so behaviour is unchanged.)
@@ -226,9 +242,9 @@ Precedence:
 3. Default **443**.
 
 443 rather than 80 because of how a wrong port fails. When no server listens on the requested port (or
-it is TLS **passthrough** / TCP), `routeConfigNameFor` returns `ok=false`, the translator returns an
-**empty** RouteConfiguration, `router_check_tool` matches nothing, and the endpoint falls back to
-`external`. The failure mode is "no cluster at all", never "the wrong cluster". Now:
+the server winning the host is TLS **passthrough** / TCP), the listener gate reports
+`ListenerNoneOnPort` before any translation, and the endpoint falls back to `external`. The failure
+mode is "no cluster at all", never "the wrong cluster". Now:
 
 - A Gateway declaring **both** a real `:80` HTTP server and a `:443` HTTPS server over the same hosts
   binds the same VirtualServices to both listeners and generates the same route table — either port
@@ -236,13 +252,31 @@ it is TLS **passthrough** / TCP), `routeConfigNameFor` returns `ok=false`, the t
 - But a Gateway declaring only `:443`, or whose `:80` server is an `httpsRedirect` stub (a very common
   pattern), has **no routable HTTP listener on :80** — an 80 guess misses.
 
-So 443 is the safer default, and the resolver records `route_engine_no_listener_on_port` as a
-**distinct** external-fallback reason from `route_engine_miss` (no route matched), so a mis-guessed
-port is diagnosable in the logs rather than blending into ordinary external traffic.
+So 443 is the safer default, and the resolver keeps the miss diagnoses **distinct**:
+`route_engine_no_listener_on_port` (`RouteNoListenerOnPort` — the port guess was wrong),
+`route_engine_no_server_for_host` (`RouteNoServerForHost` — servers DO listen on the port, but none
+serves the request host), and `route_engine_miss` (`RouteNoRoute` — right listener, no route matched
+the path). A mis-guessed port is therefore diagnosable in the logs rather than blending into ordinary
+external traffic, and a listener that never served the host is not mistaken for a bad port guess.
+`outcomeRank` orders them no_route > no_server_for_host > no_listener_on_port > no_gateway.
+
+**"No server hosts match" may end the resolution immediately — no HTTP fallback, no translate.**
+Verified against upstream: `buildGatewayHTTPRouteConfig` (`pilot/pkg/networking/core/gateway.go`)
+builds each virtual host from `host.NamesForNamespace(server.Hosts, vs.Namespace)` intersected with
+the VS hosts, and `Names.Intersection` keeps the **more specific** of the two sides — so every vhost
+domain is a subset of some server host pattern. Contrapositive: a request host matching **no** server
+host on the port can match **no** vhost; running the full istiod translate + `router_check_tool`
+subprocess (~50–60 ms) could only arrive at a foregone `RouteNoRoute`. Reporting
+`ListenerNoServerForHost` is equivalent-but-faster and diagnostically sharper. (The `httpsRedirect`
+stub's vhosts derive directly from `server.Hosts`, and the default-404 vhost istio adds to an empty
+RC carries no route — neither overturns the argument.) The one behavioural delta versus the port-only
+rule: a host served by no server on the port now reports `route_engine_no_server_for_host` instead of
+`route_engine_miss`; both degrade to the same external node, so the graph output is unchanged.
 
 Note `gwresolve` is port-agnostic (it matches `server_hosts` regardless of port), so the Gateway is
-still found — only the RDS route-name lookup fails. And `matchcheck.Query` stays `{Host, Path}`: the
-port selects *which* RouteConfiguration is built; it is not part of the match input.
+still found — only the per-server selection inside it fails. And `matchcheck.Query` stays
+`{Host, Path}`: the (port, host) pair selects *which* RouteConfiguration is built; the host is also a
+match input there, the port is not.
 
 ### D6 — `client_dns_answers` is REQUIRED; no IPs ⇒ the engine is never consulted (config_only removed)
 
