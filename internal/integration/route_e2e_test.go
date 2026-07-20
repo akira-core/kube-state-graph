@@ -21,6 +21,7 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 
 	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/route"
 	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
 	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
@@ -102,6 +103,15 @@ const (
 	// ingressExtIP fronts cluster-alpha via external_ips only (no LB array
 	// entry) — proves the probe OR-matches either column.
 	ingressExtIP = "203.0.113.80"
+	// ingressLBIPNginx fronts cluster-alpha's nginx ingress controller: an LB
+	// Service + Deployment whose selector chain reaches NO Istio Gateway CR —
+	// the ingress-lb-service-fallback fixture (Hop 3 empty, pipeline misses at
+	// gateway resolution, the unique LB Service resolves).
+	ingressLBIPNginx = "203.0.113.90"
+	// ingressLBIPNginxDup is carried by TWO differently-named LB Services in
+	// cluster-alpha — the fallback's same-IP collision, which must degrade to
+	// the external node (ambiguous_ingress_service), never guess.
+	ingressLBIPNginxDup = "203.0.113.100"
 )
 
 // dt64s renders a time as the string form ClickHouse parses into DateTime64(3)
@@ -399,6 +409,25 @@ func (s *RouteSuite) seedRouteStore() {
 		beta, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{}, []string{}, []string{}, backendSpec, uint64(14))
 
+	// nginx ingress (ingress-lb-service-fallback): an LB Service + Deployment
+	// in cluster-alpha whose selector chain (app=ingress-nginx) matches no
+	// seeded Istio Gateway CR — Hop 3 is empty, the pipeline misses with
+	// no_gateway, and the fallback resolves the unique LB Service. A second
+	// pair of differently-named Services shares ingressLBIPNginxDup — the
+	// same-IP collision that must degrade ambiguous.
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "ingress-nginx-controller", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginx}, []string{"app=ingress-nginx"}, "", uint64(30))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "ingress-nginx-controller", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"app=ingress-nginx"}, uint64(31))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "nginx-dup-a", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginxDup}, []string{"app=nginx-dup"}, "", uint64(32))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "other-lb", "nginx-dup-b", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginxDup}, []string{"app=nginx-dup"}, "", uint64(33))
+
 	// cluster-gone: an ingress Service version carrying ingressLBIPGone,
 	// closed by a REWRITE (same version slot, higher ingest_seq, valid_to
 	// pulled in) two hours before fixedNow. Without the probe's client-side
@@ -429,12 +458,16 @@ kube_service_info{cluster="cluster-alpha",namespace="shop",service="payments",cl
 kube_service_info{cluster="cluster-alpha",namespace="shop",service="reviews",cluster_ip="10.96.0.30",test=%q} 1 %d
 kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="payments-x1",label_kubernetes_io_service_name="payments",test=%q} 1 %d
 kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="payments-x1",targetref_kind="Pod",targetref_name="payments-0",targetref_namespace="shop",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="ingress-nginx",pod="ingress-nginx-controller-0",uid="alpha-3",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="ingress-nginx",service="ingress-nginx-controller",cluster_ip="10.96.0.40",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",label_kubernetes_io_service_name="ingress-nginx-controller",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",targetref_kind="Pod",targetref_name="ingress-nginx-controller-0",targetref_namespace="ingress-nginx",test=%q} 1 %d
 kube_pod_info{cluster="cluster-beta",namespace="shop",pod="payments-0",uid="beta-2",node="bworker-0",test=%q} 1 %d
 kube_node_info{cluster="cluster-beta",node="bworker-0",test=%q} 1 %d
 kube_service_info{cluster="cluster-beta",namespace="shop",service="payments",cluster_ip="10.97.0.20",test=%q} 1 %d
 kube_endpointslice_labels{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",label_kubernetes_io_service_name="payments",test=%q} 1 %d
 kube_endpointslice_endpoints{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",targetref_kind="Pod",targetref_name="payments-0",targetref_namespace="shop",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1)
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1)
 	s.IngestExpFmt(exposition)
 	s.Require().True(s.WaitForSeries(`kube_pod_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_info")
@@ -564,6 +597,55 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 		"nothing materialises in the caller's cluster for this host")
 	s.NotContains(bodyStr, `external/cross.example.com`,
 		"a cross-cluster route hit must not leave an external node behind")
+}
+
+// TestNginxIngressFallsBackToLBService is the ingress-lb-service-fallback
+// motivating case end to end: the destination IP selects cluster-alpha, whose
+// window holds the nginx LB Service + Deployment but NO Istio Gateway CR
+// reachable from the IP (Hop 3 empty → every segment misses at gateway
+// resolution). The fallback resolves the unique LB Service; the graph carries
+// a pod-calls-service edge to it and the fan-out reaches the nginx controller
+// pod — and no external node.
+func (s *RouteSuite) TestNginxIngressFallsBackToLBService() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="app.nginx.example.com",client_dns_answers="` + ingressLBIPNginx + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/ingress-nginx/ingress-nginx-controller"`,
+		"the fallback must resolve the ingress LB Service when the Istio pipeline finds no gateway")
+	s.Contains(bodyStr, `"target":"cluster-alpha/ingress-nginx/ingress-nginx-controller"`,
+		"pod-calls-service edge from the caller to the LB service")
+	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-3"`,
+		"the LB service fans out to the nginx controller pod")
+	s.NotContains(bodyStr, `external/app.nginx.example.com`,
+		"a fallback-resolved peer must not leave an external node behind")
+}
+
+// TestAmbiguousIngressLBServiceStaysExternal: two differently-named LB
+// Services carry the destination IP in the selected cluster's window — the
+// fallback must degrade to the pre-change external node instead of guessing.
+func (s *RouteSuite) TestAmbiguousIngressLBServiceStaysExternal() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="dup.nginx.example.com",client_dns_answers="` + ingressLBIPNginxDup + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `external/dup.nginx.example.com`,
+		"a same-IP LB Service collision degrades to the external node")
+	s.NotContains(bodyStr, `nginx-dup-a`)
+	s.NotContains(bodyStr, `nginx-dup-b`)
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +866,43 @@ func (s *RouteStoreSuite) TestOpenWithAuthUsesEnvStyleCredentials() {
 	st, err := routestore.Open(ctx, freeDSN, routestore.WithAuth("ksg", "ksg-test"))
 	s.Require().NoError(err, "WithAuth must supply credentials after ParseDSN")
 	defer func() { _ = st.Close() }()
+}
+
+// TestNginxFallbackResolvesViaRealStore drives the ingress-lb-service-fallback
+// through the real ClickHouse rows WITHOUT router_check_tool: the nginx window
+// shape never reaches gwresolve, so a zero matchcheck.Runner is a tripwire
+// (any invocation would fail). Unique IP → RouteIngressLBService anchored on
+// the selected cluster; the dup IP's same-cluster collision → ambiguous.
+func (s *RouteStoreSuite) TestNginxFallbackResolvesViaRealStore() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+	r := route.NewResolver(st, matchcheck.Runner{})
+
+	req := build.RouteRequest{
+		CallerCluster: "cluster-alpha",
+		Host:          "app.nginx.example.com",
+		Path:          "/",
+		Port:          443,
+		IPs:           []string{ingressLBIPNginx},
+		Start:         fixedNow.Add(-5 * time.Minute),
+		End:           fixedNow,
+	}
+	dest, outcome, err := r.ResolveRoute(ctx, req)
+	s.Require().NoError(err)
+	s.Equal(build.RouteIngressLBService, outcome)
+	s.Equal(build.RouteDestination{
+		Cluster: "cluster-alpha", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
+	}, dest, "dest carries the engine-selected cluster and the unique LB Service identity")
+
+	req.Host = "dup.nginx.example.com"
+	req.IPs = []string{ingressLBIPNginxDup}
+	dest, outcome, err = r.ResolveRoute(ctx, req)
+	s.Require().NoError(err)
+	s.Equal(build.RouteAmbiguousIngressService, outcome,
+		"two LB Services on one IP in the selected cluster must degrade ambiguous")
+	s.Equal(build.RouteDestination{}, dest)
 }
 
 // stripDSNUserinfo returns a DSN with userinfo removed so Open + WithAuth can

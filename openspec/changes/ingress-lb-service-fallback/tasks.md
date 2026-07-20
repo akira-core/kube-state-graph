@@ -48,16 +48,16 @@ ingress LB Service inside the already-selected ingress cluster resolves to that 
 
 ## 4. Integration + full checks
 
-- [ ] 4.1 `internal/integration/route_e2e_test.go`: nginx fixture — ClickHouse seed
+- [x] 4.1 `internal/integration/route_e2e_test.go`: nginx fixture — ClickHouse seed
       `service_versions` LB Service (new IP) + `deploy_versions` nginx Deployment, NO Gateway
       CR reachable from that IP; full-graph e2e in **RouteSuite** (VM seed `kube_service_info`
       + endpointslice → nginx pod + unknown-server series with `client_dns_answers` = new IP;
       assert service node, `pod-calls-service`, `service-selects-pod`, no external) plus a
       tool-free resolver-level test in **RouteStoreSuite** (real ClickHouse + zero
       `matchcheck.Runner` tripwire → `RouteIngressLBService` / ambiguous outcomes, Docker-only).
-- [ ] 4.2 ambiguous integration case: two LB Service rows on one IP → external
+- [x] 4.2 ambiguous integration case: two LB Service rows on one IP → external
       (`TestAmbiguousIngressLBServiceStaysExternal`).
-- [ ] 4.3 `make test`, `make check-route-containment`, `make lint` all green.
+- [x] 4.3 `make test`, `make check-route-containment`, `make lint` all green.
 
 ## 5. Docs + observability
 
