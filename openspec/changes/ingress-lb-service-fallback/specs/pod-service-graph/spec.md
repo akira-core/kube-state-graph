@@ -4,13 +4,18 @@
 
 When the Istio route-resolution engine ("Istio route resolution of global FQDN peers") has
 selected an ingress cluster, loaded its window, and run the Gateway + VirtualService pipeline
-over every segment WITHOUT producing a hit, the engine SHALL — before returning the pipeline's
-miss — attempt one fallback: resolve the destination IP set to a **unique ingress LB Service**
-inside the already-selected ingress cluster's loaded window.
+over every segment WITHOUT producing a hit AND without any segment progressing past gateway
+resolution (the pipeline's deepest miss is the "no gateway serves the host" outcome — the
+signature of a non-Istio ingress such as nginx, whose Hop 3 finds no Gateway CR), the engine
+SHALL — before returning that miss — attempt one fallback: resolve the destination IP set to a
+**unique ingress LB Service** inside the already-selected ingress cluster's loaded window.
 
-The fallback SHALL NOT run when the pipeline produced a hit (a routed `hit` always wins), and
-CANNOT run when ingress-cluster selection itself failed (the "no candidate ingress cluster" and
-"ambiguous ingress cluster" outcomes return before any window is loaded).
+The fallback SHALL NOT run when the pipeline produced a hit (a routed `hit` always wins), SHALL
+NOT run when the deepest miss is any deeper pipeline outcome ("no listener on the derived
+port", "no server for host", "no route matched" — an Istio Gateway DID serve the host and its
+diagnostic reason MUST NOT be masked by an LB-entry-point edge), and CANNOT run when
+ingress-cluster selection itself failed (the "no candidate ingress cluster" and "ambiguous
+ingress cluster" outcomes return before any window is loaded).
 
 **Candidate set (window-wide, no per-instant evaluation).** For each destination IP, the
 candidates are every ingress Service version in the loaded (selected-cluster) window whose
@@ -60,6 +65,14 @@ fail a build.
 - **AND** the family-wide `service-selects-pod` fan-out to the Service's backing pods (the
   ingress controller pods)
 - **AND** SHALL NOT emit an external node for the peer
+
+#### Scenario: A deep Istio miss is not masked by the fallback
+
+- **WHEN** the selected ingress cluster's Gateway serves the host but the pipeline misses at a
+  stage past gateway resolution (no listener on the derived port, no server for the host, or no
+  route matched), and the window also holds an ingress LB Service carrying the destination IP
+- **THEN** the engine SHALL return that deeper miss outcome and diagnostic reason unchanged
+- **AND** SHALL NOT resolve the ingress LB Service
 
 #### Scenario: A routed hit always beats the fallback
 

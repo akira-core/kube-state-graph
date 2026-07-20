@@ -133,6 +133,26 @@ func (m *Window) ResolveIPToGateways(ip string, t time.Time) []store.GatewayCand
 	return cands
 }
 
+// ResolveIPToIngressServices returns EVERY service row whose validity overlaps
+// the window and whose ingress IPs (external or load-balancer) contain ip —
+// the window-wide, single-cluster analogue of store.ClustersWithIngressIP's
+// SQL, returning the rows themselves instead of cluster names. Unlike the
+// as-of Hop 1 of ResolveIPToGateways it is not evaluated at an instant: all
+// overlapping versions count, and uniqueness of the (Namespace, Name)
+// identity set is the caller's concern (the ingress-lb-service-fallback
+// change). The overlap check is defensive — the store only loads overlapping
+// rows to begin with.
+func (m *Window) ResolveIPToIngressServices(ip string) []store.ServiceRow {
+	var out []store.ServiceRow
+	for i := range m.w.Services {
+		r := &m.w.Services[i]
+		if r.ValidFrom.Before(m.t1) && r.ValidTo.After(m.t0) && r.HasIngressIP(ip) {
+			out = append(out, *r)
+		}
+	}
+	return out
+}
+
 // GatewaysLiveAt returns every gateway version live at t (name + server hosts),
 // enough to build a gwresolve.Resolver for the segment.
 func (m *Window) GatewaysLiveAt(t time.Time) []store.GatewayCand {

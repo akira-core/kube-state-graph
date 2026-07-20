@@ -349,13 +349,18 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 	case entry.failed:
 		r.noteExternal("route_engine_error", t, "host", key.host, "port", key.port,
 			"peer_address", value, "caller_cluster", key.callerCluster, "classify_reason", origReason)
-	case entry.outcome == RouteHit:
+	case entry.outcome == RouteHit || entry.outcome == RouteIngressLBService:
 		// Anchor on the engine-selected ingress cluster (design D11), which
 		// may differ from the caller's — the resulting pod-calls-service edge
-		// may cross clusters (design D12).
+		// may cross clusters (design D12). RouteIngressLBService (the
+		// ingress-lb-service-fallback change) rides the same path: its
+		// destination is the LB entry point rather than a routed backend, but
+		// the graph resolution is identical — the outcome dimension in the
+		// log keeps the coarser semantics distinguishable.
 		if ids := r.resolveServiceLevel(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
+				"outcome", string(entry.outcome),
 				"service", entry.dest.Service, "namespace", entry.dest.Namespace,
 				"ingress_cluster", entry.dest.Cluster, "caller_cluster", key.callerCluster,
 				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
@@ -388,6 +393,14 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// Design D10: candidates could not be reduced to one cluster
 		// (unresolvable tie or disagreeing multi-IP selections).
 		r.noteExternal("route_engine_ambiguous_ingress_cluster", t, "host", key.host,
+			"port", key.port, "ips", key.ips, "peer_address", value,
+			"caller_cluster", key.callerCluster, "classify_reason", origReason)
+	case entry.outcome == RouteAmbiguousIngressService:
+		// ingress-lb-service-fallback: the Istio pipeline missed at gateway
+		// resolution and the destination IPs matched MORE than one ingress LB
+		// Service identity in the selected cluster's window — degrade rather
+		// than guess, mirroring the ambiguous-ingress-cluster spirit.
+		r.noteExternal("route_engine_ambiguous_ingress_service", t, "host", key.host,
 			"port", key.port, "ips", key.ips, "peer_address", value,
 			"caller_cluster", key.callerCluster, "classify_reason", origReason)
 	default: // RouteNoGateway / RouteNoRoute

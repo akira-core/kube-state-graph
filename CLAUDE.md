@@ -367,6 +367,28 @@ live under `openspec/specs/`.
   see the client-go rule) and matches with the native `router_check_tool`
   binary (`--router-check-bin`; copied into the image from the Envoy tools
   image; ~50–60 ms per distinct config — v1 is deliberately serial/uncached).
+  **(5b) Ingress LB Service fallback** (ingress-lb-service-fallback change):
+  when the pipeline produces no hit AND its folded miss is exactly
+  `RouteNoGateway` (no segment got past gateway resolution — the nginx
+  signature: Hop 3 finds no Istio Gateway CR; a DEEPER miss keeps its
+  diagnostic reason unmasked), the resolver falls back to a **window-wide
+  identity dedup** over the already-loaded rows
+  (`memwindow.ResolveIPToIngressServices` — the in-memory, single-cluster
+  analogue of the `ClustersWithIngressIP` SQL; no new store read, no
+  per-instant/segment evaluation): per destination IP the distinct
+  `(namespace, name)` of every window-overlapping ingress-IP-carrying Service
+  row, merged order-free — any IP with >1 identity (incl. an identity change
+  inside the window) → `RouteAmbiguousIngressService`
+  (`route_engine_ambiguous_ingress_service` → external, no lexicographic
+  tie-break); any IP with 0 → keep the pipeline miss byte-for-byte; else all
+  singletons must agree → `RouteIngressLBService`, resolved by
+  `routeIndexResolve` through the SAME `resolveServiceLevel` path as
+  `RouteHit` (dest.Cluster = the locked ingress cluster, topology miss →
+  `route_engine_dest_cluster_lacks_service`), with the outcome dimension in
+  the success debug log distinguishing the coarser "LB entry point" semantics
+  (host/path/port play no part — the fan-out reaches the ingress controller
+  pods, e.g. nginx, never a routed backend). Neither new outcome enters
+  `outcomeRank`.
   **(6) Containment** (D1, dependency hygiene, distinct from the client-go
   rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
   import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,

@@ -103,6 +103,19 @@ const (
 	// any window is loaded. Deliberately degrades rather than guessing:
 	// never a wrong cluster.
 	RouteAmbiguousIngress RouteOutcome = "ambiguous_ingress_cluster"
+	// RouteIngressLBService — the Istio pipeline missed every segment, but the
+	// destination IPs map to exactly ONE ingress LB Service inside the selected
+	// ingress cluster's window (the ingress-lb-service-fallback change). The
+	// destination is that Service — the LB *entry point* (e.g. an nginx ingress
+	// controller's Service), NOT a routed backend: host, path, and port play no
+	// part. Resolved by the parse exactly like RouteHit.
+	RouteIngressLBService RouteOutcome = "ingress_lb_service"
+	// RouteAmbiguousIngressService — the Istio pipeline missed and the
+	// fallback found MORE than one ingress LB Service identity for the
+	// destination IPs within the selected cluster's window (a same-IP
+	// collision, or an identity change inside the window). Degrades rather
+	// than guessing — never a wrong Service.
+	RouteAmbiguousIngressService RouteOutcome = "ambiguous_ingress_service"
 )
 
 // RouteResolver answers RouteRequests against a versioned Istio-config store.

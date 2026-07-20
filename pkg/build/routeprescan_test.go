@@ -147,6 +147,36 @@ func TestParseServiceGraphRoutes_GlobalFQDNRouteHitResolvesService(t *testing.T)
 	assert.Empty(t, res.ExternalNodes, "route hit must not leave an external node behind")
 }
 
+// An ingress-lb-service-fallback resolution (the Istio pipeline missed at
+// gateway resolution but the destination IP uniquely mapped to an ingress LB
+// Service) rides the exact same path as a RouteHit: service node in the
+// engine-selected cluster, pod-calls-service edge, endpoint fan-out, no
+// external node.
+func TestParseServiceGraphRoutes_IngressLBServiceFallbackResolvesService(t *testing.T) {
+	vec := sampleVec(unknownPeerSample("api.example.com", nil))
+	routes := routeIndex{
+		{callerCluster: "cluster-alpha", host: "api.example.com", path: "/", port: 443, ips: testDNSAnswer}: {
+			// The fallback's destination carries no port/subset (the LB entry
+			// point, not a routed backend).
+			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments"},
+			outcome: RouteIngressLBService,
+		},
+	}
+	res := parseServiceGraphRoutes(vec, sampleTopologyWithServices(), routes)
+
+	require.Len(t, res.ServiceNodes, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/abc", pcs[0].Source)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+
+	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
+	assert.Len(t, ssp, 2, "the LB service fans out to its backing (controller) pods")
+	assert.Empty(t, res.ExternalNodes, "a fallback resolution must not leave an external node behind")
+}
+
 // A hit whose selected ingress cluster differs from the caller's anchors the
 // service node in THAT cluster: the pod-calls-service edge crosses clusters
 // (design D11/D12) and the service-selects-pod fan-out runs over the selected
@@ -195,6 +225,7 @@ func TestParseServiceGraphRoutes_IndexMissFallsExternal(t *testing.T) {
 		{"no_server_for_host", routeEntry{outcome: RouteNoServerForHost}},
 		{"no_ingress", routeEntry{outcome: RouteNoIngress}},
 		{"ambiguous_ingress_cluster", routeEntry{outcome: RouteAmbiguousIngress}},
+		{"ambiguous_ingress_service", routeEntry{outcome: RouteAmbiguousIngressService}},
 		{"engine_error", routeEntry{failed: true}},
 		{"hit_but_topology_lacks_service", routeEntry{
 			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "nowhere", Service: "ghost"},
@@ -205,6 +236,12 @@ func TestParseServiceGraphRoutes_IndexMissFallsExternal(t *testing.T) {
 			// destination — never resolve it via the caller's cluster instead.
 			dest:    RouteDestination{Cluster: "cluster-gamma", Namespace: "shop", Service: "payments"},
 			outcome: RouteHit,
+		}},
+		{"ingress_lb_service_but_topology_lacks_service", routeEntry{
+			// D3: route store and VM topology disagree — the fallback hit
+			// degrades exactly like a RouteHit whose service is missing.
+			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "ingress-nginx", Service: "ingress-nginx-controller"},
+			outcome: RouteIngressLBService,
 		}},
 	}
 	for _, c := range cases {

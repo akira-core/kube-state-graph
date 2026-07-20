@@ -146,7 +146,9 @@ func TestResolveRoute_LockedClusterScopesWindowLoads(t *testing.T) {
 // report RouteNoServerForHost and return BEFORE Translate and before r.run is
 // touched (the zero matchcheck.Runner would blow up otherwise, which also pins
 // that scoped.Host is actually threaded through: an unset Host would take the
-// host-agnostic escape hatch into the RC path).
+// host-agnostic escape hatch into the RC path). The window's ingress LB
+// ServiceRow additionally pins the fallback's no-gateway gate: a deep Istio
+// miss must NOT be masked by an ingress_lb_service resolution.
 func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	gwSpec := &networking.Gateway{
 		Selector: map[string]string{"istio": "ingress"},
@@ -198,6 +200,69 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	_, outcome, err := r.ResolveRoute(context.Background(), req)
 	require.NoError(t, err)
 	assert.Equal(t, build.RouteNoServerForHost, outcome)
+}
+
+// ---------------------------------------------------------------------------
+// Ingress LB Service fallback (ingress-lb-service-fallback change). The nginx
+// window shape — LB Service + Deployment, NO Gateway CR — never reaches
+// gwresolve, so the zero matchcheck.Runner tripwire applies throughout.
+// ---------------------------------------------------------------------------
+
+// nginxWindow is the motivating fixture: Hop 1 and Hop 2 succeed, Hop 3 has no
+// Istio Gateway CR, so every segment misses at gateway resolution (the folded
+// miss stays RouteNoGateway) and the fallback fires.
+func nginxWindow() store.TrafficWindow {
+	from, to := testStart.Add(-time.Hour), testEnd.Add(time.Hour)
+	return store.TrafficWindow{
+		Services: []store.ServiceRow{{
+			Namespace: "ingress-nginx", Name: "ingress-nginx-controller",
+			ValidFrom: from, ValidTo: to,
+			LoadBalancerIPs: []string{"198.51.100.7"},
+			Selector:        []string{"app=ingress-nginx"},
+		}},
+		Deploys: []store.DeployRow{{
+			Namespace: "ingress-nginx", Name: "ingress-nginx-controller",
+			ValidFrom: from, ValidTo: to,
+			PodLabels: []string{"app=ingress-nginx"},
+		}},
+	}
+}
+
+func TestResolveRoute_NginxIngressFallsBackToLBService(t *testing.T) {
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
+		Return(nginxWindow(), nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	dest, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteIngressLBService, outcome)
+	assert.Equal(t, build.RouteDestination{
+		Cluster: "prod-01", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
+	}, dest, "dest carries the locked ingress cluster (D11) and no port/subset")
+}
+
+// Two differently-named LB Services carrying the same IP in the selected
+// cluster's window: the fallback degrades ambiguous instead of guessing.
+func TestResolveRoute_AmbiguousLBServiceOnOneIP(t *testing.T) {
+	w := nginxWindow()
+	other := w.Services[0]
+	other.Namespace, other.Name = "other-ns", "some-other-lb"
+	w.Services = append(w.Services, other)
+
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
+		Return(w, nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	dest, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteAmbiguousIngressService, outcome)
+	assert.Equal(t, build.RouteDestination{}, dest)
 }
 
 // A probe error is an infrastructure failure: returned to the caller (which

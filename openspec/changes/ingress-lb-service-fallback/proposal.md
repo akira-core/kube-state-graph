@@ -12,9 +12,12 @@ the destination IP (`docs/nginx-ingress-backend-resolution.md` §1, §7).
 
 ## What Changes
 
-- After the Istio pipeline runs over the loaded window **without a hit**, the resolver consults a
-  new fallback: does the destination IP set map to exactly **one** ingress LB Service inside the
-  **already-selected ingress cluster's** window? A unique match returns that Service as the
+- After the Istio pipeline runs over the loaded window **without a hit** and with its deepest
+  miss being **`no_gateway`** (no segment got past gateway resolution — the nginx signature; a
+  deeper Istio miss such as `no_route` / `no_server_for_host` / `no_listener_on_port` keeps its
+  diagnostic reason unmasked), the resolver consults a new fallback: does the destination IP set
+  map to exactly **one** ingress LB Service inside the **already-selected ingress cluster's**
+  window? A unique match returns that Service as the
   destination with a new `RouteIngressLBService` outcome; the graph side resolves it through the
   SAME `resolveServiceLevel` path as `RouteHit` — one `service` node in the selected cluster, a
   `pod-calls-service` edge, and the family-wide `service-selects-pod` fan-out (expanding to the

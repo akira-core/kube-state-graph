@@ -182,6 +182,24 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 		hitDest.Cluster = cluster
 		return hitDest, build.RouteHit, nil
 	}
+
+	// Ingress LB Service fallback (ingress-lb-service-fallback change), gated
+	// on miss == RouteNoGateway: the nginx-ingress signature is Hop 3 finding
+	// no Istio Gateway CR, so no segment got past gateway resolution — yet the
+	// loaded window may still map the destination IPs to exactly one ingress
+	// LB Service. A DEEPER miss (no_listener_on_port / no_server_for_host /
+	// no_route) means an Istio Gateway DID serve the host and its diagnostic
+	// reason must not be masked by an LB-entry-point edge. A routed hit above
+	// always wins; a fallback that finds nothing keeps the pipeline's own miss.
+	if miss == build.RouteNoGateway {
+		if dest, out, ok := resolveIngressLBService(mw, req.IPs); ok {
+			if out == build.RouteIngressLBService {
+				dest.Cluster = cluster // same D11 stamp as a RouteHit
+				return dest, out, nil
+			}
+			return build.RouteDestination{}, out, nil // ambiguous_ingress_service
+		}
+	}
 	return build.RouteDestination{}, miss, nil
 }
 

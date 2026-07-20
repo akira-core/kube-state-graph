@@ -61,11 +61,15 @@ else any `|S_ip| == 0` → no fallback (keep the Istio pipeline's deepest miss v
 else all singletons must be the same identity → hit, otherwise ambiguous. Order-free: the outcome
 does not depend on IP iteration order.
 
-## D8 — Hit priority and outcome plumbing
+## D8 — Hit priority, no-gateway gate, and outcome plumbing
 
 An Istio `RouteHit` in any segment always wins; the fallback is called only in the `!hit` branch
-of `resolve()`. The two new outcomes do NOT enter `outcomeRank` (they are terminal results of the
-fallback, not per-segment misses). On a fallback hit, `dest.Cluster` is stamped with the locked
+of `resolve()`, and ONLY when the folded miss is `RouteNoGateway` — the signature that no segment
+got past gateway resolution (nginx: Hop 3 finds no Gateway CR). A deeper miss
+(`no_listener_on_port` / `no_server_for_host` / `no_route`) means an Istio Gateway DID serve the
+host; its diagnostic reason must not be masked by an LB-entry-point edge (e.g. an Istio cluster's
+own ingressgateway LB Service would otherwise swallow every deep miss). The two new outcomes do
+NOT enter `outcomeRank` (they are terminal results of the fallback, not per-segment misses). On a fallback hit, `dest.Cluster` is stamped with the locked
 cluster exactly like the `RouteHit` return (parent D11); `Port`/`Subset` stay zero (discarded in
 v1 anyway). `pkg/build` gains only the two constants and the `routeIndexResolve` cases —
 containment (parent D1, `make check-route-containment`) is unaffected.

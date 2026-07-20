@@ -7,57 +7,63 @@ ingress LB Service inside the already-selected ingress cluster resolves to that 
 
 ## 1. Contract + pure functions
 
-- [ ] 1.1 `pkg/build/routeresolve.go`: add `RouteIngressLBService = "ingress_lb_service"` and
+- [x] 1.1 `pkg/build/routeresolve.go`: add `RouteIngressLBService = "ingress_lb_service"` and
       `RouteAmbiguousIngressService = "ambiguous_ingress_service"` outcome constants.
-- [ ] 1.2 `pkg/route/memwindow`: add `ResolveIPToIngressServices(ip string) []store.ServiceRow` —
+- [x] 1.2 `pkg/route/memwindow`: add `ResolveIPToIngressServices(ip string) []store.ServiceRow` —
       all rows overlapping the window with `HasIngressIP(ip)` (defensive overlap check against
       the window bounds). Tests: match / IP mismatch / multiple rows all returned /
       non-overlapping row excluded.
-- [ ] 1.3 `pkg/route/ingresslb.go`: `resolveIngressLBService(mw, ips) (dest, outcome, ok)` —
+- [x] 1.3 `pkg/route/ingresslb.go`: `resolveIngressLBService(mw, ips) (dest, outcome, ok)` —
       per-IP distinct-identity sets, order-free precedence (any >1 → ambiguous; any 0 → no
       fallback; singletons must agree).
-- [ ] 1.4 `pkg/route/ingresslb_test.go`: single IP single Service → hit; single IP two Services →
+- [x] 1.4 `pkg/route/ingresslb_test.go`: single IP single Service → hit; single IP two Services →
       ambiguous; two IPs different identities → ambiguous; two IPs same identity → hit; an IP
       with no match → ok=false; one IP two candidates + one IP zero → ambiguous; same-identity
       multi-version rows → hit; identity change within window → ambiguous.
 
 ## 2. Resolver integration
 
-- [ ] 2.1 `pkg/route/resolver.go`: in the `!hit` branch call the fallback; on
-      `RouteIngressLBService` stamp `dest.Cluster` with the locked cluster (D11) and return; on
-      `RouteAmbiguousIngressService` return it; otherwise return the pipeline miss unchanged.
-- [ ] 2.2 `pkg/route/resolver_test.go`: nginx fixture (ingress LB ServiceRow + DeployRow, no
-      GatewayRow) → `RouteIngressLBService` with correct dest; existing Istio-hit tests stay
-      green (hit priority); dual LB Services on one IP → `RouteAmbiguousIngressService`; no LB
-      row → original miss (e.g. `RouteNoGateway`); BuildScoped path unaffected.
+- [x] 2.1 `pkg/route/resolver.go`: in the `!hit` branch, gated on
+      `miss == RouteNoGateway` (deep Istio misses keep their diagnostic reason), call the
+      fallback; on `RouteIngressLBService` stamp `dest.Cluster` with the locked cluster (D11)
+      and return; on `RouteAmbiguousIngressService` return it; otherwise return the pipeline
+      miss unchanged.
+- [x] 2.2 `pkg/route/resolver_test.go`: nginx fixture (ingress LB ServiceRow + DeployRow, no
+      GatewayRow) → `RouteIngressLBService` with correct dest; existing Istio-hit and deep-miss
+      tests stay green (hit priority + no-gateway gate — `HostNotServedByAnyServerOnPort` keeps
+      `RouteNoServerForHost` even with an LB ServiceRow in the window); dual LB Services on one
+      IP → `RouteAmbiguousIngressService`; no LB row → original miss (`RouteNoGateway`);
+      BuildScoped path unaffected.
 
 ## 3. Graph-side wiring (`pkg/build`)
 
-- [ ] 3.1 `routeprescan.go` `routeIndexResolve`: `RouteIngressLBService` joins the `RouteHit`
+- [x] 3.1 `routeprescan.go` `routeIndexResolve`: `RouteIngressLBService` joins the `RouteHit`
       `resolveServiceLevel` case (same `route_engine_dest_cluster_lacks_service` on topology
       miss); success debug log carries the outcome so fallback hits are distinguishable.
-- [ ] 3.2 `routeprescan.go`: new `RouteAmbiguousIngressService` case →
+- [x] 3.2 `routeprescan.go`: new `RouteAmbiguousIngressService` case →
       `noteExternal("route_engine_ambiguous_ingress_service", ...)`.
-- [ ] 3.3 `routeprescan_test.go`: fallback-hit test (service node + `pod-calls-service` +
+- [x] 3.3 `routeprescan_test.go`: fallback-hit test (service node + `pod-calls-service` +
       `service-selects-pod`, no external); miss-table rows for `ambiguous_ingress_service` and
       `ingress_lb_service`-but-topology-lacks-service → external.
 
 ## 4. Integration + full checks
 
-- [ ] 4.1 `internal/integration/route_e2e_test.go`: nginx-only fixture in **RouteStoreSuite**
-      (no Gateway CR → `router_check_tool` never invoked → Docker-only): ClickHouse seed
-      `service_versions` LB Service (new IP) + `deploy_versions` nginx Deployment, NO
-      `gw_versions` row for that IP; VictoriaMetrics seed `kube_service_info` +
-      endpointslice → nginx pod + unknown-server series with `client_dns_answers` = new IP;
-      assert service node, `pod-calls-service`, `service-selects-pod`, no external.
-- [ ] 4.2 (optional) ambiguous integration case: two LB Service rows on one IP → external.
+- [ ] 4.1 `internal/integration/route_e2e_test.go`: nginx fixture — ClickHouse seed
+      `service_versions` LB Service (new IP) + `deploy_versions` nginx Deployment, NO Gateway
+      CR reachable from that IP; full-graph e2e in **RouteSuite** (VM seed `kube_service_info`
+      + endpointslice → nginx pod + unknown-server series with `client_dns_answers` = new IP;
+      assert service node, `pod-calls-service`, `service-selects-pod`, no external) plus a
+      tool-free resolver-level test in **RouteStoreSuite** (real ClickHouse + zero
+      `matchcheck.Runner` tripwire → `RouteIngressLBService` / ambiguous outcomes, Docker-only).
+- [ ] 4.2 ambiguous integration case: two LB Service rows on one IP → external
+      (`TestAmbiguousIngressLBServiceStaysExternal`).
 - [ ] 4.3 `make test`, `make check-route-containment`, `make lint` all green.
 
 ## 5. Docs + observability
 
-- [ ] 5.1 CLAUDE.md: extend the Istio route-resolution bullet with the fallback (outcomes,
+- [x] 5.1 CLAUDE.md: extend the Istio route-resolution bullet with the fallback (outcomes,
       ambiguous rule, window-wide dedup evaluation).
-- [ ] 5.2 `docs/nginx-ingress-backend-resolution.md` §7: note that the LB-layer fallback is
+- [x] 5.2 `docs/nginx-ingress-backend-resolution.md` §7: note that the LB-layer fallback is
       implemented by this change.
-- [ ] 5.3 No new self-metric labels; existing `route_engine_*` reason counting covers the new
+- [x] 5.3 No new self-metric labels; existing `route_engine_*` reason counting covers the new
       reasons.
