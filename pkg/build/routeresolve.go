@@ -58,6 +58,18 @@ type RouteDestination struct {
 	Service   string
 	Port      uint32
 	Subset    string
+
+	// IngressNamespace / IngressService identify the ingress LB Service the
+	// destination IPs uniquely mapped to in the selected cluster's window —
+	// the entry-point hop in front of the routed backend
+	// (route-hit-ingress-chain D1). Populated on RouteHit when the window
+	// pins exactly one identity (same window-wide dedup as the LB fallback)
+	// and, for uniformity, on RouteIngressLBService (where they equal
+	// Namespace/Service). Empty when no unique identity exists — the parse
+	// then degrades to the direct caller→backend shape; an ambiguous or
+	// absent identity NEVER demotes a hit.
+	IngressNamespace string
+	IngressService   string
 }
 
 // RouteOutcome classifies one ResolveRoute answer. Every non-hit degrades to

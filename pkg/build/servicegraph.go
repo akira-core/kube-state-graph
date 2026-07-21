@@ -90,6 +90,7 @@ type sgResolver struct {
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
 	svcEdges           map[string]*graph.Edge        // service-selects-pod, keyed by "svcID|podID"
+	routeChainEdges    map[string]routeChainEdge     // synthesized ingress-pod → backend-service pod-calls-service, keyed "srcPodID|backendSvcID"
 
 	// Debug-only evidence accumulators (no effect on the emitted graph). Counted
 	// while resolving each endpoint and surfaced as an aggregated summary at the
@@ -223,6 +224,7 @@ func newSGResolver(topology Topology) *sgResolver {
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
 		svcEdges:           map[string]*graph.Edge{},
+		routeChainEdges:    map[string]routeChainEdge{},
 		extReasons:         map[string]int{},
 	}
 }
@@ -377,6 +379,19 @@ func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIn
 	}
 	for _, e := range res.svcEdges {
 		edges = append(edges, e)
+	}
+	// Synthesized RouteHit ingress-chain edges (ingress pod → backend service,
+	// route-hit-ingress-chain D4). A trace-derived edge for the same (src, tgt)
+	// wins — the two would otherwise share one deterministic UUIDv5 edge ID —
+	// and skipping keeps pre-existing traced edges byte-identical. Map
+	// iteration order is irrelevant: the emitted SET is a pure function of the
+	// data, and SortEdges canonicalises downstream (D6).
+	for _, ce := range res.routeChainEdges {
+		if _, dup := pairs[pairKey{src: ce.src, tgt: ce.tgt}]; dup {
+			continue
+		}
+		edges = append(edges, graph.NewEdge(graph.EdgeTypePodCallsService, ce.src, ce.tgt,
+			map[string]string{"cluster": ce.cluster}))
 	}
 
 	out := ServiceGraphResult{
@@ -824,6 +839,37 @@ func (r *sgResolver) resolveServiceLevel(anchorCluster, ns, svc string) []string
 	return []string{id}
 }
 
+// resolveServiceLevelInCluster is resolveServiceLevel with the
+// service-selects-pod fan-out LOCKED to one cluster's own endpoints — no
+// family union (route-hit-ingress-chain D2). Used for ingress LB Services
+// (the RouteHit chain's entry hop and the RouteIngressLBService fallback):
+// an LB IP is a per-cluster address, so the pods behind it are the locked
+// cluster's own endpoints — a family sibling's same-named Service (e.g.
+// istio-system/istio-ingressgateway, present in nearly every mesh cluster)
+// is NOT behind this IP and must not contribute pods. Same anchor-membership
+// test, same idempotent materializeServiceNode, same
+// no-endpoint-backed-pruning rule (a held service with zero endpoints still
+// materialises its node). Returns [svcID] or nil (cluster does not hold the
+// service).
+func (r *sgResolver) resolveServiceLevelInCluster(cluster, ns, svc string) []string {
+	cands := r.svcCandidates[famSvcKey{family: ClusterFamilyKey(cluster), namespace: ns, service: svc}]
+	var anchor *svcCandidate
+	for i := range cands {
+		if cands[i].cluster == cluster {
+			anchor = &cands[i]
+			break
+		}
+	}
+	if anchor == nil {
+		return nil // cluster does not hold the service
+	}
+	id := r.materializeServiceNode(cluster, ns, svc, anchor.obs)
+	for _, ep := range r.endpointsByService[serviceKey{cluster, ns, svc}] {
+		r.addServiceEdge(id, ep.Pod.ID(), ns)
+	}
+	return []string{id}
+}
+
 // materializeServiceNode creates (once) a ServiceNode for the resolved service
 // in its own cluster. Idempotent and edge-free: the service-selects-pod fan-out
 // is driven by the caller (resolveServiceLevel) so a single local node can fan
@@ -857,6 +903,84 @@ func (r *sgResolver) addServiceEdge(svcID, podID, ns string) {
 		labels["namespace"] = ns
 	}
 	r.svcEdges[key] = graph.NewEdge(graph.EdgeTypeServiceSelectsPod, svcID, podID, labels)
+}
+
+// routeChainEdge is one synthesized (not trace-derived) pod-calls-service
+// edge of the RouteHit ingress chain: an ingress gateway pod calling the
+// routed backend service (route-hit-ingress-chain D4). cluster is the locked
+// ingress cluster — the source pod's own cluster, so the emitted edge's
+// labels.cluster follows the D9 client-side-cluster rule.
+type routeChainEdge struct{ src, tgt, cluster string }
+
+// addRouteChainEdge accumulates one synthesized ingress-pod → backend-service
+// edge, deduped by (src, tgt). Emission (with the traced-edge-wins check
+// against the parse's pairs map) happens in parseServiceGraphRoutes.
+func (r *sgResolver) addRouteChainEdge(srcPodID, backendSvcID, cluster string) {
+	key := srcPodID + "|" + backendSvcID
+	if _, ok := r.routeChainEdges[key]; ok {
+		return
+	}
+	r.routeChainEdges[key] = routeChainEdge{src: srcPodID, tgt: backendSvcID, cluster: cluster}
+}
+
+// resolveRouteChain attempts the full ingress chain for a RouteHit whose
+// destination carries an ingress LB Service identity (route-hit-ingress-chain
+// D3): caller → ingress service → ingress pods → backend service. Every
+// precondition is checked PURELY (no materialisation) first, so a degrade
+// leaves zero stray nodes/edges — service nodes are never pruned by
+// projection, so a materialise-then-bail would leak an orphan ingress node.
+// ok=false ⇒ the caller emits today's direct caller→backend shape (never an
+// external, never a build failure); the degrade is observable at Debug only
+// and deliberately NOT counted in extReasons (whose invariant is "events
+// that produced external nodes").
+//
+// On success the ingress service materialises with the LOCKED-CLUSTER
+// service-selects-pod fan-out (D2), one synthesized pod-calls-service edge
+// per locked-cluster ingress pod → the backend service, and the returned
+// [ingressSvcID] becomes the endpoint's resolution target — the main loop's
+// cross product then emits caller→ingress-service, so the direct
+// caller→backend edge simply never exists (D5).
+func (r *sgResolver) resolveRouteChain(dest RouteDestination, backendSvcID string, t sgTrace) ([]string, bool) {
+	degrade := func(reason string) ([]string, bool) {
+		slog.Debug("route chain degraded to direct edge",
+			"chain_degrade_reason", reason,
+			"ingress_cluster", dest.Cluster,
+			"ingress_namespace", dest.IngressNamespace, "ingress_service", dest.IngressService,
+			"namespace", dest.Namespace, "service", dest.Service,
+			"client", t.clientLabel, "server", t.serverLabel)
+		return nil, false
+	}
+	if dest.IngressService == "" {
+		// No unique ingress identity in the window (ambiguous or absent) —
+		// quiet: this is the common non-ingress-fronted case, not an anomaly.
+		return nil, false
+	}
+	if dest.IngressNamespace == dest.Namespace && dest.IngressService == dest.Service {
+		return degrade("destination_is_ingress_service")
+	}
+	if !r.anchorHolds(dest.Cluster, dest.IngressNamespace, dest.IngressService) {
+		return degrade("ingress_cluster_lacks_ingress_service")
+	}
+	eps := r.endpointsByService[serviceKey{dest.Cluster, dest.IngressNamespace, dest.IngressService}]
+	if len(eps) == 0 {
+		return degrade("ingress_service_has_no_endpoints")
+	}
+
+	// Preconditions hold — materialise. Non-nil by construction: membership
+	// was pre-checked via anchorHolds over the same index.
+	ids := r.resolveServiceLevelInCluster(dest.Cluster, dest.IngressNamespace, dest.IngressService)
+	podIDs := make([]string, 0, len(eps))
+	for _, ep := range eps {
+		podIDs = append(podIDs, ep.Pod.ID())
+	}
+	sort.Strings(podIDs)
+	for i, podID := range podIDs {
+		if i > 0 && podIDs[i-1] == podID {
+			continue // sorted-unique; addRouteChainEdge dedupes anyway (D6)
+		}
+		r.addRouteChainEdge(podID, backendSvcID, dest.Cluster)
+	}
+	return ids, true
 }
 
 func (r *sgResolver) external(label string) string {

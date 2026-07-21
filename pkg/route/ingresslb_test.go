@@ -39,7 +39,124 @@ func TestResolveIngressLBService_SingleIPSingleService(t *testing.T) {
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteIngressLBService, outcome)
-	assert.Equal(t, build.RouteDestination{Namespace: "ingress-nginx", Service: "ingress-nginx-controller"}, dest)
+	assert.Equal(t, build.RouteDestination{
+		Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
+		IngressNamespace: "ingress-nginx", IngressService: "ingress-nginx-controller",
+	}, dest)
+}
+
+// ingressServiceIdentity is the shared identity-dedup core (also stamped onto
+// RouteHit destinations for the ingress chain); the tri-state table below pins
+// it directly, complementing the wrapper tests around resolveIngressLBService.
+func TestIngressServiceIdentity(t *testing.T) {
+	sameIdentityV1 := lbRow("ingress-nginx", "ctl", "198.51.100.7")
+	sameIdentityV1.ValidTo = lbT0.Add(30 * time.Minute)
+	sameIdentityV2 := lbRow("ingress-nginx", "ctl", "198.51.100.7")
+	sameIdentityV2.ValidFrom = lbT0.Add(30 * time.Minute)
+
+	renamedOld := lbRow("ingress-nginx", "lb-old", "198.51.100.7")
+	renamedOld.ValidTo = lbT0.Add(30 * time.Minute)
+	renamedNew := lbRow("ingress-nginx", "lb-new", "198.51.100.7")
+	renamedNew.ValidFrom = lbT0.Add(30 * time.Minute)
+
+	dualIP := lbRow("ingress-nginx", "ctl", "198.51.100.7")
+	dualIP.ExternalIPs = []string{"198.51.100.8"}
+
+	cases := []struct {
+		name   string
+		rows   []store.ServiceRow
+		ips    []string
+		want   ingressIdentity
+		status ingressIdentityStatus
+	}{
+		{
+			name: "unique single IP",
+			rows: []store.ServiceRow{lbRow("ingress-nginx", "ctl", "198.51.100.7")},
+			ips:  []string{"198.51.100.7"},
+			want: ingressIdentity{ns: "ingress-nginx", name: "ctl"}, status: identityUnique,
+		},
+		{
+			name: "unique across two IPs of one row",
+			rows: []store.ServiceRow{dualIP},
+			ips:  []string{"198.51.100.7", "198.51.100.8"},
+			want: ingressIdentity{ns: "ingress-nginx", name: "ctl"}, status: identityUnique,
+		},
+		{
+			name: "version churn of one identity stays unique",
+			rows: []store.ServiceRow{sameIdentityV1, sameIdentityV2},
+			ips:  []string{"198.51.100.7"},
+			want: ingressIdentity{ns: "ingress-nginx", name: "ctl"}, status: identityUnique,
+		},
+		{
+			name: "same-IP collision ambiguous",
+			rows: []store.ServiceRow{
+				lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
+				lbRow("other-ns", "lb-b", "198.51.100.7"),
+			},
+			ips:    []string{"198.51.100.7"},
+			status: identityAmbiguous,
+		},
+		{
+			name: "identity change within window ambiguous",
+			rows: []store.ServiceRow{renamedOld, renamedNew},
+			ips:  []string{"198.51.100.7"},
+
+			status: identityAmbiguous,
+		},
+		{
+			name: "disagreeing singletons ambiguous",
+			rows: []store.ServiceRow{
+				lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
+				lbRow("ingress-nginx", "lb-b", "198.51.100.8"),
+			},
+			ips:    []string{"198.51.100.7", "198.51.100.8"},
+			status: identityAmbiguous,
+		},
+		{
+			name:   "no rows incomplete",
+			rows:   nil,
+			ips:    []string{"198.51.100.7"},
+			status: identityIncomplete,
+		},
+		{
+			name: "partial empty IP incomplete",
+			rows: []store.ServiceRow{lbRow("ingress-nginx", "ctl", "198.51.100.7")},
+			ips:  []string{"198.51.100.7", "203.0.113.1"},
+
+			status: identityIncomplete,
+		},
+		{
+			name: "empty outranks disagreement",
+			rows: []store.ServiceRow{
+				lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
+				lbRow("ingress-nginx", "lb-b", "198.51.100.8"),
+			},
+			ips:    []string{"198.51.100.7", "203.0.113.1", "198.51.100.8"},
+			status: identityIncomplete,
+		},
+		{
+			name: "collision outranks empty",
+			rows: []store.ServiceRow{
+				lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
+				lbRow("other-ns", "lb-b", "198.51.100.7"),
+			},
+			ips:    []string{"203.0.113.1", "198.51.100.7"},
+			status: identityAmbiguous,
+		},
+		{
+			name:   "no IPs incomplete",
+			rows:   []store.ServiceRow{lbRow("ingress-nginx", "ctl", "198.51.100.7")},
+			ips:    nil,
+			status: identityIncomplete,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, status := ingressServiceIdentity(lbWindow(tc.rows...), tc.ips)
+			assert.Equal(t, tc.status, status)
+			assert.Equal(t, tc.want, id)
+		})
+	}
 }
 
 func TestResolveIngressLBService_SingleIPTwoServicesAmbiguous(t *testing.T) {

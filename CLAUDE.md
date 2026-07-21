@@ -382,13 +382,46 @@ live under `openspec/specs/`.
   (`route_engine_ambiguous_ingress_service` → external, no lexicographic
   tie-break); any IP with 0 → keep the pipeline miss byte-for-byte; else all
   singletons must agree → `RouteIngressLBService`, resolved by
-  `routeIndexResolve` through the SAME `resolveServiceLevel` path as
-  `RouteHit` (dest.Cluster = the locked ingress cluster, topology miss →
+  `routeIndexResolve` via `resolveServiceLevelInCluster` — the same node
+  materialisation as `resolveServiceLevel` but with a **locked-cluster
+  `service-selects-pod` fan-out** (the selected cluster's own endpoints ONLY,
+  no family union — an LB IP is a per-cluster address, so a family sibling's
+  same-named Service is not behind it; route-hit-ingress-chain D2)
+  (dest.Cluster = the locked ingress cluster, topology miss →
   `route_engine_dest_cluster_lacks_service`), with the outcome dimension in
   the success debug log distinguishing the coarser "LB entry point" semantics
   (host/path/port play no part — the fan-out reaches the ingress controller
   pods, e.g. nginx, never a routed backend). Neither new outcome enters
   `outcomeRank`.
+  **(5c) RouteHit ingress chain** (route-hit-ingress-chain): on every routed
+  hit the resolver ALSO recovers the ingress LB Service identity of the
+  destination IPs via the same window-wide dedup (shared core
+  `ingressServiceIdentity` in `pkg/route/ingresslb.go`; zero new store
+  reads) into two new `RouteDestination` fields `IngressNamespace` /
+  `IngressService` — empty on ambiguous/incomplete identity, which NEVER
+  demotes the hit (the LB fallback mirrors its own identity into them for
+  uniformity). When populated AND every chain precondition holds, the parse
+  emits the **full chain instead of the direct edge**: caller pod
+  -[pod-calls-service]→ ingress service (locked-cluster
+  `service-selects-pod` fan-out to the gateway pods) plus ONE synthesized
+  `pod-calls-service` edge per locked-cluster ingress pod → the backend
+  service (which keeps its family-wide fan-out); the direct caller→backend
+  edge simply never exists (`routeIndexResolve` returns the ingress node as
+  the endpoint's resolution target). Preconditions — identity present,
+  identity ≠ backend identity, locked cluster holds the ingress Service in
+  topology, non-empty locked-cluster endpoint set — are checked **purely
+  before any materialisation** (`resolveRouteChain` in
+  `pkg/build/servicegraph.go`), so every degrade falls back to today's
+  direct-edge shape with zero stray nodes/edges, logged at Debug only
+  (`route_chain_degraded`, never counted in the external-fallback reasons —
+  no external node is produced). A backend topology miss stays the existing
+  `route_engine_dest_cluster_lacks_service` external path with the ingress
+  never materialised (backend resolves first). Synthesized edges carry
+  `labels={"cluster": <ingress cluster>}` (the client side is a pod in that
+  cluster — D9), accumulate in `sgResolver.routeChainEdges`, and dedupe
+  **traced-edge-wins** against the parse's `(src, tgt)` pairs (a real traced
+  edge would share the same UUIDv5 edge ID). No new node/edge type,
+  attribute, `labels` key, engine outcome, or PromQL change.
   **(6) Containment** (D1, dependency hygiene, distinct from the client-go
   rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
   import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,

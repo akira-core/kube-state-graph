@@ -241,7 +241,8 @@ func TestResolveRoute_NginxIngressFallsBackToLBService(t *testing.T) {
 	assert.Equal(t, build.RouteIngressLBService, outcome)
 	assert.Equal(t, build.RouteDestination{
 		Cluster: "prod-01", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
-	}, dest, "dest carries the locked ingress cluster (D11) and no port/subset")
+		IngressNamespace: "ingress-nginx", IngressService: "ingress-nginx-controller",
+	}, dest, "dest carries the locked ingress cluster (D11), the ingress identity mirror, and no port/subset")
 }
 
 // Two differently-named LB Services carrying the same IP in the selected

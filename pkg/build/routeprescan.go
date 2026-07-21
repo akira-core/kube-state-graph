@@ -349,15 +349,51 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 	case entry.failed:
 		r.noteExternal("route_engine_error", t, "host", key.host, "port", key.port,
 			"peer_address", value, "caller_cluster", key.callerCluster, "classify_reason", origReason)
-	case entry.outcome == RouteHit || entry.outcome == RouteIngressLBService:
+	case entry.outcome == RouteHit:
 		// Anchor on the engine-selected ingress cluster (design D11), which
 		// may differ from the caller's — the resulting pod-calls-service edge
-		// may cross clusters (design D12). RouteIngressLBService (the
-		// ingress-lb-service-fallback change) rides the same path: its
-		// destination is the LB entry point rather than a routed backend, but
-		// the graph resolution is identical — the outcome dimension in the
-		// log keeps the coarser semantics distinguishable.
+		// may cross clusters (design D12). The backend resolves FIRST
+		// (family-wide, unchanged): a backend topology miss keeps the
+		// existing external path with the ingress never materialised
+		// (route-hit-ingress-chain D3).
 		if ids := r.resolveServiceLevel(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
+			chain := false
+			// When the destination carries the ingress LB Service identity
+			// and every chain precondition holds, the endpoint resolves to
+			// the INGRESS service instead: the caller's edge targets the
+			// entry point, the locked-cluster ingress pods fan in between,
+			// and the direct caller→backend edge never exists
+			// (route-hit-ingress-chain D5). Any precondition failure keeps
+			// ids = the backend — today's direct shape.
+			if chainIDs, ok := r.resolveRouteChain(entry.dest, ids[0], t); ok {
+				ids, chain = chainIDs, true
+			}
+			slog.Debug("service-graph unknown-server peer resolved via route engine",
+				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
+				"outcome", string(entry.outcome), "chain", chain,
+				"service", entry.dest.Service, "namespace", entry.dest.Namespace,
+				"ingress_namespace", entry.dest.IngressNamespace, "ingress_service", entry.dest.IngressService,
+				"ingress_cluster", entry.dest.Cluster, "caller_cluster", key.callerCluster,
+				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
+			return ids, true
+		}
+		// The engine's destination is not a Service the selected ingress
+		// cluster holds in topology (config store and kube_service_info
+		// disagree) — external.
+		r.noteExternal("route_engine_dest_cluster_lacks_service", t,
+			"service", entry.dest.Service, "namespace", entry.dest.Namespace,
+			"host", key.host, "port", key.port, "ingress_cluster", entry.dest.Cluster,
+			"caller_cluster", key.callerCluster)
+	case entry.outcome == RouteIngressLBService:
+		// The ingress-lb-service-fallback destination is the LB entry point
+		// itself — "which ingress LB Service owns this IP" — so its
+		// service-selects-pod fan-out is LOCKED to the selected cluster's own
+		// endpoints (the pods actually behind the IP; a family sibling's
+		// same-named Service is not — route-hit-ingress-chain D2). No
+		// synthesized edges: there is no routed backend behind the entry
+		// point. The outcome dimension in the log keeps the coarser
+		// semantics distinguishable from a routed hit.
+		if ids := r.resolveServiceLevelInCluster(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
 				"outcome", string(entry.outcome),
@@ -366,9 +402,6 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
 			return ids, true
 		}
-		// The engine's destination is not a Service the selected ingress
-		// cluster holds in topology (config store and kube_service_info
-		// disagree) — external.
 		r.noteExternal("route_engine_dest_cluster_lacks_service", t,
 			"service", entry.dest.Service, "namespace", entry.dest.Namespace,
 			"host", key.host, "port", key.port, "ingress_cluster", entry.dest.Cluster,

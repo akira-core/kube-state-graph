@@ -180,6 +180,15 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 		// ParseEnvoyCluster cannot know it — the Envoy cluster string carries
 		// only (port, subset, service, namespace) — so it is stamped here.
 		hitDest.Cluster = cluster
+		// route-hit-ingress-chain D1: recover the ingress LB Service the
+		// destination IPs uniquely map to in the already-loaded window (same
+		// window-wide dedup as the LB fallback, zero new store reads) so the
+		// parse can emit the full caller → ingress → backend chain. Ambiguous
+		// or incomplete identity leaves the fields empty — the chain degrades
+		// to the direct edge; a hit is NEVER demoted.
+		if id, status := ingressServiceIdentity(mw, req.IPs); status == identityUnique {
+			hitDest.IngressNamespace, hitDest.IngressService = id.ns, id.name
+		}
 		return hitDest, build.RouteHit, nil
 	}
 

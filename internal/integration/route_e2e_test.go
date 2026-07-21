@@ -443,10 +443,14 @@ func (s *RouteSuite) seedRouteStore() {
 
 // SetupTest seeds the VM fixtures every test shares: the client pod, the
 // payments Service + backing pod in cluster-alpha (so the route-engine
-// destination resolves in topology and fans out), plus cluster-beta's own
-// payments Service + backing pod (the cross-cluster ingress fixture — a
-// route hit anchored on beta must resolve against beta's topology), all
-// discriminated by test name.
+// destination resolves in topology and fans out), alpha's istio-system/igw
+// ingress LB Service + gateway pod (matching the ClickHouse ingress seed, so
+// a RouteHit's ingress chain has its middle hop in topology —
+// route-hit-ingress-chain), plus cluster-beta's own payments Service +
+// backing pod (the cross-cluster ingress fixture — a route hit anchored on
+// beta must resolve against beta's topology; beta's igw is deliberately
+// ABSENT from VM topology, so the beta hit doubles as the e2e
+// chain-degrade-to-direct-edge proof), all discriminated by test name.
 func (s *RouteSuite) SetupTest() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
@@ -462,12 +466,16 @@ kube_pod_info{cluster="cluster-alpha",namespace="ingress-nginx",pod="ingress-ngi
 kube_service_info{cluster="cluster-alpha",namespace="ingress-nginx",service="ingress-nginx-controller",cluster_ip="10.96.0.40",test=%q} 1 %d
 kube_endpointslice_labels{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",label_kubernetes_io_service_name="ingress-nginx-controller",test=%q} 1 %d
 kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",targetref_kind="Pod",targetref_name="ingress-nginx-controller-0",targetref_namespace="ingress-nginx",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="istio-system",pod="igw-0",uid="alpha-4",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="istio-system",service="igw",cluster_ip="10.96.0.50",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="istio-system",endpointslice="igw-x1",label_kubernetes_io_service_name="igw",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="istio-system",endpointslice="igw-x1",targetref_kind="Pod",targetref_name="igw-0",targetref_namespace="istio-system",test=%q} 1 %d
 kube_pod_info{cluster="cluster-beta",namespace="shop",pod="payments-0",uid="beta-2",node="bworker-0",test=%q} 1 %d
 kube_node_info{cluster="cluster-beta",node="bworker-0",test=%q} 1 %d
 kube_service_info{cluster="cluster-beta",namespace="shop",service="payments",cluster_ip="10.97.0.20",test=%q} 1 %d
 kube_endpointslice_labels{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",label_kubernetes_io_service_name="payments",test=%q} 1 %d
 kube_endpointslice_endpoints{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",targetref_kind="Pod",targetref_name="payments-0",targetref_namespace="shop",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1)
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1)
 	s.IngestExpFmt(exposition)
 	s.Require().True(s.WaitForSeries(`kube_pod_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_info")
@@ -501,8 +509,11 @@ func (s *RouteSuite) startRouteAPIServer() string {
 // (traffic_simulation): server="unknown", peer FQDN api.example.com with NO
 // port (default 443 → the TLS-terminated :443 listener, RouteConfiguration
 // "https.443.https.public-gw.istio-system"), client_dns_answers narrowing to
-// the ingress LB IP via the ClickHouse 3-hop. The graph must carry an
-// ordinary pod-calls-service edge to payments — and no external node.
+// the ingress LB IP via the ClickHouse 3-hop. The destination IP uniquely
+// maps to istio-system/igw, which the VM topology holds with a backing
+// gateway pod — so the graph carries the FULL ingress chain
+// (route-hit-ingress-chain): caller → igw service → igw pod → payments →
+// backing pod, with NO direct caller→payments edge and no external node.
 func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 	s.ingestUnknownServerSeries(
 		`client_net_peer_name="api.example.com",client_dns_answers="` + ingressLBIP + `"`)
@@ -516,11 +527,18 @@ func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 
 	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
 		"route engine must resolve the global FQDN to the routed Service")
-	s.Contains(bodyStr, `"type":"pod-calls-service"`)
-	s.Contains(bodyStr, `"target":"cluster-alpha/shop/payments"`)
-	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"id":"cluster-alpha/istio-system/igw"`,
+		"the ingress LB Service materialises as the chain's entry hop")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/istio-system/igw"`,
+		"the caller's pod-calls-service edge targets the ingress entry point")
+	s.Contains(bodyStr, `"source":"cluster-alpha/istio-system/igw","target":"cluster-alpha/alpha-4"`,
+		"the ingress service selects its gateway pod (locked-cluster fan-out)")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-4","target":"cluster-alpha/shop/payments"`,
+		"the synthesized edge links the gateway pod to the routed backend")
+	s.NotContains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is replaced by the chain")
 	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
-		"the resolved service fans out to its backing pod like any other")
+		"the backend service still fans out to its backing pod like any other")
 	s.NotContains(bodyStr, `external/api.example.com`,
 		"a route-resolved peer must not leave an external node behind")
 }
@@ -542,6 +560,10 @@ func (s *RouteSuite) TestExplicitPortRoutesViaHTTPListener() {
 
 	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`)
 	s.Contains(bodyStr, `"type":"pod-calls-service"`)
+	s.Contains(bodyStr, `"id":"cluster-alpha/istio-system/igw"`,
+		"the shared ingress LB IP resolves the chain's entry hop here too")
+	s.NotContains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is replaced by the chain")
 	s.NotContains(bodyStr, `external/api8080.example.com:8080`,
 		"the raw peer value must not leak as an external node")
 }
@@ -575,7 +597,10 @@ func (s *RouteSuite) TestNoDNSAnswersStaysExternal() {
 // cluster-beta's ingress (|F|==0, |G|==1 → C=beta). The route engine reads
 // BETA's Gateway + VirtualService config, the service node materialises in
 // beta, the pod-calls-service edge crosses clusters, and the fan-out runs
-// over beta's endpoints.
+// over beta's endpoints. Beta's istio-system/igw is deliberately ABSENT from
+// the VM topology, so this doubles as the e2e chain-degrade proof
+// (route-hit-ingress-chain D3): the hit keeps today's direct-edge shape and
+// no ingress node materialises.
 func (s *RouteSuite) TestCrossClusterIngressResolves() {
 	s.ingestUnknownServerSeries(
 		`client_net_peer_name="cross.example.com",client_dns_answers="` + ingressLBIP2 + `"`)
@@ -595,6 +620,8 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 		"service-selects-pod fans out over the selected cluster's endpoints")
 	s.NotContains(bodyStr, `"id":"cluster-alpha/shop/cross"`,
 		"nothing materialises in the caller's cluster for this host")
+	s.NotContains(bodyStr, `"id":"cluster-beta/istio-system/igw"`,
+		"beta's ingress Service is not in topology → the chain degrades to the direct edge, no ingress node")
 	s.NotContains(bodyStr, `external/cross.example.com`,
 		"a cross-cluster route hit must not leave an external node behind")
 }
@@ -604,8 +631,10 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 // window holds the nginx LB Service + Deployment but NO Istio Gateway CR
 // reachable from the IP (Hop 3 empty → every segment misses at gateway
 // resolution). The fallback resolves the unique LB Service; the graph carries
-// a pod-calls-service edge to it and the fan-out reaches the nginx controller
-// pod — and no external node.
+// a pod-calls-service edge to it and the locked-cluster fan-out
+// (route-hit-ingress-chain D2 — the selected cluster's own endpoints, though
+// with one cluster the set is indistinguishable from the old family union)
+// reaches the nginx controller pod — and no external node.
 func (s *RouteSuite) TestNginxIngressFallsBackToLBService() {
 	s.ingestUnknownServerSeries(
 		`client_net_peer_name="app.nginx.example.com",client_dns_answers="` + ingressLBIPNginx + `"`)
@@ -894,7 +923,8 @@ func (s *RouteStoreSuite) TestNginxFallbackResolvesViaRealStore() {
 	s.Equal(build.RouteIngressLBService, outcome)
 	s.Equal(build.RouteDestination{
 		Cluster: "cluster-alpha", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
-	}, dest, "dest carries the engine-selected cluster and the unique LB Service identity")
+		IngressNamespace: "ingress-nginx", IngressService: "ingress-nginx-controller",
+	}, dest, "dest carries the engine-selected cluster and the unique LB Service identity (mirrored into Ingress*)")
 
 	req.Host = "dup.nginx.example.com"
 	req.IPs = []string{ingressLBIPNginxDup}
