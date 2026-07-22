@@ -8,34 +8,32 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/build"
-	"github.com/akira-core/kube-state-graph/pkg/route/memwindow"
+	"github.com/akira-core/kube-state-graph/pkg/route/snapshot"
 	"github.com/akira-core/kube-state-graph/pkg/route/store"
 )
 
-var (
-	lbT0 = time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	lbT1 = lbT0.Add(time.Hour)
-)
+// lbAt is the resolution instant every case below is evaluated at.
+var lbAt = time.Date(2026, 7, 1, 0, 30, 0, 0, time.UTC)
 
-// lbRow builds one window-spanning ingress LB service row (LoadBalancer IP +
+// lbRow builds one ingress LB service row live at lbAt (LoadBalancer IP +
 // selector, no ports — the ingress-LB shape store.ServiceRow documents).
 func lbRow(ns, name, ip string) store.ServiceRow {
 	return store.ServiceRow{
 		Namespace: ns, Name: name,
-		ValidFrom: lbT0.Add(-time.Hour), ValidTo: lbT1.Add(time.Hour),
+		ValidFrom: lbAt.Add(-time.Hour), ValidTo: lbAt.Add(time.Hour),
 		LoadBalancerIPs: []string{ip},
 		Selector:        []string{"app=" + name},
 	}
 }
 
-func lbWindow(rows ...store.ServiceRow) *memwindow.Window {
-	return memwindow.New(store.TrafficWindow{Services: rows}, lbT0, lbT1)
+func lbSnapshot(rows ...store.ServiceRow) *snapshot.Snapshot {
+	return snapshot.New(store.TrafficSnapshot{Services: rows}, lbAt)
 }
 
 func TestResolveIngressLBService_SingleIPSingleService(t *testing.T) {
-	mw := lbWindow(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
+	snap := lbSnapshot(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
 
-	dest, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7"})
+	dest, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteIngressLBService, outcome)
@@ -49,15 +47,19 @@ func TestResolveIngressLBService_SingleIPSingleService(t *testing.T) {
 // RouteHit destinations for the ingress chain); the tri-state table below pins
 // it directly, complementing the wrapper tests around resolveIngressLBService.
 func TestIngressServiceIdentity(t *testing.T) {
+	// Two versions of ONE identity, split just before the instant: only the
+	// later one is live at lbAt, and either way the identity is the same.
 	sameIdentityV1 := lbRow("ingress-nginx", "ctl", "198.51.100.7")
-	sameIdentityV1.ValidTo = lbT0.Add(30 * time.Minute)
+	sameIdentityV1.ValidTo = lbAt.Add(-time.Minute)
 	sameIdentityV2 := lbRow("ingress-nginx", "ctl", "198.51.100.7")
-	sameIdentityV2.ValidFrom = lbT0.Add(30 * time.Minute)
+	sameIdentityV2.ValidFrom = lbAt.Add(-time.Minute)
 
+	// A rename that completed BEFORE the instant: the old identity is dead, so
+	// as-of evaluation sees exactly one owner (D5 — no longer ambiguous).
 	renamedOld := lbRow("ingress-nginx", "lb-old", "198.51.100.7")
-	renamedOld.ValidTo = lbT0.Add(30 * time.Minute)
+	renamedOld.ValidTo = lbAt.Add(-time.Minute)
 	renamedNew := lbRow("ingress-nginx", "lb-new", "198.51.100.7")
-	renamedNew.ValidFrom = lbT0.Add(30 * time.Minute)
+	renamedNew.ValidFrom = lbAt.Add(-time.Minute)
 
 	dualIP := lbRow("ingress-nginx", "ctl", "198.51.100.7")
 	dualIP.ExternalIPs = []string{"198.51.100.8"}
@@ -97,11 +99,10 @@ func TestIngressServiceIdentity(t *testing.T) {
 			status: identityAmbiguous,
 		},
 		{
-			name: "identity change within window ambiguous",
+			name: "superseded identity resolves to the live owner",
 			rows: []store.ServiceRow{renamedOld, renamedNew},
 			ips:  []string{"198.51.100.7"},
-
-			status: identityAmbiguous,
+			want: ingressIdentity{ns: "ingress-nginx", name: "lb-new"}, status: identityUnique,
 		},
 		{
 			name: "disagreeing singletons ambiguous",
@@ -152,7 +153,7 @@ func TestIngressServiceIdentity(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			id, status := ingressServiceIdentity(lbWindow(tc.rows...), tc.ips)
+			id, status := ingressServiceIdentity(lbSnapshot(tc.rows...), tc.ips)
 			assert.Equal(t, tc.status, status)
 			assert.Equal(t, tc.want, id)
 		})
@@ -160,12 +161,12 @@ func TestIngressServiceIdentity(t *testing.T) {
 }
 
 func TestResolveIngressLBService_SingleIPTwoServicesAmbiguous(t *testing.T) {
-	mw := lbWindow(
+	snap := lbSnapshot(
 		lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"),
 		lbRow("other-ns", "some-other-lb", "198.51.100.7"),
 	)
 
-	dest, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7"})
+	dest, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteAmbiguousIngressService, outcome)
@@ -173,12 +174,12 @@ func TestResolveIngressLBService_SingleIPTwoServicesAmbiguous(t *testing.T) {
 }
 
 func TestResolveIngressLBService_TwoIPsDisagreeingIdentitiesAmbiguous(t *testing.T) {
-	mw := lbWindow(
+	snap := lbSnapshot(
 		lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
 		lbRow("ingress-nginx", "lb-b", "198.51.100.8"),
 	)
 
-	_, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7", "198.51.100.8"})
+	_, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7", "198.51.100.8"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteAmbiguousIngressService, outcome)
@@ -187,9 +188,9 @@ func TestResolveIngressLBService_TwoIPsDisagreeingIdentitiesAmbiguous(t *testing
 func TestResolveIngressLBService_TwoIPsSameIdentityHit(t *testing.T) {
 	row := lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7")
 	row.ExternalIPs = []string{"198.51.100.8"}
-	mw := lbWindow(row)
+	snap := lbSnapshot(row)
 
-	dest, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7", "198.51.100.8"})
+	dest, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7", "198.51.100.8"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteIngressLBService, outcome)
@@ -197,9 +198,9 @@ func TestResolveIngressLBService_TwoIPsSameIdentityHit(t *testing.T) {
 }
 
 func TestResolveIngressLBService_NoMatchKeepsMiss(t *testing.T) {
-	mw := lbWindow(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
+	snap := lbSnapshot(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
 
-	_, outcome, ok := resolveIngressLBService(mw, []string{"203.0.113.1"})
+	_, outcome, ok := resolveIngressLBService(snap, []string{"203.0.113.1"})
 
 	assert.False(t, ok)
 	assert.Empty(t, outcome)
@@ -209,9 +210,9 @@ func TestResolveIngressLBService_NoMatchKeepsMiss(t *testing.T) {
 // keep the Istio miss) applies — a partial match must not promote a fallback
 // hit the other IP cannot corroborate.
 func TestResolveIngressLBService_PartialEmptyIPKeepsMiss(t *testing.T) {
-	mw := lbWindow(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
+	snap := lbSnapshot(lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7"))
 
-	_, _, ok := resolveIngressLBService(mw, []string{"198.51.100.7", "203.0.113.1"})
+	_, _, ok := resolveIngressLBService(snap, []string{"198.51.100.7", "203.0.113.1"})
 
 	assert.False(t, ok)
 }
@@ -219,7 +220,7 @@ func TestResolveIngressLBService_PartialEmptyIPKeepsMiss(t *testing.T) {
 // One IP with two candidates and another with none: the same-IP collision
 // (rule 1) outranks the incomplete-evidence rule regardless of IP order.
 func TestResolveIngressLBService_CollisionOutranksEmptyEitherOrder(t *testing.T) {
-	mw := lbWindow(
+	snap := lbSnapshot(
 		lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
 		lbRow("other-ns", "lb-b", "198.51.100.7"),
 	)
@@ -228,7 +229,7 @@ func TestResolveIngressLBService_CollisionOutranksEmptyEitherOrder(t *testing.T)
 		{"198.51.100.7", "203.0.113.1"},
 		{"203.0.113.1", "198.51.100.7"},
 	} {
-		_, outcome, ok := resolveIngressLBService(mw, ips)
+		_, outcome, ok := resolveIngressLBService(snap, ips)
 		require.True(t, ok, "ips=%v", ips)
 		assert.Equal(t, build.RouteAmbiguousIngressService, outcome, "ips=%v", ips)
 	}
@@ -237,7 +238,7 @@ func TestResolveIngressLBService_CollisionOutranksEmptyEitherOrder(t *testing.T)
 // Disagreeing singletons rank BELOW an empty IP: with both present the Istio
 // miss is kept (rule 2 before rule 3), regardless of IP order.
 func TestResolveIngressLBService_EmptyOutranksDisagreementEitherOrder(t *testing.T) {
-	mw := lbWindow(
+	snap := lbSnapshot(
 		lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
 		lbRow("ingress-nginx", "lb-b", "198.51.100.8"),
 	)
@@ -246,7 +247,7 @@ func TestResolveIngressLBService_EmptyOutranksDisagreementEitherOrder(t *testing
 		{"198.51.100.7", "203.0.113.1", "198.51.100.8"},
 		{"198.51.100.7", "198.51.100.8", "203.0.113.1"},
 	} {
-		_, _, ok := resolveIngressLBService(mw, ips)
+		_, _, ok := resolveIngressLBService(snap, ips)
 		assert.False(t, ok, "ips=%v", ips)
 	}
 }
@@ -255,29 +256,44 @@ func TestResolveIngressLBService_EmptyOutranksDisagreementEitherOrder(t *testing
 // version churn must not read as a collision.
 func TestResolveIngressLBService_SameIdentityMultiVersionHit(t *testing.T) {
 	v1 := lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7")
-	v1.ValidTo = lbT0.Add(30 * time.Minute)
+	v1.ValidTo = lbAt.Add(-time.Minute)
 	v2 := lbRow("ingress-nginx", "ingress-nginx-controller", "198.51.100.7")
-	v2.ValidFrom = lbT0.Add(30 * time.Minute)
-	mw := lbWindow(v1, v2)
+	v2.ValidFrom = lbAt.Add(-time.Minute)
+	snap := lbSnapshot(v1, v2)
 
-	dest, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7"})
+	dest, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteIngressLBService, outcome)
 	assert.Equal(t, "ingress-nginx-controller", dest.Service)
 }
 
-// An identity CHANGE inside the window (svc-a deleted, svc-b created on the
-// same IP) yields two identities — ambiguous, per the window-wide dedup rule
-// (design D6: don't guess which one the traffic hit).
-func TestResolveIngressLBService_IdentityChangeWithinWindowAmbiguous(t *testing.T) {
+// An identity change that COMPLETED before the resolution instant (lb-old
+// deleted, lb-new created on the same IP) is not ambiguous under as-of
+// evaluation: only the owner live at the instant counts
+// (simplify-route-resolution-to-point-in-time D5).
+func TestResolveIngressLBService_SupersededIdentityResolvesToLiveOwner(t *testing.T) {
 	old := lbRow("ingress-nginx", "lb-old", "198.51.100.7")
-	old.ValidTo = lbT0.Add(30 * time.Minute)
+	old.ValidTo = lbAt.Add(-time.Minute)
 	renamed := lbRow("ingress-nginx", "lb-new", "198.51.100.7")
-	renamed.ValidFrom = lbT0.Add(30 * time.Minute)
-	mw := lbWindow(old, renamed)
+	renamed.ValidFrom = lbAt.Add(-time.Minute)
+	snap := lbSnapshot(old, renamed)
 
-	_, outcome, ok := resolveIngressLBService(mw, []string{"198.51.100.7"})
+	dest, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7"})
+
+	require.True(t, ok)
+	assert.Equal(t, build.RouteIngressLBService, outcome)
+	assert.Equal(t, "lb-new", dest.Service)
+}
+
+// Two identities carrying one IP SIMULTANEOUSLY is still a genuine collision.
+func TestResolveIngressLBService_SimultaneousIdentitiesAmbiguous(t *testing.T) {
+	snap := lbSnapshot(
+		lbRow("ingress-nginx", "lb-a", "198.51.100.7"),
+		lbRow("ingress-nginx", "lb-b", "198.51.100.7"),
+	)
+
+	_, outcome, ok := resolveIngressLBService(snap, []string{"198.51.100.7"})
 
 	require.True(t, ok)
 	assert.Equal(t, build.RouteAmbiguousIngressService, outcome)

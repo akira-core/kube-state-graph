@@ -47,25 +47,14 @@ func TestParseEnvoyCluster(t *testing.T) {
 	}
 }
 
-func TestOutcomeRank(t *testing.T) {
-	// no_route (deepest pipeline progress) must outrank no_server_for_host
-	// (right port, unserved host), which outranks no_listener (wrong port),
-	// which outranks no_gateway — the fold reports the most informative miss.
-	assert.Greater(t, outcomeRank(build.RouteNoRoute), outcomeRank(build.RouteNoServerForHost))
-	assert.Greater(t, outcomeRank(build.RouteNoServerForHost), outcomeRank(build.RouteNoListenerOnPort))
-	assert.Greater(t, outcomeRank(build.RouteNoListenerOnPort), outcomeRank(build.RouteNoGateway))
-}
-
 // ---------------------------------------------------------------------------
 // ResolveRoute over a mocked store: ingress-cluster selection wiring (D10).
-// The mock returns empty windows, so every case below finishes BEFORE the
+// The mock returns empty snapshots, so every case below finishes BEFORE the
 // translate/matchcheck stages — a zero matchcheck.Runner is never invoked.
 // ---------------------------------------------------------------------------
 
-var (
-	testStart = time.Unix(1_700_000_000, 0).UTC()
-	testEnd   = testStart.Add(5 * time.Minute)
-)
+// testAt is the resolution instant — the build window's end.
+var testAt = time.Unix(1_700_000_000, 0).UTC().Add(5 * time.Minute)
 
 func testRequest(caller string, ips ...string) build.RouteRequest {
 	return build.RouteRequest{
@@ -74,8 +63,7 @@ func testRequest(caller string, ips ...string) build.RouteRequest {
 		Path:          "/",
 		Port:          443,
 		IPs:           ips,
-		Start:         testStart,
-		End:           testEnd,
+		At:            testAt,
 	}
 }
 
@@ -91,14 +79,14 @@ func TestResolveRoute_NoIPsMissesWithoutStoreCall(t *testing.T) {
 	assert.Equal(t, build.RouteDestination{}, dest)
 }
 
-// The probe runs once per destination IP with the request's own window; a
-// selection miss (disagreeing candidates) short-circuits before any window
-// load — LoadTrafficWindow must never run.
+// The probe runs once per destination IP at the request's own instant; a
+// selection miss (disagreeing candidates) short-circuits before any snapshot
+// load — LoadTrafficAt must never run.
 func TestResolveRoute_SelectionMissShortCircuitsBeforeWindowLoad(t *testing.T) {
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return([]string{"prod-02"}, nil).Once()
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.8", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.8", testAt).
 		Return([]string{"staging-01"}, nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
@@ -108,10 +96,10 @@ func TestResolveRoute_SelectionMissShortCircuitsBeforeWindowLoad(t *testing.T) {
 	assert.Equal(t, build.RouteAmbiguousIngress, outcome)
 }
 
-// No cluster serves the IP → RouteNoIngress, again without a window load.
+// No cluster serves the IP → RouteNoIngress, again without a snapshot load.
 func TestResolveRoute_NoIngressAnywhere(t *testing.T) {
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return(nil, nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
@@ -120,17 +108,17 @@ func TestResolveRoute_NoIngressAnywhere(t *testing.T) {
 	assert.Equal(t, build.RouteNoIngress, outcome)
 }
 
-// Once the ingress cluster is locked, every window load is scoped to it — one
-// LoadTrafficWindow per IP, never any other cluster. Empty windows yield
+// Once the ingress cluster is locked, every snapshot load is scoped to it —
+// one LoadTrafficAt per IP, never any other cluster. Empty snapshots yield
 // RouteNoGateway (nothing serves the host), proving the pipeline ran on the
 // selected cluster and stopped before translate/matchcheck.
-func TestResolveRoute_LockedClusterScopesWindowLoads(t *testing.T) {
+func TestResolveRoute_LockedClusterScopesSnapshotLoads(t *testing.T) {
 	st := storemocks.NewMockStore(t)
 	for _, ip := range []string{"198.51.100.7", "198.51.100.8"} {
-		st.EXPECT().ClustersWithIngressIP(mock.Anything, ip, testStart, testEnd).
+		st.EXPECT().ClustersWithIngressIP(mock.Anything, ip, testAt).
 			Return([]string{"prod-02"}, nil).Once()
-		st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-02", ip, testStart, testEnd).
-			Return(store.TrafficWindow{}, nil).Once()
+		st.EXPECT().LoadTrafficAt(mock.Anything, "prod-02", ip, testAt).
+			Return(store.TrafficSnapshot{}, nil).Once()
 	}
 	r := NewResolver(st, matchcheck.Runner{})
 
@@ -138,7 +126,7 @@ func TestResolveRoute_LockedClusterScopesWindowLoads(t *testing.T) {
 		testRequest("prod-01", "198.51.100.7", "198.51.100.8"))
 	require.NoError(t, err)
 	assert.Equal(t, build.RouteNoGateway, outcome,
-		"empty window on the selected cluster is an ordinary no-gateway miss")
+		"empty snapshot on the selected cluster is an ordinary no-gateway miss")
 }
 
 // A gateway matched at the GATEWAY level (its ServerHosts union serves the
@@ -146,7 +134,7 @@ func TestResolveRoute_LockedClusterScopesWindowLoads(t *testing.T) {
 // report RouteNoServerForHost and return BEFORE Translate and before r.run is
 // touched (the zero matchcheck.Runner would blow up otherwise, which also pins
 // that scoped.Host is actually threaded through: an unset Host would take the
-// host-agnostic escape hatch into the RC path). The window's ingress LB
+// host-agnostic escape hatch into the RC path). The snapshot's ingress LB
 // ServiceRow additionally pins the fallback's no-gateway gate: a deep Istio
 // miss must NOT be masked by an ingress_lb_service resolution.
 func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
@@ -168,8 +156,8 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	specJSON, err := protojson.Marshal(gwSpec)
 	require.NoError(t, err)
 
-	from, to := testStart.Add(-time.Hour), testEnd.Add(time.Hour)
-	window := store.TrafficWindow{
+	from, to := testAt.Add(-time.Hour), testAt.Add(time.Hour)
+	snap := store.TrafficSnapshot{
 		Services: []store.ServiceRow{{
 			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: from, ValidTo: to,
 			ExternalIPs: []string{"198.51.100.7"}, Selector: []string{"istio=ingress"},
@@ -189,10 +177,10 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	}
 
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return([]string{"prod-01"}, nil).Once()
-	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
-		Return(window, nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(snap, nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
 	req := testRequest("prod-01", "198.51.100.7")
@@ -202,18 +190,81 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	assert.Equal(t, build.RouteNoServerForHost, outcome)
 }
 
+// The point-in-time core (simplify-route-resolution-to-point-in-time D1): with
+// two Gateway versions in the loaded rows — an older one that DID serve the
+// host and a current one that does not — resolution follows the version live at
+// req.At. Under the old range semantics the older segment would have produced a
+// hit; now it is invisible, and the current version's listener gate decides.
+// The zero matchcheck.Runner is the tripwire: reaching translate would panic.
+func TestResolveRoute_UsesVersionLiveAtInstant(t *testing.T) {
+	served, err := protojson.Marshal(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingress"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 443, Name: "api", Protocol: "HTTPS"},
+			Hosts: []string{"api.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-api"},
+		}},
+	})
+	require.NoError(t, err)
+	unserved, err := protojson.Marshal(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingress"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 443, Name: "admin", Protocol: "HTTPS"},
+			Hosts: []string{"admin.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-admin"},
+		}},
+	})
+	require.NoError(t, err)
+
+	from, closed, to := testAt.Add(-time.Hour), testAt.Add(-time.Minute), testAt.Add(time.Hour)
+	snap := store.TrafficSnapshot{
+		Services: []store.ServiceRow{{
+			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: from, ValidTo: to,
+			ExternalIPs: []string{"198.51.100.7"}, Selector: []string{"istio=ingress"},
+		}},
+		Deploys: []store.DeployRow{{
+			Namespace: "istio-system", Name: "ingress", ValidFrom: from, ValidTo: to,
+			PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{
+			{ // superseded a minute before the instant — must not be consulted
+				Namespace: "istio-system", Name: "gw-000", ValidFrom: from, ValidTo: closed,
+				SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"api.example.com"},
+				SpecJSON: string(served),
+			},
+			{ // live at the instant: serves only admin.example.com
+				Namespace: "istio-system", Name: "gw-000", ValidFrom: closed, ValidTo: to, IngestSeq: 2,
+				SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"*.example.com"},
+				SpecJSON: string(unserved),
+			},
+		},
+	}
+
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(snap, nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	_, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteNoServerForHost, outcome,
+		"the version live at the instant decides; the superseded one must be invisible")
+}
+
 // ---------------------------------------------------------------------------
 // Ingress LB Service fallback (ingress-lb-service-fallback change). The nginx
-// window shape — LB Service + Deployment, NO Gateway CR — never reaches
+// snapshot shape — LB Service + Deployment, NO Gateway CR — never reaches
 // gwresolve, so the zero matchcheck.Runner tripwire applies throughout.
 // ---------------------------------------------------------------------------
 
-// nginxWindow is the motivating fixture: Hop 1 and Hop 2 succeed, Hop 3 has no
-// Istio Gateway CR, so every segment misses at gateway resolution (the folded
-// miss stays RouteNoGateway) and the fallback fires.
-func nginxWindow() store.TrafficWindow {
-	from, to := testStart.Add(-time.Hour), testEnd.Add(time.Hour)
-	return store.TrafficWindow{
+// nginxSnapshot is the motivating fixture: Hop 1 and Hop 2 succeed, Hop 3 has no
+// Istio Gateway CR, so resolution misses at gateway selection
+// (RouteNoGateway) and the fallback fires.
+func nginxSnapshot() store.TrafficSnapshot {
+	from, to := testAt.Add(-time.Hour), testAt.Add(time.Hour)
+	return store.TrafficSnapshot{
 		Services: []store.ServiceRow{{
 			Namespace: "ingress-nginx", Name: "ingress-nginx-controller",
 			ValidFrom: from, ValidTo: to,
@@ -230,10 +281,10 @@ func nginxWindow() store.TrafficWindow {
 
 func TestResolveRoute_NginxIngressFallsBackToLBService(t *testing.T) {
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return([]string{"prod-01"}, nil).Once()
-	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
-		Return(nginxWindow(), nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(nginxSnapshot(), nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
 	dest, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
@@ -246,17 +297,17 @@ func TestResolveRoute_NginxIngressFallsBackToLBService(t *testing.T) {
 }
 
 // Two differently-named LB Services carrying the same IP in the selected
-// cluster's window: the fallback degrades ambiguous instead of guessing.
+// cluster's snapshot: the fallback degrades ambiguous instead of guessing.
 func TestResolveRoute_AmbiguousLBServiceOnOneIP(t *testing.T) {
-	w := nginxWindow()
+	w := nginxSnapshot()
 	other := w.Services[0]
 	other.Namespace, other.Name = "other-ns", "some-other-lb"
 	w.Services = append(w.Services, other)
 
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return([]string{"prod-01"}, nil).Once()
-	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
 		Return(w, nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
@@ -271,7 +322,7 @@ func TestResolveRoute_AmbiguousLBServiceOnOneIP(t *testing.T) {
 func TestResolveRoute_ProbeErrorPropagates(t *testing.T) {
 	probeErr := errors.New("store unreachable")
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return(nil, probeErr).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
@@ -291,11 +342,11 @@ func TestResolver_ImplementsBuildScoped(t *testing.T) {
 
 // Two requests in one scope sharing a destination IP probe the store ONCE:
 // ClustersWithIngressIP.Once() fails if the memo does not collapse the second
-// call. Distinct hosts/callers prove the memo keys on (ip, start, end), not on
-// the whole request. Both take the no-ingress miss path, so no window load runs.
+// call. Distinct hosts/callers prove the memo keys on (ip, at), not on
+// the whole request. Both take the no-ingress miss path, so no snapshot load runs.
 func TestBuildScoped_ProbeMemoised(t *testing.T) {
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return(nil, nil).Once()
 	scope := NewResolver(st, matchcheck.Runner{}).BuildScoped()
 
@@ -313,16 +364,16 @@ func TestBuildScoped_ProbeMemoised(t *testing.T) {
 
 // A failed probe is NOT cached: a later request sharing the IP retries the
 // store. First call errors (propagated), second succeeds and proceeds into the
-// pipeline (empty window → RouteNoGateway).
+// pipeline (empty snapshot → RouteNoGateway).
 func TestBuildScoped_ProbeErrorNotCached(t *testing.T) {
 	probeErr := errors.New("store unreachable")
 	st := storemocks.NewMockStore(t)
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return(nil, probeErr).Once()
-	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testStart, testEnd).
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
 		Return([]string{"prod-01"}, nil).Once()
-	st.EXPECT().LoadTrafficWindow(mock.Anything, "prod-01", "198.51.100.7", testStart, testEnd).
-		Return(store.TrafficWindow{}, nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(store.TrafficSnapshot{}, nil).Once()
 	scope := NewResolver(st, matchcheck.Runner{}).BuildScoped()
 
 	req := testRequest("prod-01", "198.51.100.7")

@@ -38,8 +38,8 @@ func TestDedupLatest_RewritePairCollapsesToClosingRow(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := &CH{}
-			out := dedupOverlapCounted(s, rows, gwVer, vfBase.Add(2*time.Hour), vfBase.Add(3*time.Hour))
-			assert.Empty(t, out, "the closed version must not overlap a post-close window")
+			out := dedupLiveAtCounted(s, rows, gwVer, vfBase.Add(2*time.Hour))
+			assert.Empty(t, out, "the closed version must not be live after its close")
 			assert.Equal(t, uint64(1), s.CollapsedRows(), "the slot collapse must be counted")
 		})
 	}
@@ -51,18 +51,23 @@ func TestDedupLatest_DistinctVersionsSurvive(t *testing.T) {
 	v2 := gwRow("gw", vfBase.Add(time.Hour), sentinel, 4, "b.example.com")
 
 	s := &CH{}
-	out := dedupOverlapCounted(s, []GatewayRow{v1, v2}, gwVer, vfBase, sentinel)
-	assert.Len(t, out, 2)
+	// Both slots survive dedup; only the one live at the instant passes the
+	// liveness filter, so each instant selects exactly one version.
+	assert.Len(t, dedupLiveAtCounted(s, []GatewayRow{v1, v2}, gwVer, vfBase), 1)
+	assert.Len(t, dedupLiveAtCounted(s, []GatewayRow{v1, v2}, gwVer, vfBase.Add(2*time.Hour)), 1)
 	assert.Zero(t, s.CollapsedRows(), "distinct slots are not collapses")
 }
 
-func TestVersionRowOverlapsWindow(t *testing.T) {
+// liveAt is the as-of liveness test: vf <= at < vt — inclusive at valid_from,
+// exclusive at valid_to (the half-open version interval).
+func TestVersionRowLiveAt(t *testing.T) {
 	r := versionRow{vf: vfBase, vt: vfBase.Add(time.Hour)}
-	assert.True(t, r.overlapsWindow(vfBase.Add(-time.Minute), vfBase.Add(time.Minute)))
-	assert.False(t, r.overlapsWindow(vfBase.Add(time.Hour), vfBase.Add(2*time.Hour)),
-		"window starting exactly at valid_to must not overlap (half-open interval)")
-	assert.False(t, r.overlapsWindow(vfBase.Add(-time.Hour), vfBase),
-		"window ending exactly at valid_from must not overlap")
+	assert.True(t, r.liveAt(vfBase), "valid_from itself is live (inclusive bound)")
+	assert.True(t, r.liveAt(vfBase.Add(time.Minute)))
+	assert.False(t, r.liveAt(vfBase.Add(time.Hour)),
+		"valid_to itself is NOT live (half-open interval)")
+	assert.False(t, r.liveAt(vfBase.Add(2*time.Hour)), "after valid_to")
+	assert.False(t, r.liveAt(vfBase.Add(-time.Minute)), "before valid_from")
 }
 
 // dt64Lit must preserve milliseconds and survive the far-future sentinel —

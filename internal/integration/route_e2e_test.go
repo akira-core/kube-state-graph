@@ -25,7 +25,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/route"
 	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
 	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
-	"github.com/akira-core/kube-state-graph/pkg/route/memwindow"
+	"github.com/akira-core/kube-state-graph/pkg/route/snapshot"
 	routestore "github.com/akira-core/kube-state-graph/pkg/route/store"
 	"github.com/akira-core/kube-state-graph/pkg/route/translate"
 )
@@ -714,28 +714,24 @@ func (s *RouteStoreSuite) TearDownSuite() {
 	}
 }
 
-// TestTrafficWindowThreeHopAndTranslate drives store → memwindow → gwresolve →
-// translate off the real ClickHouse rows and asserts the RouteConfiguration
-// that would be handed to router_check_tool: the 3-hop narrows to the seeded
-// gateways, the default-443 port selects the TLS-terminated listener's RC, and
-// its route cluster names payments.
-func (s *RouteStoreSuite) TestTrafficWindowThreeHopAndTranslate() {
+// TestTrafficSnapshotThreeHopAndTranslate drives store → snapshot → gwresolve
+// → translate off the real ClickHouse rows AT ONE INSTANT (fixedNow) and
+// asserts the RouteConfiguration that would be handed to router_check_tool:
+// the 3-hop narrows to the seeded gateways, the default-443 port selects the
+// TLS-terminated listener's RC, and its route cluster names payments.
+func (s *RouteStoreSuite) TestTrafficSnapshotThreeHopAndTranslate() {
 	ctx := context.Background()
 	st, err := routestore.Open(ctx, s.chDSN)
 	s.Require().NoError(err, "schema validation must pass against the seeded store")
 	defer func() { _ = st.Close() }()
 
-	w, err := st.LoadTrafficWindow(ctx, "cluster-alpha", ingressLBIP,
-		fixedNow.Add(-5*time.Minute), fixedNow)
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
 	s.Require().NoError(err)
-	s.Require().NotEmpty(w.Gateways, "3-hop window must reach the seeded gateways")
+	s.Require().NotEmpty(w.Gateways, "3-hop snapshot must reach the seeded gateways")
 
-	mw := memwindow.New(w, fixedNow.Add(-5*time.Minute), fixedNow)
-	segs := mw.Segments()
-	s.Require().NotEmpty(segs)
-	t := segs[0].From
+	snap := snapshot.New(w, fixedNow)
 
-	cands := mw.ResolveIPToGateways(ingressLBIP, t)
+	cands := snap.ResolveIPToGateways(ingressLBIP)
 	s.Require().NotEmpty(cands, "IP 3-hop must yield candidates")
 	names := make([]string, len(cands))
 	gws := make([]gwresolve.Gateway, len(cands))
@@ -747,7 +743,7 @@ func (s *RouteStoreSuite) TestTrafficWindowThreeHopAndTranslate() {
 	s.Require().True(ok)
 	s.Equal("public-gw", gw)
 
-	scoped, found, err := mw.ScopedFor(gw, t)
+	scoped, found, err := snap.ScopedFor(gw)
 	s.Require().NoError(err)
 	s.Require().True(found)
 	scoped.Port = 443
@@ -770,64 +766,67 @@ func (s *RouteStoreSuite) TestTrafficWindowThreeHopAndTranslate() {
 // the store's ONLY cross-cluster read (design D10): each seeded LB IP names
 // exactly its own cluster, an external_ips-only IP also matches, an unknown
 // IP names none, and a version pair whose open row was closed by a rewrite
-// BEFORE the window collapses under the probe's no-FINAL dedup instead of
-// resurrecting a dead cluster.
+// BEFORE the resolution instant collapses under the probe's no-FINAL dedup
+// instead of resurrecting a dead cluster.
 func (s *RouteStoreSuite) TestClustersWithIngressIPProbe() {
 	ctx := context.Background()
 	st, err := routestore.Open(ctx, s.chDSN)
 	s.Require().NoError(err)
 	defer func() { _ = st.Close() }()
-	t0, t1 := fixedNow.Add(-5*time.Minute), fixedNow
 
-	alpha, err := st.ClustersWithIngressIP(ctx, ingressLBIP, t0, t1)
+	alpha, err := st.ClustersWithIngressIP(ctx, ingressLBIP, fixedNow)
 	s.Require().NoError(err)
 	s.Equal([]string{"cluster-alpha"}, alpha)
 
-	extOnly, err := st.ClustersWithIngressIP(ctx, ingressExtIP, t0, t1)
+	extOnly, err := st.ClustersWithIngressIP(ctx, ingressExtIP, fixedNow)
 	s.Require().NoError(err)
 	s.Equal([]string{"cluster-alpha"}, extOnly,
 		"an IP present only in external_ips must still name its cluster")
 
-	beta, err := st.ClustersWithIngressIP(ctx, ingressLBIP2, t0, t1)
+	beta, err := st.ClustersWithIngressIP(ctx, ingressLBIP2, fixedNow)
 	s.Require().NoError(err)
 	s.Equal([]string{"cluster-beta"}, beta)
 
-	none, err := st.ClustersWithIngressIP(ctx, "198.18.0.99", t0, t1)
+	none, err := st.ClustersWithIngressIP(ctx, "198.18.0.99", fixedNow)
 	s.Require().NoError(err)
 	s.Empty(none, "an IP no ingress Service ever carried names no cluster")
 
 	// The cluster-gone pair: its closing rewrite (higher ingest_seq, valid_to
-	// two hours before the window) must win the client-side dedup, so the
+	// two hours before the instant) must win the client-side dedup, so the
 	// stale open row's far-future valid_to never resurrects the cluster.
-	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, t0, t1)
+	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, fixedNow)
 	s.Require().NoError(err)
-	s.Empty(gone, "a version closed before the window must not name its cluster")
+	s.Empty(gone, "a version closed before the instant must not name its cluster")
 	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
 }
 
-// TestTrafficWindowNoFinalDedupAndBareRef pins the window-load behaviours the
-// removed config-window test used to cover, off the IP-rooted load: the
-// rewritten (closed) gateway version collapses client-side, the bare-name VS
-// binding survives the gwRefs superset load into ScopedFor, and the window is
-// strictly scoped to the requested cluster.
-func (s *RouteStoreSuite) TestTrafficWindowNoFinalDedupAndBareRef() {
+// TestTrafficSnapshotNoFinalDedupAndBareRef pins the snapshot-load behaviours
+// off the IP-rooted load: only the gateway version LIVE AT the instant is
+// returned (the rewritten/closed one collapses client-side and the superseded
+// version is filtered out), the bare-name VS binding survives the gwRefs
+// superset load into ScopedFor, and the load is strictly scoped to the
+// requested cluster.
+func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	ctx := context.Background()
 	st, err := routestore.Open(ctx, s.chDSN)
 	s.Require().NoError(err)
 	defer func() { _ = st.Close() }()
-	t0, t1 := fixedNow.Add(-5*time.Minute), fixedNow
 
-	w, err := st.LoadTrafficWindow(ctx, "cluster-alpha", ingressLBIP, t0, t1)
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
 	s.Require().NoError(err)
 	// Exactly 2: public-gw's current version + public-gw-http (both selected
 	// by the ingress deployment's labels). The seeded stale-open/closing row
 	// pair for public-gw MUST collapse client-side — without the no-FINAL
-	// dedup the stale open row (valid_to = far future) still overlaps the
-	// window and a third row appears here.
+	// dedup the stale open row (valid_to = far future) reads as live at the
+	// instant and a third row appears here. The closed version that ended an
+	// hour before fixedNow is likewise absent: the point-in-time load returns
+	// ONE version per gateway, not every version of the window.
 	s.Len(w.Gateways, 2, "the stale open row must be dedup-collapsed away")
 	for _, gw := range w.Gateways {
 		s.NotContains(gw.ServerHosts, "stale.example.com",
 			"the rewritten (closed) version's stale open row leaked past the dedup")
+		s.True(!gw.ValidFrom.After(fixedNow) && fixedNow.Before(gw.ValidTo),
+			"every loaded gateway version must be live at the resolution instant")
 	}
 	// 3 VSes: the qualified-ref vs443 + noip-vs AND the bare-ref vs8080 — the
 	// bare form must survive the gwRefs superset load.
@@ -838,17 +837,17 @@ func (s *RouteStoreSuite) TestTrafficWindowNoFinalDedupAndBareRef() {
 
 	// boundTo: the bare-name binding ("public-gw-http" in the gateway's own
 	// namespace) must reach ScopedFor's translate input.
-	mw := memwindow.New(w, t0, t1)
-	scoped, found, err := mw.ScopedFor("public-gw-http", t0)
+	snap := snapshot.New(w, fixedNow)
+	scoped, found, err := snap.ScopedFor("public-gw-http")
 	s.Require().NoError(err)
 	s.Require().True(found)
 	s.Len(scoped.Configs, 2, "gateway CR + the bare-ref-bound VirtualService")
 
 	// Cluster scoping: the same IP under a different cluster loads nothing —
-	// window loads never mix clusters (only the probe is cross-cluster).
-	other, err := st.LoadTrafficWindow(ctx, "cluster-beta", ingressLBIP, t0, t1)
+	// snapshot loads never mix clusters (only the probe is cross-cluster).
+	other, err := st.LoadTrafficAt(ctx, "cluster-beta", ingressLBIP, fixedNow)
 	s.Require().NoError(err)
-	s.Empty(other.Gateways, "route-store window loads are strictly cluster-scoped")
+	s.Empty(other.Gateways, "route-store snapshot loads are strictly cluster-scoped")
 }
 
 // TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow documents WHY pruned
@@ -864,8 +863,7 @@ func (s *RouteStoreSuite) TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow()
 	s.Require().NoError(err)
 	defer func() { _ = st.Close() }()
 
-	w, err := st.LoadTrafficWindow(ctx, "cluster-alpha", ingressLBIP,
-		fixedNow.Add(-5*time.Minute), fixedNow)
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
 	s.Require().NoError(err)
 
 	stale := false
@@ -898,8 +896,8 @@ func (s *RouteStoreSuite) TestOpenWithAuthUsesEnvStyleCredentials() {
 }
 
 // TestNginxFallbackResolvesViaRealStore drives the ingress-lb-service-fallback
-// through the real ClickHouse rows WITHOUT router_check_tool: the nginx window
-// shape never reaches gwresolve, so a zero matchcheck.Runner is a tripwire
+// through the real ClickHouse rows WITHOUT router_check_tool: the nginx
+// snapshot shape never reaches gwresolve, so a zero matchcheck.Runner is a tripwire
 // (any invocation would fail). Unique IP → RouteIngressLBService anchored on
 // the selected cluster; the dup IP's same-cluster collision → ambiguous.
 func (s *RouteStoreSuite) TestNginxFallbackResolvesViaRealStore() {
@@ -915,8 +913,7 @@ func (s *RouteStoreSuite) TestNginxFallbackResolvesViaRealStore() {
 		Path:          "/",
 		Port:          443,
 		IPs:           []string{ingressLBIPNginx},
-		Start:         fixedNow.Add(-5 * time.Minute),
-		End:           fixedNow,
+		At:            fixedNow,
 	}
 	dest, outcome, err := r.ResolveRoute(ctx, req)
 	s.Require().NoError(err)

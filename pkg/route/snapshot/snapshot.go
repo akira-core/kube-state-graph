@@ -1,0 +1,261 @@
+// Package snapshot resolves a store.TrafficSnapshot in memory. Given the
+// resource versions loaded once by the store for one instant, it answers the
+// same 3-hop IP->Gateway and per-gateway ScopedFor a point-in-time store query
+// would — but against the already-loaded rows, with no further DB round-trips.
+//
+// Route resolution evaluates the ingress configuration at ONE instant — the
+// build window's end (simplify-route-resolution-to-point-in-time D1) — so this
+// package has no notion of segments, version boundaries, or config-signature
+// dedup: every accessor answers as of the snapshot's own `at`.
+//
+// The set/liveness logic mirrors the ClickHouse reader exactly: has -> contains,
+// hasAll -> containsAll, and the materialized valid_to gives
+// live(at) = ValidFrom <= at < ValidTo.
+package snapshot
+
+import (
+	"time"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/gvk"
+
+	"github.com/akira-core/kube-state-graph/pkg/route/store"
+	"github.com/akira-core/kube-state-graph/pkg/route/translate"
+)
+
+// pjUnmarshal tolerates unknown fields — production spec_json is the API
+// server's CR JSON verbatim, so a newer cluster CRD's extra fields must not
+// fail the parse. Kept in sync with the store reader's copy.
+var pjUnmarshal = protojson.UnmarshalOptions{DiscardUnknown: true}
+
+// Snapshot is a loaded TrafficSnapshot pinned to the instant it answers for.
+type Snapshot struct {
+	w  store.TrafficSnapshot
+	at time.Time
+}
+
+// New wraps loaded rows as the configuration state at `at`.
+func New(w store.TrafficSnapshot, at time.Time) *Snapshot {
+	return &Snapshot{w: w, at: at}
+}
+
+// ResolveIPToGateways runs the 3-hop selector join for a destination IP as of
+// the snapshot's instant: IP -> ingress Service (selector) -> ingress Deployment
+// pod labels L -> gateways whose selector ⊆ L. Empty result => traffic miss.
+func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
+	// Hop 1: IP -> ingress Service (its namespace + selector).
+	var svcNS string
+	var svcSel []string
+	found := false
+	for i := range s.w.Services {
+		r := &s.w.Services[i]
+		if s.live(r.ValidFrom, r.ValidTo) && r.HasIngressIP(ip) {
+			svcNS, svcSel, found = r.Namespace, r.Selector, true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	// Hop 2: Service selector -> ingress Deployment pod labels L (svc.selector ⊆ L).
+	var podLabels []string
+	found = false
+	for i := range s.w.Deploys {
+		r := &s.w.Deploys[i]
+		if s.live(r.ValidFrom, r.ValidTo) && r.Namespace == svcNS && containsAll(r.PodLabels, svcSel) {
+			podLabels, found = r.PodLabels, true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	// Hop 3: L -> candidate gateways (gateway.selector ⊆ L).
+	var cands []store.GatewayCand
+	for i := range s.w.Gateways {
+		r := &s.w.Gateways[i]
+		if s.live(r.ValidFrom, r.ValidTo) && containsAll(podLabels, r.SelectorKV) {
+			cands = append(cands, store.GatewayCand{Namespace: r.Namespace, Name: r.Name, ServerHosts: r.ServerHosts})
+		}
+	}
+	return cands
+}
+
+// ResolveIPToIngressServices returns every service row live at the snapshot's
+// instant whose ingress IPs (external or load-balancer) contain ip — the
+// single-cluster analogue of store.ClustersWithIngressIP's SQL, returning the
+// rows themselves instead of cluster names. Uniqueness of the (Namespace, Name)
+// identity set is the caller's concern (pkg/route's ingressServiceIdentity).
+//
+// Because it is evaluated as of one instant, an identity that was superseded
+// earlier is simply not returned — only the owner(s) live at `at` count, so
+// more than one of those is a genuine collision rather than version churn.
+func (s *Snapshot) ResolveIPToIngressServices(ip string) []store.ServiceRow {
+	var out []store.ServiceRow
+	for i := range s.w.Services {
+		r := &s.w.Services[i]
+		if s.live(r.ValidFrom, r.ValidTo) && r.HasIngressIP(ip) {
+			out = append(out, *r)
+		}
+	}
+	return out
+}
+
+// ScopedFor rebuilds one gateway's translate input as of the snapshot's instant:
+// its Gateway CR + the VirtualServices bound to it + the backend Services those
+// VS route to. ok=false if the gateway has no version live at that instant.
+func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error) {
+	var gw *store.GatewayRow
+	for i := range s.w.Gateways {
+		r := &s.w.Gateways[i]
+		if r.Name == gwName && s.live(r.ValidFrom, r.ValidTo) {
+			gw = r
+			break
+		}
+	}
+	if gw == nil {
+		return translate.ScopedInput{}, false, nil
+	}
+	var gwSpec networking.Gateway
+	if err := pjUnmarshal.Unmarshal([]byte(gw.SpecJSON), &gwSpec); err != nil {
+		return translate.ScopedInput{}, false, err
+	}
+	cfgs := []config.Config{{
+		Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: gwName, Namespace: gw.Namespace},
+		Spec: &gwSpec,
+	}}
+
+	var destHosts []string
+	for i := range s.w.VSes {
+		r := &s.w.VSes[i]
+		if !s.live(r.ValidFrom, r.ValidTo) || !boundTo(r.Namespace, r.BoundGateways, gw.Namespace, gwName) {
+			continue
+		}
+		var vsSpec networking.VirtualService
+		if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
+			return translate.ScopedInput{}, false, err
+		}
+		destHosts = append(destHosts, vsDestHosts(&vsSpec)...)
+		cfgs = append(cfgs, config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: r.Name, Namespace: r.Namespace},
+			Spec: &vsSpec,
+		})
+	}
+
+	return translate.ScopedInput{
+		Configs:  cfgs,
+		Services: s.backendServices(destHosts),
+		Proxy:    translate.GatewayProxy{Name: gwName, Namespace: gw.Namespace, Labels: gwSpec.GetSelector()},
+	}, true, nil
+}
+
+// backendServices rebuilds the destination Services matching hosts as of the
+// snapshot's instant. Identity is the (namespace, name) parsed from each
+// destination.host FQDN — not scoped by the gateway namespace, so it's portable
+// to production where backend Service ns == VS ns != gateway ns. Each matched
+// row is one Service carrying all its ports.
+func (s *Snapshot) backendServices(hosts []string) []*model.Service {
+	if len(hosts) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if name, ns, ok := store.ParseBackendHost(h); ok {
+			want[ns+"/"+name] = true
+		}
+	}
+	var out []*model.Service
+	for i := range s.w.Services {
+		r := &s.w.Services[i]
+		if len(r.Ports) == 0 || !want[r.Namespace+"/"+r.Name] || !s.live(r.ValidFrom, r.ValidTo) {
+			continue
+		}
+		pl := make(model.PortList, 0, len(r.Ports))
+		for _, p := range r.Ports {
+			pl = append(pl, &model.Port{Name: p.Name, Port: int(p.Port), Protocol: protocol.Parse(p.Name)})
+		}
+		out = append(out, &model.Service{
+			Hostname:       host.Name(store.BackendFQDN(r.Name, r.Namespace)),
+			DefaultAddress: "0.0.0.0",
+			Ports:          pl,
+			Attributes:     model.ServiceAttributes{Namespace: r.Namespace},
+		})
+	}
+	return out
+}
+
+// live reports whether the version [vf,vt) is live at the snapshot's instant:
+// vf <= at < vt (the reader's liveAt, applied in memory).
+func (s *Snapshot) live(vf, vt time.Time) bool {
+	return !vf.After(s.at) && s.at.Before(vt)
+}
+
+// boundTo reports whether a VirtualService in vsNS whose spec.gateways carries
+// `bound` binds the gateway (gwNS, gwName). Istio accepts two forms: the
+// qualified "<ns>/<name>", and the bare "<name>" — shorthand for a gateway in
+// the VS's OWN namespace. The exporter stores spec.gateways[*] verbatim
+// (unnormalized), so the reader must match both; matching only the qualified
+// form silently drops every bare-bound VS's routes.
+func boundTo(vsNS string, bound []string, gwNS, gwName string) bool {
+	if contains(bound, gwNS+"/"+gwName) {
+		return true
+	}
+	return vsNS == gwNS && contains(bound, gwName)
+}
+
+// contains reports whether set has x (mirrors ClickHouse has()).
+func contains(set []string, x string) bool {
+	for _, s := range set {
+		if s == x {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAll reports whether sub ⊆ super (mirrors ClickHouse hasAll(super, sub)).
+func containsAll(super, sub []string) bool {
+	for _, x := range sub {
+		if !contains(super, x) {
+			return false
+		}
+	}
+	return true
+}
+
+// vsDestHosts collects the destination host (target Service identity FQDN) of
+// every route in a VirtualService. Kept in sync with the store reader's copy.
+func vsDestHosts(vs *networking.VirtualService) []string {
+	var hosts []string
+	add := func(d *networking.Destination) {
+		if d != nil && d.GetHost() != "" {
+			hosts = append(hosts, d.GetHost())
+		}
+	}
+	for _, r := range vs.GetHttp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+		if mr := r.GetMirror(); mr != nil {
+			add(mr)
+		}
+	}
+	for _, r := range vs.GetTls() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	for _, r := range vs.GetTcp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	return hosts
+}

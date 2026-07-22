@@ -69,9 +69,9 @@ func (_c *MockStore_Close_Call) RunAndReturn(run func() error) *MockStore_Close_
 	return _c
 }
 
-// ClustersWithIngressIP provides a mock function with given fields: ctx, ip, t0, t1
-func (_m *MockStore) ClustersWithIngressIP(ctx context.Context, ip string, t0 time.Time, t1 time.Time) ([]string, error) {
-	ret := _m.Called(ctx, ip, t0, t1)
+// ClustersWithIngressIP provides a mock function with given fields: ctx, ip, at
+func (_m *MockStore) ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error) {
+	ret := _m.Called(ctx, ip, at)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ClustersWithIngressIP")
@@ -79,19 +79,19 @@ func (_m *MockStore) ClustersWithIngressIP(ctx context.Context, ip string, t0 ti
 
 	var r0 []string
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, string, time.Time, time.Time) ([]string, error)); ok {
-		return rf(ctx, ip, t0, t1)
+	if rf, ok := ret.Get(0).(func(context.Context, string, time.Time) ([]string, error)); ok {
+		return rf(ctx, ip, at)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, string, time.Time, time.Time) []string); ok {
-		r0 = rf(ctx, ip, t0, t1)
+	if rf, ok := ret.Get(0).(func(context.Context, string, time.Time) []string); ok {
+		r0 = rf(ctx, ip, at)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).([]string)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, string, time.Time, time.Time) error); ok {
-		r1 = rf(ctx, ip, t0, t1)
+	if rf, ok := ret.Get(1).(func(context.Context, string, time.Time) error); ok {
+		r1 = rf(ctx, ip, at)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -107,15 +107,14 @@ type MockStore_ClustersWithIngressIP_Call struct {
 // ClustersWithIngressIP is a helper method to define mock.On call
 //   - ctx context.Context
 //   - ip string
-//   - t0 time.Time
-//   - t1 time.Time
-func (_e *MockStore_Expecter) ClustersWithIngressIP(ctx interface{}, ip interface{}, t0 interface{}, t1 interface{}) *MockStore_ClustersWithIngressIP_Call {
-	return &MockStore_ClustersWithIngressIP_Call{Call: _e.mock.On("ClustersWithIngressIP", ctx, ip, t0, t1)}
+//   - at time.Time
+func (_e *MockStore_Expecter) ClustersWithIngressIP(ctx interface{}, ip interface{}, at interface{}) *MockStore_ClustersWithIngressIP_Call {
+	return &MockStore_ClustersWithIngressIP_Call{Call: _e.mock.On("ClustersWithIngressIP", ctx, ip, at)}
 }
 
-func (_c *MockStore_ClustersWithIngressIP_Call) Run(run func(ctx context.Context, ip string, t0 time.Time, t1 time.Time)) *MockStore_ClustersWithIngressIP_Call {
+func (_c *MockStore_ClustersWithIngressIP_Call) Run(run func(ctx context.Context, ip string, at time.Time)) *MockStore_ClustersWithIngressIP_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(string), args[2].(time.Time), args[3].(time.Time))
+		run(args[0].(context.Context), args[1].(string), args[2].(time.Time))
 	})
 	return _c
 }
@@ -125,32 +124,32 @@ func (_c *MockStore_ClustersWithIngressIP_Call) Return(_a0 []string, _a1 error) 
 	return _c
 }
 
-func (_c *MockStore_ClustersWithIngressIP_Call) RunAndReturn(run func(context.Context, string, time.Time, time.Time) ([]string, error)) *MockStore_ClustersWithIngressIP_Call {
+func (_c *MockStore_ClustersWithIngressIP_Call) RunAndReturn(run func(context.Context, string, time.Time) ([]string, error)) *MockStore_ClustersWithIngressIP_Call {
 	_c.Call.Return(run)
 	return _c
 }
 
-// LoadTrafficWindow provides a mock function with given fields: ctx, cluster, ip, t0, t1
-func (_m *MockStore) LoadTrafficWindow(ctx context.Context, cluster string, ip string, t0 time.Time, t1 time.Time) (store.TrafficWindow, error) {
-	ret := _m.Called(ctx, cluster, ip, t0, t1)
+// LoadTrafficAt provides a mock function with given fields: ctx, cluster, ip, at
+func (_m *MockStore) LoadTrafficAt(ctx context.Context, cluster string, ip string, at time.Time) (store.TrafficSnapshot, error) {
+	ret := _m.Called(ctx, cluster, ip, at)
 
 	if len(ret) == 0 {
-		panic("no return value specified for LoadTrafficWindow")
+		panic("no return value specified for LoadTrafficAt")
 	}
 
-	var r0 store.TrafficWindow
+	var r0 store.TrafficSnapshot
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, string, string, time.Time, time.Time) (store.TrafficWindow, error)); ok {
-		return rf(ctx, cluster, ip, t0, t1)
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, time.Time) (store.TrafficSnapshot, error)); ok {
+		return rf(ctx, cluster, ip, at)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, string, string, time.Time, time.Time) store.TrafficWindow); ok {
-		r0 = rf(ctx, cluster, ip, t0, t1)
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, time.Time) store.TrafficSnapshot); ok {
+		r0 = rf(ctx, cluster, ip, at)
 	} else {
-		r0 = ret.Get(0).(store.TrafficWindow)
+		r0 = ret.Get(0).(store.TrafficSnapshot)
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, string, string, time.Time, time.Time) error); ok {
-		r1 = rf(ctx, cluster, ip, t0, t1)
+	if rf, ok := ret.Get(1).(func(context.Context, string, string, time.Time) error); ok {
+		r1 = rf(ctx, cluster, ip, at)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -158,34 +157,33 @@ func (_m *MockStore) LoadTrafficWindow(ctx context.Context, cluster string, ip s
 	return r0, r1
 }
 
-// MockStore_LoadTrafficWindow_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'LoadTrafficWindow'
-type MockStore_LoadTrafficWindow_Call struct {
+// MockStore_LoadTrafficAt_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'LoadTrafficAt'
+type MockStore_LoadTrafficAt_Call struct {
 	*mock.Call
 }
 
-// LoadTrafficWindow is a helper method to define mock.On call
+// LoadTrafficAt is a helper method to define mock.On call
 //   - ctx context.Context
 //   - cluster string
 //   - ip string
-//   - t0 time.Time
-//   - t1 time.Time
-func (_e *MockStore_Expecter) LoadTrafficWindow(ctx interface{}, cluster interface{}, ip interface{}, t0 interface{}, t1 interface{}) *MockStore_LoadTrafficWindow_Call {
-	return &MockStore_LoadTrafficWindow_Call{Call: _e.mock.On("LoadTrafficWindow", ctx, cluster, ip, t0, t1)}
+//   - at time.Time
+func (_e *MockStore_Expecter) LoadTrafficAt(ctx interface{}, cluster interface{}, ip interface{}, at interface{}) *MockStore_LoadTrafficAt_Call {
+	return &MockStore_LoadTrafficAt_Call{Call: _e.mock.On("LoadTrafficAt", ctx, cluster, ip, at)}
 }
 
-func (_c *MockStore_LoadTrafficWindow_Call) Run(run func(ctx context.Context, cluster string, ip string, t0 time.Time, t1 time.Time)) *MockStore_LoadTrafficWindow_Call {
+func (_c *MockStore_LoadTrafficAt_Call) Run(run func(ctx context.Context, cluster string, ip string, at time.Time)) *MockStore_LoadTrafficAt_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(time.Time), args[4].(time.Time))
+		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(time.Time))
 	})
 	return _c
 }
 
-func (_c *MockStore_LoadTrafficWindow_Call) Return(_a0 store.TrafficWindow, _a1 error) *MockStore_LoadTrafficWindow_Call {
+func (_c *MockStore_LoadTrafficAt_Call) Return(_a0 store.TrafficSnapshot, _a1 error) *MockStore_LoadTrafficAt_Call {
 	_c.Call.Return(_a0, _a1)
 	return _c
 }
 
-func (_c *MockStore_LoadTrafficWindow_Call) RunAndReturn(run func(context.Context, string, string, time.Time, time.Time) (store.TrafficWindow, error)) *MockStore_LoadTrafficWindow_Call {
+func (_c *MockStore_LoadTrafficAt_Call) RunAndReturn(run func(context.Context, string, string, time.Time) (store.TrafficSnapshot, error)) *MockStore_LoadTrafficAt_Call {
 	_c.Call.Return(run)
 	return _c
 }

@@ -291,8 +291,12 @@ live under `openspec/specs/`.
   `KSG_ROUTE_STORE_DSN` is set, every point where `resolveUnknownServerPeer`
   would emit an external node first consults an Istio route-resolution engine:
   which Kubernetes Service did the **engine-selected ingress cluster's** Gateway
-  + VirtualService config route `(host, "/", port)` to during the request's own
-  `[start, end]`? A hit resolves through the SAME `resolveServiceLevel` as every
+  + VirtualService config route `(host, "/", port)` to **at the END of the
+  request's own window** (simplify-route-resolution-to-point-in-time D1 — a
+  single as-of instant, never a per-version range; `RouteRequest.At`, the same
+  instant the service-graph samples are evaluated at, so exactly ONE
+  configuration state is consulted and ONE outcome produced)? A hit resolves
+  through the SAME `resolveServiceLevel` as every
   other path — anchored on the **selected ingress cluster** (`dest.Cluster`),
   not the caller's (membership test, one service node, `pod-calls-service`
   edge — which therefore MAY cross clusters, family-wide `service-selects-pod`
@@ -339,46 +343,49 @@ live under `openspec/specs/`.
   exported). |F|==1 → it; |F|>1 → caller if caller∈F else ambiguous; F empty
   and |G|==1 → it; |G|>1 → caller if caller∈G else ambiguous; G empty →
   no-ingress. Multi-IP selections must all agree or degrade ambiguous;
-  candidate sets / windows are NEVER unioned across clusters. Misses surface as
+  candidate sets / snapshots are NEVER unioned across clusters. Misses surface as
   `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
   `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
   `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
-  The `ClustersWithIngressIP` probe is a pure function of `(ip, start, end)`
-  (constant across a build's keys), so it is **memoised per build** (D13): when
+  The `ClustersWithIngressIP` probe is a pure function of `(ip, at)` (both
+  constant across a build's keys), so it is **memoised per build** (D13): when
   the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
   (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
   drives the whole build through one `scopedResolver` scope that caches the
-  probe by `(ip, start, end)`, collapsing keys that share a destination IP to a
+  probe by `(ip, at)`, collapsing keys that share a destination IP to a
   single store read. The scope is one-build/serial (no mutex); the shared
   `*Resolver` stays stateless (an instance cache would leak). Errors are not
   cached; no outcome/determinism change.
-  **(5) The engine** (`pkg/route`) loads a versioned,
-  **ingress-cluster-scoped, read-only** ClickHouse window (written by the
-  metadata-exporter repo; schema drift fails fast at startup; reads use the
-  no-FINAL pattern — `valid_to` NEVER filtered in SQL, client-side dedup per
-  version slot by max ingest_seq, overlap checked post-dedup — because the
+  **(5) The engine** (`pkg/route`) loads an **ingress-cluster-scoped,
+  read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
+  `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
+  tables stay interval-versioned and are written by the metadata-exporter repo;
+  schema drift fails fast at startup; reads use the no-FINAL pattern —
+  `valid_to` NEVER filtered in SQL, SQL carries only `valid_from <= at` plus the
+  join keys, client-side dedup per version slot by max ingest_seq, and the
+  liveness test `valid_from <= at < valid_to` applied post-dedup — because the
   exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
   opts into SQL-side pruning for update-close writers ONLY; time operands are
   `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
   bare `spec.gateways` names bind same-namespace gateways — see design
   "production reader compatibility"),
-  slices it at version boundaries in memory, translates one gateway's scoped config via
+  translates that one gateway's scoped config via
   in-process istiod (`ConfigGenerator`, no istiod pod, no Kubernetes client —
   see the client-go rule) and matches with the native `router_check_tool`
   binary (`--router-check-bin`; copied into the image from the Envoy tools
-  image; ~50–60 ms per distinct config — v1 is deliberately serial/uncached).
+  image; ~50–60 ms per config — one translate + one check per resolution, so
+  there is no segment loop and no config-signature cache).
   **(5b) Ingress LB Service fallback** (ingress-lb-service-fallback change):
-  when the pipeline produces no hit AND its folded miss is exactly
-  `RouteNoGateway` (no segment got past gateway resolution — the nginx
+  when the pipeline produces no hit AND its miss is exactly
+  `RouteNoGateway` (resolution never got past gateway selection — the nginx
   signature: Hop 3 finds no Istio Gateway CR; a DEEPER miss keeps its
-  diagnostic reason unmasked), the resolver falls back to a **window-wide
-  identity dedup** over the already-loaded rows
-  (`memwindow.ResolveIPToIngressServices` — the in-memory, single-cluster
-  analogue of the `ClustersWithIngressIP` SQL; no new store read, no
-  per-instant/segment evaluation): per destination IP the distinct
-  `(namespace, name)` of every window-overlapping ingress-IP-carrying Service
-  row, merged order-free — any IP with >1 identity (incl. an identity change
-  inside the window) → `RouteAmbiguousIngressService`
+  diagnostic reason unmasked), the resolver falls back to an **as-of identity
+  dedup** over the already-loaded rows
+  (`snapshot.ResolveIPToIngressServices` — the in-memory, single-cluster
+  analogue of the `ClustersWithIngressIP` SQL; no new store read): per
+  destination IP the distinct `(namespace, name)` of every ingress-IP-carrying
+  Service row LIVE AT the instant, merged order-free — any IP with >1
+  simultaneous identity → `RouteAmbiguousIngressService`
   (`route_engine_ambiguous_ingress_service` → external, no lexicographic
   tie-break); any IP with 0 → keep the pipeline miss byte-for-byte; else all
   singletons must agree → `RouteIngressLBService`, resolved by
@@ -391,11 +398,12 @@ live under `openspec/specs/`.
   `route_engine_dest_cluster_lacks_service`), with the outcome dimension in
   the success debug log distinguishing the coarser "LB entry point" semantics
   (host/path/port play no part — the fan-out reaches the ingress controller
-  pods, e.g. nginx, never a routed backend). Neither new outcome enters
-  `outcomeRank`.
+  pods, e.g. nginx, never a routed backend). An identity that was superseded
+  BEFORE the instant is simply not a candidate (no longer ambiguous —
+  simplify-route-resolution-to-point-in-time D5).
   **(5c) RouteHit ingress chain** (route-hit-ingress-chain): on every routed
   hit the resolver ALSO recovers the ingress LB Service identity of the
-  destination IPs via the same window-wide dedup (shared core
+  destination IPs via the same as-of dedup (shared core
   `ingressServiceIdentity` in `pkg/route/ingresslb.go`; zero new store
   reads) into two new `RouteDestination` fields `IngressNamespace` /
   `IngressService` — empty on ambiguous/incomplete identity, which NEVER

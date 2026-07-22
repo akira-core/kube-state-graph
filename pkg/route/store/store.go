@@ -1,10 +1,10 @@
 // Package store is the READ-ONLY contract for the versioned Istio-config store
 // backing route resolution (the translate-global-fqdn-to-k8s-service change).
 // The metadata-exporter repo owns watch/ingest and the schema; kube-state-graph
-// only loads version windows out of it — there is deliberately no CreateSchema
+// only loads version snapshots out of it — there is deliberately no CreateSchema
 // and no inserter here (design D7). Ported from poc/route2a/internal/store with
-// one structural change: every row carries a `cluster` column and every window
-// query is scoped by it, because kube-state-graph is multi-cluster and a
+// one structural change: every row carries a `cluster` column and every
+// snapshot query is scoped by it, because kube-state-graph is multi-cluster and a
 // Gateway/VS lookup must never leak across clusters. The one deliberate
 // cross-cluster read is ClustersWithIngressIP, the ingress-cluster selection
 // probe (design D10).
@@ -130,8 +130,8 @@ type GatewayCand struct {
 }
 
 // DeployRow / GatewayRow / VSRow are full version rows for the range path. They
-// carry the materialized ValidFrom/ValidTo so the in-memory window can do AsOf
-// without re-hitting the DB; GatewayRow/VSRow keep spec_json so ScopedFor can
+// carry the materialized ValidFrom/ValidTo so the in-memory snapshot can check
+// liveness without re-hitting the DB; GatewayRow/VSRow keep spec_json so ScopedFor can
 // rebuild translate input off the loaded rows.
 type DeployRow struct {
 	Cluster            string
@@ -160,41 +160,42 @@ type VSRow struct {
 	IngestSeq          uint64
 }
 
-// TrafficWindow is every resource version overlapping [t0,t1) that one load
-// pulled: the ingress Service, its Deployment, the candidate Gateways, their
-// bound VirtualServices, and the backend Services those VS route to. It is
-// loaded once (LoadTrafficWindow), then sliced/resolved in memory
-// (pkg/route/memwindow) with no further DB round-trips. Each row's ValidTo is
-// the materialized column value, so AsOf(t) is `ValidFrom <= t < ValidTo`.
-type TrafficWindow struct {
+// TrafficSnapshot is every resource version LIVE AT one instant that a single
+// load pulled: the ingress Service, its Deployment, the candidate Gateways,
+// their bound VirtualServices, and the backend Services those VS route to. It
+// is loaded once (LoadTrafficAt), then resolved in memory
+// (pkg/route/snapshot) with no further DB round-trips. Each row's ValidTo is
+// the materialized column value, so liveness is `ValidFrom <= at < ValidTo`
+// (simplify-route-resolution-to-point-in-time D2).
+type TrafficSnapshot struct {
 	Services []ServiceRow // ingress LB + backend destination Service versions
 	Deploys  []DeployRow
 	Gateways []GatewayRow
 	VSes     []VSRow
 }
 
-// Store is the read-only window loader one backend implements. The window
+// Store is the read-only snapshot loader one backend implements. The snapshot
 // load is scoped to a single cluster — route resolution must never mix one
 // cluster's Gateways with another's. The ONLY cross-cluster read is the
 // ingress-IP probe that feeds ingress-cluster selection (design D10).
 type Store interface {
 	Close() error
 
-	// LoadTrafficWindow fetches every resource version overlapping [t0,t1)
-	// that is reachable from destination IP in cluster (one scoped Overlap
-	// load per resource kind, using the materialized valid_to:
-	// valid_from < t1 AND t0 < valid_to). The caller slices and resolves the
-	// returned window in memory.
-	LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 time.Time) (TrafficWindow, error)
+	// LoadTrafficAt fetches every resource version live at `at` that is
+	// reachable from destination IP in cluster (one scoped as-of load per
+	// resource kind, using the materialized valid_to:
+	// valid_from <= at AND at < valid_to). The caller resolves the returned
+	// snapshot in memory.
+	LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time) (TrafficSnapshot, error)
 
 	// ClustersWithIngressIP is the store's ONLY cross-cluster read: the
-	// distinct clusters that had an ingress LB Service version carrying ip
-	// in external_ips or loadbalancer_ips overlapping [t0,t1). It feeds the
+	// distinct clusters whose ingress LB Service version carrying ip in
+	// external_ips or loadbalancer_ips was live at `at`. It feeds the
 	// ingress-cluster selection (design D10) — ClickHouse's whole job there
 	// is answering "ip → []cluster". The same no-FINAL semantics as the
-	// window load apply (valid_to never filtered in SQL except under the
+	// snapshot load apply (valid_to never filtered in SQL except under the
 	// uniqueRows prune; client-side dedup per version slot by max
-	// ingest_seq; overlap checked post-dedup). The result is deduplicated
+	// ingest_seq; liveness checked post-dedup). The result is deduplicated
 	// and sorted for determinism.
-	ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error)
+	ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error)
 }

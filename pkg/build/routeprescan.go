@@ -114,7 +114,7 @@ func parseDNSAnswers(raw string) []string {
 }
 
 // routeKey identifies one distinct route-resolution question within a build.
-// Start/End are deliberately absent — they are constant per build — so
+// The resolution instant is deliberately absent — it is constant per build — so
 // multiple samples naming the same (caller cluster, host, port, IPs) share
 // one engine invocation. The caller cluster stays a key dimension even though
 // it no longer scopes the store (design D11): two callers in different
@@ -166,7 +166,9 @@ func peerRouteKey(anchorCluster string, peer peerLabels) (routeKey, bool) {
 }
 
 // request expands a routeKey back into the RouteRequest posed to the engine.
-func (k routeKey) request(start, end time.Time) RouteRequest {
+// at is the build window's end — the single instant the engine evaluates at
+// (simplify-route-resolution-to-point-in-time D1).
+func (k routeKey) request(at time.Time) RouteRequest {
 	var ips []string
 	if k.ips != "" {
 		ips = strings.Split(k.ips, ",")
@@ -177,8 +179,7 @@ func (k routeKey) request(start, end time.Time) RouteRequest {
 		Path:          k.path,
 		Port:          k.port,
 		IPs:           ips,
-		Start:         start,
-		End:           end,
+		At:            at,
 	}
 }
 
@@ -286,7 +287,7 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 // collected". The parse uses the distinction ONLY to pick the diagnostic
 // reason for IP-less endpoints (route_engine_no_ip vs the original classify
 // reason) — graph output MUST NOT depend on it.
-func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTimeout time.Duration, keys []routeKey, start, end time.Time) routeIndex {
+func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTimeout time.Duration, keys []routeKey, at time.Time) routeIndex {
 	if resolver == nil {
 		return nil
 	}
@@ -302,7 +303,7 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 		if perCallTimeout > 0 {
 			callCtx, cancel = context.WithTimeout(ctx, perCallTimeout)
 		}
-		dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(start, end))
+		dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
 		cancel()
 		if err != nil {
 			slog.Debug("route-engine resolution errored (endpoint degrades to external)",

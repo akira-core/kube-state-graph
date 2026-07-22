@@ -134,6 +134,17 @@ graph TD
 
 ### 4.2 查詢（store → 解析）
 
+> **kube-state-graph 消費端現況（simplify-route-resolution-to-point-in-time）**：store 仍是
+> interval 版本化（exporter 契約、DDL、寫入語意完全不變），但 graph build 路徑上的解析器已
+> **簡化為單點 (as-of) 查詢**——查詢時刻固定為 `/v1/graph` 時間區間的 **end**，也就是
+> service-graph `rate(...) @ end` 求值的同一刻。`store.LoadTrafficAt(cluster, ip, at)` /
+> `ClustersWithIngressIP(ip, at)` 只取 `valid_from <= at < valid_to` 的版本，`pkg/route/snapshot`
+> 在記憶體中就那一份設定解析：沒有 segment 切段、沒有 per-version 結果、沒有 config 簽章快取
+> （一次 translate + 一次 `router_check_tool`）。
+>
+> 本節描述的「回傳每個版本」屬於**獨立的取證查詢 API**（尚未實作），不在 graph build 路徑上；
+> 歷史資料仍完整保存在 store 中，隨時可以另建查詢面消費。
+
 ```mermaid
 graph TD
     Q[host + path + t0,t1<br/>選配 dst_ip] --> M{模式}

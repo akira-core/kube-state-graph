@@ -7,7 +7,7 @@ import (
 
 // RouteRequest is one route-resolution question posed to a RouteResolver: which
 // Kubernetes Service did the Istio ingress config route (Host, Path, Port) to
-// during [Start, End]? The ingress cluster is not an input — the resolver
+// AT the instant At? The ingress cluster is not an input — the resolver
 // selects it from the destination IPs (design D10), with CallerCluster feeding
 // only the family key and the collision tie-break.
 //
@@ -18,7 +18,7 @@ type RouteRequest struct {
 	// CallerCluster is the already-resolved client pod's own cluster. It is
 	// used ONLY to derive the cluster-family key and to break candidate ties
 	// during ingress-cluster selection (design D10/D11) — it never scopes a
-	// route-store window load by itself.
+	// route-store snapshot load by itself.
 	CallerCluster string
 	// Host is the peer FQDN with any trailing ":<port>" already split off.
 	Host string
@@ -32,12 +32,16 @@ type RouteRequest struct {
 	Port int
 	// IPs are the destination IPs from the client_dns_answers dimension.
 	// They are REQUIRED (design D6): they select the ingress cluster before
-	// any window is loaded, and the prescan never emits an IP-less request —
+	// any snapshot is loaded, and the prescan never emits an IP-less request —
 	// an endpoint with no parseable IP falls external without consulting the
 	// engine at all.
 	IPs []string
-	// Start / End are the build's own time window, passed through verbatim.
-	Start, End time.Time
+	// At is the instant the config is evaluated at: the END of the build's own
+	// time window (simplify-route-resolution-to-point-in-time D1), the same
+	// instant the service-graph samples are evaluated at. The resolver consults
+	// exactly the resource versions live at At — it never resolves per-version
+	// across the window, so exactly one outcome is produced.
+	At time.Time
 }
 
 // RouteDestination is a resolved route target: the Kubernetes Service an
@@ -60,10 +64,10 @@ type RouteDestination struct {
 	Subset    string
 
 	// IngressNamespace / IngressService identify the ingress LB Service the
-	// destination IPs uniquely mapped to in the selected cluster's window —
+	// destination IPs uniquely mapped to in the selected cluster's snapshot —
 	// the entry-point hop in front of the routed backend
-	// (route-hit-ingress-chain D1). Populated on RouteHit when the window
-	// pins exactly one identity (same window-wide dedup as the LB fallback)
+	// (route-hit-ingress-chain D1). Populated on RouteHit when the snapshot
+	// pins exactly one identity (same as-of dedup as the LB fallback)
 	// and, for uniformity, on RouteIngressLBService (where they equal
 	// Namespace/Service). Empty when no unique identity exists — the parse
 	// then degrades to the direct caller→backend shape; an ambiguous or
@@ -84,8 +88,8 @@ const (
 	// RouteHit — the config routed (host, path, port) to a Service.
 	RouteHit RouteOutcome = "hit"
 	// RouteNoGateway — no gateway in the selected ingress cluster is
-	// reachable from the supplied destination IPs and serves the host in the
-	// window.
+	// reachable from the supplied destination IPs and serves the host at the
+	// request instant.
 	RouteNoGateway RouteOutcome = "no_gateway"
 	// RouteNoListenerOnPort — a gateway serves the host, but NO server
 	// listens on the derived port at all (or the server winning the host
@@ -106,27 +110,27 @@ const (
 	// the matched cluster string was not a parseable in-cluster Service).
 	RouteNoRoute RouteOutcome = "no_route"
 	// RouteNoIngress — no cluster had an ingress Service carrying any of the
-	// destination IPs during the window (design D10). Occurs before any
-	// window is loaded.
+	// destination IPs live at the request instant (design D10). Occurs before
+	// any snapshot is loaded.
 	RouteNoIngress RouteOutcome = "no_ingress"
 	// RouteAmbiguousIngress — the ingress-cluster candidates could not be
 	// reduced to one cluster by the family-first selection (an unresolvable
 	// tie, or multi-IP selections that disagree — design D10). Occurs before
-	// any window is loaded. Deliberately degrades rather than guessing:
+	// any snapshot is loaded. Deliberately degrades rather than guessing:
 	// never a wrong cluster.
 	RouteAmbiguousIngress RouteOutcome = "ambiguous_ingress_cluster"
-	// RouteIngressLBService — the Istio pipeline missed every segment, but the
-	// destination IPs map to exactly ONE ingress LB Service inside the selected
-	// ingress cluster's window (the ingress-lb-service-fallback change). The
+	// RouteIngressLBService — the Istio pipeline missed, but the destination
+	// IPs map to exactly ONE ingress LB Service inside the selected ingress
+	// cluster's snapshot (the ingress-lb-service-fallback change). The
 	// destination is that Service — the LB *entry point* (e.g. an nginx ingress
 	// controller's Service), NOT a routed backend: host, path, and port play no
 	// part. Resolved by the parse exactly like RouteHit.
 	RouteIngressLBService RouteOutcome = "ingress_lb_service"
 	// RouteAmbiguousIngressService — the Istio pipeline missed and the
 	// fallback found MORE than one ingress LB Service identity for the
-	// destination IPs within the selected cluster's window (a same-IP
-	// collision, or an identity change inside the window). Degrades rather
-	// than guessing — never a wrong Service.
+	// destination IPs live at the request instant within the selected cluster
+	// (a same-IP collision, or destination IPs whose owners disagree).
+	// Degrades rather than guessing — never a wrong Service.
 	RouteAmbiguousIngressService RouteOutcome = "ambiguous_ingress_service"
 )
 
@@ -153,7 +157,7 @@ type RouteResolver interface {
 // BuildScopedRouteResolver is an OPTIONAL upgrade interface a RouteResolver may
 // implement to mint a per-build scope carrying request-invariant memoisation.
 // The engine's ingress-cluster probe (store.ClustersWithIngressIP) depends only
-// on (ip, start, end), all constant across one build's keys, yet the base
+// on (ip, at), both constant across one build's keys, yet the base
 // resolver re-runs it once per (key, ip) — the same cross-cluster store read
 // repeated whenever keys share a destination IP. resolveRouteQueries upgrades
 // when this is implemented and drives every ResolveRoute of that build through

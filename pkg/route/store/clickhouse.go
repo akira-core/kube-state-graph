@@ -43,13 +43,13 @@ import (
 //  2. The client dedups rows per version slot (cluster, namespace, name,
 //     valid_from), keeping the highest ingest_seq (dedupLatest) — the exact
 //     collapse ReplacingMergeTree performs at merge time.
-//  3. The Overlap predicate on valid_to (`t0 < valid_to`) is applied AFTER
-//     dedup, in Go (dedupOverlapCounted).
+//  3. The liveness predicate on valid_to (`at < valid_to`) is applied AFTER
+//     dedup, in Go (dedupLiveAtCounted).
 //
 // Trade-off: step 1 fetches every version of the scoped keys with
-// valid_from < t1, including versions that ended before the window — bounded
-// by per-key version counts (and table TTL), still scoped by the same join
-// predicates. In exchange, scans run at plain-MergeTree speed with skip
+// valid_from <= at, including versions that ended before that instant —
+// bounded by per-key version counts (and table TTL), still scoped by the same
+// join predicates. In exchange, scans run at plain-MergeTree speed with skip
 // indexes fully effective.
 //
 // # Pruned mode (WithUniqueRows — update-close writers only)
@@ -57,8 +57,8 @@ import (
 // When the writer guarantees one physical row per version (exporter
 // closeMode=update, after historical convergence), open the store with
 // WithUniqueRows: every query then restores the valid_to predicate in SQL, so
-// versions that ended at or before the window are pruned server-side instead
-// of fetched. Steps 2 and 3 stay in place as a zero-cost safety net;
+// versions that ended at or before the resolution instant are pruned
+// server-side instead of fetched. Steps 2 and 3 stay in place as a zero-cost safety net;
 // CollapsedRows MUST read 0 — a positive count means duplicate version slots
 // reached the reader and the writer's uniqueness guarantee is broken (alert
 // on it). Do NOT enable against a rewrite-close writer: pruning would drop
@@ -161,7 +161,7 @@ func (s *CH) CollapsedRows() uint64 { return s.collapsed.Load() }
 // dt64Lit renders t as a DateTime64(3) literal in UTC, truncated to the same
 // millisecond precision the columns store. Time operands must NOT be `?`
 // binds: clickhouse-go interpolates time.Time at second precision
-// (toDateTime), which drops milliseconds (a `valid_from < t1` boundary error
+// (toDateTime), which drops milliseconds (a `valid_from <= at` boundary error
 // for sub-second windows) and SATURATES on the far-future sentinel
 // (2200 > 32-bit DateTime's 2106 ceiling), silently breaking range predicates.
 func dt64Lit(t time.Time) string {
@@ -169,20 +169,20 @@ func dt64Lit(t time.Time) string {
 }
 
 // prune returns the optional SQL fragment restoring the valid_to predicate
-// ("no version that ended at or before t") under uniqueRows, or "" in the
+// ("no version that ended at or before at") under uniqueRows, or "" in the
 // superset+dedup mode.
-func (s *CH) prune(t time.Time) string {
+func (s *CH) prune(at time.Time) string {
 	if !s.uniqueRows {
 		return ""
 	}
-	return " AND " + dt64Lit(t) + " < valid_to"
+	return " AND " + dt64Lit(at) + " < valid_to"
 }
 
 // versionRow is the dedup/liveness envelope every no-FINAL read scans
 // alongside its payload columns: the version-slot identity (cluster,
 // namespace, name, valid_from), the writer sequence that picks the
 // authoritative row within a slot, and the materialized valid_to that the
-// overlap check runs against AFTER dedup.
+// liveness check runs against AFTER dedup.
 type versionRow struct {
 	cluster, ns, name string
 	vf, vt            time.Time
@@ -193,9 +193,10 @@ func (r versionRow) slot() string {
 	return r.cluster + "\x00" + r.ns + "\x00" + r.name + "\x00" + strconv.FormatInt(r.vf.UnixMilli(), 10)
 }
 
-// overlapsWindow reports vf < t1 && t0 < vt (checked post-dedup).
-func (r versionRow) overlapsWindow(t0, t1 time.Time) bool {
-	return r.vf.Before(t1) && t0.Before(r.vt)
+// liveAt reports vf <= at < vt — the as-of liveness test, checked post-dedup
+// (simplify-route-resolution-to-point-in-time D2).
+func (r versionRow) liveAt(at time.Time) bool {
+	return !r.vf.After(at) && at.Before(r.vt)
 }
 
 // dedupLatest keeps, per version slot, only the row with the highest
@@ -222,10 +223,10 @@ func dedupLatest[T any](rows []T, ver func(T) versionRow) []T {
 	return out
 }
 
-// dedupOverlapCounted dedups rows per version slot (collapses counted into
-// CollapsedRows — overlap filtering itself is not a collapse) and then keeps
-// only the versions overlapping [t0,t1).
-func dedupOverlapCounted[T any](s *CH, rows []T, ver func(T) versionRow, t0, t1 time.Time) []T {
+// dedupLiveAtCounted dedups rows per version slot (collapses counted into
+// CollapsedRows — liveness filtering itself is not a collapse) and then keeps
+// only the versions live at `at`.
+func dedupLiveAtCounted[T any](s *CH, rows []T, ver func(T) versionRow, at time.Time) []T {
 	before := len(rows)
 	rows = dedupLatest(rows, ver)
 	if n := before - len(rows); n > 0 {
@@ -233,7 +234,7 @@ func dedupOverlapCounted[T any](s *CH, rows []T, ver func(T) versionRow, t0, t1 
 	}
 	out := rows[:0]
 	for _, r := range rows {
-		if ver(r).overlapsWindow(t0, t1) {
+		if ver(r).liveAt(at) {
 			out = append(out, r)
 		}
 	}
@@ -326,28 +327,28 @@ func svcVer(r ServiceRow) versionRow {
 	return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 }
 
-// LoadTrafficWindow fetches every resource version overlapping [t0,t1)
-// reachable from destination IP in cluster. SQL keeps only the immutable
-// predicates (join keys + valid_from < t1, plus the uniqueRows prune); rows
-// are then deduped per version slot (max ingest_seq) and the Overlap predicate
-// on the materialized valid_to (t0 < valid_to) is applied client-side AFTER
-// dedup — the no-FINAL pattern in the CH doc comment.
+// LoadTrafficAt fetches every resource version live at `at` reachable from
+// destination IP in cluster. SQL keeps only the immutable predicates (join
+// keys + valid_from <= at, plus the uniqueRows prune); rows are then deduped
+// per version slot (max ingest_seq) and the liveness predicate on the
+// materialized valid_to (at < valid_to) is applied client-side AFTER dedup —
+// the no-FINAL pattern in the CH doc comment.
 //
-// Each hop loads a correct SUPERSET of what any single-instant point query in
-// the window would touch (e.g. gateways whose selector ⊆ the union of the
-// ingress deployment's pod labels across versions); memwindow re-applies the
-// exact per-instant predicate, so extra rows are harmless. The hops stay
-// scoped like a point query (deploys are still selector-filtered) so the
-// superset does not blow up on a shared ingress namespace.
-func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 time.Time) (TrafficWindow, error) {
-	var w TrafficWindow
+// Each hop loads a correct SUPERSET of what the resolution actually needs
+// (e.g. gateways whose selector ⊆ the union of the ingress deployment's pod
+// labels across the fetched rows); pkg/route/snapshot re-applies the exact
+// predicates, so extra rows are harmless. The hops stay narrowly scoped
+// (deploys are still selector-filtered) so the superset does not blow up on a
+// shared ingress namespace.
+func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time) (TrafficSnapshot, error) {
+	var w TrafficSnapshot
 
 	// 1. Ingress Service versions serving this IP (either external_ips or
 	// loadbalancer_ips — either array counts).
 	svcRows, err := s.conn.Query(ctx, fmt.Sprintf(
 		`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
 		 FROM service_versions
-		 WHERE cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+		 WHERE cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 		cluster, ip, ip)
 	if err != nil {
 		return w, fmt.Errorf("window ingress services: %w", err)
@@ -366,7 +367,7 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 	}
 	// Dedup BEFORE deriving selectors — a stale rewrite twin must not
 	// contribute its (possibly outdated) selector to the hop-2 fan-out.
-	ingSvcs = dedupOverlapCounted(s, ingSvcs, svcVer, t0, t1)
+	ingSvcs = dedupLiveAtCounted(s, ingSvcs, svcVer, at)
 	nsSeen := map[string]bool{}
 	var nsList []string
 	selSeen := map[string]bool{}
@@ -386,7 +387,7 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 		}
 	}
 	if len(nsList) == 0 || len(selectors) == 0 {
-		return w, nil // no ingress serves this IP in the window -> empty
+		return w, nil // no ingress serves this IP at that instant -> empty
 	}
 
 	// 2. Ingress Deployment versions: those in the ingress namespace(s) whose
@@ -398,7 +399,7 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 		depRows, err := s.conn.Query(ctx, fmt.Sprintf(
 			`SELECT cluster, namespace, name, valid_from, valid_to, pod_labels_kv, ingest_seq
 			 FROM deploy_versions
-			 WHERE cluster = ? AND has(?, namespace) AND hasAll(pod_labels_kv, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+			 WHERE cluster = ? AND has(?, namespace) AND hasAll(pod_labels_kv, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, nsList, sel)
 		if err != nil {
 			return w, fmt.Errorf("window deploys: %w", err)
@@ -415,9 +416,9 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 			return w, fmt.Errorf("window deploys: %w", err)
 		}
 	}
-	deps = dedupOverlapCounted(s, deps, func(r DeployRow) versionRow {
+	deps = dedupLiveAtCounted(s, deps, func(r DeployRow) versionRow {
 		return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
-	}, t0, t1)
+	}, at)
 	labelSeen := map[string]bool{}
 	var labelUnion []string
 	for _, r := range deps {
@@ -436,12 +437,12 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 		gwRows, err := s.conn.Query(ctx, fmt.Sprintf(
 			`SELECT cluster, namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
 			 FROM gw_versions
-			 WHERE cluster = ? AND hasAll(?, selector_kv) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+			 WHERE cluster = ? AND hasAll(?, selector_kv) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, labelUnion)
 		if err != nil {
 			return w, fmt.Errorf("window gateways: %w", err)
 		}
-		gwRefs, err = s.appendGateways(&w, gwRows, t0, t1)
+		gwRefs, err = s.appendGateways(&w, gwRows, at)
 		if err != nil {
 			return w, err
 		}
@@ -449,27 +450,27 @@ func (s *CH) LoadTrafficWindow(ctx context.Context, cluster, ip string, t0, t1 t
 
 	// 4 + 5. VirtualServices bound to the candidate gateways, then the backend
 	// Services those VS route to.
-	if err := s.loadVSAndBackends(ctx, &w, cluster, gwRefs, t0, t1); err != nil {
+	if err := s.loadVSAndBackends(ctx, &w, cluster, gwRefs, at); err != nil {
 		return w, err
 	}
 	return w, nil
 }
 
 // ClustersWithIngressIP is the store's ONLY cross-cluster read (design D10):
-// the distinct clusters that had an ingress LB Service version carrying ip
-// overlapping [t0,t1). It deliberately carries no cluster predicate — that is
-// its whole job — bounded by the small number of ingress-LB Service versions
+// the distinct clusters whose ingress LB Service version carrying ip was live
+// at `at`. It deliberately carries no cluster predicate — that is its whole
+// job — bounded by the small number of ingress-LB Service versions
 // (has(external_ips, ...) OR has(loadbalancer_ips, ...) only matches ingress
-// rows) and valid_from < t1. The same no-FINAL pattern as the window loads
+// rows) and valid_from <= at. The same no-FINAL pattern as the snapshot loads
 // applies: only the dedup envelope is selected, valid_to is never filtered in
 // SQL (except under the uniqueRows prune), the client dedups per version slot
-// and applies the overlap check after. The result is deduplicated and sorted
+// and applies the liveness check after. The result is deduplicated and sorted
 // for determinism.
-func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.Time) ([]string, error) {
+func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error) {
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(
 		`SELECT cluster, namespace, name, valid_from, valid_to, ingest_seq
 		 FROM service_versions
-		 WHERE (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+		 WHERE (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 		ip, ip)
 	if err != nil {
 		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
@@ -486,7 +487,7 @@ func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.T
 	if err := closeRows(rows); err != nil {
 		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
 	}
-	vers = dedupOverlapCounted(s, vers, func(r versionRow) versionRow { return r }, t0, t1)
+	vers = dedupLiveAtCounted(s, vers, func(r versionRow) versionRow { return r }, at)
 
 	seen := map[string]bool{}
 	var clusters []string
@@ -500,10 +501,10 @@ func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, t0, t1 time.T
 	return clusters, nil
 }
 
-// appendGateways drains one gw_versions result set, dedups + overlap-filters
-// it, appends the survivors to the window, and returns the distinct gateway
+// appendGateways drains one gw_versions result set, dedups + liveness-filters
+// it, appends the survivors to the snapshot, and returns the distinct gateway
 // refs for the bound-VS lookup — in BOTH binding forms.
-func (s *CH) appendGateways(w *TrafficWindow, gwRows driver.Rows, t0, t1 time.Time) ([]string, error) {
+func (s *CH) appendGateways(w *TrafficSnapshot, gwRows driver.Rows, at time.Time) ([]string, error) {
 	var gws []GatewayRow
 	for gwRows.Next() {
 		var r GatewayRow
@@ -517,9 +518,9 @@ func (s *CH) appendGateways(w *TrafficWindow, gwRows driver.Rows, t0, t1 time.Ti
 	if err := closeRows(gwRows); err != nil {
 		return nil, err
 	}
-	gws = dedupOverlapCounted(s, gws, func(r GatewayRow) versionRow {
+	gws = dedupLiveAtCounted(s, gws, func(r GatewayRow) versionRow {
 		return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
-	}, t0, t1)
+	}, at)
 
 	var gwRefs []string
 	refSeen := map[string]bool{}
@@ -528,8 +529,8 @@ func (s *CH) appendGateways(w *TrafficWindow, gwRows driver.Rows, t0, t1 time.Ti
 		// A VS may bind a gateway by qualified "<ns>/<name>" OR by bare
 		// "<name>" (legal Istio shorthand for a same-namespace gateway; the
 		// exporter stores spec.gateways[*] verbatim, unnormalized). Load the
-		// superset by matching both forms — memwindow re-applies the exact
-		// per-instant predicate (boundTo) with the namespace check.
+		// superset by matching both forms — pkg/route/snapshot re-applies
+		// the exact predicate (boundTo) with the namespace check.
 		for _, ref := range []string{r.Namespace + "/" + r.Name, r.Name} {
 			if !refSeen[ref] {
 				refSeen[ref] = true
@@ -545,13 +546,13 @@ func (s *CH) appendGateways(w *TrafficWindow, gwRows driver.Rows, t0, t1 time.Ti
 // (namespace, name) parsed from each route's destination.host FQDN). Backend
 // lookups are chunked so a gateway with very many routes can't inline a key
 // list past ClickHouse's max_query_size.
-func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficWindow, cluster string, gwRefs []string, t0, t1 time.Time) error {
+func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster string, gwRefs []string, at time.Time) error {
 	var destHosts []string
 	if len(gwRefs) > 0 {
 		vsRows, err := s.conn.Query(ctx, fmt.Sprintf(
 			`SELECT cluster, namespace, name, valid_from, valid_to, bound_gateways, spec_json, ingest_seq
 			 FROM vs_versions
-			 WHERE cluster = ? AND hasAny(bound_gateways, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+			 WHERE cluster = ? AND hasAny(bound_gateways, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, gwRefs)
 		if err != nil {
 			return fmt.Errorf("window virtualservices: %w", err)
@@ -571,9 +572,9 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficWindow, cluster st
 		}
 		// Dedup BEFORE collecting destination hosts — a stale rewrite twin's
 		// routes must not pull in backend Services the live version dropped.
-		vses = dedupOverlapCounted(s, vses, func(r VSRow) versionRow {
+		vses = dedupLiveAtCounted(s, vses, func(r VSRow) versionRow {
 			return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
-		}, t0, t1)
+		}, at)
 		hostSeen := map[string]bool{}
 		for _, r := range vses {
 			w.VSes = append(w.VSes, r)
@@ -595,7 +596,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficWindow, cluster st
 		bsRows, err := s.conn.Query(ctx, fmt.Sprintf(
 			`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
 			 FROM service_versions
-			 WHERE cluster = ? AND has(?, concat(namespace, '/', name)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
+			 WHERE cluster = ? AND has(?, concat(namespace, '/', name)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, chunk)
 		if err != nil {
 			return fmt.Errorf("window backend services: %w", err)
@@ -612,7 +613,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficWindow, cluster st
 			return err
 		}
 	}
-	w.Services = append(w.Services, dedupOverlapCounted(s, backends, svcVer, t0, t1)...)
+	w.Services = append(w.Services, dedupLiveAtCounted(s, backends, svcVer, at)...)
 	return nil
 }
 
@@ -648,7 +649,7 @@ func backendKeys(hosts []string) []string {
 
 // vsDestHosts collects the destination host (target Service identity FQDN) of
 // every route in a VirtualService (HTTP/TLS/TCP, mirrors included). Kept in
-// sync with memwindow's copy.
+// sync with pkg/route/snapshot's copy.
 func vsDestHosts(vs *networking.VirtualService) []string {
 	var hosts []string
 	add := func(d *networking.Destination) {

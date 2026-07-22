@@ -68,8 +68,11 @@ func ReadServiceGraph(
 	}
 	var routes routeIndex
 	if resolver != nil {
+		// Range in, instant out: the PromQL side keeps (window, end), the route
+		// engine gets ONLY end — the single instant it evaluates the ingress
+		// config at (simplify-route-resolution-to-point-in-time D1).
 		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
-			collectRouteQueries(vec, topology), end.Add(-window), end)
+			collectRouteQueries(vec, topology), end)
 	}
 	return parseServiceGraphRoutes(vec, topology, routes), nil
 }

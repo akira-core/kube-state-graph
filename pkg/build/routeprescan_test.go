@@ -66,9 +66,9 @@ func TestResolveRouteQueries_UpgradesToBuildScoped(t *testing.T) {
 		{callerCluster: "cluster-alpha", host: "api.example.com", path: "/", port: 443, ips: testDNSAnswer},
 		{callerCluster: "cluster-beta", host: "other.example.com", path: "/", port: 443, ips: testDNSAnswer},
 	}
-	start, end := time.Unix(1_700_000_000, 0).UTC(), time.Unix(1_700_000_300, 0).UTC()
+	at := time.Unix(1_700_000_300, 0).UTC()
 
-	idx := resolveRouteQueries(context.Background(), res, 0, keys, start, end)
+	idx := resolveRouteQueries(context.Background(), res, 0, keys, at)
 
 	require.Len(t, idx, len(keys))
 	assert.Equal(t, 1, res.scopedCalls, "exactly one scope minted per build")
@@ -423,11 +423,13 @@ func TestCollectRouteQueries_CarriesDNSAnswersAndPort(t *testing.T) {
 	assert.Equal(t, 8443, keys[0].port)
 	assert.Equal(t, "198.51.100.7,198.51.100.8", keys[0].ips)
 
-	req := keys[0].request(time.Unix(100, 0), time.Unix(200, 0))
+	at := time.Unix(200, 0)
+	req := keys[0].request(at)
 	assert.Equal(t, []string{"198.51.100.7", "198.51.100.8"}, req.IPs)
 	assert.Equal(t, "api.example.com", req.Host)
 	assert.Equal(t, 8443, req.Port)
 	assert.Equal(t, "cluster-alpha", req.CallerCluster)
+	assert.Equal(t, at, req.At)
 }
 
 // ---------------------------------------------------------------------------
@@ -480,9 +482,9 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 		Path:          "/",
 		Port:          443,
 		IPs:           []string{testDNSAnswer},
-		Start:         end.Add(-window),
-		End:           end,
-	}, resolver.seen[0], "the request the engine sees is exactly the prescan-derived one")
+		At:            end,
+	}, resolver.seen[0],
+		"the request the engine sees is the prescan-derived one, evaluated at the window's END")
 
 	require.Len(t, res.ServiceNodes, 1)
 	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
