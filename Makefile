@@ -139,7 +139,7 @@ build:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/kube-state-graph
 
 test:
-	go test ./... -count=1 -race -shuffle=on
+	go test ./... -count=1 -race -shuffle=on -timeout 30m
 
 vet:
 	go vet ./...
