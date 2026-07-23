@@ -46,7 +46,13 @@ func New(w store.TrafficSnapshot, at time.Time) *Snapshot {
 
 // ResolveIPToGateways runs the 3-hop selector join for a destination IP as of
 // the snapshot's instant: IP -> ingress Service (selector) -> ingress Deployment
-// pod labels L -> gateways whose selector ⊆ L. Empty result => traffic miss.
+// pod labels L -> gateways whose selector ⊆ L AND whose namespace is the
+// ingress Service's own. Hop 3 is namespace-scoped
+// (scope-gateway-candidates-to-ingress-namespace): Istio's cross-namespace
+// gateway attachment is deliberately out of scope, so within a resolution the
+// candidate set can never hold two same-named Gateways (K8s per-namespace name
+// uniqueness) and the bare-name identity downstream is unambiguous. Empty
+// result => traffic miss.
 func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
 	// Hop 1: IP -> ingress Service (its namespace + selector).
 	var svcNS string
@@ -77,11 +83,12 @@ func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
 		return nil
 	}
 
-	// Hop 3: L -> candidate gateways (gateway.selector ⊆ L).
+	// Hop 3: L -> candidate gateways (gateway.selector ⊆ L, same namespace as
+	// the ingress Service).
 	var cands []store.GatewayCand
 	for i := range s.w.Gateways {
 		r := &s.w.Gateways[i]
-		if s.live(r.ValidFrom, r.ValidTo) && containsAll(podLabels, r.SelectorKV) {
+		if s.live(r.ValidFrom, r.ValidTo) && r.Namespace == svcNS && containsAll(podLabels, r.SelectorKV) {
 			cands = append(cands, store.GatewayCand{Namespace: r.Namespace, Name: r.Name, ServerHosts: r.ServerHosts})
 		}
 	}

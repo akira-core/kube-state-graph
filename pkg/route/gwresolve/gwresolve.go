@@ -65,8 +65,13 @@ func newPats(key string, idx int, hosts []string) []pat {
 }
 
 // sortPats orders patterns most-specific first: score desc, then pattern asc,
-// then idx asc — an identical pattern resolves to the smaller (earlier
-// declared) host set, mirroring istio's CheckDuplicates first-declared-wins.
+// then gateway name asc, then idx asc. An identical pattern declared by two
+// DIFFERENT gateways resolves to the lexically-smallest gateway name —
+// deterministic regardless of declaration or storage row order (real istiod
+// flags cross-gateway duplicate server hosts as a config error via
+// CheckDuplicates; the engine picks deterministically instead of failing).
+// Under PickHosts every gw key is "", so that comparator is a no-op there and
+// the identical pattern resolves to the smaller index — first declared wins.
 // The idx comparison is numeric, never stringified (else 10 would sort
 // before 2). Under New all idx are 0, so that branch is a no-op there.
 func sortPats(pats []pat) {
@@ -76,6 +81,9 @@ func sortPats(pats []pat) {
 		}
 		if pats[a].pattern != pats[b].pattern {
 			return pats[a].pattern < pats[b].pattern // deterministic tie-break
+		}
+		if pats[a].gw != pats[b].gw {
+			return pats[a].gw < pats[b].gw // lexically-smallest gateway wins
 		}
 		return pats[a].idx < pats[b].idx
 	})

@@ -374,7 +374,21 @@ live under `openspec/specs/`.
   see the client-go rule) and matches with the native `router_check_tool`
   binary (`--router-check-bin`; copied into the image from the Envoy tools
   image; ~50–60 ms per config — one translate + one check per resolution, so
-  there is no segment loop and no config-signature cache).
+  there is no segment loop and no config-signature cache). **Hop 3 is
+  namespace-scoped** (scope-gateway-candidates-to-ingress-namespace): a
+  candidate Gateway must live in the ingress Service's OWN namespace —
+  enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1
+  nsList, like the deploy hop) and the in-memory hop
+  (`r.Namespace == svcNS`) — so within a resolution the candidate set can
+  never hold two same-named Gateways (K8s per-ns name uniqueness) and the
+  bare-name gateway identity through `gwresolve`/`ScopedFor` is unambiguous
+  by construction. Istio's cross-namespace selector attachment is
+  deliberately out of scope (degrades `no_gateway` → LB fallback/external;
+  extension path: thread `(namespace, name)` end-to-end). Two
+  different-named candidates declaring an identical equal-specificity host
+  pattern resolve to the **lexically-smallest gateway name**
+  (`gwresolve.sortPats` tie-break; `PickHosts`' numeric-index semantics
+  unchanged), never to storage row order.
   **(5b) Ingress LB Service fallback** (ingress-lb-service-fallback change):
   when the pipeline produces no hit AND its miss is exactly
   `RouteNoGateway` (resolution never got past gateway selection — the nginx

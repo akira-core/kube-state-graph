@@ -190,6 +190,60 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	assert.Equal(t, build.RouteNoServerForHost, outcome)
 }
 
+// Hop 3 is namespace-scoped (scope-gateway-candidates-to-ingress-namespace):
+// the only selector-matching gateway serving the host lives OUTSIDE the ingress
+// Service's namespace, so it is not a candidate and the pipeline misses with
+// RouteNoGateway — which then feeds the ingress LB Service fallback (the
+// ingress ServiceRow maps the IP to one identity), never reaching translate
+// (zero matchcheck.Runner tripwire). Pre-change, the cross-namespace gateway
+// was a candidate and resolution proceeded into its config.
+func TestResolveRoute_CrossNamespaceGatewayNotACandidate(t *testing.T) {
+	gwSpec := &networking.Gateway{
+		Selector: map[string]string{"istio": "ingress"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 443, Name: "api", Protocol: "HTTPS"},
+			Hosts: []string{"api.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cred-api"},
+		}},
+	}
+	specJSON, err := protojson.Marshal(gwSpec)
+	require.NoError(t, err)
+
+	from, to := testAt.Add(-time.Hour), testAt.Add(time.Hour)
+	snap := store.TrafficSnapshot{
+		Services: []store.ServiceRow{{
+			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: from, ValidTo: to,
+			ExternalIPs: []string{"198.51.100.7"}, Selector: []string{"istio=ingress"},
+		}},
+		Deploys: []store.DeployRow{{
+			Namespace: "istio-system", Name: "ingress", ValidFrom: from, ValidTo: to,
+			PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{{
+			// Selector matches the ingress workload and the hosts serve the
+			// request — but the namespace is not the ingress Service's.
+			Namespace: "team-b", Name: "gw-000", ValidFrom: from, ValidTo: to,
+			SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"api.example.com"},
+			SpecJSON: string(specJSON),
+		}},
+	}
+
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(snap, nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	dest, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	require.NoError(t, err)
+	assert.Equal(t, build.RouteIngressLBService, outcome,
+		"cross-namespace gateway must not be a candidate; the no-gateway miss feeds the LB fallback")
+	assert.Equal(t, "istio-system", dest.Namespace)
+	assert.Equal(t, "ingress-lb", dest.Service)
+	assert.Equal(t, "prod-01", dest.Cluster)
+}
+
 // The point-in-time core (simplify-route-resolution-to-point-in-time D1): with
 // two Gateway versions in the loaded rows — an older one that DID serve the
 // host and a current one that does not — resolution follows the version live at

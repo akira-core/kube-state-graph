@@ -41,6 +41,37 @@ func TestResolveMostSpecific(t *testing.T) {
 	}
 }
 
+// TestResolveIdenticalPatternLexicalTieBreak: two different gateways declaring
+// the identical, equally specific pattern must resolve to the lexically-smallest
+// gateway name in EITHER declaration order — never to input (storage row) order,
+// which is not deterministic. Real istiod flags cross-gateway duplicate server
+// hosts as a config error (CheckDuplicates); the engine picks deterministically
+// instead of failing a build over an upstream config smell.
+func TestResolveIdenticalPatternLexicalTieBreak(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+	}{
+		{"wildcard", "*.example.com", "x.example.com"},
+		{"exact", "api.example.com", "api.example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, order := range [][]Gateway{
+				{{Name: "gw-b", Hosts: []string{c.pattern}}, {Name: "gw-a", Hosts: []string{c.pattern}}},
+				{{Name: "gw-a", Hosts: []string{c.pattern}}, {Name: "gw-b", Hosts: []string{c.pattern}}},
+			} {
+				gw, ok := New(order).Resolve(c.host)
+				if !ok || gw != "gw-a" {
+					t.Errorf("Resolve(%q) with order %v = (%q,%v), want (gw-a,true)",
+						c.host, []string{order[0].Name, order[1].Name}, gw, ok)
+				}
+			}
+		})
+	}
+}
+
 func TestSanitizeServerHost(t *testing.T) {
 	cases := []struct {
 		in, want string

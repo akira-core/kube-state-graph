@@ -112,6 +112,11 @@ const (
 	// cluster-alpha — the fallback's same-IP collision, which must degrade to
 	// the external node (ambiguous_ingress_service), never guess.
 	ingressLBIPNginxDup = "203.0.113.100"
+	// ingressLBIPBoundary fronts a 3-hop chain whose every version opens
+	// EXACTLY AT fixedNow — the boundary fixture pinning the as-of SQL
+	// predicate's inclusive lower bound (valid_from <= at, not <) in the probe
+	// and in every LoadTrafficAt hop, at DateTime64(3) millisecond precision.
+	ingressLBIPBoundary = "203.0.113.110"
 )
 
 // dt64s renders a time as the string form ClickHouse parses into DateTime64(3)
@@ -439,6 +444,41 @@ func (s *RouteSuite) seedRouteStore() {
 	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(fixedNow.Add(-2*time.Hour)),
 		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(21))
+
+	// Cross-namespace gateway (scope-gateway-candidates-to-ingress-namespace):
+	// its selector matches cluster-alpha's istio-system ingress deploy labels,
+	// but it lives in team-b — the namespace-scoped Hop 3 SQL must exclude it,
+	// which TestTrafficSnapshotNoFinalDedupAndBareRef's gateway count proves.
+	gwCrossNS := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{"team-b.example.com"},
+		}},
+	})
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "team-b", "public-gw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, []string{"team-b.example.com"}, gwCrossNS, uint64(43))
+
+	// Boundary chain (as-of inclusive bound): an isolated 3-hop chain in its
+	// own namespace/selector so no existing IP-rooted assertion is perturbed;
+	// every version's valid_from is EXACTLY fixedNow.
+	gwBoundary := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"app": "boundary-igw"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{"boundary.example.com"},
+		}},
+	})
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-igw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPBoundary}, []string{"app=boundary-igw"}, "", uint64(40))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-igw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{"app=boundary-igw"}, uint64(41))
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-gw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{"app=boundary-igw"}, []string{"boundary.example.com"}, gwBoundary, uint64(42))
 }
 
 // SetupTest seeds the VM fixtures every test shares: the client pod, the
@@ -820,8 +860,17 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	// dedup the stale open row (valid_to = far future) reads as live at the
 	// instant and a third row appears here. The closed version that ended an
 	// hour before fixedNow is likewise absent: the point-in-time load returns
-	// ONE version per gateway, not every version of the window.
-	s.Len(w.Gateways, 2, "the stale open row must be dedup-collapsed away")
+	// ONE version per gateway, not every version of the window. The seeded
+	// team-b/public-gw (selector-matching but cross-namespace) is absent too:
+	// Hop 3 is scoped to the ingress namespace, so a gateway outside the
+	// ingress Service's namespace is never loaded
+	// (scope-gateway-candidates-to-ingress-namespace).
+	s.Len(w.Gateways, 2,
+		"the stale open row must be dedup-collapsed away and the cross-namespace gateway excluded")
+	for _, gw := range w.Gateways {
+		s.Equal("istio-system", gw.Namespace,
+			"hop 3 must load only the ingress namespace's gateways")
+	}
 	for _, gw := range w.Gateways {
 		s.NotContains(gw.ServerHosts, "stale.example.com",
 			"the rewritten (closed) version's stale open row leaked past the dedup")
@@ -876,6 +925,63 @@ func (s *RouteStoreSuite) TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow()
 	}
 	s.True(stale, "pruned mode against a rewrite-close writer resurrects the stale open row — the documented hazard")
 	s.Zero(st.CollapsedRows(), "the closing row was pruned in SQL, so dedup saw nothing to collapse (the alarm stays silent — why the mode is opt-in)")
+}
+
+// TestUniqueRowsProbeAgainstRewriteWriterResurrectsDeadCluster is the probe-path
+// twin of the test above (ClustersWithIngressIP's prune branch): under pruned
+// mode the SQL valid_to prune drops the cluster-gone closing rewrite before
+// dedup, so the stale sentinel-open twin wins unopposed and the DEAD cluster
+// resurrects in the ingress-cluster probe — while the collapse alarm stays
+// silent. The default no-prune mode's probe (TestClustersWithIngressIPProbe)
+// correctly reports no cluster for the same IP.
+func (s *RouteStoreSuite) TestUniqueRowsProbeAgainstRewriteWriterResurrectsDeadCluster() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN, routestore.WithUniqueRows())
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-gone"}, gone,
+		"pruned mode against a rewrite-close writer resurrects the dead cluster in the probe — the documented hazard")
+	s.Zero(st.CollapsedRows(),
+		"the closing row was pruned in SQL, so dedup saw nothing to collapse (the alarm stays silent — why the mode is opt-in)")
+}
+
+// TestAsOfBoundaryValidFromEqualsInstant pins the as-of SQL predicate's
+// INCLUSIVE lower bound (valid_from <= at, not <) against real ClickHouse, in
+// both the cross-cluster probe and every LoadTrafficAt hop, via the seeded
+// boundary chain whose every version opens EXACTLY at fixedNow. The negative
+// assertions step back ONE MILLISECOND — DateTime64(3) precision — so they
+// also guard the dt64Lit no-`?`-bind trap (a second-precision bind would make
+// them pass vacuously); do not widen them.
+func (s *RouteStoreSuite) TestAsOfBoundaryValidFromEqualsInstant() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	clusters, err := st.ClustersWithIngressIP(ctx, ingressLBIPBoundary, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-alpha"}, clusters,
+		"a version opening exactly at the instant is live (inclusive bound)")
+
+	before, err := st.ClustersWithIngressIP(ctx, ingressLBIPBoundary, fixedNow.Add(-time.Millisecond))
+	s.Require().NoError(err)
+	s.Empty(before, "one millisecond before its valid_from the version is not yet live")
+
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIPBoundary, fixedNow)
+	s.Require().NoError(err)
+	s.Require().Len(w.Services, 1, "the boundary ingress Service must load at its own valid_from")
+	s.Equal("boundary-igw", w.Services[0].Name)
+	s.Require().Len(w.Deploys, 1)
+	s.Require().Len(w.Gateways, 1, "the gw_versions hop shares the inclusive bound")
+	s.Equal("boundary-gw", w.Gateways[0].Name)
+
+	empty, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIPBoundary, fixedNow.Add(-time.Millisecond))
+	s.Require().NoError(err)
+	s.Empty(empty.Gateways, "one millisecond earlier the chain is not yet open")
+	s.Empty(empty.Services)
 }
 
 // TestOpenWithAuthUsesEnvStyleCredentials proves the production path where

@@ -431,14 +431,20 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 		}
 	}
 
-	// 3. Gateway versions whose selector ⊆ the pod-label union.
+	// 3. Gateway versions whose selector ⊆ the pod-label union, scoped to the
+	// ingress namespace(s) like the deploy hop: a candidate Gateway must live
+	// in the ingress Service's own namespace
+	// (scope-gateway-candidates-to-ingress-namespace) — cross-namespace
+	// selector attachment is deliberately out of scope. nsList unions all
+	// matching ingress Services' namespaces, so this is still a superset;
+	// pkg/route/snapshot re-applies the exact per-service-namespace predicate.
 	var gwRefs []string
 	if len(labelUnion) > 0 {
 		gwRows, err := s.conn.Query(ctx, fmt.Sprintf(
 			`SELECT cluster, namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
 			 FROM gw_versions
-			 WHERE cluster = ? AND hasAll(?, selector_kv) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
-			cluster, labelUnion)
+			 WHERE cluster = ? AND has(?, namespace) AND hasAll(?, selector_kv) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+			cluster, nsList, labelUnion)
 		if err != nil {
 			return w, fmt.Errorf("window gateways: %w", err)
 		}

@@ -219,7 +219,8 @@ func TestResolveIPToGatewaysUsesLiveVersions(t *testing.T) {
 			PodLabels: []string{"app=gw-a"},
 		}},
 		Gateways: []store.GatewayRow{{
-			Namespace: "ns-a", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
+			// Same namespace as the ingress Service — hop 3 is namespace-scoped.
+			Namespace: "istio-system", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
 			SelectorKV: []string{"app=gw-a"}, ServerHosts: []string{"*.example.com"},
 		}},
 	}
@@ -229,5 +230,43 @@ func TestResolveIPToGatewaysUsesLiveVersions(t *testing.T) {
 	}
 	if got := New(w, boundary).ResolveIPToGateways(ip); len(got) != 0 {
 		t.Errorf("after the ingress Service version ended: got %+v, want no candidates", got)
+	}
+}
+
+// Hop 3 is namespace-scoped (scope-gateway-candidates-to-ingress-namespace):
+// a candidate Gateway must live in the ingress Service's own namespace. A
+// same-named gateway in another namespace whose selector also matches the
+// ingress pod labels is NOT a candidate — cross-namespace attachment is
+// deliberately out of scope, so the bare-name identity downstream can never
+// collide.
+func TestResolveIPToGatewaysScopedToIngressNamespace(t *testing.T) {
+	const ip = "198.51.100.7"
+	w := store.TrafficSnapshot{
+		Services: []store.ServiceRow{{
+			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: sigT0, ValidTo: sigT1,
+			LoadBalancerIPs: []string{ip}, Selector: []string{"istio=ingress"},
+		}},
+		Deploys: []store.DeployRow{{
+			Namespace: "istio-system", Name: "ingress", ValidFrom: sigT0, ValidTo: sigT1,
+			PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{
+			{ // cross-namespace, listed FIRST: must be skipped, not merely outranked
+				Namespace: "team-b", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
+				SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"b.example.com"},
+			},
+			{
+				Namespace: "istio-system", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
+				SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"a.example.com"},
+			},
+		},
+	}
+
+	got := New(w, sigMid).ResolveIPToGateways(ip)
+	if len(got) != 1 {
+		t.Fatalf("candidates = %+v, want exactly the ingress-namespace gateway", got)
+	}
+	if got[0].Namespace != "istio-system" || got[0].Name != "gw-a" {
+		t.Errorf("candidate = %s/%s, want istio-system/gw-a", got[0].Namespace, got[0].Name)
 	}
 }
