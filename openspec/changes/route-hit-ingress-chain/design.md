@@ -61,12 +61,20 @@ client-side-cluster rule, not a new convention. Endpoint pods iterate sorted-uni
 (determinism); all accumulators are idempotent, so repeated series sharing a route key re-enter
 harmlessly.
 
-## D5 — Direct edge removed by returning the ingress node as the resolution target
+## D5 — Direct edge kept alongside the chain: resolution targets are [ingress, backend]
 
-`routeIndexResolve` returns the ingress Service id (instead of the backend's) as the endpoint's
+`routeIndexResolve` returns BOTH the ingress Service id AND the backend's as the endpoint's
 resolved ids, so the main loop's `srcIDs × tgtIDs` cross product emits `caller → ingress service`
-and the direct `caller → backend` edge simply never exists. No post-hoc edge deletion. On
-degrade, the backend id is returned as today.
+AND the direct `caller → backend` edge. Rationale: the chain alone routes every caller through
+the shared ingress funnel, which erases the per-caller → backend dependency (all callers meet at
+the ingress node); keeping the direct edge preserves it, at zero cost — the direct edge is
+emitted through the traced `pairs` map, so a real traced series for the same `(caller, backend)`
+pair collapses with it into one edge (same deterministic UUIDv5 edge ID; same
+`betterSrcCluster` label tie-break — no duplicate possible by construction). No post-hoc edge
+deletion. On degrade, the backend id alone is returned as today.
+
+> Revision note: this decision originally REMOVED the direct edge (chain replaces it). It was
+> revised to chain + direct edge after the dependency-loss consequence surfaced in use.
 
 ## D6 — Observability: debug-only, no reason-counter changes
 

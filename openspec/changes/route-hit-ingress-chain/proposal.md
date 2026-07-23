@@ -20,11 +20,13 @@ via `memwindow.ResolveIPToIngressServices` — zero new store reads.
   itself). Empty when the window pins no unique identity — an ambiguous or absent identity NEVER
   demotes a hit.
 - On a `RouteHit` whose destination carries an ingress identity, the reader emits the **full
-  chain** instead of the direct edge:
+  chain** in addition to the direct edge:
   `caller pod -[pod-calls-service]-> ingress LB service -[service-selects-pod]-> ingress gateway
   pod(s) -[pod-calls-service]-> backend service -[service-selects-pod]-> backend pods`.
-  The direct `caller → backend service` edge is REMOVED whenever the chain is emitted (no
-  duplicate semantics). The ingress-pod→backend edges are synthesized (not trace-derived); a real
+  The direct `caller → backend service` edge is KEPT alongside the chain — the chain alone would
+  funnel every caller through the shared ingress node and erase the per-caller → backend
+  dependency; the direct edge collapses with any trace-derived edge for the same pair (identical
+  UUIDv5 edge ID). The ingress-pod→backend edges are synthesized (not trace-derived); a real
   traced edge for the same `(pod, service)` pair wins (identical UUIDv5 edge ID otherwise).
 - The **ingress** Service's `service-selects-pod` fan-out is **locked-cluster-only** — the
   endpoints of `(dest.Cluster, ns, name)` alone, NOT the family-wide union — because an LB IP
@@ -57,7 +59,8 @@ via `memwindow.ResolveIPToIngressServices` — zero new store reads.
   extending "Istio route resolution of global FQDN peers" — the chain shape, the window-wide
   ingress-identity recovery, the locked-cluster fan-out rule (also applied to the
   `ingress-lb-service-fallback` requirement's resolution, superseding its family-wide fan-out),
-  the direct-edge removal, the traced-edge-wins dedup, and the degrade matrix.
+  the direct-edge retention alongside the chain, the traced-edge-wins dedup, and the degrade
+  matrix.
 
 ## Impact
 

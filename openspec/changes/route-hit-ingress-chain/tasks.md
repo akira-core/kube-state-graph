@@ -92,3 +92,25 @@ nginx LB fallback). TDD throughout: tests first (RED), then implementation (GREE
 - [x] 6.1 CLAUDE.md: add the (5c) chain sub-point to the route-resolution bullet (identity
       recovery, degrade matrix, direct-edge removal, traced-edge-wins, locked-cluster ingress
       fan-out) and amend (5b) to locked-cluster fan-out.
+
+## 7. Revision — keep the direct caller→backend edge alongside the chain (D5 rev)
+
+The chain-replaces-direct-edge shape erased the per-caller → backend dependency (every caller
+funnels through the shared ingress node). D5 revised: `routeIndexResolve` returns
+`[ingressSvcID, backendSvcID]` on a chain success, so the cross product emits caller→ingress AND
+the direct caller→backend edge (which collapses with any trace-derived edge for the same pair —
+identical UUIDv5 edge ID via the traced `pairs` map). Degrade paths unchanged.
+
+- [x] 7.1 `routeprescan.go` `routeIndexResolve`: append the backend id to the chain ids
+      (`append(chainIDs, ids[0])`); comment + `resolveRouteChain` doc + cross-product comment
+      updated.
+- [x] 7.2 `routeprescan_test.go`: `_RouteHitWithIngressIdentityEmitsChain` now expects 3
+      `pod-calls-service` edges incl. direct caller→payments;
+      `_ChainIngressLockedBackendFamilyWide` gains the direct edge; new
+      `_ChainDirectEdgeDedupsAgainstTracedEdge` (traced caller→backend series ⇒ one edge).
+- [x] 7.3 `route_e2e_test.go`: `TestGlobalFQDNRoutesToService` +
+      `TestExplicitPortRoutesViaHTTPListener` flip the direct-edge `NotContains` to `Contains`.
+- [x] 7.4 Spec delta + proposal + design D5 amended to "chain in addition to the direct edge";
+      CLAUDE.md (5c) re-worded.
+- [x] 7.5 `make test`, `make lint` green; `TestRouteSuite` / `TestRouteStoreSuite` where the
+      environment allows.

@@ -13,7 +13,7 @@ ambiguous or absent identity leaves the hit's destination without an ingress ide
 reader emits the pre-existing direct shape.
 
 **Chain emission.** When the hit's destination carries an ingress identity AND every chain
-precondition below holds, the reader SHALL emit — instead of the direct
+precondition below holds, the reader SHALL emit — in addition to the direct
 `caller pod → backend service` edge — the full chain:
 
 - a `service` node for the ingress LB Service in the selected ingress cluster, with
@@ -28,12 +28,15 @@ precondition below holds, the reader SHALL emit — instead of the direct
 - the backend `service` node and its family-wide `service-selects-pod` fan-out, unchanged from
   the pre-existing hit resolution.
 
-The direct `caller pod → backend service` edge SHALL NOT be emitted alongside the chain. A
-synthesized ingress-pod→backend edge whose `(source pod, target service)` pair already exists as
-a trace-derived edge SHALL be skipped — the traced edge wins (the two would otherwise share one
-deterministic edge ID). Synthesized-edge emission SHALL be deterministic (order-free over the
-endpoint set; idempotent under repeated series sharing one route key). **No new node type, no new
-edge type, no new node attribute, and no new `labels` key** are introduced.
+The direct `caller pod → backend service` edge SHALL ALSO be emitted alongside the chain, so the
+caller's dependency on the routed backend is not lost behind the shared ingress entry point; it
+SHALL collapse with any trace-derived edge for the same `(caller pod, backend service)` pair into
+a single edge (the two would otherwise share one deterministic edge ID). A synthesized
+ingress-pod→backend edge whose `(source pod, target service)` pair already exists as a
+trace-derived edge SHALL be skipped — the traced edge wins (same edge-ID collision).
+Synthesized-edge emission SHALL be deterministic (order-free over the endpoint set; idempotent
+under repeated series sharing one route key). **No new node type, no new edge type, no new node
+attribute, and no new `labels` key** are introduced.
 
 **Chain preconditions (each failure degrades to the pre-existing direct shape).** The chain SHALL
 be emitted only when ALL hold:
@@ -72,8 +75,9 @@ behind the LB entry point).
 - **AND** one synthesized `pod-calls-service` edge from each such ingress pod to the backend
   `service` node
 - **AND** the family-wide `service-selects-pod` fan-out from the backend node
-- **AND** SHALL NOT emit a direct `pod-calls-service` edge from the client pod to the backend
-  node, and SHALL NOT emit an external node
+- **AND** SHALL ALSO emit the direct `pod-calls-service` edge from the client pod to the backend
+  node (exactly one edge for that pair even when a trace-derived series yields it too), and
+  SHALL NOT emit an external node
 
 #### Scenario: Ambiguous ingress identity keeps the hit as a direct edge
 

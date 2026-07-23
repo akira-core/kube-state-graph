@@ -423,13 +423,17 @@ live under `openspec/specs/`.
   `IngressService` — empty on ambiguous/incomplete identity, which NEVER
   demotes the hit (the LB fallback mirrors its own identity into them for
   uniformity). When populated AND every chain precondition holds, the parse
-  emits the **full chain instead of the direct edge**: caller pod
+  emits the **full chain in addition to the direct edge**: caller pod
   -[pod-calls-service]→ ingress service (locked-cluster
   `service-selects-pod` fan-out to the gateway pods) plus ONE synthesized
   `pod-calls-service` edge per locked-cluster ingress pod → the backend
   service (which keeps its family-wide fan-out); the direct caller→backend
-  edge simply never exists (`routeIndexResolve` returns the ingress node as
-  the endpoint's resolution target). Preconditions — identity present,
+  edge is KEPT (`routeIndexResolve` returns `[ingress, backend]` as the
+  endpoint's resolution targets — the chain alone would funnel every caller
+  through the shared ingress node and erase the per-caller → backend
+  dependency), and it collapses with any trace-derived edge for the same
+  `(caller, backend)` pair via the traced pairs map (identical UUIDv5 edge
+  ID — no duplicate possible). Preconditions — identity present,
   identity ≠ backend identity, locked cluster holds the ingress Service in
   topology, non-empty locked-cluster endpoint set — are checked **purely
   before any materialisation** (`resolveRouteChain` in

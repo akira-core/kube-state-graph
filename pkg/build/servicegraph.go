@@ -342,7 +342,10 @@ func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIn
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
-		// series yields a single intra-cluster edge in the anchor cluster.
+		// series yields a single intra-cluster edge in the anchor cluster. The
+		// one two-target case is a chained RouteHit (route-hit-ingress-chain
+		// D5): the server side resolves to [ingress service, backend service],
+		// yielding both the caller→ingress and the direct caller→backend edge.
 		for _, srcID := range srcIDs {
 			for _, tgtID := range tgtIDs {
 				// Deterministic dedupe: multiple upstream series can resolve to the
@@ -940,9 +943,11 @@ func (r *sgResolver) addRouteChainEdge(srcPodID, backendSvcID, cluster string) {
 // On success the ingress service materialises with the LOCKED-CLUSTER
 // service-selects-pod fan-out (D2), one synthesized pod-calls-service edge
 // per locked-cluster ingress pod → the backend service, and the returned
-// [ingressSvcID] becomes the endpoint's resolution target — the main loop's
-// cross product then emits caller→ingress-service, so the direct
-// caller→backend edge simply never exists (D5).
+// [ingressSvcID] joins the backend id as the endpoint's resolution targets
+// (routeIndexResolve appends the backend) — the main loop's cross product
+// then emits caller→ingress-service AND the direct caller→backend edge, so
+// the caller's dependency on the backend is never lost behind the shared
+// ingress funnel (D5).
 func (r *sgResolver) resolveRouteChain(dest RouteDestination, backendSvcID string, t sgTrace) ([]string, bool) {
 	degrade := func(reason string) ([]string, bool) {
 		slog.Debug("route chain degraded to direct edge",

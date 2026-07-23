@@ -361,12 +361,14 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 			chain := false
 			// When the destination carries the ingress LB Service identity
 			// and every chain precondition holds, the endpoint resolves to
-			// the INGRESS service instead: the caller's edge targets the
-			// entry point, the locked-cluster ingress pods fan in between,
-			// and the direct caller→backend edge never exists
+			// BOTH the ingress service and the backend: the caller's edges
+			// target the entry point AND the routed backend directly (so the
+			// caller→backend dependency survives the ingress hop), while the
+			// locked-cluster ingress pods fan in between
 			// (route-hit-ingress-chain D5). Any precondition failure keeps
-			// ids = the backend — today's direct shape.
+			// ids = the backend alone — today's direct shape.
 			if chainIDs, ok := r.resolveRouteChain(entry.dest, ids[0], t); ok {
+				chainIDs = append(chainIDs, ids[0]) // [ingress, backend]
 				ids, chain = chainIDs, true
 			}
 			slog.Debug("service-graph unknown-server peer resolved via route engine",

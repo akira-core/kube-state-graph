@@ -567,7 +567,8 @@ var chainKey = routeKey{callerCluster: "cluster-alpha", host: "api.example.com",
 
 // A RouteHit whose destination carries the ingress LB Service identity emits
 // the full chain — caller → ingress service → ingress pod(s) → backend service
-// → backend pods — and the direct caller→backend edge never exists.
+// → backend pods — PLUS the direct caller→backend edge, so the caller's
+// dependency on the backend survives the shared ingress funnel.
 func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com", nil))
 	res := parseServiceGraphRoutes(vec, sampleTopologyWithIngress(), routeIndex{chainKey: chainHitEntry()})
@@ -578,15 +579,16 @@ func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testin
 	}, svcNodeIDs(res), "ingress and backend service nodes")
 
 	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
-	require.Len(t, pcs, 2)
+	require.Len(t, pcs, 3)
 	got := map[string]string{}
 	for _, e := range pcs {
 		got[e.Source+"->"+e.Target] = e.Labels["cluster"]
 	}
 	assert.Equal(t, map[string]string{
 		"cluster-alpha/abc->cluster-alpha/istio-system/igw": "cluster-alpha",
+		"cluster-alpha/abc->cluster-alpha/shop/payments":    "cluster-alpha",
 		"cluster-alpha/igw0->cluster-alpha/shop/payments":   "cluster-alpha",
-	}, got, "caller targets the ingress entry point; the synthesized ingress-pod edge targets the backend; no direct caller->backend edge")
+	}, got, "caller targets the ingress entry point AND the backend directly; the synthesized ingress-pod edge targets the backend")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))
@@ -678,6 +680,31 @@ func TestParseServiceGraphRoutes_ChainSynthEdgeDedupsAgainstTracedEdge(t *testin
 	assert.Equal(t, 1, igwToPayments, "exactly one edge for the pair (traced wins; identical edge ID otherwise)")
 }
 
+// The chain's direct caller→backend edge shares the traced-edge pairKey (and
+// deterministic UUIDv5 edge ID): a trace-derived series that already yields
+// caller→backend collapses with it into a single edge.
+func TestParseServiceGraphRoutes_ChainDirectEdgeDedupsAgainstTracedEdge(t *testing.T) {
+	traced := model.Sample{Metric: model.Metric{
+		"client":             "checkout",
+		"server":             "http://payments.shop",
+		"cluster":            "cluster-alpha",
+		"client_k8s_pod_uid": "abc",
+		"server_k8s_pod_uid": "",
+	}, Value: 3}
+	vec := sampleVec(unknownPeerSample("api.example.com", nil), traced)
+
+	res := parseServiceGraphRoutes(vec, sampleTopologyWithIngress(), routeIndex{chainKey: chainHitEntry()})
+
+	var callerToPayments int
+	for _, e := range edgesByType(res, graph.EdgeTypePodCallsService) {
+		if e.Source == "cluster-alpha/abc" && e.Target == "cluster-alpha/shop/payments" {
+			callerToPayments++
+			assert.Equal(t, "cluster-alpha", e.Labels["cluster"])
+		}
+	}
+	assert.Equal(t, 1, callerToPayments, "the pairs map collapses the chain's direct edge with the traced one")
+}
+
 // The ingress-lb-service-fallback destination is the LB entry point: its
 // service-selects-pod fan-out is LOCKED to the selected cluster's own
 // endpoints — a family sibling's same-named Service is not behind the IP
@@ -738,8 +765,9 @@ func TestParseServiceGraphRoutes_ChainIngressLockedBackendFamilyWide(t *testing.
 	}
 	assert.ElementsMatch(t, []string{
 		"prod-1/abc->prod-1/istio-system/igw",
+		"prod-1/abc->prod-1/messaging/nats",
 		"prod-1/igw1->prod-1/messaging/nats",
-	}, pcsPairs, "synthesized edges from the locked cluster's ingress pods only — prod-2/igw2 emits nothing")
+	}, pcsPairs, "synthesized edges from the locked cluster's ingress pods only — prod-2/igw2 emits nothing; the direct caller->backend edge is kept")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))

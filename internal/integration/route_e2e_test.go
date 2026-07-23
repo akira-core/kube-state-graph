@@ -553,7 +553,8 @@ func (s *RouteSuite) startRouteAPIServer() string {
 // maps to istio-system/igw, which the VM topology holds with a backing
 // gateway pod — so the graph carries the FULL ingress chain
 // (route-hit-ingress-chain): caller → igw service → igw pod → payments →
-// backing pod, with NO direct caller→payments edge and no external node.
+// backing pod, PLUS the direct caller→payments edge (the caller's dependency
+// on the backend survives the ingress funnel), and no external node.
 func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 	s.ingestUnknownServerSeries(
 		`client_net_peer_name="api.example.com",client_dns_answers="` + ingressLBIP + `"`)
@@ -575,8 +576,8 @@ func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 		"the ingress service selects its gateway pod (locked-cluster fan-out)")
 	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-4","target":"cluster-alpha/shop/payments"`,
 		"the synthesized edge links the gateway pod to the routed backend")
-	s.NotContains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
-		"the direct caller→backend edge is replaced by the chain")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is kept alongside the chain")
 	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
 		"the backend service still fans out to its backing pod like any other")
 	s.NotContains(bodyStr, `external/api.example.com`,
@@ -602,8 +603,8 @@ func (s *RouteSuite) TestExplicitPortRoutesViaHTTPListener() {
 	s.Contains(bodyStr, `"type":"pod-calls-service"`)
 	s.Contains(bodyStr, `"id":"cluster-alpha/istio-system/igw"`,
 		"the shared ingress LB IP resolves the chain's entry hop here too")
-	s.NotContains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
-		"the direct caller→backend edge is replaced by the chain")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is kept alongside the chain")
 	s.NotContains(bodyStr, `external/api8080.example.com:8080`,
 		"the raw peer value must not leak as an external node")
 }
