@@ -4,42 +4,22 @@ Extends `route-hit-ingress-chain` (parent; its D-numbers referenced as C1–C5) 
 `translate-global-fqdn-to-k8s-service` and `ingress-lb-service-fallback`. Purely a **labelling**
 change: no resolution, precondition, degrade, or store behaviour moves. Settled decisions:
 
-## D1 — The synthesized hop gets its own edge type, not a label
+## D1 — Distinguishability via the ingress node's `role`, not a new edge type
 
 The chain has three elements. Two (`caller → ingress`, `ingress → gateway pods`) are incident to
 the ingress `service` node and vanish with it; the third — the synthesized
 `gateway pod → backend service` edge — is **not**, so a consumer that hides only the ingress node
-is left with gateway pods pointing at the backend with no visible cause. That third element needs
-its own handle.
+is left with gateway pods pointing at the backend with no visible cause.
 
-It gets an edge **type** rather than an edge label because:
+A dedicated edge type for that third hop was considered and **rejected**: it would split
+`pod-calls-service` into two catalogue entries for what is still a pod→service relationship, and
+consumers can already identify the gateway path by selecting nodes with
+`labels.role="ingress-gateway"` (plus their backing pods via `service-selects-pod`). The
+synthesized hop therefore stays typed `pod-calls-service`, sharing the traced-edge-wins dedup and
+connectivity-prune membership of every other pod→service edge.
 
-1. `type` is a flat field on the serialised edge `data`; `labels` is a nested map. Consumers
-   (Cytoscape selectors, `?edge_type=` server-side filtering, `/v1/edge-types` documentation) all
-   key off `type`.
-2. The edge is categorically different from every other edge in the graph: it is the only one
-   **derived from translated configuration** rather than observed traffic. `pod-calls-service`
-   asserts "this pod was seen calling this service"; the synthesized hop asserts "this gateway
-   would route to this service". Conflating them mislabels the evidence.
-3. It doubles as the gateway-pod identifier — the source of a `pod-routes-to-service` edge IS an
-   ingress gateway pod, so a consumer needs no traversal to find them.
-
-Name: `pod-routes-to-service`, following the registry's existing `<source>-<verb>-<target>`
-convention (`pod-calls-service`, `service-selects-pod`, `pod-to-node`). The considered alternative
-`deployment-to-service` was rejected — the source node is a **pod**, so `source_type: [pod]` would
-contradict the name.
-
-`may_cross_cluster: false`: `resolveRouteChain` draws the source pods from
-`endpointsByService[{dest.Cluster, ...}]` (locked-cluster fan-out, C2) and the backend node is
-materialised in `dest.Cluster` by `resolveServiceLevel(dest.Cluster, ...)`, so both endpoints are
-in the locked ingress cluster by construction. This is strictly more precise than the
-`pod-calls-service` entry it leaves (which is `true` because the route-engine *caller* edge may
-anchor on a family sibling).
-
-The type is added to the connectivity case of `graph.connectivityExcluded` — it is a genuine
-connectivity edge, and the switch is documented as exhaustive over `EdgeType`. (In practice a
-gateway pod is already connected via its `service-selects-pod` edge, so no projection output
-changes; the listing is a correctness/exhaustiveness requirement, not a behaviour fix.)
+The remaining problem — telling a routed chain's ingress entry point apart from an nginx
+`ingress-lb` fallback that has **no** chain behind it — is solved by the node marker in D3.
 
 ## D2 — No new node type for the ingress Service
 
@@ -63,12 +43,12 @@ Two distinct code paths materialise an ingress node, and a consumer must tell th
 
 | Value | Emitted by | Behind it |
 |---|---|---|
-| `ingress-gateway` | `resolveRouteChain` (`RouteHit` chain entry hop) | gateway pods + `pod-routes-to-service` → backend |
+| `ingress-gateway` | `resolveRouteChain` (`RouteHit` chain entry hop) | gateway pods + synthesized `pod-calls-service` → backend |
 | `ingress-lb` | `routeIndexResolve`'s `RouteIngressLBService` branch (nginx fallback) | controller pods only — **no routed backend** |
 
 The values deliberately mirror the engine's `hit` / `ingress_lb_service` outcomes. Collapsing them
 into a single `ingress` value would force every consumer into a two-hop graph query ("does a pod
-behind this node have a `pod-routes-to-service` edge?") to avoid hiding an `ingress-lb` node — and
+behind this node have a synthesized hop to a backend?") to avoid hiding an `ingress-lb` node — and
 hiding one erases the caller's only dependency edge, since that path emits no direct edge.
 
 **Precedence.** One Service can hit both paths in a single build (one endpoint's route resolves
@@ -98,7 +78,7 @@ output. The design stays additive: the mark can be introduced later without brea
 `resolveRouteChain`'s four preconditions, the pure-before-materialisation ordering (C3), the
 backend-resolves-first rule, the locked-cluster vs family-wide fan-out split (C2), the
 traced-edge-wins dedup (C4), `extReasons`, and every `route_engine_*` external path are untouched.
-A chain degrade materialises **no** ingress node, so it produces neither marker — the degraded
+A chain degrade materialises **no** ingress node, so it produces no marker — the degraded
 output stays byte-identical to `route-hit-ingress-chain`'s. Feature-off output is unchanged.
 
 Marking happens strictly **after** successful materialisation, inside the same two call sites that
@@ -114,7 +94,7 @@ caller pod ──pod-calls-service──────────► ingress Serv
      │                                          ▼
      │                                     gateway pod(s)
      │                                          │
-     │                                          │ pod-routes-to-service   ← new type
+     │                                          │ pod-calls-service (synthesized hop)
      │                                          ▼
      └──pod-calls-service─────────────────► backend Service
                                                 │ service-selects-pod (family-wide)
@@ -123,4 +103,4 @@ caller pod ──pod-calls-service──────────► ingress Serv
 ```
 
 nginx / `RouteIngressLBService`: `caller → ingress Service` (`labels.role=ingress-lb`) plus its
-locked-cluster `service-selects-pod` fan-out only — no `pod-routes-to-service` edge.
+locked-cluster `service-selects-pod` fan-out only — no synthesized hop to a routed backend.

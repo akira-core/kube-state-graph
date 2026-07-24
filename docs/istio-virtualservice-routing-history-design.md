@@ -167,7 +167,7 @@ caller pod ──pod-calls-service──────────► ingress Serv
      │                                          │ service-selects-pod（鎖定 ingress cluster）
      │                                          ▼
      │                                     gateway pod(s)
-     │                                          │ pod-routes-to-service（設定推導，非觀測流量）
+     │                                          │ pod-calls-service（synthesized hop）
      │                                          ▼
      └──pod-calls-service─────────────────► backend Service ──service-selects-pod──► backend pods
 ```
@@ -176,14 +176,14 @@ caller pod ──pod-calls-service──────────► ingress Serv
 
 | | RouteHit 鏈（Istio） | RouteIngressLBService fallback（nginx） |
 |---|---|---|
-| 圖上標記 | ingress 節點 `labels.role="ingress-gateway"`；gateway pod → backend 的 synthesized 邊型別為 **`pod-routes-to-service`** | ingress 節點 `labels.role="ingress-lb"`；**無** `pod-routes-to-service` 邊（沒有 routed backend） |
+| 圖上標記 | ingress 節點 `labels.role="ingress-gateway"` | ingress 節點 `labels.role="ingress-lb"`（**無** routed backend） |
 | 直接邊 | caller → backend 保留（無額外標記） | 不存在（caller → ingress 是唯一依賴邊） |
 
 **消費端 toggle 規則**：「顯示 gateway 路徑」開關 = 隱藏／顯示
-`role="ingress-gateway"` 的節點、`pod-routes-to-service` 邊、以及這些邊的
-source（gateway）pod；`role="ingress-lb"` 節點與所有直接邊**永遠顯示**——
-隱藏 `ingress-lb` 節點會抹掉 caller 唯一的依賴邊。鏈的任一前置條件不成立時
-degrade 回純直接邊（無 ingress 節點、無 `role`、無 `pod-routes-to-service`）。
+`role="ingress-gateway"` 的節點、以及其背後的 gateway pods（與連到
+backend 的 synthesized `pod-calls-service` 邊）；`role="ingress-lb"` 節點與
+所有直接邊**永遠顯示**——隱藏 `ingress-lb` 節點會抹掉 caller 唯一的依賴邊。
+鏈的任一前置條件不成立時 degrade 回純直接邊（無 ingress 節點、無 `role`）。
 
 
 

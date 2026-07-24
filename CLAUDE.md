@@ -426,25 +426,20 @@ live under `openspec/specs/`.
   emits the **full chain in addition to the direct edge**: caller pod
   -[pod-calls-service]→ ingress service (locked-cluster
   `service-selects-pod` fan-out to the gateway pods) plus ONE synthesized
-  **`pod-routes-to-service`** edge per locked-cluster ingress pod → the
-  backend service (which keeps its family-wide fan-out) — the graph's only
-  **config-derived** edge type (translated Gateway + VirtualService state,
-  not observed traffic; mark-ingress-route-path D1; `source [pod]`, `target
-  [service]`, `may_cross_cluster: false` — both endpoints live in the locked
-  ingress cluster by construction; a connectivity edge for the default
-  prune); the direct caller→backend
-  edge is KEPT (`routeIndexResolve` returns `[ingress, backend]` as the
-  endpoint's resolution targets — the chain alone would funnel every caller
-  through the shared ingress node and erase the per-caller → backend
-  dependency), and it collapses with any trace-derived edge for the same
-  `(caller, backend)` pair via the traced pairs map (identical UUIDv5 edge
-  ID — no duplicate possible). **Ingress role marker**
-  (mark-ingress-route-path): the ingress entry-point node stays
-  `type="service"` (no new node type — `materializeServiceNode` is idempotent
-  by id, so a path-dependent type would be arrival-order dependent) but its
-  `labels` carry `role` — `ingress-gateway` for the RouteHit chain's entry
-  hop, `ingress-lb` for the `RouteIngressLBService` (nginx) fallback
-  destination (no routed backend, hence no `pod-routes-to-service` edge
+  **`pod-calls-service`** edge per locked-cluster ingress pod → the
+  backend service (which keeps its family-wide fan-out); the direct
+  caller→backend edge is KEPT (`routeIndexResolve` returns `[ingress,
+  backend]` as the endpoint's resolution targets — the chain alone would
+  funnel every caller through the shared ingress node and erase the
+  per-caller → backend dependency), and it collapses with any
+  trace-derived edge for the same `(caller, backend)` pair via the traced
+  pairs map (identical UUIDv5 edge ID — no duplicate possible). **Ingress
+  role marker** (mark-ingress-route-path): the ingress entry-point node
+  stays `type="service"` (no new node type — `materializeServiceNode` is
+  idempotent by id, so a path-dependent type would be arrival-order
+  dependent) but its `labels` carry `role` — `ingress-gateway` for the
+  RouteHit chain's entry hop, `ingress-lb` for the
+  `RouteIngressLBService` (nginx) fallback destination (no routed backend
   behind it). Assignment (`sgResolver.markIngressService`) is set-only and
   MONOTONE: `ingress-gateway` always overwrites, `ingress-lb` writes only
   into an unset value — one Service can be reached by both paths in one
@@ -465,10 +460,9 @@ live under `openspec/specs/`.
   never materialised (backend resolves first). Synthesized edges carry
   `labels={"cluster": <ingress cluster>}` (the client side is a pod in that
   cluster — D9), accumulate in `sgResolver.routeChainEdges`, and dedupe
-  **traced-edge-wins** against the parse's `(src, tgt)` pairs (a trace-derived
-  `pod-calls-service` edge for the pair is emitted and the synthesized
-  `pod-routes-to-service` one skipped). No new engine outcome or PromQL
-  change.
+  **traced-edge-wins** against the parse's `(src, tgt)` pairs (a
+  trace-derived `pod-calls-service` edge for the pair is emitted and the
+  synthesized hop skipped). No new engine outcome or PromQL change.
   **(6) Containment** (D1, dependency hygiene, distinct from the client-go
   rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
   import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,
@@ -496,11 +490,9 @@ live under `openspec/specs/`.
   service node in the caller's OWN cluster — that path stays intra-cluster —
   OR when the route engine resolves a global FQDN to a Service in the
   engine-selected ingress cluster, which may be a family sibling, so the type
-  is `may_cross_cluster: true`), `pod-routes-to-service` (directed ingress
-  gateway pod → routed backend service; the synthesized RouteHit ingress-chain
-  hop, config-derived from translated Gateway + VirtualService state rather
-  than observed traffic; both endpoints in the locked ingress cluster —
-  `may_cross_cluster: false`), and `service-selects-pod` (directed service →
+  is `may_cross_cluster: true`; also used for the synthesized RouteHit
+  ingress-chain hop from gateway pod → backend service), and
+  `service-selects-pod` (directed service →
   pod, emitted on demand by the D29 connection-string resolution; the local
   service node fans out across same-family clusters holding the same-named
   Service, so it MAY be cross-cluster — `may_cross_cluster: true`).

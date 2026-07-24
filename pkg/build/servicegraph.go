@@ -93,7 +93,7 @@ type sgResolver struct {
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
 	svcEdges           map[string]*graph.Edge        // service-selects-pod, keyed by "svcID|podID"
-	routeChainEdges    map[string]routeChainEdge     // synthesized ingress-pod → backend-service pod-routes-to-service, keyed "srcPodID|backendSvcID"
+	routeChainEdges    map[string]routeChainEdge     // synthesized ingress-pod → backend-service pod-calls-service, keyed "srcPodID|backendSvcID"
 
 	// Debug-only evidence accumulators (no effect on the emitted graph). Counted
 	// while resolving each endpoint and surfaced as an aggregated summary at the
@@ -387,17 +387,16 @@ func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIn
 		edges = append(edges, e)
 	}
 	// Synthesized RouteHit ingress-chain edges (ingress pod → backend service,
-	// route-hit-ingress-chain D4), typed pod-routes-to-service — the graph's
-	// only config-derived edge (translated Gateway + VirtualService state, not
-	// observed traffic; mark-ingress-route-path D1). A trace-derived edge for
-	// the same (src, tgt) wins — skipping keeps pre-existing traced edges
-	// byte-identical. Map iteration order is irrelevant: the emitted SET is a
-	// pure function of the data, and SortEdges canonicalises downstream (D6).
+	// route-hit-ingress-chain D4). A trace-derived edge for the same (src, tgt)
+	// wins — the two would otherwise share one deterministic UUIDv5 edge ID —
+	// and skipping keeps pre-existing traced edges byte-identical. Map
+	// iteration order is irrelevant: the emitted SET is a pure function of the
+	// data, and SortEdges canonicalises downstream (D6).
 	for _, ce := range res.routeChainEdges {
 		if _, dup := pairs[pairKey{src: ce.src, tgt: ce.tgt}]; dup {
 			continue
 		}
-		edges = append(edges, graph.NewEdge(graph.EdgeTypePodRoutesToService, ce.src, ce.tgt,
+		edges = append(edges, graph.NewEdge(graph.EdgeTypePodCallsService, ce.src, ce.tgt,
 			map[string]string{"cluster": ce.cluster}))
 	}
 
@@ -915,8 +914,9 @@ func (r *sgResolver) addServiceEdge(svcID, podID, ns string) {
 // Ingress-role marker values (mark-ingress-route-path D3). Exactly two, each
 // mirroring the engine outcome that materialises an ingress service node:
 // roleIngressGateway for the RouteHit chain's entry hop (gateway pods and a
-// pod-routes-to-service edge exist behind it), roleIngressLB for the
-// RouteIngressLBService (nginx) fallback destination (no routed backend).
+// synthesized pod-calls-service edge to the backend exist behind it),
+// roleIngressLB for the RouteIngressLBService (nginx) fallback destination
+// (no routed backend).
 const (
 	roleIngressGateway = "ingress-gateway"
 	roleIngressLB      = "ingress-lb"
@@ -942,7 +942,7 @@ func (r *sgResolver) markIngressService(id, role string) {
 	}
 }
 
-// routeChainEdge is one synthesized (not trace-derived) pod-routes-to-service
+// routeChainEdge is one synthesized (not trace-derived) pod-calls-service
 // edge of the RouteHit ingress chain: an ingress gateway pod routing to the
 // routed backend service (route-hit-ingress-chain D4). cluster is the locked
 // ingress cluster — the source pod's own cluster, so the emitted edge's
@@ -972,7 +972,7 @@ func (r *sgResolver) addRouteChainEdge(srcPodID, backendSvcID, cluster string) {
 // that produced external nodes").
 //
 // On success the ingress service materialises with the LOCKED-CLUSTER
-// service-selects-pod fan-out (D2), one synthesized pod-routes-to-service
+// service-selects-pod fan-out (D2), one synthesized pod-calls-service
 // edge per locked-cluster ingress pod → the backend service, and the returned
 // [ingressSvcID] joins the backend id as the endpoint's resolution targets
 // (routeIndexResolve appends the backend) — the main loop's cross product

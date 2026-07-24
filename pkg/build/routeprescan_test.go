@@ -582,7 +582,7 @@ func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testin
 	}, svcNodeIDs(res), "ingress and backend service nodes")
 
 	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
-	require.Len(t, pcs, 2)
+	require.Len(t, pcs, 3)
 	got := map[string]string{}
 	for _, e := range pcs {
 		got[e.Source+"->"+e.Target] = e.Labels["cluster"]
@@ -590,13 +590,8 @@ func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testin
 	assert.Equal(t, map[string]string{
 		"cluster-alpha/abc->cluster-alpha/istio-system/igw": "cluster-alpha",
 		"cluster-alpha/abc->cluster-alpha/shop/payments":    "cluster-alpha",
-	}, got, "caller targets the ingress entry point AND the backend directly")
-
-	prts := edgesByType(res, graph.EdgeTypePodRoutesToService)
-	require.Len(t, prts, 1, "the synthesized ingress-pod hop carries its own config-derived type")
-	assert.Equal(t, "cluster-alpha/igw0", prts[0].Source)
-	assert.Equal(t, "cluster-alpha/shop/payments", prts[0].Target)
-	assert.Equal(t, "cluster-alpha", prts[0].Labels["cluster"])
+		"cluster-alpha/igw0->cluster-alpha/shop/payments":   "cluster-alpha",
+	}, got, "caller targets the ingress entry point AND the backend directly; gateway pod→backend is a synthesized pod-calls-service")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))
@@ -666,8 +661,8 @@ func TestParseServiceGraphRoutes_ChainDegradesToDirectEdge(t *testing.T) {
 
 // A trace-derived edge for the same (ingress pod, backend service) pair wins
 // over the synthesized chain edge — the pair is deduped by (src, tgt), so the
-// observed-traffic pod-calls-service edge is emitted and the config-derived
-// pod-routes-to-service one is skipped.
+// observed-traffic pod-calls-service edge is emitted and the synthesized
+// hop is skipped.
 func TestParseServiceGraphRoutes_ChainSynthEdgeDedupsAgainstTracedEdge(t *testing.T) {
 	traced := model.Sample{Metric: model.Metric{
 		"client":             "igw",
@@ -688,8 +683,6 @@ func TestParseServiceGraphRoutes_ChainSynthEdgeDedupsAgainstTracedEdge(t *testin
 		}
 	}
 	assert.Equal(t, 1, igwToPayments, "exactly one edge for the pair (traced wins)")
-	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
-		"the synthesized hop is skipped when a traced edge covers the pair")
 }
 
 // The chain's direct caller→backend edge shares the traced-edge pairKey (and
@@ -778,16 +771,8 @@ func TestParseServiceGraphRoutes_ChainIngressLockedBackendFamilyWide(t *testing.
 	assert.ElementsMatch(t, []string{
 		"prod-1/abc->prod-1/istio-system/igw",
 		"prod-1/abc->prod-1/messaging/nats",
-	}, pcsPairs, "the direct caller->backend edge is kept alongside the chain")
-
-	prts := edgesByType(res, graph.EdgeTypePodRoutesToService)
-	prtsPairs := make([]string, 0, len(prts))
-	for _, e := range prts {
-		prtsPairs = append(prtsPairs, e.Source+"->"+e.Target)
-	}
-	assert.ElementsMatch(t, []string{
 		"prod-1/igw1->prod-1/messaging/nats",
-	}, prtsPairs, "synthesized edges from the locked cluster's ingress pods only — prod-2/igw2 emits nothing")
+	}, pcsPairs, "direct caller edges plus synthesized hop from the locked cluster's ingress pods only — prod-2/igw2 emits nothing")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))
@@ -817,17 +802,14 @@ func svcNodeByID(res ServiceGraphResult, id string) *graph.ServiceNode {
 }
 
 // assertNoRouteMarkers asserts the mark-ingress-route-path additions are
-// entirely absent: no service node carries a `role` label and no
-// pod-routes-to-service edge exists — the invariant every degrade, engine-off,
-// and no-resolver shape must satisfy.
+// entirely absent: no service node carries a `role` label — the invariant
+// every degrade, engine-off, and no-resolver shape must satisfy.
 func assertNoRouteMarkers(t *testing.T, res ServiceGraphResult) {
 	t.Helper()
 	for _, sv := range res.ServiceNodes {
 		_, ok := sv.LabelsValue["role"]
 		assert.False(t, ok, "service node %s must not carry a role label", sv.IDValue)
 	}
-	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
-		"no pod-routes-to-service edge may exist")
 }
 
 // A chained routed hit marks its ingress entry-point node with
@@ -847,7 +829,7 @@ func TestParseServiceGraphRoutes_ChainMarksIngressGatewayRole(t *testing.T) {
 }
 
 // The RouteIngressLBService (nginx) fallback marks its node role=ingress-lb
-// and emits no pod-routes-to-service edge (there is no routed backend).
+// (there is no routed backend behind it).
 func TestParseServiceGraphRoutes_IngressLBFallbackMarksIngressLBRole(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com", nil))
 	routes := routeIndex{
@@ -861,8 +843,6 @@ func TestParseServiceGraphRoutes_IngressLBFallbackMarksIngressLBRole(t *testing.
 	sv := svcNodeByID(res, "cluster-alpha/shop/payments")
 	require.NotNil(t, sv)
 	assert.Equal(t, roleIngressLB, sv.LabelsValue["role"])
-	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
-		"the LB fallback has no routed backend behind it")
 }
 
 // Determinism (design D3): when one endpoint chains through a Service as the

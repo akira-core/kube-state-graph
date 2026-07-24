@@ -104,25 +104,6 @@ func TestProject_ServiceSelectsPodBackingPodKept(t *testing.T) {
 	assert.True(t, ids["c/worker-0"], "node hosting backing pod kept")
 }
 
-// A pod connected ONLY by a pod-routes-to-service edge (the config-derived
-// ingress-chain hop) counts as connected and survives the default prune.
-func TestProject_PodRoutesToServiceSourcePodKept(t *testing.T) {
-	nodes := []GraphNode{
-		&PodNode{IDValue: "c/igw0", NameValue: "igw0", LabelsValue: map[string]string{"cluster": "c", "namespace": "istio-system", "node": "c/worker-0"}},
-		&ServiceNode{IDValue: "c/ns/backend", NameValue: "backend", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}},
-		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
-	}
-	edges := []*Edge{
-		NewEdge(EdgeTypePodRoutesToService, "c/igw0", "c/ns/backend", map[string]string{"cluster": "c"}),
-		NewEdge(EdgeTypePodToNode, "c/igw0", "c/worker-0", nil),
-	}
-	v := Project(NewGraph(nodes, edges, time.Now()), Scope{})
-	ids := idSet(v)
-	assert.True(t, ids["c/igw0"], "pod connected only by a pod-routes-to-service edge is connectivity-connected and kept")
-	assert.True(t, ids["c/ns/backend"], "backend service node kept")
-	assert.True(t, ids["c/worker-0"], "node hosting the gateway pod kept")
-}
-
 // Escape hatch: an explicit ?name= surfaces an otherwise-pruned edgeless pod
 // (symmetric with the D6 infra-node name exception).
 func TestProject_NameFilterSurfacesEdgelessPod(t *testing.T) {
