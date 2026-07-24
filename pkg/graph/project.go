@@ -108,7 +108,7 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 // connectivityExcluded returns the set of pod and PVC node IDs that the
 // default projection drops because they sit on no connectivity edge:
 //   - a pod is excluded iff it is not an endpoint of any pod-calls-pod /
-//     pod-calls-service / service-selects-pod edge;
+//     pod-calls-service / pod-routes-to-service / service-selects-pod edge;
 //   - a PVC is excluded iff none of the pods that mount it (pod-mounts-pvc) is
 //     itself connectivity-connected.
 //
@@ -122,7 +122,7 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 	pvcMounters := make(map[string][]string)
 	for _, e := range g.Edges {
 		switch e.Type {
-		case EdgeTypePodCallsPod, EdgeTypePodCallsService, EdgeTypeServiceSelectsPod:
+		case EdgeTypePodCallsPod, EdgeTypePodCallsService, EdgeTypePodRoutesToService, EdgeTypeServiceSelectsPod:
 			// Endpoints of a connectivity edge are connected. A non-pod endpoint
 			// (a service) may land in the set too — harmless, since the set is
 			// only ever queried for pod and pod-mounter IDs.

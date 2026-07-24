@@ -276,6 +276,7 @@ func TestParseServiceGraphRoutes_NilIndexIsPreChangeBehaviour(t *testing.T) {
 		sampleTopologyWithServices(), nil)
 	require.Len(t, res.ServiceNodes, 1)
 	assert.Empty(t, res.ExternalNodes)
+	assertNoRouteMarkers(t, res)
 
 	// A global FQDN still falls external.
 	res = parseServiceGraphRoutes(
@@ -284,6 +285,7 @@ func TestParseServiceGraphRoutes_NilIndexIsPreChangeBehaviour(t *testing.T) {
 	require.Len(t, res.ExternalNodes, 1)
 	assert.Equal(t, "external/api.example.com", res.ExternalNodes[0].IDValue)
 	assert.Empty(t, res.ServiceNodes)
+	assertNoRouteMarkers(t, res)
 }
 
 // With the engine ON (non-nil index) an endpoint carrying no destination IPs
@@ -297,6 +299,7 @@ func TestParseServiceGraphRoutes_NoIPsFallsExternalWithEngineOn(t *testing.T) {
 	require.Len(t, res.ExternalNodes, 1)
 	assert.Equal(t, "external/api.example.com", res.ExternalNodes[0].IDValue)
 	assert.Empty(t, res.ServiceNodes)
+	assertNoRouteMarkers(t, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +582,7 @@ func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testin
 	}, svcNodeIDs(res), "ingress and backend service nodes")
 
 	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
-	require.Len(t, pcs, 3)
+	require.Len(t, pcs, 2)
 	got := map[string]string{}
 	for _, e := range pcs {
 		got[e.Source+"->"+e.Target] = e.Labels["cluster"]
@@ -587,8 +590,13 @@ func TestParseServiceGraphRoutes_RouteHitWithIngressIdentityEmitsChain(t *testin
 	assert.Equal(t, map[string]string{
 		"cluster-alpha/abc->cluster-alpha/istio-system/igw": "cluster-alpha",
 		"cluster-alpha/abc->cluster-alpha/shop/payments":    "cluster-alpha",
-		"cluster-alpha/igw0->cluster-alpha/shop/payments":   "cluster-alpha",
-	}, got, "caller targets the ingress entry point AND the backend directly; the synthesized ingress-pod edge targets the backend")
+	}, got, "caller targets the ingress entry point AND the backend directly")
+
+	prts := edgesByType(res, graph.EdgeTypePodRoutesToService)
+	require.Len(t, prts, 1, "the synthesized ingress-pod hop carries its own config-derived type")
+	assert.Equal(t, "cluster-alpha/igw0", prts[0].Source)
+	assert.Equal(t, "cluster-alpha/shop/payments", prts[0].Target)
+	assert.Equal(t, "cluster-alpha", prts[0].Labels["cluster"])
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))
@@ -651,13 +659,15 @@ func TestParseServiceGraphRoutes_ChainDegradesToDirectEdge(t *testing.T) {
 
 			assert.Len(t, edgesByType(res, graph.EdgeTypeServiceSelectsPod), 2, "backend fan-out only")
 			assert.Empty(t, res.ExternalNodes, "a degrade never falls external")
+			assertNoRouteMarkers(t, res)
 		})
 	}
 }
 
 // A trace-derived edge for the same (ingress pod, backend service) pair wins
-// over the synthesized chain edge — the two would otherwise share one
-// deterministic UUIDv5 edge ID.
+// over the synthesized chain edge — the pair is deduped by (src, tgt), so the
+// observed-traffic pod-calls-service edge is emitted and the config-derived
+// pod-routes-to-service one is skipped.
 func TestParseServiceGraphRoutes_ChainSynthEdgeDedupsAgainstTracedEdge(t *testing.T) {
 	traced := model.Sample{Metric: model.Metric{
 		"client":             "igw",
@@ -677,7 +687,9 @@ func TestParseServiceGraphRoutes_ChainSynthEdgeDedupsAgainstTracedEdge(t *testin
 			assert.Equal(t, "cluster-alpha", e.Labels["cluster"])
 		}
 	}
-	assert.Equal(t, 1, igwToPayments, "exactly one edge for the pair (traced wins; identical edge ID otherwise)")
+	assert.Equal(t, 1, igwToPayments, "exactly one edge for the pair (traced wins)")
+	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
+		"the synthesized hop is skipped when a traced edge covers the pair")
 }
 
 // The chain's direct caller→backend edge shares the traced-edge pairKey (and
@@ -766,8 +778,16 @@ func TestParseServiceGraphRoutes_ChainIngressLockedBackendFamilyWide(t *testing.
 	assert.ElementsMatch(t, []string{
 		"prod-1/abc->prod-1/istio-system/igw",
 		"prod-1/abc->prod-1/messaging/nats",
+	}, pcsPairs, "the direct caller->backend edge is kept alongside the chain")
+
+	prts := edgesByType(res, graph.EdgeTypePodRoutesToService)
+	prtsPairs := make([]string, 0, len(prts))
+	for _, e := range prts {
+		prtsPairs = append(prtsPairs, e.Source+"->"+e.Target)
+	}
+	assert.ElementsMatch(t, []string{
 		"prod-1/igw1->prod-1/messaging/nats",
-	}, pcsPairs, "synthesized edges from the locked cluster's ingress pods only — prod-2/igw2 emits nothing; the direct caller->backend edge is kept")
+	}, prtsPairs, "synthesized edges from the locked cluster's ingress pods only — prod-2/igw2 emits nothing")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	sspPairs := make([]string, 0, len(ssp))
@@ -780,4 +800,95 @@ func TestParseServiceGraphRoutes_ChainIngressLockedBackendFamilyWide(t *testing.
 		"prod-1/messaging/nats->prod-2/n2",
 	}, sspPairs)
 	assert.Empty(t, res.ExternalNodes)
+}
+
+// ---------------------------------------------------------------------------
+// Ingress route-path marking (mark-ingress-route-path).
+// ---------------------------------------------------------------------------
+
+// svcNodeByID returns the materialised service node with the given id, or nil.
+func svcNodeByID(res ServiceGraphResult, id string) *graph.ServiceNode {
+	for _, sv := range res.ServiceNodes {
+		if sv.IDValue == id {
+			return sv
+		}
+	}
+	return nil
+}
+
+// assertNoRouteMarkers asserts the mark-ingress-route-path additions are
+// entirely absent: no service node carries a `role` label and no
+// pod-routes-to-service edge exists — the invariant every degrade, engine-off,
+// and no-resolver shape must satisfy.
+func assertNoRouteMarkers(t *testing.T, res ServiceGraphResult) {
+	t.Helper()
+	for _, sv := range res.ServiceNodes {
+		_, ok := sv.LabelsValue["role"]
+		assert.False(t, ok, "service node %s must not carry a role label", sv.IDValue)
+	}
+	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
+		"no pod-routes-to-service edge may exist")
+}
+
+// A chained routed hit marks its ingress entry-point node with
+// role=ingress-gateway; the routed backend node stays unmarked.
+func TestParseServiceGraphRoutes_ChainMarksIngressGatewayRole(t *testing.T) {
+	vec := sampleVec(unknownPeerSample("api.example.com", nil))
+	res := parseServiceGraphRoutes(vec, sampleTopologyWithIngress(), routeIndex{chainKey: chainHitEntry()})
+
+	igw := svcNodeByID(res, "cluster-alpha/istio-system/igw")
+	require.NotNil(t, igw)
+	assert.Equal(t, roleIngressGateway, igw.LabelsValue["role"])
+
+	backend := svcNodeByID(res, "cluster-alpha/shop/payments")
+	require.NotNil(t, backend)
+	_, ok := backend.LabelsValue["role"]
+	assert.False(t, ok, "the backend service node is never marked")
+}
+
+// The RouteIngressLBService (nginx) fallback marks its node role=ingress-lb
+// and emits no pod-routes-to-service edge (there is no routed backend).
+func TestParseServiceGraphRoutes_IngressLBFallbackMarksIngressLBRole(t *testing.T) {
+	vec := sampleVec(unknownPeerSample("api.example.com", nil))
+	routes := routeIndex{
+		{callerCluster: "cluster-alpha", host: "api.example.com", path: "/", port: 443, ips: testDNSAnswer}: {
+			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments"},
+			outcome: RouteIngressLBService,
+		},
+	}
+	res := parseServiceGraphRoutes(vec, sampleTopologyWithServices(), routes)
+
+	sv := svcNodeByID(res, "cluster-alpha/shop/payments")
+	require.NotNil(t, sv)
+	assert.Equal(t, roleIngressLB, sv.LabelsValue["role"])
+	assert.Empty(t, edgesByType(res, graph.EdgeTypePodRoutesToService),
+		"the LB fallback has no routed backend behind it")
+}
+
+// Determinism (design D3): when one endpoint chains through a Service as the
+// entry hop and another endpoint LB-falls-back to the SAME Service within one
+// build, the node is role=ingress-gateway for BOTH input orderings —
+// ingress-gateway overwrites, ingress-lb writes only into an unset value.
+func TestParseServiceGraphRoutes_BothPathsMarkIngressGatewayEitherOrder(t *testing.T) {
+	chainSample := unknownPeerSample("api.example.com", nil)
+	lbSample := unknownPeerSample("lb.example.com", nil)
+	routes := routeIndex{
+		chainKey: chainHitEntry(),
+		{callerCluster: "cluster-alpha", host: "lb.example.com", path: "/", port: 443, ips: testDNSAnswer}: {
+			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "istio-system", Service: "igw"},
+			outcome: RouteIngressLBService,
+		},
+	}
+	for name, vec := range map[string]model.Vector{
+		"chain_then_lb": sampleVec(chainSample, lbSample),
+		"lb_then_chain": sampleVec(lbSample, chainSample),
+	} {
+		t.Run(name, func(t *testing.T) {
+			res := parseServiceGraphRoutes(vec, sampleTopologyWithIngress(), routes)
+			igw := svcNodeByID(res, "cluster-alpha/istio-system/igw")
+			require.NotNil(t, igw)
+			assert.Equal(t, roleIngressGateway, igw.LabelsValue["role"],
+				"ingress-gateway wins regardless of resolution order")
+		})
+	}
 }

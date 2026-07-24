@@ -312,7 +312,7 @@ flowchart TD
 | [istio-virtualservice-routing-history-design.md](./istio-virtualservice-routing-history-design.md) | Ingress 視角的 Istio 主路徑；本文件是 **nginx 邊界 LB** 的補充 |
 | `openspec/changes/translate-global-fqdn-to-k8s-service/` | ksg 將 global FQDN 經 **Istio** route engine 解析到 Service；nginx 不在該 change 範圍 |
 | `pkg/route` 三跳 + `ClustersWithIngressIP` | Hop1 仍可用（IP → LB Service）；Hop3 對 nginx 會空 → 今日 degrade 為 external |
-| `openspec/changes/ingress-lb-service-fallback/` | **LB 層降級已由此 change 實作**：Istio pipeline 全 miss 後，IP 在已選 ingress cluster 內唯一對應的 ingress LB Service 以 `ingress_lb_service` outcome 回傳（僅到 LB 層，不含 backend 解析） |
+| `openspec/changes/ingress-lb-service-fallback/` | **LB 層降級已由此 change 實作**：Istio pipeline 全 miss 後，IP 在已選 ingress cluster 內唯一對應的 ingress LB Service 以 `ingress_lb_service` outcome 回傳（僅到 LB 層，不含 backend 解析）；圖上該節點標 `labels.role="ingress-lb"`（mark-ingress-route-path），與 Istio 鏈的 `ingress-gateway` 可區分 |
 
 **本文件不變更**既有 Istio 引擎契約；僅記錄 nginx 情境的可行後續路徑，供後續
 OpenSpec change / 實作引用。

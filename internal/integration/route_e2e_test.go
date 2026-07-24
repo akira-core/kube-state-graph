@@ -574,8 +574,10 @@ func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 		"the caller's pod-calls-service edge targets the ingress entry point")
 	s.Contains(bodyStr, `"source":"cluster-alpha/istio-system/igw","target":"cluster-alpha/alpha-4"`,
 		"the ingress service selects its gateway pod (locked-cluster fan-out)")
-	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-4","target":"cluster-alpha/shop/payments"`,
-		"the synthesized edge links the gateway pod to the routed backend")
+	s.Contains(bodyStr, `"type":"pod-routes-to-service","source":"cluster-alpha/alpha-4","target":"cluster-alpha/shop/payments"`,
+		"the synthesized gateway-pod→backend edge carries the config-derived pod-routes-to-service type")
+	s.Contains(bodyStr, `"labels":{"cluster":"cluster-alpha","namespace":"istio-system","role":"ingress-gateway"}`,
+		"the ingress entry-point node is marked role=ingress-gateway")
 	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
 		"the direct caller→backend edge is kept alongside the chain")
 	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
@@ -663,6 +665,10 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 		"nothing materialises in the caller's cluster for this host")
 	s.NotContains(bodyStr, `"id":"cluster-beta/istio-system/igw"`,
 		"beta's ingress Service is not in topology → the chain degrades to the direct edge, no ingress node")
+	s.NotContains(bodyStr, `"role":`,
+		"a degraded chain marks nothing — no service node carries a role label")
+	s.NotContains(bodyStr, `"type":"pod-routes-to-service"`,
+		"a degraded chain emits no synthesized edge")
 	s.NotContains(bodyStr, `external/cross.example.com`,
 		"a cross-cluster route hit must not leave an external node behind")
 }
@@ -694,6 +700,16 @@ func (s *RouteSuite) TestNginxIngressFallsBackToLBService() {
 	s.Contains(bodyStr, `"type":"service-selects-pod"`)
 	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-3"`,
 		"the LB service fans out to the nginx controller pod")
+	s.Contains(bodyStr, `"labels":{"cluster":"cluster-alpha","namespace":"ingress-nginx","role":"ingress-lb"}`,
+		"the LB fallback destination is marked role=ingress-lb")
+	// Scoped to THIS endpoint (the suite's shared VM still holds earlier tests'
+	// chain series, which legitimately carry pod-routes-to-service edges): no
+	// synthesized edge is sourced from the nginx controller pod, and none
+	// targets the LB entry point — there is no routed backend behind it.
+	s.NotContains(bodyStr, `"type":"pod-routes-to-service","source":"cluster-alpha/alpha-3"`,
+		"no routed backend behind the LB entry point → no synthesized edge from the controller pod")
+	s.NotContains(bodyStr, `"type":"pod-routes-to-service","source":"cluster-alpha/alpha-1"`,
+		"the caller's dependency on the LB entry point stays a pod-calls-service edge, never the synthesized type")
 	s.NotContains(bodyStr, `external/app.nginx.example.com`,
 		"a fallback-resolved peer must not leave an external node behind")
 }

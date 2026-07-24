@@ -397,6 +397,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// point. The outcome dimension in the log keeps the coarser
 		// semantics distinguishable from a routed hit.
 		if ids := r.resolveServiceLevelInCluster(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
+			r.markIngressService(ids[0], roleIngressLB)
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
 				"outcome", string(entry.outcome),

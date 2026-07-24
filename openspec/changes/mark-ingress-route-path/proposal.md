@@ -64,6 +64,13 @@ the dependency entirely. The two ingress nodes must be told apart.
   `pod-routes-to-service` with its `source_type` / `target_type` / `directed` /
   `may_cross_cluster` / `labels` contract.
 
+  Note: this delta also corrects pre-existing drift — the promoted spec's
+  `pod-calls-service` scenario still said `may_cross_cluster: false`, while
+  `translate-global-fqdn-to-k8s-service` made it `true` in `registry.go`
+  without a `graph-api` delta. The MODIFIED requirement reproduces the
+  accurate value (`true`, with the route-engine ingress-cluster anchoring as
+  the reason).
+
 ## Impact
 
 - **Modified**: `pkg/graph/edge.go` (new `EdgeType` constant), `pkg/graph/registry.go` (new

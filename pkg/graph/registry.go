@@ -76,6 +76,17 @@ var EdgeTypes = []EdgeTypeDefinition{
 		},
 	},
 	{
+		Type:            EdgeTypePodRoutesToService,
+		Description:     "Config-derived routing edge from an ingress gateway pod to the backend Kubernetes Service its Gateway + VirtualService configuration routes to — translated Istio configuration state, NOT observed traffic. Emitted only by the RouteHit ingress chain of the Istio route-resolution engine (route-hit-ingress-chain): the source is always an ingress gateway pod of the selected ingress cluster and the target the routed backend service node, both materialised in that same cluster, so the edge never crosses clusters. Carries labels.cluster (the ingress cluster — the client side is a pod in that cluster, D9). A trace-derived edge for the same (source, target) pair wins over the synthesized one (traced-edge-wins dedup).",
+		SourceType:      []NodeType{NodeTypePod},
+		TargetType:      []NodeType{NodeTypeService},
+		Directed:        true,
+		MayCrossCluster: false,
+		Labels: []EdgeTypeLabel{
+			{Name: "cluster", ValueType: "string"},
+		},
+	},
+	{
 		Type:            EdgeTypeServiceSelectsPod,
 		Description:     "A Kubernetes Service routes to a backing pod, derived from kube_endpointslice_endpoints joined to topology pods (D29). Materialised on demand only for the single local Service node a '://' connection-string endpoint resolves to (in the caller's own cluster). The Service node fans out one edge per backing pod across EVERY same-family cluster that holds the same-named Service object — the union of each such cluster's endpoints — so the edge MAY cross clusters (a local Service node selecting a backing pod that runs in a family-sibling cluster, reflecting service-mesh endpoint aggregation). Cross-cluster status is derived by comparing the source service node's and target pod node's labels.cluster.",
 		SourceType:      []NodeType{NodeTypeService},
