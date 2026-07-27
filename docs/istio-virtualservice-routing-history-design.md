@@ -1,471 +1,265 @@
-# Istio 路由回溯與 Ingress 流量 Gateway 解析 — 完整流程設計
+# Ingress 路由解析（kube-state-graph 現況）
 
-> 狀態：設計 + POC。涵蓋 **（1）VirtualService 路由回溯查詢**（host+path+時間 → 各版本 destination）
-> 與 **（2）Ingress 流量視角**（OTEL span / DNS / IP → 真正命中的 Gateway）。
+> 說明本專案如何把 service-graph 裡的 **global FQDN + DNS IP** 解析成 Kubernetes
+> Service，並在圖上呈現 Istio Gateway 路徑或非 Istio（例如 nginx）的 LB 終點。
 >
-> **架構定案**：ClickHouse 版本化 store（interval 模型、事件級精確）+ 引擎 2A（in-process istiod 翻譯
->
-> - Envoy `router_check_tool`）+ ingress 查詢走 **query-time 三跳** `IP→Gateway`。
->
-> **POC（**`poc/route2a`**）已驗證**：引擎 2A、ClickHouse 四表、3-hop、`ResolveAmong`、CH-backed `ScopedFor`。
-> 細節見 [poc/ARCHITECTURE.md](../poc/ARCHITECTURE.md)；使用方式見 [poc/README.md](../poc/README.md)。
->
-> **主專案尚未實作**：watch/ingest writer、時間區間查詢 API（`cmd/query`）、DR subset / EndpointSlice 層。
+> 概念流程另見 [route-resolution-flow.md](./route-resolution-flow.md)。
 
 ---
 
+## 1. 範圍與開關
 
+本功能是 **opt-in**：需同時設定 `--route-store-dsn` / `KSG_ROUTE_STORE_DSN` 與
+`--router-check-bin`（Envoy `router_check_tool`）。未設定時行為與啟用前完全相同。
 
-## 1. Context（為什麼要做這件事）
+**本 repo 只做讀取與解析**。ClickHouse 版本化 store 的 watch / ingest / schema
+由 metadata-exporter 維護；kube-state-graph 啟動時驗證 schema，不建表、不寫入。
 
-**核心需求**：給定 VirtualService 的 **host**、**path** 與**時間區間**（如今天 11:00–12:00），查出該區間內
-符合的路由規則**依序**解析到哪些 destination（K8s Service + namespace + port）。若設定在區間內被改過，要
-**回傳每個版本**；destination 要**完整解析到 Service+port**（含 DestinationRule subset）。
-使用情境 = **歷史/取證查詢**（低 QPS，精準還原當時設定最重要）。
-
-**兩種查詢語意（並存）**：
-
-
-| 模式                     | 流程                                                      | 用途                |
-| ---------------------- | ------------------------------------------------------- | ----------------- |
-| **config_only**        | `host` → Gateway 反查 → translate → `router_check_tool`   | 設定稽核、「誰接受這個 host」 |
-| **traffic_simulation** | `host` + `dst_ip` → 三跳 → 候選內 host 反查 → translate → tool | 模擬真實流量落點          |
-
-
-兩者結果可能分歧（host 設定 match 某 Gateway，但 DNS/IP 指向另一顆 ingress）。API 應標明模式，或同時
-回傳並標記 mismatch。
-
-**現況起點**：本專案原是**通用 K8s metadata → Prometheus** `_info` **gauge exporter**——scrape-time 重建、
-只反映當下，不保留歷史、無 Istio 語意。本設計在其上新增「事件驅動版本化 ingest」與「路由解析引擎」，
-與既有 exporter **解耦**。
+時間語意為 **單點 as-of**：查詢時刻固定為 `/v1/graph` 時間窗的 **`end`**（與
+service-graph `rate(...) @ end` 同一刻）。一次解析只看該瞬間的設定、只產生一個
+outcome；沒有跨窗切段、沒有 per-version 結果列表。
 
 ---
 
+## 2. 何時觸發
 
+僅在 `resolveUnknownServerPeer` 路徑：client 已解析為**真實拓撲 pod**，server
+標籤精確為 `"unknown"`，且 in-cluster DNS / ClusterIP ladder 無法解析、本來會落成
+`external` 時。
 
-## 2. 為何不用 TSDB metric 當真實來源
+| 維度 | 用途 |
+|------|------|
+| `client_net_peer_name`（優先）或 `client_server_address` | peer host（可含 `:<port>`） |
+| `client_dns_answers` | 目的 IP（**必填**；無可解析 IP → 不諮詢引擎，記 `route_engine_no_ip`） |
+| peer 上的 `:<port>` → `client_server_port` / `client_net_peer_port` → **443** | listener port |
+| path | 固定 `"/"`（metric 無 path 維度） |
 
-路由是有序、巢狀、關聯式結構；Prometheus flat label 會遺失 `http[]` 順序（first-match-wins）、
-match 細節與 route→destination 樹。path/host 當 label 造成高基數；prefix/exact/regex 比對無法在 PromQL
-執行；從碎裂 series 回溯「每個版本」的完整有序設定極為脆弱。DestinationRule subset 與完整 spec 也無法
-可靠塞進 label。
-
-> Metric/TSDB 適合低基數可觀測性；**精準歷史回溯**需要 **版本化設定快照 + 解析引擎**。ingress `IP→Gateway`
-> 同樣不應塞進 Prometheus label。
+I/O 不進 parse：`ReadServiceGraph` 先做純函式 prescan（`collectRouteQueries`），
+序列解析去重後的 key（各受 `--route-resolve-timeout` 約束），再把預取索引交給
+`parseServiceGraphRoutes`。miss / error **永不 fail build**，一律退回
+`external/<peer_address>`。
 
 ---
 
-
-
-## 3. 架構定案
-
-
-| 面向         | 定案                                                                   |
-| ---------- | -------------------------------------------------------------------- |
-| 設定儲存       | **ClickHouse**，interval 模型（`valid_from` / `valid_to`）                |
-| 時間精度       | **事件級**（informer 事件寫入，不漏短命版本）                                        |
-| Join 原語    | ingest 期物化 `Array(String)`；查詢用 `has` / `hasAll`                      |
-| 去重         | `ReplacingMergeTree(ingest_seq)` + 查詢端 `FINAL` / `argMax`            |
-| 比對引擎       | **引擎 2A**：in-process istiod `ConfigGenerator` + `router_check_tool`  |
-| 查詢視角       | **Ingress Gateway**（南北向）；不做 Sidecar mesh 視角                          |
-| IP→Gateway | **query-time 三跳**（Service → Deployment → Gateway），per-resource store |
-| 與 exporter | TSDB export **保留**；歷史走 opt-in `history:` ingest 路徑                   |
-
+## 3. 整體流程
 
 ```mermaid
-graph TD
-    K8s[K8s API watch] --> CH[(ClickHouse 版本化 store)]
-    Q[查詢 host + path + 時間] --> M{模式}
-    M -->|traffic_simulation| IP[dst_ip → 三跳 → 候選 Gateway]
-    M -->|config_only| GW[host → Gateway 反查]
-    IP --> GW2[候選內 most-specific host 消歧]
-    GW --> SF[store.AsOf T → scoped 設定]
-    GW2 --> SF
-    SF --> TR[in-process istiod → RouteConfiguration]
-    TR --> RC[router_check_tool → cluster]
-    RC --> OUT[Service + ns + port + subset]
-    CH --> SF
-    CH --> IP
+flowchart TD
+  A["FQDN + DNS IP(s)"] --> B["ClustersWithIngressIP → 選定 ingress cluster"]
+  B --> C["LoadTrafficAt → 該 cluster 的 as-of 快照"]
+  C --> D{"IP 三跳找得到 Gateway？"}
+  D -->|是| E["host 消歧 → 選 RouteConfiguration"]
+  E --> F["in-process istiod 翻譯 + router_check_tool"]
+  F --> G["後端 Service（RouteHit）"]
+  D -->|否且 miss = no_gateway| H["唯一 ingress LB Service（RouteIngressLBService）"]
+  D -->|更深 miss| I["external"]
+  G --> J["圖：caller→ingress→backend 鏈 + 直連"]
+  H --> K["圖：caller→LB（無後端路由）"]
 ```
-
-
 
 ---
 
+## 4. Ingress cluster 選定
 
+每個目的 IP 呼叫 store 的**唯一跨叢集讀** `ClustersWithIngressIP(ip, at)`，得到候選
+集合 G；再與 caller 的 cluster family（`build.ClusterFamilyKey`）交集：
 
-## 4. 資料流
+| 條件 | 結果 |
+|------|------|
+| \|F\|==1（F = G ∩ family） | 取該 cluster |
+| \|F\|>1 | caller ∈ F → caller；否則 ambiguous |
+| F 空且 \|G\|==1 | 取該 cluster |
+| F 空且 \|G\|>1 | caller ∈ G → caller；否則 ambiguous |
+| G 空 | `no_ingress` |
 
-**關鍵觀念**：VS/Gateway/DR/Service/Deployment 在 API server 可被 watch；Envoy `RouteConfiguration` 由
-istiod 對每個 proxy 現算，故查詢端走 in-process 翻譯（引擎 2A）。
+多 IP 的選定必須一致，否則 ambiguous。候選集合 / 快照**從不跨 cluster 聯集**。
+`(ip, at)` 探針可經 `BuildScoped` 在單次 build 內 memo（同一 IP 只讀 store 一次）。
 
-### 4.1 擷取（watch → ClickHouse）
+`CallerCluster` 只供 family key 與平手決勝，不單獨決定載入哪個 snapshot。
 
-```mermaid
-graph TD
-    A[K8s API server] -->|LIST + WATCH| B[Informer cache]
-    B --> C{Add/Update/Delete}
-    C -->|Add| D[insert 新版 valid_from=事件時間]
-    C -->|Update| E[收前版 valid_to + insert 新版]
-    C -->|Delete| F[收前版 valid_to]
-    D --> G[(ClickHouse)]
-    E --> G
-    F --> G
-    C -.->|resync| H{spec-hash 變了?}
-    H -->|否| I[丟棄]
-    H -->|是| E
+---
+
+## 5. IP → Gateway（三跳）
+
+Gateway CR **沒有**「掛在哪個 LB IP」的反向欄位；靠 label selector 串起來：
+
+```
+IP
+  → Hop1: Service.ingress_ips 命中 → LB Service + selector
+  → Hop2: Deployment pod-template labels ⊇ selector → L
+  → Hop3: Gateway.spec.selector ⊆ L，且 Gateway 與 ingress Service 同 namespace
+  → 候選內以 FQDN 做 most-specific host 消歧（Istio exact/wildcard；
+     同 specificity 取字典序最小 gateway 名）
 ```
 
+`server.bind` / `hosts` 上的 `<ns>/` 綁定前綴在比對前剝除（對齊 istiod SNI 語意：
+前綴限制 VS 能否綁定，不限制 client host）。
 
+`ScopedFor` 取出該 Gateway + 綁定的 VirtualService + 後端 Service；`spec.gateways`
+支援 `<ns>/<name>` 與同 ns bare name。
 
-**擷取要點**：
+---
 
-- 初始 LIST 的 `valid_from` 用 watcher 啟動時間；真實建立時間讀 `creationTimestamp`。
-- **去重用 spec-hash**（非僅 resourceVersion）。**例外**：ingress Service 的 `status.loadBalancer` IP
-變更須開新版本（IP 在 `spec.externalIPs` 則 spec-hash 已涵蓋）。
-- 版本身分用 **resourceVersion**（比 generation 抗撞）；可加 `metadata.uid`。
-- VS `spec.gateways` 可跨 namespace；watch scope 須含被引用的 Gateway ns。
+## 6. RouteConfiguration 選擇與比對
 
-**watch GVR**：`VirtualService`、`Gateway`、`DestinationRule`、`Service`、ingress `Deployment`、
-`EndpointSlice`（選配）。
+選定 Gateway 後，用 **port + host** 挑 Envoy RouteConfiguration
+（`translate.ListenerFor`，Translate 與 resolver 共用）：
 
-**traffic_simulation ingest 補充**：OTEL span 優先用既有連線 IP（`server.address` / `net.peer.ip`）；
-缺 IP 才 DNS lookup。span 固化 IP 比即時 DNS 更適合 `AsOf(T)` 回放。
+1. 篩出 listener port 上的 servers。
+2. `gwresolve.PickHosts` 依 Istio exact/wildcard specificity 選 winner（與宣告順序無關；
+   同 pattern 取較小索引）。
+3. RC 命名對齊 istiod：
+   - HTTP：`http.<port>[.<bind>]`（同 port 的 HTTP servers 共用）
+   - HTTPS terminate：`https.<port>.<portName>.<gw>.<ns>[.<bind>]`（每 server 一條）
+4. 三態：
+   - `ListenerFound` → 繼續翻譯
+   - `ListenerNoneOnPort` → `route_engine_no_listener_on_port`（port 上無可用 HTTP RDS）
+   - `ListenerNoServerForHost` → `route_engine_no_server_for_host`（port 有 server，但不服務此 host；
+     不跑 translate / tool）
 
-### 4.2 查詢（store → 解析）
+通過後：in-process istiod `ConfigGenerator` 產生 RC，`router_check_tool` 以
+`(host, path="/")` 比對，解析 cluster 字串
+`outbound|<port>|<subset>|<svc>.<ns>.svc.cluster.local`。v1 **丟棄** port / subset，
+只保留 `(cluster, namespace, service)` 餵給既有的 `resolveServiceLevel`（錨在選定的
+ingress cluster；可跨 family 發出 `pod-calls-service`，並做 family-wide
+`service-selects-pod` fan-out）。
 
-> **kube-state-graph 消費端現況（simplify-route-resolution-to-point-in-time）**：store 仍是
-> interval 版本化（exporter 契約、DDL、寫入語意完全不變），但 graph build 路徑上的解析器已
-> **簡化為單點 (as-of) 查詢**——查詢時刻固定為 `/v1/graph` 時間區間的 **end**，也就是
-> service-graph `rate(...) @ end` 求值的同一刻。`store.LoadTrafficAt(cluster, ip, at)` /
-> `ClustersWithIngressIP(ip, at)` 只取 `valid_from <= at < valid_to` 的版本，`pkg/route/snapshot`
-> 在記憶體中就那一份設定解析：沒有 segment 切段、沒有 per-version 結果、沒有 config 簽章快取
-> （一次 translate + 一次 `router_check_tool`）。
->
-> 本節描述的「回傳每個版本」屬於**獨立的取證查詢 API**（尚未實作），不在 graph build 路徑上；
-> 歷史資料仍完整保存在 store 中，隨時可以另建查詢面消費。
+---
 
-```mermaid
-graph TD
-    Q[host + path + t0,t1<br/>選配 dst_ip] --> M{模式}
-    M -->|traffic_simulation| P[dst_ip → 三跳 → 候選 Gateway]
-    M -->|config_only| S2
-    P --> S2[候選內 host 反查 Gateway.servers hosts]
-    S2 --> T1[store.AsOf T 取 VS+DR+Gateway+Service 快照]
-    T1 --> T2[in-process istiod → RouteConfiguration]
-    T2 --> U[router_check_tool → cluster]
-    U --> W[cluster → Service+ns+port+subset]
-    W --> X[回傳 per-version 結果]
-```
+## 7. 非 Istio 入口：LB Service fallback
 
-### 4.3 kube-state-graph 圖上呈現（mark-ingress-route-path）
+當三跳找不到 Gateway（outcome 精確為 `no_gateway`——典型 nginx：Hop3 空）時，
+對已載入快照做 as-of 身分去重（`ingressServiceIdentity`，不另讀 store）：
 
-路由命中（RouteHit + ingress 身分齊備）時，圖同時輸出**鏈**與**直接邊**：
+- 每個目的 IP 對應到唯一的 ingress LB `(namespace, name)`，且多 IP 一致 →
+  `RouteIngressLBService`：把該 Service 當終點（host / path / port 不參與）。
+- 任一 IP 對到多個身分 → `ambiguous_ingress_service` → external。
+- 任一 IP 對到 0 個 → 保留原 pipeline miss。
+
+更深層 miss（已有 Gateway 但 port / host / route 失敗）**不**遮成 LB fallback，
+以保留診斷 reason。
+
+LB 路徑用 `resolveServiceLevelInCluster`：service-selects-pod **只在鎖定的 ingress
+cluster** 展開（LB IP 是 per-cluster 位址，不做 family union）。
+
+> 本路徑只到 **ingress controller Service / Pods**。不解析 Kubernetes Ingress CR、
+> 也不解析 nginx.conf 來追 backend；後端依賴若存在，來自 service-graph 流量本身，
+> 不由本引擎推導。
+
+---
+
+## 8. 圖上呈現
+
+### RouteHit（Istio）
+
+前置條件齊備時，除 caller→backend **直連**外，另輸出完整鏈：
 
 ```
 caller pod ──pod-calls-service──────────► ingress Service   labels.role=ingress-gateway
      │                                          │ service-selects-pod（鎖定 ingress cluster）
      │                                          ▼
      │                                     gateway pod(s)
-     │                                          │ pod-calls-service（synthesized hop）
+     │                                          │ pod-calls-service（synthesized）
      │                                          ▼
      └──pod-calls-service─────────────────► backend Service ──service-selects-pod──► backend pods
 ```
 
-兩種 ingress 解析結果在圖上**可區分**：
+- ingress 身分來自與 LB fallback 相同的 as-of 去重；ambiguous / 缺身分 → 不 demote hit，
+  只退回純直連（無 stray 節點）。
+- 合成邊 `labels.cluster` = ingress cluster；與 trace 已有的同 `(src,tgt)` 對以
+  traced-edge-wins 去重。
+- `role` 標記單調：`ingress-gateway` 可覆寫；`ingress-lb` 只寫入尚未設定的值。
 
-| | RouteHit 鏈（Istio） | RouteIngressLBService fallback（nginx） |
+### RouteIngressLBService（nginx 等）
+
+```
+caller pod ──pod-calls-service──► ingress LB Service   labels.role=ingress-lb
+                                       │ service-selects-pod（鎖定 cluster）
+                                       ▼
+                                  controller pod(s)
+```
+
+無 routed backend、無合成 hop。隱藏 `ingress-lb` 會抹掉 caller 唯一依賴邊——消費端
+「顯示 gateway 路徑」開關應只動 `ingress-gateway` 鏈，永遠保留 `ingress-lb` 與直連。
+
+| | RouteHit | LB fallback |
 |---|---|---|
-| 圖上標記 | ingress 節點 `labels.role="ingress-gateway"` | ingress 節點 `labels.role="ingress-lb"`（**無** routed backend） |
-| 直接邊 | caller → backend 保留（無額外標記） | 不存在（caller → ingress 是唯一依賴邊） |
-
-**消費端 toggle 規則**：「顯示 gateway 路徑」開關 = 隱藏／顯示
-`role="ingress-gateway"` 的節點、以及其背後的 gateway pods（與連到
-backend 的 synthesized `pod-calls-service` 邊）；`role="ingress-lb"` 節點與
-所有直接邊**永遠顯示**——隱藏 `ingress-lb` 節點會抹掉 caller 唯一的依賴邊。
-鏈的任一前置條件不成立時 degrade 回純直接邊（無 ingress 節點、無 `role`）。
-
-
+| `labels.role` | `ingress-gateway` | `ingress-lb` |
+| 後端 | 有（VS 路由） | 無 |
+| 直連 caller→backend | 保留 | 不存在 |
 
 ---
 
+## 9. Outcome → 日誌 reason
 
+| Outcome | reason |
+|---------|--------|
+| （無 IP，prescan 跳過） | `route_engine_no_ip` |
+| resolver error | `route_engine_error` |
+| 拓撲缺目的 Service | `route_engine_dest_cluster_lacks_service` |
+| `no_listener_on_port` | `route_engine_no_listener_on_port` |
+| `no_server_for_host` | `route_engine_no_server_for_host` |
+| `no_ingress` | `route_engine_no_ingress` |
+| `ambiguous_ingress_cluster` | `route_engine_ambiguous_ingress_cluster` |
+| `ambiguous_ingress_service` | `route_engine_ambiguous_ingress_service` |
+| `no_gateway` / `no_route` | `route_engine_miss` |
+| `hit` / `ingress_lb_service` | 成功（debug 區分） |
 
-## 5. 元件設計
+---
 
-分三塊：**事件擷取**、**查詢引擎**、**（並存）Prometheus export**。
+## 10. ClickHouse store（唯讀）
 
-### A. 事件擷取 → ClickHouse temporal store
+| 表 | 用途 |
+|----|------|
+| `service_versions` | ingress LB IP + selector；後端 Service ports |
+| `deploy_versions` | ingress Deployment pod labels（Hop2） |
+| `gw_versions` | Gateway selector + server_hosts + spec |
+| `vs_versions` | VirtualService spec + bound gateways |
 
-- **重用** `pkg/collector/listers.go` 的 `ScopedInformers` 與 `pkg/config/config.go` 的 `WatchResource`。
-- **新增** informer Add/Update/Delete handler，每事件寫版本記錄：
-  ```
-  { gvk, namespace, name, uid, resourceVersion, generation,
-    valid_from, valid_to(sentinel if open),
-    spec_hash, object_json,
-    ingress_ips[], selector_kv[], pod_labels_kv[], server_hosts[] }
-  ```
+讀取契約：
 
+- `LoadTrafficAt(cluster, ip, at)` — 單 cluster、as-of 快照
+- `ClustersWithIngressIP(ip, at)` — 唯一跨 cluster 讀
 
+**no-FINAL 模式**：SQL 只帶 immutable 條件與 `valid_from <= at`；client 端依
+`ingest_seq` 去重後再套 `valid_from <= at < valid_to`。時間運算元用 `dt64Lit`，
+不用 `?` bind。`--route-store-unique-rows` 可把 `valid_to` 放回 SQL（僅適用
+update-close 寫入端）。`spec_json` 以 `DiscardUnknown` 解析。
 
-#### 資源分層
+---
 
-
-| 資源                      | 儲存                                | 原因                      |
-| ----------------------- | --------------------------------- | ----------------------- |
-| **VirtualService**      | CH 全 spec                         | `http[]` 有序、path 比對     |
-| **Gateway**             | CH + `selector_kv`/`server_hosts` | host 綁定、IP→Gateway join |
-| **DestinationRule**     | CH（條件式）                           | subset→labels           |
-| **Service（ingress LB）** | CH + `ingress_ips`/`selector_kv`  | destination + Hop1      |
-| **ingress Deployment**  | CH `pod_labels_kv`                | Hop2 的 L                |
-| **EndpointSlice**       | 當下 / best-effort                  | 高易變                     |
-
-
-
-
-#### ClickHouse 儲存模型
-
-`Store` interface：`Put` / `SetValidTo` / `AsOf(T)` / `Overlap(t0,t1)`。
-
-- **interval 模型**：`valid_from <= T AND T < valid_to`；open 版 `valid_to` = 遠未來 sentinel。
-- **ingest 期物化** join 欄為排序 `Array(String)`。
-- **子集** = `hasAll(set, subset)`。
-- **去重** = `ReplacingMergeTree(ingest_seq)` + `FINAL` / `argMax`。
-
-**DDL（ingress 相關示意；VS/DR 同模式加** `spec` **欄）**：
-
-```sql
-CREATE TABLE svc_versions (
-  namespace   LowCardinality(String),
-  name        String,
-  valid_from  DateTime64(3),
-  valid_to    DateTime64(3),
-  ingress_ips Array(String),
-  selector_kv Array(String),
-  ingest_seq  UInt64,
-  INDEX idx_ips ingress_ips TYPE bloom_filter GRANULARITY 1
-) ENGINE = ReplacingMergeTree(ingest_seq)
-ORDER BY (namespace, name, valid_from);
-
-CREATE TABLE deploy_versions (
-  namespace LowCardinality(String), name String,
-  valid_from DateTime64(3), valid_to DateTime64(3),
-  pod_labels_kv Array(String),
-  ingest_seq UInt64
-) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from);
-
-CREATE TABLE gw_versions (
-  namespace LowCardinality(String), name String,
-  valid_from DateTime64(3), valid_to DateTime64(3),
-  selector_kv Array(String),
-  server_hosts Array(String),
-  ingest_seq UInt64,
-  INDEX idx_sel selector_kv TYPE bloom_filter GRANULARITY 1
-) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from);
-```
-
-
-
-#### Config（純加法，**已實作**）
-
-每個資源可**宣告要寫入哪些 ClickHouse 欄位、型別、來源 json path**（像 tsdb rule），並可對 watch 回來的資料
-做 **client 端 filter（支援 regex）**，符合才寫入。完整語法見 [CONFIG.md §14](CONFIG.md)；範例見
-`examples/history-clickhouse.yaml`。
-
-```yaml
-watch:
-  resources:
-    - name: VirtualService
-      apiVersion: networking.istio.io/v1beta1
-      kind: VirtualService
-      resource: virtualservices
-      scope: Namespaced
-    # ... Gateway, DestinationRule, Service, EndpointSlice, Deployment
-rules: [ ... ]
-history:
-  enabled: true
-  store:
-    type: clickhouse
-    dsn: "clickhouse://user:pass@host:9000/routing"
-    createSchema: true          # dev；prod 預設 false → 只驗證 schema、drift 即 fail
-  resources:
-    - kind: VirtualService
-      table: vs_versions
-      columns:
-        - { name: spec_json, type: String, path: "spec", encode: json }
-        - { name: hosts, type: "Array(String)", path: "spec.hosts[*]" }
-        - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]", index: bloom_filter }
-      filters:
-        - { path: "metadata.namespace", op: regex, value: "^(prod|staging)-" }
-```
-
-**Schema 由 config 定義**（json path 值無型別，型別只能由 config 指定）；`createSchema` 開關控制 dev 自動建表 vs
-prod 驗證-only。**版本化為 append-only**：每事件一到兩筆 `INSERT`（`valid_from`、`valid_to`、`ingest_seq`），
-`valid_to` 於寫入端物化——Update 收前版 `valid_to` + insert 新版，Delete 只收前版 `valid_to`（無 tombstone），
-由 `ReplacingMergeTree(ingest_seq)` 折疊收尾列。落地於 `pkg/config`（設定）、`pkg/history`（filter + 事件
-ingest）、`pkg/store`（ClickHouse writer + DDL）。
-
-
-
-### B. 查詢／路由解析引擎
-
-輸入：`host`、`path`、（選配 `dst_ip`）、時間區間 `[t0,t1]`。Ingress gateway 視角。
-
-**通用流程**：
-
-1. 撈出與 `[t0,t1]` 重疊的版本，依 `valid_from` 切段。
-2. 收斂候選 Gateway/VS（見下）。
-3. 引擎 2A：path → route → cluster。
-4. cluster 名解析 Service+ns+port；套用 DR subset；選配 EndpointSlice。
-5. 回傳 per-version 結果。
-
-
-
-#### 視角收斂
+## 11. 套件邊界
 
 ```
-1. （traffic_simulation）dst_ip → 三跳候選 Gateway；（config_only）跳過
-2. Gateway.servers[].hosts 命中 host → 候選（traffic 在步驟 1 候選內找）
-3. VS：spec.hosts 命中 且 spec.gateways 含候選 Gateway（省略 gateways = mesh → 排除 ingress）
-4. VS http[] 依序比對 path → destination
+cmd/kube-state-graph          # 開 store、建 Resolver、注入 build.Options
+pkg/build                     # RouteResolver 介面、prescan、parse 接點、圖鏈
+  └── 不得 import pkg/route   # make check-route-containment
+pkg/route                     # 引擎實作
+  ├── resolver / ingresspick / ingresslb / scoped
+  ├── snapshot                # 三跳、ScopedFor、IP→ingress Services
+  ├── gwresolve               # host 比對、PickHosts
+  ├── translate               # ListenerFor、istiod 翻譯
+  ├── matchcheck              # router_check_tool
+  └── store                   # ClickHouse 唯讀
 ```
 
-
-
-#### traffic_simulation：IP → Gateway
-
-`ingressgateway workload → Gateway CR` **無 back-reference**；靠 `Gateway.spec.selector ⊆ ingress pod labels`
-的 label-selector join。用 **Deployment pod-template labels** 當 L。
-
-**IP 來源 union** → `ingress_ips` 陣列：`spec.externalIPs` ∪ `status.loadBalancer.ingress[]` ∪（選配）NodePort+NodeIP。
-
-**三跳 SQL**（每跳窄查詢 + `valid_from <= T AND T < valid_to`）：
-
-```sql
--- Hop1: has(ingress_ips, ip) → svc selector
-SELECT namespace AS ns, selector_kv AS svc_sel
-FROM svc_versions FINAL
-WHERE has(ingress_ips, {ip}) AND valid_from <= {t} AND {t} < valid_to;
-
--- Hop2: hasAll(pod_labels_kv, svc_sel) → L
-SELECT pod_labels_kv AS L FROM deploy_versions FINAL
-WHERE namespace = {ns} AND hasAll(pod_labels_kv, {svc_sel})
-  AND valid_from <= {t} AND {t} < valid_to;
-
--- Hop3: hasAll(L, selector_kv) → 候選 Gateway
-SELECT namespace, name, server_hosts FROM gw_versions FINAL
-WHERE hasAll({L}, selector_kv) AND valid_from <= {t} AND {t} < valid_to;
-```
-
-候選交 `gwresolve(host, candidates)` 做 most-specific host 消歧。可合併為單一 WITH join 查詢以攤平
-per-query overhead。
-
-**效能**：ingress 相關列數極小；掃描微秒級，延遲下限主要來自 ClickHouse per-query overhead（單 join
-約 1–5ms，三次 round-trip 約 5–15ms），對取證/低 QPS 足夠。
-
-**調校**：ingest 期物化 join 欄；`valid_to` sentinel；`ORDER BY (identity, valid_from)`；
-`bloom_filter` on `ingress_ips`；單一查詢 + prepared statement；必要時 `argMax` 取代 `FINAL`。
-
-#### 引擎 2A
-
-in-process link istiod `ConfigGenerator` → `RouteConfiguration` → `router_check_tool` 比對 `host+path`。
-命中 cluster `outbound|PORT|SUBSET|SERVICE.NS.svc.cluster.local`，destination 解析幾乎免費。
-代價：與 `istio.io/istio` 版本強耦合。
-
-**步驟概要**：
-
-1. `store.AsOf(T)` → VS+Gateway+DR+Service 快照 → `config.Config` / `*model.Service`。
-2. 建 `model.Environment` + `PushContext` + synthetic `model.Proxy`（Router + Gateway selector labels）。
-3. `ConfigGenerator.BuildHTTPRoutes` → RC。
-4. `router_check_tool` 比對 → 切 cluster 字串 →（選配）EndpointSlice。
-
-POC 落地差異（固定 `http.80`、無 `FakeDiscoveryServer`、sentinel 解析技巧等）見
-[poc/ARCHITECTURE.md](../poc/ARCHITECTURE.md)。
-
-### C. Prometheus export（並存）
-
-現有 `_info` metric 續用於即時可觀測性，**不是**路由回溯真實來源。
+不 dial Kubernetes apiserver；istio / client-go 僅作 in-memory 翻譯庫。
 
 ---
 
+## 12. 刻意不做的事（現況邊界）
 
-
-## 6. POC 現況摘要
-
-`poc/route2a`（獨立 Go module）已驗證：
-
-- 引擎 2A 全鏈：600 gateway × 100 VS，0 mismatch oracle
-- ClickHouse 四表、3-hop、`ResolveAmong`、CH-backed `ScopedFor`、多版本 `AsOf(T)`
-- benchmark 六階段計時（lookup / resolve / scopedfetch / translate / check / total）
-
-主專案待移植：`pkg/store`、`pkg/resolve`、ingest writer、`cmd/query`。
-完整 POC 架構與套件對照 → [poc/ARCHITECTURE.md](../poc/ARCHITECTURE.md)。
+| 項目 | 現況 |
+|------|------|
+| 歷史區間 API（回傳每個版本 destination） | 未實作；store 仍保留完整 interval，graph 路徑只用 as-of |
+| DestinationRule subset | cluster 字串有解析但 v1 丟棄 |
+| EndpointSlice 當路由層 | 不用；拓撲的 `service-selects-pod` 仍走 KSM |
+| Ingress CR / nginx.conf → backend | 未實作；非 Istio 只落到 LB Service |
+| Sidecar mesh 視角 | 只做南北向 ingress |
+| 新 node / edge type | 無；role 是既有 service 節點的 `labels` |
 
 ---
 
+## 一句話
 
-
-## 7. 主專案整合（關鍵檔案）
-
-
-| 檔案                         | 動作                                   |
-| -------------------------- | ------------------------------------ |
-| `pkg/collector/listers.go` | 重用 informer，掛事件 handler              |
-| `pkg/config/config.go`     | 新增 Istio GVR + `history:` 區塊         |
-| `pkg/store/`（新增）           | `Store` interface + ClickHouse 實作    |
-| `pkg/resolve/`（新增）         | 視角收斂、destination 解析；引擎 2A 移植自 POC    |
-| `pkg/ingressresolve/`（新增）  | IP→Gateway 三跳 + `ResolveAmong`       |
-| `cmd/query/`（新增）           | host/path/dst_ip/區間 → per-version 結果 |
-
-
-`cmd/main.go`（scrape exporter）與 ingest/query **解耦**。
-
----
-
-
-
-## 8. 驗證方式
-
-1. **引擎 2A**：POC `matchcheck` vs `scalegen` oracle（已在 `poc/route2a` 驗證）。
-2. **IP→Gateway 三跳**：POC `TestIPFlowClickHouse`；主專案需 mock 多候選案例。
-3. **時間回溯**：VS 變更後查橫跨區間 → 兩個版本各自 destination 正確。
-4. **解析對照**：`istioctl proxy-config routes` 比對。
-5. **store**：`AsOf(T)` 唯一版、`Overlap(t0,t1)` 全版本、`FINAL` 去重正確。
-
----
-
-
-
-## 9. 風險與注意事項
-
-1. **LB IP 在 status**：須觸發新版本（見 §4.1）。
-2. **多 A record / CNAME**：候選 IP 取 union。
-3. **Port / TLS**：POC 固定 HTTP :80。
-4. **istiod 版本耦合**：叢集升級須重建 query binary。
-5. **效能**：docker 下 `router_check_tool` 啟動 ~200ms 主導單筆延遲；三跳相對可忽略。
-
----
-
-
-
-## 10. 待實作清單
-
-- [x] ingest：event handler + ClickHouse writer（`pkg/history`）＋設定式欄位/型別/json path＋client 端 regex filter
-- [x] `pkg/store` ClickHouse：append-only writer + DDL 產生/驗證（`EnsureSchema` / `WriteBatch`）
-  - 查詢面 `AsOf(T)` / `Overlap(t0,t1)`（含 `valid_to` 推導）待查詢引擎階段實作
-- [ ] watch 新增 GVR：VS/Gateway/DR/Service/EndpointSlice/ingress Deployment（設定已支援；預設清單待補）
-- [x] POC：引擎 2A、`ResolveAmong`、IP→Gateway 三跳（`poc/route2a`）
-- [ ] 移植 POC `Translator` / `Runner.Resolve` → `pkg/resolve/envoy`
-- [ ] OTEL collector：span IP 優先、DNS lookup processor
-- [ ] DestinationRule subset + EndpointSlice 解析層
-- [ ] `cmd/query`：host/path/dst_ip/區間 API
-
----
-
-
-
-## 11. 一句話總結
-
-**ClickHouse 版本化快照（interval +** `hasAll` **join）+ 引擎 2A（istiod 翻譯 +** `router_check_tool`**）**，
-重用 informer 基礎，精準回放 host/path → Service+ns+port；ingress `IP→Gateway` 以 query-time 三跳下推
-ClickHouse，維持 per-resource 儲存。
+**DNS IP 鎖定入口叢集與門；FQDN + port 決定 Istio Gateway 上的 RouteConfiguration，再比對到後端 Service。沒有 Gateway 時，唯一的 ingress LB Service 就是終點。**
