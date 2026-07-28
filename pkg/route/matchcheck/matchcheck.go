@@ -141,9 +141,15 @@ var actualMarker = []byte("actual: [")
 
 // parseActuals reads router_check_tool --details output. Each case prints its
 // test_name (our decimal index) on its own line, followed by a line containing
-// "actual: [<cluster>]" (empty brackets == miss). Returns one cluster per index;
-// errors only if NOT A SINGLE case produced a detail line (i.e. the tool failed
-// before running tests).
+// "actual: [<cluster>]" (empty brackets == miss). Returns one cluster per index.
+//
+// It errors unless EVERY query was recovered. The marker rule — any all-digits
+// line re-points the current index — cannot distinguish a test name from a stray
+// numeric line the tool prints for its own reasons, and the scraped text format
+// is not a stable contract (design D8 rests on the MATCHER being Envoy's, not on
+// its output format). Today only a single query is ever posed, so a stray line
+// already fails closed; requiring a full result set makes that hold for any
+// batch size instead of by accident (design D7).
 func parseActuals(out []byte, n int) ([]string, error) {
 	res := make([]string, n)
 	filled := make([]bool, n)
@@ -171,8 +177,8 @@ func parseActuals(out []byte, n int) ([]string, error) {
 			cur = -1
 		}
 	}
-	if got == 0 {
-		return nil, fmt.Errorf("no per-case results parsed")
+	if got != n {
+		return nil, fmt.Errorf("parsed %d of %d per-case results", got, n)
 	}
 	return res, nil
 }

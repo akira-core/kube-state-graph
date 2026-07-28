@@ -475,8 +475,27 @@ func TestResolveRoute_ProbeErrorPropagates(t *testing.T) {
 		Return(nil, probeErr).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
-	_, _, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	_, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
 	assert.ErrorIs(t, err, probeErr)
+	// An infrastructure failure must not also claim a routing outcome —
+	// RouteNoGateway is the ingress-LB-fallback gate, so a store outage would
+	// read as "no Istio Gateway serves this host" (design D6).
+	assert.Empty(t, outcome)
+}
+
+// Same contract for the snapshot load: error in, empty outcome out.
+func TestResolveRoute_SnapshotLoadErrorCarriesNoOutcome(t *testing.T) {
+	loadErr := errors.New("clickhouse down")
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().ClustersWithIngressIP(mock.Anything, "198.51.100.7", testAt).
+		Return([]string{"prod-01"}, nil).Once()
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(store.TrafficSnapshot{}, loadErr).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	_, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
+	assert.ErrorIs(t, err, loadErr)
+	assert.Empty(t, outcome)
 }
 
 // ---------------------------------------------------------------------------

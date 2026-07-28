@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -75,6 +77,7 @@ type CH struct {
 	// exporter's default rewrite-close mode — see the package doc above.
 	uniqueRows bool
 	collapsed  atomic.Uint64
+	warnOnce   sync.Once
 }
 
 var _ Store = (*CH)(nil)
@@ -152,11 +155,32 @@ func (s *CH) Close() error { return s.conn.Close() }
 
 // CollapsedRows reports how many rows the client-side dedup has discarded
 // over this store's lifetime. Under uniqueRows it is the writer-uniqueness
-// alarm: any positive value means the "one row per version" guarantee broke
-// (wire to a metric/alert in production — tracked as follow-up). Without
-// uniqueRows, collapses are expected whenever the query races the exporter's
-// close-rewrite or a replay.
+// alarm: any positive value means the "one row per version" guarantee broke,
+// and warnCollapse logs it the first time it happens. Without uniqueRows,
+// collapses are expected whenever the query races the exporter's close-rewrite
+// or a replay.
 func (s *CH) CollapsedRows() uint64 { return s.collapsed.Load() }
+
+// warnCollapse fires the writer-uniqueness alarm the doc above promises. Only
+// meaningful under uniqueRows, where a collapse means the assertion the operator
+// made when enabling the flag is false — and the documented consequence is
+// silent data corruption (the closing rewrite pruned in SQL, a stale sentinel
+// twin winning the dedup unopposed, dead config versions treated as live).
+//
+// Logged once per store: the condition is a property of the writer, not of a
+// query, so repeating it per read would bury it. Without uniqueRows a collapse
+// is the expected race with the exporter's close-rewrite and says nothing.
+func (s *CH) warnCollapse(n int) {
+	if !s.uniqueRows {
+		return
+	}
+	s.warnOnce.Do(func() {
+		slog.Warn("route store collapsed duplicate rows while --route-store-unique-rows is set: "+
+			"the writer's one-row-per-version guarantee is broken, and SQL-side valid_to pruning "+
+			"can now treat dead config versions as live — disable the flag or fix the writer",
+			"collapsed_rows", n)
+	})
+}
 
 // dt64Lit renders t as a DateTime64(3) literal in UTC, truncated to the same
 // millisecond precision the columns store. Time operands must NOT be `?`
@@ -231,6 +255,7 @@ func dedupLiveAtCounted[T any](s *CH, rows []T, ver func(T) versionRow, at time.
 	rows = dedupLatest(rows, ver)
 	if n := before - len(rows); n > 0 {
 		s.collapsed.Add(uint64(n))
+		s.warnCollapse(n)
 	}
 	out := rows[:0]
 	for _, r := range rows {

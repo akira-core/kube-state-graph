@@ -72,6 +72,11 @@ type ingressIPProbe func(ctx context.Context, ip string, at time.Time) ([]string
 // resolve is ResolveRoute's body with the ingress-IP probe injected. The base
 // resolver passes r.st.ClustersWithIngressIP directly; the per-build scope
 // passes a memoising wrapper. Everything downstream is identical.
+//
+// When the returned error is non-nil the outcome is meaningless and MUST be the
+// empty value: RouteNoGateway is the ingress-LB-fallback gate below, so
+// returning it alongside an infrastructure failure would let a store outage read
+// as "no Istio Gateway serves this host" (design D6).
 func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe ingressIPProbe) (build.RouteDestination, build.RouteOutcome, error) {
 	if len(req.IPs) == 0 {
 		// Defensive: the prescan never emits an IP-less request (design D6) —
@@ -86,7 +91,7 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 	for i, ip := range req.IPs {
 		cands, err := probe(ctx, ip, req.At)
 		if err != nil {
-			return build.RouteDestination{}, build.RouteNoGateway, err
+			return build.RouteDestination{}, "", err
 		}
 		perIP[i] = cands
 	}
@@ -97,13 +102,13 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 
 	rows, err := r.loadSnapshot(ctx, cluster, req)
 	if err != nil {
-		return build.RouteDestination{}, build.RouteNoGateway, err
+		return build.RouteDestination{}, "", err
 	}
 	snap := snapshot.New(rows, req.At)
 
 	dest, outcome, err := r.resolveConfig(ctx, snap, req)
 	if err != nil {
-		return build.RouteDestination{}, build.RouteNoGateway, err
+		return build.RouteDestination{}, "", err
 	}
 
 	if outcome == build.RouteHit {
