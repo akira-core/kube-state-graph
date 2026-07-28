@@ -148,19 +148,61 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 // req.At: one store.LoadTrafficAt per destination IP, rows unioned —
 // multi-A-record DNS answers are a union of candidates WITHIN the one selected
 // cluster (design §9.2 / D10; cross-cluster unions are forbidden).
+//
+// The union is deduplicated by resource-version identity. Two destination IPs
+// published by the SAME ingress Service (a dual-stack Service carrying an A and
+// an AAAA address, or several addresses of one load balancer) make each per-IP
+// load return the same gateway/VS rows, and the store's own dedup only spans a
+// single call. Without this, ScopedFor would hand istiod the same
+// VirtualService twice and its config store would reject it ("item already
+// exists"), failing the whole resolution — see design D1.
 func (r *Resolver) loadSnapshot(ctx context.Context, cluster string, req build.RouteRequest) (store.TrafficSnapshot, error) {
 	var out store.TrafficSnapshot
+	svcSeen, depSeen := map[versionKey]bool{}, map[versionKey]bool{}
+	gwSeen, vsSeen := map[versionKey]bool{}, map[versionKey]bool{}
 	for _, ip := range req.IPs {
 		w, err := r.st.LoadTrafficAt(ctx, cluster, ip, req.At)
 		if err != nil {
 			return store.TrafficSnapshot{}, err
 		}
-		out.Services = append(out.Services, w.Services...)
-		out.Deploys = append(out.Deploys, w.Deploys...)
-		out.Gateways = append(out.Gateways, w.Gateways...)
-		out.VSes = append(out.VSes, w.VSes...)
+		for _, row := range w.Services {
+			appendUnseen(&out.Services, svcSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
+		}
+		for _, row := range w.Deploys {
+			appendUnseen(&out.Deploys, depSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
+		}
+		for _, row := range w.Gateways {
+			appendUnseen(&out.Gateways, gwSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
+		}
+		for _, row := range w.VSes {
+			appendUnseen(&out.VSes, vsSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
+		}
 	}
 	return out, nil
+}
+
+// versionKey identifies ONE resource version across per-IP loads. ValidFrom is
+// part of the identity so two genuine versions of one resource both survive;
+// IngestSeq deliberately is NOT — a rewrite twin and its closing row share a
+// version slot and the store collapses them before the union sees either.
+// ValidFrom is stored as UnixNano because a time.Time (monotonic reading +
+// *Location pointer) is not a sound map key.
+type versionKey struct {
+	cluster, namespace, name string
+	validFrom                int64
+}
+
+func keyOf(cluster, namespace, name string, validFrom time.Time) versionKey {
+	return versionKey{cluster: cluster, namespace: namespace, name: name, validFrom: validFrom.UnixNano()}
+}
+
+// appendUnseen appends row to dst the first time its key is seen.
+func appendUnseen[T any](dst *[]T, seen map[versionKey]bool, k versionKey, row T) {
+	if seen[k] {
+		return
+	}
+	seen[k] = true
+	*dst = append(*dst, row)
 }
 
 // candidates returns the gateway candidates for the request: the union of the

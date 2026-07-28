@@ -139,12 +139,25 @@ func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error)
 		Spec: &gwSpec,
 	}}
 
+	// Configs are keyed by resource identity: istiod's in-memory config store
+	// rejects a repeat ("item already exists"), which would fail the whole
+	// translation. Resolver.loadSnapshot already dedups its multi-IP union, but
+	// store.Store is an interface and this package's contract is to answer
+	// exactly what a point-in-time query would — so the invariant is enforced
+	// here too (design D1).
+	seen := map[string]bool{gvk.Gateway.String() + "|" + gw.Namespace + "|" + gwName: true}
+
 	var destHosts []string
 	for i := range s.w.VSes {
 		r := &s.w.VSes[i]
 		if !s.live(r.ValidFrom, r.ValidTo) || !boundTo(r.Namespace, r.BoundGateways, gw.Namespace, gwName) {
 			continue
 		}
+		key := gvk.VirtualService.String() + "|" + r.Namespace + "|" + r.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		var vsSpec networking.VirtualService
 		if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
 			return translate.ScopedInput{}, false, err
@@ -167,7 +180,8 @@ func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error)
 // snapshot's instant. Identity is the (namespace, name) parsed from each
 // destination.host FQDN — not scoped by the gateway namespace, so it's portable
 // to production where backend Service ns == VS ns != gateway ns. Each matched
-// row is one Service carrying all its ports.
+// row is one Service carrying all its ports, and each identity contributes at
+// most one registry entry (same duplicate-row reasoning as ScopedFor).
 func (s *Snapshot) backendServices(hosts []string) []*model.Service {
 	if len(hosts) == 0 {
 		return nil
@@ -178,12 +192,15 @@ func (s *Snapshot) backendServices(hosts []string) []*model.Service {
 			want[ns+"/"+name] = true
 		}
 	}
+	emitted := make(map[string]bool, len(want))
 	var out []*model.Service
 	for i := range s.w.Services {
 		r := &s.w.Services[i]
-		if len(r.Ports) == 0 || !want[r.Namespace+"/"+r.Name] || !s.live(r.ValidFrom, r.ValidTo) {
+		id := r.Namespace + "/" + r.Name
+		if len(r.Ports) == 0 || !want[id] || emitted[id] || !s.live(r.ValidFrom, r.ValidTo) {
 			continue
 		}
+		emitted[id] = true
 		pl := make(model.PortList, 0, len(r.Ports))
 		for _, p := range r.Ports {
 			pl = append(pl, &model.Port{Name: p.Name, Port: int(p.Port), Protocol: protocol.Parse(p.Name)})

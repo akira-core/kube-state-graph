@@ -129,6 +129,75 @@ func TestResolveRoute_LockedClusterScopesSnapshotLoads(t *testing.T) {
 		"empty snapshot on the selected cluster is an ordinary no-gateway miss")
 }
 
+// loadSnapshot unions one per-IP load per destination IP. Two IPs published by
+// the SAME ingress Service — a dual-stack Service carrying both an A and an AAAA
+// address is the common shape — return byte-identical rows, and an undeduped
+// union makes ScopedFor hand istiod the same VirtualService twice, which its
+// config store rejects ("item already exists"): the whole endpoint then falls
+// back to an external node. The union must carry each version once.
+func TestLoadSnapshot_DedupsOverlappingPerIPLoads(t *testing.T) {
+	from, to := testAt.Add(-time.Hour), testAt.Add(time.Hour)
+	snap := store.TrafficSnapshot{
+		Services: []store.ServiceRow{{
+			Cluster: "prod-01", Namespace: "istio-system", Name: "ingress-lb",
+			ValidFrom: from, ValidTo: to,
+			LoadBalancerIPs: []string{"198.51.100.7", "2001:db8::7"},
+			Selector:        []string{"istio=ingress"},
+		}},
+		Deploys: []store.DeployRow{{
+			Cluster: "prod-01", Namespace: "istio-system", Name: "ingress",
+			ValidFrom: from, ValidTo: to, PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{{
+			Cluster: "prod-01", Namespace: "istio-system", Name: "gw-000",
+			ValidFrom: from, ValidTo: to,
+			SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"api.example.com"},
+		}},
+		VSes: []store.VSRow{{
+			Cluster: "prod-01", Namespace: "istio-system", Name: "vs-api",
+			ValidFrom: from, ValidTo: to, BoundGateways: []string{"istio-system/gw-000"},
+		}},
+	}
+
+	st := storemocks.NewMockStore(t)
+	for _, ip := range []string{"198.51.100.7", "2001:db8::7"} {
+		// Both IPs resolve through the same Service, so the store returns the
+		// same rows for each.
+		st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", ip, testAt).Return(snap, nil).Once()
+	}
+	r := NewResolver(st, matchcheck.Runner{})
+
+	got, err := r.loadSnapshot(context.Background(), "prod-01",
+		testRequest("prod-01", "198.51.100.7", "2001:db8::7"))
+	require.NoError(t, err)
+	assert.Len(t, got.Services, 1, "same Service version loaded via two IPs must appear once")
+	assert.Len(t, got.Deploys, 1)
+	assert.Len(t, got.Gateways, 1)
+	assert.Len(t, got.VSes, 1)
+}
+
+// Distinct versions of one resource — the identity repeats but the version slot
+// does not — must both survive the union, so liveness selection downstream still
+// has both to choose between.
+func TestLoadSnapshot_KeepsDistinctVersionsOfOneResource(t *testing.T) {
+	boundary := testAt.Add(-30 * time.Minute)
+	older := store.GatewayRow{
+		Cluster: "prod-01", Namespace: "istio-system", Name: "gw-000",
+		ValidFrom: testAt.Add(-time.Hour), ValidTo: boundary,
+	}
+	newer := older
+	newer.ValidFrom, newer.ValidTo = boundary, testAt.Add(time.Hour)
+
+	st := storemocks.NewMockStore(t)
+	st.EXPECT().LoadTrafficAt(mock.Anything, "prod-01", "198.51.100.7", testAt).
+		Return(store.TrafficSnapshot{Gateways: []store.GatewayRow{older, newer}}, nil).Once()
+	r := NewResolver(st, matchcheck.Runner{})
+
+	got, err := r.loadSnapshot(context.Background(), "prod-01", testRequest("prod-01", "198.51.100.7"))
+	require.NoError(t, err)
+	assert.Len(t, got.Gateways, 2, "two version slots of one gateway are not duplicates")
+}
+
 // A gateway matched at the GATEWAY level (its ServerHosts union serves the
 // host) can still have no :port server serving it — the listener gate must
 // report RouteNoServerForHost and return BEFORE Translate and before r.run is

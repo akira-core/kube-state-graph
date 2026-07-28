@@ -9,6 +9,7 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 
 	"github.com/akira-core/kube-state-graph/pkg/route/store"
+	"github.com/akira-core/kube-state-graph/pkg/route/translate"
 )
 
 var (
@@ -186,6 +187,38 @@ func TestScopedForUsesVersionLiveAtInstant(t *testing.T) {
 				t.Fatalf("backend services = %v, want only %s", in.Services, c.wantSvc)
 			}
 		})
+	}
+}
+
+// TestScopedForDedupsDuplicateRows is the multi-IP union guard: a request whose
+// destination IPs are served by the same ingress Service loads the SAME gateway,
+// VS and backend rows once per IP, and Resolver.loadSnapshot concatenates them.
+// istiod's in-memory config store rejects a duplicate ("item already exists"),
+// so an undeduped translate input fails the whole resolution and the endpoint
+// falls back to an external node — the dual-stack ingress shape.
+//
+// The final Translate is the point of the test: asserting only on the config
+// count would not prove istiod accepts the input.
+func TestScopedForDedupsDuplicateRows(t *testing.T) {
+	w := testSnapshot(t)
+	// Exactly what two per-IP LoadTrafficAt calls against one dual-stack ingress
+	// Service return: byte-identical rows, appended twice.
+	w.Gateways = append(w.Gateways, w.Gateways[0])
+	w.VSes = append(w.VSes, w.VSes[0])
+	w.Services = append(w.Services, w.Services[0])
+
+	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	if err != nil || !found {
+		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
+	}
+	if len(in.Configs) != 2 {
+		t.Fatalf("configs = %d, want 2 (one gateway + one VS) — duplicates must collapse", len(in.Configs))
+	}
+	if len(in.Services) != 1 {
+		t.Fatalf("backend services = %d, want 1 — duplicates must collapse", len(in.Services))
+	}
+	if _, err := translate.NewTranslator().Translate(in); err != nil {
+		t.Fatalf("translate rejected the deduped input: %v", err)
 	}
 }
 
