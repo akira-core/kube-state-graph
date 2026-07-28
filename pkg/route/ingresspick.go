@@ -8,7 +8,7 @@ import (
 // selection (design D10). caller is the client pod's own cluster — it feeds
 // ONLY the family key and the collision tie-break, never a default answer.
 // perIP holds, per destination IP, the candidate clusters that had an ingress
-// Service carrying that IP overlapping the window (the store probe's output;
+// Service carrying that IP live at the resolution instant (the store probe's output;
 // order does not matter — selection is order-free).
 //
 // Per IP, with G the candidate set and F its same-family subset

@@ -47,9 +47,12 @@ type RouteRequest struct {
 // RouteDestination is a resolved route target: the Kubernetes Service an
 // Envoy cluster string (outbound|<port>|<subset>|<svc>.<ns>.svc.cluster.local)
 // names, in the engine-selected ingress cluster. Cluster, Namespace and
-// Service feed the graph — the triple is handed to the same
-// resolveServiceLevel used by every other service resolution path, anchored on
-// Cluster (design D11). Port and Subset are parsed but unused in v1 (labels
+// Service feed the graph — the triple is handed to resolveServiceLevel, the
+// same family-wide resolution every other service path uses, anchored on
+// Cluster (design D11). The ingress ENTRY POINT (the chain's first hop, and the
+// LB fallback's destination) instead goes through the locked-cluster variant:
+// an ingress address is per-cluster, so a family sibling's same-named Service
+// is not behind it. Port and Subset are parsed but unused in v1 (labels
 // stay strict typological metadata; a typed attribute would be a separate
 // change).
 type RouteDestination struct {

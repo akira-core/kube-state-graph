@@ -481,8 +481,8 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		r.noteExternal("route_engine_no_server_for_host", t, "host", key.host,
 			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoIngress:
-		// Design D10: no cluster had an ingress Service with any of the
-		// destination IPs in the window.
+		// Design D10: no cluster had an ingress Service carrying any of the
+		// destination IPs at the resolution instant.
 		r.noteExternal("route_engine_no_ingress", t, "host", key.host, "port", key.port,
 			"ips", key.ips, "peer_address", value, "caller_cluster", key.callerCluster,
 			"classify_reason", origReason)
@@ -495,7 +495,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 	case entry.outcome == RouteAmbiguousIngressService:
 		// ingress-lb-service-fallback: the Istio pipeline missed at gateway
 		// resolution and the destination IPs matched MORE than one ingress LB
-		// Service identity in the selected cluster's window — degrade rather
+		// Service identity in the selected cluster at the instant — degrade rather
 		// than guess, mirroring the ambiguous-ingress-cluster spirit.
 		r.noteExternal("route_engine_ambiguous_ingress_service", t, "host", key.host,
 			"port", key.port, "ips", key.ips, "peer_address", value,

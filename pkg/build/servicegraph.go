@@ -326,8 +326,11 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 
 		// Each side resolves to a (possibly empty) slice of node IDs. With the
 		// localised model a "://" endpoint resolves to AT MOST ONE service node —
-		// in the caller's own (anchor) cluster — or to a single external node;
-		// every other path also yields exactly one ID, and an empty slice drops
+		// in the caller's own (anchor) cluster — or to a single external node.
+		// Almost every path yields exactly one ID; the one exception is a
+		// chained RouteHit, which returns [ingress, backend] so the caller keeps
+		// its direct dependency alongside the entry-point hop (see the two-target
+		// case below). An empty slice drops
 		// the side (and with it the series — the cross product below is empty).
 		srcIDs, srcIsPod := res.resolveClient(clientLabel, traceCluster, clientUID, clientNS, ctClient)
 

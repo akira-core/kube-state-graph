@@ -376,7 +376,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 		 WHERE cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 		cluster, ip, ip)
 	if err != nil {
-		return w, fmt.Errorf("window ingress services: %w", err)
+		return w, fmt.Errorf("load ingress services: %w", err)
 	}
 	var ingSvcs []ServiceRow
 	for svcRows.Next() {
@@ -388,7 +388,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 		ingSvcs = append(ingSvcs, r)
 	}
 	if err := closeRows(svcRows); err != nil {
-		return w, fmt.Errorf("window ingress services: %w", err)
+		return w, fmt.Errorf("load ingress services: %w", err)
 	}
 	// Dedup BEFORE deriving selectors — a stale rewrite twin must not
 	// contribute its (possibly outdated) selector to the hop-2 fan-out.
@@ -427,7 +427,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 			 WHERE cluster = ? AND has(?, namespace) AND hasAll(pod_labels_kv, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, nsList, sel)
 		if err != nil {
-			return w, fmt.Errorf("window deploys: %w", err)
+			return w, fmt.Errorf("load deploys: %w", err)
 		}
 		for depRows.Next() {
 			var r DeployRow
@@ -438,7 +438,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 			deps = append(deps, r)
 		}
 		if err := closeRows(depRows); err != nil {
-			return w, fmt.Errorf("window deploys: %w", err)
+			return w, fmt.Errorf("load deploys: %w", err)
 		}
 	}
 	deps = dedupLiveAtCounted(s, deps, func(r DeployRow) versionRow {
@@ -471,7 +471,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 			 WHERE cluster = ? AND has(?, namespace) AND hasAll(?, selector_kv) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, nsList, labelUnion)
 		if err != nil {
-			return w, fmt.Errorf("window gateways: %w", err)
+			return w, fmt.Errorf("load gateways: %w", err)
 		}
 		gwRefs, err = s.appendGateways(&w, gwRows, at)
 		if err != nil {
@@ -586,7 +586,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 			 WHERE cluster = ? AND hasAny(bound_gateways, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, gwRefs)
 		if err != nil {
-			return fmt.Errorf("window virtualservices: %w", err)
+			return fmt.Errorf("load virtualservices: %w", err)
 		}
 		var vses []VSRow
 		for vsRows.Next() {
@@ -611,7 +611,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 			w.VSes = append(w.VSes, r)
 			var vsSpec networking.VirtualService
 			if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
-				return fmt.Errorf("window unmarshal vs %s/%s: %w", r.Namespace, r.Name, err)
+				return fmt.Errorf("unmarshal vs %s/%s: %w", r.Namespace, r.Name, err)
 			}
 			for _, h := range VSDestHosts(&vsSpec, r.Namespace) {
 				if !hostSeen[h] {
@@ -630,7 +630,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 			 WHERE cluster = ? AND has(?, concat(namespace, '/', name)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
 			cluster, chunk)
 		if err != nil {
-			return fmt.Errorf("window backend services: %w", err)
+			return fmt.Errorf("load backend services: %w", err)
 		}
 		for bsRows.Next() {
 			r, err := scanServiceRow(bsRows)
@@ -649,7 +649,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 }
 
 // scanServiceRow scans one full service_versions row, decoding spec_json into
-// Ports. Shared by the ingress and backend window loads.
+// Ports. Shared by the ingress and backend loads.
 func scanServiceRow(rows driver.Rows) (ServiceRow, error) {
 	var r ServiceRow
 	var specJSON string
