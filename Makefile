@@ -1,6 +1,7 @@
 .PHONY: build test vet lint vuln ci cover docs check-docs check-route-containment clean \
         docker-build docker-push docker-buildx docker-run docker-docs docker-docs-stop \
-        init init-go init-tools init-hooks doctor mocks verify-mocks tools-versions
+        init init-go init-tools init-hooks doctor mocks verify-mocks tools-versions \
+        router-check-tool
 
 BIN_DIR := bin
 BIN     := $(BIN_DIR)/kube-state-graph
@@ -18,6 +19,11 @@ VERSION       ?= $(shell git describe --tags --always --dirty 2>/dev/null || ech
 COMMIT        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 DOCKERFILE    := deploy/docker/server.Dockerfile
+# Read the digest-pinned Envoy tools image straight out of the Dockerfile's ARG
+# so the matcher CI installs is byte-identical to the one the server image
+# ships. One declaration, no drift check needed.
+ENVOY_TOOLS_IMAGE := $(shell sed -n 's/^ARG ENVOY_TOOLS_IMAGE=//p' $(DOCKERFILE))
+ROUTER_CHECK_BIN  := $(BIN_DIR)/router_check_tool
 PLATFORMS     ?= linux/amd64,linux/arm64
 LOCAL_TAG     := localhost/kube-state-graph/server:dev
 DOCKER_BUILD_ARGS := \
@@ -170,6 +176,22 @@ check-route-containment:
 	    exit 1; \
 	fi
 	@echo "route-engine containment OK (pkg/kubegraph and pkg/build never reach pkg/route or client-go)"
+
+## Extract router_check_tool from the digest-pinned Envoy tools image into
+## $(ROUTER_CHECK_BIN). The route-engine e2e (internal/integration TestRouteSuite)
+## needs the native binary and FAILS rather than skips under CI, so this is the
+## CI install step as well as a local convenience. `docker create` materialises
+## the container filesystem WITHOUT running anything — no entrypoint, no port.
+## The binary is a dynamically linked Linux C++ executable: it runs on a Linux
+## host (or a Linux container) and NOT on macOS, where developers keep skipping.
+router-check-tool:
+	@mkdir -p $(BIN_DIR)
+	@echo ">> extracting router_check_tool from $(ENVOY_TOOLS_IMAGE)"
+	@cid=$$(docker create $(ENVOY_TOOLS_IMAGE)) && \
+	    docker cp $$cid:/usr/local/bin/router_check_tool $(ROUTER_CHECK_BIN) >/dev/null && \
+	    docker rm -f $$cid >/dev/null
+	@chmod +x $(ROUTER_CHECK_BIN)
+	@echo "router_check_tool -> $(ROUTER_CHECK_BIN)"
 
 ## Full local CI mirror — runs the same checks as the five GitHub Actions jobs
 ## in .github/workflows/ci.yml (lint, vuln, test, docs-drift, mocks-drift), in

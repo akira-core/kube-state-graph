@@ -129,9 +129,13 @@ func dt64s(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000"
 // RouteSuite exercises translate-global-fqdn-to-k8s-service end to end: a
 // real VictoriaMetrics container carries the topology + service-graph
 // fixtures, a real ClickHouse container carries the versioned Istio config,
-// and the REAL router_check_tool binary performs the route match. The whole
-// suite skips when the tool is unavailable (it is a Linux binary; macOS dev
-// machines skip, CI runs it — mirroring SkipIfDockerUnavailable).
+// and the REAL router_check_tool binary performs the route match.
+//
+// The tool is a dynamically linked Linux binary, so a macOS dev machine cannot
+// run it and the suite skips there. In CI it MUST run: the workflow installs it
+// via `make router-check-tool` and a missing binary FAILS the suite rather than
+// skipping it. A skip prints as `ok`, which is exactly how a batch of
+// engine-level defects previously merged green.
 type RouteSuite struct {
 	VMSuite
 
@@ -149,10 +153,16 @@ func (s *RouteSuite) SetupSuite() {
 	SkipIfDockerUnavailable(s.T())
 
 	// Native router_check_tool only (the docker fallback was deliberately
-	// dropped): KSG_ROUTER_CHECK_BIN or PATH. Absent → skip, per task 8.4.
+	// dropped): KSG_ROUTER_CHECK_BIN or PATH. Absent → skip locally, FAIL in
+	// CI: this suite is the only end-to-end coverage of the route engine, and a
+	// silent skip there means every engine regression merges green.
 	runner, err := matchcheck.NewRunner(os.Getenv("KSG_ROUTER_CHECK_BIN"))
 	if err != nil {
-		s.T().Skipf("router_check_tool unavailable (set KSG_ROUTER_CHECK_BIN or put it on PATH): %v", err)
+		const msg = "router_check_tool unavailable (set KSG_ROUTER_CHECK_BIN or put it on PATH): %v"
+		if os.Getenv("CI") != "" {
+			s.T().Fatalf(msg+" — CI must run this suite (see `make router-check-tool`)", err)
+		}
+		s.T().Skipf(msg, err)
 	}
 	s.runner = runner
 
