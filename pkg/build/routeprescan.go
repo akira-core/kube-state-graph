@@ -359,21 +359,22 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 			dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
 			cancel()
 
-			entry := routeEntry{dest: dest, outcome: outcome}
+			entry, record := routeEntry{dest: dest, outcome: outcome}, true
 			if err != nil {
 				slog.Debug("route-engine resolution errored (endpoint degrades to external)",
 					"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips, "error", err)
-				if ctx.Err() != nil {
-					// The build deadline, not the engine: leave no entry, so the
-					// endpoint keeps the pre-change external reason a key the
-					// serial loop never reached would have had.
-					return nil
-				}
-				entry = routeEntry{failed: true}
+				// A build-deadline cancellation is not an engine failure:
+				// record nothing, so the endpoint keeps the pre-change external
+				// reason a key the loop never reached would have had.
+				entry, record = routeEntry{failed: true}, ctx.Err() == nil
 			}
-			mu.Lock()
-			idx[k] = entry
-			mu.Unlock()
+			if record {
+				mu.Lock()
+				idx[k] = entry
+				mu.Unlock()
+			}
+			// The error is deliberately swallowed: route resolution can never
+			// fail a build (design D9); it is recorded per key instead.
 			return nil
 		})
 	}

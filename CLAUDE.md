@@ -309,10 +309,16 @@ live under `openspec/specs/`.
   unclassifiable branch makes the feature a silent no-op for its motivating
   case. **(2) I/O stays out of the parse** (D6): `ReadServiceGraph` runs a pure
   prescan (`collectRouteQueries`, sharing `classifyPeerHost` /
-  `lookupClientPod` / `anchorHolds` with the parse so the two cannot drift),
-  resolves the deduped keys serially (each bounded by
-  `--route-resolve-timeout`), and hands `parseServiceGraphRoutes` a prefetched
-  index — nil index ⇒ byte-for-byte pre-change output. **(3) Listener port
+  `lookupClientPod` / `anchorHolds` with the parse — and, in `ReadServiceGraph`,
+  the very same `sgResolver` instance, so the two cannot drift and the topology
+  indexes are built once per build), resolves the deduped keys under a bounded
+  `errgroup` (`routeResolveConcurrency`; each call bounded by
+  `--route-resolve-timeout`; the key set capped at `maxRouteKeys` with any
+  truncation logged), and hands `parseServiceGraphRoutes` a prefetched index —
+  nil index ⇒ byte-for-byte pre-change output. Concurrency cannot change the
+  index's CONTENTS (entries are keyed by `routeKey` and independent); it changes
+  only which keys are answered when the build deadline fires first, already
+  wall-clock dependent when the loop was serial. **(3) Listener port
   precedence** (D5): the `:<port>` on the peer-address value (now returned by
   `splitPeerAddressPort`, no longer discarded) → the optional
   `client_server_port` / `client_net_peer_port` dimension → default **443**
@@ -353,9 +359,11 @@ live under `openspec/specs/`.
   (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
   drives the whole build through one `scopedResolver` scope that caches the
   probe by `(ip, at)`, collapsing keys that share a destination IP to a
-  single store read. The scope is one-build/serial (no mutex); the shared
-  `*Resolver` stays stateless (an instance cache would leak). Errors are not
-  cached; no outcome/determinism change.
+  single store read. The scope is one-build and mutex-guarded (keys resolve
+  concurrently; the store read stays outside the lock, so a racing duplicate
+  probe is possible and harmless); the shared `*Resolver` stays stateless (an
+  instance cache would leak). Errors are not cached; no outcome/determinism
+  change.
   **(5) The engine** (`pkg/route`) loads an **ingress-cluster-scoped,
   read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
   `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
@@ -367,6 +375,19 @@ live under `openspec/specs/`.
   exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
   opts into SQL-side pruning for update-close writers ONLY; time operands are
   `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
+  the **multi-IP union is deduped by resource-version identity**
+  `(cluster, namespace, name, valid_from)` — a dual-stack ingress Service makes
+  each per-IP load return the same rows, and istiod's config store rejects a
+  duplicate, so an undeduped union failed the whole resolution; `ScopedFor` /
+  `backendServices` enforce the same one-entry-per-identity invariant on their
+  own output. **Destination-host identity follows istiod exactly**: every
+  config carries `Domain` (`store.ClusterDomain`), so a dot-free
+  `destination.host` resolves to `<name>.<vs-namespace>.svc.cluster.local` (the
+  common way operators write a destination) while anything containing a dot is
+  left verbatim — istiod does not expand `checkout.shop` either, so that shape
+  names no registry Service and correctly stays external. One
+  `store.VSDestHosts` serves both the reader and the snapshot, and
+  `ParseBackendHost` requires exactly two leading labels;
   bare `spec.gateways` names bind same-namespace gateways — see design
   "production reader compatibility"),
   translates that one gateway's scoped config via
@@ -379,12 +400,25 @@ live under `openspec/specs/`.
   candidate Gateway must live in the ingress Service's OWN namespace —
   enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1
   nsList, like the deploy hop) and the in-memory hop
-  (`r.Namespace == svcNS`) — so within a resolution the candidate set can
-  never hold two same-named Gateways (K8s per-ns name uniqueness) and the
-  bare-name gateway identity through `gwresolve`/`ScopedFor` is unambiguous
-  by construction. Istio's cross-namespace selector attachment is
-  deliberately out of scope (degrades `no_gateway` → LB fallback/external;
-  extension path: thread `(namespace, name)` end-to-end). Two
+  (`r.Namespace == svcNS`) — so a single IP's candidate set can never hold two
+  same-named Gateways (K8s per-ns name uniqueness). Istio's cross-namespace
+  selector attachment is deliberately out of scope (degrades `no_gateway` → LB
+  fallback/external). The **gateway identity carried downstream is
+  `(namespace, name)`** (`ScopedFor(ns, name)`): the LOADED rows are a
+  deliberate superset spanning namespaces (the gw_versions SQL binds the union
+  of every ingress Service namespace carrying the IP), and a multi-IP request
+  unions candidates across IPs, so a bare-name scan could select another
+  namespace's same-named Gateway — and since the selected row's namespace also
+  decides which VirtualServices bind to it, that was a WRONG destination, not a
+  miss. `gwresolve` still matches on host patterns and returns a bare name;
+  `pickCandidate` recovers the namespace, and same-named candidates from two
+  namespaces (only reachable multi-IP) degrade rather than guess. **Hop 1
+  degrades on ambiguity** — more than one live Service identity carrying the IP
+  yields no candidates, matching `ingressServiceIdentity`'s rule for the same
+  situation — and **hop 2 unions** the pod labels of every matching ingress
+  Deployment (a revision-based canary gateway upgrade runs two; the SQL layer's
+  `labelUnion` already did this), so neither hop depends on storage row order.
+  Two
   different-named candidates declaring an identical equal-specificity host
   pattern resolve to the **lexically-smallest gateway name**
   (`gwresolve.sortPats` tie-break; `PickHosts`' numeric-index semantics

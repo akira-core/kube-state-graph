@@ -476,7 +476,7 @@ func TestResolveRoute_ProbeErrorPropagates(t *testing.T) {
 	r := NewResolver(st, matchcheck.Runner{})
 
 	_, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
-	assert.ErrorIs(t, err, probeErr)
+	require.ErrorIs(t, err, probeErr)
 	// An infrastructure failure must not also claim a routing outcome —
 	// RouteNoGateway is the ingress-LB-fallback gate, so a store outage would
 	// read as "no Istio Gateway serves this host" (design D6).
@@ -494,7 +494,7 @@ func TestResolveRoute_SnapshotLoadErrorCarriesNoOutcome(t *testing.T) {
 	r := NewResolver(st, matchcheck.Runner{})
 
 	_, outcome, err := r.ResolveRoute(context.Background(), testRequest("prod-01", "198.51.100.7"))
-	assert.ErrorIs(t, err, loadErr)
+	require.ErrorIs(t, err, loadErr)
 	assert.Empty(t, outcome)
 }
 
