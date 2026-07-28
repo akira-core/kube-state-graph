@@ -121,14 +121,14 @@ implementation (GREEN).
 ## 9. Verification
 
 - [x] 9.1 `go test ./pkg/route/... ./pkg/build/ -count=1 -race`
-- [ ] 9.2 `KSG_ROUTER_CHECK_BIN=... CI=1 go test ./internal/integration/ -run 'TestRouteSuite|TestRouteStoreSuite' -v`
+- [x] 9.2 `KSG_ROUTER_CHECK_BIN=... CI=1 go test ./internal/integration/ -run 'TestRouteSuite|TestRouteStoreSuite' -v`
 - [x] 9.3 `make ci` green (lint + vuln + test + docs + mocks + containment)
-- [ ] 9.4 Real GitHub Actions run: the matcher install step succeeds; the route e2e
+- [x] 9.4 Real GitHub Actions run: the matcher install step succeeds; the route e2e
       executes (not `SKIP`); `-timeout 30m` appears in the test command; the containment
       job is present and green. Prove the guard by temporarily disabling the install step
       and confirming the job goes RED, then restore it.
-- [ ] 9.5 `openspec verify harden-istio-route-resolution`
-- [ ] 9.6 Reply on PR #7 covering EVERY review finding — including the three where this
+- [x] 9.5 `openspec verify harden-istio-route-resolution`
+- [x] 9.6 Reply on PR #7 covering EVERY review finding — including the three where this
       change's conclusion differs from the review's (dotted relative destination hosts are
       not a defect; ingress identity from backend rows is intended; the matcher parse is
       currently fail-closed) and the one the reviewer self-corrected (`recover()`).
