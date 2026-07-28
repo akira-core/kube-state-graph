@@ -129,6 +129,32 @@ func TestResolveRoute_LockedClusterScopesSnapshotLoads(t *testing.T) {
 		"empty snapshot on the selected cluster is an ordinary no-gateway miss")
 }
 
+// gwresolve matches host patterns and returns a bare gateway name; the
+// namespace has to come back with it, because ScopedFor now selects by
+// (namespace, name). Within one namespace the name is unique (Kubernetes
+// guarantees it) and hop 3 scopes candidates to the ingress namespace, so the
+// ambiguous case needs a multi-IP request whose per-IP hop 1 landed in different
+// namespaces — and there, neither candidate is more correct than the other.
+func TestPickCandidate(t *testing.T) {
+	istio := store.GatewayCand{Namespace: "istio-system", Name: "public-gw"}
+	nginx := store.GatewayCand{Namespace: "nginx-ingress", Name: "public-gw"}
+	other := store.GatewayCand{Namespace: "istio-system", Name: "other-gw"}
+
+	t.Run("unique_name", func(t *testing.T) {
+		got, ok := pickCandidate([]store.GatewayCand{istio, other}, "public-gw")
+		require.True(t, ok)
+		assert.Equal(t, istio, got)
+	})
+	t.Run("same_name_two_namespaces_degrades", func(t *testing.T) {
+		_, ok := pickCandidate([]store.GatewayCand{istio, nginx}, "public-gw")
+		assert.False(t, ok, "an unresolvable collision must degrade, not pick one")
+	})
+	t.Run("no_such_name", func(t *testing.T) {
+		_, ok := pickCandidate([]store.GatewayCand{istio}, "missing-gw")
+		assert.False(t, ok)
+	})
+}
+
 // loadSnapshot unions one per-IP load per destination IP. Two IPs published by
 // the SAME ingress Service — a dual-stack Service carrying both an A and an AAAA
 // address is the common shape — return byte-identical rows, and an undeduped

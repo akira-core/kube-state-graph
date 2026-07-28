@@ -227,12 +227,20 @@ func candidates(snap *snapshot.Snapshot, ips []string) []store.GatewayCand {
 // → istiod translate → router_check_tool → Envoy cluster-string parse.
 func (r *Resolver) resolveConfig(ctx context.Context, snap *snapshot.Snapshot, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
 	cands := candidates(snap, req.IPs)
-	gw, ok := gwresolve.New(candsToGateways(cands)).ResolveAmong(req.Host, candNames(cands))
+	gwName, ok := gwresolve.New(candsToGateways(cands)).ResolveAmong(req.Host, candNames(cands))
 	if !ok {
 		return build.RouteDestination{}, build.RouteNoGateway, nil // no gateway serves the host
 	}
+	gw, ok := pickCandidate(cands, gwName)
+	if !ok {
+		// Two candidates share a bare name across namespaces — only reachable
+		// when a multi-IP request's per-IP hop 1 landed in different namespaces.
+		// Neither is more correct than the other, so degrade instead of guessing
+		// (design D3); the caller's LB fallback still applies.
+		return build.RouteDestination{}, build.RouteNoGateway, nil
+	}
 
-	scoped, found, err := snap.ScopedFor(gw)
+	scoped, found, err := snap.ScopedFor(gw.Namespace, gw.Name)
 	if err != nil {
 		return build.RouteDestination{}, "", err
 	}
@@ -300,6 +308,23 @@ func ParseEnvoyCluster(cluster string) (build.RouteDestination, bool) {
 		Port:      uint32(port),
 		Subset:    parts[2],
 	}, true
+}
+
+// pickCandidate recovers the full candidate — namespace included — that
+// gwresolve selected by name. gwresolve matches on host patterns and returns a
+// bare name, which is unambiguous within one namespace (Kubernetes guarantees
+// it) and therefore for any single-IP request, since hop 3 scopes candidates to
+// the ingress namespace. ok=false only when a multi-IP request contributed
+// same-named candidates from two namespaces.
+func pickCandidate(cands []store.GatewayCand, name string) (store.GatewayCand, bool) {
+	var found store.GatewayCand
+	n := 0
+	for _, c := range cands {
+		if c.Name == name {
+			found, n = c, n+1
+		}
+	}
+	return found, n == 1
 }
 
 // candsToGateways / candNames adapt store.GatewayCand rows for gwresolve.

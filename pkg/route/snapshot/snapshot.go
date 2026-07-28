@@ -14,6 +14,8 @@
 package snapshot
 
 import (
+	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -54,34 +56,45 @@ func New(w store.TrafficSnapshot, at time.Time) *Snapshot {
 // uniqueness) and the bare-name identity downstream is unambiguous. Empty
 // result => traffic miss.
 func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
-	// Hop 1: IP -> ingress Service (its namespace + selector).
-	var svcNS string
-	var svcSel []string
-	found := false
-	for i := range s.w.Services {
-		r := &s.w.Services[i]
-		if s.live(r.ValidFrom, r.ValidTo) && r.HasIngressIP(ip) {
-			svcNS, svcSel, found = r.Namespace, r.Selector, true
-			break
-		}
-	}
+	// Hop 1: IP -> ingress Service (its namespace + selector). More than ONE
+	// live identity carrying the IP means the question "which Service owns this
+	// address" has no answer, so the hop degrades rather than taking whichever
+	// row the store returned first — the same rule the ingress LB Service
+	// identity dedup already applies to this exact situation (design D4). A
+	// single identity with several rows is only a defensive case (liveness is
+	// exclusive per version slot); the lexically-smallest selector wins, per the
+	// repo-wide determinism convention.
+	svcNS, svcSel, found := s.ingressServiceFor(ip)
 	if !found {
 		return nil
 	}
 
 	// Hop 2: Service selector -> ingress Deployment pod labels L (svc.selector ⊆ L).
+	// Several matching Deployments is a NORMAL state — a revision-based canary
+	// gateway upgrade runs two whose pods both satisfy the Service selector — so
+	// the hop takes the UNION of their labels rather than one Deployment's set.
+	// That is also what the store query itself computes (labelUnion), and hop 3
+	// is a subset test over the result (design D4).
 	var podLabels []string
 	found = false
+	seen := map[string]bool{}
 	for i := range s.w.Deploys {
 		r := &s.w.Deploys[i]
-		if s.live(r.ValidFrom, r.ValidTo) && r.Namespace == svcNS && containsAll(r.PodLabels, svcSel) {
-			podLabels, found = r.PodLabels, true
-			break
+		if !s.live(r.ValidFrom, r.ValidTo) || r.Namespace != svcNS || !containsAll(r.PodLabels, svcSel) {
+			continue
+		}
+		found = true
+		for _, l := range r.PodLabels {
+			if !seen[l] {
+				seen[l] = true
+				podLabels = append(podLabels, l)
+			}
 		}
 	}
 	if !found {
 		return nil
 	}
+	sort.Strings(podLabels) // order-free result, independent of row order
 
 	// Hop 3: L -> candidate gateways (gateway.selector ⊆ L, same namespace as
 	// the ingress Service).
@@ -94,6 +107,41 @@ func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
 	}
 	return cands
 }
+
+// ingressServiceFor answers hop 1: which Service owns ip at the instant, and
+// what does it select? ok=false when no live row carries the IP, or when more
+// than one distinct (namespace, name) identity does — the latter is a genuine
+// ambiguity, and guessing would pick a namespace that then scopes hop 3 and the
+// gateway's whole configuration.
+func (s *Snapshot) ingressServiceFor(ip string) (ns string, selector []string, ok bool) {
+	var id ingressID
+	for i := range s.w.Services {
+		r := &s.w.Services[i]
+		if !s.live(r.ValidFrom, r.ValidTo) || !r.HasIngressIP(ip) {
+			continue
+		}
+		cur := ingressID{ns: r.Namespace, name: r.Name}
+		if !ok {
+			id, selector, ok = cur, r.Selector, true
+			continue
+		}
+		if cur != id {
+			return "", nil, false // several owners at one instant: no answer
+		}
+		// Same identity twice is a data anomaly (liveness is exclusive per
+		// version slot); pick deterministically rather than by row order.
+		if joinSel(r.Selector) < joinSel(selector) {
+			selector = r.Selector
+		}
+	}
+	return id.ns, selector, ok
+}
+
+// ingressID is one ingress Service identity within the loaded cluster.
+type ingressID struct{ ns, name string }
+
+// joinSel renders a selector set for the defensive lexical tie-break above.
+func joinSel(sel []string) string { return strings.Join(sel, "\x00") }
 
 // ResolveIPToIngressServices returns every service row live at the snapshot's
 // instant whose ingress IPs (external or load-balancer) contain ip — the
@@ -118,11 +166,20 @@ func (s *Snapshot) ResolveIPToIngressServices(ip string) []store.ServiceRow {
 // ScopedFor rebuilds one gateway's translate input as of the snapshot's instant:
 // its Gateway CR + the VirtualServices bound to it + the backend Services those
 // VS route to. ok=false if the gateway has no version live at that instant.
-func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error) {
+//
+// The gateway is identified by (namespace, name), NOT by bare name. Hop 3 scopes
+// CANDIDATES to the ingress namespace, but the loaded rows are a deliberate
+// superset spanning namespaces (the gw_versions query binds the union of every
+// ingress Service namespace carrying the IP, and a multi-IP request unions
+// candidates across IPs). Matching by name alone could select a same-named
+// Gateway from another namespace — and since the selected row's namespace also
+// decides which VirtualServices bind to it, that yielded a WRONG destination
+// rather than a miss (design D3).
+func (s *Snapshot) ScopedFor(gwNS, gwName string) (translate.ScopedInput, bool, error) {
 	var gw *store.GatewayRow
 	for i := range s.w.Gateways {
 		r := &s.w.Gateways[i]
-		if r.Name == gwName && s.live(r.ValidFrom, r.ValidTo) {
+		if r.Namespace == gwNS && r.Name == gwName && s.live(r.ValidFrom, r.ValidTo) {
 			gw = r
 			break
 		}

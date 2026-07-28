@@ -800,7 +800,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotThreeHopAndTranslate() {
 	s.Require().True(ok)
 	s.Equal("public-gw", gw)
 
-	scoped, found, err := snap.ScopedFor(gw)
+	scoped, found, err := snap.ScopedFor("istio-system", gw)
 	s.Require().NoError(err)
 	s.Require().True(found)
 	scoped.Port = 443
@@ -904,7 +904,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	// boundTo: the bare-name binding ("public-gw-http" in the gateway's own
 	// namespace) must reach ScopedFor's translate input.
 	snap := snapshot.New(w, fixedNow)
-	scoped, found, err := snap.ScopedFor("public-gw-http")
+	scoped, found, err := snap.ScopedFor("istio-system", "public-gw-http")
 	s.Require().NoError(err)
 	s.Require().True(found)
 	s.Len(scoped.Configs, 2, "gateway CR + the bare-ref-bound VirtualService")

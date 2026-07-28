@@ -105,7 +105,7 @@ func TestScopedForBareGatewayRef(t *testing.T) {
 	w.VSes[0].Namespace = "ns-a"
 	w.VSes[0].BoundGateways = []string{"gw-a"}
 
-	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
 	if err != nil || !found {
 		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
 	}
@@ -126,7 +126,7 @@ func TestScopedForToleratesUnknownSpecFields(t *testing.T) {
 	w.Gateways[0].SpecJSON = `{"futureField":{"x":1},` + w.Gateways[0].SpecJSON[1:]
 	w.VSes[0].SpecJSON = `{"anotherFutureField":"y",` + w.VSes[0].SpecJSON[1:]
 
-	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
 	if err != nil {
 		t.Fatalf("ScopedFor must tolerate unknown spec fields (DiscardUnknown): %v", err)
 	}
@@ -173,7 +173,7 @@ func TestScopedForUsesVersionLiveAtInstant(t *testing.T) {
 		{"after_boundary", boundary.Add(time.Hour), "gw-a-NEW", "svc-2.ns-a.svc.cluster.local"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			in, found, err := New(w, c.at).ScopedFor("gw-a")
+			in, found, err := New(w, c.at).ScopedFor("ns-a", "gw-a")
 			if err != nil || !found {
 				t.Fatalf("ScopedFor: found=%v err=%v", found, err)
 			}
@@ -207,7 +207,7 @@ func TestScopedForDedupsDuplicateRows(t *testing.T) {
 	w.VSes = append(w.VSes, w.VSes[0])
 	w.Services = append(w.Services, w.Services[0])
 
-	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
 	if err != nil || !found {
 		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
 	}
@@ -233,7 +233,7 @@ func TestScopedForResolvesBareShortDestinationHost(t *testing.T) {
 	w := testSnapshot(t)
 	w.VSes[0].SpecJSON = vsSpecJSON(t, "svc.example.com", "svc-1") // bare short name
 
-	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
 	if err != nil || !found {
 		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
 	}
@@ -268,7 +268,7 @@ func TestScopedForLeavesDottedRelativeDestinationHost(t *testing.T) {
 	w := testSnapshot(t)
 	w.VSes[0].SpecJSON = vsSpecJSON(t, "svc.example.com", "svc-1.ns-a")
 
-	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
 	if err != nil || !found {
 		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
 	}
@@ -277,12 +277,136 @@ func TestScopedForLeavesDottedRelativeDestinationHost(t *testing.T) {
 	}
 }
 
+// TestScopedForSelectsGatewayByNamespace: hop 3 scopes CANDIDATES to the ingress
+// namespace, but the loaded rows are a deliberate superset spanning namespaces
+// (the gw_versions query binds the union of every ingress Service namespace
+// carrying the IP). Matching a gateway by bare name could pick the other
+// namespace's row — and since that row's namespace also decides which
+// VirtualServices bind to it, the result was a WRONG destination, not a miss.
+func TestScopedForSelectsGatewayByNamespace(t *testing.T) {
+	w := testSnapshot(t)
+	// The impostor is FIRST in the slice, so a bare-name scan picks it.
+	w.Gateways = append([]store.GatewayRow{{
+		Namespace: "ns-b", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
+		SelectorKV: []string{"app=gw-a"}, ServerHosts: []string{"*.example.com"},
+		SpecJSON: gwSpecJSON(t, "gw-a-IMPOSTOR"),
+	}}, w.Gateways...)
+	// ...and it has its own bound VS routing somewhere else entirely.
+	w.VSes = append(w.VSes, store.VSRow{
+		Namespace: "ns-b", Name: "vs-b", ValidFrom: sigT0, ValidTo: sigT1,
+		BoundGateways: []string{"ns-b/gw-a"},
+		SpecJSON:      vsSpecJSON(t, "other.example.com", "svc-b.ns-b.svc.cluster.local"),
+	})
+	w.Services = append(w.Services, store.ServiceRow{
+		Namespace: "ns-b", Name: "svc-b", ValidFrom: sigT0, ValidTo: sigT1,
+		Ports: []store.SvcPort{{Name: "http", Port: 8080, Protocol: "TCP"}},
+	})
+
+	in, found, err := New(w, sigMid).ScopedFor("ns-a", "gw-a")
+	if err != nil || !found {
+		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
+	}
+	if got := in.Proxy.Labels["app"]; got != "gw-a" {
+		t.Errorf("selected gateway selector = %q, want ns-a's own (%q)", got, "gw-a")
+	}
+	if in.Proxy.Namespace != "ns-a" {
+		t.Errorf("proxy namespace = %q, want ns-a", in.Proxy.Namespace)
+	}
+	if len(in.Configs) != 2 {
+		t.Fatalf("configs = %d, want 2 — only ns-a's gateway and its bound VS", len(in.Configs))
+	}
+	if len(in.Services) != 1 || string(in.Services[0].Hostname) != "svc-1.ns-a.svc.cluster.local" {
+		t.Fatalf("backend services = %v, want only ns-a's — the impostor's VS must not bind", in.Services)
+	}
+}
+
+// Hop 1 asks "which Service owns this IP". Two live identities carrying it means
+// the question has no answer: guessing would pick a namespace that then scopes
+// hop 3 and the gateway's whole configuration (design D4).
+func TestResolveIPToGatewaysAmbiguousIngressServiceDegrades(t *testing.T) {
+	const ip = "198.51.100.7"
+	w := store.TrafficSnapshot{
+		Services: []store.ServiceRow{
+			{
+				Namespace: "istio-system", Name: "ingress-lb", ValidFrom: sigT0, ValidTo: sigT1,
+				LoadBalancerIPs: []string{ip}, Selector: []string{"istio=ingress"},
+			},
+			{
+				Namespace: "nginx-ingress", Name: "controller", ValidFrom: sigT0, ValidTo: sigT1,
+				ExternalIPs: []string{ip}, Selector: []string{"app=nginx"},
+			},
+		},
+		Deploys: []store.DeployRow{{
+			Namespace: "istio-system", Name: "ingress", ValidFrom: sigT0, ValidTo: sigT1,
+			PodLabels: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{{
+			Namespace: "istio-system", Name: "gw-a", ValidFrom: sigT0, ValidTo: sigT1,
+			SelectorKV: []string{"istio=ingress"}, ServerHosts: []string{"*.example.com"},
+		}},
+	}
+
+	if got := New(w, sigMid).ResolveIPToGateways(ip); len(got) != 0 {
+		t.Fatalf("candidates = %v, want none — two Services own the IP at this instant", got)
+	}
+}
+
+// Hop 2 asks "what labels does the ingress workload carry". Several matching
+// Deployments is NORMAL — a revision-based canary gateway upgrade runs two whose
+// pods both satisfy the Service selector — so the hop takes the UNION rather than
+// whichever row came first. Both row orders must give the same candidates.
+func TestResolveIPToGatewaysUnionsCanaryDeploymentLabels(t *testing.T) {
+	const ip = "198.51.100.7"
+	stable := store.DeployRow{
+		Namespace: "istio-system", Name: "ingress", ValidFrom: sigT0, ValidTo: sigT1,
+		PodLabels: []string{"istio=ingress", "rev=stable"},
+	}
+	canary := store.DeployRow{
+		Namespace: "istio-system", Name: "ingress-canary", ValidFrom: sigT0, ValidTo: sigT1,
+		PodLabels: []string{"istio=ingress", "rev=canary"},
+	}
+	base := store.TrafficSnapshot{
+		Services: []store.ServiceRow{{
+			Namespace: "istio-system", Name: "ingress-lb", ValidFrom: sigT0, ValidTo: sigT1,
+			LoadBalancerIPs: []string{ip}, Selector: []string{"istio=ingress"},
+		}},
+		Gateways: []store.GatewayRow{
+			{
+				// Only the canary Deployment's pods carry rev=canary.
+				Namespace: "istio-system", Name: "gw-canary", ValidFrom: sigT0, ValidTo: sigT1,
+				SelectorKV: []string{"istio=ingress", "rev=canary"}, ServerHosts: []string{"*.example.com"},
+			},
+			{
+				Namespace: "istio-system", Name: "gw-stable", ValidFrom: sigT0, ValidTo: sigT1,
+				SelectorKV: []string{"istio=ingress", "rev=stable"}, ServerHosts: []string{"*.example.com"},
+			},
+		},
+	}
+
+	for _, c := range []struct {
+		name    string
+		deploys []store.DeployRow
+	}{
+		{"stable_first", []store.DeployRow{stable, canary}},
+		{"canary_first", []store.DeployRow{canary, stable}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := base
+			w.Deploys = c.deploys
+			got := New(w, sigMid).ResolveIPToGateways(ip)
+			if len(got) != 2 {
+				t.Fatalf("candidates = %v, want both gateways regardless of row order", got)
+			}
+		})
+	}
+}
+
 // A gateway with no version live at the instant is not resolvable at all.
 func TestScopedForGatewayNotLiveAtInstant(t *testing.T) {
 	w := testSnapshot(t)
 	w.Gateways[0].ValidTo = sigMid // ends before the queried instant
 
-	_, found, err := New(w, sigMid.Add(time.Hour)).ScopedFor("gw-a")
+	_, found, err := New(w, sigMid.Add(time.Hour)).ScopedFor("ns-a", "gw-a")
 	if err != nil {
 		t.Fatalf("ScopedFor: %v", err)
 	}
