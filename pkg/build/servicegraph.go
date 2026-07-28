@@ -66,15 +66,21 @@ func ReadServiceGraph(
 	if err != nil {
 		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
 	}
+	// ONE resolver per build, shared by the prescan and the parse. Its topology
+	// indexes are immutable and building them scans every pod and Service across
+	// every cluster (with per-family sorts), so building them twice per request
+	// was pure duplicated work — and the prescan consults them read-only.
+	res := newSGResolver(topology)
+
 	var routes routeIndex
 	if resolver != nil {
 		// Range in, instant out: the PromQL side keeps (window, end), the route
 		// engine gets ONLY end — the single instant it evaluates the ingress
 		// config at (simplify-route-resolution-to-point-in-time D1).
 		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
-			collectRouteQueries(vec, topology), end)
+			collectRouteQueriesWith(vec, res), end)
 	}
-	return parseServiceGraphRoutes(vec, topology, routes), nil
+	return parseWithResolver(vec, res, routes), nil
 }
 
 // sgResolver carries the per-build dedupe maps and topology indexes used to
@@ -237,7 +243,19 @@ func newSGResolver(topology Topology) *sgResolver {
 // resolveUnknownServerPeer, at the points that would otherwise emit an
 // external node; resolution stays a pure function of (vec, topology, routes) —
 // all I/O happened before this call (design D2).
+//
+// It builds its own resolver, which is what the direct test call sites want.
+// ReadServiceGraph goes through parseWithResolver instead, sharing one resolver
+// with the prescan.
 func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIndex) ServiceGraphResult {
+	if len(vec) == 0 {
+		return ServiceGraphResult{}
+	}
+	return parseWithResolver(vec, newSGResolver(topology), routes)
+}
+
+// parseWithResolver is the parse body over an already-built resolver.
+func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) ServiceGraphResult {
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
 	}
@@ -246,7 +264,6 @@ func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIn
 	// aggregated warn at the end of the parse.
 	mc := missingClusterCounts{}
 
-	res := newSGResolver(topology)
 	res.routes = routes
 
 	// Dedup pod-calls-pod by (srcID, tgtID). Multiple upstream series can

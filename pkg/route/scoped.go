@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/akira-core/kube-state-graph/pkg/build"
@@ -13,9 +14,10 @@ import (
 // constant across the build's keys — so keys sharing a destination IP would
 // otherwise repeat the same cross-cluster store read.
 //
-// The scope is used serially by the prescan loop, so no locking is needed. It
-// lives for one build and is then discarded; the memo never outlives it, so
-// there is no unbounded growth (a cache on the shared *Resolver would leak).
+// The scope lives for one build and is then discarded; the memo never outlives
+// it, so there is no unbounded growth (a cache on the shared *Resolver would
+// leak). The prescan resolves keys with bounded concurrency, so the memo is
+// mutex-guarded.
 func (r *Resolver) BuildScoped() build.RouteResolver {
 	return &scopedResolver{r: r, probes: map[probeKey][]string{}}
 }
@@ -30,9 +32,11 @@ type probeKey struct {
 }
 
 // scopedResolver is a per-build wrapper around *Resolver that memoises the
-// ingress-IP probe. NOT safe for concurrent use — one build, serial calls.
+// ingress-IP probe. Safe for concurrent use within its one build.
 type scopedResolver struct {
-	r      *Resolver
+	r *Resolver
+
+	mu     sync.Mutex
 	probes map[probeKey][]string
 }
 
@@ -45,15 +49,26 @@ func (s *scopedResolver) ResolveRoute(ctx context.Context, req build.RouteReques
 // probe is the memoising ingressIPProbe. A successful result (including a nil
 // "no ingress cluster" slice) is cached; errors are NOT cached, so a later key
 // sharing the IP retries — matching the base resolver's per-call behaviour.
+//
+// The store read runs OUTSIDE the lock, so two keys racing on the same IP may
+// both issue it. That is accepted rather than serialised behind a singleflight:
+// the probe is idempotent and read-only, the race window is one build, and
+// holding the lock across a network round-trip would serialise the very
+// concurrency this exists alongside.
 func (s *scopedResolver) probe(ctx context.Context, ip string, at time.Time) ([]string, error) {
 	k := probeKey{ip: ip, at: at.UnixMilli()}
-	if cands, ok := s.probes[k]; ok {
+	s.mu.Lock()
+	cands, hit := s.probes[k]
+	s.mu.Unlock()
+	if hit {
 		return cands, nil
 	}
 	cands, err := s.r.st.ClustersWithIngressIP(ctx, ip, at)
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
 	s.probes[k] = cands
+	s.mu.Unlock()
 	return cands, nil
 }

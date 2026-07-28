@@ -3,6 +3,9 @@ package build
 import (
 	"context"
 	"errors"
+	"sort"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,14 +28,41 @@ const testDNSAnswer = "198.51.100.7"
 // fakeRouteResolver is an in-package stand-in for the mockery mock (which
 // lives in pkg/build/mocks and cannot be imported from package build itself —
 // import cycle). It records the requests it saw.
+//
+// resolveRouteQueries drives keys concurrently, so the recorder is guarded and
+// requests() returns them in a deterministic (sorted) order rather than
+// completion order.
 type fakeRouteResolver struct {
-	fn   func(RouteRequest) (RouteDestination, RouteOutcome, error)
+	fn func(RouteRequest) (RouteDestination, RouteOutcome, error)
+
+	mu   sync.Mutex
 	seen []RouteRequest
 }
 
 func (f *fakeRouteResolver) ResolveRoute(_ context.Context, req RouteRequest) (RouteDestination, RouteOutcome, error) {
+	f.mu.Lock()
 	f.seen = append(f.seen, req)
+	f.mu.Unlock()
 	return f.fn(req)
+}
+
+// requests returns the recorded requests sorted by (caller cluster, host, port),
+// matching the prescan's own key ordering.
+func (f *fakeRouteResolver) requests() []RouteRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := append([]RouteRequest(nil), f.seen...)
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.CallerCluster != b.CallerCluster {
+			return a.CallerCluster < b.CallerCluster
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		return a.Port < b.Port
+	})
+	return out
 }
 
 // scopeAwareResolver implements the optional BuildScopedRouteResolver upgrade:
@@ -73,8 +103,84 @@ func TestResolveRouteQueries_UpgradesToBuildScoped(t *testing.T) {
 	require.Len(t, idx, len(keys))
 	assert.Equal(t, 1, res.scopedCalls, "exactly one scope minted per build")
 	require.NotNil(t, res.scope)
-	assert.Len(t, res.scope.seen, len(keys), "every call routed through the scope")
-	assert.Empty(t, res.seen, "base resolver saw nothing once upgraded")
+	assert.Len(t, res.scope.requests(), len(keys), "every call routed through the scope")
+	assert.Empty(t, res.requests(), "base resolver saw nothing once upgraded")
+}
+
+// Keys are resolved concurrently, but each key's answer is independent of every
+// other key's, so the resulting index must be identical to a serial one. The
+// resolver here answers each key differently and blocks until every key is
+// in flight, which both forces genuine overlap and would expose any shared
+// mutable state in the resolution loop.
+func TestResolveRouteQueries_ConcurrentIndexMatchesSerial(t *testing.T) {
+	const n = routeResolveConcurrency * 3
+	keys := make([]routeKey, n)
+	for i := range keys {
+		keys[i] = routeKey{
+			callerCluster: "cluster-alpha",
+			host:          "svc-" + strconv.Itoa(i) + ".example.com",
+			path:          "/", port: 443, ips: testDNSAnswer,
+		}
+	}
+	answer := func(req RouteRequest) (RouteDestination, RouteOutcome, error) {
+		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: req.Host}, RouteHit, nil
+	}
+	at := time.Unix(1_700_000_300, 0).UTC()
+
+	// Serial reference: concurrency 1 is what a limit of 1 gives.
+	want := routeIndex{}
+	for _, k := range keys {
+		dest, outcome, _ := answer(k.request(at))
+		want[k] = routeEntry{dest: dest, outcome: outcome}
+	}
+
+	// Hold the first routeResolveConcurrency calls until they are ALL in
+	// flight, so the assertion is made about genuinely overlapping work rather
+	// than about a loop that happened to run serially.
+	entered := make(chan struct{}, n)
+	release := make(chan struct{})
+	gate := func(req RouteRequest) (RouteDestination, RouteOutcome, error) {
+		entered <- struct{}{}
+		<-release
+		return answer(req)
+	}
+	go func() {
+		for range routeResolveConcurrency {
+			<-entered
+		}
+		close(release)
+	}()
+
+	got := resolveRouteQueries(context.Background(),
+		&fakeRouteResolver{fn: gate}, 0, keys, at)
+
+	assert.Equal(t, want, got)
+}
+
+// The key cap is a backstop, not a silent truncation: the resolved set is the
+// prescan's deterministic prefix and the dropped remainder is reported.
+func TestResolveRouteQueries_CapsKeySet(t *testing.T) {
+	keys := make([]routeKey, maxRouteKeys+7)
+	for i := range keys {
+		keys[i] = routeKey{
+			callerCluster: "cluster-alpha",
+			host:          "svc-" + strconv.Itoa(i) + ".example.com",
+			path:          "/", port: 443, ips: testDNSAnswer,
+		}
+	}
+	resolver := &fakeRouteResolver{fn: func(RouteRequest) (RouteDestination, RouteOutcome, error) {
+		return RouteDestination{}, RouteNoIngress, nil
+	}}
+
+	idx := resolveRouteQueries(context.Background(), resolver, 0, keys,
+		time.Unix(1_700_000_300, 0).UTC())
+
+	assert.Len(t, idx, maxRouteKeys)
+	assert.Len(t, resolver.requests(), maxRouteKeys, "capped keys are never asked")
+	for _, k := range keys[maxRouteKeys:] {
+		_, ok := idx[k]
+		assert.False(t, ok, "a dropped key must have NO entry, so it keeps its pre-change reason")
+	}
 }
 
 // unknownPeerSample builds one server="unknown" sample whose client resolves
@@ -455,7 +561,7 @@ func TestReadServiceGraph_ResolverErrorDegradesToExternal(t *testing.T) {
 	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
 		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
 	require.NoError(t, err, "a resolver error must never fail the read")
-	require.Len(t, resolver.seen, 1, "the prescan collected the endpoint")
+	require.Len(t, resolver.requests(), 1, "the prescan collected the endpoint")
 
 	require.Len(t, res.ExternalNodes, 1)
 	assert.Equal(t, "external/api.example.com", res.ExternalNodes[0].IDValue)
@@ -478,7 +584,7 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
 		window, end, sampleTopologyWithServices(), resolver, time.Second)
 	require.NoError(t, err)
-	require.Len(t, resolver.seen, 1)
+	require.Len(t, resolver.requests(), 1)
 	assert.Equal(t, RouteRequest{
 		CallerCluster: "cluster-alpha",
 		Host:          "api.example.com",
@@ -486,7 +592,7 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 		Port:          443,
 		IPs:           []string{testDNSAnswer},
 		At:            end,
-	}, resolver.seen[0],
+	}, resolver.requests()[0],
 		"the request the engine sees is the prescan-derived one, evaluated at the window's END")
 
 	require.Len(t, res.ServiceNodes, 1)
@@ -514,7 +620,7 @@ func TestReadServiceGraph_NoDNSAnswersNeverConsultsResolver(t *testing.T) {
 	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
 		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
 	require.NoError(t, err)
-	assert.Empty(t, resolver.seen, "no engine call for an IP-less endpoint")
+	assert.Empty(t, resolver.requests(), "no engine call for an IP-less endpoint")
 
 	require.Len(t, res.ExternalNodes, 1)
 	assert.Equal(t, "external/api.example.com", res.ExternalNodes[0].IDValue)

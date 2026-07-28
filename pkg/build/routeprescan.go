@@ -7,9 +7,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
+	"golang.org/x/sync/errgroup"
 )
 
 // defaultListenerPort is the design-D5 fallback when neither the peer-address
@@ -204,7 +206,17 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	if len(vec) == 0 {
 		return nil
 	}
-	r := newSGResolver(topology)
+	return collectRouteQueriesWith(vec, newSGResolver(topology))
+}
+
+// collectRouteQueriesWith is the prescan over an already-built resolver.
+// ReadServiceGraph shares ONE resolver between the prescan and the parse: the
+// indexes consulted here are immutable and read-only, and building them scans
+// every pod and Service across every cluster.
+func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
+	if len(vec) == 0 {
+		return nil
+	}
 
 	var keys []routeKey
 	seen := map[routeKey]bool{}
@@ -276,11 +288,35 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	return keys
 }
 
+// Bounds on the per-build route-resolution work. Each key costs one
+// cross-cluster probe, a handful of ClickHouse round-trips per destination IP,
+// one in-process istiod translation and one router_check_tool fork/exec
+// (~50-60ms) — all on the request path, with no result cache to amortise it.
+//
+// routeResolveConcurrency is a fixed constant rather than a flag: the useful
+// value is bounded by the matcher's process cost, not by anything an operator
+// can observe, and the repo does not add tuning knobs speculatively.
+//
+// maxRouteKeys is a backstop against a build whose service graph carries an
+// unbounded number of distinct external FQDNs. Keys are resolved in the
+// prescan's deterministic sorted order, so the truncation point is a function of
+// the data rather than of scheduling — and it is always logged (design D5).
+const (
+	routeResolveConcurrency = 4
+	maxRouteKeys            = 512
+)
+
 // resolveRouteQueries answers the prescan's keys against the injected
-// RouteResolver, serially, each call bounded by perCallTimeout (zero = inherit
-// ctx only). Errors and misses are recorded in the index — never returned —
-// so route resolution can never fail a build (design D9); the parse logs the
-// per-endpoint reason off the recorded entry.
+// RouteResolver with bounded concurrency, each call bounded by perCallTimeout
+// (zero = inherit ctx only). Errors and misses are recorded in the index —
+// never returned — so route resolution can never fail a build (design D9); the
+// parse logs the per-endpoint reason off the recorded entry.
+//
+// Concurrency cannot change the index's CONTENTS: entries are keyed by routeKey
+// and each key's answer is independent of every other key's. What it changes is
+// which keys are answered when the build deadline fires first — already
+// wall-clock dependent in the serial version, and a successful build answers
+// every key either way (design D5).
 //
 // With a resolver configured the returned index is ALWAYS non-nil (possibly
 // empty): nil means "engine off", non-nil-empty means "engine on, nothing
@@ -291,33 +327,57 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	if resolver == nil {
 		return nil
 	}
+	if len(keys) > maxRouteKeys {
+		// Never a silent cap: the dropped keys fall back to their pre-change
+		// external behaviour, which is indistinguishable from "the engine had
+		// nothing to say" unless it is said out loud.
+		slog.Warn("route-engine key set exceeds the per-build cap; the remainder degrades to external nodes",
+			"collected", len(keys), "resolved", maxRouteKeys, "dropped", len(keys)-maxRouteKeys)
+		keys = keys[:maxRouteKeys]
+	}
 	// Upgrade to a per-build scope when the resolver offers one: keys sharing a
 	// destination IP then collapse to a single ingress-cluster store read
-	// (BuildScopedRouteResolver). The scope is used serially for this build only.
+	// (BuildScopedRouteResolver). The scope lives for this build only.
 	if s, ok := resolver.(BuildScopedRouteResolver); ok {
 		resolver = s.BuildScoped()
 	}
 	idx := make(routeIndex, len(keys))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(routeResolveConcurrency)
 	for _, k := range keys {
-		callCtx, cancel := ctx, context.CancelFunc(func() {})
-		if perCallTimeout > 0 {
-			callCtx, cancel = context.WithTimeout(ctx, perCallTimeout)
-		}
-		dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
-		cancel()
-		if err != nil {
-			slog.Debug("route-engine resolution errored (endpoint degrades to external)",
-				"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips, "error", err)
-			idx[k] = routeEntry{failed: true}
-			continue
-		}
-		idx[k] = routeEntry{dest: dest, outcome: outcome}
-		if ctx.Err() != nil {
-			// Build deadline hit: stop asking; uncollected keys simply have no
+		if gctx.Err() != nil {
+			// Build deadline hit: stop asking. Uncollected keys simply have no
 			// entry and fall back to their pre-change external reasons.
 			break
 		}
+		g.Go(func() error {
+			callCtx, cancel := ctx, context.CancelFunc(func() {})
+			if perCallTimeout > 0 {
+				callCtx, cancel = context.WithTimeout(ctx, perCallTimeout)
+			}
+			dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
+			cancel()
+
+			entry := routeEntry{dest: dest, outcome: outcome}
+			if err != nil {
+				slog.Debug("route-engine resolution errored (endpoint degrades to external)",
+					"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips, "error", err)
+				if ctx.Err() != nil {
+					// The build deadline, not the engine: leave no entry, so the
+					// endpoint keeps the pre-change external reason a key the
+					// serial loop never reached would have had.
+					return nil
+				}
+				entry = routeEntry{failed: true}
+			}
+			mu.Lock()
+			idx[k] = entry
+			mu.Unlock()
+			return nil
+		})
 	}
+	_ = g.Wait() // no goroutine returns an error; resolution never fails a build
 	return idx
 }
 
