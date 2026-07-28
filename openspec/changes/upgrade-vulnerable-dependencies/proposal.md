@@ -74,10 +74,11 @@ from the same configuration. This is a dependency and internal-lifecycle change.
   the bare-short-name destination resolution depends on — is byte-identical at
   the target commit, and the `-tags oracle` sweep (whose expected clusters are
   computed by construction, independently of istiod) passes unchanged.
-- **Performance**: each translation now starts and stops two controllers and
-  waits for krt sync, where it previously started nothing. Measured against the
-  existing per-resolution cost this is small — one `router_check_tool` fork/exec
-  already dominates at ~50–60 ms — but it is no longer zero.
+- **Performance**: `Translate` went from ~59 µs to ~433 µs per call (measured,
+  see design "Risks") — istio's VirtualService controller builds ~20 krt
+  collections per translation. One route resolution also forks
+  `router_check_tool` at ~48 ms, so translation moved from roughly 0.1% to 0.8%
+  of a resolution.
 - **Dependencies**: no new direct dependency. `k8s.io/*` moves to v0.35.3 as a
   transitive consequence; it remains linked-only, and
   `make check-route-containment` still passes.

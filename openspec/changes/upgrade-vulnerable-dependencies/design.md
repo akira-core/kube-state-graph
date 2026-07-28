@@ -101,8 +101,18 @@ Zero mismatches is the acceptance bar.
   versions, so any version carrying both fixes is a master commit. This is
   pre-existing (the previous pin was also a master snapshot) but the jump is
   ~11 months.
-- **Per-translation cost is no longer zero**: two controllers start, sync, and
-  stop per translation. Bounded by the existing `router_check_tool` fork/exec,
-  but a regression in principle.
+- **Per-translation cost rose ~7x**, measured rather than estimated: an
+  identical 500-iteration benchmark of `Translate` over the same scoped input
+  gives ~59 µs/op before the upgrade and ~433 µs/op after (medians of six runs,
+  same machine). Nearly all of the increase is istio's own doing — the
+  VirtualService controller builds a graph of ~20 krt collections per
+  translation. Only ~55 µs of it is the sync wait's poll interval: replacing
+  `time.Sleep` with `runtime.Gosched()` measures ~377 µs/op, which is not worth
+  burning a core to spin for.
+
+  In context the absolute number stays small: one route resolution also forks
+  `router_check_tool`, which the oracle sweep measures at ~48 ms, so translation
+  went from roughly 0.1% to 0.8% of a resolution. Worth revisiting only if the
+  matcher ever stops dominating.
 - **k8s.io/\* moved three minors**: linked-only, and the containment gate covers
   the rule that matters (`pkg/build` / `pkg/kubegraph` must not reach client-go).
