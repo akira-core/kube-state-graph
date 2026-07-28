@@ -16,19 +16,24 @@
 // route and resolve to a miss; a port whose servers serve other hosts only is
 // the distinct ListenerNoServerForHost miss.
 //
-// istio's TEST fixture core.NewConfigGenTest is deliberately avoided: it ties a
-// stop channel to t.Cleanup and starts two long-lived goroutines. Translator
-// builds the minimal, STATIC config-generator world by hand — no controllers
-// running, no goroutines. Key fact that makes this safe:
-// PushContext.InitContext reads config via env.List(gvk.VirtualService, ...)
-// directly from the store (push_context.go), not from an event-driven index —
-// so the controllers' Run loops are not needed once the configs are Create()d
-// into the store before InitContext. This is also the design-D0 discipline: no
-// Kubernetes client, informer, watch, or kubeconfig is ever constructed here.
+// istio's TEST fixture core.NewConfigGenTest is deliberately avoided: it ties
+// its stop channel to t.Cleanup and builds a fake Kubernetes client for the
+// ServiceEntry registry. Translator assembles the minimal config-generator world
+// by hand and tears it down when the call returns, so nothing outlives a
+// translation. This is also the design-D0 discipline: no Kubernetes client,
+// informer, watch, or kubeconfig is ever constructed here.
+//
+// The world is no longer entirely static. istio moved VirtualService merging
+// into a krt-backed controller that PushContext.InitContext consults, and krt
+// collections are populated by event delivery rather than read straight from the
+// store — so buildScopedEnv Creates the configs, starts the controllers, WAITS
+// for them to sync, and returns a cleanup that reclaims their goroutines.
+// Gateways are still listed directly from the store. See buildScopedEnv.
 package translate
 
 import (
 	"fmt"
+	"time"
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	networking "istio.io/api/networking/v1alpha3"
@@ -41,7 +46,6 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
-	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	cluster2 "istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/gateway"
@@ -117,10 +121,13 @@ func (tr *Translator) Translate(in ScopedInput) (*route.RouteConfiguration, erro
 		return &route.RouteConfiguration{Name: fmt.Sprintf("http.%d", port)}, nil
 	}
 
-	env, err := buildScopedEnv(in)
+	env, cleanup, err := buildScopedEnv(in)
 	if err != nil {
 		return nil, err
 	}
+	// The scoped world is discarded when this returns — including the krt
+	// collections' goroutines.
+	defer cleanup()
 	pc := env.PushContext()
 
 	proxy := setupProxy(env, pc, in.Proxy)
@@ -263,12 +270,34 @@ func routeConfigNameFor(gwCfg config.Config, port int, reqHost string) (string, 
 }
 
 // buildScopedEnv assembles the minimal static Environment for one gateway's
-// scoped config, mirroring core.NewConfigGenTest but WITHOUT running any
-// controller goroutine. Configs are Create()d synchronously before InitContext,
-// which lists them straight from the store.
-func buildScopedEnv(in ScopedInput) (*model.Environment, error) {
-	cc := memory.NewSyncController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
+// scoped config, mirroring core.NewConfigGenTest. The returned cleanup MUST be
+// called: it stops the controllers this starts.
+//
+// The service registry is the in-memory one ALONE. istiod's own test harness
+// also wires a ServiceEntry registry, but this translator never receives a
+// ServiceEntry: ScopedInput.Configs carries Gateway + VirtualService only, and
+// every backend Service arrives through in.Services. Constructing one now
+// requires a *multicluster.Controller, which would mean building Kubernetes
+// clients — forbidden here (design D0) — so the registry that was never
+// consulted is gone rather than faked.
+func buildScopedEnv(in ScopedInput) (*model.Environment, func(), error) {
+	// NewController, not the removed NewSyncController: the memory store is
+	// built on krt now and no longer distinguishes a synchronous monitor.
+	cc := memory.NewController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
 	configController, _ := configaggregate.MakeWriteableCache([]model.ConfigStoreController{cc}, cc)
+
+	// Populate the store FIRST. Ordering is now load-bearing: VirtualService
+	// merging moved out of PushContext into a krt-backed controller whose
+	// derived collections take their initial contents from the source at
+	// CONSTRUCTION. Building it over an empty store and creating configs
+	// afterwards leaves MergedVirtualServices empty at InitContext — every route
+	// resolves to no cluster. (InitContext still lists Gateways straight from
+	// the store, so that half is unchanged.)
+	for _, cfg := range in.Configs {
+		if _, err := configController.Create(cfg); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	m := mesh.DefaultMeshConfig()
 	env := model.NewEnvironment()
@@ -276,9 +305,26 @@ func buildScopedEnv(in ScopedInput) (*model.Environment, error) {
 
 	xdsUpdater := model.NewEndpointIndexUpdater(env.EndpointIndex)
 
+	// InitContext dereferences VirtualServiceController unconditionally, so it
+	// must exist. Its krt collections own goroutines that live until the
+	// controller's internal stop channel closes, and Run(stop) is precisely the
+	// shutdown hook that closes it — hence the returned cleanup. Without it each
+	// translation would leak its collections' goroutines.
+	vsController := model.NewVirtualServiceController(
+		configController,
+		model.VSControllerOptions{XDSUpdater: xdsUpdater},
+		env.Watcher,
+	)
+	done := make(chan struct{})
+	go configController.Run(done)
+	go vsController.Run(done)
+	cleanup := func() { close(done) }
+	if err := waitSynced(configController.HasSynced, vsController.HasSynced); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
 	serviceDiscovery := aggregate.NewController(aggregate.Options{})
-	se := serviceentry.NewController(configController, xdsUpdater, env.Watcher)
-	serviceDiscovery.AddRegistry(se)
 
 	msd := memregistry.NewServiceDiscovery(in.Services...)
 	msd.XdsUpdater = xdsUpdater
@@ -291,22 +337,46 @@ func buildScopedEnv(in ScopedInput) (*model.Environment, error) {
 
 	env.ServiceDiscovery = serviceDiscovery
 	env.ConfigStore = configController
+	env.VirtualServiceController = vsController
 	env.NetworksWatcher = meshwatcher.NewFixedNetworksWatcher(nil)
 	env.Init()
 
-	// Populate the store BEFORE InitContext; InitContext lists directly from it.
-	for _, cfg := range in.Configs {
-		if _, err := configController.Create(cfg); err != nil {
-			return nil, err
-		}
-	}
-
 	if err := env.InitNetworksManager(xdsUpdater); err != nil {
-		return nil, err
+		cleanup()
+		return nil, nil, err
 	}
 	env.PushContext().InitContext(env, nil, nil)
-	return env, nil
+	return env, cleanup, nil
 }
+
+// waitSynced blocks until every krt-backed controller reports synced, or gives
+// up. The collections are populated by event delivery, so InitContext must not
+// run before they have caught up — an unsynced MergedVirtualServices lists
+// nothing and every route resolves to no cluster.
+func waitSynced(checks ...func() bool) error {
+	deadline := time.Now().Add(syncTimeout)
+	for {
+		synced := true
+		for _, ok := range checks {
+			if !ok() {
+				synced = false
+				break
+			}
+		}
+		if synced {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("translate: scoped config controllers did not sync within %s", syncTimeout)
+		}
+		time.Sleep(syncPoll)
+	}
+}
+
+const (
+	syncTimeout = 5 * time.Second
+	syncPoll    = 100 * time.Microsecond
+)
 
 // setupProxy fills the same proxy defaults core.ConfigGenTest.SetupProxy does
 // for a gateway vantage, then wires it to the freshly built PushContext.
