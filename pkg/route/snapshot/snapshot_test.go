@@ -222,6 +222,61 @@ func TestScopedForDedupsDuplicateRows(t *testing.T) {
 	}
 }
 
+// TestScopedForResolvesBareShortDestinationHost pins the istiod-faithful
+// destination identity. A dot-free `destination.host` is a short name Istio
+// resolves in the VirtualService's own namespace, but istiod only appends
+// `.svc.<domain>` when the config carries a domain suffix — production's config
+// store stamps one, ours did not. The translated Envoy cluster then named
+// `svc-1.ns-a`, which ParseEnvoyCluster rejects, so every VirtualService written
+// with a short destination missed with route_engine_no_route.
+func TestScopedForResolvesBareShortDestinationHost(t *testing.T) {
+	w := testSnapshot(t)
+	w.VSes[0].SpecJSON = vsSpecJSON(t, "svc.example.com", "svc-1") // bare short name
+
+	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	if err != nil || !found {
+		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
+	}
+	if len(in.Services) != 1 || string(in.Services[0].Hostname) != "svc-1.ns-a.svc.cluster.local" {
+		t.Fatalf("backend services = %v, want the short name resolved in the VS namespace", in.Services)
+	}
+
+	rc, err := translate.NewTranslator().Translate(in)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var got []string
+	for _, vh := range rc.GetVirtualHosts() {
+		for _, r := range vh.GetRoutes() {
+			got = append(got, r.GetRoute().GetCluster())
+		}
+	}
+	// The port comes from the backend Service in the registry (the route
+	// declares none), which additionally proves the resolved identity reached
+	// the registry rather than only the cluster string.
+	want := "outbound|8080||svc-1.ns-a.svc.cluster.local"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("clusters = %v, want [%s] — the cluster host must be a parseable Service FQDN", got, want)
+	}
+}
+
+// A dotted relative destination.host is NOT expanded — istiod leaves it verbatim
+// and looks it up as a literal registry hostname, so a real mesh 503s on it.
+// Inferring a Service identity here would report an edge for traffic that is in
+// fact failing (design D2).
+func TestScopedForLeavesDottedRelativeDestinationHost(t *testing.T) {
+	w := testSnapshot(t)
+	w.VSes[0].SpecJSON = vsSpecJSON(t, "svc.example.com", "svc-1.ns-a")
+
+	in, found, err := New(w, sigMid).ScopedFor("gw-a")
+	if err != nil || !found {
+		t.Fatalf("ScopedFor: found=%v err=%v", found, err)
+	}
+	if len(in.Services) != 0 {
+		t.Fatalf("backend services = %v, want none — %q names no registry Service", in.Services, "svc-1.ns-a")
+	}
+}
+
 // A gateway with no version live at the instant is not resolvable at all.
 func TestScopedForGatewayNotLiveAtInstant(t *testing.T) {
 	w := testSnapshot(t)

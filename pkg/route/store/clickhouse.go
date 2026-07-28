@@ -588,7 +588,7 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 			if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
 				return fmt.Errorf("window unmarshal vs %s/%s: %w", r.Namespace, r.Name, err)
 			}
-			for _, h := range vsDestHosts(&vsSpec) {
+			for _, h := range VSDestHosts(&vsSpec, r.Namespace) {
 				if !hostSeen[h] {
 					hostSeen[h] = true
 					destHosts = append(destHosts, h)
@@ -651,37 +651,6 @@ func backendKeys(hosts []string) []string {
 		}
 	}
 	return keys
-}
-
-// vsDestHosts collects the destination host (target Service identity FQDN) of
-// every route in a VirtualService (HTTP/TLS/TCP, mirrors included). Kept in
-// sync with pkg/route/snapshot's copy.
-func vsDestHosts(vs *networking.VirtualService) []string {
-	var hosts []string
-	add := func(d *networking.Destination) {
-		if d != nil && d.GetHost() != "" {
-			hosts = append(hosts, d.GetHost())
-		}
-	}
-	for _, r := range vs.GetHttp() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-		if m := r.GetMirror(); m != nil {
-			add(m)
-		}
-	}
-	for _, r := range vs.GetTls() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-	}
-	for _, r := range vs.GetTcp() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-	}
-	return hosts
 }
 
 // hostChunk bounds how many host FQDNs go into one IN-list, keeping the inlined

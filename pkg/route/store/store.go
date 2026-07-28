@@ -13,8 +13,11 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"strings"
 	"time"
+
+	networking "istio.io/api/networking/v1alpha3"
 )
 
 // ServiceRow is one service_versions row (ingress LB: ExternalIPs and/or
@@ -65,29 +68,103 @@ type SvcPort struct {
 	Protocol string `json:"protocol"`
 }
 
-// serviceDomain is the standard Kubernetes Service FQDN suffix. The reader
-// assumes the default cluster domain; the exporter stores only (namespace,
-// name), so the FQDN mapping is Istio-side derivation that lives here.
-const serviceDomain = ".svc.cluster.local"
+// ClusterDomain is the mesh's DNS domain. It is also stamped on every
+// config.Meta the snapshot builds, because istiod resolves a short
+// destination.host to `<name>.<namespace>.svc.<domain>` and appends nothing when
+// the meta carries no domain (see ResolveDestinationHost).
+//
+// serviceDomain is the derived Service FQDN suffix — one source, so the two can
+// never drift. The reader assumes the default cluster domain; the exporter
+// stores only (namespace, name), so the FQDN mapping is Istio-side derivation
+// that lives here.
+const (
+	ClusterDomain = "cluster.local"
+	serviceDomain = ".svc." + ClusterDomain
+)
 
 // BackendFQDN reconstructs a backend Service's FQDN (its destination.host
 // identity) from its (name, namespace) — the inverse of ParseBackendHost.
 func BackendFQDN(name, ns string) string { return name + "." + ns + serviceDomain }
 
-// ParseBackendHost derives (name, namespace) from a VirtualService route's
-// destination.host FQDN (name.namespace.svc.cluster.local). ok=false for a host
-// that isn't a resolvable in-cluster FQDN (e.g. a bare short name or external
-// host), which the caller skips.
+// ResolveDestinationHost normalises a VirtualService route's destination.host to
+// the identity istiod itself resolves it to, given the namespace of the
+// VirtualService that declares it. It mirrors istio's ResolveShortnameToFQDN
+// exactly: ONLY a dot-free name is a short name, and it is qualified with the
+// namespace and the cluster domain. A wildcard, an IP literal, or anything
+// already containing a dot is returned verbatim — istiod treats those as fully
+// qualified and looks them up as literal registry hostnames.
+//
+// That verbatim branch is deliberate, not an omission: `checkout.shop` and
+// `checkout.shop.svc` name no Service in a real mesh either (a real Envoy 503s
+// on them), so they must NOT be coerced into a Service identity here.
+func ResolveDestinationHost(host, vsNamespace string) string {
+	if host == "" || host == "*" || vsNamespace == "" {
+		return host
+	}
+	if strings.Contains(host, ".") {
+		// Already qualified as far as istiod is concerned — this also covers
+		// wildcards like *.example.com and dotted IPv4 literals.
+		return host
+	}
+	if net.ParseIP(host) != nil { // a bare IPv6 literal carries no dot
+		return host
+	}
+	return BackendFQDN(host, vsNamespace)
+}
+
+// ParseBackendHost derives (name, namespace) from an in-cluster Service FQDN —
+// either a destination.host already normalised by ResolveDestinationHost, or the
+// host segment of an istiod-generated Envoy cluster string. ok=false for
+// anything else, which the caller skips.
+//
+// Exactly two leading labels are required. `mysql-0.mysql.db.svc.cluster.local`
+// (the headless per-pod form) is NOT the Service `mysql-0` in namespace `mysql`;
+// parsing it by prefix would report a Service that never received the traffic.
 func ParseBackendHost(host string) (name, ns string, ok bool) {
 	rest, found := strings.CutSuffix(host, serviceDomain)
 	if !found {
 		return "", "", false
 	}
-	labels := strings.SplitN(rest, ".", 3)
-	if len(labels) < 2 || labels[0] == "" || labels[1] == "" {
+	labels := strings.Split(rest, ".")
+	if len(labels) != 2 || labels[0] == "" || labels[1] == "" {
 		return "", "", false
 	}
 	return labels[0], labels[1], true
+}
+
+// VSDestHosts collects the destination Service identity of every route in a
+// VirtualService (HTTP/TLS/TCP, mirrors included), each normalised through
+// ResolveDestinationHost with vsNamespace — the namespace of the VirtualService
+// the routes come from. It is THE single implementation: the ClickHouse reader
+// and pkg/route/snapshot both call it, so the backend-Service key list, the
+// backend query, and the translate registry cannot disagree on an identity.
+func VSDestHosts(vs *networking.VirtualService, vsNamespace string) []string {
+	var hosts []string
+	add := func(d *networking.Destination) {
+		if d == nil || d.GetHost() == "" {
+			return
+		}
+		hosts = append(hosts, ResolveDestinationHost(d.GetHost(), vsNamespace))
+	}
+	for _, r := range vs.GetHttp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+		if m := r.GetMirror(); m != nil {
+			add(m)
+		}
+	}
+	for _, r := range vs.GetTls() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	for _, r := range vs.GetTcp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	return hosts
 }
 
 // serviceSpec is the minimal shape read out of the spec_json column: just the

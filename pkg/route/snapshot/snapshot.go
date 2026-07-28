@@ -134,8 +134,17 @@ func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error)
 	if err := pjUnmarshal.Unmarshal([]byte(gw.SpecJSON), &gwSpec); err != nil {
 		return translate.ScopedInput{}, false, err
 	}
+	// Domain is what production's config store stamps on every config it serves,
+	// and istiod needs it to finish resolving a short destination.host: without
+	// it ResolveShortnameToFQDN appends only the namespace, yielding `<svc>.<ns>`
+	// — neither a short name nor an FQDN, and unparseable downstream (design D2).
 	cfgs := []config.Config{{
-		Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: gwName, Namespace: gw.Namespace},
+		Meta: config.Meta{
+			GroupVersionKind: gvk.Gateway,
+			Name:             gwName,
+			Namespace:        gw.Namespace,
+			Domain:           store.ClusterDomain,
+		},
 		Spec: &gwSpec,
 	}}
 
@@ -162,9 +171,14 @@ func (s *Snapshot) ScopedFor(gwName string) (translate.ScopedInput, bool, error)
 		if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
 			return translate.ScopedInput{}, false, err
 		}
-		destHosts = append(destHosts, vsDestHosts(&vsSpec)...)
+		destHosts = append(destHosts, store.VSDestHosts(&vsSpec, r.Namespace)...)
 		cfgs = append(cfgs, config.Config{
-			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: r.Name, Namespace: r.Namespace},
+			Meta: config.Meta{
+				GroupVersionKind: gvk.VirtualService,
+				Name:             r.Name,
+				Namespace:        r.Namespace,
+				Domain:           store.ClusterDomain,
+			},
 			Spec: &vsSpec,
 		})
 	}
@@ -254,32 +268,6 @@ func containsAll(super, sub []string) bool {
 	return true
 }
 
-// vsDestHosts collects the destination host (target Service identity FQDN) of
-// every route in a VirtualService. Kept in sync with the store reader's copy.
-func vsDestHosts(vs *networking.VirtualService) []string {
-	var hosts []string
-	add := func(d *networking.Destination) {
-		if d != nil && d.GetHost() != "" {
-			hosts = append(hosts, d.GetHost())
-		}
-	}
-	for _, r := range vs.GetHttp() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-		if mr := r.GetMirror(); mr != nil {
-			add(mr)
-		}
-	}
-	for _, r := range vs.GetTls() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-	}
-	for _, r := range vs.GetTcp() {
-		for _, rd := range r.GetRoute() {
-			add(rd.GetDestination())
-		}
-	}
-	return hosts
-}
+// (destination-host collection lives in pkg/route/store as VSDestHosts — one
+// implementation shared with the ClickHouse reader, so the backend key list and
+// the translate registry cannot disagree on a Service identity.)
