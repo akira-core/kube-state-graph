@@ -388,7 +388,10 @@ func (s *RouteSuite) seedRouteStore() {
 	// public-gw, version 2: the current config.
 	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "public-gw", dt64s(gwCloseAt), dt64s(routeValidTo),
-		[]string{"istio=ingressgateway"}, []string{"api.example.com", "noip.example.com"}, gw443, uint64(5))
+		[]string{"istio=ingressgateway"},
+		// server_hosts must mirror the spec's server hosts: gwresolve matches
+		// the request host against THIS column, not against spec_json.
+		[]string{"api.example.com", "noip.example.com", "short.example.com"}, gw443, uint64(5))
 	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "public-gw-http", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"istio=ingressgateway"}, []string{"api8080.example.com"}, gw8080, uint64(6))
@@ -750,8 +753,13 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 		"nothing materialises in the caller's cluster for this host")
 	s.NotContains(bodyStr, `"id":"cluster-beta/istio-system/igw"`,
 		"beta's ingress Service is not in topology → the chain degrades to the direct edge, no ingress node")
-	s.NotContains(bodyStr, `"role":`,
-		"a degraded chain marks nothing — no service node carries a role label")
+	// Scoped to THIS resolution's own node: every case in this suite ingests
+	// into the same VictoriaMetrics, so each graph also carries the series of
+	// every case that ran before it (testify orders suite methods by name). A
+	// blanket NotContains on `"role":` would therefore assert about another
+	// case's ingress node, not this one's degraded chain.
+	s.NotContains(bodyStr, `"labels":{"cluster":"cluster-beta","namespace":"shop","role":`,
+		"a degraded chain marks nothing — no service node in the selected cluster carries a role label")
 	s.NotContains(bodyStr, `external/cross.example.com`,
 		"a cross-cluster route hit must not leave an external node behind")
 }
