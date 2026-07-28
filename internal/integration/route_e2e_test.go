@@ -117,6 +117,12 @@ const (
 	// predicate's inclusive lower bound (valid_from <= at, not <) in the probe
 	// and in every LoadTrafficAt hop, at DateTime64(3) millisecond precision.
 	ingressLBIPBoundary = "203.0.113.110"
+	// ingressLBIPv6 is the SECOND address of cluster-alpha's ingress Service —
+	// one dual-stack Service publishing both an A and an AAAA record. A DNS
+	// answer naming both makes the resolver load that cluster's config once per
+	// IP and union byte-identical rows, which an undeduped union turns into a
+	// duplicate config istiod rejects.
+	ingressLBIPv6 = "2001:db8::50"
 )
 
 // dt64s renders a time as the string form ClickHouse parses into DateTime64(3)
@@ -289,7 +295,9 @@ func (s *RouteSuite) seedRouteStore() {
 			// ever queried WITHOUT client_dns_answers: if the engine were
 			// consulted for an IP-less endpoint, reviews would materialise —
 			// the sharp negative probe for design D6.
-			Hosts: []string{"api.example.com", "noip.example.com"},
+			// short.example.com routes to a BARE short destination.host, the
+			// most common way an operator writes a VirtualService destination.
+			Hosts: []string{"api.example.com", "noip.example.com", "short.example.com"},
 			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "api-cert"},
 		}},
 	})
@@ -320,6 +328,20 @@ func (s *RouteSuite) seedRouteStore() {
 			}}},
 		}},
 	})
+	// A BARE short destination.host, resolved in this VirtualService's own
+	// namespace (shop) exactly as istiod resolves it — the shape that produced
+	// an unparseable `payments.shop` Envoy cluster before config.Meta carried a
+	// domain suffix.
+	vsShort := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"short.example.com"},
+		Gateways: []string{"istio-system/public-gw"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "payments",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
 	// Bare gateway binding: legal Istio shorthand for a same-namespace gateway;
 	// the exporter stores it verbatim, so bound_gateways carries just the name.
 	vs8080 := s.mustSpec(&networking.VirtualService{
@@ -341,9 +363,12 @@ func (s *RouteSuite) seedRouteStore() {
 	// Ingress LB Service (Hop 1 of the 3-hop) + ingress Deployment (Hop 2).
 	// loadbalancer_ips carries ingressLBIP; a second Service carries
 	// ingressExtIP in external_ips only (probe OR coverage).
+	// Dual-stack: ONE Service publishing both an A and an AAAA address, so a DNS
+	// answer naming both loads this cluster's config twice and unions identical
+	// rows.
 	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
-		[]string{}, []string{ingressLBIP}, []string{"istio=ingressgateway"}, "", uint64(1))
+		[]string{}, []string{ingressLBIP, ingressLBIPv6}, []string{"istio=ingressgateway"}, "", uint64(1))
 	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "igw-ext", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{ingressExtIP}, []string{}, []string{"istio=ingressgateway"}, "", uint64(17))
@@ -375,6 +400,9 @@ func (s *RouteSuite) seedRouteStore() {
 	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
 		cluster, "shop", "noip-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"istio-system/public-gw"}, vsNoIP, uint64(15))
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "short-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio-system/public-gw"}, vsShort, uint64(18))
 	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
 		cluster, "istio-system", "api8080-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{"public-gw-http"}, vs8080, uint64(8))
@@ -594,6 +622,53 @@ func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
 		"the backend service still fans out to its backing pod like any other")
 	s.NotContains(bodyStr, `external/api.example.com`,
 		"a route-resolved peer must not leave an external node behind")
+}
+
+// TestDualStackDNSAnswerResolves is the multi-IP union guard end to end. The
+// ingress Service publishes both an A and an AAAA address, so the DNS answer
+// names both and the resolver loads cluster-alpha's config once per IP,
+// unioning byte-identical gateway/VS rows. Undeduped, ScopedFor handed istiod
+// the same VirtualService twice, its config store rejected it ("item already
+// exists"), Translate errored, and the endpoint fell back to an external node.
+func (s *RouteSuite) TestDualStackDNSAnswerResolves() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="api.example.com",client_dns_answers="` +
+			ingressLBIP + `,` + ingressLBIPv6 + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
+		"a dual-stack DNS answer must resolve exactly like either address alone")
+	s.NotContains(bodyStr, `external/api.example.com`,
+		"the duplicated per-IP rows must not fail the translation")
+}
+
+// TestBareShortDestinationHostResolves covers the most common way an operator
+// writes a VirtualService destination: a bare short Service name, which istiod
+// resolves in the VirtualService's own namespace. Without a domain suffix on
+// the config metadata istiod stopped half-way and emitted the Envoy cluster
+// `payments.shop`, which is neither a short name nor an FQDN — the endpoint
+// missed with route_engine_no_route and fell external.
+func (s *RouteSuite) TestBareShortDestinationHostResolves() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="short.example.com",client_dns_answers="` + ingressLBIP + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
+		"a bare short destination.host must resolve in the VirtualService's namespace")
+	s.NotContains(bodyStr, `external/short.example.com`,
+		"a resolvable short destination must not leave an external node behind")
 }
 
 // TestExplicitPortRoutesViaHTTPListener covers the explicit-port path: the
@@ -894,9 +969,9 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 		s.True(!gw.ValidFrom.After(fixedNow) && fixedNow.Before(gw.ValidTo),
 			"every loaded gateway version must be live at the resolution instant")
 	}
-	// 3 VSes: the qualified-ref vs443 + noip-vs AND the bare-ref vs8080 — the
-	// bare form must survive the gwRefs superset load.
-	s.Len(w.VSes, 3)
+	// 4 VSes: the qualified-ref vs443 + noip-vs + short-vs AND the bare-ref
+	// vs8080 — the bare form must survive the gwRefs superset load.
+	s.Len(w.VSes, 4)
 	s.NotEmpty(w.Services, "ingress + backend services in one window")
 	s.NotEmpty(w.Deploys, "the IP 3-hop loads the ingress deployment")
 	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
