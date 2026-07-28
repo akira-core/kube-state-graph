@@ -37,12 +37,12 @@ adaptation istio's newer API requires — and the validation carries the weight.
 - [x] 3.4 `make check-route-containment` after the `k8s.io/*` move
 - [x] 3.5 `-tags oracle` sweep in a Linux container (design D5): PASS at 20×10
       and at 200×50 (10,000 VirtualServices), zero mismatches
-- [ ] 3.6 `make check-docs`, `make verify-mocks`
-- [ ] 3.7 Re-read `CLAUDE.md`'s dependency paragraph against the new pins
-- [ ] 3.8 `openspec validate upgrade-vulnerable-dependencies`
-- [ ] 3.9 Real GitHub Actions run: **`vuln` green**, `test` still green
+- [x] 3.6 `make check-docs`, `make verify-mocks`
+- [x] 3.7 Re-read `CLAUDE.md`'s dependency paragraph against the new pins
+- [x] 3.8 `openspec validate upgrade-vulnerable-dependencies`
+- [x] 3.9 Real GitHub Actions run: **`vuln` green**, `test` still green
       (`internal/integration` complete, zero SKIPs — the istio bump would show up
       here as host matching, listener selection, or RDS naming drift),
       `route-containment`, `lint`, `docs-drift`, `mocks-drift` all green
-- [ ] 3.10 Note on PR #7: what moved, why the two istio findings were not
+- [x] 3.10 Note on PR #7: what moved, why the two istio findings were not
       exploitable yet still fixed by upgrading, and the oracle-sweep result
