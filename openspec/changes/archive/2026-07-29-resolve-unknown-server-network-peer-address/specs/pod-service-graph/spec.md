@@ -80,6 +80,11 @@ applied to their selectors so the edge set stays consistent across metric famili
 - **WHEN** a series has `server="http://user/api"`, `server_k8s_pod_uid=""` (the value contains, but is not equal to, `user`)
 - **THEN** the series is NOT excluded (the matcher is fully anchored), and connection-string endpoint resolution proceeds normally for that endpoint
 
+#### Scenario: `cluster="unknown"` bucketing is unaffected
+
+- **WHEN** a series is missing its `cluster` external label and is bucketed to `cluster="unknown"`, while its `client` and `server` labels are real service names with resolvable pod UIDs
+- **THEN** the series is NOT excluded by the sentinel matchers (they match only `client` / `server`, never `cluster`), and the edge is emitted under `cluster="unknown"` exactly as before
+
 ### Requirement: Unknown-server peer-label enrichment
 
 The reader SHALL attempt to resolve the server side of a
