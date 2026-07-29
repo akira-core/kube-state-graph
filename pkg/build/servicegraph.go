@@ -233,12 +233,21 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
-		// Peer-address labels recorded on the CLIENT span (OTel semconv
-		// client.net.peer.name / client.server.address), consulted only when
+		// Peer-address labels recorded on the CLIENT span, consulted only when
 		// server=="unknown" and the client resolves to a real pod — see
-		// resolveUnknownServerPeer.
-		clientNetPeerName := string(s.Metric["client_net_peer_name"])
+		// resolveUnknownServerPeer. The three are distinct OTel attributes, not
+		// three spellings of one: client_server_address is the stable
+		// server.address (logical destination as addressed — name, IP, or UDS
+		// name); client_network_peer_address is the stable network.peer.address
+		// (socket-level peer address, by convention an IP); client_net_peer_name
+		// is the deprecated net.peer.name, superseded by server.address.
+		// client_network_peer_port is deliberately NOT read — the stable
+		// conventions split the port into its own attribute, but a port
+		// participates in neither peer identification nor node naming
+		// (design.md Non-Goals; do not add it back "for symmetry").
 		clientServerAddress := string(s.Metric["client_server_address"])
+		clientNetworkPeerAddress := string(s.Metric["client_network_peer_address"])
+		clientNetPeerName := string(s.Metric["client_net_peer_name"])
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -295,7 +304,7 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, clientNetPeerName, clientServerAddress)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, clientServerAddress, clientNetworkPeerAddress, clientNetPeerName)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -496,17 +505,21 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
 //
-// clientPod, clientNetPeerName, and clientServerAddress feed ONLY the
-// resolve-unknown-server-peer-labels enrichment: whenever the raw server label
+// clientPod and the three peer-address parameters feed ONLY the
+// unknown-server peer-label enrichment: whenever the raw server label
 // is literally "unknown" AND no real topology pod is found for it (UID empty,
 // or UID present but absent from the global pod-UID index), resolution routes
 // to resolveUnknownServerPeer instead of resolveEmptyUID or the synth-pod
 // fallback below — D1's explicit carve-out, so the loosened server!~"user"
-// selector does not leak external/unknown noise via the generic paths.
-func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string) []string {
+// selector does not leak external/unknown noise via the generic paths. The
+// three peer parameters are declared in D1 precedence order
+// (clientServerAddress, clientNetworkPeerAddress, clientNetPeerName) so the
+// signature reads as the rule and a transposition at the call site is
+// visible.
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, clientServerAddress, clientNetworkPeerAddress, clientNetPeerName string) []string {
 	if podUID == "" {
 		if label == sentinelUnknown {
-			return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+			return r.resolveUnknownServerPeer(clientPod, clientServerAddress, clientNetworkPeerAddress, clientNetPeerName, t)
 		}
 		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
@@ -530,38 +543,51 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 		return []string{pod.ID()}
 	}
 	if label == sentinelUnknown {
-		return r.resolveUnknownServerPeer(clientPod, clientNetPeerName, clientServerAddress, t)
+		return r.resolveUnknownServerPeer(clientPod, clientServerAddress, clientNetworkPeerAddress, clientNetPeerName, t)
 	}
 	r.synthPod(graph.PodID("", podUID), "", namespace, podUID) // server cluster unknown
 	return []string{graph.PodID("", podUID)}
 }
 
 // resolveUnknownServerPeer implements the "Unknown-server peer-label
-// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3): the
-// narrow carve-out that lets a literal server="unknown" endpoint resolve via
-// the client-recorded peer-address labels client_net_peer_name /
-// client_server_address instead of being unconditionally dropped — but only
-// when the client side already resolved to a REAL (non-synthesised) topology
-// pod, so the anchor cluster is unambiguous. clientPod nil (client
-// unresolved, or resolved only to a synth pod) and "neither label present"
-// both drop the endpoint (nil), byte-for-byte identical to the outcome under
-// the old server!~"user|unknown" query-layer exclusion.
-func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNetPeerName, clientServerAddress string, t sgTrace) []string {
+// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3, extended
+// by resolve-unknown-server-ip-peer and resolve-unknown-server-network-peer-address):
+// the narrow carve-out that lets a literal server="unknown" endpoint resolve
+// via three client-recorded peer-address labels instead of being
+// unconditionally dropped — but only when the client side already resolved to
+// a REAL (non-synthesised) topology pod, so the anchor cluster is unambiguous.
+// clientPod nil (client unresolved, or resolved only to a synth pod) and "all
+// three labels empty" both drop the endpoint (nil), byte-for-byte identical to
+// the outcome under the old server!~"user|unknown" query-layer exclusion.
+//
+// The three peer parameters are precedence-ordered (D1): the first non-empty
+// wins outright and is never merged with a lower-precedence label, and a
+// non-empty higher-precedence label that fails to classify does NOT fall
+// through to a lower-precedence one. clientServerAddress (server.address,
+// stable, name-valued) leads; clientNetworkPeerAddress (network.peer.address,
+// stable, IP-valued) follows; clientNetPeerName (net.peer.name, deprecated in
+// favour of server.address) trails — ranked by what the classification chain
+// below can resolve (strong on names, weak on IP literals), not by recency of
+// spelling.
+func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientServerAddress, clientNetworkPeerAddress, clientNetPeerName string, t sgTrace) []string {
 	if clientPod == nil {
 		return nil // client side did not resolve to a real topology pod
 	}
-	value := clientNetPeerName
+	value := clientServerAddress
 	if value == "" {
-		value = clientServerAddress
+		value = clientNetworkPeerAddress
 	}
 	if value == "" {
-		return nil // neither client_net_peer_name nor client_server_address present
+		value = clientNetPeerName
+	}
+	if value == "" {
+		return nil // none of the three peer-address labels present
 	}
 
 	anchorCluster := clientPod.Labels()["cluster"]
 	clientNamespace := clientPod.Labels()["namespace"]
 
-	host := stripPeerAddressPort(value)
+	host := stripPeerAddressPort(truncateBracketSuffix(value))
 	svc, ns, ok := classifyK8sDNS(host)
 	if !ok {
 		if svc, ok = classifyBareShortName(host); ok {
@@ -605,11 +631,46 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, clientNe
 	return []string{r.external(value)}
 }
 
+// truncateBracketSuffix implements resolve-unknown-server-network-peer-address
+// D2: cut a peer-address value at the first '[' whose index is > 0, discarding
+// that byte and everything after it. Runs BEFORE stripPeerAddressPort so
+// net.SplitHostPort sees a well-formed authority.
+//
+// Why needed: some instrumentations append a bracketed connection/session
+// identifier to the authority (observed shape: "mongo.com:27017[-181]").
+// net.SplitHostPort rejects a port segment containing '[' with "unexpected
+// '[' in address" and returns the value unchanged, and classifyK8sDNS performs
+// no DNS-1123 validation, so today such a value garbage-classifies into a
+// namespace that can never match (service="mongo", namespace="com:27017[-181]")
+// — an accidentally-correct external fallback, not a designed one.
+//
+// Why the index-0 guard: a leading '[' is the IPv6 bracket form
+// ([2001:db8::1]:8080), which net.SplitHostPort ALREADY handles correctly —
+// it strips the brackets and yields a host net.ParseIP accepts, so a
+// dual-stack cluster's IPv6 ClusterIP peer resolves today. An unconditional
+// first-'[' cut would truncate that value to the empty string and regress a
+// peer that currently resolves. The guard is a property of the value's
+// shape, not of which label supplied it — this function is called uniformly
+// on all three peer-address labels, keeping the resolver provenance-free
+// (resolve-unknown-server-ip-peer D4).
+func truncateBracketSuffix(value string) string {
+	if i := strings.IndexByte(value, '['); i > 0 {
+		return value[:i]
+	}
+	return value
+}
+
 // stripPeerAddressPort best-effort strips a trailing ":<port>" suffix from a
-// client_net_peer_name / client_server_address value (resolve-unknown-server-peer-labels
-// D2 step 1). net.SplitHostPort fails on a plain hostname/IP with no port (no
+// client_server_address / client_network_peer_address / client_net_peer_name
+// value (resolve-unknown-server-peer-labels D2 step 1), after
+// truncateBracketSuffix has already removed any bracketed connection
+// identifier. net.SplitHostPort fails on a plain hostname/IP with no port (no
 // colon) or on an unbracketed IPv6 literal (ambiguous colon) — either failure
-// falls back to the raw, unstripped value.
+// falls back to the raw, unstripped value. A bracketed IPv6 authority
+// ([<ipv6>]:<port>) is the one bracketed shape this function handles
+// correctly on its own — it strips the brackets and the port together — which
+// is why truncateBracketSuffix guards index 0 rather than cutting
+// unconditionally.
 func stripPeerAddressPort(value string) string {
 	host, _, err := net.SplitHostPort(value)
 	if err != nil {
