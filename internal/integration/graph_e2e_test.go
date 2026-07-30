@@ -1143,9 +1143,11 @@ func (s *GraphSuite) TestEdgeTypesCatalogue() {
 		s.Contains(string(body), et)
 	}
 
-	// may_cross_cluster contract (localised model): pod-calls-service resolves to
-	// a Service node in the caller's OWN cluster — always intra-cluster — while
-	// service-selects-pod fans out across same-family clusters and MAY cross.
+	// may_cross_cluster contract: pod-calls-service MAY cross clusters (a
+	// route-engine-resolved endpoint anchors on the selected ingress cluster,
+	// which may be a family sibling; the D29 connection-string path stays
+	// intra-cluster per edge), and service-selects-pod fans out across
+	// same-family clusters and MAY cross.
 	var catalogue struct {
 		EdgeTypes []graph.EdgeTypeDefinition `json:"edge_types"`
 	}
@@ -1154,7 +1156,7 @@ func (s *GraphSuite) TestEdgeTypesCatalogue() {
 	for _, et := range catalogue.EdgeTypes {
 		got[et.Type] = et.MayCrossCluster
 	}
-	s.False(got["pod-calls-service"], "pod-calls-service resolves to a local service node — always intra-cluster")
+	s.True(got["pod-calls-service"], "pod-calls-service may cross clusters via a route-engine ingress-cluster hit")
 	s.True(got["service-selects-pod"], "service-selects-pod may cross clusters via the same-family endpoint union")
 }
 

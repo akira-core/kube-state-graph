@@ -1,0 +1,1150 @@
+package integration
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/stretchr/testify/suite"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	networking "istio.io/api/networking/v1alpha3"
+
+	"github.com/akira-core/kube-state-graph/internal/config"
+	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/route"
+	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
+	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
+	"github.com/akira-core/kube-state-graph/pkg/route/snapshot"
+	routestore "github.com/akira-core/kube-state-graph/pkg/route/store"
+	"github.com/akira-core/kube-state-graph/pkg/route/translate"
+)
+
+// CHImage is the pinned ClickHouse image for the route-store container (same
+// pin the POC benchmarked against). Never `:latest`, per D20.
+const CHImage = "clickhouse/clickhouse-server:25.5"
+
+// routeChDDL is the TEST-SIDE seed of the route-store schema. In production
+// the metadata-exporter owns this DDL; kube-state-graph only validates and
+// reads it (design D7). Columns must stay a superset of
+// pkg/route/store.expectedSchema.
+var routeChDDL = []string{
+	`CREATE TABLE service_versions (
+		cluster           LowCardinality(String),
+		namespace         LowCardinality(String),
+		name              String,
+		valid_from        DateTime64(3),
+		valid_to          DateTime64(3),
+		external_ips      Array(String),
+		loadbalancer_ips  Array(String),
+		selector_kv       Array(String),
+		spec_json         String,
+		ingest_seq        UInt64
+	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (cluster, namespace, name, valid_from)`,
+	`CREATE TABLE deploy_versions (
+		cluster       LowCardinality(String),
+		namespace     LowCardinality(String),
+		name          String,
+		valid_from    DateTime64(3),
+		valid_to      DateTime64(3),
+		pod_labels_kv Array(String),
+		ingest_seq    UInt64
+	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (cluster, namespace, name, valid_from)`,
+	`CREATE TABLE gw_versions (
+		cluster      LowCardinality(String),
+		namespace    LowCardinality(String),
+		name         String,
+		valid_from   DateTime64(3),
+		valid_to     DateTime64(3),
+		selector_kv  Array(String),
+		server_hosts Array(String),
+		spec_json    String,
+		ingest_seq   UInt64
+	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (cluster, namespace, name, valid_from)`,
+	`CREATE TABLE vs_versions (
+		cluster        LowCardinality(String),
+		namespace      LowCardinality(String),
+		name           String,
+		valid_from     DateTime64(3),
+		valid_to       DateTime64(3),
+		bound_gateways Array(String),
+		spec_json      String,
+		ingest_seq     UInt64
+	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (cluster, namespace, name, valid_from)`,
+}
+
+// Route-store fixture constants. Validity spans a wide fixed interval around
+// fixedNow so the 5m request window always overlaps (D20: no time.Now()).
+var (
+	routeValidFrom = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	routeValidTo   = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+const (
+	// ingressLBIP fronts cluster-alpha's ingress gateway (loadbalancer_ips).
+	ingressLBIP = "203.0.113.50"
+	// ingressLBIP2 fronts cluster-beta's ingress gateway — the cross-cluster
+	// selection fixture (caller in alpha, ingress in beta).
+	ingressLBIP2 = "203.0.113.60"
+	// ingressLBIPGone belongs to an ingress Service version that was CLOSED by
+	// a rewrite before the query window: the probe must see the pair collapse
+	// (no-FINAL dedup) and report no cluster for it.
+	ingressLBIPGone = "203.0.113.70"
+	// ingressExtIP fronts cluster-alpha via external_ips only (no LB array
+	// entry) — proves the probe OR-matches either column.
+	ingressExtIP = "203.0.113.80"
+	// ingressLBIPNginx fronts cluster-alpha's nginx ingress controller: an LB
+	// Service + Deployment whose selector chain reaches NO Istio Gateway CR —
+	// the ingress-lb-service-fallback fixture (Hop 3 empty, pipeline misses at
+	// gateway resolution, the unique LB Service resolves).
+	ingressLBIPNginx = "203.0.113.90"
+	// ingressLBIPNginxDup is carried by TWO differently-named LB Services in
+	// cluster-alpha — the fallback's same-IP collision, which must degrade to
+	// the external node (ambiguous_ingress_service), never guess.
+	ingressLBIPNginxDup = "203.0.113.100"
+	// ingressLBIPBoundary fronts a 3-hop chain whose every version opens
+	// EXACTLY AT fixedNow — the boundary fixture pinning the as-of SQL
+	// predicate's inclusive lower bound (valid_from <= at, not <) in the probe
+	// and in every LoadTrafficAt hop, at DateTime64(3) millisecond precision.
+	ingressLBIPBoundary = "203.0.113.110"
+	// ingressLBIPv6 is the SECOND address of cluster-alpha's ingress Service —
+	// one dual-stack Service publishing both an A and an AAAA record. A DNS
+	// answer naming both makes the resolver load that cluster's config once per
+	// IP and union byte-identical rows, which an undeduped union turns into a
+	// duplicate config istiod rejects.
+	ingressLBIPv6 = "2001:db8::50"
+)
+
+// dt64s renders a time as the string form ClickHouse parses into DateTime64(3)
+// on INSERT. Times must not go through `?` binds as time.Time: clickhouse-go
+// interpolates them at second precision (toDateTime), which SATURATES the 2200
+// sentinel past DateTime's 2106 ceiling — the same driver trap the reader's
+// dt64Lit avoids on the query side.
+func dt64s(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000") }
+
+// RouteSuite exercises translate-global-fqdn-to-k8s-service end to end: a
+// real VictoriaMetrics container carries the topology + service-graph
+// fixtures, a real ClickHouse container carries the versioned Istio config,
+// and the REAL router_check_tool binary performs the route match.
+//
+// The tool is a dynamically linked Linux binary, so a macOS dev machine cannot
+// run it and the suite skips there. In CI it MUST run: the workflow installs it
+// via `make router-check-tool` and a missing binary FAILS the suite rather than
+// skipping it. A skip prints as `ok`, which is exactly how a batch of
+// engine-level defects previously merged green.
+type RouteSuite struct {
+	VMSuite
+
+	runner      matchcheck.Runner
+	chContainer testcontainers.Container
+	chDSN       string
+	chConn      driver.Conn
+}
+
+func TestRouteSuite(t *testing.T) {
+	suite.Run(t, new(RouteSuite))
+}
+
+func (s *RouteSuite) SetupSuite() {
+	SkipIfDockerUnavailable(s.T())
+
+	// Native router_check_tool only (the docker fallback was deliberately
+	// dropped): KSG_ROUTER_CHECK_BIN or PATH. Absent → skip locally, FAIL in
+	// CI: this suite is the only end-to-end coverage of the route engine, and a
+	// silent skip there means every engine regression merges green.
+	runner, err := matchcheck.NewRunner(os.Getenv("KSG_ROUTER_CHECK_BIN"))
+	if err != nil {
+		const msg = "router_check_tool unavailable (set KSG_ROUTER_CHECK_BIN or put it on PATH): %v"
+		if os.Getenv("CI") != "" {
+			s.T().Fatalf(msg+" — CI must run this suite (see `make router-check-tool`)", err)
+		}
+		s.T().Skipf(msg, err)
+	}
+	s.runner = runner
+
+	s.VMSuite.SetupSuite()
+	s.startClickHouse()
+	s.seedRouteStore()
+}
+
+func (s *RouteSuite) TearDownSuite() {
+	if s.chConn != nil {
+		_ = s.chConn.Close()
+	}
+	if s.chContainer != nil {
+		_ = s.chContainer.Terminate(context.Background())
+	}
+	s.VMSuite.TearDownSuite()
+}
+
+// startClickHouse boots the route-store container with a network-reachable
+// user (the image's default user is localhost-only) and creates the schema.
+func (s *RouteSuite) startClickHouse() {
+	s.T().Helper()
+	ctx := context.Background()
+	req := testcontainers.ContainerRequest{
+		Image:        CHImage,
+		ExposedPorts: []string{"9000/tcp"},
+		Env: map[string]string{
+			"CLICKHOUSE_USER":     "ksg",
+			"CLICKHOUSE_PASSWORD": "ksg-test",
+		},
+		WaitingFor: wait.ForListeningPort("9000/tcp").WithStartupTimeout(90 * time.Second),
+	}
+	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	s.Require().NoError(err, "start ClickHouse container")
+	s.chContainer = c
+
+	host, err := c.Host(ctx)
+	s.Require().NoError(err)
+	port, err := c.MappedPort(ctx, "9000/tcp")
+	s.Require().NoError(err)
+	addr := fmt.Sprintf("%s:%s", host, port.Port())
+	s.chDSN = fmt.Sprintf("clickhouse://ksg:ksg-test@%s/default", addr)
+
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{addr},
+		Auth: clickhouse.Auth{Database: "default", Username: "ksg", Password: "ksg-test"},
+	})
+	s.Require().NoError(err)
+	// The port can accept TCP before ClickHouse finishes booting; retry the
+	// first ping briefly.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err = conn.Ping(ctx); err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().NoError(err, "ping ClickHouse")
+	s.chConn = conn
+
+	for _, stmt := range routeChDDL {
+		s.Require().NoError(conn.Exec(ctx, stmt))
+	}
+	// Freeze background merges so the seeded stale-open/closing row pairs stay
+	// two physical rows for the whole suite: the no-FINAL client dedup (and
+	// its CollapsedRows counter) is then exercised DETERMINISTICALLY instead
+	// of racing ClickHouse's merge scheduler — exactly the pre-merge window
+	// the reader must survive in production.
+	s.Require().NoError(conn.Exec(ctx, "SYSTEM STOP MERGES"))
+}
+
+func (s *RouteSuite) mustSpec(m proto.Message) string {
+	s.T().Helper()
+	b, err := protojson.Marshal(m)
+	s.Require().NoError(err)
+	return string(b)
+}
+
+// seedRouteStore writes the Istio config corpus shaped exactly like the
+// metadata-exporter's history ingest: no `rev` column (a POC-only oracle
+// field), spec.gateways stored VERBATIM (so a bare gateway name appears
+// unqualified), and a version "closed" by REWRITING the open row (same ORDER
+// BY key, higher ingest_seq) — leaving a stale open row + closing row pair
+// that only FINAL collapses.
+//
+//   - public-gw (istio-system): seeded as THREE rows — a stale open row with
+//     WRONG hosts (stale.example.com, valid_to = far future, low ingest_seq),
+//     its closing rewrite (same key, higher ingest_seq, valid_to pulled in to
+//     an hour before fixedNow), and the current version (TLS-terminated :443
+//     serving api.example.com → payments.shop:8080). Without FINAL the stale
+//     row stays live inside the query window and the suite fails
+//     nondeterministically.
+//   - public-gw-http (istio-system): plain HTTP :8080 serving
+//     api8080.example.com, bound by its VS via the BARE name "public-gw-http"
+//     (same-namespace shorthand) — the boundTo production case.
+//   - cluster-beta corpus: a second, family-foreign cluster whose ingress LB
+//     carries ingressLBIP2 and whose public-gw serves cross.example.com :443 →
+//     payments.shop:8080 — the cross-cluster ingress-selection fixture (D10).
+//   - cluster-gone: an ingress Service version carrying ingressLBIPGone whose
+//     open row was CLOSED by a rewrite well before the query window — the
+//     probe's no-FINAL dedup fixture.
+func (s *RouteSuite) seedRouteStore() {
+	s.T().Helper()
+	ctx := context.Background()
+	const cluster = "cluster-alpha"
+	gwCloseAt := fixedNow.Add(-time.Hour)
+
+	gwStale := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 443, Name: "https", Protocol: "HTTPS"},
+			Hosts: []string{"stale.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "stale-cert"},
+		}},
+	})
+	gw443 := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port: &networking.Port{Number: 443, Name: "https", Protocol: "HTTPS"},
+			// noip.example.com is served and routable (→ reviews.shop) but only
+			// ever queried WITHOUT client_dns_answers: if the engine were
+			// consulted for an IP-less endpoint, reviews would materialise —
+			// the sharp negative probe for design D6.
+			// short.example.com routes to a BARE short destination.host, the
+			// most common way an operator writes a VirtualService destination.
+			Hosts: []string{"api.example.com", "noip.example.com", "short.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "api-cert"},
+		}},
+	})
+	gw8080 := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 8080, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{"api8080.example.com"},
+		}},
+	})
+	vs443 := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"api.example.com"},
+		Gateways: []string{"istio-system/public-gw"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "payments.shop.svc.cluster.local",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
+	vsNoIP := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"noip.example.com"},
+		Gateways: []string{"istio-system/public-gw"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "reviews.shop.svc.cluster.local",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
+	// A BARE short destination.host, resolved in this VirtualService's own
+	// namespace (shop) exactly as istiod resolves it — the shape that produced
+	// an unparseable `payments.shop` Envoy cluster before config.Meta carried a
+	// domain suffix.
+	vsShort := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"short.example.com"},
+		Gateways: []string{"istio-system/public-gw"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "payments",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
+	// Bare gateway binding: legal Istio shorthand for a same-namespace gateway;
+	// the exporter stores it verbatim, so bound_gateways carries just the name.
+	vs8080 := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"api8080.example.com"},
+		Gateways: []string{"public-gw-http"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "payments.shop.svc.cluster.local",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
+	backendSpec, err := routestore.MarshalPorts([]routestore.SvcPort{{Name: "http", Port: 8080, Protocol: "TCP"}})
+	s.Require().NoError(err)
+
+	exec := func(query string, args ...any) {
+		s.Require().NoError(s.chConn.Exec(ctx, query, args...))
+	}
+	// Ingress LB Service (Hop 1 of the 3-hop) + ingress Deployment (Hop 2).
+	// loadbalancer_ips carries ingressLBIP; a second Service carries
+	// ingressExtIP in external_ips only (probe OR coverage).
+	// Dual-stack: ONE Service publishing both an A and an AAAA address, so a DNS
+	// answer naming both loads this cluster's config twice and unions identical
+	// rows.
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIP, ingressLBIPv6}, []string{"istio=ingressgateway"}, "", uint64(1))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "igw-ext", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{ingressExtIP}, []string{}, []string{"istio=ingressgateway"}, "", uint64(17))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "igw-deploy", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, uint64(2))
+	// public-gw, version 1: the STALE OPEN row (wrong hosts, far-future
+	// valid_to, ingest_seq=3) followed by its closing REWRITE (same ORDER BY
+	// key, ingest_seq=4, valid_to pulled in). FINAL must collapse the pair to
+	// the closing row, which the query window then excludes.
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "public-gw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, []string{"stale.example.com"}, gwStale, uint64(3))
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "public-gw", dt64s(routeValidFrom), dt64s(gwCloseAt),
+		[]string{"istio=ingressgateway"}, []string{"stale.example.com"}, gwStale, uint64(4))
+	// public-gw, version 2: the current config.
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "public-gw", dt64s(gwCloseAt), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"},
+		// server_hosts must mirror the spec's server hosts: gwresolve matches
+		// the request host against THIS column, not against spec_json.
+		[]string{"api.example.com", "noip.example.com", "short.example.com"}, gw443, uint64(5))
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "public-gw-http", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, []string{"api8080.example.com"}, gw8080, uint64(6))
+	// Bound VirtualServices. vs8080's bound_gateways is the BARE name, and the
+	// VS lives in the gateway's namespace — exactly what the exporter stores.
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "api-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio-system/public-gw"}, vs443, uint64(7))
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "noip-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio-system/public-gw"}, vsNoIP, uint64(15))
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "short-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio-system/public-gw"}, vsShort, uint64(18))
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		cluster, "istio-system", "api8080-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"public-gw-http"}, vs8080, uint64(8))
+	// Backend destination Services.
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{}, []string{}, backendSpec, uint64(9))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "shop", "reviews", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{}, []string{}, backendSpec, uint64(16))
+
+	// cluster-beta: a family-foreign cluster fronted by ingressLBIP2 whose
+	// gateway serves cross.example.com. A caller in cluster-alpha reaches it
+	// via the |F|==0, |G|==1 selection rule (design D10).
+	const beta = "cluster-beta"
+	gwBeta := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 443, Name: "https", Protocol: "HTTPS"},
+			Hosts: []string{"cross.example.com"},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: "cross-cert"},
+		}},
+	})
+	vsBeta := s.mustSpec(&networking.VirtualService{
+		Hosts:    []string{"cross.example.com"},
+		Gateways: []string{"istio-system/public-gw"},
+		Http: []*networking.HTTPRoute{{
+			Route: []*networking.HTTPRouteDestination{{Destination: &networking.Destination{
+				Host: "payments.shop.svc.cluster.local",
+				Port: &networking.PortSelector{Number: 8080},
+			}}},
+		}},
+	})
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		beta, "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIP2}, []string{"istio=ingressgateway"}, "", uint64(10))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		beta, "istio-system", "igw-deploy", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, uint64(11))
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		beta, "istio-system", "public-gw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, []string{"cross.example.com"}, gwBeta, uint64(12))
+	exec(`INSERT INTO vs_versions VALUES (?,?,?,?,?,?,?,?)`,
+		beta, "shop", "cross-vs", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio-system/public-gw"}, vsBeta, uint64(13))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		beta, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{}, []string{}, backendSpec, uint64(14))
+
+	// nginx ingress (ingress-lb-service-fallback): an LB Service + Deployment
+	// in cluster-alpha whose selector chain (app=ingress-nginx) matches no
+	// seeded Istio Gateway CR — Hop 3 is empty, the pipeline misses with
+	// no_gateway, and the fallback resolves the unique LB Service. A second
+	// pair of differently-named Services shares ingressLBIPNginxDup — the
+	// same-IP collision that must degrade ambiguous.
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "ingress-nginx-controller", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginx}, []string{"app=ingress-nginx"}, "", uint64(30))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "ingress-nginx-controller", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"app=ingress-nginx"}, uint64(31))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "ingress-nginx", "nginx-dup-a", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginxDup}, []string{"app=nginx-dup"}, "", uint64(32))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "other-lb", "nginx-dup-b", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPNginxDup}, []string{"app=nginx-dup"}, "", uint64(33))
+
+	// cluster-gone: an ingress Service version carrying ingressLBIPGone,
+	// closed by a REWRITE (same version slot, higher ingest_seq, valid_to
+	// pulled in) two hours before fixedNow. Without the probe's client-side
+	// dedup the stale open row (far-future valid_to) would overlap the window
+	// and a dead cluster would appear to serve the IP.
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(20))
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(fixedNow.Add(-2*time.Hour)),
+		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(21))
+
+	// Cross-namespace gateway (scope-gateway-candidates-to-ingress-namespace):
+	// its selector matches cluster-alpha's istio-system ingress deploy labels,
+	// but it lives in team-b — the namespace-scoped Hop 3 SQL must exclude it,
+	// which TestTrafficSnapshotNoFinalDedupAndBareRef's gateway count proves.
+	gwCrossNS := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"istio": "ingressgateway"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{"team-b.example.com"},
+		}},
+	})
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "team-b", "public-gw", dt64s(routeValidFrom), dt64s(routeValidTo),
+		[]string{"istio=ingressgateway"}, []string{"team-b.example.com"}, gwCrossNS, uint64(43))
+
+	// Boundary chain (as-of inclusive bound): an isolated 3-hop chain in its
+	// own namespace/selector so no existing IP-rooted assertion is perturbed;
+	// every version's valid_from is EXACTLY fixedNow.
+	gwBoundary := s.mustSpec(&networking.Gateway{
+		Selector: map[string]string{"app": "boundary-igw"},
+		Servers: []*networking.Server{{
+			Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{"boundary.example.com"},
+		}},
+	})
+	exec(`INSERT INTO service_versions VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-igw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{}, []string{ingressLBIPBoundary}, []string{"app=boundary-igw"}, "", uint64(40))
+	exec(`INSERT INTO deploy_versions VALUES (?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-igw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{"app=boundary-igw"}, uint64(41))
+	exec(`INSERT INTO gw_versions VALUES (?,?,?,?,?,?,?,?,?)`,
+		cluster, "boundary", "boundary-gw", dt64s(fixedNow), dt64s(routeValidTo),
+		[]string{"app=boundary-igw"}, []string{"boundary.example.com"}, gwBoundary, uint64(42))
+}
+
+// SetupTest seeds the VM fixtures every test shares: the client pod, the
+// payments Service + backing pod in cluster-alpha (so the route-engine
+// destination resolves in topology and fans out), alpha's istio-system/igw
+// ingress LB Service + gateway pod (matching the ClickHouse ingress seed, so
+// a RouteHit's ingress chain has its middle hop in topology —
+// route-hit-ingress-chain), plus cluster-beta's own payments Service +
+// backing pod (the cross-cluster ingress fixture — a route hit anchored on
+// beta must resolve against beta's topology; beta's igw is deliberately
+// ABSENT from VM topology, so the beta hit doubles as the e2e
+// chain-degrade-to-direct-edge proof), all discriminated by test name.
+func (s *RouteSuite) SetupTest() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	exposition := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="checkout",uid="alpha-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="payments-0",uid="alpha-2",node="worker-0",test=%q} 1 %d
+kube_node_info{cluster="cluster-alpha",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="payments",cluster_ip="10.96.0.20",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="reviews",cluster_ip="10.96.0.30",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="payments-x1",label_kubernetes_io_service_name="payments",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="payments-x1",targetref_kind="Pod",targetref_name="payments-0",targetref_namespace="shop",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="ingress-nginx",pod="ingress-nginx-controller-0",uid="alpha-3",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="ingress-nginx",service="ingress-nginx-controller",cluster_ip="10.96.0.40",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",label_kubernetes_io_service_name="ingress-nginx-controller",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="ingress-nginx",endpointslice="nginx-x1",targetref_kind="Pod",targetref_name="ingress-nginx-controller-0",targetref_namespace="ingress-nginx",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="istio-system",pod="igw-0",uid="alpha-4",node="worker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-alpha",namespace="istio-system",service="igw",cluster_ip="10.96.0.50",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="istio-system",endpointslice="igw-x1",label_kubernetes_io_service_name="igw",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="istio-system",endpointslice="igw-x1",targetref_kind="Pod",targetref_name="igw-0",targetref_namespace="istio-system",test=%q} 1 %d
+kube_pod_info{cluster="cluster-beta",namespace="shop",pod="payments-0",uid="beta-2",node="bworker-0",test=%q} 1 %d
+kube_node_info{cluster="cluster-beta",node="bworker-0",test=%q} 1 %d
+kube_service_info{cluster="cluster-beta",namespace="shop",service="payments",cluster_ip="10.97.0.20",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",label_kubernetes_io_service_name="payments",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-beta",namespace="shop",endpointslice="payments-b1",targetref_kind="Pod",targetref_name="payments-0",targetref_namespace="shop",test=%q} 1 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1)
+	s.IngestExpFmt(exposition)
+	s.Require().True(s.WaitForSeries(`kube_pod_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_pod_info")
+}
+
+// ingestUnknownServerSeries writes one server="unknown" service-graph series
+// (two counter samples so rate() is non-zero) with the given peer labels.
+func (s *RouteSuite) ingestUnknownServerSeries(peerLabels string) {
+	s.T().Helper()
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	base := `traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",connection_type="virtual_node",` + peerLabels + `,test=` + strconv.Quote(disc) + `}`
+	s.IngestExpFmt(fmt.Sprintf("%s 0 %d\n%s 120 %d\n", base, t0, base, t1))
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested server=\"unknown\" series")
+}
+
+func (s *RouteSuite) startRouteAPIServer() string {
+	s.T().Helper()
+	st, err := routestore.Open(context.Background(), s.chDSN)
+	s.Require().NoError(err, "route store must open and pass schema validation")
+	s.T().Cleanup(func() { _ = st.Close() })
+	srv := s.StartAPIServer(func(cfg *config.Config) {},
+		WithRouteResolver(route.NewResolver(st, s.runner), 30*time.Second))
+	return srv.URL
+}
+
+// TestGlobalFQDNRoutesToService is the motivating case end to end
+// (traffic_simulation): server="unknown", peer FQDN api.example.com with NO
+// port (default 443 → the TLS-terminated :443 listener, RouteConfiguration
+// "https.443.https.public-gw.istio-system"), client_dns_answers narrowing to
+// the ingress LB IP via the ClickHouse 3-hop. The destination IP uniquely
+// maps to istio-system/igw, which the VM topology holds with a backing
+// gateway pod — so the graph carries the FULL ingress chain
+// (route-hit-ingress-chain): caller → igw service → igw pod → payments →
+// backing pod, PLUS the direct caller→payments edge (the caller's dependency
+// on the backend survives the ingress funnel), and no external node.
+func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="api.example.com",client_dns_answers="` + ingressLBIP + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
+		"route engine must resolve the global FQDN to the routed Service")
+	s.Contains(bodyStr, `"id":"cluster-alpha/istio-system/igw"`,
+		"the ingress LB Service materialises as the chain's entry hop")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/istio-system/igw"`,
+		"the caller's pod-calls-service edge targets the ingress entry point")
+	s.Contains(bodyStr, `"source":"cluster-alpha/istio-system/igw","target":"cluster-alpha/alpha-4"`,
+		"the ingress service selects its gateway pod (locked-cluster fan-out)")
+	s.Contains(bodyStr, `"type":"pod-calls-service","source":"cluster-alpha/alpha-4","target":"cluster-alpha/shop/payments"`,
+		"the synthesized gateway-pod→backend edge is a pod-calls-service hop")
+	s.Contains(bodyStr, `"labels":{"cluster":"cluster-alpha","namespace":"istio-system","role":"ingress-gateway"}`,
+		"the ingress entry-point node is marked role=ingress-gateway")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is kept alongside the chain")
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
+		"the backend service still fans out to its backing pod like any other")
+	s.NotContains(bodyStr, `external/api.example.com`,
+		"a route-resolved peer must not leave an external node behind")
+}
+
+// TestDualStackDNSAnswerResolves is the multi-IP union guard end to end. The
+// ingress Service publishes both an A and an AAAA address, so the DNS answer
+// names both and the resolver loads cluster-alpha's config once per IP,
+// unioning byte-identical gateway/VS rows. Undeduped, ScopedFor handed istiod
+// the same VirtualService twice, its config store rejected it ("item already
+// exists"), Translate errored, and the endpoint fell back to an external node.
+func (s *RouteSuite) TestDualStackDNSAnswerResolves() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="api.example.com",client_dns_answers="` +
+			ingressLBIP + `,` + ingressLBIPv6 + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
+		"a dual-stack DNS answer must resolve exactly like either address alone")
+	s.NotContains(bodyStr, `external/api.example.com`,
+		"the duplicated per-IP rows must not fail the translation")
+}
+
+// TestBareShortDestinationHostResolves covers the most common way an operator
+// writes a VirtualService destination: a bare short Service name, which istiod
+// resolves in the VirtualService's own namespace. Without a domain suffix on
+// the config metadata istiod stopped half-way and emitted the Envoy cluster
+// `payments.shop`, which is neither a short name nor an FQDN — the endpoint
+// missed with route_engine_no_route and fell external.
+func (s *RouteSuite) TestBareShortDestinationHostResolves() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="short.example.com",client_dns_answers="` + ingressLBIP + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`,
+		"a bare short destination.host must resolve in the VirtualService's namespace")
+	s.NotContains(bodyStr, `external/short.example.com`,
+		"a resolvable short destination must not leave an external node behind")
+}
+
+// TestExplicitPortRoutesViaHTTPListener covers the explicit-port path: the
+// peer value carries ":8080" (design D5 step 1), the destination IP selects
+// the caller's own cluster, and the HTTP :8080 listener's RouteConfiguration
+// ("http.8080") routes to payments.
+func (s *RouteSuite) TestExplicitPortRoutesViaHTTPListener() {
+	s.ingestUnknownServerSeries(
+		`client_server_address="api8080.example.com:8080",client_dns_answers="` + ingressLBIP + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/payments"`)
+	s.Contains(bodyStr, `"type":"pod-calls-service"`)
+	s.Contains(bodyStr, `"id":"cluster-alpha/istio-system/igw"`,
+		"the shared ingress LB IP resolves the chain's entry hop here too")
+	s.Contains(bodyStr, `"source":"cluster-alpha/alpha-1","target":"cluster-alpha/shop/payments"`,
+		"the direct caller→backend edge is kept alongside the chain")
+	s.NotContains(bodyStr, `external/api8080.example.com:8080`,
+		"the raw peer value must not leak as an external node")
+}
+
+// TestNoDNSAnswersStaysExternal proves design D6 end to end: with the engine
+// ON, a series carrying no client_dns_answers never consults the route store —
+// the endpoint stays the pre-change external node. The probe host
+// noip.example.com is served by the alpha gateway and routed to reviews.shop
+// (present in topology), and NO other test resolves reviews — so if an
+// IP-less endpoint ever consulted the engine again, the reviews service node
+// would materialise and the negative assertion below would catch it even in
+// this suite's shared VictoriaMetrics (earlier tests' series stay visible).
+func (s *RouteSuite) TestNoDNSAnswersStaysExternal() {
+	s.ingestUnknownServerSeries(`client_net_peer_name="noip.example.com"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `external/noip.example.com`,
+		"no destination IPs → engine not consulted → pre-change external node")
+	s.NotContains(bodyStr, `"id":"cluster-alpha/shop/reviews"`,
+		"the routed Service must NOT materialise without a destination IP")
+}
+
+// TestCrossClusterIngressResolves is the design-D10/D11/D12 case end to end:
+// the caller pod lives in cluster-alpha, but the destination IP belongs to
+// cluster-beta's ingress (|F|==0, |G|==1 → C=beta). The route engine reads
+// BETA's Gateway + VirtualService config, the service node materialises in
+// beta, the pod-calls-service edge crosses clusters, and the fan-out runs
+// over beta's endpoints. Beta's istio-system/igw is deliberately ABSENT from
+// the VM topology, so this doubles as the e2e chain-degrade proof
+// (route-hit-ingress-chain D3): the hit keeps today's direct-edge shape and
+// no ingress node materialises.
+func (s *RouteSuite) TestCrossClusterIngressResolves() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="cross.example.com",client_dns_answers="` + ingressLBIP2 + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-beta/shop/payments"`,
+		"the service node lives in the engine-selected ingress cluster, not the caller's")
+	s.Contains(bodyStr, `"target":"cluster-beta/shop/payments"`,
+		"the pod-calls-service edge crosses from the alpha caller to the beta service")
+	s.Contains(bodyStr, `"target":"cluster-beta/beta-2"`,
+		"service-selects-pod fans out over the selected cluster's endpoints")
+	s.NotContains(bodyStr, `"id":"cluster-alpha/shop/cross"`,
+		"nothing materialises in the caller's cluster for this host")
+	s.NotContains(bodyStr, `"id":"cluster-beta/istio-system/igw"`,
+		"beta's ingress Service is not in topology → the chain degrades to the direct edge, no ingress node")
+	// Scoped to THIS resolution's own node: every case in this suite ingests
+	// into the same VictoriaMetrics, so each graph also carries the series of
+	// every case that ran before it (testify orders suite methods by name). A
+	// blanket NotContains on `"role":` would therefore assert about another
+	// case's ingress node, not this one's degraded chain.
+	s.NotContains(bodyStr, `"labels":{"cluster":"cluster-beta","namespace":"shop","role":`,
+		"a degraded chain marks nothing — no service node in the selected cluster carries a role label")
+	s.NotContains(bodyStr, `external/cross.example.com`,
+		"a cross-cluster route hit must not leave an external node behind")
+}
+
+// TestNginxIngressFallsBackToLBService is the ingress-lb-service-fallback
+// motivating case end to end: the destination IP selects cluster-alpha, whose
+// window holds the nginx LB Service + Deployment but NO Istio Gateway CR
+// reachable from the IP (Hop 3 empty → every segment misses at gateway
+// resolution). The fallback resolves the unique LB Service; the graph carries
+// a pod-calls-service edge to it and the locked-cluster fan-out
+// (route-hit-ingress-chain D2 — the selected cluster's own endpoints, though
+// with one cluster the set is indistinguishable from the old family union)
+// reaches the nginx controller pod — and no external node.
+func (s *RouteSuite) TestNginxIngressFallsBackToLBService() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="app.nginx.example.com",client_dns_answers="` + ingressLBIPNginx + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/ingress-nginx/ingress-nginx-controller"`,
+		"the fallback must resolve the ingress LB Service when the Istio pipeline finds no gateway")
+	s.Contains(bodyStr, `"target":"cluster-alpha/ingress-nginx/ingress-nginx-controller"`,
+		"pod-calls-service edge from the caller to the LB service")
+	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-3"`,
+		"the LB service fans out to the nginx controller pod")
+	s.Contains(bodyStr, `"labels":{"cluster":"cluster-alpha","namespace":"ingress-nginx","role":"ingress-lb"}`,
+		"the LB fallback destination is marked role=ingress-lb")
+	s.NotContains(bodyStr, `external/app.nginx.example.com`,
+		"a fallback-resolved peer must not leave an external node behind")
+}
+
+// TestAmbiguousIngressLBServiceStaysExternal: two differently-named LB
+// Services carry the destination IP in the selected cluster's window — the
+// fallback must degrade to the pre-change external node instead of guessing.
+func (s *RouteSuite) TestAmbiguousIngressLBServiceStaysExternal() {
+	s.ingestUnknownServerSeries(
+		`client_net_peer_name="dup.nginx.example.com",client_dns_answers="` + ingressLBIPNginxDup + `"`)
+
+	url := s.startRouteAPIServer()
+	resp := s.httpGet(s.graphURL(url, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `external/dup.nginx.example.com`,
+		"a same-IP LB Service collision degrades to the external node")
+	s.NotContains(bodyStr, `nginx-dup-a`)
+	s.NotContains(bodyStr, `nginx-dup-b`)
+}
+
+// ---------------------------------------------------------------------------
+// Tool-free store coverage: everything up to (but excluding) router_check_tool
+// runs against the real ClickHouse container, so developer machines without
+// the Linux-only binary still exercise the window loads, the 3-hop, host
+// disambiguation, and istiod translation.
+// ---------------------------------------------------------------------------
+
+type RouteStoreSuite struct {
+	suite.Suite
+	chContainer testcontainers.Container
+	chDSN       string
+	chConn      driver.Conn
+}
+
+func TestRouteStoreSuite(t *testing.T) {
+	suite.Run(t, new(RouteStoreSuite))
+}
+
+func (s *RouteStoreSuite) SetupSuite() {
+	SkipIfDockerUnavailable(s.T())
+	// Reuse RouteSuite's container + seed helpers via a shim suite value.
+	shim := &RouteSuite{}
+	shim.SetT(s.T())
+	shim.startClickHouse()
+	shim.seedRouteStore()
+	s.chContainer, s.chDSN, s.chConn = shim.chContainer, shim.chDSN, shim.chConn
+}
+
+func (s *RouteStoreSuite) TearDownSuite() {
+	if s.chConn != nil {
+		_ = s.chConn.Close()
+	}
+	if s.chContainer != nil {
+		_ = s.chContainer.Terminate(context.Background())
+	}
+}
+
+// TestTrafficSnapshotThreeHopAndTranslate drives store → snapshot → gwresolve
+// → translate off the real ClickHouse rows AT ONE INSTANT (fixedNow) and
+// asserts the RouteConfiguration that would be handed to router_check_tool:
+// the 3-hop narrows to the seeded gateways, the default-443 port selects the
+// TLS-terminated listener's RC, and its route cluster names payments.
+func (s *RouteStoreSuite) TestTrafficSnapshotThreeHopAndTranslate() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err, "schema validation must pass against the seeded store")
+	defer func() { _ = st.Close() }()
+
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
+	s.Require().NoError(err)
+	s.Require().NotEmpty(w.Gateways, "3-hop snapshot must reach the seeded gateways")
+
+	snap := snapshot.New(w, fixedNow)
+
+	cands := snap.ResolveIPToGateways(ingressLBIP)
+	s.Require().NotEmpty(cands, "IP 3-hop must yield candidates")
+	names := make([]string, len(cands))
+	gws := make([]gwresolve.Gateway, len(cands))
+	for i, c := range cands {
+		names[i] = c.Name
+		gws[i] = gwresolve.Gateway{Name: c.Name, Hosts: c.ServerHosts}
+	}
+	gw, ok := gwresolve.New(gws).ResolveAmong("api.example.com", names)
+	s.Require().True(ok)
+	s.Equal("public-gw", gw)
+
+	scoped, found, err := snap.ScopedFor("istio-system", gw)
+	s.Require().NoError(err)
+	s.Require().True(found)
+	scoped.Port = 443
+
+	rc, err := translate.NewTranslator().Translate(scoped)
+	s.Require().NoError(err)
+	s.Equal("https.443.https.public-gw.istio-system", rc.GetName(),
+		"default-443 must select the TLS-terminated listener's RouteConfiguration")
+
+	var clusters []string
+	for _, vh := range rc.GetVirtualHosts() {
+		for _, rt := range vh.GetRoutes() {
+			clusters = append(clusters, rt.GetRoute().GetCluster())
+		}
+	}
+	s.Contains(clusters, "outbound|8080||payments.shop.svc.cluster.local")
+}
+
+// TestClustersWithIngressIPProbe covers the ingress-cluster selection probe —
+// the store's ONLY cross-cluster read (design D10): each seeded LB IP names
+// exactly its own cluster, an external_ips-only IP also matches, an unknown
+// IP names none, and a version pair whose open row was closed by a rewrite
+// BEFORE the resolution instant collapses under the probe's no-FINAL dedup
+// instead of resurrecting a dead cluster.
+func (s *RouteStoreSuite) TestClustersWithIngressIPProbe() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	alpha, err := st.ClustersWithIngressIP(ctx, ingressLBIP, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-alpha"}, alpha)
+
+	extOnly, err := st.ClustersWithIngressIP(ctx, ingressExtIP, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-alpha"}, extOnly,
+		"an IP present only in external_ips must still name its cluster")
+
+	beta, err := st.ClustersWithIngressIP(ctx, ingressLBIP2, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-beta"}, beta)
+
+	none, err := st.ClustersWithIngressIP(ctx, "198.18.0.99", fixedNow)
+	s.Require().NoError(err)
+	s.Empty(none, "an IP no ingress Service ever carried names no cluster")
+
+	// The cluster-gone pair: its closing rewrite (higher ingest_seq, valid_to
+	// two hours before the instant) must win the client-side dedup, so the
+	// stale open row's far-future valid_to never resurrects the cluster.
+	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, fixedNow)
+	s.Require().NoError(err)
+	s.Empty(gone, "a version closed before the instant must not name its cluster")
+	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
+}
+
+// TestTrafficSnapshotNoFinalDedupAndBareRef pins the snapshot-load behaviours
+// off the IP-rooted load: only the gateway version LIVE AT the instant is
+// returned (the rewritten/closed one collapses client-side and the superseded
+// version is filtered out), the bare-name VS binding survives the gwRefs
+// superset load into ScopedFor, and the load is strictly scoped to the
+// requested cluster.
+func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
+	s.Require().NoError(err)
+	// Exactly 2: public-gw's current version + public-gw-http (both selected
+	// by the ingress deployment's labels). The seeded stale-open/closing row
+	// pair for public-gw MUST collapse client-side — without the no-FINAL
+	// dedup the stale open row (valid_to = far future) reads as live at the
+	// instant and a third row appears here. The closed version that ended an
+	// hour before fixedNow is likewise absent: the point-in-time load returns
+	// ONE version per gateway, not every version of the window. The seeded
+	// team-b/public-gw (selector-matching but cross-namespace) is absent too:
+	// Hop 3 is scoped to the ingress namespace, so a gateway outside the
+	// ingress Service's namespace is never loaded
+	// (scope-gateway-candidates-to-ingress-namespace).
+	s.Len(w.Gateways, 2,
+		"the stale open row must be dedup-collapsed away and the cross-namespace gateway excluded")
+	for _, gw := range w.Gateways {
+		s.Equal("istio-system", gw.Namespace,
+			"hop 3 must load only the ingress namespace's gateways")
+	}
+	for _, gw := range w.Gateways {
+		s.NotContains(gw.ServerHosts, "stale.example.com",
+			"the rewritten (closed) version's stale open row leaked past the dedup")
+		s.True(!gw.ValidFrom.After(fixedNow) && fixedNow.Before(gw.ValidTo),
+			"every loaded gateway version must be live at the resolution instant")
+	}
+	// 4 VSes: the qualified-ref vs443 + noip-vs + short-vs AND the bare-ref
+	// vs8080 — the bare form must survive the gwRefs superset load.
+	s.Len(w.VSes, 4)
+	s.NotEmpty(w.Services, "ingress + backend services in one window")
+	s.NotEmpty(w.Deploys, "the IP 3-hop loads the ingress deployment")
+	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
+
+	// boundTo: the bare-name binding ("public-gw-http" in the gateway's own
+	// namespace) must reach ScopedFor's translate input.
+	snap := snapshot.New(w, fixedNow)
+	scoped, found, err := snap.ScopedFor("istio-system", "public-gw-http")
+	s.Require().NoError(err)
+	s.Require().True(found)
+	s.Len(scoped.Configs, 2, "gateway CR + the bare-ref-bound VirtualService")
+
+	// Cluster scoping: the same IP under a different cluster loads nothing —
+	// snapshot loads never mix clusters (only the probe is cross-cluster).
+	other, err := st.LoadTrafficAt(ctx, "cluster-beta", ingressLBIP, fixedNow)
+	s.Require().NoError(err)
+	s.Empty(other.Gateways, "route-store snapshot loads are strictly cluster-scoped")
+}
+
+// TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow documents WHY pruned
+// mode must never be enabled against a rewrite-close writer (the seeded shape):
+// the SQL-side valid_to prune drops the closing rewrite before dedup, so the
+// stale sentinel twin wins unopposed and a dead version appears live. This is
+// the exact failure the default no-prune mode exists to prevent — if this test
+// ever starts failing because the stale row NO LONGER resurrects, the store
+// semantics changed and the WithUniqueRows guardrails should be re-examined.
+func (s *RouteStoreSuite) TestUniqueRowsAgainstRewriteWriterResurrectsStaleRow() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN, routestore.WithUniqueRows())
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIP, fixedNow)
+	s.Require().NoError(err)
+
+	stale := false
+	for _, gw := range w.Gateways {
+		for _, h := range gw.ServerHosts {
+			if h == "stale.example.com" {
+				stale = true
+			}
+		}
+	}
+	s.True(stale, "pruned mode against a rewrite-close writer resurrects the stale open row — the documented hazard")
+	s.Zero(st.CollapsedRows(), "the closing row was pruned in SQL, so dedup saw nothing to collapse (the alarm stays silent — why the mode is opt-in)")
+}
+
+// TestUniqueRowsProbeAgainstRewriteWriterResurrectsDeadCluster is the probe-path
+// twin of the test above (ClustersWithIngressIP's prune branch): under pruned
+// mode the SQL valid_to prune drops the cluster-gone closing rewrite before
+// dedup, so the stale sentinel-open twin wins unopposed and the DEAD cluster
+// resurrects in the ingress-cluster probe — while the collapse alarm stays
+// silent. The default no-prune mode's probe (TestClustersWithIngressIPProbe)
+// correctly reports no cluster for the same IP.
+func (s *RouteStoreSuite) TestUniqueRowsProbeAgainstRewriteWriterResurrectsDeadCluster() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN, routestore.WithUniqueRows())
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-gone"}, gone,
+		"pruned mode against a rewrite-close writer resurrects the dead cluster in the probe — the documented hazard")
+	s.Zero(st.CollapsedRows(),
+		"the closing row was pruned in SQL, so dedup saw nothing to collapse (the alarm stays silent — why the mode is opt-in)")
+}
+
+// TestAsOfBoundaryValidFromEqualsInstant pins the as-of SQL predicate's
+// INCLUSIVE lower bound (valid_from <= at, not <) against real ClickHouse, in
+// both the cross-cluster probe and every LoadTrafficAt hop, via the seeded
+// boundary chain whose every version opens EXACTLY at fixedNow. The negative
+// assertions step back ONE MILLISECOND — DateTime64(3) precision — so they
+// also guard the dt64Lit no-`?`-bind trap (a second-precision bind would make
+// them pass vacuously); do not widen them.
+func (s *RouteStoreSuite) TestAsOfBoundaryValidFromEqualsInstant() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+
+	clusters, err := st.ClustersWithIngressIP(ctx, ingressLBIPBoundary, fixedNow)
+	s.Require().NoError(err)
+	s.Equal([]string{"cluster-alpha"}, clusters,
+		"a version opening exactly at the instant is live (inclusive bound)")
+
+	before, err := st.ClustersWithIngressIP(ctx, ingressLBIPBoundary, fixedNow.Add(-time.Millisecond))
+	s.Require().NoError(err)
+	s.Empty(before, "one millisecond before its valid_from the version is not yet live")
+
+	w, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIPBoundary, fixedNow)
+	s.Require().NoError(err)
+	s.Require().Len(w.Services, 1, "the boundary ingress Service must load at its own valid_from")
+	s.Equal("boundary-igw", w.Services[0].Name)
+	s.Require().Len(w.Deploys, 1)
+	s.Require().Len(w.Gateways, 1, "the gw_versions hop shares the inclusive bound")
+	s.Equal("boundary-gw", w.Gateways[0].Name)
+
+	empty, err := st.LoadTrafficAt(ctx, "cluster-alpha", ingressLBIPBoundary, fixedNow.Add(-time.Millisecond))
+	s.Require().NoError(err)
+	s.Empty(empty.Gateways, "one millisecond earlier the chain is not yet open")
+	s.Empty(empty.Services)
+}
+
+// TestOpenWithAuthUsesEnvStyleCredentials proves the production path where
+// the DSN carries only host/db and credentials come from WithAuth (wired from
+// KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD). The password-protected
+// container rejects a credential-free Open, so a vacuous pass is impossible.
+func (s *RouteStoreSuite) TestOpenWithAuthUsesEnvStyleCredentials() {
+	ctx := context.Background()
+	freeDSN, err := stripDSNUserinfo(s.chDSN)
+	s.Require().NoError(err)
+
+	_, err = routestore.Open(ctx, freeDSN)
+	s.Require().Error(err, "password-protected ClickHouse must reject unauthenticated Open")
+
+	st, err := routestore.Open(ctx, freeDSN, routestore.WithAuth("ksg", "ksg-test"))
+	s.Require().NoError(err, "WithAuth must supply credentials after ParseDSN")
+	defer func() { _ = st.Close() }()
+}
+
+// TestNginxFallbackResolvesViaRealStore drives the ingress-lb-service-fallback
+// through the real ClickHouse rows WITHOUT router_check_tool: the nginx
+// snapshot shape never reaches gwresolve, so a zero matchcheck.Runner is a tripwire
+// (any invocation would fail). Unique IP → RouteIngressLBService anchored on
+// the selected cluster; the dup IP's same-cluster collision → ambiguous.
+func (s *RouteStoreSuite) TestNginxFallbackResolvesViaRealStore() {
+	ctx := context.Background()
+	st, err := routestore.Open(ctx, s.chDSN)
+	s.Require().NoError(err)
+	defer func() { _ = st.Close() }()
+	r := route.NewResolver(st, matchcheck.Runner{})
+
+	req := build.RouteRequest{
+		CallerCluster: "cluster-alpha",
+		Host:          "app.nginx.example.com",
+		Path:          "/",
+		Port:          443,
+		IPs:           []string{ingressLBIPNginx},
+		At:            fixedNow,
+	}
+	dest, outcome, err := r.ResolveRoute(ctx, req)
+	s.Require().NoError(err)
+	s.Equal(build.RouteIngressLBService, outcome)
+	s.Equal(build.RouteDestination{
+		Cluster: "cluster-alpha", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
+		IngressNamespace: "ingress-nginx", IngressService: "ingress-nginx-controller",
+	}, dest, "dest carries the engine-selected cluster and the unique LB Service identity (mirrored into Ingress*)")
+
+	req.Host = "dup.nginx.example.com"
+	req.IPs = []string{ingressLBIPNginxDup}
+	dest, outcome, err = r.ResolveRoute(ctx, req)
+	s.Require().NoError(err)
+	s.Equal(build.RouteAmbiguousIngressService, outcome,
+		"two LB Services on one IP in the selected cluster must degrade ambiguous")
+	s.Equal(build.RouteDestination{}, dest)
+}
+
+// stripDSNUserinfo returns a DSN with userinfo removed so Open + WithAuth can
+// be exercised the way production config prefers (secrets in env, not URL).
+func stripDSNUserinfo(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	u.User = nil
+	return u.String(), nil
+}

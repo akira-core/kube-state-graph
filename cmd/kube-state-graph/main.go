@@ -35,6 +35,9 @@ import (
 	"github.com/akira-core/kube-state-graph/internal/telemetry"
 	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/pkg/route"
+	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
+	routestore "github.com/akira-core/kube-state-graph/pkg/route/store"
 )
 
 // version is the build-time service version. Override with
@@ -81,6 +84,7 @@ func run() error {
 		"otlp_enabled", telemetryProviders.Enabled,
 		// Boolean only — the credential values themselves are never logged.
 		"prom_basic_auth", cfg.PromUsername != "",
+		"route_store_auth", cfg.RouteStoreUsername != "",
 	)
 
 	metrics := observability.NewMetrics()
@@ -101,7 +105,50 @@ func run() error {
 		return fmt.Errorf("api keys: %w", err)
 	}
 
-	builder := build.New(promClient, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, nil)
+	// Route resolution (translate-global-fqdn-to-k8s-service) is opt-in: an
+	// empty DSN leaves routeResolver nil and the service-graph reader behaves
+	// exactly as before. When set, both the store schema and the
+	// router_check_tool binary are verified here — fail fast at startup, not
+	// on the first build that needs them. The store connection lives for the
+	// process lifetime and is closed on shutdown.
+	var routeResolver build.RouteResolver
+	if cfg.RouteStoreDSN != "" {
+		runner, err := matchcheck.NewRunner(cfg.RouterCheckBin)
+		if err != nil {
+			return fmt.Errorf("route resolution: %w", err)
+		}
+		var storeOpts []routestore.Option
+		if cfg.RouteStoreUniqueRows {
+			storeOpts = append(storeOpts, routestore.WithUniqueRows())
+		}
+		// Route-store auth is env-only (KSG_ROUTE_STORE_USERNAME /
+		// KSG_ROUTE_STORE_PASSWORD); config.Validate guarantees the pair is
+		// set together or not at all. Credential values are never logged.
+		if cfg.RouteStoreUsername != "" {
+			storeOpts = append(storeOpts, routestore.WithAuth(cfg.RouteStoreUsername, cfg.RouteStorePassword))
+		}
+		storeCtx, storeCancel := context.WithTimeout(appCtx, 10*time.Second)
+		routeStore, err := routestore.Open(storeCtx, cfg.RouteStoreDSN, storeOpts...)
+		storeCancel()
+		if err != nil {
+			return fmt.Errorf("route resolution: %w", err)
+		}
+		defer func() { _ = routeStore.Close() }()
+		routeResolver = route.NewResolver(routeStore, runner)
+		logger.Info("route resolution enabled",
+			"router_check_bin", cfg.RouterCheckBin,
+			"route_resolve_timeout", cfg.RouteResolveTimeout,
+			"route_store_unique_rows", cfg.RouteStoreUniqueRows,
+			"route_store_auth", cfg.RouteStoreUsername != "",
+		)
+	}
+
+	builder := build.New(promClient, build.Options{
+		MetricPrefix:        cfg.MetricPrefix,
+		APITimeout:          cfg.APITimeout,
+		RouteResolver:       routeResolver,
+		RouteResolveTimeout: cfg.RouteResolveTimeout,
+	}, metrics, nil)
 	server := api.New(cfg, builder, promClient, metrics, logger, keys, nil)
 
 	httpSrv := &http.Server{

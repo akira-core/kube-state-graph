@@ -20,6 +20,12 @@ packages:
   github.com/akira-core/kube-state-graph/pkg/promql:
     interfaces:
       Querier:
+  github.com/akira-core/kube-state-graph/pkg/build:
+    interfaces:
+      RouteResolver:
+  github.com/akira-core/kube-state-graph/pkg/route/store:
+    interfaces:
+      Store:
   github.com/akira-core/kube-state-graph/internal/auth:
     interfaces:
       Validator:

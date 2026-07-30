@@ -2,7 +2,7 @@ package build
 
 import "strings"
 
-// clusterFamilyKey normalises a cluster name to its family key by replacing
+// ClusterFamilyKey normalises a cluster name to its family key by replacing
 // every maximal ASCII digit run with a single '0' sentinel: "prod-03" and
 // "prod-12" both yield "prod-0" (same family), while "staging-1" yields
 // "staging-0" (a different family). A digit-free name normalises to itself,
@@ -21,7 +21,11 @@ import "strings"
 // family, never across families. The rule is a hardcoded pure string
 // function — no flag, env var, or config field — so resolution stays a pure
 // function of (series labels, topology) and determinism is preserved.
-func clusterFamilyKey(name string) string {
+//
+// Exported because pkg/route's ingress-cluster selection (design D10) shares
+// the family rule: the two consumers must agree on what "same family" means,
+// or a cluster the route engine selects could be one the fan-out disowns.
+func ClusterFamilyKey(name string) string {
 	var b strings.Builder
 	inDigits := false
 	for i := range len(name) {

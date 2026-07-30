@@ -208,3 +208,51 @@ func TestParse_PromBasicAuth_NoFlagsRegistered(t *testing.T) {
 		})
 	}
 }
+
+// Route-store credentials are env-only and must be configured as a pair;
+// validation errors must never echo the configured values.
+func TestParse_RouteStoreAuth_EnvPair(t *testing.T) {
+	env := map[string]string{
+		"KSG_ROUTE_STORE_USERNAME": "ksg",
+		"KSG_ROUTE_STORE_PASSWORD": "s3cret",
+	}
+	cfg, err := Parse(nil, func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err)
+	assert.Equal(t, "ksg", cfg.RouteStoreUsername)
+	assert.Equal(t, "s3cret", cfg.RouteStorePassword)
+}
+
+func TestParse_RouteStoreAuth_DefaultUnset(t *testing.T) {
+	cfg, err := Parse(nil, func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	assert.Empty(t, cfg.RouteStoreUsername)
+	assert.Empty(t, cfg.RouteStorePassword)
+}
+
+func TestValidate_RouteStoreAuth_HalfConfiguredRejected(t *testing.T) {
+	cases := map[string]Config{
+		"username only": func() Config { c := Defaults(); c.RouteStoreUsername = "ksg"; return c }(),
+		"password only": func() Config { c := Defaults(); c.RouteStorePassword = "s3cret-value"; return c }(),
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := cfg.Validate()
+			require.Error(t, err, "half-configured credentials must be rejected")
+			assert.Contains(t, err.Error(), "KSG_ROUTE_STORE_USERNAME", "error should name both env vars")
+			assert.Contains(t, err.Error(), "KSG_ROUTE_STORE_PASSWORD", "error should name both env vars")
+			assert.NotContains(t, err.Error(), "ksg", "error must not echo the username")
+			assert.NotContains(t, err.Error(), "s3cret-value", "error must not echo the password")
+		})
+	}
+}
+
+// Credentials are deliberately env-only: no --route-store-username /
+// --route-store-password flags exist.
+func TestParse_RouteStoreAuth_NoFlagsRegistered(t *testing.T) {
+	for _, arg := range []string{"--route-store-username=x", "--route-store-password=x"} {
+		t.Run(arg, func(t *testing.T) {
+			_, err := Parse([]string{arg}, func(string) (string, bool) { return "", false })
+			require.Error(t, err, "credential flags must not exist")
+		})
+	}
+}

@@ -1,7 +1,8 @@
 name: CI
 
-# `lint`, `vuln`, `test`, and `docs-drift` are separate jobs; they run in
-# parallel (no `needs` edges) so PR feedback latency = max, not sum.
+# `lint`, `vuln`, `test`, `docs-drift`, `route-containment`, and `mocks-drift`
+# are separate jobs; they run in parallel (no `needs` edges) so PR feedback
+# latency = max, not sum.
 on:
   pull_request:
   # Also run on direct pushes / merges to the default branch so post-merge
@@ -54,8 +55,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The route-engine e2e (internal/integration TestRouteSuite) needs Envoy's
+      # native router_check_tool. Without it the suite used to Skipf — which
+      # prints as `ok`, so every route-engine regression merged green. It now
+      # Fatalf's whenever CI is set, and this step is what keeps that green:
+      # the binary comes from the SAME digest-pinned image the server image
+      # ships (single source: the Dockerfile ARG the Makefile reads).
+      - name: Install router_check_tool
+        run: make router-check-tool
+
+      - name: Export router_check_tool path
+        run: echo "KSG_ROUTER_CHECK_BIN=$PWD/bin/router_check_tool" >> "$GITHUB_ENV"
+
+      # Single source of truth: `make test` carries the -timeout 30m the three
+      # container-backed suites need under -race (Go's 10m default aborts them
+      # with a panic dump instead of a clean failure).
       - name: Run unit + integration tests
-        run: go test ./... -count=1 -race -shuffle=on
+        run: make test
 
   docs-drift:
     runs-on: ubuntu-latest
@@ -78,6 +94,25 @@ jobs:
       # committed docs/ spec (embedded into the binary via docs/embed.go).
       - name: Verify docs in sync
         run: make check-docs
+
+  # Dependency containment (translate-global-fqdn-to-k8s-service D1): pkg/build
+  # declares only the RouteResolver interface, pkg/route holds the engine. A
+  # future pkg/build -> pkg/route import would make every embedder of the graph
+  # engine inherit istio + ClickHouse + Envoy protos. The check lived only in
+  # `make ci` until now, so the guarantee CLAUDE.md documents was not actually
+  # enforced anywhere.
+  route-containment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify route-engine containment
+        run: make check-route-containment
 
   mocks-drift:
     runs-on: ubuntu-latest

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,6 +43,24 @@ func installInMemoryTracer(t *testing.T) *tracetest.InMemoryExporter {
 		otel.SetTextMapPropagator(prevProp)
 	})
 	return exporter
+}
+
+// waitForSpans returns the exporter's spans once at least one has arrived.
+//
+// Reading the exporter straight after the response is a race the test can lose:
+// otelgin ends the server span in a DEFERRED call, after the handler returns,
+// while net/http flushes a response larger than its 4 KB write buffer to the
+// client mid-handler. /v1/edge-types is well past that, so the client can have
+// the whole body in hand before the span exists. Only the positive assertions
+// need this — a test asserting NO span has nothing to wait for.
+func waitForSpans(t *testing.T, exporter *tracetest.InMemoryExporter, msg string) tracetest.SpanStubs {
+	t.Helper()
+	var spans tracetest.SpanStubs
+	require.Eventually(t, func() bool {
+		spans = exporter.GetSpans()
+		return len(spans) > 0
+	}, 5*time.Second, 5*time.Millisecond, msg)
+	return spans
 }
 
 func TestTracing_LivezProbeEmitsNoSpan(t *testing.T) {
@@ -81,8 +100,7 @@ func TestTracing_EdgeTypesEmitsServerSpan(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	spans := exporter.GetSpans()
-	require.NotEmpty(t, spans, "/v1/edge-types must emit at least one server span")
+	spans := waitForSpans(t, exporter, "/v1/edge-types must emit at least one server span")
 
 	var found bool
 	for _, span := range spans {
@@ -112,8 +130,7 @@ func TestTracing_InboundTraceparentBecomesParent(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	spans := exporter.GetSpans()
-	require.NotEmpty(t, spans)
+	spans := waitForSpans(t, exporter, "/v1/edge-types must emit a server span")
 	var serverSpan *tracetest.SpanStub
 	for i := range spans {
 		if spans[i].Name == "GET /v1/edge-types" {
@@ -140,7 +157,7 @@ func TestTracing_FailedGraphRecordsErrorSpan(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
 
-	spans := exporter.GetSpans()
+	spans := waitForSpans(t, exporter, "/v1/graph must emit a server span")
 	var serverSpan *tracetest.SpanStub
 	for i := range spans {
 		if spans[i].Name == "GET /v1/graph" {
@@ -180,7 +197,7 @@ func TestTracing_OutsideRetention400_LeavesServerSpanUnset(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
-	spans := exporter.GetSpans()
+	spans := waitForSpans(t, exporter, "/v1/graph must emit a server span")
 	var serverSpan *tracetest.SpanStub
 	for i := range spans {
 		if spans[i].Name == "GET /v1/graph" {
