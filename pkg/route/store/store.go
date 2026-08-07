@@ -1,0 +1,278 @@
+// Package store is the READ-ONLY contract for the versioned Istio-config store
+// backing route resolution (the translate-global-fqdn-to-k8s-service change).
+// The metadata-exporter repo owns watch/ingest and the schema; kube-state-graph
+// only loads version snapshots out of it — there is deliberately no CreateSchema
+// and no inserter here (design D7). Ported from poc/route2a/internal/store with
+// one structural change: every row carries a `cluster` column and every
+// snapshot query is scoped by it, because kube-state-graph is multi-cluster and a
+// Gateway/VS lookup must never leak across clusters. The one deliberate
+// cross-cluster read is ClustersWithIngressIP, the ingress-cluster selection
+// probe (design D10).
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"strings"
+	"time"
+
+	networking "istio.io/api/networking/v1alpha3"
+)
+
+// ServiceRow is one service_versions row (ingress LB: ExternalIPs and/or
+// LoadBalancerIPs set plus Selector; Ports empty; backend: Ports set, both IP
+// arrays empty). One row per Service version — a backend Service's ports all
+// live in Ports (decoded from the spec_json column), so a multi-port Service
+// is a single row, not one row per port. The backend Service's identity is
+// (Cluster, Namespace, Name); its FQDN (the destination.host a VS routes to)
+// is derived — see BackendFQDN / ParseBackendHost.
+//
+// No Rev field on any row type: `rev` was the POC corpus's synthetic oracle
+// column. The production tables the exporter writes identify versions by
+// resource_version + ingest_seq envelope columns instead, resolution never
+// needed a rev, and selecting it against production would fail with
+// Unknown column.
+type ServiceRow struct {
+	Cluster                      string
+	Namespace, Name              string
+	ValidFrom, ValidTo           time.Time
+	ExternalIPs, LoadBalancerIPs []string
+	Selector                     []string
+	Ports                        []SvcPort
+	IngestSeq                    uint64
+}
+
+// HasIngressIP reports whether ip appears in ExternalIPs or LoadBalancerIPs
+// (the hop-1 / probe match: either array counts).
+func (r ServiceRow) HasIngressIP(ip string) bool {
+	for _, a := range r.ExternalIPs {
+		if a == ip {
+			return true
+		}
+	}
+	for _, a := range r.LoadBalancerIPs {
+		if a == ip {
+			return true
+		}
+	}
+	return false
+}
+
+// SvcPort is one Service port. JSON tags match the corev1 ServiceSpec.ports
+// shape so the reader unmarshals the exporter's `spec` blob directly (extra
+// fields ignored).
+type SvcPort struct {
+	Name     string `json:"name"`
+	Port     uint32 `json:"port"`
+	Protocol string `json:"protocol"`
+}
+
+// ClusterDomain is the mesh's DNS domain. It is also stamped on every
+// config.Meta the snapshot builds, because istiod resolves a short
+// destination.host to `<name>.<namespace>.svc.<domain>` and appends nothing when
+// the meta carries no domain (see ResolveDestinationHost).
+//
+// serviceDomain is the derived Service FQDN suffix — one source, so the two can
+// never drift. The reader assumes the default cluster domain; the exporter
+// stores only (namespace, name), so the FQDN mapping is Istio-side derivation
+// that lives here.
+const (
+	ClusterDomain = "cluster.local"
+	serviceDomain = ".svc." + ClusterDomain
+)
+
+// BackendFQDN reconstructs a backend Service's FQDN (its destination.host
+// identity) from its (name, namespace) — the inverse of ParseBackendHost.
+func BackendFQDN(name, ns string) string { return name + "." + ns + serviceDomain }
+
+// ResolveDestinationHost normalises a VirtualService route's destination.host to
+// the identity istiod itself resolves it to, given the namespace of the
+// VirtualService that declares it. It mirrors istio's ResolveShortnameToFQDN
+// exactly: ONLY a dot-free name is a short name, and it is qualified with the
+// namespace and the cluster domain. A wildcard, an IP literal, or anything
+// already containing a dot is returned verbatim — istiod treats those as fully
+// qualified and looks them up as literal registry hostnames.
+//
+// That verbatim branch is deliberate, not an omission: `checkout.shop` and
+// `checkout.shop.svc` name no Service in a real mesh either (a real Envoy 503s
+// on them), so they must NOT be coerced into a Service identity here.
+func ResolveDestinationHost(host, vsNamespace string) string {
+	if host == "" || host == "*" || vsNamespace == "" {
+		return host
+	}
+	if strings.Contains(host, ".") {
+		// Already qualified as far as istiod is concerned — this also covers
+		// wildcards like *.example.com and dotted IPv4 literals.
+		return host
+	}
+	if net.ParseIP(host) != nil { // a bare IPv6 literal carries no dot
+		return host
+	}
+	return BackendFQDN(host, vsNamespace)
+}
+
+// ParseBackendHost derives (name, namespace) from an in-cluster Service FQDN —
+// either a destination.host already normalised by ResolveDestinationHost, or the
+// host segment of an istiod-generated Envoy cluster string. ok=false for
+// anything else, which the caller skips.
+//
+// Exactly two leading labels are required. `mysql-0.mysql.db.svc.cluster.local`
+// (the headless per-pod form) is NOT the Service `mysql-0` in namespace `mysql`;
+// parsing it by prefix would report a Service that never received the traffic.
+func ParseBackendHost(host string) (name, ns string, ok bool) {
+	rest, found := strings.CutSuffix(host, serviceDomain)
+	if !found {
+		return "", "", false
+	}
+	labels := strings.Split(rest, ".")
+	if len(labels) != 2 || labels[0] == "" || labels[1] == "" {
+		return "", "", false
+	}
+	return labels[0], labels[1], true
+}
+
+// VSDestHosts collects the destination Service identity of every route in a
+// VirtualService (HTTP/TLS/TCP, mirrors included), each normalised through
+// ResolveDestinationHost with vsNamespace — the namespace of the VirtualService
+// the routes come from. It is THE single implementation: the ClickHouse reader
+// and pkg/route/snapshot both call it, so the backend-Service key list, the
+// backend query, and the translate registry cannot disagree on an identity.
+func VSDestHosts(vs *networking.VirtualService, vsNamespace string) []string {
+	var hosts []string
+	add := func(d *networking.Destination) {
+		if d == nil || d.GetHost() == "" {
+			return
+		}
+		hosts = append(hosts, ResolveDestinationHost(d.GetHost(), vsNamespace))
+	}
+	for _, r := range vs.GetHttp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+		if m := r.GetMirror(); m != nil {
+			add(m)
+		}
+	}
+	for _, r := range vs.GetTls() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	for _, r := range vs.GetTcp() {
+		for _, rd := range r.GetRoute() {
+			add(rd.GetDestination())
+		}
+	}
+	return hosts
+}
+
+// serviceSpec is the minimal shape read out of the spec_json column: just the
+// ports subtree of a Service spec. It mirrors the field the exporter's `spec`
+// blob exposes, so one decoder works for both the test corpus and production.
+type serviceSpec struct {
+	Ports []SvcPort `json:"ports"`
+}
+
+// MarshalPorts encodes a Service's ports as a spec_json column value
+// (`{"ports":[...]}`), or "" for a portless (ingress LB) row. The reader never
+// writes production rows — this exists for test corpora that seed a store.
+func MarshalPorts(ports []SvcPort) (string, error) {
+	if len(ports) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(serviceSpec{Ports: ports})
+	return string(b), err
+}
+
+// ParsePorts decodes the ports out of a spec_json column value ("" => none).
+// Unknown fields are ignored, so it reads a full exporter `spec` blob.
+func ParsePorts(specJSON string) ([]SvcPort, error) {
+	if specJSON == "" {
+		return nil, nil
+	}
+	var s serviceSpec
+	if err := json.Unmarshal([]byte(specJSON), &s); err != nil {
+		return nil, err
+	}
+	return s.Ports, nil
+}
+
+// GatewayCand is one candidate gateway from the IP 3-hop (name + server host
+// patterns, enough to build a gwresolve.Resolver).
+type GatewayCand struct {
+	Namespace   string
+	Name        string
+	ServerHosts []string
+}
+
+// DeployRow / GatewayRow / VSRow are full version rows for the range path. They
+// carry the materialized ValidFrom/ValidTo so the in-memory snapshot can check
+// liveness without re-hitting the DB; GatewayRow/VSRow keep spec_json so ScopedFor can
+// rebuild translate input off the loaded rows.
+type DeployRow struct {
+	Cluster            string
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	PodLabels          []string
+	IngestSeq          uint64
+}
+
+type GatewayRow struct {
+	Cluster            string
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	SelectorKV         []string
+	ServerHosts        []string
+	SpecJSON           string
+	IngestSeq          uint64
+}
+
+type VSRow struct {
+	Cluster            string
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	BoundGateways      []string
+	SpecJSON           string
+	IngestSeq          uint64
+}
+
+// TrafficSnapshot is every resource version LIVE AT one instant that a single
+// load pulled: the ingress Service, its Deployment, the candidate Gateways,
+// their bound VirtualServices, and the backend Services those VS route to. It
+// is loaded once (LoadTrafficAt), then resolved in memory
+// (pkg/route/snapshot) with no further DB round-trips. Each row's ValidTo is
+// the materialized column value, so liveness is `ValidFrom <= at < ValidTo`
+// (simplify-route-resolution-to-point-in-time D2).
+type TrafficSnapshot struct {
+	Services []ServiceRow // ingress LB + backend destination Service versions
+	Deploys  []DeployRow
+	Gateways []GatewayRow
+	VSes     []VSRow
+}
+
+// Store is the read-only snapshot loader one backend implements. The snapshot
+// load is scoped to a single cluster — route resolution must never mix one
+// cluster's Gateways with another's. The ONLY cross-cluster read is the
+// ingress-IP probe that feeds ingress-cluster selection (design D10).
+type Store interface {
+	Close() error
+
+	// LoadTrafficAt fetches every resource version live at `at` that is
+	// reachable from destination IP in cluster (one scoped as-of load per
+	// resource kind, using the materialized valid_to:
+	// valid_from <= at AND at < valid_to). The caller resolves the returned
+	// snapshot in memory.
+	LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time) (TrafficSnapshot, error)
+
+	// ClustersWithIngressIP is the store's ONLY cross-cluster read: the
+	// distinct clusters whose ingress LB Service version carrying ip in
+	// external_ips or loadbalancer_ips was live at `at`. It feeds the
+	// ingress-cluster selection (design D10) — ClickHouse's whole job there
+	// is answering "ip → []cluster". The same no-FINAL semantics as the
+	// snapshot load apply (valid_to never filtered in SQL except under the
+	// uniqueRows prune; client-side dedup per version slot by max
+	// ingest_seq; liveness checked post-dedup). The result is deduplicated
+	// and sorted for determinism.
+	ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error)
+}

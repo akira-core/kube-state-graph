@@ -72,7 +72,7 @@ curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
 
 以 `rate(traces_service_graph_request_total[<window>]) @ <end>` 評估。每條 series 帶單一 `cluster` external label，代表追蹤來源（通常是執行 Tempo metrics-generator 的 cluster），即呼叫的 **client 端** cluster。**Server 端** cluster 由 build 時把 `server_k8s_pod_uid` 對全域 topology pod-UID index join 還原——K8s pod UID 在實務上跨 cluster 唯一，lookup 可明確還原。僅在兩端都能解析時才輸出邊。當某端的 pod-UID 標籤為空時，會用內建的**連線字串判斷**（無旗標可調）解析其 `client`／`server` 人類可讀標籤：含字面 `://` 的標籤視為 URL——叢集內 `<service>.<namespace>.svc` 名稱會解析為**呼叫端自己 cluster 中的單一** `type="service"` 節點（因此 `pod-calls-service` 永遠為叢集內），前提是該 cluster 持有同名 Service。該 service 節點再隨需 fan-out `service-selects-pod` 邊，指向**同 family 中每個持有同名 Service 的 cluster** 的後端 pod——因此 `service-selects-pod` **可跨叢集**，對應多叢集 service mesh 的端點聚合（cluster 名稱在壓縮數字串後相同即同 family，例如 `prod-1` ↔ `prod-2`）。headless 的 `<pod>.<service>.<namespace>.svc` 名稱會解析為**相同的** service 節點（丟棄前導 pod-hostname）——`://` endpoint 永不為特定 pod。無法解析的 URL、或呼叫端 cluster 未持有該 Service 時，則成為 `external` 節點；非 URL（不含 `://`）的標籤則經 missing pod-UID human-label fallback 亦成為 `external` 節點。
 
-`servicegraph` connector 產生的**虛擬節點**——`client="user"`（未被 instrument 的呼叫端）與 `unknown`（無法解析的對端）——會在 query 層直接排除（`client!~"user|unknown",server!~"user|unknown"`），不會出現為任何節點或邊。比對為精確且大小寫敏感，因此 host 只是「包含」`user` 的 `://` 連線字串不受影響。
+`servicegraph` connector 產生的**虛擬節點**——`client="user"`（未被 instrument 的呼叫端）與 `unknown`（無法解析的對端）——會在 query 層排除（`client!~"user|unknown",server!~"user"`），通常不會出現為任何節點或邊。比對為精確且大小寫敏感，因此 host 只是「包含」`user` 的 `://` 連線字串不受影響。**Server 端收窄為 `server!~"user"`**，因此 `server="unknown"` 的 series 仍會到達 reader：當其 client 端解析為**真實** pod、且 client 端記錄的對端位址（`client_net_peer_name`／`client_server_address`）指向某個 Kubernetes Service 時，該對端會被還原成 `pod-calls-service` 邊（非叢集位址則成為 `external` 節點），而非直接丟棄；其餘所有 `server="unknown"` 情況仍如舊 byte-for-byte 丟棄。
 
 ### 探針 — 診斷用，不屬於圖資料
 
@@ -133,7 +133,7 @@ make doctor         # 檢查工具版本（go、golangci-lint、govulncheck、mo
 make init-hooks     # （選用）安裝 pre-commit hook（gofmt + go vet）
 ```
 
-需求：Go 1.25+。`go.mod` 中 pin 的 toolchain（目前 `go1.26.4`）會在第一次 build 時自動下載。
+需求：Go 1.25+。`go.mod` 中 pin 的 toolchain（目前 `go1.26.5`）會在第一次 build 時自動下載。
 
 ### 日常指令
 

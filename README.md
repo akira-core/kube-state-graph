@@ -139,9 +139,15 @@ via the missing pod-UID human-label fallback.
 
 The `servicegraph` connector's **virtual peers** — `client="user"` (an
 uninstrumented caller) and `unknown` (an unresolved peer) — are dropped at the
-query layer (`client!~"user|unknown",server!~"user|unknown"`) and never appear
+query layer (`client!~"user|unknown",server!~"user"`) and normally never appear
 as nodes or edges. The match is exact and case-sensitive, so a `://` host that
-merely *contains* `user` is unaffected.
+merely *contains* `user` is unaffected. The **server side is narrowed to
+`server!~"user"`** so a `server="unknown"` series still reaches the reader: when
+its client resolves to a **real** pod and the client-recorded peer address
+(`client_net_peer_name` / `client_server_address`) names a Kubernetes Service,
+that peer is recovered into a `pod-calls-service` edge (or an `external` node
+for a non-cluster address) instead of being dropped; every other
+`server="unknown"` case is still dropped, byte-for-byte as before.
 
 ### Probes — diagnostics, not graph data
 
@@ -232,7 +238,7 @@ make doctor         # verify toolchain (go, golangci-lint, govulncheck, mockery,
 make init-hooks     # (optional) install pre-commit hook (gofmt + go vet)
 ```
 
-Required: Go 1.25+. The toolchain pinned in `go.mod` (currently `go1.26.4`)
+Required: Go 1.25+. The toolchain pinned in `go.mod` (currently `go1.26.5`)
 will be auto-fetched by Go on first build.
 
 ### Day-to-day commands

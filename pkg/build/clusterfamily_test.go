@@ -25,17 +25,17 @@ func TestClusterFamilyKey(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := clusterFamilyKey(tc.in); got != tc.want {
-				t.Errorf("clusterFamilyKey(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := ClusterFamilyKey(tc.in); got != tc.want {
+				t.Errorf("ClusterFamilyKey(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
 
 	// Injectivity spot-checks: distinct families must not share a key.
-	if clusterFamilyKey("prod-#") == clusterFamilyKey("prod-1") {
+	if ClusterFamilyKey("prod-#") == ClusterFamilyKey("prod-1") {
 		t.Error("a literal sentinel-lookalike name must not join a numbered family")
 	}
-	if clusterFamilyKey("a#1") == clusterFamilyKey("a1#") {
+	if ClusterFamilyKey("a#1") == ClusterFamilyKey("a1#") {
 		t.Error("digit-run position must stay significant around non-digit bytes")
 	}
 }

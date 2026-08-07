@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -14,6 +15,13 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
+
+// sentinelUnknown is the literal server-label value the D30 query-layer
+// exclusion no longer drops on the server side (resolve-unknown-server-peer-labels
+// D1). A no-op everywhere except the two resolveServer branches that route it
+// to resolveUnknownServerPeer instead of the generic empty-UID / synth-pod
+// fallbacks.
+const sentinelUnknown = "unknown"
 
 // ServiceGraphResult is the typed output of the pod-service-graph reader.
 type ServiceGraphResult struct {
@@ -32,6 +40,14 @@ type ServiceGraphResult struct {
 // with ReadTopology; the metric-name prefix is NOT applied to
 // traces_service_graph_request_total (different exporter family, design.md
 // D26), so r is effectively a no-op here today.
+//
+// resolver is the optional Istio route-resolution engine
+// (translate-global-fqdn-to-k8s-service): when non-nil, a pure prescan
+// collects the unknown-server endpoints that would fall to external nodes,
+// resolves them here — where ctx and the window exist — and hands the answers
+// to the parse as a prefetched index, keeping parseServiceGraphRoutes free of
+// I/O (design D2). resolveTimeout bounds each engine call (zero = ctx only).
+// A nil resolver skips the prescan entirely: pre-change behaviour.
 func ReadServiceGraph(
 	ctx context.Context,
 	q promql.Querier,
@@ -39,6 +55,8 @@ func ReadServiceGraph(
 	window time.Duration,
 	end time.Time,
 	topology Topology,
+	resolver RouteResolver,
+	resolveTimeout time.Duration,
 ) (ServiceGraphResult, error) {
 	vec, err := q.Instant(ctx,
 		string(promql.QServiceGraphTotal),
@@ -48,7 +66,21 @@ func ReadServiceGraph(
 	if err != nil {
 		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
 	}
-	return parseServiceGraph(vec, topology), nil
+	// ONE resolver per build, shared by the prescan and the parse. Its topology
+	// indexes are immutable and building them scans every pod and Service across
+	// every cluster (with per-family sorts), so building them twice per request
+	// was pure duplicated work — and the prescan consults them read-only.
+	res := newSGResolver(topology)
+
+	var routes routeIndex
+	if resolver != nil {
+		// Range in, instant out: the PromQL side keeps (window, end), the route
+		// engine gets ONLY end — the single instant it evaluates the ingress
+		// config at (simplify-route-resolution-to-point-in-time D1).
+		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
+			collectRouteQueriesWith(vec, res), end)
+	}
+	return parseWithResolver(vec, res, routes), nil
 }
 
 // sgResolver carries the per-build dedupe maps and topology indexes used to
@@ -60,11 +92,14 @@ type sgResolver struct {
 	podByID            map[string]*graph.PodNode    // client side: cluster known from metric
 	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
+	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
 	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
+	routes             routeIndex                   // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
 	svcEdges           map[string]*graph.Edge        // service-selects-pod, keyed by "svcID|podID"
+	routeChainEdges    map[string]routeChainEdge     // synthesized ingress-pod → backend-service pod-calls-service, keyed "srcPodID|backendSvcID"
 
 	// Debug-only evidence accumulators (no effect on the emitted graph). Counted
 	// while resolving each endpoint and surfaced as an aggregated summary at the
@@ -116,15 +151,29 @@ type svcCandidate struct {
 	obs     ServiceObs
 }
 
+// ipKey keys the resolve-unknown-server-ip-peer reverse index: a Service's
+// ClusterIP, scoped to a single cluster. Deliberately NOT family-scoped like
+// famSvcKey — a ClusterIP is a per-cluster address assigned from that
+// cluster's own (often overlapping) Service CIDR, so matching it across
+// clusters risks resolving to the wrong Service. The identification lookup
+// is anchor-cluster-only; once a (namespace, service) is identified, the
+// existing family-wide resolveServiceLevel still governs the
+// service-selects-pod fan-out.
+type ipKey struct{ cluster, ip string }
+
+// parseServiceGraph is the route-index-free form: the ~70 direct test call
+// sites and any parse without a RouteResolver go through here. Identical to
+// parseServiceGraphRoutes with a nil index — i.e. the pre-change behaviour,
+// byte for byte.
 func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
-	if len(vec) == 0 {
-		return ServiceGraphResult{}
-	}
+	return parseServiceGraphRoutes(vec, topology, nil)
+}
 
-	// Per-metric tally of samples missing the `cluster` label; surfaced as one
-	// aggregated warn at the end of the parse.
-	mc := missingClusterCounts{}
-
+// newSGResolver builds the per-parse resolver: the immutable topology indexes
+// every resolution path consults. Shared by parseServiceGraphRoutes and the
+// collectRouteQueries prescan so both classify endpoints over identical
+// indexes (design D2).
+func newSGResolver(topology Topology) *sgResolver {
 	podByID := make(map[string]*graph.PodNode, len(topology.Pods))
 	for _, p := range topology.Pods {
 		podByID[p.ID()] = p
@@ -140,28 +189,82 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 	// "unknown"-bucketed service entries (samples missing their cluster label)
 	// land under family "unknown" — its own family-of-one — so they are reachable
 	// only by an "unknown"-anchored caller and never unioned into a real cluster's
-	// fan-out (clusterFamilyKey("unknown") == "unknown" != "prod-0").
+	// fan-out (ClusterFamilyKey("unknown") == "unknown" != "prod-0").
 	svcCandidates := make(map[famSvcKey][]svcCandidate, len(topology.ServicesByNameNS))
 	for k, obs := range topology.ServicesByNameNS {
-		key := famSvcKey{family: clusterFamilyKey(k.cluster), namespace: k.namespace, service: k.service}
+		key := famSvcKey{family: ClusterFamilyKey(k.cluster), namespace: k.namespace, service: k.service}
 		svcCandidates[key] = append(svcCandidates[key], svcCandidate{cluster: k.cluster, obs: obs})
 	}
 	for _, cands := range svcCandidates {
 		sort.Slice(cands, func(i, j int) bool { return cands[i].cluster < cands[j].cluster })
 	}
 
-	res := &sgResolver{
+	// Reverse ClusterIP index for the resolve-unknown-server-ip-peer bare
+	// IP-literal classification step: (cluster, ClusterIP) -> the Service
+	// deployed at that address in that cluster. Skips headless ("None") and
+	// empty ClusterIP values — neither is a matchable literal. On a same-
+	// cluster duplicate ClusterIP (a data anomaly Kubernetes itself prevents,
+	// but the index build stays defensive), the lexically-smaller
+	// (namespace, service) wins — deterministic, independent of map-
+	// iteration order (D6).
+	ipIndex := make(map[ipKey]serviceKey, len(topology.ServicesByNameNS))
+	for k, obs := range topology.ServicesByNameNS {
+		if obs.ClusterIP == "" || obs.ClusterIP == "None" {
+			continue
+		}
+		ik := ipKey{cluster: k.cluster, ip: obs.ClusterIP}
+		if existing, ok := ipIndex[ik]; ok {
+			if k.namespace > existing.namespace ||
+				(k.namespace == existing.namespace && k.service >= existing.service) {
+				continue
+			}
+		}
+		ipIndex[ik] = k
+	}
+
+	return &sgResolver{
 		endpointsByService: topology.EndpointsByService,
 		podByID:            podByID,
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
+		ipIndex:            ipIndex,
 		serviceApps:        topology.ServiceApplications,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
 		svcEdges:           map[string]*graph.Edge{},
+		routeChainEdges:    map[string]routeChainEdge{},
 		extReasons:         map[string]int{},
 	}
+}
+
+// parseServiceGraphRoutes is parseServiceGraph plus a prefetched route-engine
+// index (nil = engine off). The index is consulted only inside
+// resolveUnknownServerPeer, at the points that would otherwise emit an
+// external node; resolution stays a pure function of (vec, topology, routes) —
+// all I/O happened before this call (design D2).
+//
+// It builds its own resolver, which is what the direct test call sites want.
+// ReadServiceGraph goes through parseWithResolver instead, sharing one resolver
+// with the prescan.
+func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIndex) ServiceGraphResult {
+	if len(vec) == 0 {
+		return ServiceGraphResult{}
+	}
+	return parseWithResolver(vec, newSGResolver(topology), routes)
+}
+
+// parseWithResolver is the parse body over an already-built resolver.
+func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) ServiceGraphResult {
+	if len(vec) == 0 {
+		return ServiceGraphResult{}
+	}
+
+	// Per-metric tally of samples missing the `cluster` label; surfaced as one
+	// aggregated warn at the end of the parse.
+	mc := missingClusterCounts{}
+
+	res.routes = routes
 
 	// Dedup pod-calls-pod by (srcID, tgtID). Multiple upstream series can
 	// resolve to the same edge identity — most commonly when `connection_type`
@@ -190,6 +293,12 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
+		// Peer dimensions recorded on the CLIENT span (OTel semconv
+		// client.net.peer.name / client.server.address, plus the optional
+		// client_dns_answers / client_server_port / client_net_peer_port added
+		// for route resolution), consulted only when server=="unknown" and the
+		// client resolves to a real pod — see resolveUnknownServerPeer.
+		peer := peerLabelsOf(s.Metric)
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -217,8 +326,11 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 
 		// Each side resolves to a (possibly empty) slice of node IDs. With the
 		// localised model a "://" endpoint resolves to AT MOST ONE service node —
-		// in the caller's own (anchor) cluster — or to a single external node;
-		// every other path also yields exactly one ID, and an empty slice drops
+		// in the caller's own (anchor) cluster — or to a single external node.
+		// Almost every path yields exactly one ID; the one exception is a
+		// chained RouteHit, which returns [ingress, backend] so the caller keeps
+		// its direct dependency alongside the entry-point hop (see the two-target
+		// case below). An empty slice drops
 		// the side (and with it the series — the cross product below is empty).
 		srcIDs, srcIsPod := res.resolveClient(clientLabel, traceCluster, clientUID, clientNS, ctClient)
 
@@ -231,19 +343,29 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 		// pod. The "://" then resolves to a single service node in THIS cluster
 		// (iff it holds the service), per the same-cluster rule. Edge
 		// labels.cluster is unaffected (still the raw trace label, per D9).
+		//
+		// clientPod is also the trigger signal for the unknown-server peer-label
+		// enrichment: it is non-nil ONLY when the client side resolved to a REAL
+		// topology pod (res.podByID never indexes a synthesised pod), matching
+		// this requirement's "not a synthesised pod" trigger condition.
 		anchorCluster := traceCluster
+		var clientPod *graph.PodNode
 		if srcIsPod && len(srcIDs) == 1 {
 			if pod, ok := res.podByID[srcIDs[0]]; ok {
+				clientPod = pod
 				if c := pod.Labels()["cluster"]; c != "" {
 					anchorCluster = c
 				}
 			}
 		}
-		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer)
+		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, peer)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
-		// series yields a single intra-cluster edge in the anchor cluster.
+		// series yields a single intra-cluster edge in the anchor cluster. The
+		// one two-target case is a chained RouteHit (route-hit-ingress-chain
+		// D5): the server side resolves to [ingress service, backend service],
+		// yielding both the caller→ingress and the direct caller→backend edge.
 		for _, srcID := range srcIDs {
 			for _, tgtID := range tgtIDs {
 				// Deterministic dedupe: multiple upstream series can resolve to the
@@ -283,6 +405,19 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 	}
 	for _, e := range res.svcEdges {
 		edges = append(edges, e)
+	}
+	// Synthesized RouteHit ingress-chain edges (ingress pod → backend service,
+	// route-hit-ingress-chain D4). A trace-derived edge for the same (src, tgt)
+	// wins — the two would otherwise share one deterministic UUIDv5 edge ID —
+	// and skipping keeps pre-existing traced edges byte-identical. Map
+	// iteration order is irrelevant: the emitted SET is a pure function of the
+	// data, and SortEdges canonicalises downstream (D6).
+	for _, ce := range res.routeChainEdges {
+		if _, dup := pairs[pairKey{src: ce.src, tgt: ce.tgt}]; dup {
+			continue
+		}
+		edges = append(edges, graph.NewEdge(graph.EdgeTypePodCallsService, ce.src, ce.tgt,
+			map[string]string{"cluster": ce.cluster}))
 	}
 
 	out := ServiceGraphResult{
@@ -412,22 +547,75 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 			"client", t.clientLabel, "server", t.serverLabel,
 			"client_uid", t.clientUID, "server_uid", t.serverUID)
 	}
-	id := graph.PodID(traceCluster, podUID)
-	if _, ok := r.podByID[id]; ok {
-		return []string{id}, true
-	}
-	// The trace's `cluster` label is frequently missing (bucketed to "unknown")
-	// or disagrees with the client pod's real topology cluster, so the
-	// cluster-scoped podByID lookup misses even though the pod exists. Recover
-	// the real pod via the global UID index — symmetric with resolveServer —
-	// before minting a ghost, otherwise every client pod in a no-cluster-label
-	// deployment would duplicate as an "unknown/<uid>" synth node. Only
-	// synthesise when the UID is unknown to BOTH indexes.
-	if pod, ok := r.podByUID[podUID]; ok {
+	if pod := r.lookupClientPod(traceCluster, podUID); pod != nil {
 		return []string{pod.ID()}, true
 	}
+	id := graph.PodID(traceCluster, podUID)
 	r.synthPod(id, traceCluster, namespace, podUID)
 	return []string{id}, true
+}
+
+// lookupClientPod finds the REAL topology pod for a client endpoint: first the
+// cluster-scoped id (trace cluster + UID), then the global UID index — the
+// trace's `cluster` label is frequently missing (bucketed to "unknown") or
+// disagrees with the client pod's real topology cluster, so the cluster-scoped
+// lookup can miss even though the pod exists; recovering via the UID index
+// (symmetric with resolveServer) avoids minting an "unknown/<uid>" ghost for
+// every client pod of a no-cluster-label deployment. nil when the UID is empty
+// or unknown to BOTH indexes — the synth-pod fallback is the caller's
+// (resolveClient's) concern. Shared with the collectRouteQueries prescan so
+// the prescan's real-client-pod trigger test cannot drift from resolution's.
+func (r *sgResolver) lookupClientPod(traceCluster, podUID string) *graph.PodNode {
+	if podUID == "" {
+		return nil
+	}
+	if pod, ok := r.podByID[graph.PodID(traceCluster, podUID)]; ok {
+		return pod
+	}
+	if pod, ok := r.podByUID[podUID]; ok {
+		return pod
+	}
+	return nil
+}
+
+// classifyPeerHost runs the in-cluster classification ladder of the
+// unknown-server enrichment over a port-stripped host: the Kubernetes .svc DNS
+// grammar, the bare short Service name (resolved in the client pod's own
+// namespace), and the anchor-cluster ClusterIP literal. classified=false means
+// no grammar produced a service identity. Pure over the resolver's immutable
+// indexes — no materialisation — so the collectRouteQueries prescan shares it
+// with resolveUnknownServerPeer (design D2's anti-drift extraction).
+func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster string) (ns, svc string, classified bool) {
+	if s, n, ok := classifyK8sDNS(host); ok {
+		return n, s, true
+	}
+	if s, ok := classifyBareShortName(host); ok {
+		return clientNamespace, s, true
+	}
+	// resolve-unknown-server-ip-peer: a bare IP literal is looked up against
+	// the anchor cluster's OWN ClusterIP set only — never a family sibling,
+	// since a ClusterIP is a per-cluster address that can legitimately collide
+	// across unrelated clusters' Service CIDRs (see ipKey doc comment).
+	if net.ParseIP(host) != nil {
+		if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: host}]; hit {
+			return sk.namespace, sk.service, true
+		}
+	}
+	return "", "", false
+}
+
+// anchorHolds reports whether the anchor cluster itself deploys (ns, svc) —
+// the same membership test resolveServiceLevel applies before materialising a
+// service node. Used by the prescan to skip endpoints the in-cluster ladder
+// already resolves (route resolution runs ONLY where the parse would fall to
+// an external node).
+func (r *sgResolver) anchorHolds(anchorCluster, ns, svc string) bool {
+	for _, cand := range r.svcCandidates[famSvcKey{family: ClusterFamilyKey(anchorCluster), namespace: ns, service: svc}] {
+		if cand.cluster == anchorCluster {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveServer mirrors resolveClient. The metric does not carry server-side
@@ -439,15 +627,28 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 // routing). anchorCluster is the caller's authoritative cluster: the
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
-func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace) []string {
+//
+// clientPod and peer feed ONLY the resolve-unknown-server-peer-labels
+// enrichment: whenever the raw server label is literally "unknown" AND no real
+// topology pod is found for it (UID empty, or UID present but absent from the
+// global pod-UID index), resolution routes to resolveUnknownServerPeer instead
+// of resolveEmptyUID or the synth-pod fallback below — D1's explicit
+// carve-out, so the loosened server!~"user" selector does not leak
+// external/unknown noise via the generic paths.
+func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, peer peerLabels) []string {
 	if podUID == "" {
+		if label == sentinelUnknown {
+			return r.resolveUnknownServerPeer(clientPod, peer, t)
+		}
 		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
 	// As in resolveClient: a populated server_k8s_pod_uid SKIPS connection-string
 	// resolution, so a "://" server label never maps to its service node (it
 	// collapses onto the UID's pod, or a synth pod when the UID is unknown to
 	// topology). This is the most common cause of a "://" peer resolving as a
-	// service on the client side yet falling through on the server side.
+	// service on the client side yet falling through on the server side. Never
+	// fires for label == "unknown" — isConnString("unknown") is false — so this
+	// evidence path and the enrichment branch below are mutually exclusive.
 	if isConnString(label) {
 		r.shadowed++
 		_, known := r.podByUID[podUID]
@@ -460,8 +661,102 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 	if pod, ok := r.podByUID[podUID]; ok {
 		return []string{pod.ID()}
 	}
+	if label == sentinelUnknown {
+		return r.resolveUnknownServerPeer(clientPod, peer, t)
+	}
 	r.synthPod(graph.PodID("", podUID), "", namespace, podUID) // server cluster unknown
 	return []string{graph.PodID("", podUID)}
+}
+
+// resolveUnknownServerPeer implements the "Unknown-server peer-label
+// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3): the
+// narrow carve-out that lets a literal server="unknown" endpoint resolve via
+// the client-recorded peer-address labels client_net_peer_name /
+// client_server_address instead of being unconditionally dropped — but only
+// when the client side already resolved to a REAL (non-synthesised) topology
+// pod, so the anchor cluster is unambiguous. clientPod nil (client
+// unresolved, or resolved only to a synth pod) and "neither label present"
+// both drop the endpoint (nil), byte-for-byte identical to the outcome under
+// the old server!~"user|unknown" query-layer exclusion.
+//
+// translate-global-fqdn-to-k8s-service adds ONE step: at EVERY point below
+// that would emit an external node — no grammar matched, an IP literal with
+// no ClusterIP hit, AND a classified (ns, svc) the anchor cluster does not
+// hold (the branch a global FQDN like api.example.com actually takes, design
+// D3) — the prefetched route-engine index is consulted first via
+// routeExternal. A route hit resolves through the same resolveServiceLevel as
+// every other path; a miss (or the engine being off) falls to the external
+// node exactly as before.
+func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer peerLabels, t sgTrace) []string {
+	if clientPod == nil {
+		return nil // client side did not resolve to a real topology pod
+	}
+	value := peer.value()
+	if value == "" {
+		return nil // neither client_net_peer_name nor client_server_address present
+	}
+
+	anchorCluster := clientPod.Labels()["cluster"]
+	clientNamespace := clientPod.Labels()["namespace"]
+
+	host, _ := splitPeerAddressPort(value)
+	// The same key derivation the collectRouteQueries prescan used, so the
+	// index lookup can never miss for key-derivation reasons (ok is guaranteed
+	// here: value is non-empty).
+	key, _ := peerRouteKey(anchorCluster, peer)
+
+	// routeExternal is the shared external fallback: consult the route index
+	// first; only when it does not save the endpoint, record the classify
+	// reason (unless the index already recorded a route_engine_* reason for
+	// this endpoint) and emit the external node.
+	routeExternal := func(reason string, attrs ...any) []string {
+		ids, noted := r.routeIndexResolve(key, value, reason, t)
+		if len(ids) > 0 {
+			return ids
+		}
+		if !noted {
+			r.noteExternal(reason, t, attrs...)
+		}
+		return []string{r.external(value)}
+	}
+
+	ns, svc, classified := r.classifyPeerHost(host, clientNamespace, anchorCluster)
+	if !classified {
+		if net.ParseIP(host) != nil {
+			return routeExternal("unknown_server_peer_ip_literal_no_match",
+				"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+		}
+		return routeExternal("unknown_server_peer_not_k8s_dns",
+			"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+	}
+	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
+		slog.Debug("service-graph unknown-server peer-label resolved to service node",
+			"side", t.side, "peer_address", value, "service", svc, "namespace", ns,
+			"anchor_cluster", anchorCluster, "service_id", ids[0],
+			"client", t.clientLabel, "server", t.serverLabel)
+		return ids
+	}
+	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
+	// hold that Service in its own family — external, not dropped (mirrors
+	// resolveConnString's anchor_cluster_lacks_service outcome).
+	return routeExternal("unknown_server_peer_anchor_lacks_service",
+		"service", svc, "namespace", ns, "host", host, "peer_address", value,
+		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
+}
+
+// classifyBareShortName reports whether host is a bare, dot-free Service short
+// name — the resolve-unknown-server-peer-labels D2 step-3 grammar extension
+// over classifyK8sDNS, scoped to the unknown-server peer-label enrichment
+// trigger only (connection-string resolution does NOT gain this grammar). A
+// multi-label host or an IP literal (IPv4 or IPv6) is never a bare short name.
+func classifyBareShortName(host string) (service string, ok bool) {
+	if host == "" || strings.Contains(host, ".") {
+		return "", false
+	}
+	if net.ParseIP(host) != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // resolveConnString implements D29 Stage 0 for a label containing "://". Every
@@ -511,7 +806,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 	// label as name).
 	r.noteExternal("anchor_cluster_lacks_service", t,
 		"service", svc, "namespace", ns, "host", host,
-		"anchor_cluster", anchorCluster, "anchor_family", clusterFamilyKey(anchorCluster))
+		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
 	return []string{r.external(label)}
 }
 
@@ -529,7 +824,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 //     sibling holding it is NOT enough — a same-named local Service is a mesh
 //     precondition), an "unknown"/empty/bogus anchor naming no holder in its
 //     own family, AND preserves the fully-unlabelled single-cluster case
-//     (clusterFamilyKey("unknown") == "unknown" is a family-of-one, so an
+//     (ClusterFamilyKey("unknown") == "unknown" is a family-of-one, so an
 //     "unknown"-bucketed service makes "unknown" a legitimate holder). There is
 //     NO cross-family fallback.
 //  3. Materialise ONE service node, in the anchor cluster, from its OWN
@@ -546,7 +841,7 @@ func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) [
 //
 // Returns the single-element slice [anchorSvcID], or nil (→ external).
 func (r *sgResolver) resolveServiceLevel(anchorCluster, ns, svc string) []string {
-	cands := r.svcCandidates[famSvcKey{family: clusterFamilyKey(anchorCluster), namespace: ns, service: svc}]
+	cands := r.svcCandidates[famSvcKey{family: ClusterFamilyKey(anchorCluster), namespace: ns, service: svc}]
 	var anchor *svcCandidate
 	for i := range cands {
 		if cands[i].cluster == anchorCluster {
@@ -566,6 +861,37 @@ func (r *sgResolver) resolveServiceLevel(anchorCluster, ns, svc string) []string
 		for _, ep := range r.endpointsByService[serviceKey{cand.cluster, ns, svc}] {
 			r.addServiceEdge(id, ep.Pod.ID(), ns)
 		}
+	}
+	return []string{id}
+}
+
+// resolveServiceLevelInCluster is resolveServiceLevel with the
+// service-selects-pod fan-out LOCKED to one cluster's own endpoints — no
+// family union (route-hit-ingress-chain D2). Used for ingress LB Services
+// (the RouteHit chain's entry hop and the RouteIngressLBService fallback):
+// an LB IP is a per-cluster address, so the pods behind it are the locked
+// cluster's own endpoints — a family sibling's same-named Service (e.g.
+// istio-system/istio-ingressgateway, present in nearly every mesh cluster)
+// is NOT behind this IP and must not contribute pods. Same anchor-membership
+// test, same idempotent materializeServiceNode, same
+// no-endpoint-backed-pruning rule (a held service with zero endpoints still
+// materialises its node). Returns [svcID] or nil (cluster does not hold the
+// service).
+func (r *sgResolver) resolveServiceLevelInCluster(cluster, ns, svc string) []string {
+	cands := r.svcCandidates[famSvcKey{family: ClusterFamilyKey(cluster), namespace: ns, service: svc}]
+	var anchor *svcCandidate
+	for i := range cands {
+		if cands[i].cluster == cluster {
+			anchor = &cands[i]
+			break
+		}
+	}
+	if anchor == nil {
+		return nil // cluster does not hold the service
+	}
+	id := r.materializeServiceNode(cluster, ns, svc, anchor.obs)
+	for _, ep := range r.endpointsByService[serviceKey{cluster, ns, svc}] {
+		r.addServiceEdge(id, ep.Pod.ID(), ns)
 	}
 	return []string{id}
 }
@@ -603,6 +929,120 @@ func (r *sgResolver) addServiceEdge(svcID, podID, ns string) {
 		labels["namespace"] = ns
 	}
 	r.svcEdges[key] = graph.NewEdge(graph.EdgeTypeServiceSelectsPod, svcID, podID, labels)
+}
+
+// Ingress-role marker values (mark-ingress-route-path D3). Exactly two, each
+// mirroring the engine outcome that materialises an ingress service node:
+// roleIngressGateway for the RouteHit chain's entry hop (gateway pods and a
+// synthesized pod-calls-service edge to the backend exist behind it),
+// roleIngressLB for the RouteIngressLBService (nginx) fallback destination
+// (no routed backend).
+const (
+	roleIngressGateway = "ingress-gateway"
+	roleIngressLB      = "ingress-lb"
+)
+
+// markIngressService sets the `role` key on an already-materialised ingress
+// service node's labels. Assignment is set-only and MONOTONE (design D3): one
+// Service can be reached by BOTH paths within a single build — one endpoint's
+// routed hit chains through it as the entry hop while another endpoint's
+// resolution LB-falls-back to the same Service — and a first-write-wins rule
+// would make the emitted value depend on vector arrival order. Rule:
+// ingress-gateway always overwrites (the more informative claim — a chain
+// provably exists behind the node); ingress-lb writes only into an unset
+// value. Never cleared, never downgraded, so it is idempotent under repeated
+// series sharing one route key and order-free (D6).
+func (r *sgResolver) markIngressService(id, role string) {
+	sv, ok := r.services[id]
+	if !ok {
+		return
+	}
+	if role == roleIngressGateway || sv.LabelsValue["role"] == "" {
+		sv.LabelsValue["role"] = role
+	}
+}
+
+// routeChainEdge is one synthesized (not trace-derived) pod-calls-service
+// edge of the RouteHit ingress chain: an ingress gateway pod routing to the
+// routed backend service (route-hit-ingress-chain D4). cluster is the locked
+// ingress cluster — the source pod's own cluster, so the emitted edge's
+// labels.cluster follows the D9 client-side-cluster rule.
+type routeChainEdge struct{ src, tgt, cluster string }
+
+// addRouteChainEdge accumulates one synthesized ingress-pod → backend-service
+// edge, deduped by (src, tgt). Emission (with the traced-edge-wins check
+// against the parse's pairs map) happens in parseServiceGraphRoutes.
+func (r *sgResolver) addRouteChainEdge(srcPodID, backendSvcID, cluster string) {
+	key := srcPodID + "|" + backendSvcID
+	if _, ok := r.routeChainEdges[key]; ok {
+		return
+	}
+	r.routeChainEdges[key] = routeChainEdge{src: srcPodID, tgt: backendSvcID, cluster: cluster}
+}
+
+// resolveRouteChain attempts the full ingress chain for a RouteHit whose
+// destination carries an ingress LB Service identity (route-hit-ingress-chain
+// D3): caller → ingress service → ingress pods → backend service. Every
+// precondition is checked PURELY (no materialisation) first, so a degrade
+// leaves zero stray nodes/edges — service nodes are never pruned by
+// projection, so a materialise-then-bail would leak an orphan ingress node.
+// ok=false ⇒ the caller emits today's direct caller→backend shape (never an
+// external, never a build failure); the degrade is observable at Debug only
+// and deliberately NOT counted in extReasons (whose invariant is "events
+// that produced external nodes").
+//
+// On success the ingress service materialises with the LOCKED-CLUSTER
+// service-selects-pod fan-out (D2), one synthesized pod-calls-service
+// edge per locked-cluster ingress pod → the backend service, and the returned
+// [ingressSvcID] joins the backend id as the endpoint's resolution targets
+// (routeIndexResolve appends the backend) — the main loop's cross product
+// then emits caller→ingress-service AND the direct caller→backend edge, so
+// the caller's dependency on the backend is never lost behind the shared
+// ingress funnel (D5).
+func (r *sgResolver) resolveRouteChain(dest RouteDestination, backendSvcID string, t sgTrace) ([]string, bool) {
+	degrade := func(reason string) ([]string, bool) {
+		slog.Debug("route chain degraded to direct edge",
+			"chain_degrade_reason", reason,
+			"ingress_cluster", dest.Cluster,
+			"ingress_namespace", dest.IngressNamespace, "ingress_service", dest.IngressService,
+			"namespace", dest.Namespace, "service", dest.Service,
+			"client", t.clientLabel, "server", t.serverLabel)
+		return nil, false
+	}
+	if dest.IngressService == "" {
+		// No unique ingress identity in the window (ambiguous or absent) —
+		// quiet: this is the common non-ingress-fronted case, not an anomaly.
+		return nil, false
+	}
+	if dest.IngressNamespace == dest.Namespace && dest.IngressService == dest.Service {
+		return degrade("destination_is_ingress_service")
+	}
+	if !r.anchorHolds(dest.Cluster, dest.IngressNamespace, dest.IngressService) {
+		return degrade("ingress_cluster_lacks_ingress_service")
+	}
+	eps := r.endpointsByService[serviceKey{dest.Cluster, dest.IngressNamespace, dest.IngressService}]
+	if len(eps) == 0 {
+		return degrade("ingress_service_has_no_endpoints")
+	}
+
+	// Preconditions hold — materialise. Non-nil by construction: membership
+	// was pre-checked via anchorHolds over the same index. Every precondition
+	// degrade returned before this point, so marking happens only on a
+	// successfully materialised ingress node (mark-ingress-route-path).
+	ids := r.resolveServiceLevelInCluster(dest.Cluster, dest.IngressNamespace, dest.IngressService)
+	r.markIngressService(ids[0], roleIngressGateway)
+	podIDs := make([]string, 0, len(eps))
+	for _, ep := range eps {
+		podIDs = append(podIDs, ep.Pod.ID())
+	}
+	sort.Strings(podIDs)
+	for i, podID := range podIDs {
+		if i > 0 && podIDs[i-1] == podID {
+			continue // sorted-unique; addRouteChainEdge dedupes anyway (D6)
+		}
+		r.addRouteChainEdge(podID, backendSvcID, dest.Cluster)
+	}
+	return ids, true
 }
 
 func (r *sgResolver) external(label string) string {

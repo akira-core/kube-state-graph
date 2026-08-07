@@ -1,0 +1,61 @@
+{
+  "name": "kube-state-graph",
+  "build": {
+    "dockerfile": "Dockerfile",
+    // Must match the `toolchain` directive in go.mod — bump both together.
+    "args": { "GO_VERSION": "1.26.5" }
+  },
+
+  // Docker-outside-of-Docker: mount the host daemon socket and install the
+  // docker CLI. testcontainers-go then starts its ClickHouse / VictoriaMetrics
+  // containers as siblings on the host daemon, sharing the host image cache.
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+
+  // Make host.docker.internal resolve on native Linux too (Docker Desktop on
+  // Mac already provides it). Paired with TESTCONTAINERS_HOST_OVERRIDE below so
+  // the tests can reach the sibling containers' published ports on both OSes.
+  "runArgs": ["--add-host=host.docker.internal:host-gateway"],
+
+  "containerEnv": {
+    // Matches internal/config default (config.go RouterCheckBin); baked into the
+    // image by the Dockerfile. Set here so both the terminal and the VS Code
+    // Test UI pick it up, so the route e2e suite runs instead of self-skipping.
+    "KSG_ROUTER_CHECK_BIN": "/usr/local/bin/router_check_tool",
+    // With DooD the sibling containers publish on the host daemon, not on this
+    // container's localhost — point testcontainers (and its ryuk reaper) at the
+    // host.
+    "TESTCONTAINERS_HOST_OVERRIDE": "host.docker.internal",
+    // The base image is pinned to the exact go.mod toolchain, so nothing is
+    // downloaded. Left on "auto" purely as a safety net: if go.mod is bumped
+    // before the image is rebuilt, Go fetches the right toolchain instead of
+    // failing.
+    "GOTOOLCHAIN": "auto"
+  },
+
+  // Persist the module + build cache across rebuilds for faster `-race` runs.
+  "mounts": [
+    "source=ksg-gomod,target=/go/pkg/mod,type=volume",
+    "source=ksg-gobuild,target=/home/vscode/.cache/go-build,type=volume"
+  ],
+
+  // Reuse the repo's own bootstrap as the single source of truth for pinned tool
+  // versions: init-go (go mod download) + init-tools (golangci-lint v2.11.4 +
+  // govulncheck into /go/bin). mockery/swag need no install (go.mod tool dirs).
+  "postCreateCommand": "make init",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go", "ms-azuretools.vscode-docker"],
+      "settings": {
+        "go.useLanguageServer": true,
+        "go.lintTool": "golangci-lint",
+        "go.lintFlags": ["--timeout=5m"],
+        "go.toolsManagement.checkForUpdates": "off"
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}

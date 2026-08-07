@@ -269,7 +269,7 @@ func TestParseServiceGraph_EndpointlessAnchorStillFansOutToSibling(t *testing.T)
 
 func TestParseServiceGraph_FullyUnlabelledDeploymentResolvesWithinUnknown(t *testing.T) {
 	// A deployment whose KSM series carry no cluster label at all: everything
-	// (pods, services, endpoints) is bucketed to "unknown". clusterFamilyKey
+	// (pods, services, endpoints) is bucketed to "unknown". ClusterFamilyKey
 	// ("unknown") == "unknown" is a family-of-one, so an "unknown"-anchored
 	// caller IS a holder of its "unknown"-bucketed Service and resolution stays
 	// inside the pseudo-cluster.

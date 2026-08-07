@@ -945,12 +945,17 @@ traces_service_graph_request_total{client="uffb-admin",server="nats://uffb-svc.u
 }
 
 // TestSentinelPeersExcludedAtQueryLayer exercises design.md D30 end-to-end
-// against a real VM: the servicegraph connector's virtual peers (client="user",
-// server="unknown") are dropped by the anchored selector matchers
-// (client!~"user|unknown",server!~"user|unknown") so they never reach the API.
+// against a real VM: the servicegraph connector's virtual peers are dropped by
+// the anchored selector matchers (client!~"user|unknown",server!~"user") —
+// client="user" is excluded upstream at the QUERY layer, so it never reaches
+// the API. server="unknown" is narrower (resolve-unknown-server-peer-labels
+// D1): the series itself now reaches Go, but this fixture carries neither
+// client_net_peer_name nor client_server_address, so it still resolves to
+// nothing (dropped in Go by resolveUnknownServerPeer) — the SAME observable
+// outcome (no node, no edge) as the old blanket query-layer exclusion.
 // Crucially the raw sentinel series ARE ingested into VM (asserted below), so a
-// missing node proves the QUERY matcher excluded them — not that the data was
-// absent. A connection string whose host merely CONTAINS "user"
+// missing node proves the matchers/resolution excluded them — not that the
+// data was absent. A connection string whose host merely CONTAINS "user"
 // ("http://user/api") is NOT excluded (the match is fully anchored), proving
 // the matcher is exact rather than substring.
 func (s *GraphSuite) TestSentinelPeersExcludedAtQueryLayer() {
@@ -996,6 +1001,86 @@ traces_service_graph_request_total{client="checkout",server="http://user/api",cl
 		"connection string containing (but not equal to) user must survive the anchored matcher")
 }
 
+// TestUnknownServerPeerLabelResolvesToServiceNode exercises the
+// resolve-unknown-server-peer-labels change end-to-end against a real VM: the
+// D30 server-side matcher no longer excludes server="unknown" at the query
+// layer (only server!~"user"), so a series with server="unknown" now reaches
+// Go. Because the client side resolves to a real topology pod (checkout =
+// alpha-1) and the series carries client_net_peer_name, resolveUnknownServerPeer
+// resolves it via the same D29 machinery as connection-string resolution — a
+// pod-calls-service edge to the addressed service, with its usual
+// service-selects-pod fan-out — instead of dropping the endpoint.
+func (s *GraphSuite) TestUnknownServerPeerLabelResolvesToServiceNode() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_service_info dummy
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="peer-svc",cluster_ip="10.96.0.44",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="peer-svc-x1",label_kubernetes_io_service_name="peer-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="peer-svc-x1",targetref_kind="Pod",targetref_name="cart",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_net_peer_name="peer-svc.shop.svc.cluster.local",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_net_peer_name="peer-svc.shop.svc.cluster.local",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",client_net_peer_name="peer-svc.shop.svc.cluster.local",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested server=\"unknown\" series with client_net_peer_name — the loosened selector must still return it")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/peer-svc"`, "peer-label enrichment must resolve to the addressed service node")
+	s.Contains(bodyStr, `"type":"pod-calls-service"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/shop/peer-svc"`)
+	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
+		"service-selects-pod edge resolves the backing cart pod via endpointslice targetref")
+	s.NotContains(bodyStr, `external/unknown`, "the literal server label must never leak as an external node")
+	s.NotContains(bodyStr, `"name":"unknown"`)
+}
+
+// TestUnknownServerIPPeerResolvesToServiceNode exercises the
+// resolve-unknown-server-ip-peer change end-to-end against a real VM: a
+// server="unknown" series whose client_server_address is a bare ClusterIP
+// literal (no DNS name) resolves via resolveUnknownServerPeer's new
+// IP-literal classification step — anchor-cluster-only ClusterIP lookup —
+// to the addressed service node, instead of falling to an external node.
+func (s *GraphSuite) TestUnknownServerIPPeerResolvesToServiceNode() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_service_info dummy
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="ip-peer-svc",cluster_ip="10.96.0.77",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="ip-peer-svc-x1",label_kubernetes_io_service_name="ip-peer-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="ip-peer-svc-x1",targetref_kind="Pod",targetref_name="cart",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="10.96.0.77",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="10.96.0.77",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",client_server_address="10.96.0.77",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested server=\"unknown\" series with client_server_address")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/ip-peer-svc"`, "bare IP-literal peer address must resolve to the addressed service node")
+	s.Contains(bodyStr, `"type":"pod-calls-service"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/shop/ip-peer-svc"`)
+	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
+		"service-selects-pod edge resolves the backing cart pod via endpointslice targetref")
+	s.NotContains(bodyStr, `external/10.96.0.77`, "the ClusterIP literal must not leak as an external node")
+}
+
 func (s *GraphSuite) TestClustersDiscovery() {
 	// Discovery handler evaluates "now" via the injected Clock. Pin it to
 	// fixedNow so the 1h discovery lookback covers the statically-timestamped
@@ -1019,9 +1104,11 @@ func (s *GraphSuite) TestEdgeTypesCatalogue() {
 		s.Contains(string(body), et)
 	}
 
-	// may_cross_cluster contract (localised model): pod-calls-service resolves to
-	// a Service node in the caller's OWN cluster — always intra-cluster — while
-	// service-selects-pod fans out across same-family clusters and MAY cross.
+	// may_cross_cluster contract: pod-calls-service MAY cross clusters (a
+	// route-engine-resolved endpoint anchors on the selected ingress cluster,
+	// which may be a family sibling; the D29 connection-string path stays
+	// intra-cluster per edge), and service-selects-pod fans out across
+	// same-family clusters and MAY cross.
 	var catalogue struct {
 		EdgeTypes []graph.EdgeTypeDefinition `json:"edge_types"`
 	}
@@ -1030,7 +1117,7 @@ func (s *GraphSuite) TestEdgeTypesCatalogue() {
 	for _, et := range catalogue.EdgeTypes {
 		got[et.Type] = et.MayCrossCluster
 	}
-	s.False(got["pod-calls-service"], "pod-calls-service resolves to a local service node — always intra-cluster")
+	s.True(got["pod-calls-service"], "pod-calls-service may cross clusters via a route-engine ingress-cluster hit")
 	s.True(got["service-selects-pod"], "service-selects-pod may cross clusters via the same-family endpoint union")
 }
 
