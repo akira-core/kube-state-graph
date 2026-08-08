@@ -1081,6 +1081,45 @@ traces_service_graph_request_total{client="checkout",server="unknown",cluster="c
 	s.NotContains(bodyStr, `external/10.96.0.77`, "the ClusterIP literal must not leak as an external node")
 }
 
+// TestUnknownServerNetworkPeerAddressResolvesToServiceNode exercises the
+// resolve-unknown-server-network-peer-address change end-to-end against a
+// real VM: a server="unknown" series carrying client_network_peer_address
+// (and neither client_server_address nor client_net_peer_name) resolves via
+// resolveUnknownServerPeer's middle-precedence label to the addressed service
+// node, with its usual service-selects-pod fan-out.
+func (s *GraphSuite) TestUnknownServerNetworkPeerAddressResolvesToServiceNode() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_service_info dummy
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="netpeer-svc",cluster_ip="10.96.0.88",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="netpeer-svc-x1",label_kubernetes_io_service_name="netpeer-svc",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="netpeer-svc-x1",targetref_kind="Pod",targetref_name="cart",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_network_peer_address="netpeer-svc.shop.svc.cluster.local",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_network_peer_address="netpeer-svc.shop.svc.cluster.local",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",client_network_peer_address="netpeer-svc.shop.svc.cluster.local",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested server=\"unknown\" series with client_network_peer_address")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/shop/netpeer-svc"`, "client_network_peer_address must resolve to the addressed service node")
+	s.Contains(bodyStr, `"type":"pod-calls-service"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/shop/netpeer-svc"`)
+	s.Contains(bodyStr, `"type":"service-selects-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-2"`,
+		"service-selects-pod edge resolves the backing cart pod via endpointslice targetref")
+	s.NotContains(bodyStr, `external/unknown`, "the literal server label must never leak as an external node")
+	s.NotContains(bodyStr, `"name":"unknown"`)
+}
+
 func (s *GraphSuite) TestClustersDiscovery() {
 	// Discovery handler evaluates "now" via the injected Clock. Pin it to
 	// fixedNow so the 1h discovery lookback covers the statically-timestamped
