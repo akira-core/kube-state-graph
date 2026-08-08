@@ -307,9 +307,11 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 			continue
 		}
 		// Same reason, for the resolve-unknown-server-pod-ip-peer step: an IP
-		// literal that resolves to a pod in the anchor cluster never reaches the
-		// parse's external fallback, so the engine must not be asked about it.
-		if r.lookupPeerPodIP(anchorCluster, key.host) != nil {
+		// literal that resolves to a pod in the anchor cluster's family never
+		// reaches the parse's external fallback, so the engine must not be asked
+		// about it. An AMBIGUOUS family (pod nil) deliberately does not skip —
+		// the parse falls external there, so the engine should get its chance.
+		if pod, _ := r.lookupPeerPodIP(anchorCluster, key.host); pod != nil {
 			continue
 		}
 		// Destination IPs are a precondition (design D6): without one the

@@ -300,32 +300,53 @@ live under `openspec/specs/`.
   Service DNS name, which is a mesh-wide convention the family union already
   handles); (3) (resolve-unknown-server-pod-ip-peer) when the IP literal
   matches **no** Service `ClusterIP`, it is looked up as a **Pod IP** against
-  a second reverse index (`(cluster, pod_ip) → pod`, built once per parse from
-  `topology.Pods` in the same loop as `podByID`, skipping pods with no
-  `pod_ip`) — again **anchor-cluster only**, and for a stronger reason than
-  the ClusterIP case: sibling clusters' pod CIDRs overlap by default. This
-  covers a caller that dialled another pod's address directly, bypassing any
-  Service. A hit resolves the endpoint **straight to that topology pod** — it
-  does NOT go through `resolveServiceLevel`, materialises **no service node**
-  and emits **no `service-selects-pod` edge**, so the generic target-driven
-  rule makes the edge `pod-calls-pod`. Ordering is structural, not
-  conventional: the ClusterIP step lives inside `classifyPeerHost` and a hit
-  there returns `classified=true`, so **`ClusterIP` always beats Pod IP**, and
-  the Pod-IP step sits immediately before `routeExternal`, so it also beats
-  the route engine and the external fallback. On a same-cluster duplicate
-  `pod_ip` — the normal case for `hostNetwork` pods, which all report their
-  node's address, and transient on address reuse within the window — the
-  **lexically-smallest pod ID** wins (order-free, D6). `lookupPeerPodIP` is
-  pure and shared with the `collectRouteQueries` prescan, which skips such
-  endpoints so the route engine is never asked about traffic the in-cluster
-  ladder now resolves. An IP-valued peer that matches neither an
-  anchor-cluster `ClusterIP` nor a Pod IP (a sidecar loopback, a NodePort/LB
-  address, any off-cluster IP) becomes an `external/<ip>` node, not a dropped
-  endpoint. The reverse index (`(cluster, ClusterIP) → Service`) is built once
-  per parse from `topology.ServicesByNameNS`, skipping empty/`"None"`
-  ClusterIP; on a same-cluster duplicate `ClusterIP` (a data anomaly
-  Kubernetes itself prevents), the lexically-smaller `(namespace, service)`
-  wins. Once identified via IP, resolution proceeds through the SAME
+  a second index (`famIPKey{family, pod_ip} → []podIPCandidate{cluster, pod}`,
+  built once per parse from `topology.Pods` in **two stages**: stage 1 reduces
+  to one holder per `(cluster, ip)` in the same loop as `podByID`, skipping
+  pods with no `pod_ip`; stage 2 regroups by `ClusterFamilyKey(cluster)` and
+  sorts each group by cluster, exactly like `svcCandidates`). This covers a
+  caller that dialled another pod's address directly, bypassing any Service —
+  **including across a cluster boundary**, which is ordinary traffic wherever
+  clusters share a flat routable network. **Selection**: the **anchor
+  cluster's own** holder always wins (byte-for-byte the anchor-only
+  behaviour); otherwise a **lone family holder** resolves; **two or more**
+  family holders yield no pod and degrade via `routeExternal` with the
+  distinct reason `unknown_server_peer_pod_ip_ambiguous` — **no tie-break
+  across clusters**. Being the family's only holder IS the evidence that its
+  pod CIDRs do not overlap at that address, which is why **no service-mesh
+  gate is applied**: cross-cluster pod-to-pod reachability is a network-layer
+  property, and an `istio-proxy` sidecar is neither necessary (a flat network
+  needs no Istio) nor sufficient (in a multi-network mesh the caller's sidecar
+  is handed the east-west gateway address, never a remote Pod IP). A cluster
+  outside the anchor's family is never a candidate. A hit resolves the
+  endpoint **straight to that topology pod** — it does NOT go through
+  `resolveServiceLevel`, materialises **no service node** and emits **no
+  `service-selects-pod` edge**, so the generic target-driven rule makes the
+  edge `pod-calls-pod` (which MAY therefore cross clusters). Ordering is
+  structural, not conventional: the ClusterIP step lives inside
+  `classifyPeerHost` and a hit there returns `classified=true`, so
+  **`ClusterIP` always beats Pod IP**, and the Pod-IP step sits immediately
+  before `routeExternal`, so it also beats the route engine and the external
+  fallback. The **ClusterIP lookup itself stays anchor-only** — Service CIDRs
+  overlap just as readily, and under multi-primary the same
+  `(namespace, service)` carries a *different* ClusterIP in each cluster. On a
+  **same-cluster** duplicate `pod_ip` — the normal case for `hostNetwork`
+  pods, which all report their node's address, and transient on address reuse
+  within the window — stage 1 keeps the **lexically-smallest pod ID**
+  (order-free, D6), so an intra-cluster duplicate never makes the family look
+  ambiguous. `lookupPeerPodIP` is pure and shared with the
+  `collectRouteQueries` prescan, which skips resolvable endpoints so the route
+  engine is never asked about traffic the in-cluster ladder now resolves —
+  while an **ambiguous** family, which does fall external, is still offered to
+  the engine. An IP-valued peer that matches neither an anchor-cluster
+  `ClusterIP` nor a resolvable family Pod IP (a sidecar loopback, a
+  NodePort/LB address, any off-cluster IP, or an ambiguous family) becomes an
+  `external/<ip>` node, not a dropped endpoint. The reverse index
+  (`(cluster, ClusterIP) → Service`) is built once per parse from
+  `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
+  same-cluster duplicate `ClusterIP` (a data anomaly Kubernetes itself
+  prevents), the lexically-smaller `(namespace, service)` wins. Once
+  identified via IP, resolution proceeds through the SAME
   `resolveServiceLevel` call as every other classification path below —
   including its normal family-wide `service-selects-pod` fan-out — only the
   identification lookup itself is anchor-scoped. A successful classification

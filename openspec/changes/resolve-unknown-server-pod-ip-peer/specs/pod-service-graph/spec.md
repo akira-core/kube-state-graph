@@ -45,15 +45,35 @@ When a peer address is obtained (step 1 or 2), the reader SHALL classify it:
    explicitly excludes IP literals).
 5. When step 4 finds no matching Service `ClusterIP` AND the host is a valid IP literal,
    the reader SHALL look it up as a **Pod IP** — the `pod_ip` of a pod in the topology —
-   **within the already-resolved client pod's own (anchor) cluster only**, never any
-   other cluster, including a family sibling. A match yields that topology **pod**, not a
+   **within the cluster family of the already-resolved client pod's own (anchor)
+   cluster**, using the same family rule as connection-string resolution's
+   `service-selects-pod` fan-out. A match yields that topology **pod**, not a
    `(namespace, service)` pair. Only pods with a non-empty `pod_ip` participate in this
    lookup; a pod whose IP is unknown is never a candidate. This step is evaluated ONLY
    after step 4 misses, so a Service `ClusterIP` always takes priority over a Pod IP for
    the same address, and it is scoped ONLY to this requirement's trigger condition.
+
+   Among the family's clusters carrying the address, the reader SHALL select in this
+   order:
+
+   1. If the **anchor cluster itself** carries the address, its pod — always, even when
+      family siblings also carry it.
+   2. Otherwise, if **exactly one** cluster in the family carries the address, that
+      cluster's pod. Cross-cluster pod-to-pod dialling is a network-layer property of a
+      flat routable plane and is independent of any service mesh, so no mesh evidence is
+      required; being the family's lone holder is itself the evidence that the family's
+      pod CIDRs do not overlap at this address.
+   3. Otherwise (**two or more** clusters in the family carry the address, meaning their
+      pod CIDRs do overlap here), the lookup SHALL yield no pod. The reader MUST NOT
+      select one of them by any tie-break — the endpoint falls to the external node of
+      step 6.
+
+   A cluster outside the anchor cluster's family SHALL never be a candidate, regardless
+   of how many clusters carry the address.
 6. Any other shape (multi-label non-`.svc` FQDN, an IP literal absent from BOTH the
-   anchor cluster's own Service `ClusterIP` set and its own pod `pod_ip` set, unparseable
-   value) is **unresolvable** at this step.
+   anchor cluster's own Service `ClusterIP` set and the pod `pod_ip` set of its cluster
+   family, an IP literal carried by two or more clusters of the family with none in the
+   anchor cluster, unparseable value) is **unresolvable** at this step.
 
 When step 2, step 3, or step 4 yields a `(namespace, service)` pair, the reader SHALL
 resolve it via the same same-cluster Service-node resolution used by connection-string
@@ -73,19 +93,21 @@ When step 5 yields a topology **pod**, the reader SHALL resolve the endpoint dir
 that pod. It SHALL NOT materialise a service node and SHALL NOT emit any
 `service-selects-pod` edge for this resolution: the caller addressed a pod directly, so
 no Service relationship is evidenced by the series. The resulting edge is therefore
-`pod-calls-pod` under the generic edge-type rule below.
+`pod-calls-pod` under the generic edge-type rule below, and it MAY cross clusters when
+the selected pod lives in a family sibling.
 
 If two or more Services within the SAME anchor cluster share the identical `ClusterIP`
 value (a data anomaly Kubernetes itself prevents in a healthy cluster, but the reader
 stays defensive), step 4 SHALL deterministically select the Service with the
 lexically-smaller `(namespace, service)` pair.
 
-If two or more pods within the SAME anchor cluster report the identical `pod_ip` value —
-which occurs legitimately for `hostNetwork` pods sharing their node's address, and
-transiently when an address is reassigned within the query window — step 5 SHALL
-deterministically select the pod with the lexically-smallest node id, independently of
-the order in which pods were loaded, and identically across rebuilds of the same upstream
-data.
+If two or more pods within the SAME cluster report the identical `pod_ip` value — which
+occurs legitimately for `hostNetwork` pods sharing their node's address, and transiently
+when an address is reassigned within the query window — step 5 SHALL deterministically
+select the pod with the lexically-smallest node id **as that cluster's holder of the
+address**, before the cross-cluster selection above is applied. Both the intra-cluster
+reduction and the cross-cluster selection SHALL be independent of the order in which pods
+were loaded, and identical across rebuilds of the same upstream data.
 
 When classification (step 6) is unresolvable, OR the anchor cluster does not hold the
 addressed Service, the reader SHALL fall back to an **external** node from the RAW,
@@ -146,24 +168,39 @@ resolved pod. No new node type and no new edge type are introduced by this requi
 - **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.96.0.7"`, `cluster-alpha` holds a `payments` service in namespace `shop` with `cluster_ip="10.96.0.7"`, AND a pod in `cluster-alpha` also reports `pod_ip="10.96.0.7"`
 - **THEN** the endpoint resolves to the service node `cluster-alpha/shop/payments` with `type: "pod-calls-service"` — the Service `ClusterIP` step is evaluated first and the Pod-IP step is never reached
 
-#### Scenario: Pod IP present only in a family-sibling cluster — external, not cross-resolved
+#### Scenario: Pod IP held only by a family sibling resolves across the cluster boundary
 
-- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no Service or pod in `prod-1` carries that address, but a same-family sibling cluster `prod-2` has a pod with `pod_ip="10.244.1.9"`
-- **THEN** the endpoint falls back to `external/10.244.1.9` — the Pod-IP lookup is scoped to the anchor cluster only and does NOT consult family siblings
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no Service or pod in `prod-1` carries that address, and exactly one same-family sibling cluster `prod-2` has a pod (UID `sib`) with `pod_ip="10.244.1.9"`
+- **THEN** the resulting edge has `type: "pod-calls-pod"`, `target: "prod-2/sib"`, `labels.cluster: "prod-1"` (the client side, unchanged); no external node is produced, no service node is materialised, and no `service-selects-pod` edge is emitted
+
+#### Scenario: Anchor cluster wins over a family sibling holding the same Pod IP
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, a pod in `prod-1` (UID `own`) has `pod_ip="10.244.1.9"`, AND a pod in the same-family sibling `prod-2` also has `pod_ip="10.244.1.9"`
+- **THEN** the endpoint resolves to `prod-1/own` — the anchor cluster's own holder is always preferred, regardless of how many family siblings carry the address
+
+#### Scenario: Two family siblings hold the Pod IP — external, no tie-break
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no pod in `prod-1` carries that address, and BOTH same-family siblings `prod-2` and `prod-3` have a pod with `pod_ip="10.244.1.9"`
+- **THEN** the endpoint falls back to `external/10.244.1.9` and NO `pod-calls-pod` edge targets either sibling pod — two holders is direct evidence that the family's pod CIDRs overlap at this address, so the reader degrades rather than tie-breaking
+
+#### Scenario: Pod IP present only outside the anchor cluster's family — external
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1` (family `prod-0`), `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and the only pod carrying that address lives in `staging-1` (family `staging-0`)
+- **THEN** the endpoint falls back to `external/10.244.1.9` — a cluster outside the anchor cluster's family is never a candidate
 
 #### Scenario: Pod without a known IP is never a Pod-IP candidate
 
-- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and every pod in `cluster-alpha` has an empty or absent `pod_ip`
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and every pod in `cluster-alpha`'s family has an empty or absent `pod_ip`
 - **THEN** the endpoint falls back to `external/10.244.1.9`
 
-#### Scenario: Duplicate Pod IP within the anchor cluster resolves deterministically
+#### Scenario: Duplicate Pod IP within one cluster resolves deterministically
 
 - **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and two pods in `cluster-alpha` — node ids `cluster-alpha/zzz` and `cluster-alpha/aaa` — both report `pod_ip="10.244.1.9"` (for example two `hostNetwork` pods on the same node)
-- **THEN** the endpoint resolves to `cluster-alpha/aaa` — the lexically-smallest node id — deterministically, independently of the order in which the pods were loaded and identically across rebuilds of the same upstream data
+- **THEN** the endpoint resolves to `cluster-alpha/aaa` — the lexically-smallest node id — deterministically, independently of the order in which the pods were loaded and identically across rebuilds of the same upstream data; the intra-cluster duplicate does NOT make the cluster an ambiguous candidate, since ambiguity is counted per cluster, not per pod
 
 #### Scenario: IP-literal peer address absent from the anchor cluster's Service set — external
 
-- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_net_peer_name="192.0.2.55"`, and neither any Service `ClusterIP` nor any pod `pod_ip` in `cluster-alpha` equals that address
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_net_peer_name="192.0.2.55"`, and neither any Service `ClusterIP` in `cluster-alpha` nor any pod `pod_ip` in its cluster family equals that address
 - **THEN** the endpoint falls back to `external/192.0.2.55`
 
 #### Scenario: External peer address becomes an external node

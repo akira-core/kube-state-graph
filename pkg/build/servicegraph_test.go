@@ -1206,17 +1206,33 @@ func sampleTopologyPodIP() Topology {
 	return topo
 }
 
-// sampleTopologyPodIPFamily puts the only holder of 10.244.1.9 in prod-2 while
-// the caller sits in prod-1 — same family ("prod-0"), so this asserts the
-// Pod IP lookup never crosses the family boundary the service fan-out may.
-func sampleTopologyPodIPFamily() Topology {
-	topo := sampleTopologyIPFamily()
-	sibling := &graph.PodNode{
-		IDValue: "prod-2/sib", NameValue: "backend",
-		LabelsValue:    map[string]string{"cluster": "prod-2", "namespace": "shop"},
-		IPAddressValue: []string{"10.244.1.9"},
+// podIPPod is a terse constructor for the family fixtures below.
+func podIPPod(cluster, uid, ip string) *graph.PodNode {
+	return &graph.PodNode{
+		IDValue: cluster + "/" + uid, NameValue: "backend-" + uid,
+		LabelsValue:    map[string]string{"cluster": cluster, "namespace": "shop"},
+		IPAddressValue: []string{ip},
 	}
-	topo.Pods = append(topo.Pods, sibling)
+}
+
+// sampleTopologyPodIPFamily seeds the cross-cluster cases on top of the
+// prod-1 / prod-2 family fixture (family "prod-0"), plus a staging-1 pod that
+// must stay unreachable (different family). Callers pass the extra pods they
+// want; the prod-1 client pod "abc" is always present.
+func sampleTopologyPodIPFamily(extra ...*graph.PodNode) Topology {
+	topo := sampleTopologyIPFamily()
+	topo.Pods = append(topo.Pods, extra...)
+	return topo
+}
+
+// reversePods returns the topology with topology.Pods in reverse order — used
+// to prove the index build and the candidate pick are order-free (D6).
+func reversePods(topo Topology) Topology {
+	out := make([]*graph.PodNode, len(topo.Pods))
+	for i, p := range topo.Pods {
+		out[len(topo.Pods)-1-i] = p
+	}
+	topo.Pods = out
 	return topo
 }
 
@@ -1296,24 +1312,94 @@ func TestParseServiceGraph_UnknownServerPeerLabel_ClusterIPBeatsPodIP(t *testing
 	}
 }
 
-func TestParseServiceGraph_UnknownServerPeerLabel_PodIPFamilySiblingNotMatched(t *testing.T) {
-	vec := sampleVec(model.Sample{
-		Metric: model.Metric{
-			"client":                "checkout",
-			"server":                "unknown",
-			"cluster":               "prod-1",
-			"client_k8s_pod_uid":    "abc",
-			"server_k8s_pod_uid":    "",
-			"client_server_address": "10.244.1.9", // only prod-2 holds it
-		},
-		Value: 5,
-	})
-	res := parseServiceGraph(vec, sampleTopologyPodIPFamily())
+// familyPodIPSample is podIPPeerSample anchored in prod-1 (family "prod-0").
+func familyPodIPSample(peer string) model.Sample {
+	s := podIPPeerSample(peer)
+	s.Metric["cluster"] = "prod-1"
+	return s
+}
 
-	require.Len(t, res.ExternalNodes, 1, "Pod IP lookup is anchor-cluster-only — pod CIDRs overlap across clusters")
+// A pod IP held by exactly one family sibling resolves across the cluster
+// boundary: cross-cluster pod-to-pod dialling over a flat network is real
+// traffic, and being the lone family holder is direct evidence that the
+// family's pod CIDRs do not overlap at this address.
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPFamilySiblingResolves(t *testing.T) {
+	topo := sampleTopologyPodIPFamily(podIPPod("prod-2", "sib", "10.244.1.9"))
+
+	for _, reverse := range []bool{false, true} {
+		fixture := topo
+		if reverse {
+			fixture = reversePods(topo)
+		}
+		res := parseServiceGraph(sampleVec(familyPodIPSample("10.244.1.9")), fixture)
+
+		pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+		require.Len(t, pcp, 1, "reverse=%v", reverse)
+		assert.Equal(t, "prod-1/abc", pcp[0].Source)
+		assert.Equal(t, "prod-2/sib", pcp[0].Target, "lone family holder resolves across clusters (reverse=%v)", reverse)
+		assert.Equal(t, "prod-1", pcp[0].Labels["cluster"], "edge cluster stays the client side (D9)")
+		assert.Empty(t, res.ExternalNodes)
+		assert.Empty(t, res.ServiceNodes)
+	}
+}
+
+// The anchor cluster's own holder wins even when a family sibling carries the
+// same address — a caller most plausibly reached a pod in its own cluster, and
+// this path is byte-for-byte the pre-widening behaviour.
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPAnchorBeatsSibling(t *testing.T) {
+	topo := sampleTopologyPodIPFamily(
+		podIPPod("prod-1", "own", "10.244.1.9"),
+		podIPPod("prod-2", "sib", "10.244.1.9"),
+	)
+
+	for _, reverse := range []bool{false, true} {
+		fixture := topo
+		if reverse {
+			fixture = reversePods(topo)
+		}
+		res := parseServiceGraph(sampleVec(familyPodIPSample("10.244.1.9")), fixture)
+
+		pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+		require.Len(t, pcp, 1, "reverse=%v", reverse)
+		assert.Equal(t, "prod-1/own", pcp[0].Target, "anchor cluster wins (reverse=%v)", reverse)
+		assert.Empty(t, res.ExternalNodes)
+	}
+}
+
+// Two family siblings holding the address means the family's pod CIDRs overlap
+// here; picking one would fabricate a dependency, so the endpoint degrades.
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPFamilyAmbiguousDegrades(t *testing.T) {
+	topo := sampleTopologyPodIPFamily(
+		podIPPod("prod-2", "sib2", "10.244.1.9"),
+		podIPPod("prod-3", "sib3", "10.244.1.9"),
+	)
+
+	for _, reverse := range []bool{false, true} {
+		fixture := topo
+		if reverse {
+			fixture = reversePods(topo)
+		}
+		res := parseServiceGraph(sampleVec(familyPodIPSample("10.244.1.9")), fixture)
+
+		require.Len(t, res.ExternalNodes, 1, "reverse=%v", reverse)
+		assert.Equal(t, "external/10.244.1.9", res.ExternalNodes[0].IDValue)
+		for _, e := range edgesByType(res, graph.EdgeTypePodCallsPod) {
+			assert.NotEqual(t, "prod-2/sib2", e.Target, "reverse=%v", reverse)
+			assert.NotEqual(t, "prod-3/sib3", e.Target, "reverse=%v", reverse)
+		}
+	}
+}
+
+// The family boundary still holds: staging-1 is family "staging-0", not
+// "prod-0", so its pod is never a candidate for a prod-1 caller.
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPOtherFamilyNotMatched(t *testing.T) {
+	topo := sampleTopologyPodIPFamily(podIPPod("staging-1", "stg", "10.244.1.9"))
+	res := parseServiceGraph(sampleVec(familyPodIPSample("10.244.1.9")), topo)
+
+	require.Len(t, res.ExternalNodes, 1, "a different cluster family is never consulted")
 	assert.Equal(t, "external/10.244.1.9", res.ExternalNodes[0].IDValue)
 	for _, e := range edgesByType(res, graph.EdgeTypePodCallsPod) {
-		assert.NotEqual(t, "prod-2/sib", e.Target)
+		assert.NotEqual(t, "staging-1/stg", e.Target)
 	}
 }
 
