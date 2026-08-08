@@ -22,46 +22,90 @@ import (
 const defaultListenerPort = 443
 
 // peerLabels bundles the client-recorded peer dimensions of one service-graph
-// sample that feed the unknown-server enrichment: the two peer-address labels
-// the D2 precedence already reads, plus the two OPTIONAL dimensions added by
-// translate-global-fqdn-to-k8s-service (destination IPs and listener port).
+// sample that feed the unknown-server enrichment: the three peer-address
+// labels the D1 precedence reads (resolve-unknown-server-network-peer-address),
+// plus the two OPTIONAL dimensions added by translate-global-fqdn-to-k8s-service
+// (destination IPs and listener port). client_network_peer_port is deliberately
+// NOT read — a port participates in neither peer identification nor node naming
+// (design.md Non-Goals); the listener-port dimensions below are the older
+// client_server_port / client_net_peer_port pair used only by route resolution.
 type peerLabels struct {
-	netPeerName   string // client_net_peer_name (checked first)
-	serverAddress string // client_server_address (checked second)
-	dnsAnswers    string // client_dns_answers — raw label, parsed lazily
-	serverPort    string // client_server_port
-	netPeerPort   string // client_net_peer_port
+	serverAddress      string // client_server_address (checked first)
+	networkPeerAddress string // client_network_peer_address (checked second)
+	netPeerName        string // client_net_peer_name (checked third)
+	dnsAnswers         string // client_dns_answers — raw label, parsed lazily
+	serverPort         string // client_server_port
+	netPeerPort        string // client_net_peer_port
 }
 
 // peerLabelsOf extracts the bundle from one sample's metric.
 func peerLabelsOf(m model.Metric) peerLabels {
 	return peerLabels{
-		netPeerName:   string(m["client_net_peer_name"]),
-		serverAddress: string(m["client_server_address"]),
-		dnsAnswers:    string(m["client_dns_answers"]),
-		serverPort:    string(m["client_server_port"]),
-		netPeerPort:   string(m["client_net_peer_port"]),
+		serverAddress:      string(m["client_server_address"]),
+		networkPeerAddress: string(m["client_network_peer_address"]),
+		netPeerName:        string(m["client_net_peer_name"]),
+		dnsAnswers:         string(m["client_dns_answers"]),
+		serverPort:         string(m["client_server_port"]),
+		netPeerPort:        string(m["client_net_peer_port"]),
 	}
 }
 
-// value returns the peer-address value under the existing D2 precedence:
-// client_net_peer_name first, client_server_address second, "" when neither
-// is present.
+// value returns the peer-address value under the D1 precedence
+// (resolve-unknown-server-network-peer-address): client_server_address first,
+// client_network_peer_address second, client_net_peer_name third. The first
+// non-empty wins outright — a non-empty higher-precedence label that fails to
+// classify does NOT fall through to a lower-precedence one. "" when all three
+// are absent.
 func (p peerLabels) value() string {
-	if p.netPeerName != "" {
-		return p.netPeerName
+	if p.serverAddress != "" {
+		return p.serverAddress
 	}
-	return p.serverAddress
+	if p.networkPeerAddress != "" {
+		return p.networkPeerAddress
+	}
+	return p.netPeerName
+}
+
+// truncateBracketSuffix implements resolve-unknown-server-network-peer-address
+// D2: cut a peer-address value at the first '[' whose index is > 0, discarding
+// that byte and everything after it. Runs BEFORE splitPeerAddressPort so
+// net.SplitHostPort sees a well-formed authority.
+//
+// Why needed: some instrumentations append a bracketed connection/session
+// identifier to the authority (observed shape: "mongo.com:27017[-181]").
+// net.SplitHostPort rejects a port segment containing '[' with "unexpected
+// '[' in address" and returns the value unchanged, and classifyK8sDNS performs
+// no DNS-1123 validation, so such a value would garbage-classify into a
+// namespace that can never match (service="mongo", namespace="com:27017[-181]").
+//
+// Why the index-0 guard: a leading '[' is the IPv6 bracket form
+// ([2001:db8::1]:8080), which net.SplitHostPort ALREADY handles correctly —
+// it strips the brackets and yields a host net.ParseIP accepts, so a
+// dual-stack cluster's IPv6 ClusterIP peer resolves. An unconditional
+// first-'[' cut would truncate that value to the empty string and regress a
+// peer that currently resolves. The guard is a property of the value's
+// shape, not of which label supplied it — this function is called uniformly
+// on all three peer-address labels, keeping the resolver provenance-free
+// (resolve-unknown-server-ip-peer D4).
+func truncateBracketSuffix(value string) string {
+	if i := strings.IndexByte(value, '['); i > 0 {
+		return value[:i]
+	}
+	return value
 }
 
 // splitPeerAddressPort best-effort splits a trailing ":<port>" suffix off a
-// client_net_peer_name / client_server_address value. net.SplitHostPort fails
-// on a plain hostname/IP with no port (no colon) or on an unbracketed IPv6
-// literal (ambiguous colon) — either failure yields the raw, unsplit value as
-// the host and "" as the port. This is the pre-change stripPeerAddressPort
-// with the port RETURNED instead of discarded (design D5 step 1); every
-// classification caller keeps using the host alone, so their behaviour is
-// unchanged.
+// peer-address value (after truncateBracketSuffix has already removed any
+// bracketed connection identifier). net.SplitHostPort fails on a plain
+// hostname/IP with no port (no colon) or on an unbracketed IPv6 literal
+// (ambiguous colon) — either failure yields the raw, unsplit value as the host
+// and "" as the port. A bracketed IPv6 authority ([<ipv6>]:<port>) is the one
+// bracketed shape this function handles correctly on its own — it strips the
+// brackets and the port together — which is why truncateBracketSuffix guards
+// index 0 rather than cutting unconditionally. This is the pre-change
+// stripPeerAddressPort with the port RETURNED instead of discarded (design D5
+// step 1); every classification caller keeps using the host alone, so their
+// behaviour is unchanged.
 func splitPeerAddressPort(value string) (host, port string) {
 	h, p, err := net.SplitHostPort(value)
 	if err != nil {
@@ -157,7 +201,9 @@ func peerRouteKey(anchorCluster string, peer peerLabels) (routeKey, bool) {
 	if value == "" {
 		return routeKey{}, false
 	}
-	host, portStr := splitPeerAddressPort(value)
+	// Truncate before the port split so both the route-key host and the
+	// classify host in resolveUnknownServerPeer stay identical (anti-drift).
+	host, portStr := splitPeerAddressPort(truncateBracketSuffix(value))
 	return routeKey{
 		callerCluster: anchorCluster,
 		host:          host,

@@ -824,6 +824,357 @@ func TestParseServiceGraph_UnknownServerPeerLabel_IPLiteralDuplicateClusterIP(t 
 	assert.Equal(t, "cluster-alpha/ops/alpha", res.ServiceNodes[0].IDValue, "lexically-smaller (namespace, service) wins: alpha < zeta")
 }
 
+// sampleTopologyPrecedence gives one client pod three DISTINCT, independently
+// resolvable Services in its own namespace/cluster — "primary", "secondary",
+// "tertiary" — so a precedence test can prove resolution targets exactly one
+// of them regardless of which other (also-resolvable) labels are present.
+func sampleTopologyPrecedence() Topology {
+	clientPod := &graph.PodNode{IDValue: "cluster-alpha/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	prim0 := &graph.PodNode{IDValue: "cluster-alpha/prim0", NameValue: "primary-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	sec0 := &graph.PodNode{IDValue: "cluster-alpha/sec0", NameValue: "secondary-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	tert0 := &graph.PodNode{IDValue: "cluster-alpha/tert0", NameValue: "tertiary-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	return Topology{
+		Pods:      []*graph.PodNode{clientPod, prim0, sec0, tert0},
+		PodsByUID: map[string]*graph.PodNode{"abc": clientPod},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"cluster-alpha", "shop", "primary"}:   {ClusterIP: "10.9.9.1"},
+			{"cluster-alpha", "shop", "secondary"}: {ClusterIP: "10.9.9.2"},
+			{"cluster-alpha", "shop", "tertiary"}:  {ClusterIP: "10.9.9.3"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"cluster-alpha", "shop", "primary"}:   {{Pod: prim0}},
+			{"cluster-alpha", "shop", "secondary"}: {{Pod: sec0}},
+			{"cluster-alpha", "shop", "tertiary"}:  {{Pod: tert0}},
+		},
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressResolvesService(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "payments.shop.svc.cluster.local",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+
+	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
+	require.Len(t, ssp, 2, "payments fans out to its two backing pods")
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_ServerAddressWinsPrecedence(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_server_address":       "primary.shop.svc.cluster.local",
+			"client_network_peer_address": "secondary.shop.svc.cluster.local",
+			"client_net_peer_name":        "tertiary.shop.svc.cluster.local",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyPrecedence())
+
+	require.Len(t, res.ServiceNodes, 1, "only client_server_address's target is materialised")
+	assert.Equal(t, "cluster-alpha/shop/primary", res.ServiceNodes[0].IDValue)
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/primary", pcs[0].Target)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressBeatsNetPeerName(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_server_address":       "",
+			"client_network_peer_address": "secondary.shop.svc.cluster.local",
+			"client_net_peer_name":        "tertiary.shop.svc.cluster.local",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyPrecedence())
+
+	require.Len(t, res.ServiceNodes, 1, "middle slot wins when client_server_address is absent")
+	assert.Equal(t, "cluster-alpha/shop/secondary", res.ServiceNodes[0].IDValue)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NoFallThroughOnNonClassifying(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_server_address":       "payments.partner.example",         // multi-label, not a .svc name — anchor lacks the addressed service
+			"client_network_peer_address": "secondary.shop.svc.cluster.local", // WOULD resolve, must not be tried
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyPrecedence())
+
+	require.Len(t, res.ExternalNodes, 1, "first non-empty label wins outright — no fall-through on classification failure")
+	assert.Equal(t, "external/payments.partner.example", res.ExternalNodes[0].IDValue)
+	assert.Empty(t, res.ServiceNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressBracketSuffixResolves(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "payments.shop.svc.cluster.local:27017[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "bracket suffix truncated, then port stripped, before classification")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressBracketSuffixExternalKeepsRaw(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "mongo.com:27017[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ExternalNodes, 1)
+	ext := res.ExternalNodes[0]
+	assert.Equal(t, "external/mongo.com:27017[-181]", ext.IDValue, "raw value verbatim — bracket suffix AND port kept")
+	assert.Equal(t, "mongo.com:27017[-181]", ext.NameValue)
+	assert.Empty(t, res.ServiceNodes)
+
+	pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+	require.Len(t, pcp, 1)
+	assert.Equal(t, "external/mongo.com:27017[-181]", pcp[0].Target)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressBracketDistinctExternals(t *testing.T) {
+	vec := sampleVec(
+		model.Sample{
+			Metric: model.Metric{
+				"client":                      "checkout",
+				"server":                      "unknown",
+				"cluster":                     "cluster-alpha",
+				"client_k8s_pod_uid":          "abc",
+				"server_k8s_pod_uid":          "",
+				"client_network_peer_address": "mongo.com:27017[-181]",
+			},
+			Value: 5,
+		},
+		model.Sample{
+			Metric: model.Metric{
+				"client":                      "checkout",
+				"server":                      "unknown",
+				"cluster":                     "cluster-alpha",
+				"client_k8s_pod_uid":          "abc",
+				"server_k8s_pod_uid":          "",
+				"client_network_peer_address": "mongo.com:27017[-182]",
+			},
+			Value: 5,
+		},
+	)
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ExternalNodes, 2, "raw-value naming is not deduplicated by host")
+	ids := []string{res.ExternalNodes[0].IDValue, res.ExternalNodes[1].IDValue}
+	assert.ElementsMatch(t, []string{"external/mongo.com:27017[-181]", "external/mongo.com:27017[-182]"}, ids)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerAddressBracketIPLiteral(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "10.0.0.5:27017[-9]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "bracket then port stripped, ClusterIP lookup hits")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_BracketSuffixOnNetPeerName(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":               "checkout",
+			"server":               "unknown",
+			"cluster":              "cluster-alpha",
+			"client_k8s_pod_uid":   "abc",
+			"server_k8s_pod_uid":   "",
+			"client_net_peer_name": "payments.shop.svc.cluster.local:27017[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "truncation is uniform across all three labels, including the deprecated one")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_NetworkPeerPortIgnored(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                   "checkout",
+			"server":                   "unknown",
+			"cluster":                  "cluster-alpha",
+			"client_k8s_pod_uid":       "abc",
+			"server_k8s_pod_uid":       "",
+			"client_network_peer_port": "27017",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	assert.Empty(t, res.Edges, "port label is never read as a peer address")
+	assert.Empty(t, res.ExternalNodes)
+	assert.Empty(t, res.ServiceNodes)
+	assert.Empty(t, res.SynthPods)
+}
+
+// sampleTopologyIPv6 gives a Service with an IPv6 ClusterIP so bracket-vs-IPv6
+// interaction tests (2.10 / 2.11) have a real dual-stack address to match
+// against — sampleTopologyWithServices only carries IPv4 ClusterIPs.
+func sampleTopologyIPv6() Topology {
+	clientPod := &graph.PodNode{IDValue: "cluster-alpha/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	pay0 := &graph.PodNode{IDValue: "cluster-alpha/pay0", NameValue: "payments-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	return Topology{
+		Pods:      []*graph.PodNode{clientPod, pay0},
+		PodsByUID: map[string]*graph.PodNode{"abc": clientPod},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"cluster-alpha", "shop", "payments"}: {ClusterIP: "fd00:10:96::a"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"cluster-alpha", "shop", "payments"}: {{Pod: pay0}},
+		},
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_BracketedIPv6NotTruncated(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "[fd00:10:96::a]:8080",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyIPv6())
+
+	require.Len(t, res.ServiceNodes, 1, "leading '[' is index 0 — not truncated; host/port split strips brackets and resolves by ClusterIP")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_BracketedIPv6WithIdentifierExternal(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "[fd00:10:96::a]:8080[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyIPv6())
+
+	require.Len(t, res.ExternalNodes, 1, "index-0 guard leaves it untruncated; host/port split fails on the trailing '['; bare-short-name stage matches but no Service answers")
+	ext := res.ExternalNodes[0]
+	assert.Equal(t, "external/[fd00:10:96::a]:8080[-181]", ext.IDValue)
+	assert.Equal(t, "[fd00:10:96::a]:8080[-181]", ext.NameValue)
+	assert.Empty(t, res.ServiceNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_TruncationPromotesToBareShortName(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "payments:8080[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ServiceNodes, 1, "truncation reduces the value to the bare short name 'payments', resolved in the client's own namespace (shop)")
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+	assert.Empty(t, res.ExternalNodes)
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_TruncationPromotesToBareShortName_NoMatchStaysExternal(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                      "checkout",
+			"server":                      "unknown",
+			"cluster":                     "cluster-alpha",
+			"client_k8s_pod_uid":          "abc",
+			"server_k8s_pod_uid":          "",
+			"client_network_peer_address": "nosuchsvc:8080[-181]",
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyWithServices())
+
+	require.Len(t, res.ExternalNodes, 1)
+	ext := res.ExternalNodes[0]
+	assert.Equal(t, "external/nosuchsvc:8080[-181]", ext.IDValue, "raw value verbatim")
+	assert.Equal(t, "nosuchsvc:8080[-181]", ext.NameValue)
+	assert.Empty(t, res.ServiceNodes)
+}
+
 func TestParseServiceGraph_GhostFallback_ServerUIDUnknown(t *testing.T) {
 	vec := sampleVec(model.Sample{
 		Metric: model.Metric{

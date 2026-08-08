@@ -243,48 +243,90 @@ live under `openspec/specs/`.
   dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
   the same fragment when added.
 - **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
-  D1–D3, hardcoded — no knob): the one carve-out from the D30 outcome above.
-  When `client_k8s_pod_uid` resolves to a **real topology pod** (never a
-  synthesised one) AND the server side has no resolvable pod (UID empty, or
-  present but absent from `Topology.PodsByUID`) AND the raw `server` label is
-  exactly `"unknown"`, `resolveServer` dispatches to the new
-  `resolveUnknownServerPeer` instead of the generic empty-UID
+  D1–D3, extended by resolve-unknown-server-ip-peer and
+  resolve-unknown-server-network-peer-address, hardcoded — no knob): the one
+  carve-out from the D30 outcome above. When `client_k8s_pod_uid` resolves to
+  a **real topology pod** (never a synthesised one) AND the server side has no
+  resolvable pod (UID empty, or present but absent from `Topology.PodsByUID`)
+  AND the raw `server` label is exactly `"unknown"`, `resolveServer` dispatches
+  to the new `resolveUnknownServerPeer` instead of the generic empty-UID
   (`resolveEmptyUID`, which owns the D27 fallback) or synth-pod path — never
-  both, for this literal value. It reads `client_net_peer_name` (checked
-  first) then `client_server_address` (checked second; an optional trailing
-  `:<port>` is best-effort stripped via `net.SplitHostPort`) and classifies
-  whichever is non-empty first via the same `classifyK8sDNS` grammar D29
-  connection-string resolution uses (2-label `<service>.<namespace>`, 3-label
-  headless `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped),
-  **plus two grammar extensions scoped to this rule only**: (1) a single
-  dot-free, non-IP-literal label is treated as a bare short Service name
-  resolved in the **client pod's own namespace**; (2) (resolve-unknown-server-ip-peer)
-  when neither the DNS grammar nor the bare-short-name form matches AND the
-  host is a valid IP literal (`net.ParseIP`), it is looked up as a Service
-  `ClusterIP` **within the already-resolved client pod's own (anchor) cluster
-  only** — never a family sibling, since a `ClusterIP` is a per-cluster
-  address that can legitimately collide across unrelated clusters' Service
-  CIDRs (unlike a Service DNS name, which is a mesh-wide convention the
-  family union already handles). The reverse index (`(cluster, ClusterIP) →
-  Service`) is built once per parse from `topology.ServicesByNameNS`,
-  skipping empty/`"None"` ClusterIP; on a same-cluster duplicate `ClusterIP`
-  (a data anomaly Kubernetes itself prevents), the lexically-smaller
-  `(namespace, service)` wins. Once identified via IP, resolution proceeds
-  through the SAME `resolveServiceLevel` call as every other classification
-  path below — including its normal family-wide `service-selects-pod`
-  fan-out — only the identification lookup itself is anchor-scoped. A
-  successful classification resolves via the
-  existing `resolveServiceLevel(anchorCluster, ns, svc)` — anchor = the
-  already-resolved client pod's own cluster (no anchor-recovery fallback chain
-  needed here, unlike D29) — with the same anchor-membership test and
-  cross-cluster `service-selects-pod` fan-out. An unresolvable classification,
-  or a `resolveServiceLevel` miss, falls back to `external/<raw_peer_address>`
-  (the RAW, unstripped value — same convention as every other external
-  fallback). Neither label present, or the client did not resolve to a real
-  pod, drops the endpoint (no node, no edge) — **identical outward behaviour
-  to the pre-change blanket exclusion**. This is the invariant the loosened
-  selector must never violate: it must never leak a `external/unknown` node
-  via the generic D27 path for a case outside this rule's trigger.
+  both, for this literal value. It reads **three** client-recorded peer-address
+  labels, checked in this precedence order — `client_server_address` (checked
+  first), then `client_network_peer_address` (checked second), then
+  `client_net_peer_name` (checked third) — the first non-empty wins outright
+  and is never merged with, nor falls back to, a lower-precedence label that
+  fails to classify. The three are distinct OTel attributes, not three
+  spellings of one: `client_server_address` is the stable `server.address`
+  (logical destination as addressed — name, IP, or UDS name);
+  `client_network_peer_address` is the stable `network.peer.address`
+  (socket-level peer address, by convention an IP); `client_net_peer_name` is
+  the deprecated `net.peer.name`, superseded by `server.address`. The order
+  ranks them by what the classification chain below can resolve — strong on
+  names (DNS grammar / bare short name, both reaching `resolveServiceLevel`
+  with its family-wide fan-out), weak on IP literals (the `ClusterIP` lookup
+  is anchor-cluster-only) — so the name-valued stable attribute leads, the
+  IP-valued stable attribute follows, and the deprecated name-valued attribute
+  trails. `client_network_peer_port` is deliberately **not read** — the
+  stable conventions split the port into its own attribute, but a port
+  participates in neither peer identification nor node naming.
+  Whichever label wins is normalised in two steps before classification: (1)
+  bracket-suffix truncation — cut at the **first `[` whose index is > 0**,
+  discarding it and the remainder (some instrumentations append a bracketed
+  connection/session id to the authority, e.g. `mongo.com:27017[-181]`, which
+  `net.SplitHostPort` cannot handle and which `classifyK8sDNS`'s lack of
+  DNS-1123 validation would otherwise garbage-classify); a leading `[` (index
+  0) is left untouched because it is the IPv6 bracket form
+  (`[2001:db8::1]:8080`), which step (2) already handles correctly — an
+  unconditional cut would destroy a resolvable dual-stack `ClusterIP` peer;
+  (2) an optional trailing `:<port>` is then best-effort stripped via
+  `net.SplitHostPort`. Both steps apply uniformly regardless of which label
+  supplied the value — the resolver stays provenance-free. The result is
+  classified via the same `classifyK8sDNS` grammar D29 connection-string
+  resolution uses (2-label `<service>.<namespace>`, 3-label headless
+  `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped), **plus
+  two grammar extensions scoped to this rule only**: (1) a single dot-free,
+  non-IP-literal label is treated as a bare short Service name resolved in the
+  **client pod's own namespace** — note this means bracket truncation can
+  promote a value like `mongo:27017[-181]` into the bare short name `mongo`,
+  resolved in the client's own namespace, exactly as the un-bracketed
+  `mongo:27017` already does; (2) (resolve-unknown-server-ip-peer) when
+  neither the DNS grammar nor the bare-short-name form matches AND the host is
+  a valid IP literal (`net.ParseIP`), it is looked up as a Service `ClusterIP`
+  **within the already-resolved client pod's own (anchor) cluster only** —
+  never a family sibling, since a `ClusterIP` is a per-cluster address that
+  can legitimately collide across unrelated clusters' Service CIDRs (unlike a
+  Service DNS name, which is a mesh-wide convention the family union already
+  handles) — note an IP-valued peer that is not itself an anchor-cluster
+  `ClusterIP` (a pod IP, a sidecar loopback, a NodePort/LB address, any
+  off-cluster IP) becomes an `external/<ip>` node, not a dropped endpoint. The
+  reverse index (`(cluster, ClusterIP) → Service`) is built once per parse
+  from `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
+  same-cluster duplicate `ClusterIP` (a data anomaly Kubernetes itself
+  prevents), the lexically-smaller `(namespace, service)` wins. Once
+  identified via IP, resolution proceeds through the SAME
+  `resolveServiceLevel` call as every other classification path below —
+  including its normal family-wide `service-selects-pod` fan-out — only the
+  identification lookup itself is anchor-scoped. A successful classification
+  resolves via the existing `resolveServiceLevel(anchorCluster, ns, svc)` —
+  anchor = the already-resolved client pod's own cluster (no anchor-recovery
+  fallback chain needed here, unlike D29) — with the same anchor-membership
+  test and cross-cluster `service-selects-pod` fan-out. An unresolvable
+  classification, or a `resolveServiceLevel` miss, falls back to
+  `external/<raw_peer_address>` — the RAW, wholly unnormalised label value
+  (neither bracket-truncated nor port-stripped) — same convention for all
+  three labels; a host dialed under several distinct bracketed identifiers
+  therefore materialises one external node per identifier. All three labels
+  empty/absent, or the client did not resolve to a real pod, drops the
+  endpoint (no node, no edge) — **identical outward behaviour to the
+  pre-change blanket exclusion**. This is the invariant the loosened selector
+  must never violate: it must never leak a `external/unknown` node via the
+  generic D27 path for a case outside this rule's trigger. **Note:** this
+  extension reorders the two pre-existing labels — a series carrying both
+  `client_net_peer_name` and `client_server_address` with different values
+  now resolves from `client_server_address` (previously the reverse), which
+  can also change an unresolved endpoint's external node `id`/`name` from
+  `external/<client_net_peer_name>` to `external/<client_server_address>`.
 - **Istio route resolution of global FQDN peers**
   (translate-global-fqdn-to-k8s-service, OPT-IN — off by default): the ONE
   step added to the enrichment above. When `--route-store-dsn` /

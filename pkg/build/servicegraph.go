@@ -293,11 +293,15 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
-		// Peer dimensions recorded on the CLIENT span (OTel semconv
-		// client.net.peer.name / client.server.address, plus the optional
-		// client_dns_answers / client_server_port / client_net_peer_port added
-		// for route resolution), consulted only when server=="unknown" and the
-		// client resolves to a real pod — see resolveUnknownServerPeer.
+		// Peer dimensions recorded on the CLIENT span — the three peer-address
+		// labels (client_server_address / client_network_peer_address /
+		// client_net_peer_name; distinct OTel attributes, not three spellings
+		// of one — see peerLabels.value) plus the optional client_dns_answers /
+		// client_server_port / client_net_peer_port added for route resolution.
+		// client_network_peer_port is deliberately NOT read (design.md
+		// Non-Goals; do not add it back "for symmetry"). Consulted only when
+		// server=="unknown" and the client resolves to a real pod — see
+		// resolveUnknownServerPeer.
 		peer := peerLabelsOf(s.Metric)
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
@@ -628,13 +632,15 @@ func (r *sgResolver) anchorHolds(anchorCluster, ns, svc string) bool {
 // UID-recovered client-pod cluster when the client side resolved to a topology
 // pod, else the raw trace label (bucketed to "unknown" when missing).
 //
-// clientPod and peer feed ONLY the resolve-unknown-server-peer-labels
-// enrichment: whenever the raw server label is literally "unknown" AND no real
-// topology pod is found for it (UID empty, or UID present but absent from the
-// global pod-UID index), resolution routes to resolveUnknownServerPeer instead
-// of resolveEmptyUID or the synth-pod fallback below — D1's explicit
-// carve-out, so the loosened server!~"user" selector does not leak
-// external/unknown noise via the generic paths.
+// clientPod and peer feed ONLY the unknown-server peer-label enrichment:
+// whenever the raw server label is literally "unknown" AND no real topology
+// pod is found for it (UID empty, or UID present but absent from the global
+// pod-UID index), resolution routes to resolveUnknownServerPeer instead of
+// resolveEmptyUID or the synth-pod fallback below — D1's explicit carve-out,
+// so the loosened server!~"user" selector does not leak external/unknown noise
+// via the generic paths. peer carries the three precedence-ordered
+// peer-address labels (see peerLabels.value) plus the optional route-resolution
+// dimensions.
 func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace string, t sgTrace, clientPod *graph.PodNode, peer peerLabels) []string {
 	if podUID == "" {
 		if label == sentinelUnknown {
@@ -669,15 +675,25 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 }
 
 // resolveUnknownServerPeer implements the "Unknown-server peer-label
-// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3): the
-// narrow carve-out that lets a literal server="unknown" endpoint resolve via
-// the client-recorded peer-address labels client_net_peer_name /
-// client_server_address instead of being unconditionally dropped — but only
-// when the client side already resolved to a REAL (non-synthesised) topology
-// pod, so the anchor cluster is unambiguous. clientPod nil (client
-// unresolved, or resolved only to a synth pod) and "neither label present"
-// both drop the endpoint (nil), byte-for-byte identical to the outcome under
-// the old server!~"user|unknown" query-layer exclusion.
+// enrichment" requirement (resolve-unknown-server-peer-labels D1-D3, extended
+// by resolve-unknown-server-ip-peer and resolve-unknown-server-network-peer-address):
+// the narrow carve-out that lets a literal server="unknown" endpoint resolve
+// via three client-recorded peer-address labels instead of being
+// unconditionally dropped — but only when the client side already resolved to
+// a REAL (non-synthesised) topology pod, so the anchor cluster is unambiguous.
+// clientPod nil (client unresolved, or resolved only to a synth pod) and "all
+// three labels empty" both drop the endpoint (nil), byte-for-byte identical to
+// the outcome under the old server!~"user|unknown" query-layer exclusion.
+//
+// The three peer-address labels are precedence-ordered in peerLabels.value
+// (D1): the first non-empty wins outright and is never merged with a
+// lower-precedence label, and a non-empty higher-precedence label that fails
+// to classify does NOT fall through to a lower-precedence one.
+// client_server_address (server.address, stable, name-valued) leads;
+// client_network_peer_address (network.peer.address, stable, IP-valued)
+// follows; client_net_peer_name (net.peer.name, deprecated in favour of
+// server.address) trails — ranked by what the classification chain below can
+// resolve (strong on names, weak on IP literals), not by recency of spelling.
 //
 // translate-global-fqdn-to-k8s-service adds ONE step: at EVERY point below
 // that would emit an external node — no grammar matched, an IP literal with
@@ -693,13 +709,16 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	}
 	value := peer.value()
 	if value == "" {
-		return nil // neither client_net_peer_name nor client_server_address present
+		return nil // none of the three peer-address labels present
 	}
 
 	anchorCluster := clientPod.Labels()["cluster"]
 	clientNamespace := clientPod.Labels()["namespace"]
 
-	host, _ := splitPeerAddressPort(value)
+	// Truncate + port-split matches peerRouteKey so classify host and route-key
+	// host cannot drift (resolve-unknown-server-network-peer-address D2;
+	// translate-global-fqdn-to-k8s-service anti-drift).
+	host, _ := splitPeerAddressPort(truncateBracketSuffix(value))
 	// The same key derivation the collectRouteQueries prescan used, so the
 	// index lookup can never miss for key-derivation reasons (ok is guaranteed
 	// here: value is non-empty).
