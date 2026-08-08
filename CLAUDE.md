@@ -741,6 +741,15 @@ changes, start a new change and update the relevant promoted spec
 
 ## Repository conventions
 
+- **Conversational output is written in Traditional Chinese (繁體中文).** This
+  covers the two artifacts of a Claude Code session: the plan file
+  (`~/.claude/plans/*.md`) and the explanatory prose in chat replies. Code,
+  identifiers, API names, CLI commands, commit-type keywords (feat/fix/…) and
+  error strings stay verbatim in English. This rule does **NOT** apply to
+  anything persisted in the repo — OpenSpec artifacts (`proposal.md`,
+  `design.md`, `tasks.md`, `spec.md`), code comments, commit messages,
+  `CLAUDE.md` itself, and all other docs stay in English, consistent with the
+  existing codebase.
 - All HTTP routes live under `/v1/`. Adding a route means committing to keeping
   it for v1's lifetime. Schema changes that aren't additive are v2 — see D14.
 - Self-metric names are stable contracts: `kube_state_graph_*`. Adding a label
