@@ -306,6 +306,12 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 		if ns, svc, classified := r.classifyPeerHost(key.host, clientPod.Labels()["namespace"], anchorCluster); classified && r.anchorHolds(anchorCluster, ns, svc) {
 			continue
 		}
+		// Same reason, for the resolve-unknown-server-pod-ip-peer step: an IP
+		// literal that resolves to a pod in the anchor cluster never reaches the
+		// parse's external fallback, so the engine must not be asked about it.
+		if r.lookupPeerPodIP(anchorCluster, key.host) != nil {
+			continue
+		}
 		// Destination IPs are a precondition (design D6): without one the
 		// ingress cluster cannot be selected, so the engine is never asked —
 		// the endpoint falls external directly (route_engine_no_ip).

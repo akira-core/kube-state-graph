@@ -523,6 +523,25 @@ func TestCollectRouteQueries_CoversAllThreeExternalBranches(t *testing.T) {
 	}
 }
 
+// resolve-unknown-server-pod-ip-peer: an IP literal the parse now resolves to a
+// pod in the anchor cluster never reaches routeExternal, so the prescan must not
+// spend a store probe / translation on it.
+func TestCollectRouteQueries_SkipsPodIPResolvableEndpoints(t *testing.T) {
+	vec := sampleVec(
+		// NOT collected: matches a pod's own pod_ip in the anchor cluster.
+		unknownPeerSample("10.244.1.9", nil),
+		// NOT collected: same, with a port suffix.
+		unknownPeerSample("10.244.1.9:8080", nil),
+		// STILL collected: no Service and no pod in the anchor cluster holds it.
+		unknownPeerSample("203.0.113.9", nil),
+	)
+
+	keys := collectRouteQueries(vec, sampleTopologyPodIP())
+
+	require.Len(t, keys, 1)
+	assert.Equal(t, "203.0.113.9", keys[0].host)
+}
+
 func TestCollectRouteQueries_CarriesDNSAnswersAndPort(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com:8443", model.Metric{
 		"client_dns_answers": "198.51.100.7,198.51.100.8",

@@ -243,8 +243,9 @@ live under `openspec/specs/`.
   dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
   the same fragment when added.
 - **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
-  D1–D3, extended by resolve-unknown-server-ip-peer and
-  resolve-unknown-server-network-peer-address, hardcoded — no knob): the one
+  D1–D3, extended by resolve-unknown-server-ip-peer,
+  resolve-unknown-server-network-peer-address, and
+  resolve-unknown-server-pod-ip-peer, hardcoded — no knob): the one
   carve-out from the D30 outcome above. When `client_k8s_pod_uid` resolves to
   a **real topology pod** (never a synthesised one) AND the server side has no
   resolvable pod (UID empty, or present but absent from `Topology.PodsByUID`)
@@ -285,7 +286,7 @@ live under `openspec/specs/`.
   classified via the same `classifyK8sDNS` grammar D29 connection-string
   resolution uses (2-label `<service>.<namespace>`, 3-label headless
   `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped), **plus
-  two grammar extensions scoped to this rule only**: (1) a single dot-free,
+  three grammar extensions scoped to this rule only**: (1) a single dot-free,
   non-IP-literal label is treated as a bare short Service name resolved in the
   **client pod's own namespace** — note this means bracket truncation can
   promote a value like `mongo:27017[-181]` into the bare short name `mongo`,
@@ -297,14 +298,34 @@ live under `openspec/specs/`.
   never a family sibling, since a `ClusterIP` is a per-cluster address that
   can legitimately collide across unrelated clusters' Service CIDRs (unlike a
   Service DNS name, which is a mesh-wide convention the family union already
-  handles) — note an IP-valued peer that is not itself an anchor-cluster
-  `ClusterIP` (a pod IP, a sidecar loopback, a NodePort/LB address, any
-  off-cluster IP) becomes an `external/<ip>` node, not a dropped endpoint. The
-  reverse index (`(cluster, ClusterIP) → Service`) is built once per parse
-  from `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
-  same-cluster duplicate `ClusterIP` (a data anomaly Kubernetes itself
-  prevents), the lexically-smaller `(namespace, service)` wins. Once
-  identified via IP, resolution proceeds through the SAME
+  handles); (3) (resolve-unknown-server-pod-ip-peer) when the IP literal
+  matches **no** Service `ClusterIP`, it is looked up as a **Pod IP** against
+  a second reverse index (`(cluster, pod_ip) → pod`, built once per parse from
+  `topology.Pods` in the same loop as `podByID`, skipping pods with no
+  `pod_ip`) — again **anchor-cluster only**, and for a stronger reason than
+  the ClusterIP case: sibling clusters' pod CIDRs overlap by default. This
+  covers a caller that dialled another pod's address directly, bypassing any
+  Service. A hit resolves the endpoint **straight to that topology pod** — it
+  does NOT go through `resolveServiceLevel`, materialises **no service node**
+  and emits **no `service-selects-pod` edge**, so the generic target-driven
+  rule makes the edge `pod-calls-pod`. Ordering is structural, not
+  conventional: the ClusterIP step lives inside `classifyPeerHost` and a hit
+  there returns `classified=true`, so **`ClusterIP` always beats Pod IP**, and
+  the Pod-IP step sits immediately before `routeExternal`, so it also beats
+  the route engine and the external fallback. On a same-cluster duplicate
+  `pod_ip` — the normal case for `hostNetwork` pods, which all report their
+  node's address, and transient on address reuse within the window — the
+  **lexically-smallest pod ID** wins (order-free, D6). `lookupPeerPodIP` is
+  pure and shared with the `collectRouteQueries` prescan, which skips such
+  endpoints so the route engine is never asked about traffic the in-cluster
+  ladder now resolves. An IP-valued peer that matches neither an
+  anchor-cluster `ClusterIP` nor a Pod IP (a sidecar loopback, a NodePort/LB
+  address, any off-cluster IP) becomes an `external/<ip>` node, not a dropped
+  endpoint. The reverse index (`(cluster, ClusterIP) → Service`) is built once
+  per parse from `topology.ServicesByNameNS`, skipping empty/`"None"`
+  ClusterIP; on a same-cluster duplicate `ClusterIP` (a data anomaly
+  Kubernetes itself prevents), the lexically-smaller `(namespace, service)`
+  wins. Once identified via IP, resolution proceeds through the SAME
   `resolveServiceLevel` call as every other classification path below —
   including its normal family-wide `service-selects-pod` fan-out — only the
   identification lookup itself is anchor-scoped. A successful classification

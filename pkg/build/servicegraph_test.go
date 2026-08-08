@@ -1175,6 +1175,171 @@ func TestParseServiceGraph_UnknownServerPeerLabel_TruncationPromotesToBareShortN
 	assert.Empty(t, res.ServiceNodes)
 }
 
+// ---------------------------------------------------------------------------
+// resolve-unknown-server-pod-ip-peer: an IP-literal peer that matches no
+// Service ClusterIP is looked up against the anchor cluster's Pod IP set.
+
+// sampleTopologyPodIP extends the service fixture with pod-level addresses:
+//   - "cluster-alpha/def" holds pod_ip 10.244.1.9 — a pod dialled directly,
+//     behind no Service
+//   - "cluster-alpha/col" holds pod_ip 10.0.0.5 — the SAME address as the
+//     shop/payments ClusterIP, so it can only be reached if the ClusterIP step
+//     were (wrongly) skipped
+//   - "cluster-alpha/nip" carries no address at all and must never be indexed
+func sampleTopologyPodIP() Topology {
+	topo := sampleTopologyWithServices()
+	direct := &graph.PodNode{
+		IDValue: "cluster-alpha/def", NameValue: "backend",
+		LabelsValue:    map[string]string{"cluster": "cluster-alpha", "namespace": "shop"},
+		IPAddressValue: []string{"10.244.1.9"},
+	}
+	collide := &graph.PodNode{
+		IDValue: "cluster-alpha/col", NameValue: "collider",
+		LabelsValue:    map[string]string{"cluster": "cluster-alpha", "namespace": "shop"},
+		IPAddressValue: []string{"10.0.0.5"}, // == shop/payments ClusterIP
+	}
+	noIP := &graph.PodNode{
+		IDValue: "cluster-alpha/nip", NameValue: "addressless",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"},
+	}
+	topo.Pods = append(topo.Pods, direct, collide, noIP)
+	return topo
+}
+
+// sampleTopologyPodIPFamily puts the only holder of 10.244.1.9 in prod-2 while
+// the caller sits in prod-1 — same family ("prod-0"), so this asserts the
+// Pod IP lookup never crosses the family boundary the service fan-out may.
+func sampleTopologyPodIPFamily() Topology {
+	topo := sampleTopologyIPFamily()
+	sibling := &graph.PodNode{
+		IDValue: "prod-2/sib", NameValue: "backend",
+		LabelsValue:    map[string]string{"cluster": "prod-2", "namespace": "shop"},
+		IPAddressValue: []string{"10.244.1.9"},
+	}
+	topo.Pods = append(topo.Pods, sibling)
+	return topo
+}
+
+// sampleTopologyPodIPDuplicate models the hostNetwork case: two pods in ONE
+// cluster reporting their shared node address. reverse flips the load order to
+// prove the pick does not depend on topology.Pods ordering.
+func sampleTopologyPodIPDuplicate(reverse bool) Topology {
+	clientPod := &graph.PodNode{IDValue: "cluster-alpha/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	zzz := &graph.PodNode{
+		IDValue: "cluster-alpha/zzz", NameValue: "host-z",
+		LabelsValue:    map[string]string{"cluster": "cluster-alpha", "namespace": "infra"},
+		IPAddressValue: []string{"10.244.1.9"},
+	}
+	aaa := &graph.PodNode{
+		IDValue: "cluster-alpha/aaa", NameValue: "host-a",
+		LabelsValue:    map[string]string{"cluster": "cluster-alpha", "namespace": "infra"},
+		IPAddressValue: []string{"10.244.1.9"},
+	}
+	pods := []*graph.PodNode{clientPod, zzz, aaa}
+	if reverse {
+		pods = []*graph.PodNode{clientPod, aaa, zzz}
+	}
+	return Topology{Pods: pods, PodsByUID: map[string]*graph.PodNode{"abc": clientPod}}
+}
+
+func podIPPeerSample(peer string) model.Sample {
+	return model.Sample{
+		Metric: model.Metric{
+			"client":                "checkout",
+			"server":                "unknown",
+			"cluster":               "cluster-alpha",
+			"client_k8s_pod_uid":    "abc",
+			"server_k8s_pod_uid":    "",
+			"client_server_address": model.LabelValue(peer),
+		},
+		Value: 5,
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPResolvesPod(t *testing.T) {
+	res := parseServiceGraph(sampleVec(podIPPeerSample("10.244.1.9")), sampleTopologyPodIP())
+
+	pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+	require.Len(t, pcp, 1)
+	assert.Equal(t, "cluster-alpha/abc", pcp[0].Source)
+	assert.Equal(t, "cluster-alpha/def", pcp[0].Target, "peer IP matched the backend pod's own pod_ip")
+	assert.Equal(t, "cluster-alpha", pcp[0].Labels["cluster"])
+
+	assert.Empty(t, res.ExternalNodes)
+	assert.Empty(t, res.SynthPods)
+	assert.Empty(t, res.ServiceNodes, "a direct Pod IP call materialises no service node")
+	assert.Empty(t, edgesByType(res, graph.EdgeTypeServiceSelectsPod), "and no fan-out")
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPWithPort(t *testing.T) {
+	res := parseServiceGraph(sampleVec(podIPPeerSample("10.244.1.9:8080")), sampleTopologyPodIP())
+
+	pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+	require.Len(t, pcp, 1)
+	assert.Equal(t, "cluster-alpha/def", pcp[0].Target, "port suffix stripped before the Pod IP lookup")
+	assert.Empty(t, res.ExternalNodes)
+}
+
+// The ClusterIP step runs inside classifyPeerHost, before the Pod IP step is
+// reached — so a colliding pod address can never shadow a real Service.
+func TestParseServiceGraph_UnknownServerPeerLabel_ClusterIPBeatsPodIP(t *testing.T) {
+	res := parseServiceGraph(sampleVec(podIPPeerSample("10.0.0.5")), sampleTopologyPodIP())
+
+	require.Len(t, res.ServiceNodes, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+	for _, e := range edgesByType(res, graph.EdgeTypePodCallsPod) {
+		assert.NotEqual(t, "cluster-alpha/col", e.Target, "the colliding pod must not be reached")
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPFamilySiblingNotMatched(t *testing.T) {
+	vec := sampleVec(model.Sample{
+		Metric: model.Metric{
+			"client":                "checkout",
+			"server":                "unknown",
+			"cluster":               "prod-1",
+			"client_k8s_pod_uid":    "abc",
+			"server_k8s_pod_uid":    "",
+			"client_server_address": "10.244.1.9", // only prod-2 holds it
+		},
+		Value: 5,
+	})
+	res := parseServiceGraph(vec, sampleTopologyPodIPFamily())
+
+	require.Len(t, res.ExternalNodes, 1, "Pod IP lookup is anchor-cluster-only — pod CIDRs overlap across clusters")
+	assert.Equal(t, "external/10.244.1.9", res.ExternalNodes[0].IDValue)
+	for _, e := range edgesByType(res, graph.EdgeTypePodCallsPod) {
+		assert.NotEqual(t, "prod-2/sib", e.Target)
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_PodIPDuplicateDeterministic(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		res := parseServiceGraph(sampleVec(podIPPeerSample("10.244.1.9")), sampleTopologyPodIPDuplicate(reverse))
+
+		pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+		require.Len(t, pcp, 1, "reverse=%v", reverse)
+		assert.Equal(t, "cluster-alpha/aaa", pcp[0].Target,
+			"lexically-smallest pod id wins regardless of load order (reverse=%v)", reverse)
+	}
+}
+
+func TestParseServiceGraph_UnknownServerPeerLabel_PodWithoutIPNotIndexed(t *testing.T) {
+	// 198.51.100.4 is held by no Service and by no pod — the addressless pod in
+	// the fixture must not be reachable by any IP.
+	res := parseServiceGraph(sampleVec(podIPPeerSample("198.51.100.4")), sampleTopologyPodIP())
+
+	require.Len(t, res.ExternalNodes, 1)
+	assert.Equal(t, "external/198.51.100.4", res.ExternalNodes[0].IDValue)
+	for _, e := range edgesByType(res, graph.EdgeTypePodCallsPod) {
+		assert.NotEqual(t, "cluster-alpha/nip", e.Target)
+	}
+}
+
 func TestParseServiceGraph_GhostFallback_ServerUIDUnknown(t *testing.T) {
 	vec := sampleVec(model.Sample{
 		Metric: model.Metric{

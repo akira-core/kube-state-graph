@@ -1120,6 +1120,43 @@ traces_service_graph_request_total{client="checkout",server="unknown",cluster="c
 	s.NotContains(bodyStr, `"name":"unknown"`)
 }
 
+// TestUnknownServerPodIPPeerResolvesToPod exercises the
+// resolve-unknown-server-pod-ip-peer change end-to-end: a server="unknown"
+// series whose client_server_address is a bare Pod IP literal — matching no
+// Service ClusterIP — resolves via the new Pod-IP classification step to the
+// topology pod that holds the address, producing a pod-calls-pod edge instead
+// of an external node. No service node and no fan-out are involved.
+func (s *GraphSuite) TestUnknownServerPodIPPeerResolvesToPod() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="podip-backend",uid="alpha-podip-1",node="worker-0",pod_ip="10.244.1.9",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="10.244.1.9",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="10.244.1.9",connection_type="virtual_node",test=%q} 120 %d
+`, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",client_server_address="10.244.1.9",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested server=\"unknown\" series with a Pod IP client_server_address")
+	s.Require().True(
+		s.WaitForSeries(`kube_pod_info{uid="alpha-podip-1",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested backend pod carrying pod_ip")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	s.Contains(bodyStr, `"id":"cluster-alpha/alpha-podip-1"`, "the addressed pod must be in the graph")
+	s.Contains(bodyStr, `"type":"pod-calls-pod"`)
+	s.Contains(bodyStr, `"target":"cluster-alpha/alpha-podip-1"`,
+		"a direct Pod IP peer resolves to the pod holding it, not to a service")
+	s.NotContains(bodyStr, `external/10.244.1.9`, "the Pod IP literal must not leak as an external node")
+}
+
 func (s *GraphSuite) TestClustersDiscovery() {
 	// Discovery handler evaluates "now" via the injected Clock. Pin it to
 	// fixedNow so the 1h discovery lookback covers the statically-timestamped

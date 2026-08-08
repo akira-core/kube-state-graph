@@ -93,6 +93,7 @@ type sgResolver struct {
 	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
 	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
 	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
+	podIPIndex         map[ipKey]*graph.PodNode     // (cluster, Pod IP) → pod running there (resolve-unknown-server-pod-ip-peer)
 	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
 	routes             routeIndex                   // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
 	externals          map[string]*graph.ExternalNode
@@ -159,6 +160,12 @@ type svcCandidate struct {
 // is anchor-cluster-only; once a (namespace, service) is identified, the
 // existing family-wide resolveServiceLevel still governs the
 // service-selects-pod fan-out.
+//
+// The same key type serves the resolve-unknown-server-pod-ip-peer index
+// (podIPIndex), whose scoping rationale is identical and if anything stronger:
+// pod CIDRs of sibling clusters overlap by default in most installations, so a
+// cross-cluster Pod IP match would produce silently wrong data rather than a
+// missed resolution.
 type ipKey struct{ cluster, ip string }
 
 // parseServiceGraph is the route-index-free form: the ~70 direct test call
@@ -174,9 +181,28 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 // collectRouteQueries prescan so both classify endpoints over identical
 // indexes (design D2).
 func newSGResolver(topology Topology) *sgResolver {
+	// Reverse Pod IP index for the resolve-unknown-server-pod-ip-peer
+	// classification step: (cluster, pod_ip) -> the pod holding that address in
+	// that cluster. Built in the same pass as podByID. A pod with no known IP
+	// never participates. On a duplicate (cluster, ip) — legitimate for
+	// hostNetwork pods, which all report their node's address, and transient
+	// when an address is reassigned inside the query window — the
+	// lexically-smallest pod ID wins, so the index is a pure function of the
+	// pod set and not of topology.Pods slice order (D6).
 	podByID := make(map[string]*graph.PodNode, len(topology.Pods))
+	podIPIndex := make(map[ipKey]*graph.PodNode, len(topology.Pods))
 	for _, p := range topology.Pods {
 		podByID[p.ID()] = p
+
+		ips := p.IPAddress()
+		if len(ips) == 0 || ips[0] == "" {
+			continue
+		}
+		ik := ipKey{cluster: p.Labels()["cluster"], ip: ips[0]}
+		if existing, ok := podIPIndex[ik]; ok && existing.ID() <= p.ID() {
+			continue
+		}
+		podIPIndex[ik] = p
 	}
 
 	// Inverted index for D29 connection-string resolution: (family, namespace,
@@ -228,6 +254,7 @@ func newSGResolver(topology Topology) *sgResolver {
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
 		ipIndex:            ipIndex,
+		podIPIndex:         podIPIndex,
 		serviceApps:        topology.ServiceApplications,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
@@ -608,6 +635,20 @@ func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster strin
 	return "", "", false
 }
 
+// lookupPeerPodIP resolves a peer host to the pod holding that Pod IP in the
+// anchor cluster — the resolve-unknown-server-pod-ip-peer step, tried only
+// after the Service ClusterIP lookup inside classifyPeerHost has missed, so a
+// ClusterIP always takes priority over a Pod IP for the same address. Returns
+// nil when the host is not an IP literal or no pod in the anchor cluster holds
+// it. Pure over the resolver's immutable indexes — no materialisation — so the
+// collectRouteQueries prescan shares it with resolveUnknownServerPeer.
+func (r *sgResolver) lookupPeerPodIP(anchorCluster, host string) *graph.PodNode {
+	if net.ParseIP(host) == nil {
+		return nil
+	}
+	return r.podIPIndex[ipKey{cluster: anchorCluster, ip: host}]
+}
+
 // anchorHolds reports whether the anchor cluster itself deploys (ns, svc) —
 // the same membership test resolveServiceLevel applies before materialising a
 // service node. Used by the prescan to skip endpoints the in-cluster ladder
@@ -695,6 +736,14 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 // server.address) trails — ranked by what the classification chain below can
 // resolve (strong on names, weak on IP literals), not by recency of spelling.
 //
+// resolve-unknown-server-pod-ip-peer adds ONE step to the IP-literal branch:
+// when the host parses as an IP but matches no Service ClusterIP in the anchor
+// cluster, it is looked up against that same cluster's Pod IP set before the
+// external fallback (and therefore before route resolution). A hit resolves to
+// the topology pod itself — no service node, no service-selects-pod fan-out —
+// yielding the ordinary pod-calls-pod edge. Anchor-cluster only, never a family
+// sibling: pod CIDRs overlap across clusters.
+//
 // translate-global-fqdn-to-k8s-service adds ONE step: at EVERY point below
 // that would emit an external node — no grammar matched, an IP literal with
 // no ClusterIP hit, AND a classified (ns, svc) the anchor cluster does not
@@ -742,6 +791,20 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	ns, svc, classified := r.classifyPeerHost(host, clientNamespace, anchorCluster)
 	if !classified {
 		if net.ParseIP(host) != nil {
+			// resolve-unknown-server-pod-ip-peer: an IP literal that matched no
+			// Service ClusterIP may still be a pod's own address — a caller that
+			// dialled the pod directly, bypassing any Service. Anchor-cluster
+			// only, same scoping as the ClusterIP lookup. A hit is a POD, so it
+			// deliberately does NOT go through resolveServiceLevel: no service
+			// node is materialised and no service-selects-pod edge is emitted,
+			// and the generic target-driven rule makes the edge pod-calls-pod.
+			if pod := r.lookupPeerPodIP(anchorCluster, host); pod != nil {
+				slog.Debug("service-graph unknown-server peer IP resolved to pod",
+					"side", t.side, "peer_address", value, "host", host,
+					"anchor_cluster", anchorCluster, "pod_id", pod.ID(),
+					"client", t.clientLabel, "server", t.serverLabel)
+				return []string{pod.ID()}
+			}
 			return routeExternal("unknown_server_peer_ip_literal_no_match",
 				"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
 		}
