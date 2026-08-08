@@ -30,12 +30,12 @@ const defaultListenerPort = 443
 // (design.md Non-Goals); the listener-port dimensions below are the older
 // client_server_port / client_net_peer_port pair used only by route resolution.
 type peerLabels struct {
-	serverAddress       string // client_server_address (checked first)
-	networkPeerAddress  string // client_network_peer_address (checked second)
-	netPeerName         string // client_net_peer_name (checked third)
-	dnsAnswers          string // client_dns_answers — raw label, parsed lazily
-	serverPort          string // client_server_port
-	netPeerPort         string // client_net_peer_port
+	serverAddress      string // client_server_address (checked first)
+	networkPeerAddress string // client_network_peer_address (checked second)
+	netPeerName        string // client_net_peer_name (checked third)
+	dnsAnswers         string // client_dns_answers — raw label, parsed lazily
+	serverPort         string // client_server_port
+	netPeerPort        string // client_net_peer_port
 }
 
 // peerLabelsOf extracts the bundle from one sample's metric.
