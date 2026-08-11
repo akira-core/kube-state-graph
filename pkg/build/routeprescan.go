@@ -12,6 +12,8 @@ import (
 
 	"github.com/prometheus/common/model"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // defaultListenerPort is the design-D5 fallback when neither the peer-address
@@ -47,6 +49,23 @@ func peerLabelsOf(m model.Metric) peerLabels {
 		dnsAnswers:         string(m["client_dns_answers"]),
 		serverPort:         string(m["client_server_port"]),
 		netPeerPort:        string(m["client_net_peer_port"]),
+	}
+}
+
+// serverPeerLabelsOf extracts the SERVER-side mirror bundle of one span-link
+// sample's metric (add-span-link-logical-edges): the exporter records the
+// consumer side's own broker peer address under server_-prefixed mirrors of
+// the client labels. v1 emits no server_network_peer_address and no
+// server_net_peer_port, so those fields stay empty — peerLabels.value() and
+// derivePort skip empty fields, which keeps the D1 precedence and the D5
+// port ladder applicable unchanged (one struct, two constructors, zero
+// forked logic).
+func serverPeerLabelsOf(m model.Metric) peerLabels {
+	return peerLabels{
+		serverAddress: string(m["server_server_address"]),
+		netPeerName:   string(m["server_net_peer_name"]),
+		dnsAnswers:    string(m["server_dns_answers"]),
+		serverPort:    string(m["server_server_port"]),
 	}
 }
 
@@ -255,6 +274,39 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	return collectRouteQueriesWith(vec, newSGResolver(topology))
 }
 
+// viaRouteKey derives the route key for one endpoint anchored on its OWN
+// already-resolved topology pod, applying the prescan's full skip chain: no
+// peer value, an in-cluster classification the anchor holds, a Pod-IP-
+// resolvable host (an AMBIGUOUS family deliberately does not skip — the
+// parse falls external there, so the engine should get its chance), or no
+// destination IPs (design D6: the ingress cluster cannot be selected without
+// one) all yield ok=false — the parse never consults the route index for such
+// an endpoint, so the engine must not be asked about it either. Shared by the
+// unknown-server collection branch and the span-link via-key branch so the
+// two cannot drift, and mirrored lookup-only by viaNodeID in the parse.
+func (r *sgResolver) viaRouteKey(ownPod *graph.PodNode, peer peerLabels) (routeKey, bool) {
+	anchorCluster := ownPod.Labels()["cluster"]
+	key, ok := peerRouteKey(anchorCluster, peer)
+	if !ok {
+		return routeKey{}, false // no peer value — the endpoint drops, nothing to resolve
+	}
+	// Skip endpoints the existing in-cluster ladder already resolves: the
+	// route engine is consulted ONLY where the parse would fall external.
+	if ns, svc, classified := r.classifyPeerHost(key.host, ownPod.Labels()["namespace"], anchorCluster); classified && r.anchorHolds(anchorCluster, ns, svc) {
+		return routeKey{}, false
+	}
+	// Same reason, for the resolve-unknown-server-pod-ip-peer step: an IP
+	// literal that resolves to a pod in the anchor cluster's family never
+	// reaches the parse's external fallback.
+	if pod, _ := r.lookupPeerPodIP(anchorCluster, key.host); pod != nil {
+		return routeKey{}, false
+	}
+	if key.ips == "" {
+		return routeKey{}, false
+	}
+	return key, true
+}
+
 // collectRouteQueriesWith is the prescan over an already-built resolver.
 // ReadServiceGraph shares ONE resolver between the prescan and the parse: the
 // indexes consulted here are immutable and read-only, and building them scans
@@ -266,15 +318,18 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 
 	var keys []routeKey
 	seen := map[routeKey]bool{}
+	add := func(key routeKey) {
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
+	}
 	for _, s := range vec {
 		if !(s.Value > 0) {
 			continue
 		}
-		serverLabel := string(s.Metric["server"])
-		if serverLabel != sentinelUnknown {
-			continue
-		}
 		clientLabel := string(s.Metric["client"])
+		serverLabel := string(s.Metric["server"])
 		traceCluster := string(s.Metric["cluster"])
 		if traceCluster == "" {
 			traceCluster = "unknown" // mirrors missingClusterCounts.bucket
@@ -285,6 +340,38 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 		if (clientUID == "" && clientLabel == "") || (serverUID == "" && serverLabel == "") {
 			continue // wholly-empty side: the parse drops the series pre-resolution
 		}
+
+		// Span-link series (add-span-link-logical-edges): each side whose own
+		// pod resolves may consult the route index for its broker peer address
+		// (viaNodeID in the parse), so its key must be collected — anchored on
+		// that side's own pod cluster. Mirrors the parse's no-consumer guard: a
+		// link series whose server side is the "unknown" sentinel with no
+		// resolvable pod contributes no via markers in the parse (design D6),
+		// so the link branch skips it here too — the unknown-server branch
+		// below still derives the identical key for the enrichment path, so
+		// the collected set is unchanged either way (`seen` would unify them).
+		if string(s.Metric["edge_relation"]) == relationLink {
+			serverPod, serverKnown := (*graph.PodNode)(nil), false
+			if serverUID != "" {
+				serverPod, serverKnown = r.podByUID[serverUID]
+			}
+			if serverLabel != sentinelUnknown || serverKnown {
+				if clientPod := r.lookupClientPod(traceCluster, clientUID); clientPod != nil {
+					if key, ok := r.viaRouteKey(clientPod, peerLabelsOf(s.Metric)); ok {
+						add(key)
+					}
+				}
+				if serverKnown {
+					if key, ok := r.viaRouteKey(serverPod, serverPeerLabelsOf(s.Metric)); ok {
+						add(key)
+					}
+				}
+			}
+		}
+
+		if serverLabel != sentinelUnknown {
+			continue
+		}
 		if serverUID != "" {
 			if _, known := r.podByUID[serverUID]; known {
 				continue // server resolves to a real pod — enrichment never fires
@@ -294,35 +381,8 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 		if clientPod == nil {
 			continue // trigger requires a REAL topology client pod
 		}
-
-		peer := peerLabelsOf(s.Metric)
-		anchorCluster := clientPod.Labels()["cluster"]
-		key, ok := peerRouteKey(anchorCluster, peer)
-		if !ok {
-			continue // no peer value — the endpoint drops, nothing to resolve
-		}
-		// Skip endpoints the existing in-cluster ladder already resolves: the
-		// route engine is consulted ONLY where the parse would fall external.
-		if ns, svc, classified := r.classifyPeerHost(key.host, clientPod.Labels()["namespace"], anchorCluster); classified && r.anchorHolds(anchorCluster, ns, svc) {
-			continue
-		}
-		// Same reason, for the resolve-unknown-server-pod-ip-peer step: an IP
-		// literal that resolves to a pod in the anchor cluster's family never
-		// reaches the parse's external fallback, so the engine must not be asked
-		// about it. An AMBIGUOUS family (pod nil) deliberately does not skip —
-		// the parse falls external there, so the engine should get its chance.
-		if pod, _ := r.lookupPeerPodIP(anchorCluster, key.host); pod != nil {
-			continue
-		}
-		// Destination IPs are a precondition (design D6): without one the
-		// ingress cluster cannot be selected, so the engine is never asked —
-		// the endpoint falls external directly (route_engine_no_ip).
-		if key.ips == "" {
-			continue
-		}
-		if !seen[key] {
-			seen[key] = true
-			keys = append(keys, key)
+		if key, ok := r.viaRouteKey(clientPod, peerLabelsOf(s.Metric)); ok {
+			add(key)
 		}
 	}
 	// Deterministic resolution order (D6): sorted, not vector-arrival order.

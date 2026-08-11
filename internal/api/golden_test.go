@@ -30,6 +30,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"with-netapp-trident":  buildWithNetAppTrident(),
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
+		"link-relation":        buildLinkRelation(),
 	}
 
 	for name, view := range scenarios {
@@ -203,6 +204,25 @@ func buildMissingUIDFallback() graph.View {
 	ext := &graph.ExternalNode{IDValue: "external/admin", NameValue: "admin", LabelsValue: map[string]string{}}
 	edge := graph.NewEdge(graph.EdgeTypePodCallsPod, ext.IDValue, pod.IDValue, map[string]string{})
 	return graph.View{Nodes: []graph.GraphNode{pod, ext}, Edges: []*graph.Edge{edge}}
+}
+
+// buildLinkRelation snapshots the span-link relation marking
+// (add-span-link-logical-edges): a logical producer→consumer pod-calls-pod
+// edge carries labels.relation="link", the producer's pod→broker
+// pod-calls-service edge carries labels.relation="transport", and the broker's
+// service-selects-pod fan-out carries no relation key (shared edge, never
+// marked). Ordinary labels (cluster / namespace) are unaffected.
+func buildLinkRelation() graph.View {
+	producer := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "producer", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	consumer := &graph.PodNode{IDValue: "cluster-alpha/c1", NameValue: "consumer", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	broker := &graph.ServiceNode{IDValue: "cluster-alpha/messaging/nats", NameValue: "nats", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "messaging"}, IPAddressValue: []string{"10.0.0.9"}}
+	brokerPod := &graph.PodNode{IDValue: "cluster-alpha/n1", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "messaging"}}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodCallsPod, producer.IDValue, consumer.IDValue, map[string]string{"cluster": "cluster-alpha", "relation": "link"}),
+		graph.NewEdge(graph.EdgeTypePodCallsService, producer.IDValue, broker.IDValue, map[string]string{"cluster": "cluster-alpha", "relation": "transport"}),
+		graph.NewEdge(graph.EdgeTypeServiceSelectsPod, broker.IDValue, brokerPod.IDValue, map[string]string{"namespace": "messaging"}),
+	}
+	return graph.View{Nodes: []graph.GraphNode{producer, consumer, broker, brokerPod}, Edges: edges}
 }
 
 // buildNameFilter snapshots the projection of a two-cluster graph through
