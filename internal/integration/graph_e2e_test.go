@@ -1529,3 +1529,67 @@ func (s *GraphSuite) TestAPIKey_FileBacked_Enforced() {
 	_ = live.Body.Close()
 	s.Equal(http.StatusOK, live.StatusCode)
 }
+
+// TestSpanLinkRelationEdges exercises span-link relation marking
+// (add-span-link-logical-edges) end-to-end: an edge_relation="link" series
+// (producer checkout/alpha-1 → consumer payments/beta-1, both UIDs resolvable)
+// yields the logical pod-calls-pod edge with labels.relation="link"; an
+// ordinary server="unknown" network series from the same producer to the
+// broker Service (via client_server_address) yields the pod-calls-service
+// edge, which the link series' client-side via lookup marks
+// labels.relation="transport"; and the broker's service-selects-pod fan-out
+// stays unmarked (a shared edge is never relation-marked).
+func (s *GraphSuite) TestSpanLinkRelationEdges() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	extra := fmt.Sprintf(`# HELP kube_service_info dummy
+kube_service_info{cluster="cluster-alpha",namespace="shop",service="nats-broker",cluster_ip="10.96.0.99",test=%q} 1 %d
+kube_endpointslice_labels{cluster="cluster-alpha",namespace="shop",endpointslice="nats-broker-x1",label_kubernetes_io_service_name="nats-broker",test=%q} 1 %d
+kube_endpointslice_endpoints{cluster="cluster-alpha",namespace="shop",endpointslice="nats-broker-x1",targetref_kind="Pod",targetref_name="cart",targetref_namespace="shop",test=%q} 1 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="nats-broker.shop",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="unknown",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="",client_k8s_namespace_name="shop",server_k8s_namespace_name="",client_server_address="nats-broker.shop",connection_type="virtual_node",test=%q} 120 %d
+traces_service_graph_request_total{client="checkout",server="payments",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="beta-1",client_k8s_namespace_name="shop",server_k8s_namespace_name="billing",edge_relation="link",client_server_address="nats-broker.shop",test=%q} 0 %d
+traces_service_graph_request_total{client="checkout",server="payments",cluster="cluster-alpha",client_k8s_pod_uid="alpha-1",server_k8s_pod_uid="beta-1",client_k8s_namespace_name="shop",server_k8s_namespace_name="billing",edge_relation="link",client_server_address="nats-broker.shop",test=%q} 60 %d
+`, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1, disc, t0, disc, t1)
+	s.IngestExpFmt(extra)
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{edge_relation="link",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested edge_relation=\"link\" series")
+	s.Require().True(
+		s.WaitForSeries(`traces_service_graph_request_total{server="unknown",client_server_address="nats-broker.shop",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the ingested broker network series")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	findEdge := func(src, tgt string) *cytoscape.EdgeData {
+		for _, e := range body.Elements.Edges {
+			if e.Data.Source == src && e.Data.Target == tgt {
+				return &e.Data
+			}
+		}
+		return nil
+	}
+
+	logical := findEdge("cluster-alpha/alpha-1", "cluster-beta/beta-1")
+	s.Require().NotNil(logical, "the producer→consumer link edge must be present")
+	s.Equal("pod-calls-pod", logical.Type)
+	s.Equal("link", logical.Labels["relation"], "the span-link series marks its edge relation=link")
+
+	broker := findEdge("cluster-alpha/alpha-1", "cluster-alpha/shop/nats-broker")
+	s.Require().NotNil(broker, "the producer→broker network edge must be present")
+	s.Equal("pod-calls-service", broker.Type)
+	s.Equal("transport", broker.Labels["relation"], "the link series' via lookup marks the broker edge relation=transport")
+
+	fanout := findEdge("cluster-alpha/shop/nats-broker", "cluster-alpha/alpha-2")
+	s.Require().NotNil(fanout, "the broker fan-out edge must be present")
+	s.Equal("service-selects-pod", fanout.Type)
+	_, marked := fanout.Labels["relation"]
+	s.False(marked, "service-selects-pod fan-out edges are never relation-marked")
+}

@@ -23,6 +23,18 @@ import (
 // fallbacks.
 const sentinelUnknown = "unknown"
 
+// Span-link relation marking (add-span-link-logical-edges): a series whose
+// edge_relation label is exactly relationLink is a logical producer→consumer
+// edge derived from cross-trace span links through a broker. Its emitted edge
+// carries labels[relationLabelKey]=relationLink, and the pod→broker network
+// edges evidenced by each side's own peer-address labels are marked
+// relationTransport. Any other edge_relation value is ignored (exact match).
+const (
+	relationLabelKey  = "relation"
+	relationLink      = "link"
+	relationTransport = "transport"
+)
+
 // ServiceGraphResult is the typed output of the pod-service-graph reader.
 type ServiceGraphResult struct {
 	Edges         []*graph.Edge
@@ -342,6 +354,17 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 	type pairKey struct{ src, tgt string }
 	pairs := make(map[pairKey]aggEdge, len(vec))
 
+	// Span-link relation marking (add-span-link-logical-edges D1): two
+	// function-local pair sets consulted at edge-build time — linkPairs marks
+	// an edge labels.relation="link", transportPairs marks "transport", link
+	// wins on collision. Accumulation is insert-only (monotone), so the final
+	// marking is a pure function of the accumulated sets regardless of sample
+	// arrival order (D6). Function-local like `pairs`: no resolver field, no
+	// cross-build state.
+	linkPairs := map[pairKey]struct{}{}
+	transportPairs := map[pairKey]struct{}{}
+	linkNoConsumer := 0 // link series whose consumer was unresolvable — contributed no markers (aggregated debug)
+
 	for _, s := range vec {
 		// Drop zero-rate series. Written as !(v > 0) rather than v <= 0 so
 		// NaN-valued samples are dropped too — every comparison with NaN is
@@ -452,6 +475,56 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 				}
 			}
 		}
+
+		// Span-link handling (add-span-link-logical-edges). Exact-match on
+		// "link": any other edge_relation value is an ordinary series.
+		if string(s.Metric["edge_relation"]) == relationLink {
+			// No-consumer guard (design D6): when the server side has no
+			// resolvable topology pod AND its raw label is the "unknown"
+			// sentinel, the pairs above came out of resolveUnknownServerPeer —
+			// the client-side peer labels resolved the BROKER, so the produced
+			// edge is producer→broker with no renderable consumer. Such a
+			// series contributes NO markers at all: not link (the target is
+			// the broker, not the consumer), and not transport either — the
+			// frontend contract is "transport = the network hop backing a
+			// rendered logical edge", so dashing a network edge that backs no
+			// emitted link edge would misrepresent a real dependency. The edge
+			// itself stays byte-identical to an ordinary server="unknown"
+			// series' outcome. Every other link sample — real pod, synth pod,
+			// D27 ghost external — keeps the logical claim and marks its via
+			// hops.
+			_, serverKnown := res.podByUID[serverUID]
+			if serverLabel == sentinelUnknown && (serverUID == "" || !serverKnown) {
+				if len(srcIDs) > 0 && len(tgtIDs) > 0 {
+					linkNoConsumer++
+				}
+			} else {
+				for _, srcID := range srcIDs {
+					for _, tgtID := range tgtIDs {
+						linkPairs[pairKey{src: srcID, tgt: tgtID}] = struct{}{}
+					}
+				}
+				// Per-side via marking (design D3/D6): each side whose own pod
+				// resolved to a REAL topology pod derives its broker node ID
+				// from its OWN peer labels — lookup-only, never materialising —
+				// and the (pod, broker) pair is marked transport. An unresolved
+				// side simply contributes no marker; the other side is
+				// unaffected. Because this branch always records the series'
+				// link pair above, a transport marker can only ever originate
+				// from a series that also emitted its link-marked logical edge.
+				if clientPod != nil {
+					if viaID, ok := res.viaNodeID(clientPod, peer); ok {
+						transportPairs[pairKey{src: clientPod.ID(), tgt: viaID}] = struct{}{}
+					}
+				}
+				if serverUID != "" && serverKnown {
+					serverPod := res.podByUID[serverUID]
+					if viaID, ok := res.viaNodeID(serverPod, serverPeerLabelsOf(s.Metric)); ok {
+						transportPairs[pairKey{src: serverPod.ID(), tgt: viaID}] = struct{}{}
+					}
+				}
+			}
+		}
 	}
 
 	edges := make([]*graph.Edge, 0, len(pairs)+len(res.svcEdges))
@@ -464,6 +537,14 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		if agg.srcIsPod {
 			labels["cluster"] = agg.srcCluster
 		}
+		// Span-link relation marking: link wins over transport on collision
+		// (checked first), transport otherwise, no key on ordinary edges.
+		// Pure set-membership — labels never feed the UUIDv5 edge identity.
+		if _, isLink := linkPairs[k]; isLink {
+			labels[relationLabelKey] = relationLink
+		} else if _, isTransport := transportPairs[k]; isTransport {
+			labels[relationLabelKey] = relationTransport
+		}
 		// Edge type is target-driven: a target that resolved to a service node
 		// (via the D29 "://" connection-string rule) yields pod-calls-service;
 		// every other target (pod, synth-pod, external) stays pod-calls-pod.
@@ -472,6 +553,24 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 			edgeType = graph.EdgeTypePodCallsService
 		}
 		edges = append(edges, graph.NewEdge(edgeType, k.src, k.tgt, labels))
+	}
+	// Aggregated span-link evidence (per-endpoint detail would be noise): a
+	// transport pair with no matching emitted edge is a pure marker — the
+	// network series for the pod→broker hop was absent from the window — and
+	// is deliberately NOT synthesised (design D3). linkPairs need no check:
+	// every link pair was inserted alongside its `pairs` entry.
+	if unmatchedTransport := func() int {
+		n := 0
+		for k := range transportPairs {
+			if _, ok := pairs[k]; !ok {
+				n++
+			}
+		}
+		return n
+	}(); unmatchedTransport > 0 || linkNoConsumer > 0 {
+		slog.Debug("span-link relation marking summary",
+			"unmatched_transport_pairs", unmatchedTransport,
+			"link_series_without_resolvable_consumer", linkNoConsumer)
 	}
 	for _, e := range res.svcEdges {
 		edges = append(edges, e)
@@ -902,6 +1001,78 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	return routeExternal("unknown_server_peer_anchor_lacks_service",
 		"service", svc, "namespace", ns, "host", host, "peer_address", value,
 		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
+}
+
+// viaNodeID is the LOOKUP-ONLY mirror of resolveUnknownServerPeer's
+// classification chain (add-span-link-logical-edges D3): it derives the graph
+// node ID a peer address WOULD resolve to — anchored on the given side's own
+// already-resolved topology pod — without materialising any node, emitting any
+// edge, or recording any external-fallback reason. Used to mark the
+// pod→broker transport pair of a span-link series; if the network edge for
+// the pair was never produced by a real series, the pair is a pure marker
+// (resolveRouteChain's orphan-protection precedent: service nodes are never
+// pruned by projection, so a marker lookup that materialised would leak
+// orphan broker nodes). ok=false when the side carries no peer-address value.
+//
+// Anti-drift: every step calls the same pure helpers the materialising path
+// calls (truncateBracketSuffix, splitPeerAddressPort, classifyPeerHost,
+// anchorHolds, lookupPeerPodIP, peerRouteKey), so the derived ID can never
+// diverge from the ID resolveUnknownServerPeer would materialise for the same
+// (pod, peer) input. An ambiguous Pod-IP family degrades through routeNodeID
+// exactly like the materialising path's routeExternal.
+func (r *sgResolver) viaNodeID(ownPod *graph.PodNode, peer peerLabels) (string, bool) {
+	value := peer.value()
+	if value == "" {
+		return "", false // none of the peer-address labels present — no marker
+	}
+	anchorCluster := ownPod.Labels()["cluster"]
+	host, _ := splitPeerAddressPort(truncateBracketSuffix(value))
+	// ok is guaranteed: value is non-empty (same reasoning as
+	// resolveUnknownServerPeer's key derivation).
+	key, _ := peerRouteKey(anchorCluster, peer)
+
+	if ns, svc, classified := r.classifyPeerHost(host, ownPod.Labels()["namespace"], anchorCluster); classified {
+		if r.anchorHolds(anchorCluster, ns, svc) {
+			return graph.ServiceID(anchorCluster, ns, svc), true
+		}
+		return r.routeNodeID(key, value), true
+	}
+	if pod, _ := r.lookupPeerPodIP(anchorCluster, host); pod != nil {
+		return pod.ID(), true
+	}
+	return r.routeNodeID(key, value), true
+}
+
+// routeNodeID is the lookup-only twin of routeIndexResolve (design D5): it
+// consults the prefetched route index for the node ID an endpoint would
+// resolve to, without materialisation, logging, or extReasons tallies. The
+// deliberate divergences from the materialising path: a chained RouteHit
+// yields only the BACKEND service ID (the marker targets the routed service,
+// never the ingress hop), no role marking, no chain synthesis. Every miss —
+// engine off, no destination IPs, an uncollected/truncated key (maxRouteKeys:
+// a truncated key has no index entry, so both paths degrade identically), a
+// failed or non-hit entry, or a dest cluster that does not hold the service —
+// derives the external node ID of the RAW peer value, exactly the ID the
+// materialising path's external fallback produces.
+func (r *sgResolver) routeNodeID(key routeKey, raw string) string {
+	ext := graph.ExternalID(raw)
+	if r.routes == nil || key.ips == "" {
+		return ext
+	}
+	entry, ok := r.routes[key]
+	if !ok || entry.failed {
+		return ext
+	}
+	if entry.outcome == RouteHit || entry.outcome == RouteIngressLBService {
+		// Same membership test resolveServiceLevel / resolveServiceLevelInCluster
+		// apply before materialising: the engine-selected cluster must itself
+		// hold the destination service in topology. Every other outcome (the
+		// route_engine_* miss family) degrades to the external ID below.
+		if r.anchorHolds(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service) {
+			return graph.ServiceID(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service)
+		}
+	}
+	return ext
 }
 
 // classifyBareShortName reports whether host is a bare, dot-free Service short

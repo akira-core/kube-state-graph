@@ -37,6 +37,11 @@
         {
           "name": "cluster",
           "value_type": "string"
+        },
+        {
+          "name": "relation",
+          "value_type": "string",
+          "description": "Span-link relation marker: 'link' for a logical producer→consumer edge derived from cross-trace span links through a broker, 'transport' for a pod→broker network hop backing such a link. Absent on ordinary edges."
         }
       ]
     },
@@ -57,6 +62,11 @@
         {
           "name": "cluster",
           "value_type": "string"
+        },
+        {
+          "name": "relation",
+          "value_type": "string",
+          "description": "Span-link relation marker: 'link' for a logical producer→consumer edge derived from cross-trace span links through a broker, 'transport' for a pod→broker network hop backing such a link. Absent on ordinary edges."
         }
       ]
     },

@@ -1,0 +1,124 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/messaging",
+          "name": "messaging",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/p1",
+          "name": "producer",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/c1",
+          "name": "consumer",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/messaging/nats",
+          "name": "nats",
+          "type": "service",
+          "parent": "cluster-alpha/namespace/messaging",
+          "ipaddress": [
+            "10.0.0.9"
+          ],
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "messaging"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/n1",
+          "name": "nats-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/messaging",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "messaging"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "201df0bd-f6ea-5451-9a2f-30487acf2e2b",
+          "type": "pod-calls-pod",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/c1",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "relation": "link"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "a025e287-75a8-525d-bfc1-6401c8da1c3c",
+          "type": "pod-calls-service",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/messaging/nats",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "relation": "transport"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "1afde9ef-aa50-5930-a47f-627df3001623",
+          "type": "service-selects-pod",
+          "source": "cluster-alpha/messaging/nats",
+          "target": "cluster-alpha/n1",
+          "labels": {
+            "namespace": "messaging"
+          }
+        }
+      }
+    ]
+  }
+}

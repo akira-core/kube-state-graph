@@ -62,6 +62,7 @@ var EdgeTypes = []EdgeTypeDefinition{
 		MayCrossCluster: true,
 		Labels: []EdgeTypeLabel{
 			{Name: "cluster", ValueType: "string"},
+			{Name: "relation", ValueType: "string", Description: "Span-link relation marker: 'link' for a logical producer→consumer edge derived from cross-trace span links through a broker, 'transport' for a pod→broker network hop backing such a link. Absent on ordinary edges."},
 		},
 	},
 	{
@@ -73,6 +74,7 @@ var EdgeTypes = []EdgeTypeDefinition{
 		MayCrossCluster: true,
 		Labels: []EdgeTypeLabel{
 			{Name: "cluster", ValueType: "string"},
+			{Name: "relation", ValueType: "string", Description: "Span-link relation marker: 'link' for a logical producer→consumer edge derived from cross-trace span links through a broker, 'transport' for a pod→broker network hop backing such a link. Absent on ordinary edges."},
 		},
 	},
 	{

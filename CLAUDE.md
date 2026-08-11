@@ -369,6 +369,53 @@ live under `openspec/specs/`.
   now resolves from `client_server_address` (previously the reverse), which
   can also change an unresolved endpoint's external node `id`/`name` from
   `external/<client_net_peer_name>` to `external/<client_server_address>`.
+- **Span-link logical edge relation marking** (add-span-link-logical-edges,
+  hardcoded — no knob): a series whose `edge_relation` label is exactly
+  `"link"` (span-link-derived: client = producer pod, server = consumer pod,
+  joined across trace IDs through a broker) resolves through the ordinary
+  ladder unchanged and its emitted edge carries `labels.relation="link"`;
+  each side whose own pod resolved to a REAL topology pod additionally
+  derives its broker node ID from its OWN peer-address labels — client side
+  the existing `client_server_address`/`client_net_peer_name` (+
+  `client_dns_answers`/`client_server_port`), server side the mirrored
+  `server_server_address`/`server_net_peer_name` (+ `server_dns_answers`/
+  `server_server_port`, filled into the same `peerLabels` struct by
+  `serverPeerLabelsOf`; no `server_network_peer_address` in v1) — via
+  `sgResolver.viaNodeID`, a **lookup-only** mirror of the
+  unknown-server-enrichment classification chain (shares every pure helper;
+  route index consulted through `routeNodeID`, the lookup-only twin of
+  `routeIndexResolve` that takes only the RouteHit BACKEND — never the
+  ingress hop, no `role` marking, no chain — and degrades everything else to
+  `ExternalID(raw)`); the `(pod, broker)` pair marks the matching
+  `pod-calls-pod`/`pod-calls-service` edge `labels.relation="transport"`.
+  Marking is set-membership at edge-build time over two
+  **`parseWithResolver`-local** sets (`linkPairs`/`transportPairs` — no
+  resolver field, no cross-build state); insert-only accumulation makes it
+  order-free (D6), `link` wins over `transport` and over plain series for the
+  same pair, `service-selects-pod` fan-out and synthesized route-chain edges
+  are NEVER marked, and a transport pair with no matching edge is a pure
+  marker (aggregated Debug, never synthesised — via lookup materialises
+  NOTHING, the `resolveRouteChain` orphan-protection precedent). A link
+  series with `server=="unknown"` and no resolvable server pod recovered no
+  consumer and contributes **NO markers at all** (neither `link` nor
+  `transport`, no via pairs — its producer→broker edge stays the ordinary
+  unmarked enrichment outcome, byte-identical): the rendering contract is
+  "transport = the network hop backing a rendered logical edge", so a
+  `transport` edge always coexists with a `link` edge from the same series
+  set in the built graph — do NOT re-add a demote-to-transport rule (other
+  degrades — synth pod, D27 ghost external — keep `link`). Any other
+  `edge_relation` value is ignored (exact match). Prescan: link series emit
+  ≤2 via keys (per resolved side, anchor = that side's own pod cluster)
+  through `viaRouteKey` — the extracted skip chain the unknown-server branch
+  also uses — deduped by the prescan `seen` map with ordinary unknown-server
+  keys (same `peerRouteKey` derivation ⇒ one store read per broker FQDN per
+  anchor cluster; the in-memory chain stays un-memoised per the
+  `resolveConnString` precedent). Edge IDs (UUIDv5 over `type|source|target`)
+  and the D30 selector are untouched; `relation` is registered on the
+  `pod-calls-pod`/`pod-calls-service` `graph.EdgeTypes` entries only. Tests:
+  `pkg/build/servicegraph_link_test.go`, golden
+  `link-relation-cytoscape.json`, `internal/integration`
+  (`TestSpanLinkRelationEdges`).
 - **Istio route resolution of global FQDN peers**
   (translate-global-fqdn-to-k8s-service, OPT-IN — off by default): the ONE
   step added to the enrichment above. When `--route-store-dsn` /
