@@ -243,8 +243,9 @@ live under `openspec/specs/`.
   dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
   the same fragment when added.
 - **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
-  D1–D3, extended by resolve-unknown-server-ip-peer and
-  resolve-unknown-server-network-peer-address, hardcoded — no knob): the one
+  D1–D3, extended by resolve-unknown-server-ip-peer,
+  resolve-unknown-server-network-peer-address, and
+  resolve-unknown-server-pod-ip-peer, hardcoded — no knob): the one
   carve-out from the D30 outcome above. When `client_k8s_pod_uid` resolves to
   a **real topology pod** (never a synthesised one) AND the server side has no
   resolvable pod (UID empty, or present but absent from `Topology.PodsByUID`)
@@ -285,7 +286,7 @@ live under `openspec/specs/`.
   classified via the same `classifyK8sDNS` grammar D29 connection-string
   resolution uses (2-label `<service>.<namespace>`, 3-label headless
   `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped), **plus
-  two grammar extensions scoped to this rule only**: (1) a single dot-free,
+  three grammar extensions scoped to this rule only**: (1) a single dot-free,
   non-IP-literal label is treated as a bare short Service name resolved in the
   **client pod's own namespace** — note this means bracket truncation can
   promote a value like `mongo:27017[-181]` into the bare short name `mongo`,
@@ -297,11 +298,52 @@ live under `openspec/specs/`.
   never a family sibling, since a `ClusterIP` is a per-cluster address that
   can legitimately collide across unrelated clusters' Service CIDRs (unlike a
   Service DNS name, which is a mesh-wide convention the family union already
-  handles) — note an IP-valued peer that is not itself an anchor-cluster
-  `ClusterIP` (a pod IP, a sidecar loopback, a NodePort/LB address, any
-  off-cluster IP) becomes an `external/<ip>` node, not a dropped endpoint. The
-  reverse index (`(cluster, ClusterIP) → Service`) is built once per parse
-  from `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
+  handles); (3) (resolve-unknown-server-pod-ip-peer) when the IP literal
+  matches **no** Service `ClusterIP`, it is looked up as a **Pod IP** against
+  a second index (`famIPKey{family, pod_ip} → []podIPCandidate{cluster, pod}`,
+  built once per parse from `topology.Pods` in **two stages**: stage 1 reduces
+  to one holder per `(cluster, ip)` in the same loop as `podByID`, skipping
+  pods with no `pod_ip`; stage 2 regroups by `ClusterFamilyKey(cluster)` and
+  sorts each group by cluster, exactly like `svcCandidates`). This covers a
+  caller that dialled another pod's address directly, bypassing any Service —
+  **including across a cluster boundary**, which is ordinary traffic wherever
+  clusters share a flat routable network. **Selection**: the **anchor
+  cluster's own** holder always wins (byte-for-byte the anchor-only
+  behaviour); otherwise a **lone family holder** resolves; **two or more**
+  family holders yield no pod and degrade via `routeExternal` with the
+  distinct reason `unknown_server_peer_pod_ip_ambiguous` — **no tie-break
+  across clusters**. Being the family's only holder IS the evidence that its
+  pod CIDRs do not overlap at that address, which is why **no service-mesh
+  gate is applied**: cross-cluster pod-to-pod reachability is a network-layer
+  property, and an `istio-proxy` sidecar is neither necessary (a flat network
+  needs no Istio) nor sufficient (in a multi-network mesh the caller's sidecar
+  is handed the east-west gateway address, never a remote Pod IP). A cluster
+  outside the anchor's family is never a candidate. A hit resolves the
+  endpoint **straight to that topology pod** — it does NOT go through
+  `resolveServiceLevel`, materialises **no service node** and emits **no
+  `service-selects-pod` edge**, so the generic target-driven rule makes the
+  edge `pod-calls-pod` (which MAY therefore cross clusters). Ordering is
+  structural, not conventional: the ClusterIP step lives inside
+  `classifyPeerHost` and a hit there returns `classified=true`, so
+  **`ClusterIP` always beats Pod IP**, and the Pod-IP step sits immediately
+  before `routeExternal`, so it also beats the route engine and the external
+  fallback. The **ClusterIP lookup itself stays anchor-only** — Service CIDRs
+  overlap just as readily, and under multi-primary the same
+  `(namespace, service)` carries a *different* ClusterIP in each cluster. On a
+  **same-cluster** duplicate `pod_ip` — the normal case for `hostNetwork`
+  pods, which all report their node's address, and transient on address reuse
+  within the window — stage 1 keeps the **lexically-smallest pod ID**
+  (order-free, D6), so an intra-cluster duplicate never makes the family look
+  ambiguous. `lookupPeerPodIP` is pure and shared with the
+  `collectRouteQueries` prescan, which skips resolvable endpoints so the route
+  engine is never asked about traffic the in-cluster ladder now resolves —
+  while an **ambiguous** family, which does fall external, is still offered to
+  the engine. An IP-valued peer that matches neither an anchor-cluster
+  `ClusterIP` nor a resolvable family Pod IP (a sidecar loopback, a
+  NodePort/LB address, any off-cluster IP, or an ambiguous family) becomes an
+  `external/<ip>` node, not a dropped endpoint. The reverse index
+  (`(cluster, ClusterIP) → Service`) is built once per parse from
+  `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
   same-cluster duplicate `ClusterIP` (a data anomaly Kubernetes itself
   prevents), the lexically-smaller `(namespace, service)` wins. Once
   identified via IP, resolution proceeds through the SAME
@@ -720,6 +762,15 @@ changes, start a new change and update the relevant promoted spec
 
 ## Repository conventions
 
+- **Conversational output is written in Traditional Chinese (繁體中文).** This
+  covers the two artifacts of a Claude Code session: the plan file
+  (`~/.claude/plans/*.md`) and the explanatory prose in chat replies. Code,
+  identifiers, API names, CLI commands, commit-type keywords (feat/fix/…) and
+  error strings stay verbatim in English. This rule does **NOT** apply to
+  anything persisted in the repo — OpenSpec artifacts (`proposal.md`,
+  `design.md`, `tasks.md`, `spec.md`), code comments, commit messages,
+  `CLAUDE.md` itself, and all other docs stay in English, consistent with the
+  existing codebase.
 - All HTTP routes live under `/v1/`. Adding a route means committing to keeping
   it for v1's lifetime. Schema changes that aren't additive are v2 — see D14.
 - Self-metric names are stable contracts: `kube_state_graph_*`. Adding a label

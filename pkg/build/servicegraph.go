@@ -88,13 +88,14 @@ func ReadServiceGraph(
 // service-selects-pod edges are materialised on demand (only for services a
 // "://" connection string actually references) and deduped here.
 type sgResolver struct {
-	endpointsByService map[serviceKey][]EndpointObs // service-selects-pod fan-out source
-	podByID            map[string]*graph.PodNode    // client side: cluster known from metric
-	podByUID           map[string]*graph.PodNode    // server side: cluster recovered via index
-	svcCandidates      map[famSvcKey][]svcCandidate // family → clusters holding (ns, svc), sorted by cluster
-	ipIndex            map[ipKey]serviceKey         // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
-	serviceApps        map[serviceKey]string        // (cluster, namespace, service) → ArgoCD Application
-	routes             routeIndex                   // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
+	endpointsByService map[serviceKey][]EndpointObs  // service-selects-pod fan-out source
+	podByID            map[string]*graph.PodNode     // client side: cluster known from metric
+	podByUID           map[string]*graph.PodNode     // server side: cluster recovered via index
+	svcCandidates      map[famSvcKey][]svcCandidate  // family → clusters holding (ns, svc), sorted by cluster
+	ipIndex            map[ipKey]serviceKey          // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
+	podIPCandidates    map[famIPKey][]podIPCandidate // family → clusters holding a Pod IP, sorted by cluster (resolve-unknown-server-pod-ip-peer)
+	serviceApps        map[serviceKey]string         // (cluster, namespace, service) → ArgoCD Application
+	routes             routeIndex                    // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
 	services           map[string]*graph.ServiceNode // keyed by service id
@@ -155,11 +156,41 @@ type svcCandidate struct {
 // ClusterIP, scoped to a single cluster. Deliberately NOT family-scoped like
 // famSvcKey — a ClusterIP is a per-cluster address assigned from that
 // cluster's own (often overlapping) Service CIDR, so matching it across
-// clusters risks resolving to the wrong Service. The identification lookup
-// is anchor-cluster-only; once a (namespace, service) is identified, the
-// existing family-wide resolveServiceLevel still governs the
+// clusters risks resolving to the wrong Service. Worse than an overlap: under
+// Istio multi-primary the SAME (namespace, service) exists in every cluster
+// with a DIFFERENT ClusterIP, so a sibling's ClusterIP identifies a different
+// Service instance than the one the caller addressed. The identification
+// lookup stays anchor-cluster-only; once a (namespace, service) is identified,
+// the existing family-wide resolveServiceLevel still governs the
 // service-selects-pod fan-out.
+//
+// The same key type also stages the per-cluster winner of the Pod IP index
+// (see famIPKey), which is grouped into family candidates afterwards.
 type ipKey struct{ cluster, ip string }
+
+// famIPKey keys the resolve-unknown-server-pod-ip-peer index: a Pod IP scoped
+// by cluster family, mirroring famSvcKey. Unlike a ClusterIP (see ipKey), a
+// Pod IP identifies a real, singular workload wherever it is reachable from —
+// cross-cluster pod-to-pod dialling is a NETWORK-layer property (a flat
+// routable plane: shared VPC, VPC peering, BGP/native-routing CNI, L3-routed
+// on-prem pod CIDRs), independent of any service mesh. Sidecar presence is
+// neither necessary (a flat network needs no Istio) nor sufficient (in a
+// multi-network mesh the caller's sidecar sees the east-west gateway address,
+// never a remote Pod IP), so it is not used as a gate.
+//
+// The safety condition is that the family's pod CIDRs do not overlap, and that
+// is directly observable rather than assumed: if they overlapped, the same IP
+// would appear in more than one family cluster. lookupPeerPodIP therefore
+// prefers the anchor cluster, accepts a lone family holder, and degrades to
+// external on two or more — the uniqueness test IS the CIDR-disjointness test.
+type famIPKey struct{ family, ip string }
+
+// podIPCandidate is one cluster's holder of a Pod IP (already reduced to that
+// cluster's single winner — see the two-stage build in newSGResolver).
+type podIPCandidate struct {
+	cluster string
+	pod     *graph.PodNode
+}
 
 // parseServiceGraph is the route-index-free form: the ~70 direct test call
 // sites and any parse without a RouteResolver go through here. Identical to
@@ -174,9 +205,43 @@ func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 // collectRouteQueries prescan so both classify endpoints over identical
 // indexes (design D2).
 func newSGResolver(topology Topology) *sgResolver {
+	// Reverse Pod IP index for the resolve-unknown-server-pod-ip-peer
+	// classification step, built in two stages so the intra-cluster and
+	// cross-cluster rules stay separable.
+	//
+	// Stage 1, in the same pass as podByID: (cluster, pod_ip) -> that cluster's
+	// single holder of the address. A pod with no known IP never participates.
+	// On a duplicate within ONE cluster — legitimate for hostNetwork pods, which
+	// all report their node's address, and transient when an address is
+	// reassigned inside the query window — the lexically-smallest pod ID wins.
 	podByID := make(map[string]*graph.PodNode, len(topology.Pods))
+	perCluster := make(map[ipKey]*graph.PodNode, len(topology.Pods))
 	for _, p := range topology.Pods {
 		podByID[p.ID()] = p
+
+		ips := p.IPAddress()
+		if len(ips) == 0 || ips[0] == "" {
+			continue
+		}
+		ik := ipKey{cluster: p.Labels()["cluster"], ip: ips[0]}
+		if existing, ok := perCluster[ik]; ok && existing.ID() <= p.ID() {
+			continue
+		}
+		perCluster[ik] = p
+	}
+
+	// Stage 2: group the per-cluster winners by (family, ip), sorted by cluster
+	// — the same shape as svcCandidates below, so both indexes are pure
+	// functions of the data rather than of map-iteration order (D6). The slice
+	// length is what lookupPeerPodIP reads as evidence of pod-CIDR overlap
+	// within the family.
+	podIPCandidates := make(map[famIPKey][]podIPCandidate, len(perCluster))
+	for ik, pod := range perCluster {
+		fk := famIPKey{family: ClusterFamilyKey(ik.cluster), ip: ik.ip}
+		podIPCandidates[fk] = append(podIPCandidates[fk], podIPCandidate{cluster: ik.cluster, pod: pod})
+	}
+	for _, cands := range podIPCandidates {
+		sort.Slice(cands, func(i, j int) bool { return cands[i].cluster < cands[j].cluster })
 	}
 
 	// Inverted index for D29 connection-string resolution: (family, namespace,
@@ -228,6 +293,7 @@ func newSGResolver(topology Topology) *sgResolver {
 		podByUID:           topology.PodsByUID,
 		svcCandidates:      svcCandidates,
 		ipIndex:            ipIndex,
+		podIPCandidates:    podIPCandidates,
 		serviceApps:        topology.ServiceApplications,
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
@@ -608,6 +674,46 @@ func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster strin
 	return "", "", false
 }
 
+// lookupPeerPodIP resolves a peer host to the pod holding that Pod IP within
+// the anchor cluster's FAMILY — the resolve-unknown-server-pod-ip-peer step,
+// tried only after the Service ClusterIP lookup inside classifyPeerHost has
+// missed, so a ClusterIP always takes priority over a Pod IP for the same
+// address. Pure over the resolver's immutable indexes — no materialisation —
+// so the collectRouteQueries prescan shares it with resolveUnknownServerPeer.
+//
+// Three rules, in order (see famIPKey for why cross-cluster matching is sound
+// and why no mesh gate is applied):
+//
+//  1. The anchor cluster's own holder always wins. Byte-for-byte the
+//     pre-widening behaviour, and the right call even under real overlap: a
+//     caller most plausibly reached a pod in its own cluster.
+//  2. Otherwise, a LONE family holder resolves. Being the only cluster in the
+//     family carrying the address is direct evidence that the family's pod
+//     CIDRs do not overlap at this address, so the match is unambiguous.
+//  3. Two or more family holders means the address is genuinely ambiguous:
+//     return no pod and report ambiguous=true, so the caller degrades to an
+//     external node rather than guessing (the repo's pickIngressCluster /
+//     RouteAmbiguousIngressService convention).
+//
+// ambiguous is only ever true alongside a nil pod, and distinguishes rule 3
+// from a plain miss for the debug tally. A different-family cluster is
+// excluded by the famIPKey lookup itself — no extra check.
+func (r *sgResolver) lookupPeerPodIP(anchorCluster, host string) (pod *graph.PodNode, ambiguous bool) {
+	if net.ParseIP(host) == nil {
+		return nil, false
+	}
+	cands := r.podIPCandidates[famIPKey{family: ClusterFamilyKey(anchorCluster), ip: host}]
+	for _, c := range cands {
+		if c.cluster == anchorCluster {
+			return c.pod, false
+		}
+	}
+	if len(cands) == 1 {
+		return cands[0].pod, false
+	}
+	return nil, len(cands) > 1
+}
+
 // anchorHolds reports whether the anchor cluster itself deploys (ns, svc) —
 // the same membership test resolveServiceLevel applies before materialising a
 // service node. Used by the prescan to skip endpoints the in-cluster ladder
@@ -695,6 +801,16 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 // server.address) trails — ranked by what the classification chain below can
 // resolve (strong on names, weak on IP literals), not by recency of spelling.
 //
+// resolve-unknown-server-pod-ip-peer adds ONE step to the IP-literal branch:
+// when the host parses as an IP but matches no Service ClusterIP in the anchor
+// cluster, it is looked up against the Pod IP set of the anchor cluster's whole
+// FAMILY before the external fallback (and therefore before route resolution) —
+// cross-cluster pod-to-pod dialling over a flat network is real traffic. A hit
+// resolves to the topology pod itself — no service node, no service-selects-pod
+// fan-out — yielding the ordinary pod-calls-pod edge, which MAY cross clusters.
+// The anchor cluster wins when it holds the address; otherwise a lone family
+// holder resolves and two or more degrade to external. See lookupPeerPodIP.
+//
 // translate-global-fqdn-to-k8s-service adds ONE step: at EVERY point below
 // that would emit an external node — no grammar matched, an IP literal with
 // no ClusterIP hit, AND a classified (ns, svc) the anchor cluster does not
@@ -742,6 +858,31 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	ns, svc, classified := r.classifyPeerHost(host, clientNamespace, anchorCluster)
 	if !classified {
 		if net.ParseIP(host) != nil {
+			// resolve-unknown-server-pod-ip-peer: an IP literal that matched no
+			// Service ClusterIP may still be a pod's own address — a caller that
+			// dialled the pod directly, bypassing any Service, possibly across a
+			// flat cluster boundary. Scoped to the anchor cluster's family, with
+			// the anchor preferred and an ambiguous family degrading (see
+			// lookupPeerPodIP). A hit is a POD, so it deliberately does NOT go
+			// through resolveServiceLevel: no service node is materialised and
+			// no service-selects-pod edge is emitted, and the generic
+			// target-driven rule makes the edge pod-calls-pod.
+			pod, ambiguous := r.lookupPeerPodIP(anchorCluster, host)
+			if pod != nil {
+				slog.Debug("service-graph unknown-server peer IP resolved to pod",
+					"side", t.side, "peer_address", value, "host", host,
+					"anchor_cluster", anchorCluster, "pod_cluster", pod.Labels()["cluster"],
+					"pod_id", pod.ID(),
+					"client", t.clientLabel, "server", t.serverLabel)
+				return []string{pod.ID()}
+			}
+			if ambiguous {
+				// Two or more family clusters hold the address: their pod CIDRs
+				// overlap here, so picking one would fabricate a dependency.
+				return routeExternal("unknown_server_peer_pod_ip_ambiguous",
+					"host", host, "peer_address", value, "anchor_cluster", anchorCluster,
+					"anchor_family", ClusterFamilyKey(anchorCluster))
+			}
 			return routeExternal("unknown_server_peer_ip_literal_no_match",
 				"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
 		}

@@ -523,6 +523,48 @@ func TestCollectRouteQueries_CoversAllThreeExternalBranches(t *testing.T) {
 	}
 }
 
+// resolve-unknown-server-pod-ip-peer: an IP literal the parse now resolves to a
+// pod never reaches routeExternal, so the prescan must not spend a store probe /
+// translation on it.
+func TestCollectRouteQueries_SkipsPodIPResolvableEndpoints(t *testing.T) {
+	vec := sampleVec(
+		// NOT collected: matches a pod's own pod_ip in the anchor cluster.
+		unknownPeerSample("10.244.1.9", nil),
+		// NOT collected: same, with a port suffix.
+		unknownPeerSample("10.244.1.9:8080", nil),
+		// STILL collected: no Service and no pod in the anchor cluster holds it.
+		unknownPeerSample("203.0.113.9", nil),
+	)
+
+	keys := collectRouteQueries(vec, sampleTopologyPodIP())
+
+	require.Len(t, keys, 1)
+	assert.Equal(t, "203.0.113.9", keys[0].host)
+}
+
+// The prescan must track lookupPeerPodIP exactly: a lone family holder resolves
+// in the parse (skip), an ambiguous family falls external (collect, so the
+// route engine still gets its chance).
+func TestCollectRouteQueries_PodIPFamilyResolutionMatchesParse(t *testing.T) {
+	familySample := func(peer string) model.Sample {
+		return unknownPeerSample(peer, model.Metric{"cluster": "prod-1"})
+	}
+	topo := sampleTopologyPodIPFamily(
+		podIPPod("prod-2", "lone", "10.244.1.9"),
+		podIPPod("prod-2", "amb2", "10.244.2.9"),
+		podIPPod("prod-3", "amb3", "10.244.2.9"),
+	)
+
+	keys := collectRouteQueries(sampleVec(
+		familySample("10.244.1.9"), // lone family holder → parse resolves → skip
+		familySample("10.244.2.9"), // two family holders → parse degrades → collect
+	), topo)
+
+	require.Len(t, keys, 1)
+	assert.Equal(t, "10.244.2.9", keys[0].host)
+	assert.Equal(t, "prod-1", keys[0].callerCluster)
+}
+
 func TestCollectRouteQueries_CarriesDNSAnswersAndPort(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com:8443", model.Metric{
 		"client_dns_answers": "198.51.100.7,198.51.100.8",
