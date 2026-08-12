@@ -74,6 +74,11 @@
           "target": "cluster-beta/p2",
           "labels": {
             "cluster": "cluster-alpha"
+          },
+          "metrics": {
+            "rate": 5,
+            "error_rate": 0.1,
+            "p90_server_ms": 12.5
           }
         }
       }

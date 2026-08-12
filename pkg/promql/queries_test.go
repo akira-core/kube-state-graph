@@ -95,9 +95,36 @@ func TestRenderer_PrefixNotAppliedToServiceGraphOrUp(t *testing.T) {
 	assert.Equal(t, `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[1m])`, sg)
 	assert.NotContains(t, sg, "o11y_", "prefix must NOT apply to service-graph metric")
 
+	failed := r.Render(QServiceGraphFailedTotal, time.Minute)
+	assert.NotContains(t, failed, "o11y_", "prefix must NOT apply to failed_total")
+	bucket := r.Render(QServiceGraphServerSecondsBucket, time.Minute)
+	assert.NotContains(t, bucket, "o11y_", "prefix must NOT apply to server_seconds_bucket")
+
 	up := r.Render(QUpProbe, 0)
 	assert.Equal(t, "up", up)
 	assert.NotContains(t, up, "o11y_", "prefix must NOT apply to up{} probe")
+}
+
+// TestRender_ServiceGraphFailedTotal pins the OPTIONAL Errors counter render:
+// rate(...) at raw label granularity, sentinel + pod-pair selectors, bare
+// metric name (no prefix), stable Query constant.
+func TestRender_ServiceGraphFailedTotal(t *testing.T) {
+	want := `rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",client_k8s_pod_uid!="",server_k8s_pod_uid!=""}[1m])`
+	assert.Equal(t, want, Render(QServiceGraphFailedTotal, time.Minute))
+	assert.Equal(t, "traces_service_graph_request_failed_total", string(QServiceGraphFailedTotal))
+	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphFailedTotal, time.Minute),
+		"prefix must NOT apply to failed_total")
+}
+
+// TestRender_ServiceGraphServerSecondsBucket pins the OPTIONAL Duration
+// histogram render: sum by (cluster, client/server UID, le) of rate(...),
+// sentinel + pod-pair selectors, bare metric name (no prefix).
+func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
+	want := `sum by (cluster, client_k8s_pod_uid, server_k8s_pod_uid, le) (rate(traces_service_graph_request_server_seconds_bucket{client!~"user|unknown",server!~"user",client_k8s_pod_uid!="",server_k8s_pod_uid!=""}[1m]))`
+	assert.Equal(t, want, Render(QServiceGraphServerSecondsBucket, time.Minute))
+	assert.Equal(t, "traces_service_graph_request_server_seconds_bucket", string(QServiceGraphServerSecondsBucket))
+	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphServerSecondsBucket, time.Minute),
+		"prefix must NOT apply to server_seconds_bucket")
 }
 
 // TestRender_ZeroPrefixIdenticalToBareNames pins the back-compat contract:

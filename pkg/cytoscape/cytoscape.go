@@ -14,6 +14,7 @@ import (
 	"cmp"
 	"maps"
 	"slices"
+	"strconv"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
@@ -64,13 +65,60 @@ type Edge struct {
 	Data EdgeData `json:"data"`
 }
 
+// EdgeMetricsDTO is the serialised form of graph.EdgeMetrics. Rounding to 6
+// significant digits is applied here and only here (design D9) so pkg/graph
+// values stay un-rounded and the policy lives in one place.
+//
+// Absent-vs-zero: ErrorRate is omitted when the failure counter was unreadable;
+// a present 0 means "read successfully, no failures". P90ServerMs is omitted
+// when no usable classic histogram was available. All three values are JSON
+// numbers (never strings) and MAY appear in exponent form for small values.
+//
+//	@Description	RED measurements on a UID-resolved pod-to-pod edge. rate is required when the object is present. error_rate is omitted when the failure counter was unreadable (do not treat absence as 0). p90_server_ms is omitted when no usable classic histogram was available. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+type EdgeMetricsDTO struct {
+	// Rate is requests per second over the window (always > 0 when present).
+	Rate float64 `json:"rate" example:"5"`
+	// ErrorRate is the failed fraction in [0,1]. Omitted when the failure counter was unreadable; 0 means read successfully with no failures.
+	ErrorRate *float64 `json:"error_rate,omitempty" example:"0.1"`
+	// P90ServerMs is the 90th percentile server-observed request duration in milliseconds.
+	P90ServerMs *float64 `json:"p90_server_ms,omitempty" example:"12.5"`
+}
+
 // EdgeData is the serialised form of a graph edge.
 type EdgeData struct {
-	ID     string            `json:"id"`
-	Type   string            `json:"type"`
-	Source string            `json:"source"`
-	Target string            `json:"target"`
-	Labels map[string]string `json:"labels"`
+	ID      string            `json:"id"`
+	Type    string            `json:"type"`
+	Source  string            `json:"source"`
+	Target  string            `json:"target"`
+	Labels  map[string]string `json:"labels"`
+	Metrics *EdgeMetricsDTO   `json:"metrics,omitempty"`
+}
+
+// round6 rounds v to 6 significant digits via decimal formatting.
+// Do NOT use math.Pow/math.Log10-based decimal-place rounding — it double-rounds,
+// is off-by-one at exact powers of ten, and is not bit-identical across platforms
+// (design D9 of add-service-graph-red-metrics).
+func round6(v float64) float64 {
+	r, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 6, 64), 64)
+	return r
+}
+
+// metricsDTO converts graph.EdgeMetrics to the wire DTO with rounding applied.
+// Returns nil when m is nil so the metrics key is wholly absent.
+func metricsDTO(m *graph.EdgeMetrics) *EdgeMetricsDTO {
+	if m == nil {
+		return nil
+	}
+	dto := &EdgeMetricsDTO{Rate: round6(m.Rate)}
+	if m.ErrorRate != nil {
+		er := round6(*m.ErrorRate)
+		dto.ErrorRate = &er
+	}
+	if m.P90ServerMs != nil {
+		p90 := round6(*m.P90ServerMs)
+		dto.P90ServerMs = &p90
+	}
+	return dto
 }
 
 // Synthetic compound group-node types. These exist only in the Cytoscape
@@ -236,11 +284,12 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	for _, e := range view.Edges {
 		body.Elements.Edges = append(body.Elements.Edges, Edge{
 			Data: EdgeData{
-				ID:     e.ID,
-				Type:   string(e.Type),
-				Source: e.Source,
-				Target: e.Target,
-				Labels: e.Labels,
+				ID:      e.ID,
+				Type:    string(e.Type),
+				Source:  e.Source,
+				Target:  e.Target,
+				Labels:  e.Labels,
+				Metrics: metricsDTO(e.Metrics),
 			},
 		})
 	}

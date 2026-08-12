@@ -21,7 +21,7 @@
     },
     {
       "type": "pod-calls-pod",
-      "description": "Pod-UID-resolved RPC edge from service-graph metrics. May cross clusters when the resolved source and target pods live in different clusters (recovered from the topology pod-UID index since the metric only carries the trace-source cluster). An endpoint that resolves to a Kubernetes Service produces a 'pod-calls-service' edge instead (see that type for the paths that do so). An endpoint whose resolution finds no such Service — a '://' connection string the caller's own cluster does not hold, an unknown-server peer address no lookup matched, or a missing pod UID with a non-URL label (D27) — falls back to an 'external' node.",
+      "description": "Pod-UID-resolved RPC edge from service-graph metrics. May cross clusters when the resolved source and target pods live in different clusters (recovered from the topology pod-UID index since the metric only carries the trace-source cluster). An endpoint that resolves to a Kubernetes Service produces a 'pod-calls-service' edge instead (see that type for the paths that do so). An endpoint whose resolution finds no such Service — a '://' connection string the caller's own cluster does not hold, an unknown-server peer address no lookup matched, or a missing pod UID with a non-URL label (D27) — falls back to an 'external' node. When both endpoints are UID-resolved pods, the edge may carry a typed data.metrics object (rate / error_rate / p90_server_ms) derived from traces_service_graph_request_{total,failed_total,server_seconds_bucket}; peer-resolved and external endpoints never carry metrics.",
       "source_type": [
         "pod",
         "service",

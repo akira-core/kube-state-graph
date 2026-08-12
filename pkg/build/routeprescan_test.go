@@ -587,14 +587,28 @@ func TestCollectRouteQueries_CarriesDNSAnswersAndPort(t *testing.T) {
 // ReadServiceGraph with a mocked resolver (task 7.6, design D9).
 // ---------------------------------------------------------------------------
 
+// expectServiceGraphQueries registers Instant expectations for the three
+// service-graph queries ReadServiceGraph fans out (total + two OPTIONAL RED).
+// The RED queries return empty vectors so tests that only care about total
+// resolution stay focused.
+func expectServiceGraphQueries(q *promqlmocks.MockQuerier, end time.Time, total model.Vector) {
+	q.EXPECT().
+		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
+		Return(total, nil)
+	q.EXPECT().
+		Instant(mock.Anything, string(promql.QServiceGraphFailedTotal), mock.Anything, end).
+		Return(model.Vector{}, nil).Maybe()
+	q.EXPECT().
+		Instant(mock.Anything, string(promql.QServiceGraphServerSecondsBucket), mock.Anything, end).
+		Return(model.Vector{}, nil).Maybe()
+}
+
 func TestReadServiceGraph_ResolverErrorDegradesToExternal(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com", nil))
 	end := time.Unix(1_700_000_000, 0)
 
 	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
-		Return(vec, nil)
+	expectServiceGraphQueries(q, end, vec)
 
 	resolver := &fakeRouteResolver{fn: func(RouteRequest) (RouteDestination, RouteOutcome, error) {
 		return RouteDestination{}, RouteNoGateway, errors.New("store unreachable")
@@ -615,9 +629,7 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 	window := 5 * time.Minute
 
 	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
-		Return(vec, nil)
+	expectServiceGraphQueries(q, end, vec)
 
 	resolver := &fakeRouteResolver{fn: func(RouteRequest) (RouteDestination, RouteOutcome, error) {
 		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments", Port: 8080}, RouteHit, nil
@@ -650,9 +662,7 @@ func TestReadServiceGraph_NoDNSAnswersNeverConsultsResolver(t *testing.T) {
 	end := time.Unix(1_700_000_000, 0)
 
 	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
-		Return(vec, nil)
+	expectServiceGraphQueries(q, end, vec)
 
 	resolver := &fakeRouteResolver{fn: func(RouteRequest) (RouteDestination, RouteOutcome, error) {
 		t.Fatal("the resolver must not be consulted for an IP-less endpoint")
@@ -674,9 +684,7 @@ func TestReadServiceGraph_NilResolverNeverPrescans(t *testing.T) {
 	end := time.Unix(1_700_000_000, 0)
 
 	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
-		Return(vec, nil)
+	expectServiceGraphQueries(q, end, vec)
 
 	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
 		5*time.Minute, end, sampleTopologyWithServices(), nil, 0)

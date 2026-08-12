@@ -111,7 +111,9 @@ per container (a recency pick that is accurate for near-now windows; see
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid` | Optional (no series ⇒ no call edges) |
+| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges; denominator for `data.metrics.rate` | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, plus peer-address labels used only for `server="unknown"` enrichment | Optional (no series ⇒ no call edges) |
+| `traces_service_graph_request_failed_total` | `data.metrics.error_rate` on UID-resolved pod-to-pod edges | Same identity labels as `_total` (joined by exact series identity minus `__name__`) | Optional — absence / query error omits `error_rate` (never reports `0`) |
+| `traces_service_graph_request_server_seconds_bucket` | `data.metrics.p90_server_ms` on UID-resolved pod-to-pod edges (server-observed classic histogram) | `cluster`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, `le` (pre-aggregated upstream) | Optional — absence / non-classic buckets omit `p90_server_ms` |
 
 Wrapped in `rate(traces_service_graph_request_total[<window>]) @ <end>`. Each
 series carries a single `cluster` external label representing the trace source
@@ -137,6 +139,40 @@ unresolvable URL, or one whose caller cluster does not hold the Service, becomes
 an `external` node. A non-URL label (no `://`) also becomes an `external` node
 via the missing pod-UID human-label fallback.
 
+#### RED metrics on edges (`data.metrics`)
+
+A `pod-calls-pod` edge receives a typed `data.metrics` object **iff** it is
+trace-derived **and** both endpoints were resolved from a non-empty
+`client_k8s_pod_uid` / `server_k8s_pod_uid` (a real topology pod or a
+synthesised pod). Peer-resolved endpoints (including the Pod-IP ladder under
+`server="unknown"`), external endpoints, `pod-calls-service`,
+`service-selects-pod`, and topology edges (`pod-to-node`, `pod-mounts-pvc`,
+`pvc-to-storageclass`) never carry `metrics`.
+
+When present:
+
+| Field | Meaning |
+|---|---|
+| `rate` | Requests per second over the window (always > 0) |
+| `error_rate` | Failed fraction in `[0, 1]`. **Absent** when the failure counter could not be read; **`0`** when it was read and reported no failures — do not conflate the two |
+| `p90_server_ms` | 90th percentile **server-observed** duration in milliseconds. Matches Grafana's service-graph **definition** (server side, p90), not necessarily Grafana's numbers (Grafana aggregates by service name; this API aggregates by pod pair) |
+
+Both new series are **optional** and degrade gracefully: a missing metric,
+empty result, or query error omits only the affected field (or leaves
+rate-only metrics) and never fails the build. All three values are JSON
+numbers rounded to **6 significant digits** and **may appear in exponent
+form** (e.g. `3.86e-7` for one request over a 30-day window). Consumers must
+not assume fixed-decimal rendering (`toFixed`) and must treat `0` as
+semantically distinct from a very small non-zero value.
+
+**Producer prerequisites for RED coverage:** the collector's `dimensions` must
+carry `client_k8s_pod_uid` / `server_k8s_pod_uid` on all three series;
+`add_metric_suffixes` must be on so the histogram is named
+`..._server_seconds_bucket` (not `..._server_bucket`); multi-replica collectors
+need trace-ID-aware routing (`loadbalancing` exporter with
+`routing_key: traceID`) or client/server spans never pair and edges fall to
+peer-resolved / external paths without metrics.
+
 The `servicegraph` connector's **virtual peers** — `client="user"` (an
 uninstrumented caller) and `unknown` (an unresolved peer) — are dropped at the
 query layer (`client!~"user|unknown",server!~"user"`) and normally never appear
@@ -147,7 +183,8 @@ its client resolves to a **real** pod and the client-recorded peer address
 (`client_net_peer_name` / `client_server_address`) names a Kubernetes Service,
 that peer is recovered into a `pod-calls-service` edge (or an `external` node
 for a non-cluster address) instead of being dropped; every other
-`server="unknown"` case is still dropped, byte-for-byte as before.
+`server="unknown"` case is still dropped, byte-for-byte as before. The same
+sentinel fragment is applied to the two RED series selectors.
 
 ### Probes — diagnostics, not graph data
 

@@ -21,8 +21,20 @@ const (
 	QPVCBindings       Query = "kube_pod_spec_volumes_persistentvolumeclaims_info"
 	QNodeLabels        Query = "kube_node_labels"
 	QServiceGraphTotal Query = "traces_service_graph_request_total"
-	QClusterDiscovery  Query = "cluster_discovery"
-	QUpProbe           Query = "up"
+	// QServiceGraphFailedTotal is the Errors counter of the service-graph RED
+	// triple. OPTIONAL — a missing metric, empty result, or query error degrades
+	// to "no error_rate on the edge" and never fails the build. The configurable
+	// metric-name prefix is NOT applied (Alloy/Tempo exporter family, same as
+	// QServiceGraphTotal). See design D3 / D6 of add-service-graph-red-metrics.
+	QServiceGraphFailedTotal Query = "traces_service_graph_request_failed_total"
+	// QServiceGraphServerSecondsBucket is the Duration classic histogram of the
+	// service-graph RED triple (server-observed). OPTIONAL — absence degrades to
+	// "no p90_server_ms". Prefix NOT applied. The rendered PromQL pre-aggregates
+	// by (cluster, client_k8s_pod_uid, server_k8s_pod_uid, le) so histogram
+	// cardinality is collapsed before it crosses the wire (design D4 / D5).
+	QServiceGraphServerSecondsBucket Query = "traces_service_graph_request_server_seconds_bucket"
+	QClusterDiscovery                Query = "cluster_discovery"
+	QUpProbe                         Query = "up"
 
 	// Service / endpointslice topology (D29 connection-string resolution).
 	// KSM-shaped, so prefix-aware via Renderer.
@@ -136,9 +148,25 @@ const ClusterDiscoveryLookback = time.Hour
 // identical no-node/no-edge outcome as the old exclusion — see
 // resolveUnknownServerPeer in pkg/build/servicegraph.go.
 //
-// Deferred numeric service-graph metrics (traces_service_graph_request_failed_total,
-// _server_seconds_bucket) MUST reuse this fragment so the edge set stays consistent.
+// The numeric service-graph metrics (traces_service_graph_request_failed_total,
+// traces_service_graph_request_server_seconds_bucket) reuse this fragment so the
+// three series always describe one edge population (add-service-graph-red-metrics D6).
 const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
+
+// serviceGraphPodPairSelector is a request-invariant metric-selection contract
+// that makes the queried RED series population EXACTLY equal to the attachment
+// rule (add-service-graph-red-metrics D1 / D6): both endpoints must carry a
+// non-empty pod UID. It is the same class as the D30 sentinel and the node
+// condition="Ready" selector — a fixed contract that never varies per request,
+// NOT a caller filter — so the "no filters pushed to PromQL" rule is preserved.
+//
+// Equivalence to the attachment rule: client_k8s_pod_uid!="" ⇔ resolveClient
+// returns isPod for a non-empty UID; server_k8s_pod_uid!="" ⇔ the server side
+// is UID-resolved (peer-resolved endpoints have an empty server UID by
+// construction). Applied only to the two optional RED queries; the total
+// counter still accepts peer-resolved series so those edges can be materialised
+// (without metrics).
+const serviceGraphPodPairSelector = `client_k8s_pod_uid!="",server_k8s_pod_uid!=""`
 
 // Renderer renders Query templates to PromQL strings, optionally prepending
 // Prefix to every kube-state-metrics-shaped metric name. The prefix is
@@ -219,6 +247,20 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// identical for every request — NOT a caller-supplied filter — so it
 		// does not violate the "no filters pushed to PromQL" rule (D2 / D7).
 		return fmt.Sprintf(`rate(traces_service_graph_request_total{%s}[%s])`, serviceGraphSentinelSelector, w)
+	case QServiceGraphFailedTotal:
+		// OPTIONAL Errors counter. Prefix NOT applied (Alloy/Tempo family).
+		// Raw label granularity so failures join the total series by exact
+		// identity (design D4). Sentinel + pod-pair selectors make the
+		// population exactly equal to the RED attachment rule (D1 / D6).
+		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total{%s,%s}[%s])`,
+			serviceGraphSentinelSelector, serviceGraphPodPairSelector, w)
+	case QServiceGraphServerSecondsBucket:
+		// OPTIONAL Duration classic histogram. Prefix NOT applied.
+		// Pre-aggregated by pod-pair identity + le so histogram cardinality
+		// collapses before it crosses the wire (design D4 / D5).
+		return fmt.Sprintf(
+			`sum by (cluster, client_k8s_pod_uid, server_k8s_pod_uid, le) (rate(traces_service_graph_request_server_seconds_bucket{%s,%s}[%s]))`,
+			serviceGraphSentinelSelector, serviceGraphPodPairSelector, w)
 	case QClusterDiscovery:
 		return fmt.Sprintf(`group by (cluster) (last_over_time(%skube_node_info[%s]))`, r.Prefix, w)
 	case QUpProbe:

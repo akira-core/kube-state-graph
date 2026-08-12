@@ -31,6 +31,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 		"link-relation":        buildLinkRelation(),
+		"with-red-metrics":     buildWithREDMetrics(),
 	}
 
 	for name, view := range scenarios {
@@ -81,9 +82,11 @@ func buildSingleCluster() graph.View {
 func buildTwoClusterCross() graph.View {
 	a := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
 	b := &graph.PodNode{IDValue: "cluster-beta/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing"}}
+	er := 0.1
+	p90 := 12.5
 	cross := graph.NewEdge(graph.EdgeTypePodCallsPod, a.IDValue, b.IDValue, map[string]string{
 		"cluster": "cluster-alpha",
-	})
+	}).WithMetrics(graph.EdgeMetrics{Rate: 5, ErrorRate: &er, P90ServerMs: &p90})
 	return graph.View{Nodes: []graph.GraphNode{a, b}, Edges: []*graph.Edge{cross}}
 }
 
@@ -237,9 +240,49 @@ func buildNameFilter() graph.View {
 	b := &graph.PodNode{IDValue: "cluster-beta/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing", "node": "cluster-beta/worker-0"}}
 	nodeA := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
 	nodeB := &graph.K8sNode{IDValue: "cluster-beta/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-beta"}}
+	er := 0.0
 	edges := []*graph.Edge{
-		graph.NewEdge(graph.EdgeTypePodCallsPod, a.IDValue, b.IDValue, map[string]string{"cluster": "cluster-alpha"}),
+		graph.NewEdge(graph.EdgeTypePodCallsPod, a.IDValue, b.IDValue, map[string]string{"cluster": "cluster-alpha"}).
+			WithMetrics(graph.EdgeMetrics{Rate: 2, ErrorRate: &er}),
 	}
 	g := graph.NewGraph([]graph.GraphNode{a, b, nodeA, nodeB}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
 	return graph.Project(g, graph.Scope{Names: map[string]struct{}{"checkout": {}}})
+}
+
+// buildWithREDMetrics exercises every wire shape of data.metrics in one body:
+// full RED, partial RED (rate + error_rate, no p90), peer-resolved pod-to-pod
+// with no metrics, a metric-less topology edge, and a tiny rate that serialises
+// in exponent form (one request over a long window).
+func buildWithREDMetrics() graph.View {
+	client := &graph.PodNode{IDValue: "cluster-alpha/c1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	server := &graph.PodNode{IDValue: "cluster-alpha/s1", NameValue: "cart", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	peer := &graph.PodNode{IDValue: "cluster-alpha/s2", NameValue: "direct", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	slow := &graph.PodNode{IDValue: "cluster-alpha/s3", NameValue: "rare", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}}
+	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
+
+	erFull := 0.2
+	p90 := 45.0
+	erPartial := 0.0
+	tiny := 3.86e-7
+	erTiny := 6.7e-8
+
+	edges := []*graph.Edge{
+		// Full RED.
+		graph.NewEdge(graph.EdgeTypePodCallsPod, client.IDValue, server.IDValue, map[string]string{"cluster": "cluster-alpha"}).
+			WithMetrics(graph.EdgeMetrics{Rate: 5, ErrorRate: &erFull, P90ServerMs: &p90}),
+		// Partial RED (no p90).
+		graph.NewEdge(graph.EdgeTypePodCallsPod, client.IDValue, slow.IDValue, map[string]string{"cluster": "cluster-alpha"}).
+			WithMetrics(graph.EdgeMetrics{Rate: 1, ErrorRate: &erPartial}),
+		// Peer-resolved pod-to-pod — no metrics (half-observed call).
+		graph.NewEdge(graph.EdgeTypePodCallsPod, client.IDValue, peer.IDValue, map[string]string{"cluster": "cluster-alpha"}),
+		// Tiny rate (exponent form on the wire).
+		graph.NewEdge(graph.EdgeTypePodCallsPod, server.IDValue, slow.IDValue, map[string]string{"cluster": "cluster-alpha"}).
+			WithMetrics(graph.EdgeMetrics{Rate: tiny, ErrorRate: &erTiny}),
+		// Topology edge — never carries metrics.
+		graph.NewEdge(graph.EdgeTypePodToNode, client.IDValue, node.IDValue, nil),
+	}
+	return graph.View{
+		Nodes: []graph.GraphNode{client, server, peer, slow, node},
+		Edges: edges,
+	}
 }
