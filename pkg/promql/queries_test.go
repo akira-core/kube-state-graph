@@ -106,10 +106,10 @@ func TestRenderer_PrefixNotAppliedToServiceGraphOrUp(t *testing.T) {
 }
 
 // TestRender_ServiceGraphFailedTotal pins the OPTIONAL Errors counter render:
-// rate(...) at raw label granularity, sentinel + pod-pair selectors, bare
+// rate(...) at raw label granularity, sentinel + span-link selectors, bare
 // metric name (no prefix), stable Query constant.
 func TestRender_ServiceGraphFailedTotal(t *testing.T) {
-	want := `rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",client_k8s_pod_uid!="",server_k8s_pod_uid!=""}[1m])`
+	want := `rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",edge_relation!="link"}[1m])`
 	assert.Equal(t, want, Render(QServiceGraphFailedTotal, time.Minute))
 	assert.Equal(t, "traces_service_graph_request_failed_total", string(QServiceGraphFailedTotal))
 	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphFailedTotal, time.Minute),
@@ -117,14 +117,37 @@ func TestRender_ServiceGraphFailedTotal(t *testing.T) {
 }
 
 // TestRender_ServiceGraphServerSecondsBucket pins the OPTIONAL Duration
-// histogram render: sum by (cluster, client/server UID, le) of rate(...),
-// sentinel + pod-pair selectors, bare metric name (no prefix).
+// histogram render: RAW rate(...) with NO upstream aggregation (design D4), so
+// each bucket series keeps its full dimension set plus `le` and joins by exact
+// identity. Sentinel + span-link selectors, bare metric name (no prefix).
 func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
-	want := `sum by (cluster, client_k8s_pod_uid, server_k8s_pod_uid, le) (rate(traces_service_graph_request_server_seconds_bucket{client!~"user|unknown",server!~"user",client_k8s_pod_uid!="",server_k8s_pod_uid!=""}[1m]))`
-	assert.Equal(t, want, Render(QServiceGraphServerSecondsBucket, time.Minute))
+	want := `rate(traces_service_graph_request_server_seconds_bucket{client!~"user|unknown",server!~"user",edge_relation!="link"}[1m])`
+	got := Render(QServiceGraphServerSecondsBucket, time.Minute)
+	assert.Equal(t, want, got)
+	assert.NotContains(t, got, "sum by",
+		"the duration histogram must NOT be aggregated upstream — a group-by silently merges unrelated edges")
 	assert.Equal(t, "traces_service_graph_request_server_seconds_bucket", string(QServiceGraphServerSecondsBucket))
 	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphServerSecondsBucket, time.Minute),
 		"prefix must NOT apply to server_seconds_bucket")
+}
+
+// TestRender_ServiceGraphTotalKeepsSpanLinkSeries pins the deliberate asymmetry
+// of design D6: the span-link exclusion belongs to the two OPTIONAL RED
+// selectors only. A link edge must still be EMITTED — it is a real dependency —
+// so filtering it out of the request-total query would delete the edge itself,
+// not just its numbers.
+func TestRender_ServiceGraphTotalKeepsSpanLinkSeries(t *testing.T) {
+	total := Render(QServiceGraphTotal, time.Minute)
+	assert.Equal(t, `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[1m])`, total)
+	assert.NotContains(t, total, "edge_relation",
+		"the request-total selector must not exclude span-link series")
+
+	for _, q := range []Query{QServiceGraphFailedTotal, QServiceGraphServerSecondsBucket} {
+		assert.Contains(t, Render(q, time.Minute), `edge_relation!="link"`,
+			"RED selector %s must exclude span-link series", q)
+		assert.NotContains(t, Render(q, time.Minute), "client_k8s_pod_uid",
+			"RED selector %s must not filter on pod UIDs — peer-resolved edges are eligible", q)
+	}
 }
 
 // TestRender_ZeroPrefixIdenticalToBareNames pins the back-compat contract:

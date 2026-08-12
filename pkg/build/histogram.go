@@ -105,15 +105,12 @@ func classicQuantile(q float64, buckets []bucket) (float64, bool) {
 // would be used as a map key by the bucket accumulator, and since NaN != NaN
 // every occurrence would allocate a fresh entry — unbounded growth driven by
 // an untrusted upstream label, for a value no quantile can use anyway.
+// strconv.ParseFloat already accepts every Prometheus infinity spelling
+// ("+Inf" / "Inf" / "inf" / "-Inf"), case-insensitively, so no special-casing
+// is needed ahead of it.
 func parseLe(s string) (float64, bool) {
 	if s == "" {
 		return 0, false
-	}
-	switch s {
-	case "+Inf", "Inf", "+inf", "inf":
-		return math.Inf(1), true
-	case "-Inf", "-inf":
-		return math.Inf(-1), true
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil || math.IsNaN(v) {

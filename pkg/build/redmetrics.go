@@ -13,8 +13,16 @@ import (
 // redInputs carries the two OPTIONAL RED query results into the parse.
 // A non-nil *Err means that query failed and the corresponding field must be
 // omitted (not zeroed) on every edge — design D3 / graceful degradation.
-// A nil Err with an empty vector means the query succeeded and found nothing
-// (error_rate → 0; p90_server_ms → absent).
+//
+// A nil Err with an EMPTY vector means the metric does not exist upstream. The
+// spec puts that on the same footing as a query error: `error_rate` is OMITTED
+// (never 0) and `p90_server_ms` is absent. `error_rate == 0` is reserved for a
+// counter that WAS read (non-empty result) but carried no series matching that
+// particular edge.
+//
+// Consequence for the zero value: `redInputs{}` reads as "neither OPTIONAL
+// metric exists", i.e. rate-only metrics — the safe interpretation for the
+// route-index-free test entry points that pass it.
 type redInputs struct {
 	Failed      model.Vector
 	FailedErr   error
@@ -26,37 +34,35 @@ type redInputs struct {
 // Shared by the resolution loop and the RED attach pass.
 type pairKey struct{ src, tgt string }
 
-// redKey is the histogram join key: the pod-pair identity the duration query
-// groups by (cluster, client_k8s_pod_uid, server_k8s_pod_uid). Several redKeys
-// may map to one pairKey (e.g. missing-cluster bucketed to "unknown" alongside
-// a sibling carrying the real cluster); their bucket sets are summed (D4/D5).
-type redKey struct{ cluster, clientUID, serverUID string }
-
 // redPairAcc accumulates in-scope RED contributions for one pairKey.
 // Contributions are stored as slices and summed in ascending order at attach
 // time so the result is a pure function of the multiset (design D9) — that
 // holds for the histogram buckets too, since float addition is not
-// associative and several redKeys may feed one le boundary.
+// associative and several contributing series may feed one le boundary.
 type redPairAcc struct {
 	rates   []float64
 	fails   []float64
 	buckets map[float64][]float64 // le → cumulative-count contributions
-	// hasInScope / hasOutOfScope record whether the pair was fed by
-	// UID-resolved and/or peer-resolved series (design D1).
-	hasInScope    bool
-	hasOutOfScope bool
+	// ineligible is sticky: set when the pair failed a structural condition
+	// of the attachment rule (an endpoint that is neither a pod nor a
+	// service node, or the RouteHit chain's caller→ingress entry hop —
+	// design D1). Sticky rather than per-series so the outcome is a pure
+	// function of the data, independent of vector arrival order (D6).
+	ineligible bool
 	// noUsableLe is set when duration series matched this pair but none
 	// carried a parseable classic "le" label (native-histogram / vmrange).
 	noUsableLe bool
 }
 
-// redJoin holds the series→pair and redKey→pair maps built during the
-// resolution loop, plus the per-pair accumulators.
+// redJoin holds the series→pair map built during the resolution loop, plus the
+// per-pair accumulators.
 //
 // joinFailures / joinDuration mirror whether the corresponding OPTIONAL query
-// returned anything to join against. When it did not — the common case for a
+// returned anything to join against. When neither did — the common case for a
 // deployment that exposes neither metric — the join map is never allocated and
 // its key is never computed, so the parse pays nothing for an absent metric.
+// Both vectors join through the SAME map: the failure counter by full series
+// identity, the histogram by that identity minus `le` (design D4).
 type redJoin struct {
 	joinFailures bool
 	joinDuration bool
@@ -64,10 +70,8 @@ type redJoin struct {
 	// __name__, sorted) to every pair that series contributed to. Normally
 	// one pair; multi-target resolution can produce more.
 	seriesToPairs map[string][]pairKey
-	// redToPairs maps the pod-pair triple to every pairKey it resolved to.
-	redToPairs map[redKey][]pairKey
 	// acc is the per-pair accumulator; only pairs with at least one
-	// contribution (in- or out-of-scope) appear.
+	// in-scope contribution or a structural rejection appear.
 	acc map[pairKey]*redPairAcc
 }
 
@@ -77,14 +81,15 @@ func newRedJoin(capHint int, joinFailures, joinDuration bool) *redJoin {
 		joinDuration: joinDuration,
 		acc:          make(map[pairKey]*redPairAcc, capHint),
 	}
-	if joinFailures {
+	if joinFailures || joinDuration {
 		j.seriesToPairs = make(map[string][]pairKey, capHint)
-	}
-	if joinDuration {
-		j.redToPairs = make(map[redKey][]pairKey, capHint)
 	}
 	return j
 }
+
+// joinKeyed reports whether either companion vector is present, i.e. whether
+// the resolution loop must compute a series key at all.
+func (j *redJoin) joinKeyed() bool { return j.joinFailures || j.joinDuration }
 
 func (j *redJoin) pairAcc(k pairKey) *redPairAcc {
 	a, ok := j.acc[k]
@@ -96,22 +101,27 @@ func (j *redJoin) pairAcc(k pairKey) *redPairAcc {
 }
 
 // recordSeries is called once per upstream total series for each (src,tgt)
-// pair it produced. inScope is true when both raw pod UIDs are non-empty
-// (design D1 attachment rule). rate is the series' rate value. sk / rk are
-// only read when the corresponding join is active.
-func (j *redJoin) recordSeries(k pairKey, inScope bool, rate float64, sk string, rk redKey) {
-	a := j.pairAcc(k)
-	if !inScope {
-		a.hasOutOfScope = true
+// pair it produced.
+//
+// eligible carries the pair's STRUCTURAL verdict (design D1 conditions 2–3:
+// both endpoints resolved to a pod or a service node, and this is not the
+// ingress chain's entry hop); a false value rejects the pair permanently.
+// inScope carries the SERIES verdict (design D1b: not a span-link series); a
+// false value skips this series' measurement while leaving the pair — and every
+// other series feeding it — untouched, so a mixed pair is measured over its
+// non-link subset. sk is read only when a companion vector is present.
+func (j *redJoin) recordSeries(k pairKey, eligible, inScope bool, rate float64, sk string) {
+	if !eligible {
+		j.pairAcc(k).ineligible = true
 		return
 	}
-	a.hasInScope = true
-	a.rates = append(a.rates, rate)
-	if j.joinFailures {
-		j.seriesToPairs[sk] = appendUniquePair(j.seriesToPairs[sk], k)
+	if !inScope {
+		return
 	}
-	if j.joinDuration {
-		j.redToPairs[rk] = appendUniquePair(j.redToPairs[rk], k)
+	a := j.pairAcc(k)
+	a.rates = append(a.rates, rate)
+	if j.joinKeyed() {
+		j.seriesToPairs[sk] = appendUniquePair(j.seriesToPairs[sk], k)
 	}
 }
 
@@ -134,18 +144,22 @@ func appendUniquePair(s []pairKey, k pairKey) []pairKey {
 // clean zero.
 func (j *redJoin) accumulateFailures(failed model.Vector) (matched, unmatched int) {
 	for _, s := range failed {
-		v := float64(s.Value)
-		// Drop NaN / non-positive and +Inf: a non-finite contribution would
-		// poison the error_rate numerator.
-		if !(v > 0) || math.IsInf(v, 0) {
-			continue
-		}
+		// Tally the JOIN outcome before filtering on value, mirroring
+		// accumulateDuration: a healthy deployment's failure series are all 0,
+		// and counting those as "not matched" would raise the label-set-drift
+		// warning on exactly the population it is meant to exonerate.
 		pairs := j.seriesToPairs[seriesKeyOf(s.Metric)]
 		if len(pairs) == 0 {
 			unmatched++
 			continue
 		}
 		matched++
+		v := float64(s.Value)
+		// Drop NaN / non-positive and +Inf: a non-finite contribution would
+		// poison the error_rate numerator. A zero contributes nothing either.
+		if !(v > 0) || math.IsInf(v, 0) {
+			continue
+		}
 		for _, k := range pairs {
 			a := j.pairAcc(k)
 			a.fails = append(a.fails, v)
@@ -154,13 +168,20 @@ func (j *redJoin) accumulateFailures(failed model.Vector) (matched, unmatched in
 	return matched, unmatched
 }
 
-// accumulateDuration walks the pre-aggregated duration vector and sums bucket
-// counts per le boundary onto each mapped pair. Several redKeys mapping to one
-// pair sum together (design D4/D5).
+// accumulateDuration walks the RAW duration vector and sums bucket counts per
+// le boundary onto each mapped pair. Several contributing series mapping to one
+// pair sum together, per le (design D4/D5).
 //
-// Returns true when at least one series was seen without a usable "le" label
-// (logged as a distinct degradation reason).
-func (j *redJoin) accumulateDuration(duration model.Vector) (sawNoLe bool) {
+// The join mirrors accumulateFailures exactly, minus the `le` label: a bucket
+// series carries the same dimension set as its request-total series plus `le`,
+// so identity-minus-le is that series' key. The unmatched tally is returned for
+// the same reason as the failure one — a label-set drift between _total and
+// _bucket joins nothing and omits p90_server_ms everywhere, which reads as "the
+// producer emits no histogram" unless it is surfaced.
+//
+// sawNoLe reports that at least one MATCHED series carried no usable "le"
+// label (logged as its own degradation reason).
+func (j *redJoin) accumulateDuration(duration model.Vector) (matched, unmatched int, sawNoLe bool) {
 	for _, s := range duration {
 		v := float64(s.Value)
 		// Skip NaN, negative and infinite counts — any of them would make the
@@ -169,16 +190,13 @@ func (j *redJoin) accumulateDuration(duration model.Vector) (sawNoLe bool) {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
 			continue
 		}
-		rk := redKey{
-			cluster:   bucketCluster(string(s.Metric["cluster"])),
-			clientUID: string(s.Metric["client_k8s_pod_uid"]),
-			serverUID: string(s.Metric["server_k8s_pod_uid"]),
-		}
-		pairs := j.redToPairs[rk]
+		pairs := j.seriesToPairs[bucketSeriesKeyOf(s.Metric)]
 		if len(pairs) == 0 {
+			unmatched++
 			continue
 		}
-		le, ok := parseLe(string(s.Metric["le"]))
+		matched++
+		le, ok := parseLe(string(s.Metric[model.BucketLabel]))
 		if !ok {
 			sawNoLe = true
 			for _, k := range pairs {
@@ -194,14 +212,15 @@ func (j *redJoin) accumulateDuration(duration model.Vector) (sawNoLe bool) {
 			a.buckets[le] = append(a.buckets[le], v)
 		}
 	}
-	return sawNoLe
+	return matched, unmatched, sawNoLe
 }
 
-// eligible reports whether the pair qualifies for a metrics object: every
-// contributing series was in-scope (both UIDs non-empty) and at least one
-// contributed a positive rate.
+// eligible reports whether the pair qualifies for a metrics object: it was
+// never structurally rejected and at least one in-scope contributing series fed
+// it a positive rate. A pair whose contributing series are ALL span-link series
+// has no rates and therefore falls out here — no special case needed (D1b).
 func (a *redPairAcc) eligible() bool {
-	return a != nil && a.hasInScope && !a.hasOutOfScope && len(a.rates) > 0
+	return a != nil && !a.ineligible && len(a.rates) > 0
 }
 
 // attachMetrics builds graph.EdgeMetrics for an eligible pair, or returns
@@ -263,13 +282,24 @@ func sumAscending(xs []float64) float64 {
 // seriesKeyOf builds a deterministic identity for a sample's full label set
 // minus __name__, used to join the failure counter to the total series (D4).
 func seriesKeyOf(m model.Metric) string {
+	return seriesKeyExcluding(m, "")
+}
+
+// bucketSeriesKeyOf is seriesKeyOf minus the `le` label: a duration-histogram
+// series carries its request-total series' dimension set plus the bucket
+// boundary, so dropping `le` yields that series' identity (D4).
+func bucketSeriesKeyOf(m model.Metric) string {
+	return seriesKeyExcluding(m, model.BucketLabel)
+}
+
+func seriesKeyExcluding(m model.Metric, skip model.LabelName) string {
 	if len(m) == 0 {
 		return ""
 	}
 	// Collect and sort label names for determinism.
 	names := make([]string, 0, len(m))
 	for k := range m {
-		if k == model.MetricNameLabel {
+		if k == model.MetricNameLabel || (skip != "" && k == skip) {
 			continue
 		}
 		names = append(names, string(k))
@@ -287,9 +317,23 @@ func seriesKeyOf(m model.Metric) string {
 	return b.String()
 }
 
-// redInScope reports whether a series' raw pod UIDs satisfy the D1 attachment
-// rule (both non-empty). Evaluated on the pre-normalisation UID labels so it
-// matches the query-layer pod-pair selector exactly.
-func redInScope(clientUID, serverUID string) bool {
-	return clientUID != "" && serverUID != ""
+const (
+	// labelEdgeRelation is the operator-configured servicegraph dimension that
+	// marks how the connector derived an edge, and edgeRelationLink is the
+	// value it carries for an edge materialised from a SPAN LINK. A fixed,
+	// case-sensitive contract with no knob — same class as the D30 sentinel
+	// values (design D1b).
+	labelEdgeRelation = "edge_relation"
+	edgeRelationLink  = "link"
+)
+
+// redSeriesInScope reports whether a contributing series measures the edge
+// (design D1b). A span-link series does not: its two spans belong to different
+// trace contexts and the interaction crosses a queue or a database, so its
+// rate, failures and durations describe something that is not a
+// request-response call. The edge is still emitted; only the measurement is
+// skipped. Mirrors promql.serviceGraphLinkExclusionSelector, which drops the
+// same series from the two companion vectors upstream.
+func redSeriesInScope(m model.Metric) bool {
+	return string(m[labelEdgeRelation]) != edgeRelationLink
 }

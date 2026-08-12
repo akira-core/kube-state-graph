@@ -104,18 +104,41 @@ live under `openspec/specs/`.
   remain deferred to a future typed field. **RED edge metrics** live on the
   typed nullable `Edge.Metrics *EdgeMetrics` (`rate`, `error_rate`,
   `p90_server_ms`) serialised as `data.metrics` — never inside `labels`.
-  Attachment rule (hardcoded): a **trace-derived** `pod-calls-pod` edge whose
-  contributing series all carried non-empty `client_k8s_pod_uid` **and**
-  `server_k8s_pod_uid` (UID-resolved endpoints — real or synth pods). Peer-
-  resolved endpoints (including Pod-IP under `server="unknown"`), external
-  endpoints, `pod-calls-service`, `service-selects-pod`, and topology edges
-  never get metrics. Three parallel queries: `traces_service_graph_request_total`
-  (required for the edge), plus OPTIONAL `..._failed_total` and
-  `..._server_seconds_bucket` (reuse D30 sentinel + pod-pair selectors
-  `client_k8s_pod_uid!="",server_k8s_pod_uid!=""`). Failure/duration errors
-  degrade field-by-field (`error_rate` absent ≠ `0`; `p90_server_ms` omitted)
-  and never fail the build. Values are JSON numbers rounded to 6 significant
-  digits at serialisation and MAY appear in exponent form. `pod-calls-pod` and
+  Attachment rule (hardcoded): a **trace-derived** edge whose **both resolved
+  endpoints** name a `type="pod"` node (real or synth) or a `type="service"`
+  node — enforced by `sgResolver.isPodOrServiceID`, NOT by the raw UID labels
+  and NOT by the edge type (D33 clears a `"://"` side's UID after the labels are
+  read, and an `external` target leaves the type at `pod-calls-pod`). **How** an
+  endpoint was identified is irrelevant: pod UID, `"://"` connection string,
+  `server="unknown"` peer address → ClusterIP or Pod IP, and route-engine
+  resolution all qualify, so `pod-calls-service` edges ARE measured. No metrics
+  on: any edge with an `external` endpoint; synthesised edges
+  (`service-selects-pod` fan-out, the ingress-chain gateway-pod → backend hop,
+  topology edges); and the route-hit chain's **caller → ingress entry hop**
+  (`chainEntryIndex` — that hop and the retained caller → backend edge are two
+  projections of ONE call, so only the backend is measured and a sum over the
+  chain never double-counts). A contributing series carrying
+  `edge_relation="link"` is **out of scope** (span-link virtual edge — the call
+  crosses a queue/DB and the two spans are different trace contexts): the edge
+  is still emitted, but the series feeds no rate/error/bucket, so a mixed edge
+  is measured over its non-link subset and an all-link edge gets no `metrics`
+  object (empty in-scope set ⇒ rate 0 ⇒ ineligible; no special case). Three
+  parallel queries: `traces_service_graph_request_total` (required for the
+  edge; deliberately NOT link-filtered), plus OPTIONAL `..._failed_total` and
+  `..._server_seconds_bucket` — both read at the total counter's **raw** label
+  granularity (the histogram has NO upstream `sum by`) and joined by exact
+  series identity (the histogram minus `le`) through one `seriesKey → pairKey`
+  map, both carrying D30's sentinel plus `serviceGraphLinkExclusionSelector`
+  (`edge_relation!="link"`). The queried population is a **superset** of the
+  attached one (endpoint node type has no label-level form); what holds is the
+  one-way property — every query-layer filter is mirrored in Go, so no eligible
+  edge loses its companion series and reads `error_rate: 0`. Failure/duration
+  errors degrade field-by-field (`error_rate` absent ≠ `0`; `p90_server_ms`
+  omitted) and never fail the build; a non-empty companion vector that joined
+  NOTHING is warned per vector (`failed_total_label_set_mismatch` /
+  `server_seconds_bucket_label_set_mismatch`). Values are JSON numbers rounded
+  to 6 significant digits at serialisation and MAY appear in exponent form.
+  `pod-calls-pod` and
   `pod-calls-service` edges carry a single `labels.cluster` (the trace source /
   client-side cluster, omitted when the client side is non-pod). Cross-cluster
   status is derived by comparing the resolved source-node and target-node
@@ -132,17 +155,26 @@ live under `openspec/specs/`.
   `traces_service_graph_request_total` series (the `pairs` map in the parse).
 - **Synthesised edge**: an edge with no originating series —
   `service-selects-pod` fan-out, topology edges (`pod-to-node`, `pod-mounts-pvc`,
-  `pvc-to-storageclass`), and the route-hit ingress-chain `pod-calls-service`
-  hop. Spelling is British **synthesised** in prose; Go identifiers may use
-  `synthesized` (e.g. `routeChainEdges` comments).
+  `pvc-to-storageclass`), and the route-hit ingress-chain's gateway-pod →
+  backend-service `pod-calls-service` hop. Spelling is British **synthesised**
+  in prose; Go identifiers may use `synthesized` (e.g. `routeChainEdges`
+  comments). NOT synthesised: the chain's **caller → ingress entry hop**, which
+  IS trace-derived — it is excluded from RED for a different reason (it
+  re-projects the caller → backend call).
 - **UID-resolved endpoint**: resolved from a non-empty `client_k8s_pod_uid` /
   `server_k8s_pod_uid` to a `type="pod"` node (topology or synth).
 - **Peer-resolved endpoint**: identified only via the unknown-server peer-address
-  ladder (including Pod-IP) — the connector could not pair a server span.
+  ladder (including Pod-IP) — the connector could not pair a server span. Since
+  the RED revision this is a provenance label only: it does NOT affect metrics
+  eligibility, which turns on the resolved node type.
 - **Contributing series**: the set of total-series samples that collapsed onto
   one `(src, tgt)` pair during resolution.
-- **RED scope / in-scope**: a contributing series with both pod UIDs non-empty.
-  A pair is metrics-eligible only when every contributing series is in-scope.
+- **In-scope series**: a contributing series that does NOT carry
+  `edge_relation="link"` — i.e. one that measures the edge. Rate, error
+  numerator and duration buckets are all summed over this subset and no other.
+- **RED scope**: the edges that carry `data.metrics` — trace-derived, both
+  endpoints pod-or-service, not the chain entry hop, at least one in-scope
+  contributing series.
 
 - **Connection-string resolution rule** (D29, hardcoded — no knob): for any
   service-graph endpoint whose pod UID is empty, the verbatim `client`/`server`
@@ -678,7 +710,7 @@ live under `openspec/specs/`.
   label) follow the missing-UID fallback above; UIDs present but unknown
   to topology become synth pods with `cluster=""` (server-side cluster
   unknown).
-- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The one fixed exception is the D30 sentinel matcher (`client!~"user|unknown",server!~"user"` — the server side narrowed by resolve-unknown-server-peer-labels D1) on the service-graph selector — it is a **request-invariant metric-selection contract**, not a caller filter, so it never varies per request and does not break the projection-over-graph contract a future cache relies on.
+- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The fixed exceptions are the D30 sentinel matcher (`client!~"user|unknown",server!~"user"` — the server side narrowed by resolve-unknown-server-peer-labels D1) on the service-graph selector, and `edge_relation!="link"` on the two OPTIONAL RED selectors only — both are **request-invariant metric-selection contracts**, not caller filters, so they never vary per request and do not break the projection-over-graph contract a future cache relies on.
 - **`/v1/edge-types` reads from `graph.EdgeTypes` only** — a single in-code
   registry shared with the builder. Adding an edge type = update both the
   builder and the registry in the same change; the API can never list a type

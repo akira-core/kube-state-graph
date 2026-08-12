@@ -84,7 +84,7 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 
 ### Requirement: Edge `metrics` attribute
 
-An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding the edge's RED measurements for the requested window. The key SHALL be **absent entirely** — never `null`, never an empty object — on every edge that has no measurements, and the presence rule is defined by the `pod-service-graph` capability (in short: only trace-derived `pod-calls-pod` edges whose `source` and `target` were both resolved from a non-empty pod UID).
+An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding the edge's RED measurements for the requested window. The key SHALL be **absent entirely** — never `null`, never an empty object — on every edge that has no measurements, and the presence rule is defined by the `pod-service-graph` capability (in short: only trace-derived edges whose `source` and `target` both resolved to a pod or a service node, excluding the ingress chain's entry hop and any measurement derived from span-link series).
 
 When present, the object SHALL contain:
 
@@ -99,9 +99,14 @@ All three SHALL be JSON numbers, never strings. Each value SHALL be rounded to a
 - **WHEN** the response contains a `pod-calls-pod` edge whose `source` and `target` are both pod nodes and whose upstream series carried request, failure, and duration data
 - **THEN** its `data.metrics` is an object with numeric `rate`, `error_rate`, and `p90_server_ms` fields
 
+#### Scenario: Pod-to-service edge carries RED metrics
+
+- **WHEN** the response contains a `pod-calls-service` edge produced by a contributing service-graph series (a connection string, a peer address matched to a Service, or a route-engine resolution to a backend Service)
+- **THEN** its `data.metrics` is present and follows the same shape as a pod-to-pod edge's
+
 #### Scenario: Edge without measurements omits the key
 
-- **WHEN** the response contains a `service-selects-pod`, `pod-to-node`, `pvc-to-storageclass`, `pod-mounts-pvc`, or `pod-calls-service` edge
+- **WHEN** the response contains a `service-selects-pod`, `pod-to-node`, `pvc-to-storageclass`, or `pod-mounts-pvc` edge, or any edge with an `external` endpoint
 - **THEN** its `data` object has no `metrics` key at all (not `null`, not `{}`)
 
 #### Scenario: Partial measurements omit only the missing fields

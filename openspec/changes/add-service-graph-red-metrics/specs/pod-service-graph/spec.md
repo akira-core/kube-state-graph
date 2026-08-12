@@ -1,14 +1,19 @@
 ## ADDED Requirements
 
-### Requirement: RED edge metrics on UID-resolved pod-to-pod edges
+### Requirement: RED edge metrics on trace-derived pod / service edges
 
-The reader SHALL attach a typed, nullable numeric metrics object to an emitted edge **iff all three** of the following hold:
+The reader SHALL attach a typed, nullable numeric metrics object to an emitted edge **iff all four** of the following hold:
 
-1. the edge `type` is `pod-calls-pod`; AND
-2. the edge was produced from at least one `traces_service_graph_request_total` series (it is **trace-derived**, not synthesised from topology or from a route-resolution outcome); AND
-3. **both** endpoints are **UID-resolved** — the contributing series carried a non-empty `client_k8s_pod_uid` AND a non-empty `server_k8s_pod_uid`, and each resolved to a `type="pod"` node (a real topology pod or a synthesised pod).
+1. the edge was produced from at least one `traces_service_graph_request_total` series (it is **trace-derived**, not synthesised from topology or from a route-resolution outcome); AND
+2. **both** resolved endpoints name a `type="pod"` node (a real topology pod or a synthesised pod) or a `type="service"` node; AND
+3. the edge is NOT the route-hit ingress chain's caller → ingress-service entry hop; AND
+4. the edge has at least one **in-scope contributing series** (defined below) and their summed rate is a finite value greater than zero.
 
-An endpoint that is **peer-resolved** — identified only through the "Unknown-server peer-label enrichment" ladder, including the Pod-IP branch that resolves straight to a topology pod — SHALL NOT satisfy condition 3, even though it yields a `type="pod"` node and a `pod-calls-pod` edge. The peer-address ladder runs only because the producer could not pair a server span; that endpoint's own side emitted no trace, so the RED series contain no measurement for it.
+**How an endpoint was identified SHALL NOT affect eligibility.** A non-empty `client_k8s_pod_uid` / `server_k8s_pod_uid`, a `"://"` connection string resolved to an in-cluster Service, a `server="unknown"` peer address classified as a Service DNS name, a peer address matched against a Service `ClusterIP`, a peer address matched against a family Pod IP, and an Istio route-engine resolution to a backend Service all satisfy condition 2 equally. The edge `type` SHALL likewise not be a condition: both `pod-calls-pod` and `pod-calls-service` edges MAY carry the object, since the type is a consequence of what the target resolved to.
+
+A **contributing series** is a `traces_service_graph_request_total` sample that resolved onto the edge's `(source, target)` pair. A contributing series is **in scope** iff it does NOT carry the dimension `edge_relation="link"`. A series carrying that dimension describes a virtual edge the producer materialised from a **span link** rather than from a paired client/server span — the interaction it records traverses a queue or a database and its two spans belong to different trace contexts — so it SHALL contribute to no rate, no error numerator, and no duration bucket. The edge itself SHALL still be emitted; only its measurement is suppressed. The label name and the value `link` are a fixed, case-sensitive contract with NO configuration surface.
+
+Where an edge's contributing series are a mix of in-scope and link series, the reader SHALL measure it over the **in-scope subset only**. Where they are ALL link series, the in-scope set is empty, condition 4 fails, and the edge SHALL carry no metrics object at all.
 
 The object SHALL carry the following fields:
 
@@ -20,10 +25,10 @@ The quantile is `0.90` and the observation side is **server**, matching the defi
 
 The reader SHALL NOT attach the metrics object to any other edge. In particular, an edge SHALL carry no metrics object when it is:
 
-- a `pod-calls-service` edge (target is a materialised service node, not a pod — whether from connection-string resolution, from route resolution, or from the synthesised ingress-chain hop);
+- an edge with an `external` node on either side (an unresolvable `"://"` connection string, the missing-UID human-label fallback, or an unresolved peer address);
 - a `service-selects-pod` edge (synthesised fan-out; no series names the individual backing pod);
-- a `pod-calls-pod` edge with an `external` endpoint on either side;
-- a `pod-calls-pod` edge whose endpoint was peer-resolved rather than UID-resolved;
+- the synthesised ingress-chain hop from an ingress-gateway pod to the backend service (no contributing series exists);
+- the route-hit ingress chain's caller → ingress-service entry hop. That edge and the retained caller → backend edge are two projections of the SAME observed call, so measuring both would make one request contribute twice to any sum taken over the chain. The measurement SHALL be carried by the caller → backend edge, which names the actual destination;
 - a topology-derived edge (`pod-mounts-pvc`, `pod-to-node`, `pvc-to-storageclass`).
 
 Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remains strictly `map[string]string`. Attaching the metrics object SHALL NOT change an edge's `id`, `type`, `source`, `target`, or `labels`.
@@ -38,20 +43,25 @@ Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remain
 - **WHEN** a series' `server_k8s_pod_uid` is non-empty but absent from the topology pod-UID index, so the target materialises as a synthesised pod node
 - **THEN** the emitted `pod-calls-pod` edge still carries a metrics object — the endpoint is UID-resolved and the target is a `type="pod"` node
 
-#### Scenario: Peer-resolved Pod-IP target carries no metrics
+#### Scenario: Peer-resolved Pod-IP target carries metrics
 
 - **WHEN** a series has `server="unknown"` and an empty `server_k8s_pod_uid`, and the peer-label enrichment resolves its peer address to a family Pod IP, producing a `pod-calls-pod` edge whose target is a real topology pod
-- **THEN** that edge carries NO metrics object — the target is peer-resolved, not UID-resolved
+- **THEN** that edge carries a metrics object — condition 2 is satisfied by the resolved node type, regardless of how the endpoint was identified
+
+#### Scenario: Peer address resolved to a Service ClusterIP
+
+- **WHEN** a series has `server="unknown"` and an empty `server_k8s_pod_uid`, and the peer-label enrichment matches its peer address against a Service `ClusterIP` in the client pod's own cluster, producing a `pod-calls-service` edge
+- **THEN** that edge carries a metrics object, and the `service-selects-pod` edges fanned out from the same service node carry none
+
+#### Scenario: Connection-string endpoint resolved to a service
+
+- **WHEN** a series' server side is a `"://"` connection string that resolves to a `type="service"` node and a `pod-calls-service` edge is emitted
+- **THEN** that edge carries a metrics object whose `rate` is the summed rate of the series that resolved onto it
 
 #### Scenario: Endpoint fell back to an external node
 
 - **WHEN** a series' server side resolved to an `external` node (missing UID with a non-`"://"` label, an unresolvable connection string, or an unresolved peer address)
-- **THEN** the emitted `pod-calls-pod` edge carries NO metrics object
-
-#### Scenario: Connection-string endpoint resolved to a service
-
-- **WHEN** a series' server side resolved to a `type="service"` node and a `pod-calls-service` edge is emitted
-- **THEN** that edge carries NO metrics object
+- **THEN** the emitted edge carries NO metrics object
 
 #### Scenario: Synthesised service-selects-pod fan-out edge
 
@@ -62,6 +72,21 @@ Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remain
 
 - **WHEN** the route engine produces the ingress chain and a synthesised gateway-pod → backend-service `pod-calls-service` edge is emitted
 - **THEN** that edge carries NO metrics object
+
+#### Scenario: Route-hit chain measures the backend edge, not the entry hop
+
+- **WHEN** the route engine resolves a peer to a backend Service and the parse emits both the caller → ingress-service entry hop and the retained caller → backend-service edge from the same contributing series
+- **THEN** the caller → backend-service edge carries the metrics object and the caller → ingress-service entry hop carries none, so the observed call's rate appears exactly once across the chain
+
+#### Scenario: Span-link series suppress measurement without dropping the edge
+
+- **WHEN** every contributing series of a pod-to-pod pair carries `edge_relation="link"`
+- **THEN** the edge is still emitted with its usual `id`, `type`, `source`, `target`, and `labels`, and it carries NO metrics object
+
+#### Scenario: Mixed link and non-link series measure the non-link subset
+
+- **WHEN** an edge receives one contributing series carrying `edge_relation="link"` with rate `4` and one series without that dimension with rate `1`
+- **THEN** the edge's `rate` is `1`, and its `error_rate` and `p90_server_ms` are likewise derived only from the non-link series
 
 #### Scenario: Topology-derived edges never carry metrics
 
@@ -78,11 +103,15 @@ Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remain
 In addition to `traces_service_graph_request_total`, the reader SHALL read two further service-graph series for the same window and the same evaluation instant:
 
 - `traces_service_graph_request_failed_total` — the Errors counter, read at the same label granularity as the total counter so it can be joined to the exact same series.
-- `traces_service_graph_request_server_seconds_bucket` — the Duration classic histogram, pre-aggregated upstream by the pod-pair identity `(cluster, client_k8s_pod_uid, server_k8s_pod_uid)` plus the `le` bucket boundary, so per-bucket cardinality is collapsed before it crosses the wire.
+- `traces_service_graph_request_server_seconds_bucket` — the Duration classic histogram, also read at the same label granularity as the total counter, additionally carrying the `le` bucket boundary. The reader SHALL NOT aggregate it upstream: no low-cardinality label subset identifies an edge once endpoints may be resolved from peer addresses and connection strings, so a group-by would merge the latency distributions of unrelated edges that happen to share the retained labels.
 
 The reader SHALL apply the SAME virtual-sentinel exclusion fragment to both new selectors as it applies to `traces_service_graph_request_total` (see "Virtual sentinel endpoint exclusion (user / unknown)"), so that the three series always describe the same edge population.
 
-Both new selectors SHALL additionally require a non-empty `client_k8s_pod_uid` and a non-empty `server_k8s_pod_uid`. This is a fixed, request-invariant metric-selection contract — the same class as the sentinel exclusion and the node-condition selector, NOT a caller-supplied filter — and it makes the queried series population **exactly equal** to the attachment rule above, so no qualifying edge can be silently uncovered and no uncovered edge can be silently reported as measured. It SHALL NOT vary per request.
+Both new selectors SHALL additionally exclude series carrying `edge_relation="link"`, mirroring the out-of-scope rule in the attachment requirement above. The `traces_service_graph_request_total` selector SHALL NOT carry that matcher — the span-link edge must still be emitted. Because a negative label matcher retains series on which the label is absent, the exclusion is inert for a producer that does not configure the dimension.
+
+Both matchers are fixed, request-invariant metric-selection contracts — the same class as the sentinel exclusion and the node-condition selector, NOT caller-supplied filters — and SHALL NOT vary per request.
+
+The queried series population is a **superset** of the attachment population, because the attachment rule's endpoint-node-type and chain-position conditions have no label-level equivalent. The reader SHALL guarantee the direction that matters instead: **every** query-layer exclusion applied to the two new selectors SHALL also be enforced during resolution, so a qualifying edge can never have its failure or duration series filtered away upstream and then be reported as `error_rate: 0` or as lacking a histogram. Series returned for a pair that turns out ineligible SHALL simply go unused.
 
 The configurable upstream metric-name prefix SHALL NOT be applied to either new series (they belong to the trace-pipeline exporter family, not to kube-state-metrics). The reader SHALL NOT read `traces_service_graph_request_client_seconds_*`, nor the `_sum` / `_count` companions of the server histogram.
 
@@ -91,10 +120,20 @@ The configurable upstream metric-name prefix SHALL NOT be applied to either new 
 - **WHEN** the reader issues the failure-counter and duration-histogram queries
 - **THEN** both selectors carry the identical sentinel-exclusion matcher fragment used by the request-total selector, so a sentinel peer contributes to none of the three
 
-#### Scenario: Series without both pod UIDs never reach the RED join
+#### Scenario: Span-link series never reach the RED join
 
-- **WHEN** a service-graph series has an empty `client_k8s_pod_uid` or an empty `server_k8s_pod_uid`
-- **THEN** it is excluded from the failure-counter and duration-histogram results at the query layer, matching the attachment rule that gives such an edge no metrics object
+- **WHEN** a service-graph series carries `edge_relation="link"`
+- **THEN** it is excluded from the failure-counter and duration-histogram results at the query layer, and the reader independently marks it out of scope during resolution, so the two layers agree
+
+#### Scenario: Series without a pod UID still reach the RED join
+
+- **WHEN** a service-graph series has an empty `server_k8s_pod_uid` and a `server="unknown"` peer address that resolves to a pod or a service
+- **THEN** its failure and duration series are returned by both new queries and joined to the resulting edge, because neither selector filters on the pod-UID labels
+
+#### Scenario: Duration histogram is not aggregated upstream
+
+- **WHEN** the reader issues the duration-histogram query
+- **THEN** the query carries no `sum by (...)` aggregation, and each returned series retains the full dimension set of the corresponding request-total series plus `le`
 
 #### Scenario: Metric prefix is not applied to the RED series
 
@@ -103,11 +142,11 @@ The configurable upstream metric-name prefix SHALL NOT be applied to either new 
 
 ### Requirement: RED join and deterministic aggregation
 
-Several upstream series legitimately resolve to a single edge (most commonly when a dimension the edge identity does not carry, such as `connection_type`, differs, or when two series carry different `cluster` labels that resolve to the same client pod). The **in-scope contributing series** of an edge are those contributing series that carry a non-empty `client_k8s_pod_uid` and a non-empty `server_k8s_pod_uid`. The reader SHALL aggregate over that set and no other:
+Several upstream series legitimately resolve to a single edge (most commonly when a dimension the edge identity does not carry, such as `connection_type`, differs, or when two series carry different `cluster` labels that resolve to the same client pod). The reader SHALL aggregate over the edge's **in-scope contributing series** (those not carrying `edge_relation="link"`) and no other:
 
-- `rate` SHALL be the SUM of the in-scope contributing series' rates. A contributing series outside the RED selector's scope SHALL NOT be counted, so that the Rate denominator, the Errors numerator, and the Duration buckets are all derived from one identical series set.
-- The failure counter SHALL be joined to an in-scope contributing series by that series' **exact label identity** (all labels except the metric name).
-- The duration histogram SHALL be joined to an edge by the `(cluster, client_k8s_pod_uid, server_k8s_pod_uid)` identity recorded for that edge while its contributing series were resolved; where several such identities map to one edge, their bucket sets SHALL be summed per `le` boundary.
+- `rate` SHALL be the SUM of the in-scope contributing series' rates. An out-of-scope series SHALL NOT be counted, so that the Rate denominator, the Errors numerator, and the Duration buckets are all derived from one identical series set.
+- Both companion vectors SHALL be joined to an in-scope contributing series by that series' **exact label identity** — all labels except the metric name, and for the duration histogram except `le` as well. The reader SHALL record that mapping while resolving the request-total vector and SHALL NOT re-derive an edge's endpoints from labels in a second pass.
+- Where several in-scope contributing series map to one edge, their matched bucket counts SHALL be summed per `le` boundary before any quantile is taken.
 - `p90_server_ms` SHALL be computed from the **summed** bucket set, using the classic cumulative-bucket convention with linear interpolation inside the bucket that contains the 90th percentile (the same algorithm as a PromQL `histogram_quantile(0.9, ...)`), then converted from seconds to milliseconds. The reader SHALL NOT compute per-series quantiles and then average or otherwise combine them.
 
 Every attached value SHALL be a pure function of the upstream data and SHALL NOT depend on the arrival order of series within a query result. To that end the reader SHALL make its summation order-independent and SHALL round each attached value before serialisation, so that two builds over identical upstream data produce byte-identical response bodies (see the `graph-api` "Deterministic response body" requirement).
@@ -119,10 +158,15 @@ Rounding SHALL be to a fixed number of **significant digits**, applied identical
 - **WHEN** two `traces_service_graph_request_total` series differing only in `connection_type`, both carrying both pod UIDs, resolve to the same pod-to-pod edge with rates `2` and `3`
 - **THEN** the edge's `rate` is `5`
 
-#### Scenario: Out-of-scope contributing series are excluded from rate
+#### Scenario: UID-resolved and peer-resolved series collapse into one measured edge
 
 - **WHEN** an edge receives contributions from one series carrying both pod UIDs (rate `4`) and one `server="unknown"` series with an empty `server_k8s_pod_uid` whose peer address resolves to the same target pod (rate `1`)
-- **THEN** the edge carries no metrics object at all, because condition 3 of the attachment rule is evaluated per contributing series and the edge's identity is not wholly UID-resolved
+- **THEN** the edge's `rate` is `5` — both series are in scope, since eligibility depends on the resolved node type and not on how the endpoint was identified
+
+#### Scenario: p90 joins by full series identity minus `le`
+
+- **WHEN** two in-scope contributing series differing only in `connection_type` resolve to one edge, and each has its own set of duration-histogram series
+- **THEN** each histogram series is joined to its own contributing series by the label set it shares with it, and the edge's `p90_server_ms` is computed from the per-`le` sum of both bucket sets
 
 #### Scenario: Error rate uses the matching series set
 
@@ -131,8 +175,8 @@ Rounding SHALL be to a fixed number of **significant digits**, applied identical
 
 #### Scenario: p90 is computed from summed buckets
 
-- **WHEN** two pod-pair identities map to one edge and each contributes its own duration histogram
-- **THEN** the edge's `p90_server_ms` is derived from the per-`le` sum of both bucket sets, not from combining two per-identity quantiles
+- **WHEN** two in-scope contributing series map to one edge and each has its own duration histogram
+- **THEN** the edge's `p90_server_ms` is derived from the per-`le` sum of both bucket sets, not from combining two per-series quantiles
 
 #### Scenario: Attached values are order-independent
 
@@ -161,7 +205,7 @@ Neither new query SHALL be able to fail a build. The reader SHALL degrade as fol
 
 A **non-finite upstream sample SHALL NOT reach the response**. Upstream exposition formats accept `NaN` and `+Inf`, and JSON has no representation for either, so a single poisoned sample would otherwise make the whole response body unencodable and turn one bad series into a failed request for the entire graph. The reader SHALL therefore: skip non-finite samples when accumulating; omit the metrics object entirely when an edge's aggregated `rate` is not a finite value greater than zero; and omit `p90_server_ms` when the computed quantile is not finite. Degrading one edge is always preferred to failing the request.
 
-The reader SHALL additionally detect the case where the failure counter was read successfully but **joined to nothing**: if the failure result is non-empty yet no series matched any edge, every edge would report `error_rate: 0`, which is indistinguishable from a measured absence of failures. The reader SHALL surface that signature as aggregated operator evidence naming the distinct reason, so a label-set divergence between the request and failure counters is diagnosable rather than silently reading clean.
+The reader SHALL additionally detect, **for each companion vector independently**, the case where it was read successfully but **joined to nothing**: a non-empty result none of whose series matched any edge. For the failure counter that would make every edge report `error_rate: 0`, indistinguishable from a measured absence of failures; for the duration histogram it would omit `p90_server_ms` everywhere, indistinguishable from a producer that emits no histogram. The reader SHALL surface each signature as aggregated operator evidence naming its own distinct reason, so a label-set divergence between the request counter and either companion is diagnosable rather than silently reading clean.
 
 Each degradation SHALL be surfaced as aggregated operator evidence in the logs, naming the query and the reason, not per edge, and SHALL NOT alter any node, edge, `id`, `type`, `source`, `target`, or `labels`.
 
@@ -194,6 +238,11 @@ Each degradation SHALL be surfaced as aggregated operator evidence in the logs, 
 
 - **WHEN** the failure-counter query returns a non-empty result and none of its series matches any edge's contributing series identity
 - **THEN** the build succeeds and the condition is logged once as aggregated evidence under its own reason, so the resulting `error_rate: 0` on every edge is diagnosable as a join failure rather than read as a measured absence of failures
+
+#### Scenario: Duration histogram read successfully but joined nothing
+
+- **WHEN** the duration-histogram query returns a non-empty result and none of its series matches any edge's contributing series identity minus `le`
+- **THEN** the build succeeds, `p90_server_ms` is absent everywhere, and the condition is logged once as aggregated evidence under its own reason, distinguishable from "metric absent" and from "no usable `le` boundaries"
 
 #### Scenario: Request-total query error still fails the build
 
@@ -257,8 +306,9 @@ byte-identically, to the selectors of the numeric service-graph series
 (`traces_service_graph_request_failed_total`,
 `traces_service_graph_request_server_seconds_bucket`) read by the "RED source series and
 selector consistency" requirement, so the edge population stays consistent across metric
-families. Those selectors carry additional request-invariant matchers of their own; that
-does not weaken this rule, which fixes only the sentinel fragment.
+families. Those selectors carry one additional request-invariant matcher of their own
+(the span-link exclusion); that does not weaken this rule, which fixes only the sentinel
+fragment.
 
 #### Scenario: Series with client `user` is excluded at the query layer
 
@@ -299,6 +349,6 @@ does not weaken this rule, which fixes only the sentinel fragment.
 
 ### Requirement: Numeric metrics deferred from v1
 
-**Reason**: Superseded by "RED edge metrics on UID-resolved pod-to-pod edges". The deferral existed only because `Edge.labels` is strictly `map[string]string` and there was no typed place to carry a float; this change adds that typed place, so numeric metrics are no longer deferred. The prohibition the requirement actually protected — no numbers inside `labels` — is preserved verbatim by the replacing requirement and by the `graph-api` edge-payload requirement.
+**Reason**: Superseded by "RED edge metrics on trace-derived pod / service edges". The deferral existed only because `Edge.labels` is strictly `map[string]string` and there was no typed place to carry a float; this change adds that typed place, so numeric metrics are no longer deferred. The prohibition the requirement actually protected — no numbers inside `labels` — is preserved verbatim by the replacing requirement and by the `graph-api` edge-payload requirement.
 
 **Migration**: Consumers that relied on edges carrying no numeric data continue to work unchanged: the new data lives on an additive, omitted-when-absent `data.metrics` object and `labels` is untouched. Consumers that want RED read `data.metrics.rate`, `data.metrics.error_rate`, and `data.metrics.p90_server_ms`, each of which may be absent.

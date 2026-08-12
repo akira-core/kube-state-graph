@@ -92,3 +92,90 @@
 - [x] 11.6 Bucket counts accumulate as slices summed via `sumAscending` at attach, matching the order-free contract already applied to rates and failures (design D9).
 - [x] 11.7 Incidental (pre-existing, both indexes): key the Pod-IP **and** Service-`ClusterIP` reverse indexes on `net.IP.String()`, and canonicalise the peer host the same way before lookup, so an IPv6 address written in a different textual form than the exporter's label still matches. No spec change — the promoted `resolve-unknown-server-ip-peer` / `-pod-ip-peer` semantics are unaltered; this only makes the lookup work as those specs already describe.
 - [x] 11.8 `make lint` clean (the review pass introduced a `prealloc` violation in `redmetrics_test.go`; `go build` / `go vet` / `go test` alone do not catch it).
+
+## 12. Revision — widen the attachment rule, exclude span-link series
+
+Scope revision after the first implementation landed (design D1 / D1b / D4 / D6 rewritten).
+**Supersedes** the completed items 3.3, 3.4, 5.2, 5.3, 5.6, 5.8, 7.1, 7.2, 7.6, 8.6, 9.2
+and 9.6 — leave them checked as a record of the earlier shape, but expect their code and
+tests to change here. Items 1–2, 6, 10, 11 are unaffected.
+
+### 12.1 Query layer (`pkg/promql`)
+
+- [x] 12.1.1 Delete `serviceGraphPodPairSelector` and every use of it; add `serviceGraphLinkExclusionSelector = edge_relation!="link"` next to `serviceGraphSentinelSelector`, documenting it as a request-invariant metric-selection contract, that a negative matcher retains series where the label is absent, and that it is deliberately NOT applied to `QServiceGraphTotal` (design D6).
+- [x] 12.1.2 Re-render `QServiceGraphServerSecondsBucket` as raw `rate(traces_service_graph_request_server_seconds_bucket{<sentinel>,<link>}[w])` — drop the `sum by (cluster, client_k8s_pod_uid, server_k8s_pod_uid, le)` wrapper (design D4).
+- [x] 12.1.3 Re-render `QServiceGraphFailedTotal` with the sentinel + link fragments only.
+- [x] 12.1.4 Update the exact-string assertions in `pkg/promql/queries_test.go` for both renders; add a case asserting the `_total` render is unchanged (no link matcher).
+
+### 12.2 Attachment rule (`pkg/build`)
+
+- [x] 12.2.1 Replace `sgResolver.isPodID` with `isPodOrServiceID` (pods, synth pods, materialised service nodes) and drop the raw-UID in-scope test from the eligibility path (design D1).
+- [x] 12.2.2 Redefine **in-scope contributing series** as "does not carry `edge_relation="link"`"; a link series still creates/keeps the edge but records no join key and contributes no rate (design D1b).
+- [x] 12.2.3 Replace the pair-poisoning rule from 5.3 with per-series exclusion: a mixed pair is measured over its non-link subset; an all-link pair ends with an empty in-scope set, hence no metrics object via the existing rate `> 0` guard. Assert no separate special case is needed.
+- [x] 12.2.4 Mark the route-hit chain's **caller → ingress-service entry hop** ineligible at the point that knows it (`resolveRouteChain` / `routeIndexResolve`), so only the retained caller → backend edge is measured. Do NOT infer it afterwards from node role or from `labels.role`.
+- [x] 12.2.5 Confirm the still-excluded set is exactly: any edge with an `external` endpoint, `service-selects-pod`, the synthesised gateway-pod → backend hop, the chain entry hop, and topology edges.
+
+### 12.3 Join (`pkg/build/redmetrics.go`)
+
+- [x] 12.3.1 Delete `redKey{cluster, clientUID, serverUID}` and its map; both companion vectors now join through the single `seriesKey → pairKey` map (design D4).
+- [x] 12.3.2 Join bucket series by `seriesKey` computed from the series' labels **minus `le`**; accumulate counts per `le` boundary onto the pair, summing across all matched contributing series.
+- [x] 12.3.3 Add a bucket-side matched/unmatched counter mirroring `accumulateFailures`, and log a non-empty bucket result that joined nothing under its own reason — distinguishable from "metric absent" and from "no usable `le`" (design D10).
+- [x] 12.3.4 Re-check the lazy-allocation work from 11.4 against the new single-map shape.
+
+### 12.4 Tests
+
+- [x] 12.4.1 Invert the attachment tests that the revision reverses: peer-resolved Pod-IP target now HAS metrics; `ClusterIP`-resolved and connection-string-resolved `pod-calls-service` now HAVE metrics; rename `TestRED_D33ClearedUIDDoesNotAttachToService` accordingly and keep the external-endpoint case excluded.
+- [x] 12.4.2 New tests: all-link pair → no metrics object, edge still emitted with unchanged `id`/`type`/`source`/`target`/`labels`; mixed link + non-link pair → rate/error/p90 over the non-link subset only.
+- [x] 12.4.3 New test: on a route-engine hit, the caller → backend edge carries metrics and the caller → ingress entry hop does not, so the call's rate appears exactly once across the chain.
+- [x] 12.4.4 New test: a UID-resolved series and a peer-resolved series onto the same pair sum their rates (replaces the old "mixed scope → no metrics" expectation).
+- [x] 12.4.5 Update the parse-driven invariant test from 8.1: `Metrics` never appears on an edge with an `external` endpoint, on a synthesised edge, or on the chain entry hop.
+- [x] 12.4.6 Update the bucket-join tests for identity-minus-`le`; add the joined-nothing degradation case.
+- [x] 12.4.7 Integration: replace 8.6's expectation — a `server="unknown"` series whose peer resolves to a family Pod IP now yields `data.metrics`; add an integration case for a `pod-calls-service` edge carrying metrics while its `service-selects-pod` fan-out does not.
+- [x] 12.4.8 Regenerate goldens (`go test ./internal/api/ -update -run Golden`): **empty diff**. The component-level golden fixtures drive the parse through `MockQuerier` with no `_failed_total` / `_bucket` series and no newly-eligible edge shapes, so no snapshot changed. Attachment coverage stays with 12.4.1–12.4.7.
+
+### 12.5 Docs
+
+- [x] 12.5.1 `README.md`: restate the attachment rule (trace-derived, both endpoints pod-or-service, entry hop excluded), document `edge_relation="link"` as a producer dimension that suppresses measurement, and note that on unpaired edges `_server_seconds` is client-observed so `p90_server_ms` includes network time.
+- [x] 12.5.2 `README.md`: record that the duration histogram is read raw (no upstream aggregation) and what that costs in series volume.
+- [x] 12.5.3 `CLAUDE.md`: update the RED bullet and the glossary — add **in-scope series**, correct the attachment rule, the two selectors, and the removal of the pod-pair matcher.
+- [x] 12.5.4 `make docs` + `make check-docs` after updating the OpenAPI description of `data.metrics`.
+
+### 12.6 Verification
+
+- [x] 12.6.1 `make build`, `make vet`, `make lint`, `make test` (`-race -shuffle=on`).
+- [x] 12.6.2 `openspec validate "add-service-graph-red-metrics"` passes. (`openspec verify` is not available in the installed CLI — `error: unknown command 'verify'`; validate is the equivalent gate here.)
+
+## 13. Post-review hardening — second pass (from `/code-review xhigh --fix`)
+
+- [x] 13.1 **Spec violation.** `failedOK` was `red.FailedErr == nil`, so an ABSENT
+  `_failed_total` (empty result, nil error) emitted `error_rate: 0` on every measured
+  edge — the exact absent-vs-zero conflation this change exists to prevent, and a direct
+  contradiction of the *RED graceful degradation* requirement ("the failure-counter query
+  returns an error, **or the metric does not exist upstream**: … SHALL OMIT `error_rate`")
+  and of the README row. Gate it on `joinFailures` instead, so `error_rate == 0` means only
+  what the spec defines it to mean: the counter was READ and no series matched that edge.
+  Tests updated: `TestRED_SynthPodTargetStillGetsMetrics`,
+  `TestRED_FailureQueryNoMatch_ErrorRateZero` (now uses a non-empty, non-matching vector),
+  new `TestRED_FailureMetricAbsent_OmitsErrorRate`, and the integration
+  `TestRateOnlyWhenNoFailureOrHistogram` (which shares a container with cases that DO
+  ingest `_failed_total`, so it no longer pins one branch).
+- [x] 13.2 `pkg/graph/registry.go` (task 9.8, missed by the §12 revision): the
+  `pod-calls-pod` description still declared the pre-revision rule ("when both endpoints
+  are UID-resolved pods … peer-resolved and external endpoints never carry metrics"),
+  which `/v1/edge-types` publishes as the authoritative catalogue. Restated for the widened
+  rule; added the metrics clause to `pod-calls-service` (including the excluded chain entry
+  hop) and the never-measured clause to `service-selects-pod`. Golden regenerated.
+- [x] 13.3 `accumulateFailures` tallied matched/unmatched AFTER the value filter, so a
+  healthy deployment — every failure series legitimately `0` — could trip the
+  `failed_total_label_set_mismatch` warn on the very population it exists to exonerate.
+  Tally the join outcome first, mirroring `accumulateDuration`.
+- [x] 13.4 `chainEntryIndex` written `len(tgtIDs) > 1` rather than `== 2`: the two-target
+  shape is an invariant of today's resolution paths, not a typed guarantee, and the safe
+  failure for a future three-target path is "first hop unmeasured", not "entry hop measured
+  and the call counted twice".
+- [x] 13.5 `parseLe`: dropped the hand-rolled `+Inf` / `Inf` / `inf` / `-Inf` switch —
+  `strconv.ParseFloat` already accepts every one of those spellings, so the cases were dead
+  code. NaN rejection retained (it is NOT redundant).
+- [x] 13.6 `pkg/cytoscape/metrics_test.go`: the "JSON number, not a string" assertion
+  compared an untyped rune constant against a `byte`, which `reflect.DeepEqual` reports as
+  unequal for ANY input — the check could never fail. Replaced with a prefix test.

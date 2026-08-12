@@ -112,8 +112,9 @@ per container (a recency pick that is accurate for near-now windows; see
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
 | `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges; denominator for `data.metrics.rate` | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, plus peer-address labels used only for `server="unknown"` enrichment | Optional (no series ⇒ no call edges) |
-| `traces_service_graph_request_failed_total` | `data.metrics.error_rate` on UID-resolved pod-to-pod edges | Same identity labels as `_total` (joined by exact series identity minus `__name__`) | Optional — absence / query error omits `error_rate` (never reports `0`) |
-| `traces_service_graph_request_server_seconds_bucket` | `data.metrics.p90_server_ms` on UID-resolved pod-to-pod edges (server-observed classic histogram) | `cluster`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, `le` (pre-aggregated upstream) | Optional — absence / non-classic buckets omit `p90_server_ms` |
+| `traces_service_graph_request_failed_total` | `data.metrics.error_rate` on measured edges | Same identity labels as `_total` (joined by exact series identity minus `__name__`) | Optional — absence / query error omits `error_rate` (never reports `0`) |
+| `traces_service_graph_request_server_seconds_bucket` | `data.metrics.p90_server_ms` on measured edges (server-observed classic histogram) | Same identity labels as `_total`, plus `le` — read **raw**, no upstream aggregation, joined by identity minus `le` | Optional — absence / non-classic buckets omit `p90_server_ms` |
+| `edge_relation` (a **dimension**, not a metric) | Value `link` marks a connector-materialised **span-link** edge: the edge is still emitted, but it measures a queue/DB hop rather than a request, so it contributes nothing to `data.metrics` | Read on all three series; excluded from the two RED selectors via `edge_relation!="link"` | Optional — a producer that does not set it is unaffected (a negative matcher retains series where the label is absent) |
 
 Wrapped in `rate(traces_service_graph_request_total[<window>]) @ <end>`. Each
 series carries a single `cluster` external label representing the trace source
@@ -141,13 +142,31 @@ via the missing pod-UID human-label fallback.
 
 #### RED metrics on edges (`data.metrics`)
 
-A `pod-calls-pod` edge receives a typed `data.metrics` object **iff** it is
-trace-derived **and** both endpoints were resolved from a non-empty
-`client_k8s_pod_uid` / `server_k8s_pod_uid` (a real topology pod or a
-synthesised pod). Peer-resolved endpoints (including the Pod-IP ladder under
-`server="unknown"`), external endpoints, `pod-calls-service`,
-`service-selects-pod`, and topology edges (`pod-to-node`, `pod-mounts-pvc`,
-`pvc-to-storageclass`) never carry `metrics`.
+An edge receives a typed `data.metrics` object **iff** it is trace-derived
+(produced by at least one `traces_service_graph_request_total` series) **and**
+both endpoints resolved to a `type="pod"` node (real or synthesised) or a
+`type="service"` node. **How** the endpoint was identified does not matter — a
+pod UID, a `://` connection string, a `server="unknown"` peer address matched to
+a Service `ClusterIP` or straight to a Pod IP, and an Istio route-engine
+resolution all qualify — so both `pod-calls-pod` and `pod-calls-service` edges
+can be measured.
+
+No `metrics` key at all on:
+
+- any edge with an `external` endpoint (the external node collapses every
+  destination sharing one label string onto one identity);
+- synthesised edges: `service-selects-pod` fan-out, the ingress chain's
+  gateway-pod → backend-service hop, and topology edges (`pod-to-node`,
+  `pod-mounts-pvc`, `pvc-to-storageclass`);
+- the route-hit ingress chain's **caller → ingress-service entry hop**. One
+  series produces both that hop and the retained caller → backend edge; they are
+  two projections of the same call, so only the backend edge — the one naming
+  the actual destination — is measured, and summing `rate` across the chain
+  never double-counts;
+- an edge whose contributing series **all** carry `edge_relation="link"`. Those
+  are span-link virtual edges (the call crosses a queue or a database and the
+  two spans belong to different trace contexts), so they measure nothing. A
+  mixed edge is measured over its non-link series only.
 
 When present:
 
@@ -166,12 +185,27 @@ not assume fixed-decimal rendering (`toFixed`) and must treat `0` as
 semantically distinct from a very small non-zero value.
 
 **Producer prerequisites for RED coverage:** the collector's `dimensions` must
-carry `client_k8s_pod_uid` / `server_k8s_pod_uid` on all three series;
+be **identical across all three series** — the failure counter and the histogram
+join the request counter by exact label identity, so a relabel or an extra
+dimension applied to only one family joins nothing (surfaced as its own warn:
+`failed_total_label_set_mismatch` / `server_seconds_bucket_label_set_mismatch`).
 `add_metric_suffixes` must be on so the histogram is named
-`..._server_seconds_bucket` (not `..._server_bucket`); multi-replica collectors
-need trace-ID-aware routing (`loadbalancing` exporter with
-`routing_key: traceID`) or client/server spans never pair and edges fall to
-peer-resolved / external paths without metrics.
+`..._server_seconds_bucket` (not `..._server_bucket`). Pod UIDs
+(`client_k8s_pod_uid` / `server_k8s_pod_uid`) are no longer required for
+measurement, but they give the most precise endpoint identity; multi-replica
+collectors need trace-ID-aware routing (`loadbalancing` exporter with
+`routing_key: traceID`) or client/server spans never pair, and an unpaired edge
+resolves through the peer-address ladder — still measured, but its
+`_server_seconds` is what the **client** observed, so `p90_server_ms` then
+includes network time the server never saw.
+
+**Query cost.** The histogram is read raw (`rate(..._bucket{...}[w])`, no
+`sum by`), so roughly `edge-cardinality × bucket-count` series cross the wire.
+That is deliberate: no low-cardinality label subset identifies an edge once
+endpoints may come from peer addresses or connection strings, and a group-by
+would silently merge unrelated edges' latency distributions. The metric is
+optional — a store that refuses the query degrades exactly like an absent one
+(no `p90_server_ms`, no build failure).
 
 The `servicegraph` connector's **virtual peers** — `client="user"` (an
 uninstrumented caller) and `unknown` (an unresolved peer) — are dropped at the
@@ -184,7 +218,8 @@ its client resolves to a **real** pod and the client-recorded peer address
 that peer is recovered into a `pod-calls-service` edge (or an `external` node
 for a non-cluster address) instead of being dropped; every other
 `server="unknown"` case is still dropped, byte-for-byte as before. The same
-sentinel fragment is applied to the two RED series selectors.
+sentinel fragment is applied to the two RED series selectors, which carry one
+matcher of their own — `edge_relation!="link"` (see the table above).
 
 ### Probes — diagnostics, not graph data
 

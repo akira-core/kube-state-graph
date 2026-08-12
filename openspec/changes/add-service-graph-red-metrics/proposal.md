@@ -24,26 +24,36 @@ metrics the promoted spec already declares the reader SHALL consume.
   serialised as the `omitempty` `data.metrics` object on the Cytoscape edge DTO.
   Numeric values NEVER enter `labels` — same precedent as node `ipaddress` / `owner`
   / `ready_status`.
-- **RED is attached to trace-derived, UID-resolved pod↔pod edges ONLY.** An edge
-  receives `data.metrics` iff it is a `pod-calls-pod` edge produced from at least one
-  `traces_service_graph_*` series **and both endpoints were resolved from a non-empty
-  `client_k8s_pod_uid` / `server_k8s_pod_uid`**. Every other edge carries no `metrics`
-  key at all:
-  - synthesised / derived edges — `service-selects-pod` (D29 fan-out), `pod-to-node`,
-    `pvc-to-storageclass`, `pod-mounts-pvc`, and the route-hit ingress-chain
-    `pod-calls-service` hop;
-  - `pod-calls-service` edges (target is a materialised service node, not a pod);
-  - `pod-calls-pod` edges with an `external` endpoint;
-  - `pod-calls-pod` edges whose target was **peer-resolved** rather than UID-resolved
-    — i.e. the `server="unknown"` peer-address ladder resolving straight to a Pod IP.
-
-  Rationale for the last exclusion: the peer-address ladder only runs *because* the
-  `servicegraph` connector could not pair a server span. A peer-resolved endpoint is
-  by definition an endpoint whose own side emitted no trace, so the RED series carry
-  no measurement for it — the connector never observed it. Attaching numbers there
-  would be attributing a half-observed call as if it were fully measured. When both
-  pods do emit traces the pairing succeeds, the UID is populated, and the edge gets
-  RED through the ordinary path.
+- **RED is attached to trace-derived edges whose two endpoints both resolved to a pod
+  or a service.** An edge receives `data.metrics` iff it was produced from at least one
+  `traces_service_graph_request_total` series **and both resolved endpoints name a
+  `type="pod"` node (real topology pod or synthesised pod) or a `type="service"` node**.
+  How the endpoint was identified does not matter: a pod UID, a `"://"` connection
+  string resolved to a Service, a `server="unknown"` peer address resolved to a
+  Service `ClusterIP`, a peer address resolved straight to a Pod IP, and an Istio
+  route-engine resolution to a backend Service all qualify. Every other edge carries
+  no `metrics` key at all:
+  - any edge with an `external` endpoint on either side — the external node collapses
+    all traffic behind one label string and its id is not cluster-scoped, so the
+    number would not name a measurable dependency;
+  - synthesised edges, which have no contributing series to measure —
+    `service-selects-pod` (D29 fan-out), `pod-to-node`, `pvc-to-storageclass`,
+    `pod-mounts-pvc`, and the route-hit ingress-chain's gateway-pod → backend-service
+    hop;
+  - the route-hit ingress chain's **caller → ingress-service entry hop**. It is
+    trace-derived and both its endpoints are pod/service, but it and the retained
+    caller → backend edge are two projections of the **same** call: measuring both
+    would make one request contribute twice to any sum over the chain. The backend
+    edge — the one naming the actual destination — carries the measurement.
+- **A contributing series carrying `edge_relation="link"` measures nothing.** That
+  dimension marks a virtual edge the connector materialised from a **span link**, so
+  the "call" it describes actually crossed a queue or a database and the two spans
+  belong to different trace contexts. The edge is still emitted — it is a real
+  dependency — but the series is **out of scope** for RED: it contributes to no rate,
+  no error numerator, and no duration bucket. An edge whose contributing series are
+  *all* link series therefore carries no `metrics` object at all, while a mixed edge is
+  measured over its non-link series only. The label name is a fixed, case-sensitive
+  contract (same class as the D30 sentinel values) — there is no knob.
 - **Grafana/Tempo definitional parity for Duration.** `p90_server_ms` uses the same
   metric, observation side, and quantile as Grafana's documented service-graph
   queries: `histogram_quantile(0.9, ...traces_service_graph_request_server_seconds_bucket...)`.
@@ -51,13 +61,16 @@ metrics the promoted spec already declares the reader SHALL consume.
   service name (`client`, `server`) while this API aggregates by pod pair — the parity
   is in the definition, not the number.
 - **Two new PromQL queries** in `ReadServiceGraph`, run in parallel with the existing
-  one: `traces_service_graph_request_failed_total` (raw, joined by series identity)
-  and `traces_service_graph_request_server_seconds_bucket` (upstream-aggregated by the
-  pod-pair identity + `le`, to keep histogram cardinality off the wire). Both reuse
-  the D30 sentinel selector fragment, as `promql.serviceGraphSentinelSelector`'s own
-  doc comment already mandates, plus a request-invariant
-  `client_k8s_pod_uid!="",server_k8s_pod_uid!=""` pair that makes the query population
-  exactly equal to the attachment rule above.
+  one: `traces_service_graph_request_failed_total` and
+  `traces_service_graph_request_server_seconds_bucket`. Both are read at the **same raw
+  label granularity as the total counter** (the histogram additionally carrying `le`)
+  and both join to a contributing series by exact label identity, so the Rate
+  denominator, the Errors numerator, and the Duration buckets always come from one
+  identical series set. Both reuse the D30 sentinel selector fragment, as
+  `promql.serviceGraphSentinelSelector`'s own doc comment already mandates, plus a
+  request-invariant `edge_relation!="link"` matcher mirroring the out-of-scope rule
+  above. The `_total` selector does **not** gain that matcher — the link edge must
+  still be emitted, it just carries no numbers.
 - **Both new queries are OPTIONAL and non-fatal.** A missing metric, an empty result,
   or a query error degrades to "no `metrics` on the edge" (or "no `p90_server_ms`
   inside `metrics`") and never fails the build.
@@ -80,8 +93,9 @@ None — this extends two existing capabilities.
 ### Modified Capabilities
 
 - `pod-service-graph`: **replaces** `Requirement: Numeric metrics deferred from v1`
-  with requirements that define RED derivation, the UID-resolved-pod-pair attachment
-  rule, the series→edge join, deterministic aggregation, and graceful degradation.
+  with requirements that define RED derivation, the pod/service-endpoint attachment
+  rule, the span-link out-of-scope rule, the series→edge join, deterministic
+  aggregation, and graceful degradation.
   **Modifies** `Requirement: Virtual sentinel endpoint exclusion (user / unknown)`,
   whose forward note about "deferred numeric service-graph metrics … queried in a
   future spec revision" this change makes true and must therefore be rewritten in the
@@ -99,10 +113,12 @@ None — this extends two existing capabilities.
   `UUIDv5(type|source|target)`), so no edge ID churn.
 - `pkg/promql/queries.go` — two new `Query` constants + render cases; the shared
   `serviceGraphSentinelSelector` gains two more call sites; a new
-  `serviceGraphPodPairSelector` fragment.
+  `serviceGraphLinkExclusionSelector` fragment. The histogram render carries no
+  upstream `sum by` aggregation.
 - `pkg/build/servicegraph.go` — `ReadServiceGraph` fans out three queries under an
-  errgroup; `parseWithResolver` records the series→pair join keys and attaches the
-  aggregated RED after the resolution loop.
+  errgroup; `parseWithResolver` records one `seriesKey → pairKey` join map serving both
+  the failure and the bucket vectors, tracks endpoint node types and the route-chain
+  entry hop for eligibility, and attaches the aggregated RED after the resolution loop.
 - `pkg/build/histogram.go` (new) — classic-bucket quantile, pure + unit-tested.
 - `pkg/cytoscape/cytoscape.go` — `EdgeData.Metrics *EdgeMetricsDTO`.
 - `internal/api/testdata/golden/*.json` — regenerated (`-update`).
@@ -110,9 +126,9 @@ None — this extends two existing capabilities.
 - `README.md` — "Service-graph metric" section gains the two new metrics and the RED
   attachment rule; "Edge → metric mapping" table unchanged.
 - `CLAUDE.md` — a compact glossary block (trace-derived / synthesised edge,
-  UID-resolved / peer-resolved endpoint, contributing series, RED scope) ahead of the
-  service-graph rules, plus the retirement of the "numeric edge metrics deferred"
-  statement.
+  UID-resolved / peer-resolved endpoint, contributing series, in-scope series, RED
+  scope) ahead of the service-graph rules, plus the retirement of the "numeric edge
+  metrics deferred" statement.
 - Self-metrics: two new `query` / `query_name` dimension values.
 - Upstream load: +2 PromQL queries per `/v1/graph` request. No new dependency, no new
   flag, no new node type, no new edge type.

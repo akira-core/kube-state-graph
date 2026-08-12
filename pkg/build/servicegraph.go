@@ -472,12 +472,8 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		serverLabel := string(s.Metric["server"])
 		// Single `cluster` label = trace source / client-side cluster.
 		traceCluster := mc.bucket(promql.QServiceGraphTotal, string(s.Metric["cluster"]))
-		// Raw UIDs (pre-D33 normalisation) drive the RED attachment rule so the
-		// in-scope check matches the query-layer pod-pair selector exactly.
-		rawClientUID := string(s.Metric["client_k8s_pod_uid"])
-		rawServerUID := string(s.Metric["server_k8s_pod_uid"])
-		clientUID := rawClientUID
-		serverUID := rawServerUID
+		clientUID := string(s.Metric["client_k8s_pod_uid"])
+		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
 		serverNS := string(s.Metric["server_k8s_namespace_name"])
 		// Peer dimensions recorded on the CLIENT span — the three peer-address
@@ -491,25 +487,17 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		// resolveUnknownServerPeer.
 		peer := peerLabelsOf(s.Metric)
 
-		// seriesKey / redKey are pure functions of the RAW series labels (D4):
-		// the failure counter joins by exact identity, and the histogram is
-		// keyed by the same (cluster, clientUID, serverUID) the producer emitted.
-		// Both are computed only when their join is active — seriesKeyOf sorts
-		// and concatenates every label of every series, so it is not something
-		// to pay for when there is no failure vector to join against.
+		// seriesKey is a pure function of the RAW series labels (D4): both
+		// companion vectors join to it by exact identity, the histogram after
+		// dropping `le`. Computed only when at least one of them is present —
+		// seriesKeyOf sorts and concatenates every label of every series, so it
+		// is not something to pay for when there is nothing to join against.
 		var sk string
-		if joinFailures {
+		if rj.joinKeyed() {
 			sk = seriesKeyOf(s.Metric)
 		}
-		var rk redKey
-		if joinDuration {
-			rk = redKey{
-				cluster:   traceCluster,
-				clientUID: rawClientUID,
-				serverUID: rawServerUID,
-			}
-		}
-		inScope := redInScope(rawClientUID, rawServerUID)
+		// A span-link series still produces its edge but measures nothing (D1b).
+		inScope := redSeriesInScope(s.Metric)
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -570,6 +558,11 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 			}
 		}
 		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, peer)
+		// Index of the RouteHit ingress-chain ENTRY hop within tgtIDs, or -1.
+		// Its edge is trace-derived and pod/service on both ends, but it is a
+		// second projection of the SAME call as the retained caller→backend
+		// edge, so only the backend carries the measurement (design D1).
+		chainEntry := chainEntryIndex(tgtIDs)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -578,7 +571,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		// D5): the server side resolves to [ingress service, backend service],
 		// yielding both the caller→ingress and the direct caller→backend edge.
 		for _, srcID := range srcIDs {
-			for _, tgtID := range tgtIDs {
+			for ti, tgtID := range tgtIDs {
 				// Deterministic dedupe: multiple upstream series can resolve to the
 				// same (src, tgt) pair while carrying different trace `cluster`
 				// labels (e.g. one missing → "unknown", the client pod recovered via
@@ -592,19 +585,18 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 					pairs[key] = aggEdge{srcIsPod: srcIsPod, srcCluster: traceCluster}
 				}
 				// Record RED join keys for every pair this series produced.
-				// Out-of-scope series mark the pair ineligible (mixed
-				// UID-resolved / peer-resolved pairs get no metrics — D1).
 				//
-				// In-scope is the CONJUNCTION of the raw-UID test (which is what
-				// makes the query-layer pod-pair selector exactly equivalent) and
-				// the RESOLVED endpoint types. Both are required: D33's self-loop
-				// normalisation clears the "://" side's UID AFTER the raw test has
-				// already passed, so that side resolves to a service or external
-				// node while the raw UIDs still look fully pod-resolved. An
-				// external target keeps the edge type at pod-calls-pod, so the
-				// type check downstream cannot catch it either.
-				rj.recordSeries(key, inScope && srcIsPod && res.isPodID(tgtID),
-					float64(s.Value), sk, rk)
+				// The structural verdict is the RESOLVED endpoint types plus the
+				// chain position (design D1) — never the raw UID labels and never
+				// the edge type. Neither of those holds: D33's self-loop
+				// normalisation clears the "://" side's UID, so that side can
+				// resolve to a service or an external node while the raw UIDs
+				// still look fully pod-resolved, and an external target leaves
+				// the edge type at pod-calls-pod (only a service target
+				// downgrades it), so the type check cannot catch it either.
+				rj.recordSeries(key,
+					ti != chainEntry && res.isPodOrServiceID(srcID) && res.isPodOrServiceID(tgtID),
+					inScope, float64(s.Value), sk)
 			}
 		}
 
@@ -678,16 +670,37 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 				"unmatched_series", unmatched, "matched_series", matched)
 		}
 	}
-	sawNoLe := false
 	if joinDuration {
-		sawNoLe = rj.accumulateDuration(red.Duration)
-	}
-	if sawNoLe {
-		slog.Warn("service-graph RED duration series carried no usable classic le buckets; p90_server_ms omitted",
-			"reason", "no_classic_le_buckets")
+		matched, unmatched, sawNoLe := rj.accumulateDuration(red.Duration)
+		// Same failure mode as the failure counter, different symptom: the
+		// histogram joins by exact identity minus `le`, so a label-set drift
+		// between _total and _bucket matches nothing and omits p90_server_ms on
+		// every edge — indistinguishable from a producer that emits no
+		// histogram at all unless it is surfaced.
+		switch {
+		case matched == 0 && unmatched > 0:
+			slog.Warn("service-graph duration histogram joined no request series; p90_server_ms omitted on every edge",
+				"reason", "server_seconds_bucket_label_set_mismatch",
+				"unmatched_series", unmatched)
+		case unmatched > 0:
+			slog.Debug("service-graph duration series with no matching request series",
+				"unmatched_series", unmatched, "matched_series", matched)
+		}
+		if sawNoLe {
+			slog.Warn("service-graph RED duration series carried no usable classic le buckets; p90_server_ms omitted",
+				"reason", "no_classic_le_buckets")
+		}
 	}
 
-	failedOK := red.FailedErr == nil
+	// error_rate is emitted ONLY when the failure counter was actually read:
+	// the query succeeded AND returned at least one series. An empty result is
+	// "the metric does not exist upstream", which the spec's *RED graceful
+	// degradation* requirement puts on the same footing as a query error —
+	// `error_rate` is OMITTED, never reported as 0, so an absent measurement is
+	// never presented as a measured absence of errors. `error_rate == 0` is
+	// reserved for the case the spec defines it for: the counter was read and
+	// no series matched THIS edge.
+	failedOK := joinFailures
 	durationOK := red.DurationErr == nil
 
 	edges := make([]*graph.Edge, 0, len(pairs)+len(res.svcEdges))
@@ -716,14 +729,15 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 			edgeType = graph.EdgeTypePodCallsService
 		}
 		e := graph.NewEdge(edgeType, k.src, k.tgt, labels)
-		// RED attach: only trace-derived pod-calls-pod edges whose contributing
-		// series were wholly UID-resolved (design D1). svcEdges, routeChainEdges,
-		// pod-calls-service, external endpoints, and peer-resolved pairs are
-		// excluded by construction (ineligible acc or non-pod-calls-pod type).
-		if edgeType == graph.EdgeTypePodCallsPod {
-			if m, ok := rj.acc[k].attachMetrics(failedOK, durationOK); ok {
-				e = e.WithMetrics(m)
-			}
+		// RED attach (design D1). Every pair in this map is trace-derived by
+		// construction; the accumulator carries the rest of the rule — an
+		// external endpoint, the ingress chain's entry hop, and an all-span-link
+		// pair are all ineligible there, so no edge-type gate is needed and
+		// pod-calls-service edges are measured like any other. The two
+		// synthesised edge sets (svcEdges, routeChainEdges) never pass through
+		// here at all.
+		if m, ok := rj.acc[k].attachMetrics(failedOK, durationOK); ok {
+			e = e.WithMetrics(m)
 		}
 		edges = append(edges, e)
 	}
@@ -921,17 +935,54 @@ func (r *sgResolver) lookupClientPod(traceCluster, podUID string) *graph.PodNode
 	return nil
 }
 
-// isPodID reports whether a resolved endpoint id names a type="pod" node —
-// a real topology pod or a synthesised one. Used by the RED attachment rule
-// (design D1), which requires BOTH endpoints to be pods and cannot infer that
-// from the edge type: only a service target downgrades the type to
-// pod-calls-service, so an external target leaves it at pod-calls-pod.
-func (r *sgResolver) isPodID(id string) bool {
+// isPodOrServiceID reports whether a resolved endpoint id names a type="pod"
+// node (a real topology pod or a synthesised one) or a type="service" node.
+//
+// This is the RED attachment rule's structural test (design D1): an endpoint the
+// reader could actually NAME. How it was identified — a pod UID, a "://"
+// connection string, a peer address matched to a ClusterIP or to a Pod IP, a
+// route-engine resolution — is irrelevant. What the rule excludes is the
+// external node, which collapses every caller-visible destination sharing one
+// label string onto one non-cluster-scoped identity.
+//
+// It cannot be inferred from the edge type: only a service target downgrades
+// the type to pod-calls-service, so an external target leaves a pod-calls-pod
+// edge looking exactly like a resolved one.
+func (r *sgResolver) isPodOrServiceID(id string) bool {
 	if _, ok := r.podByID[id]; ok {
 		return true
 	}
-	_, ok := r.synthPods[id]
+	if _, ok := r.synthPods[id]; ok {
+		return true
+	}
+	_, ok := r.services[id]
 	return ok
+}
+
+// chainEntryIndex reports the index within a resolved server-target slice that
+// holds the RouteHit ingress-chain ENTRY hop, or -1 when the resolution
+// produced no chain.
+//
+// The two-target shape is unique to a chained RouteHit: routeIndexResolve
+// appends the backend id to resolveRouteChain's single ingress id, yielding
+// [ingress, backend] (route-hit-ingress-chain D5). Every other server-side path
+// — pod UID, synth pod, connection string, peer address, route hit without a
+// chain, external fallback — resolves to at most one node, because
+// resolveServiceLevel materialises exactly one service node per endpoint.
+//
+// Load-bearing for RED: the entry hop and the retained caller→backend edge are
+// two projections of ONE observed call, so measuring both would make a single
+// request contribute its rate twice to any sum over the chain (design D1).
+// Written as `> 1` rather than `== 2` deliberately: the shape is an invariant
+// of today's resolution paths, not something the type system enforces, and if a
+// future path ever returns three targets the safe failure is "the first hop
+// goes unmeasured", not "the entry hop is measured and the call is counted
+// twice".
+func chainEntryIndex(tgtIDs []string) int {
+	if len(tgtIDs) > 1 {
+		return 0
+	}
+	return -1
 }
 
 // classifyPeerHost runs the in-cluster classification ladder of the

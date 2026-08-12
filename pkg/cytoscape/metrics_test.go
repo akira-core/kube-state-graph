@@ -2,6 +2,7 @@ package cytoscape
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -62,7 +63,10 @@ func TestSerialise_PartialMetricsOmitsMissingFields(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &decoded))
 	for k, v := range decoded {
 		s := string(v)
-		assert.NotEqual(t, '"', s[0], "%s must be a JSON number, not a string", k)
+		// Compare byte-to-byte: assert.NotEqual on an untyped rune constant and
+		// a byte compares int32 against uint8, which reflect.DeepEqual reports
+		// as unequal for ANY input — the assertion would never fail.
+		assert.False(t, strings.HasPrefix(s, `"`), "%s must be a JSON number, not a string", k)
 	}
 
 	// labels gain no numeric key.

@@ -21,10 +21,16 @@ import (
 // design, so it lives here rather than in servicegraph.go — production code
 // must not carry test-only constructors.
 func parseServiceGraphRED(vec, failed, duration model.Vector, topology Topology) ServiceGraphResult {
+	return parseServiceGraphREDRoutes(vec, failed, duration, topology, nil)
+}
+
+// parseServiceGraphREDRoutes is parseServiceGraphRED with a route index, for
+// the ingress-chain cases.
+func parseServiceGraphREDRoutes(vec, failed, duration model.Vector, topology Topology, routes routeIndex) ServiceGraphResult {
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
 	}
-	return parseWithResolver(vec, newSGResolver(topology), nil, redInputs{
+	return parseWithResolver(vec, newSGResolver(topology), routes, redInputs{
 		Failed:   failed,
 		Duration: duration,
 	})
@@ -53,18 +59,19 @@ func failSample(clientUID, serverUID string, rate float64, extra ...model.Metric
 	return s
 }
 
-// bucketSample is one pre-aggregated duration histogram bucket.
-func bucketSample(clientUID, serverUID, le string, count float64) model.Sample {
-	return model.Sample{
-		Metric: model.Metric{
-			"cluster":            "cluster-alpha",
-			"client_k8s_pod_uid": model.LabelValue(clientUID),
-			"server_k8s_pod_uid": model.LabelValue(serverUID),
-			"le":                 model.LabelValue(le),
-		},
-		Value: model.SampleValue(count),
-	}
+// bucketSample is one duration-histogram bucket. The histogram is read RAW
+// (design D4), so a bucket series carries its request-total series' full
+// dimension set PLUS `le`, and joins by that identity minus `le`. The fixture
+// mirrors that shape — a bucket built from a narrower label set would join
+// nothing, exactly as it would in production.
+func bucketSample(clientUID, serverUID, le string, count float64, extra ...model.Metric) model.Sample {
+	s := uidPodSample(clientUID, serverUID, count, extra...)
+	s.Metric[model.BucketLabel] = model.LabelValue(le)
+	return s
 }
+
+// linkDim marks a series as a connector-materialised span-link edge (D1b).
+func linkDim() model.Metric { return model.Metric{"edge_relation": "link"} }
 
 func edgeMetrics(t *testing.T, res ServiceGraphResult, src, tgt string) *graph.EdgeMetrics {
 	t.Helper()
@@ -108,24 +115,38 @@ func TestRED_SynthPodTargetStillGetsMetrics(t *testing.T) {
 	m := edgeMetrics(t, res, "cluster-alpha/abc", res.SynthPods[0].ID())
 	require.NotNil(t, m, "synth-pod target is UID-resolved and must carry metrics")
 	assert.InDelta(t, 3.0, m.Rate, 1e-12)
-	require.NotNil(t, m.ErrorRate)
-	assert.InDelta(t, 0.0, *m.ErrorRate, 1e-12, "failed query succeeded with no match → 0")
+	assert.Nil(t, m.ErrorRate, "failure metric absent upstream → error_rate omitted, not 0")
 	assert.Nil(t, m.P90ServerMs)
 }
 
-func TestRED_PeerResolvedPodIP_NoMetrics(t *testing.T) {
-	// server="unknown", empty server UID, peer address resolves to a Pod IP.
-	// Edge is pod-calls-pod but peer-resolved → no metrics (D1).
-	res := parseServiceGraph(sampleVec(podIPPeerSample("10.244.1.9")), sampleTopologyPodIP())
-	require.NotEmpty(t, res.Edges)
-	var found bool
-	for _, e := range res.Edges {
-		if e.Type == graph.EdgeTypePodCallsPod {
-			found = true
-			assert.Nil(t, e.Metrics, "peer-resolved Pod-IP target must carry no metrics")
-		}
+// TestRED_PeerResolvedPodIP_GetsMetrics pins the widened attachment rule:
+// HOW an endpoint was identified is irrelevant, only what it resolved to. The
+// server="unknown" peer-address ladder names a real topology pod here, so the
+// edge is measured like any UID-resolved one.
+func TestRED_PeerResolvedPodIP_GetsMetrics(t *testing.T) {
+	res := parseServiceGraphRED(sampleVec(podIPPeerSample("10.244.1.9")), nil, nil, sampleTopologyPodIP())
+	pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+	require.Len(t, pcp, 1)
+	require.NotNil(t, pcp[0].Metrics, "peer-resolved Pod-IP target resolves to a pod and must carry metrics")
+	assert.InDelta(t, 5.0, pcp[0].Metrics.Rate, 1e-12)
+}
+
+// TestRED_PeerResolvedClusterIP_GetsMetrics is the sibling case one rung up the
+// ladder: the peer address matches a Service ClusterIP, so the endpoint is a
+// service node and the edge is pod-calls-service — also measured. Its
+// service-selects-pod fan-out stays synthesised and unmeasured.
+func TestRED_PeerResolvedClusterIP_GetsMetrics(t *testing.T) {
+	res := parseServiceGraphRED(sampleVec(podIPPeerSample("10.0.0.5")), nil, nil, sampleTopologyWithServices())
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+	require.NotNil(t, pcs[0].Metrics)
+	assert.InDelta(t, 5.0, pcs[0].Metrics.Rate, 1e-12)
+
+	for _, e := range edgesByType(res, graph.EdgeTypeServiceSelectsPod) {
+		assert.Nil(t, e.Metrics, "the fan-out behind a measured service edge stays unmeasured")
 	}
-	assert.True(t, found, "expected a pod-calls-pod edge from Pod-IP resolution")
 }
 
 func TestRED_ExternalEndpoint_NoMetrics(t *testing.T) {
@@ -146,7 +167,10 @@ func TestRED_ExternalEndpoint_NoMetrics(t *testing.T) {
 	}
 }
 
-func TestRED_PodCallsService_NoMetrics(t *testing.T) {
+// TestRED_PodCallsService_GetsMetrics: a D29 connection string names the
+// Service the caller actually dialled, so that is where the caller's rate
+// belongs. Nothing is double-counted — the fan-out below it carries none.
+func TestRED_PodCallsService_GetsMetrics(t *testing.T) {
 	vec := sampleVec(model.Sample{
 		Metric: model.Metric{
 			"client":             "checkout",
@@ -157,11 +181,10 @@ func TestRED_PodCallsService_NoMetrics(t *testing.T) {
 		Value: 4,
 	})
 	res := parseServiceGraphRED(vec, nil, nil, sampleTopologyWithServices())
-	for _, e := range res.Edges {
-		if e.Type == graph.EdgeTypePodCallsService {
-			assert.Nil(t, e.Metrics)
-		}
-	}
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	require.NotNil(t, pcs[0].Metrics)
+	assert.InDelta(t, 4.0, pcs[0].Metrics.Rate, 1e-12)
 }
 
 func TestRED_ServiceSelectsPod_NoMetrics(t *testing.T) {
@@ -205,9 +228,10 @@ func TestRED_TwoSeriesCollapseSumRates(t *testing.T) {
 	assert.InDelta(t, 5.0, m.Rate, 1e-12)
 }
 
-func TestRED_MixedInScopeOutOfScope_NoMetrics(t *testing.T) {
-	// One UID-resolved series + one peer-resolved series collapsing onto the
-	// same target pod → pair is ineligible (partially measured).
+// TestRED_UIDAndPeerResolvedSeriesSumRates: a UID-resolved series and a
+// peer-resolved series landing on the SAME pair are both in scope, so their
+// rates sum. (Under the first draft of D1 this pair carried no metrics at all.)
+func TestRED_UIDAndPeerResolvedSeriesSumRates(t *testing.T) {
 	topo := sampleTopologyPodIP()
 	// Register the peer pod under UID "def" so a UID-resolved series hits the
 	// same topology pod that the Pod-IP ladder finds via 10.244.1.9.
@@ -239,7 +263,106 @@ func TestRED_MixedInScopeOutOfScope_NoMetrics(t *testing.T) {
 			m = e.Metrics
 		}
 	}
-	assert.Nil(t, m, "mixed in-scope / out-of-scope pair must carry no metrics")
+	require.NotNil(t, m, "both series resolve to pod endpoints and are in scope")
+	assert.InDelta(t, 5.0, m.Rate, 1e-12, "4 (UID-resolved) + 1 (peer-resolved)")
+}
+
+// --- D1b: span-link series measure nothing ---
+
+// TestRED_AllLinkSeries_EdgeEmittedWithoutMetrics: the edge is a real
+// dependency and must survive; only the numbers are suppressed. No special case
+// produces this — the in-scope set is empty, so the rate>0 guard rejects it.
+func TestRED_AllLinkSeries_EdgeEmittedWithoutMetrics(t *testing.T) {
+	vec := sampleVec(uidPodSample("abc", "def", 9, linkDim()))
+	res := parseServiceGraphRED(vec, nil, nil, sampleTopology())
+
+	pcp := edgesByType(res, graph.EdgeTypePodCallsPod)
+	require.Len(t, pcp, 1, "the span-link edge must still be emitted")
+	assert.Equal(t, "cluster-alpha/abc", pcp[0].Source)
+	assert.Equal(t, "cluster-beta/def", pcp[0].Target)
+	assert.Equal(t, map[string]string{"cluster": "cluster-alpha"}, pcp[0].Labels)
+	assert.Nil(t, pcp[0].Metrics, "a span-link series measures a queue/db hop, not a request")
+}
+
+// TestRED_MixedLinkAndDirectSeries_MeasuresNonLinkSubset: unlike the older
+// pair-poisoning rule, a link series does not disqualify its pair — both
+// subsets describe the same dependency, so the non-link one is measured.
+func TestRED_MixedLinkAndDirectSeries_MeasuresNonLinkSubset(t *testing.T) {
+	vec := sampleVec(
+		uidPodSample("abc", "def", 4, linkDim()),
+		uidPodSample("abc", "def", 1, model.Metric{"connection_type": "http"}),
+	)
+	// Only the non-link series has companions; a producer-side link failure
+	// series would already be dropped by the query-layer matcher.
+	failed := sampleVec(failSample("abc", "def", 0.5, model.Metric{"connection_type": "http"}))
+	res := parseServiceGraphRED(vec, failed, nil, sampleTopology())
+
+	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
+	require.NotNil(t, m)
+	assert.InDelta(t, 1.0, m.Rate, 1e-12, "the link series' rate 4 must not be counted")
+	require.NotNil(t, m.ErrorRate)
+	assert.InDelta(t, 0.5, *m.ErrorRate, 1e-9, "numerator and denominator share one series set")
+}
+
+// TestRED_LinkSeriesNotJoined pins that a link series records no join key: even
+// if the query layer leaked a matching failure series (it does not — see
+// promql.serviceGraphLinkExclusionSelector), it could not be attributed.
+func TestRED_LinkSeriesNotJoined(t *testing.T) {
+	vec := sampleVec(
+		uidPodSample("abc", "def", 2, model.Metric{"connection_type": "http"}),
+		uidPodSample("abc", "def", 8, linkDim()),
+	)
+	failed := sampleVec(failSample("abc", "def", 8, linkDim()))
+	res := parseServiceGraphRED(vec, failed, nil, sampleTopology())
+
+	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
+	require.NotNil(t, m)
+	require.NotNil(t, m.ErrorRate)
+	assert.InDelta(t, 0.0, *m.ErrorRate, 1e-12, "a link failure series must join nothing")
+}
+
+// --- D1: the ingress chain's entry hop is not measured ---
+
+// TestRED_RouteChainEntryHopUnmeasured: one series produces caller→ingress AND
+// caller→backend. They are two projections of the SAME call, so measuring both
+// would double the request in any sum over the chain. The backend edge — the
+// one naming the actual destination — carries the measurement.
+func TestRED_RouteChainEntryHopUnmeasured(t *testing.T) {
+	vec := sampleVec(unknownPeerSample("api.example.com", nil))
+	res := parseServiceGraphREDRoutes(vec, nil, nil, sampleTopologyWithIngress(),
+		routeIndex{chainKey: chainHitEntry()})
+
+	got := map[string]*graph.EdgeMetrics{}
+	for _, e := range edgesByType(res, graph.EdgeTypePodCallsService) {
+		got[e.Source+"->"+e.Target] = e.Metrics
+	}
+	require.Len(t, got, 3)
+
+	backend := got["cluster-alpha/abc->cluster-alpha/shop/payments"]
+	require.NotNil(t, backend, "the direct caller→backend edge carries the measurement")
+	assert.InDelta(t, 5.0, backend.Rate, 1e-12)
+
+	assert.Nil(t, got["cluster-alpha/abc->cluster-alpha/istio-system/igw"],
+		"the chain's entry hop is a second projection of the same call")
+	assert.Nil(t, got["cluster-alpha/igw0->cluster-alpha/shop/payments"],
+		"the synthesized gateway-pod hop has no contributing series at all")
+}
+
+// TestRED_RouteHitWithoutChainMeasuresBackend: with no ingress identity the
+// endpoint resolves to the backend alone, so there is no entry hop to suppress
+// and the single edge is measured.
+func TestRED_RouteHitWithoutChainMeasuresBackend(t *testing.T) {
+	entry := chainHitEntry()
+	entry.dest.IngressNamespace, entry.dest.IngressService = "", ""
+	vec := sampleVec(unknownPeerSample("api.example.com", nil))
+	res := parseServiceGraphREDRoutes(vec, nil, nil, sampleTopologyWithIngress(),
+		routeIndex{chainKey: entry})
+
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+	require.NotNil(t, pcs[0].Metrics)
+	assert.InDelta(t, 5.0, pcs[0].Metrics.Rate, 1e-12)
 }
 
 func TestRED_ErrorRateMatchingSeriesSet(t *testing.T) {
@@ -257,47 +380,48 @@ func TestRED_ErrorRateMatchingSeriesSet(t *testing.T) {
 }
 
 func TestRED_P90FromSummedBuckets(t *testing.T) {
-	// Two redKeys (different cluster labels) mapping to same pair: buckets sum.
+	// Two contributing series (differing only in connection_type) collapse onto
+	// one pair. Each joins its OWN bucket set by full identity minus `le`; the
+	// two sets are summed per boundary before the quantile is taken — combining
+	// two per-series quantiles would be wrong and invisible.
+	http := model.Metric{"connection_type": "http"}
+	grpc := model.Metric{"connection_type": "grpc"}
 	vec := sampleVec(
-		uidPodSample("abc", "def", 5, model.Metric{"cluster": "cluster-alpha"}),
-		// Same UIDs, cluster missing → bucketed to "unknown"; client recovered via UID.
-		// Need cluster empty and client still resolves via podByUID.
-		model.Sample{
-			Metric: model.Metric{
-				"client": "checkout",
-				"server": "payments",
-				// no cluster
-				"client_k8s_pod_uid": "abc",
-				"server_k8s_pod_uid": "def",
-			},
-			Value: 5,
-		},
+		uidPodSample("abc", "def", 5, http),
+		uidPodSample("abc", "def", 5, grpc),
 	)
-	// Buckets for cluster-alpha: total 50 at +Inf
-	// Buckets for unknown: total 50 at +Inf
-	// Combined: same shape doubled.
 	dur := sampleVec(
-		bucketSample("abc", "def", "0.1", 20),
-		bucketSample("abc", "def", "0.5", 40),
-		bucketSample("abc", "def", "+Inf", 50),
-		// unknown cluster buckets
-		model.Sample{Metric: model.Metric{
-			"cluster": "unknown", "client_k8s_pod_uid": "abc", "server_k8s_pod_uid": "def", "le": "0.1",
-		}, Value: 20},
-		model.Sample{Metric: model.Metric{
-			"cluster": "unknown", "client_k8s_pod_uid": "abc", "server_k8s_pod_uid": "def", "le": "0.5",
-		}, Value: 40},
-		model.Sample{Metric: model.Metric{
-			"cluster": "unknown", "client_k8s_pod_uid": "abc", "server_k8s_pod_uid": "def", "le": "+Inf",
-		}, Value: 50},
+		bucketSample("abc", "def", "0.1", 20, http),
+		bucketSample("abc", "def", "0.5", 40, http),
+		bucketSample("abc", "def", "+Inf", 50, http),
+		bucketSample("abc", "def", "0.1", 20, grpc),
+		bucketSample("abc", "def", "0.5", 40, grpc),
+		bucketSample("abc", "def", "+Inf", 50, grpc),
 	)
 	res := parseServiceGraphRED(vec, nil, dur, sampleTopology())
 	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
 	require.NotNil(t, m)
 	require.NotNil(t, m.P90ServerMs)
-	// Combined: 0.1→40, 0.5→80, +Inf→100; rank=90 → in (0.5, +Inf] → clamp to 0.5s = 500ms
-	// Wait: 0.1:20+20=40, 0.5:40+40=80, +Inf:50+50=100. rank=90. 80<90 so +Inf clamp → 500ms
+	// Summed: 0.1→40, 0.5→80, +Inf→100. rank=90 > 80, so the quantile lands in
+	// the +Inf bucket and clamps to the highest finite boundary: 0.5s = 500ms.
 	assert.InDelta(t, 500.0, *m.P90ServerMs, 1e-6)
+}
+
+// TestRED_BucketJoinRequiresFullIdentity pins the join contract: a bucket
+// series whose labels drift from its request-total series (an extra dimension
+// on one metric family, a relabel applied to only one) matches nothing and
+// omits p90 — the failure mode accumulateDuration's unmatched tally exists to
+// make diagnosable.
+func TestRED_BucketJoinRequiresFullIdentity(t *testing.T) {
+	vec := sampleVec(uidPodSample("abc", "def", 5))
+	dur := sampleVec(
+		bucketSample("abc", "def", "0.1", 50, model.Metric{"exporter_instance": "otel-1"}),
+		bucketSample("abc", "def", "+Inf", 100, model.Metric{"exporter_instance": "otel-1"}),
+	)
+	res := parseServiceGraphRED(vec, nil, dur, sampleTopology())
+	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
+	require.NotNil(t, m)
+	assert.Nil(t, m.P90ServerMs, "a drifted bucket label set must join nothing, not mis-attribute")
 }
 
 // --- 7.3 Determinism ---
@@ -312,10 +436,11 @@ func TestRED_ShuffleInputByteIdentical(t *testing.T) {
 		fails := []model.Sample{
 			failSample("abc", "def", 1, model.Metric{"connection_type": "http"}),
 		}
+		http := model.Metric{"connection_type": "http"}
 		durs := []model.Sample{
-			bucketSample("abc", "def", "0.1", 50),
-			bucketSample("abc", "def", "0.5", 90),
-			bucketSample("abc", "def", "+Inf", 100),
+			bucketSample("abc", "def", "0.1", 50, http),
+			bucketSample("abc", "def", "0.5", 90, http),
+			bucketSample("abc", "def", "+Inf", 100, http),
 		}
 		rng.Shuffle(len(totals), func(i, j int) { totals[i], totals[j] = totals[j], totals[i] })
 		rng.Shuffle(len(fails), func(i, j int) { fails[i], fails[j] = fails[j], fails[i] })
@@ -374,13 +499,29 @@ type assertAnError struct{}
 
 func (assertAnError) Error() string { return "upstream failed" }
 
+// The counter WAS read (non-empty result) but carries no series matching this
+// edge — the one case the spec defines error_rate == 0 for.
 func TestRED_FailureQueryNoMatch_ErrorRateZero(t *testing.T) {
 	vec := sampleVec(uidPodSample("abc", "def", 5))
-	res := parseServiceGraphRED(vec, sampleVec(), nil, sampleTopology())
+	failed := sampleVec(failSample("other-client", "other-server", 3))
+	res := parseServiceGraphRED(vec, failed, nil, sampleTopology())
 	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
 	require.NotNil(t, m)
 	require.NotNil(t, m.ErrorRate)
 	assert.InDelta(t, 0.0, *m.ErrorRate, 1e-12)
+}
+
+// An EMPTY failure result means the metric does not exist upstream, which the
+// spec's *RED graceful degradation* requirement puts on the same footing as a
+// query error: error_rate is OMITTED so an absent measurement is never
+// presented as a measured absence of errors.
+func TestRED_FailureMetricAbsent_OmitsErrorRate(t *testing.T) {
+	vec := sampleVec(uidPodSample("abc", "def", 5))
+	res := parseServiceGraphRED(vec, sampleVec(), nil, sampleTopology())
+	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
+	require.NotNil(t, m)
+	assert.InDelta(t, 5.0, m.Rate, 1e-12)
+	assert.Nil(t, m.ErrorRate, "failure metric absent upstream → error_rate omitted, not 0")
 }
 
 func TestRED_DurationEmpty_OmitsP90(t *testing.T) {
@@ -393,16 +534,9 @@ func TestRED_DurationEmpty_OmitsP90(t *testing.T) {
 
 func TestRED_DurationNoLe_OmitsP90(t *testing.T) {
 	vec := sampleVec(uidPodSample("abc", "def", 5))
-	// Series with no le label (native histogram / vmrange case).
-	dur := sampleVec(model.Sample{
-		Metric: model.Metric{
-			"cluster":            "cluster-alpha",
-			"client_k8s_pod_uid": "abc",
-			"server_k8s_pod_uid": "def",
-			// no "le"
-		},
-		Value: 10,
-	})
+	// A series that JOINS its request-total series but carries no `le` label —
+	// the native-histogram / vmrange case, distinct from "joined nothing".
+	dur := sampleVec(uidPodSample("abc", "def", 10))
 	res := parseServiceGraphRED(vec, nil, dur, sampleTopology())
 	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
 	require.NotNil(t, m)
@@ -513,11 +647,11 @@ func TestRED_D33ClearedUIDDoesNotAttachToExternal(t *testing.T) {
 	require.True(t, sawExternal, "fixture must produce an external endpoint")
 }
 
-// TestRED_D33ClearedUIDDoesNotAttachToService is the sibling case: a RESOLVABLE
-// "://" target downgrades the edge to pod-calls-service, which the attach
-// already excludes by type. Pinned so a future refactor of the type check
-// cannot silently start attaching metrics to service endpoints.
-func TestRED_D33ClearedUIDDoesNotAttachToService(t *testing.T) {
+// TestRED_D33ClearedUIDAttachesToService is the sibling case: a RESOLVABLE
+// "://" target names a real Service, so the pod-calls-service edge IS measured.
+// Pinned alongside the external case above so the pair is read together — the
+// discriminator is the resolved node type, never the edge type.
+func TestRED_D33ClearedUIDAttachesToService(t *testing.T) {
 	vec := sampleVec(model.Sample{
 		Metric: model.Metric{
 			"client":             "checkout",
@@ -531,20 +665,23 @@ func TestRED_D33ClearedUIDDoesNotAttachToService(t *testing.T) {
 
 	res := parseServiceGraphRED(vec, nil, nil, sampleTopologyWithServices())
 
-	for _, e := range res.Edges {
-		if e.Type != graph.EdgeTypePodCallsPod {
-			assert.Nilf(t, e.Metrics, "non pod-calls-pod edge carries RED: %s", e.Type)
-		}
-	}
+	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+	require.Len(t, pcs, 1)
+	assert.Equal(t, "cluster-alpha/shop/payments", pcs[0].Target)
+	require.NotNil(t, pcs[0].Metrics)
+	assert.InDelta(t, 3.0, pcs[0].Metrics.Rate, 1e-12)
 }
 
-// TestRED_InvariantMetricsOnlyOnPodPairs is the real form of the "metrics only
-// on pod↔pod edges" invariant: it drives the ACTUAL parse over a corpus of
-// series shapes and checks the emitted graph, rather than seeding a graph with
-// attachments that already satisfy the rule. A tautological version of this
-// check cannot catch a resolution-path defect (see
-// TestRED_D33ClearedUIDDoesNotAttachToExternal).
-func TestRED_InvariantMetricsOnlyOnPodPairs(t *testing.T) {
+// TestRED_InvariantMetricsOnlyOnNamedEndpoints is the real form of the
+// attachment invariant: it drives the ACTUAL parse over a corpus of series
+// shapes and checks the emitted graph, rather than seeding a graph with
+// attachments that already satisfy the rule. A tautological version cannot
+// catch a resolution-path defect (see TestRED_D33ClearedUIDDoesNotAttachToExternal).
+//
+// The invariant: an edge carrying metrics has BOTH endpoints resolved to a pod
+// or a service node, is not a synthesised edge, and is not the ingress chain's
+// entry hop.
+func TestRED_InvariantMetricsOnlyOnNamedEndpoints(t *testing.T) {
 	connString := func(server, clientUID, serverUID string) model.Sample {
 		return model.Sample{Metric: model.Metric{
 			"client": "checkout", "server": model.LabelValue(server),
@@ -555,41 +692,66 @@ func TestRED_InvariantMetricsOnlyOnPodPairs(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		vec  model.Vector
-		topo Topology
+		name   string
+		vec    model.Vector
+		topo   Topology
+		routes routeIndex
 	}{
-		{"uid-resolved pods", sampleVec(uidPodSample("abc", "def", 5)), sampleTopology()},
-		{"synth pod target", sampleVec(uidPodSample("abc", "no-such-uid", 2)), sampleTopology()},
-		{"d27 external", sampleVec(connString("payments.example.com", "abc", "")), sampleTopology()},
-		{"conn-string service", sampleVec(connString("http://payments.shop.svc.cluster.local:8080", "abc", "")), sampleTopologyWithServices()},
-		{"d33 collision → external", sampleVec(connString("redis://nowhere.invalid:6379", "abc", "abc")), sampleTopology()},
-		{"d33 collision → service", sampleVec(connString("http://payments.shop.svc.cluster.local:8080", "pay0", "pay0")), sampleTopologyWithServices()},
-		{"peer-resolved pod ip", sampleVec(podIPPeerSample("10.244.1.9")), sampleTopologyPodIP()},
+		{name: "uid-resolved pods", vec: sampleVec(uidPodSample("abc", "def", 5)), topo: sampleTopology()},
+		{name: "synth pod target", vec: sampleVec(uidPodSample("abc", "no-such-uid", 2)), topo: sampleTopology()},
+		{name: "span-link series", vec: sampleVec(uidPodSample("abc", "def", 5, linkDim())), topo: sampleTopology()},
+		{name: "d27 external", vec: sampleVec(connString("payments.example.com", "abc", "")), topo: sampleTopology()},
+		{name: "conn-string service", vec: sampleVec(connString("http://payments.shop.svc.cluster.local:8080", "abc", "")), topo: sampleTopologyWithServices()},
+		{name: "d33 collision → external", vec: sampleVec(connString("redis://nowhere.invalid:6379", "abc", "abc")), topo: sampleTopology()},
+		{name: "d33 collision → service", vec: sampleVec(connString("http://payments.shop.svc.cluster.local:8080", "pay0", "pay0")), topo: sampleTopologyWithServices()},
+		{name: "peer-resolved pod ip", vec: sampleVec(podIPPeerSample("10.244.1.9")), topo: sampleTopologyPodIP()},
+		{name: "peer-resolved cluster ip", vec: sampleVec(podIPPeerSample("10.0.0.5")), topo: sampleTopologyWithServices()},
+		{
+			name: "route hit ingress chain", vec: sampleVec(unknownPeerSample("api.example.com", nil)),
+			topo: sampleTopologyWithIngress(), routes: routeIndex{chainKey: chainHitEntry()},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res := parseServiceGraphRED(tc.vec, nil, nil, tc.topo)
+			res := parseServiceGraphREDRoutes(tc.vec, nil, nil, tc.topo, tc.routes)
 
-			pods := map[string]struct{}{}
+			named := map[string]struct{}{}
 			for _, p := range tc.topo.Pods {
-				pods[p.ID()] = struct{}{}
+				named[p.ID()] = struct{}{}
 			}
 			for _, p := range res.SynthPods {
-				pods[p.ID()] = struct{}{}
+				named[p.ID()] = struct{}{}
+			}
+			for _, sv := range res.ServiceNodes {
+				named[sv.ID()] = struct{}{}
+			}
+			// The chain's entry hop is the ONE named-endpoint edge that must
+			// stay unmeasured: it re-projects the caller→backend call.
+			entryHops := map[string]struct{}{}
+			for _, e := range res.Edges {
+				if e.Labels["role"] != "" { // never set on edges; guard against drift
+					t.Fatalf("edge carries a role label: %v", e.Labels)
+				}
+			}
+			for _, sv := range res.ServiceNodes {
+				if sv.Labels()["role"] == roleIngressGateway {
+					entryHops[sv.ID()] = struct{}{}
+				}
 			}
 
 			for _, e := range res.Edges {
 				if e.Metrics == nil {
 					continue
 				}
-				assert.Equalf(t, graph.EdgeTypePodCallsPod, e.Type,
-					"metrics on %s edge %s → %s", e.Type, e.Source, e.Target)
-				_, srcPod := pods[e.Source]
-				_, tgtPod := pods[e.Target]
-				assert.Truef(t, srcPod, "metrics source %s is not a pod node", e.Source)
-				assert.Truef(t, tgtPod, "metrics target %s is not a pod node", e.Target)
+				assert.NotEqualf(t, graph.EdgeTypeServiceSelectsPod, e.Type,
+					"metrics on a synthesised fan-out edge %s → %s", e.Source, e.Target)
+				_, srcNamed := named[e.Source]
+				_, tgtNamed := named[e.Target]
+				assert.Truef(t, srcNamed, "metrics source %s is neither a pod nor a service node", e.Source)
+				assert.Truef(t, tgtNamed, "metrics target %s is neither a pod nor a service node", e.Target)
+				_, isEntry := entryHops[e.Target]
+				assert.Falsef(t, isEntry, "metrics on the ingress chain's entry hop %s → %s", e.Source, e.Target)
 			}
 		})
 	}

@@ -74,7 +74,7 @@ type Edge struct {
 // when no usable classic histogram was available. All three values are JSON
 // numbers (never strings) and MAY appear in exponent form for small values.
 //
-//	@Description	RED measurements on a UID-resolved pod-to-pod edge. rate is required when the object is present. error_rate is omitted when the failure counter was unreadable (do not treat absence as 0). p90_server_ms is omitted when no usable classic histogram was available. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+//	@Description	RED measurements on a trace-derived edge whose two endpoints both resolved to a pod or a service node. rate is required when the object is present. error_rate is omitted when the failure counter was unreadable (do not treat absence as 0). p90_server_ms is omitted when no usable classic histogram was available. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
 type EdgeMetricsDTO struct {
 	// Rate is requests per second over the window (always > 0 when present).
 	Rate float64 `json:"rate" example:"5"`
