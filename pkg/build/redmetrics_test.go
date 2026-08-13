@@ -280,7 +280,7 @@ func TestRED_AllLinkSeries_EdgeEmittedWithoutMetrics(t *testing.T) {
 	require.Len(t, pcp, 1, "the span-link edge must still be emitted")
 	assert.Equal(t, "cluster-alpha/abc", pcp[0].Source)
 	assert.Equal(t, "cluster-beta/def", pcp[0].Target)
-	assert.Equal(t, map[string]string{"cluster": "cluster-alpha"}, pcp[0].Labels)
+	assert.Equal(t, map[string]string{"cluster": "cluster-alpha", "relation": "link"}, pcp[0].Labels)
 	assert.Nil(t, pcp[0].Metrics, "a span-link series measures a queue/db hop, not a request")
 }
 

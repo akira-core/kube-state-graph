@@ -7,7 +7,6 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
@@ -465,9 +464,7 @@ func TestReadServiceGraph_SameFQDNResolvedOnce(t *testing.T) {
 	end := time.Unix(1_700_000_000, 0)
 
 	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, string(promql.QServiceGraphTotal), mock.Anything, end).
-		Return(vec, nil)
+	expectServiceGraphQueries(q, end, vec)
 
 	resolver := &fakeRouteResolver{fn: func(RouteRequest) (RouteDestination, RouteOutcome, error) {
 		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments", Port: 8080}, RouteHit, nil
