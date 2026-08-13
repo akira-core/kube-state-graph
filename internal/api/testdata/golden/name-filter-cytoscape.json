@@ -76,6 +76,10 @@
           "target": "cluster-beta/p2",
           "labels": {
             "cluster": "cluster-alpha"
+          },
+          "metrics": {
+            "rate": 2,
+            "error_rate": 0
           }
         }
       }

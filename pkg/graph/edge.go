@@ -23,17 +23,35 @@ const (
 // MUST be treated as a v2 break.
 var edgeNamespace = uuid.MustParse("4f6a3f9c-9d7e-5d8b-9b14-3a3f0a9e2c11")
 
+// EdgeMetrics holds the RED measurements attached to a trace-derived,
+// UID-resolved pod-to-pod edge. Numeric values NEVER enter Labels — same
+// precedent as node ipaddress / owner / ready_status.
+//
+// Absent-vs-zero contract (design D2):
+//   - Rate is required and always > 0 when the struct is present (a zero-rate
+//     series never produces an edge).
+//   - ErrorRate is nil when the failure counter could not be read (query
+//     error / metric absent); a non-nil 0 means the counter was read and
+//     reported no failures. Consumers MUST NOT treat a missing key as 0.
+//   - P90ServerMs is nil when no usable classic histogram was available.
+type EdgeMetrics struct {
+	Rate        float64  // req/s, always > 0 when the struct is present
+	ErrorRate   *float64 // nil = unreadable; 0 = read, no failures
+	P90ServerMs *float64 // nil = no usable classic histogram
+}
+
 // Edge is the canonical edge value carried over the wire.
 type Edge struct {
-	ID     string
-	Type   EdgeType
-	Source string
-	Target string
-	Labels map[string]string
+	ID      string
+	Type    EdgeType
+	Source  string
+	Target  string
+	Labels  map[string]string
+	Metrics *EdgeMetrics // nil = no RED measurements for this edge
 }
 
 // NewEdge constructs an Edge with a deterministic UUIDv5 id derived from
-// (type | source | target).
+// (type | source | target). Metrics is always nil; attach via WithMetrics.
 func NewEdge(t EdgeType, source, target string, labels map[string]string) *Edge {
 	if labels == nil {
 		labels = map[string]string{}
@@ -46,6 +64,20 @@ func NewEdge(t EdgeType, source, target string, labels map[string]string) *Edge 
 		Target: target,
 		Labels: labels,
 	}
+}
+
+// WithMetrics returns a shallow copy of e carrying the given metrics.
+// ID, Type, Source, Target, and Labels are unchanged — edge identity is
+// derived solely from (type|source|target) and metrics never perturb it.
+// The original *Edge is left untouched (immutability).
+func (e *Edge) WithMetrics(m EdgeMetrics) *Edge {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	mm := m
+	cp.Metrics = &mm
+	return &cp
 }
 
 // SortEdges orders edges deterministically by ID for stable output.

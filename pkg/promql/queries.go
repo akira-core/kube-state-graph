@@ -21,8 +21,21 @@ const (
 	QPVCBindings       Query = "kube_pod_spec_volumes_persistentvolumeclaims_info"
 	QNodeLabels        Query = "kube_node_labels"
 	QServiceGraphTotal Query = "traces_service_graph_request_total"
-	QClusterDiscovery  Query = "cluster_discovery"
-	QUpProbe           Query = "up"
+	// QServiceGraphFailedTotal is the Errors counter of the service-graph RED
+	// triple. OPTIONAL — a missing metric, empty result, or query error degrades
+	// to "no error_rate on the edge" and never fails the build. The configurable
+	// metric-name prefix is NOT applied (Alloy/Tempo exporter family, same as
+	// QServiceGraphTotal). See design D3 / D6 of add-service-graph-red-metrics.
+	QServiceGraphFailedTotal Query = "traces_service_graph_request_failed_total"
+	// QServiceGraphServerSecondsBucket is the Duration classic histogram of the
+	// service-graph RED triple (server-observed). OPTIONAL — absence degrades to
+	// "no p90_server_ms". Prefix NOT applied. The rendered PromQL is RAW: no
+	// upstream aggregation, so each bucket series keeps the full dimension set of
+	// its request-total series plus `le` and joins by exact identity, exactly like
+	// the failure counter (design D4 / D5).
+	QServiceGraphServerSecondsBucket Query = "traces_service_graph_request_server_seconds_bucket"
+	QClusterDiscovery                Query = "cluster_discovery"
+	QUpProbe                         Query = "up"
 
 	// Service / endpointslice topology (D29 connection-string resolution).
 	// KSM-shaped, so prefix-aware via Renderer.
@@ -136,9 +149,38 @@ const ClusterDiscoveryLookback = time.Hour
 // identical no-node/no-edge outcome as the old exclusion — see
 // resolveUnknownServerPeer in pkg/build/servicegraph.go.
 //
-// Deferred numeric service-graph metrics (traces_service_graph_request_failed_total,
-// _server_seconds_bucket) MUST reuse this fragment so the edge set stays consistent.
+// The numeric service-graph metrics (traces_service_graph_request_failed_total,
+// traces_service_graph_request_server_seconds_bucket) reuse this fragment so the
+// three series always describe one edge population (add-service-graph-red-metrics D6).
 const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
+
+// serviceGraphLinkExclusionSelector drops span-link virtual edges from the two
+// OPTIONAL RED series (add-service-graph-red-metrics D1b / D6). The
+// operator-configured `edge_relation="link"` dimension marks an edge the
+// servicegraph connector materialised from a SPAN LINK rather than from a
+// paired client/server span: the two spans belong to different trace contexts
+// and the interaction physically traverses a queue or a database, so the RED
+// series measure something that is not a request-response call. The edge is
+// still emitted (the request-total selector deliberately does NOT carry this
+// matcher) — only its measurement is suppressed.
+//
+// Same class as the D30 sentinel and the node condition="Ready" selector: a
+// fixed contract that never varies per request, NOT a caller filter, so the
+// "no filters pushed to PromQL" rule is preserved. The label name and the value
+// are compiled in — no knob.
+//
+// PromQL `!=` treats an ABSENT label as the empty string, so this retains every
+// series that does not carry the dimension at all: inert for a producer that
+// never configured it.
+//
+// Deliberately NOT equivalent to the attachment rule — the rule's remaining
+// conditions (both endpoints resolved to a pod or a service; not the ingress
+// chain's entry hop) are functions of topology and of the route index and have
+// no label-level form. The queried population is a SUPERSET of the attached
+// one; what matters is the other direction, which holds: every query-layer
+// exclusion here is mirrored in pkg/build, so no eligible edge can have its
+// failure/bucket series filtered away upstream and then read as error_rate=0.
+const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 
 // Renderer renders Query templates to PromQL strings, optionally prepending
 // Prefix to every kube-state-metrics-shaped metric name. The prefix is
@@ -219,6 +261,27 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// identical for every request — NOT a caller-supplied filter — so it
 		// does not violate the "no filters pushed to PromQL" rule (D2 / D7).
 		return fmt.Sprintf(`rate(traces_service_graph_request_total{%s}[%s])`, serviceGraphSentinelSelector, w)
+	case QServiceGraphFailedTotal:
+		// OPTIONAL Errors counter. Prefix NOT applied (Alloy/Tempo family).
+		// Raw label granularity so failures join the total series by exact
+		// identity (design D4).
+		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total{%s,%s}[%s])`,
+			serviceGraphSentinelSelector, serviceGraphLinkExclusionSelector, w)
+	case QServiceGraphServerSecondsBucket:
+		// OPTIONAL Duration classic histogram. Prefix NOT applied.
+		//
+		// Read RAW — deliberately no upstream `sum by` (design D4). Once an
+		// endpoint may be resolved from a peer address or a connection string,
+		// no low-cardinality label subset identifies an edge: grouping by the
+		// pod-pair triple merges every peer-resolved destination of one client
+		// pod into a single bucket set, and recovering the distinction means
+		// tracking the resolver's full peer-label set in the group-by forever.
+		// Series identity has no such coupling. The cost is bucket-count
+		// multiplied cardinality on the wire; the metric is OPTIONAL, so a store
+		// that refuses the query degrades exactly as an absent one.
+		return fmt.Sprintf(
+			`rate(traces_service_graph_request_server_seconds_bucket{%s,%s}[%s])`,
+			serviceGraphSentinelSelector, serviceGraphLinkExclusionSelector, w)
 	case QClusterDiscovery:
 		return fmt.Sprintf(`group by (cluster) (last_over_time(%skube_node_info[%s]))`, r.Prefix, w)
 	case QUpProbe:

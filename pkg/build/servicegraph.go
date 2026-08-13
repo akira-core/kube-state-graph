@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
@@ -70,14 +71,67 @@ func ReadServiceGraph(
 	resolver RouteResolver,
 	resolveTimeout time.Duration,
 ) (ServiceGraphResult, error) {
-	vec, err := q.Instant(ctx,
-		string(promql.QServiceGraphTotal),
-		r.Render(promql.QServiceGraphTotal, window),
-		end,
+	// Fan the three service-graph queries out under an errgroup (design D3).
+	// The total query's error still fails the build; the two OPTIONAL RED
+	// queries record their error and yield a nil vector so the parse can
+	// degrade field-by-field without failing the request.
+	var (
+		vec      model.Vector
+		totalErr error
+		failed   model.Vector
+		failErr  error
+		duration model.Vector
+		durErr   error
 	)
-	if err != nil {
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		out, err := q.Instant(gctx,
+			string(promql.QServiceGraphTotal),
+			r.Render(promql.QServiceGraphTotal, window),
+			end,
+		)
+		vec, totalErr = out, err
+		return err // only the total query's error fails the group
+	})
+	g.Go(func() error {
+		out, err := q.Instant(gctx,
+			string(promql.QServiceGraphFailedTotal),
+			r.Render(promql.QServiceGraphFailedTotal, window),
+			end,
+		)
+		failed, failErr = out, err
+		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
+	})
+	g.Go(func() error {
+		out, err := q.Instant(gctx,
+			string(promql.QServiceGraphServerSecondsBucket),
+			r.Render(promql.QServiceGraphServerSecondsBucket, window),
+			end,
+		)
+		duration, durErr = out, err
+		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
+	})
+	if err := g.Wait(); err != nil {
+		// Prefer the total-query error message when present.
+		if totalErr != nil {
+			return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", totalErr)
+		}
 		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
 	}
+
+	// One aggregated degradation line naming which optional RED query failed
+	// and why — never per edge (design D3 / graceful degradation).
+	if failErr != nil || durErr != nil {
+		attrs := []any{}
+		if failErr != nil {
+			attrs = append(attrs, "failed_total_error", failErr.Error())
+		}
+		if durErr != nil {
+			attrs = append(attrs, "server_seconds_bucket_error", durErr.Error())
+		}
+		slog.Warn("service-graph RED query degraded; metrics will be partial", attrs...)
+	}
+
 	// ONE resolver per build, shared by the prescan and the parse. Its topology
 	// indexes are immutable and building them scans every pod and Service across
 	// every cluster (with per-family sorts), so building them twice per request
@@ -92,7 +146,27 @@ func ReadServiceGraph(
 		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
 			collectRouteQueriesWith(vec, res), end)
 	}
-	return parseWithResolver(vec, res, routes), nil
+	return parseWithResolver(vec, res, routes, redInputs{
+		Failed:      failed,
+		FailedErr:   failErr,
+		Duration:    duration,
+		DurationErr: durErr,
+	}), nil
+}
+
+// optionalQueryFatal decides whether an OPTIONAL RED query's error should fail
+// the build. The metric's own absence or upstream rejection never does — that
+// is the graceful-degradation contract. A failure caused by the CALLER's own
+// context (build timeout / client disconnect) MUST still surface: swallowing it
+// would let a request that blew --build-timeout return 200 with silently
+// degraded metrics instead of the 504 the timeout contract promises. gctx's own
+// cancellation (triggered by the total query failing) is deliberately not
+// fatal here — the total query's error is the one that gets reported.
+func optionalQueryFatal(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return err
+	}
+	return nil
 }
 
 // sgResolver carries the per-build dedupe maps and topology indexes used to
@@ -204,10 +278,15 @@ type podIPCandidate struct {
 	pod     *graph.PodNode
 }
 
-// parseServiceGraph is the route-index-free form: the ~70 direct test call
-// sites and any parse without a RouteResolver go through here. Identical to
-// parseServiceGraphRoutes with a nil index — i.e. the pre-change behaviour,
-// byte for byte.
+// parseServiceGraph is the route-index-free form used by the ~70 direct test
+// call sites. Identical to parseServiceGraphRoutes with a nil index.
+//
+// NOT a production entry point — ReadServiceGraph always goes through
+// parseWithResolver so it can hand over the real RED inputs. This form passes a
+// zero redInputs, which by that type's contract reads as "both OPTIONAL queries
+// succeeded and returned nothing", so qualifying edges get rate + error_rate=0
+// and no p90_server_ms. Any future production caller MUST pass real inputs
+// instead, or it will fabricate an error_rate=0 no query ever measured.
 func parseServiceGraph(vec model.Vector, topology Topology) ServiceGraphResult {
 	return parseServiceGraphRoutes(vec, topology, nil)
 }
@@ -235,7 +314,11 @@ func newSGResolver(topology Topology) *sgResolver {
 		if len(ips) == 0 || ips[0] == "" {
 			continue
 		}
-		ik := ipKey{cluster: p.Labels()["cluster"], ip: ips[0]}
+		// Index the CANONICAL textual form so an IPv6 peer address written
+		// differently from the exporter's pod_ip label (case, zero-run
+		// compression, IPv4-mapped prefix) still matches — lookupPeerPodIP
+		// canonicalises its host the same way. IPv4 is unchanged by this.
+		ik := ipKey{cluster: p.Labels()["cluster"], ip: canonicalIP(ips[0])}
 		if existing, ok := perCluster[ik]; ok && existing.ID() <= p.ID() {
 			continue
 		}
@@ -289,7 +372,10 @@ func newSGResolver(topology Topology) *sgResolver {
 		if obs.ClusterIP == "" || obs.ClusterIP == "None" {
 			continue
 		}
-		ik := ipKey{cluster: k.cluster, ip: obs.ClusterIP}
+		// Canonical textual form, symmetric with the Pod-IP index above and
+		// with classifyPeerHost's lookup: an IPv6 ClusterIP written differently
+		// from the peer-address label would otherwise miss. IPv4 is unchanged.
+		ik := ipKey{cluster: k.cluster, ip: canonicalIP(obs.ClusterIP)}
 		if existing, ok := ipIndex[ik]; ok {
 			if k.namespace > existing.namespace ||
 				(k.namespace == existing.namespace && k.service >= existing.service) {
@@ -329,11 +415,12 @@ func parseServiceGraphRoutes(vec model.Vector, topology Topology, routes routeIn
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
 	}
-	return parseWithResolver(vec, newSGResolver(topology), routes)
+	return parseWithResolver(vec, newSGResolver(topology), routes, redInputs{})
 }
 
 // parseWithResolver is the parse body over an already-built resolver.
-func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) ServiceGraphResult {
+// red carries the two OPTIONAL RED query results (may be zero-value).
+func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red redInputs) ServiceGraphResult {
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
 	}
@@ -351,8 +438,15 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		srcIsPod   bool
 		srcCluster string
 	}
-	type pairKey struct{ src, tgt string }
 	pairs := make(map[pairKey]aggEdge, len(vec))
+	// RED join state: series→pair and redKey→pair maps built during the
+	// resolution loop; attach pass runs after the loop (design D1/D4).
+	// A join whose vector is absent (query errored, or the deployment does not
+	// expose the OPTIONAL metric — the common case) is switched off entirely so
+	// the loop never pays for a key it cannot use.
+	joinFailures := red.FailedErr == nil && len(red.Failed) > 0
+	joinDuration := red.DurationErr == nil && len(red.Duration) > 0
+	rj := newRedJoin(len(vec), joinFailures, joinDuration)
 
 	// Span-link relation marking (add-span-link-logical-edges D1): two
 	// function-local pair sets consulted at edge-build time — linkPairs marks
@@ -392,6 +486,18 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		// server=="unknown" and the client resolves to a real pod — see
 		// resolveUnknownServerPeer.
 		peer := peerLabelsOf(s.Metric)
+
+		// seriesKey is a pure function of the RAW series labels (D4): both
+		// companion vectors join to it by exact identity, the histogram after
+		// dropping `le`. Computed only when at least one of them is present —
+		// seriesKeyOf sorts and concatenates every label of every series, so it
+		// is not something to pay for when there is nothing to join against.
+		var sk string
+		if rj.joinKeyed() {
+			sk = seriesKeyOf(s.Metric)
+		}
+		// A span-link series still produces its edge but measures nothing (D1b).
+		inScope := redSeriesInScope(s.Metric)
 
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
 
@@ -452,6 +558,11 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 			}
 		}
 		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, peer)
+		// Index of the RouteHit ingress-chain ENTRY hop within tgtIDs, or -1.
+		// Its edge is trace-derived and pod/service on both ends, but it is a
+		// second projection of the SAME call as the retained caller→backend
+		// edge, so only the backend carries the measurement (design D1).
+		chainEntry := chainEntryIndex(tgtIDs)
 
 		// Cross product: any resolved source × any resolved target. Each "://"
 		// side now resolves to at most one (local) service node, so a both-"://"
@@ -460,7 +571,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		// D5): the server side resolves to [ingress service, backend service],
 		// yielding both the caller→ingress and the direct caller→backend edge.
 		for _, srcID := range srcIDs {
-			for _, tgtID := range tgtIDs {
+			for ti, tgtID := range tgtIDs {
 				// Deterministic dedupe: multiple upstream series can resolve to the
 				// same (src, tgt) pair while carrying different trace `cluster`
 				// labels (e.g. one missing → "unknown", the client pod recovered via
@@ -473,6 +584,19 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 				if prev, dup := pairs[key]; !dup || betterSrcCluster(traceCluster, prev.srcCluster) {
 					pairs[key] = aggEdge{srcIsPod: srcIsPod, srcCluster: traceCluster}
 				}
+				// Record RED join keys for every pair this series produced.
+				//
+				// The structural verdict is the RESOLVED endpoint types plus the
+				// chain position (design D1) — never the raw UID labels and never
+				// the edge type. Neither of those holds: D33's self-loop
+				// normalisation clears the "://" side's UID, so that side can
+				// resolve to a service or an external node while the raw UIDs
+				// still look fully pod-resolved, and an external target leaves
+				// the edge type at pod-calls-pod (only a service target
+				// downgrades it), so the type check cannot catch it either.
+				rj.recordSeries(key,
+					ti != chainEntry && res.isPodOrServiceID(srcID) && res.isPodOrServiceID(tgtID),
+					inScope, float64(s.Value), sk)
 			}
 		}
 
@@ -527,6 +651,58 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		}
 	}
 
+	// Second pass: join failure rates and duration buckets onto pairs (D4).
+	if joinFailures {
+		matched, unmatched := rj.accumulateFailures(red.Failed)
+		// The failure counter joins the request counter by EXACT series
+		// identity. If the two metrics ever disagree on their label set (an
+		// extra dimension, a relabel applied to only one of them), NOTHING
+		// joins and every edge reports error_rate=0 — indistinguishable from
+		// "no failures", which is precisely the conflation the contract
+		// forbids. Surface that signature instead of letting it read clean.
+		switch {
+		case matched == 0 && unmatched > 0:
+			slog.Warn("service-graph failure counter joined no request series; error_rate reads 0 on every edge",
+				"reason", "failed_total_label_set_mismatch",
+				"unmatched_series", unmatched)
+		case unmatched > 0:
+			slog.Debug("service-graph failure series with no matching request series",
+				"unmatched_series", unmatched, "matched_series", matched)
+		}
+	}
+	if joinDuration {
+		matched, unmatched, sawNoLe := rj.accumulateDuration(red.Duration)
+		// Same failure mode as the failure counter, different symptom: the
+		// histogram joins by exact identity minus `le`, so a label-set drift
+		// between _total and _bucket matches nothing and omits p90_server_ms on
+		// every edge — indistinguishable from a producer that emits no
+		// histogram at all unless it is surfaced.
+		switch {
+		case matched == 0 && unmatched > 0:
+			slog.Warn("service-graph duration histogram joined no request series; p90_server_ms omitted on every edge",
+				"reason", "server_seconds_bucket_label_set_mismatch",
+				"unmatched_series", unmatched)
+		case unmatched > 0:
+			slog.Debug("service-graph duration series with no matching request series",
+				"unmatched_series", unmatched, "matched_series", matched)
+		}
+		if sawNoLe {
+			slog.Warn("service-graph RED duration series carried no usable classic le buckets; p90_server_ms omitted",
+				"reason", "no_classic_le_buckets")
+		}
+	}
+
+	// error_rate is emitted ONLY when the failure counter was actually read:
+	// the query succeeded AND returned at least one series. An empty result is
+	// "the metric does not exist upstream", which the spec's *RED graceful
+	// degradation* requirement puts on the same footing as a query error —
+	// `error_rate` is OMITTED, never reported as 0, so an absent measurement is
+	// never presented as a measured absence of errors. `error_rate == 0` is
+	// reserved for the case the spec defines it for: the counter was read and
+	// no series matched THIS edge.
+	failedOK := joinFailures
+	durationOK := red.DurationErr == nil
+
 	edges := make([]*graph.Edge, 0, len(pairs)+len(res.svcEdges))
 	for k, agg := range pairs {
 		// Edge `cluster` label is the trace-source / client-side cluster, but
@@ -552,7 +728,18 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 		if _, isSvc := res.services[k.tgt]; isSvc {
 			edgeType = graph.EdgeTypePodCallsService
 		}
-		edges = append(edges, graph.NewEdge(edgeType, k.src, k.tgt, labels))
+		e := graph.NewEdge(edgeType, k.src, k.tgt, labels)
+		// RED attach (design D1). Every pair in this map is trace-derived by
+		// construction; the accumulator carries the rest of the rule — an
+		// external endpoint, the ingress chain's entry hop, and an all-span-link
+		// pair are all ineligible there, so no edge-type gate is needed and
+		// pod-calls-service edges are measured like any other. The two
+		// synthesised edge sets (svcEdges, routeChainEdges) never pass through
+		// here at all.
+		if m, ok := rj.acc[k].attachMetrics(failedOK, durationOK); ok {
+			e = e.WithMetrics(m)
+		}
+		edges = append(edges, e)
 	}
 	// Aggregated span-link evidence (per-endpoint detail would be noise): a
 	// transport pair with no matching emitted edge is a pure marker — the
@@ -573,6 +760,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex) Ser
 			"link_series_without_resolvable_consumer", linkNoConsumer)
 	}
 	for _, e := range res.svcEdges {
+		// service-selects-pod edges never carry metrics (synthesised fan-out).
 		edges = append(edges, e)
 	}
 	// Synthesized RouteHit ingress-chain edges (ingress pod → backend service,
@@ -747,6 +935,56 @@ func (r *sgResolver) lookupClientPod(traceCluster, podUID string) *graph.PodNode
 	return nil
 }
 
+// isPodOrServiceID reports whether a resolved endpoint id names a type="pod"
+// node (a real topology pod or a synthesised one) or a type="service" node.
+//
+// This is the RED attachment rule's structural test (design D1): an endpoint the
+// reader could actually NAME. How it was identified — a pod UID, a "://"
+// connection string, a peer address matched to a ClusterIP or to a Pod IP, a
+// route-engine resolution — is irrelevant. What the rule excludes is the
+// external node, which collapses every caller-visible destination sharing one
+// label string onto one non-cluster-scoped identity.
+//
+// It cannot be inferred from the edge type: only a service target downgrades
+// the type to pod-calls-service, so an external target leaves a pod-calls-pod
+// edge looking exactly like a resolved one.
+func (r *sgResolver) isPodOrServiceID(id string) bool {
+	if _, ok := r.podByID[id]; ok {
+		return true
+	}
+	if _, ok := r.synthPods[id]; ok {
+		return true
+	}
+	_, ok := r.services[id]
+	return ok
+}
+
+// chainEntryIndex reports the index within a resolved server-target slice that
+// holds the RouteHit ingress-chain ENTRY hop, or -1 when the resolution
+// produced no chain.
+//
+// The two-target shape is unique to a chained RouteHit: routeIndexResolve
+// appends the backend id to resolveRouteChain's single ingress id, yielding
+// [ingress, backend] (route-hit-ingress-chain D5). Every other server-side path
+// — pod UID, synth pod, connection string, peer address, route hit without a
+// chain, external fallback — resolves to at most one node, because
+// resolveServiceLevel materialises exactly one service node per endpoint.
+//
+// Load-bearing for RED: the entry hop and the retained caller→backend edge are
+// two projections of ONE observed call, so measuring both would make a single
+// request contribute its rate twice to any sum over the chain (design D1).
+// Written as `> 1` rather than `== 2` deliberately: the shape is an invariant
+// of today's resolution paths, not something the type system enforces, and if a
+// future path ever returns three targets the safe failure is "the first hop
+// goes unmeasured", not "the entry hop is measured and the call is counted
+// twice".
+func chainEntryIndex(tgtIDs []string) int {
+	if len(tgtIDs) > 1 {
+		return 0
+	}
+	return -1
+}
+
 // classifyPeerHost runs the in-cluster classification ladder of the
 // unknown-server enrichment over a port-stripped host: the Kubernetes .svc DNS
 // grammar, the bare short Service name (resolved in the client pod's own
@@ -765,8 +1003,8 @@ func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster strin
 	// the anchor cluster's OWN ClusterIP set only — never a family sibling,
 	// since a ClusterIP is a per-cluster address that can legitimately collide
 	// across unrelated clusters' Service CIDRs (see ipKey doc comment).
-	if net.ParseIP(host) != nil {
-		if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: host}]; hit {
+	if ip := net.ParseIP(host); ip != nil {
+		if sk, hit := r.ipIndex[ipKey{cluster: anchorCluster, ip: ip.String()}]; hit {
 			return sk.namespace, sk.service, true
 		}
 	}
@@ -798,10 +1036,11 @@ func (r *sgResolver) classifyPeerHost(host, clientNamespace, anchorCluster strin
 // from a plain miss for the debug tally. A different-family cluster is
 // excluded by the famIPKey lookup itself — no extra check.
 func (r *sgResolver) lookupPeerPodIP(anchorCluster, host string) (pod *graph.PodNode, ambiguous bool) {
-	if net.ParseIP(host) == nil {
+	ip := net.ParseIP(host)
+	if ip == nil {
 		return nil, false
 	}
-	cands := r.podIPCandidates[famIPKey{family: ClusterFamilyKey(anchorCluster), ip: host}]
+	cands := r.podIPCandidates[famIPKey{family: ClusterFamilyKey(anchorCluster), ip: ip.String()}]
 	for _, c := range cands {
 		if c.cluster == anchorCluster {
 			return c.pod, false
@@ -811,6 +1050,17 @@ func (r *sgResolver) lookupPeerPodIP(anchorCluster, host string) (pod *graph.Pod
 		return cands[0].pod, false
 	}
 	return nil, len(cands) > 1
+}
+
+// canonicalIP normalises an IP literal to net.IP's canonical text form, so an
+// index built from one spelling is hit by any other spelling of the same
+// address. A non-IP value is returned verbatim (it can then only be matched by
+// an identical non-IP value, which is the pre-existing behaviour).
+func canonicalIP(s string) string {
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
+	}
+	return s
 }
 
 // anchorHolds reports whether the anchor cluster itself deploys (ns, svc) —

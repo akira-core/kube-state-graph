@@ -78,7 +78,7 @@ parseGraphRequest        ── validates start/end (RFC 3339 or Unix seconds); 
 context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; deadline exceeded → 504 timeout
    └─ Builder.Build(ctx, window, end)
          ├─ ReadTopology  (errgroup of 18 PromQL queries in parallel: KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 2 NetApp Trident)
-         ├─ ReadServiceGraph (1 PromQL, `user`/`unknown` peers excluded at selector — D30; joined with topology)
+         ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector — D30; joined with topology)
          └─ assemble + graph.NewGraph → *Graph (immutable, with adjacency)
    (no in-process concurrency cap; HPA + Pod resource limits handle load shedding)
    ▼
@@ -100,18 +100,82 @@ live under `openspec/specs/`.
 - **Default projection is the connectivity-connected subgraph.** Every `/v1/graph` response carries only the workload that sits on a **connectivity edge** (`pod-calls-pod` / `pod-calls-service` / `service-selects-pod`) plus the infra that hangs off it. Concretely: a pod is kept iff it is an endpoint of a connectivity edge; an edgeless pod is dropped, and with it (via the generalised D6 reference rule) the node hosting only edgeless pods, the PVC mounted only by edgeless pods, and the StorageClass backing only such PVCs. **An unmounted PVC (no `pod-mounts-pvc` binding at all) is therefore dropped too** — a PVC is kept iff a connectivity-connected pod mounts it. **Service nodes are unaffected** — they are only ever materialised by the D29 connection-string resolver, so they are connectivity-born by construction (topology `kube_service_info` is index-only, never emitted as a node). The decision set is `graph.connectivityExcluded(g)` — a **pure function of the built graph** (scope-independent: a PVC's keep/drop depends on whether its mounting pod is *connected*, not on the request's cluster/namespace filter, and the two co-move because `pod-mounts-pvc` is intra-cluster/same-namespace), computed once in `graph.Project` and consulted in **both** `filterNodes` (skip excluded ids) **and** `filterEdges`/`readdEdgePartners` (an excluded pod/PVC is never resurrected as an edge partner — e.g. the pruned pod of a `pod-to-node` edge whose host node survived via another pod). The prune is **suppressed under two on-demand escape hatches** (symmetric with the D6 infra-node name/root exception): an explicit `?name=<pod|pvc>` surfaces a specific edgeless element, and a `?root=`-anchored traversal returns its reachable set verbatim (`excluded` is nil whenever `scope.Root != ""` or `NameFilterActive()`). `?cluster=` / `?namespace=` filters do **not** disable the prune. **Consequence:** the default/no-filter view is the traffic graph, not the full inventory — an edgeless pod, an unmounted PVC, or a podless node is fetched on demand with `?name=`. The **full-topology `*Graph` is still built** (the build still loads every cluster's every pod/node/pvc — see "No filters pushed to PromQL"); the prune is a **projection concern**, scope-independent, so a future cache serving any filter from one built graph is unaffected.
 - **No time-window alignment, no window cap, no future-time guard.** `start` and `end` are passed through to upstream PromQL verbatim; only `end > start` is enforced. The previous 60 s `floor`/`ceil` grid was removed alongside the in-process cache it was bucketing for. Bounded query cost is delegated to upstream VictoriaMetrics search limits (`-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`, `-search.maxSamplesPerQuery`). Response body is `{apiVersion, clusters, elements}` — no time fields are echoed.
 - **`labels` is strict `map[string]string`** on both nodes and edges. No bools,
-  no numbers, no string-encoded numbers. Numeric edge metrics (`rate`, `p99_ms`,
-  `error_rate`) and boolean flags (`cross_cluster`, `ghost`) are **deferred to a
-  future typed struct field**. `pod-calls-pod` and `pod-calls-service` edges
-  carry a single `labels.cluster` (the trace source / client-side cluster,
-  omitted when the client side is non-pod). Cross-cluster status is derived by
-  comparing the resolved source-node and target-node `labels.cluster` — D9.
+  no numbers, no string-encoded numbers. Boolean flags (`cross_cluster`, `ghost`)
+  remain deferred to a future typed field. **RED edge metrics** live on the
+  typed nullable `Edge.Metrics *EdgeMetrics` (`rate`, `error_rate`,
+  `p90_server_ms`) serialised as `data.metrics` — never inside `labels`.
+  Attachment rule (hardcoded): a **trace-derived** edge whose **both resolved
+  endpoints** name a `type="pod"` node (real or synth) or a `type="service"`
+  node — enforced by `sgResolver.isPodOrServiceID`, NOT by the raw UID labels
+  and NOT by the edge type (D33 clears a `"://"` side's UID after the labels are
+  read, and an `external` target leaves the type at `pod-calls-pod`). **How** an
+  endpoint was identified is irrelevant: pod UID, `"://"` connection string,
+  `server="unknown"` peer address → ClusterIP or Pod IP, and route-engine
+  resolution all qualify, so `pod-calls-service` edges ARE measured. No metrics
+  on: any edge with an `external` endpoint; synthesised edges
+  (`service-selects-pod` fan-out, the ingress-chain gateway-pod → backend hop,
+  topology edges); and the route-hit chain's **caller → ingress entry hop**
+  (`chainEntryIndex` — that hop and the retained caller → backend edge are two
+  projections of ONE call, so only the backend is measured and a sum over the
+  chain never double-counts). A contributing series carrying
+  `edge_relation="link"` is **out of scope** (span-link virtual edge — the call
+  crosses a queue/DB and the two spans are different trace contexts): the edge
+  is still emitted, but the series feeds no rate/error/bucket, so a mixed edge
+  is measured over its non-link subset and an all-link edge gets no `metrics`
+  object (empty in-scope set ⇒ rate 0 ⇒ ineligible; no special case). Three
+  parallel queries: `traces_service_graph_request_total` (required for the
+  edge; deliberately NOT link-filtered), plus OPTIONAL `..._failed_total` and
+  `..._server_seconds_bucket` — both read at the total counter's **raw** label
+  granularity (the histogram has NO upstream `sum by`) and joined by exact
+  series identity (the histogram minus `le`) through one `seriesKey → pairKey`
+  map, both carrying D30's sentinel plus `serviceGraphLinkExclusionSelector`
+  (`edge_relation!="link"`). The queried population is a **superset** of the
+  attached one (endpoint node type has no label-level form); what holds is the
+  one-way property — every query-layer filter is mirrored in Go, so no eligible
+  edge loses its companion series and reads `error_rate: 0`. Failure/duration
+  errors degrade field-by-field (`error_rate` absent ≠ `0`; `p90_server_ms`
+  omitted) and never fail the build; a non-empty companion vector that joined
+  NOTHING is warned per vector (`failed_total_label_set_mismatch` /
+  `server_seconds_bucket_label_set_mismatch`). Values are JSON numbers rounded
+  to 6 significant digits at serialisation and MAY appear in exponent form.
+  `pod-calls-pod` and
+  `pod-calls-service` edges carry a single `labels.cluster` (the trace source /
+  client-side cluster, omitted when the client side is non-pod). Cross-cluster
+  status is derived by comparing the resolved source-node and target-node
+  `labels.cluster` — D9.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
   and the canonical input `<type>|<source>|<target>`. Stable across rebuilds —
   required for golden tests. Bumping the namespace UUID is a v2 break.
 - **Cluster-scoped IDs everywhere.** Pods: `<cluster>/<uid>`, K8s nodes:
   `<cluster>/<node>`, PVCs: `<cluster>/<namespace>/<claim>`, externals:
   `external/<value>`. Node names are not globally unique without the prefix.
+#### Service-graph glossary (load-bearing terms)
+
+- **Trace-derived edge**: an edge produced from at least one
+  `traces_service_graph_request_total` series (the `pairs` map in the parse).
+- **Synthesised edge**: an edge with no originating series —
+  `service-selects-pod` fan-out, topology edges (`pod-to-node`, `pod-mounts-pvc`,
+  `pvc-to-storageclass`), and the route-hit ingress-chain's gateway-pod →
+  backend-service `pod-calls-service` hop. Spelling is British **synthesised**
+  in prose; Go identifiers may use `synthesized` (e.g. `routeChainEdges`
+  comments). NOT synthesised: the chain's **caller → ingress entry hop**, which
+  IS trace-derived — it is excluded from RED for a different reason (it
+  re-projects the caller → backend call).
+- **UID-resolved endpoint**: resolved from a non-empty `client_k8s_pod_uid` /
+  `server_k8s_pod_uid` to a `type="pod"` node (topology or synth).
+- **Peer-resolved endpoint**: identified only via the unknown-server peer-address
+  ladder (including Pod-IP) — the connector could not pair a server span. Since
+  the RED revision this is a provenance label only: it does NOT affect metrics
+  eligibility, which turns on the resolved node type.
+- **Contributing series**: the set of total-series samples that collapsed onto
+  one `(src, tgt)` pair during resolution.
+- **In-scope series**: a contributing series that does NOT carry
+  `edge_relation="link"` — i.e. one that measures the edge. Rate, error
+  numerator and duration buckets are all summed over this subset and no other.
+- **RED scope**: the edges that carry `data.metrics` — trace-derived, both
+  endpoints pod-or-service, not the chain entry hop, at least one in-scope
+  contributing series.
+
 - **Connection-string resolution rule** (D29, hardcoded — no knob): for any
   service-graph endpoint whose pod UID is empty, the verbatim `client`/`server`
   label is checked for a `"://"` connection string. Detection is hardcoded —
@@ -646,7 +710,7 @@ live under `openspec/specs/`.
   label) follow the missing-UID fallback above; UIDs present but unknown
   to topology become synth pods with `cluster=""` (server-side cluster
   unknown).
-- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The one fixed exception is the D30 sentinel matcher (`client!~"user|unknown",server!~"user"` — the server side narrowed by resolve-unknown-server-peer-labels D1) on the service-graph selector — it is a **request-invariant metric-selection contract**, not a caller filter, so it never varies per request and does not break the projection-over-graph contract a future cache relies on.
+- **No filters pushed to PromQL.** Each build loads every cluster present in upstream VictoriaMetrics. Caller-supplied filters (`cluster`, `namespace`, `edge_type`, `name`, traversal) are applied at projection time over the freshly built `*Graph`. Bounded query cost is delegated to upstream VictoriaMetrics search limits. The fixed exceptions are the D30 sentinel matcher (`client!~"user|unknown",server!~"user"` — the server side narrowed by resolve-unknown-server-peer-labels D1) on the service-graph selector, and `edge_relation!="link"` on the two OPTIONAL RED selectors only — both are **request-invariant metric-selection contracts**, not caller filters, so they never vary per request and do not break the projection-over-graph contract a future cache relies on.
 - **`/v1/edge-types` reads from `graph.EdgeTypes` only** — a single in-code
   registry shared with the builder. Adding an edge type = update both the
   builder and the registry in the same change; the API can never list a type
@@ -671,7 +735,7 @@ live under `openspec/specs/`.
   Validation is constant-time and iterates the whole set —
   do NOT add early-return optimisations to `auth.KeySet.Validate`. Logs must
   never include the presented key value.
-- **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`: node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
+- **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`: node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
 - **IP addresses live on the typed `ipaddress` attribute, never in `labels`.** `PodNode.IPAddress()` carries `[pod_ip]` from `kube_pod_info` (when present). `K8sNode.IPAddress()` carries `[external_ip]` from `kube_node_status_addresses{type="ExternalIP"}` when present, falling back to `[internal_ip]` from `kube_node_status_addresses{type="InternalIP"}` when the node has no ExternalIP row (ExternalIP always wins over InternalIP regardless of upstream sample order; within each type a duplicate `(cluster, node)` sample resolves to the lexically-smallest address; address types other than `ExternalIP`/`InternalIP` are ignored); omitted only when neither type is present. The selector is the anchored alternation `kube_node_status_addresses{type=~"ExternalIP|InternalIP"}` — a fixed, request-invariant metric-selection contract, not a caller filter. `ServiceNode.IPAddress()` carries `[cluster_ip]` from `kube_service_info` (when present, omitted for headless `cluster_ip="None"`). `PVCNode` and `ExternalNode` always return nil. `host_ip` from `kube_pod_info` is intentionally dropped — it is the node's IP, surfaced via the node entry instead. The serialiser emits `data.ipaddress` (with `omitempty`); `labels.pod_ip`, `labels.host_ip`, `labels.external_ip`, `labels.internal_ip`, and `labels.cluster_ip` MUST NOT appear.
 - **Cytoscape compound nodes are presentation-only — workload hierarchy (supersedes D31).** The change `add-storageclass-and-argo-application-nodes` replaced the old `cluster > node > pod` / `cluster > storageclass > pvc` nesting. `pkg/cytoscape` now synthesises a `type="cluster"` group per cluster plus `type="namespace"` / `type="application"` / `type="controller"` groups (all `labels={}`, no `ipaddress`, emitted in tier order each sorted by id, before real nodes) and sets `data.parent` (`omitempty`) for the hierarchy `cluster > namespace > application > controller > pod` with **skip-absent-levels** (pod → its controller group when it has an `Owner()`, else its application group when it has an `Application()`, else its namespace group), plus `cluster > namespace > [application >] {service, pvc}` (a service/pvc nests under its `application` group when it resolves an `Application()`, else its namespace group — skip-absent) and `cluster > {node, storageclass}`. `external` nodes get no parent. Group ids are **path-encoded** (`<cluster>/namespace/<ns>/application/<app>/controller/<kind>/<name>`) so each pod independently derives its full parent chain — the tree is dangling-free by construction. The synthesised `namespace`/`application`/`controller`/`cluster` groups are serialiser DTOs, not `GraphNode`s, derived from emitted pods' `labels.namespace` / `Application()` / `Owner()` and from service/pvc `labels.namespace` / `Application()` (the `application` group is derived from any pod/service/pvc with a resolved `Application()`; `controller` groups stay pod-only). **`StorageClass` is now a real `GraphNode`** (`NodeTypeStorageClass`, `id="<cluster>/storageclass/<name>"`), sourced from `kube_storageclass_info` (`resolveStorageClassInfo` in `pkg/build/topology.go`): it carries `data.provisioner` (native `provisioner` label) + `data.parameters` (`pool`←`storagePools`\|`pool`, `fs`←`fsType`\|`fsName`, `cluster_id`←`ClusterID`, `selector`) as typed attributes via the new sealed `GraphNode.StorageClassInfo() *StorageClassInfo` method (`labels` stay `{cluster}`); a class referenced by a PVC but absent from the info metric is materialised **bare** (nil info). The pod→node and pvc→storageclass relationships are now **edges** (`pod-to-node`, `pvc-to-storageclass`, intra-cluster, built in `TopologyEdges`), so K8s `node` nodes carry edges again and a `?name=<node>` match pulls its scheduled pods via the `pod-to-node` edge re-add. `PVCNode.StorageClass()` stays a PVC-only typed value (never a label) and drives the `pvc-to-storageclass` edge (lexically-smallest on collision). On **every** request shape (default/no-filter, `?cluster=`, `?namespace=`), the cluster-scoped infra nodes `node` and `storageclass` (neither carries a namespace) are **retained iff referenced by an in-scope element** — a pod scheduled on the node (`labels.node`) or a PVC backed by the StorageClass — so the default view never carries an orphan/empty node or a PVC-less StorageClass (it only lists host nodes of pods that are in the graph). The **one exception** is an explicit `?name=<node|storageclass>`, which surfaces the named infra node even when referenced by nothing (an empty / NotReady node, or an unused StorageClass, stays queryable on demand). This is the generalised `infraNodePassesFilters` deferred-admission rule in `graph.Project`/`filterNodes` (the D6 rule). **Consequence:** a podless node's `ready_status` / `ipaddress` (and a PVC-less StorageClass's attributes) are no longer in the default graph — fetch them with `?name=`. The full-topology `*Graph` is still built (the build loads every node); the pruning is a projection concern, so a future cache serving any filter from one built graph is unaffected.
 - **OTLP tracing/logging is config'd by OTel env vars only** (`OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`). No bespoke `--otlp-*` flags. Telemetry defaults to no-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset (zero export overhead, no background goroutines). Tracing MUST NOT alter response bodies — resource attrs and span IDs live on spans, never in JSON. `otelgin` is mounted on `/v1/*` only; `/livez`, `/readyz`, `/metrics`, and `/docs/*` are deliberately untraced. The auth middleware MUST NEVER log or attribute the presented `X-API-Key` value via either the local handler or the OTLP slog bridge.

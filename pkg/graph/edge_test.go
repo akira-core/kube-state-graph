@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var uuidV5Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -43,6 +44,58 @@ func TestNewEdge_LabelsDefaultEmpty(t *testing.T) {
 	e := NewEdge(EdgeTypePodCallsPod, "a", "b", nil)
 	assert.NotNil(t, e.Labels, "expected non-nil labels even when nil supplied")
 	assert.Empty(t, e.Labels)
+}
+
+// TestNewEdge_MetricsNil pins that NewEdge alone yields Metrics == nil —
+// RED is attached only via WithMetrics after the edge is constructed.
+func TestNewEdge_MetricsNil(t *testing.T) {
+	e := NewEdge(EdgeTypePodCallsPod, "a", "b", nil)
+	assert.Nil(t, e.Metrics)
+}
+
+// TestWithMetrics_ImmutableCopy asserts WithMetrics leaves the original
+// untouched, produces an identical ID, and only sets Metrics on the copy.
+func TestWithMetrics_ImmutableCopy(t *testing.T) {
+	orig := NewEdge(EdgeTypePodCallsPod, "cluster-a/uid-1", "cluster-a/uid-2",
+		map[string]string{"cluster": "cluster-a"})
+	origID := orig.ID
+	origType := orig.Type
+	origSrc := orig.Source
+	origTgt := orig.Target
+	origLabels := map[string]string{}
+	for k, v := range orig.Labels {
+		origLabels[k] = v
+	}
+
+	errRate := 0.1
+	p90 := 12.5
+	with := orig.WithMetrics(EdgeMetrics{
+		Rate:        3.5,
+		ErrorRate:   &errRate,
+		P90ServerMs: &p90,
+	})
+
+	// Original untouched.
+	assert.Nil(t, orig.Metrics)
+	assert.Equal(t, origID, orig.ID)
+	assert.Equal(t, origType, orig.Type)
+	assert.Equal(t, origSrc, orig.Source)
+	assert.Equal(t, origTgt, orig.Target)
+	assert.Equal(t, origLabels, orig.Labels)
+
+	// Copy carries metrics with identical identity.
+	assert.Equal(t, origID, with.ID)
+	assert.Equal(t, origType, with.Type)
+	assert.Equal(t, origSrc, with.Source)
+	assert.Equal(t, origTgt, with.Target)
+	assert.Equal(t, origLabels, with.Labels)
+	require.NotNil(t, with.Metrics)
+	assert.InDelta(t, 3.5, with.Metrics.Rate, 1e-12)
+	assert.InDelta(t, 0.1, *with.Metrics.ErrorRate, 1e-12)
+	assert.InDelta(t, 12.5, *with.Metrics.P90ServerMs, 1e-12)
+
+	// Distinct pointers.
+	assert.NotSame(t, orig, with)
 }
 
 // TestEdgeTypes_TopologyRelationshipEntries — the two new topology edge types

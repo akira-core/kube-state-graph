@@ -1,0 +1,154 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/c1",
+          "name": "checkout",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/s1",
+          "name": "cart",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/s2",
+          "name": "direct",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/s3",
+          "name": "rare",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-0",
+          "name": "worker-0",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "f45e6029-b0d3-5728-a84f-17675b96a116",
+          "type": "pod-calls-pod",
+          "source": "cluster-alpha/c1",
+          "target": "cluster-alpha/s1",
+          "labels": {
+            "cluster": "cluster-alpha"
+          },
+          "metrics": {
+            "rate": 5,
+            "error_rate": 0.2,
+            "p90_server_ms": 45
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "727c1f5d-cc63-5de2-908b-2423790891ae",
+          "type": "pod-calls-pod",
+          "source": "cluster-alpha/c1",
+          "target": "cluster-alpha/s3",
+          "labels": {
+            "cluster": "cluster-alpha"
+          },
+          "metrics": {
+            "rate": 1,
+            "error_rate": 0
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "f5a3c779-3819-517f-9a26-e1464bb06bc5",
+          "type": "pod-calls-pod",
+          "source": "cluster-alpha/c1",
+          "target": "cluster-alpha/s2",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "505f918c-9db7-59fd-af22-77dba36d80cd",
+          "type": "pod-calls-pod",
+          "source": "cluster-alpha/s1",
+          "target": "cluster-alpha/s3",
+          "labels": {
+            "cluster": "cluster-alpha"
+          },
+          "metrics": {
+            "rate": 3.86e-7,
+            "error_rate": 6.7e-8
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "9c178c9e-48ce-5fea-b64e-fbfa8b1ba687",
+          "type": "pod-to-node",
+          "source": "cluster-alpha/c1",
+          "target": "cluster-alpha/worker-0",
+          "labels": {}
+        }
+      }
+    ]
+  }
+}
