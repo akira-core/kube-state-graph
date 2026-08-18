@@ -1,0 +1,87 @@
+# kube-state-metrics custom-resource-state configuration for kube-state-graph.
+#
+# Produces the two NetApp Trident series the PVC svm/volumename chain consumes
+# (kube_tridentvolume_info, kube_tridentbackend_info) and a parameter-carrying
+# replacement for kube_storageclass_info.
+#
+# Label names are a FIXED, CASE-SENSITIVE contract with the graph reader
+# (pkg/build/topology.go): `name`, `backendUUID`, `svm`, `storageclass`,
+# `provisioner`, `storagePools`/`pool`, `fsType`/`fsName`, `ClusterID`,
+# `selector`. A different spelling silently fails the join (graceful
+# degradation — the affected label/attribute is simply absent).
+#
+# IMPORTANT: when this file is used, REMOVE `storageclasses` from the built-in
+# collector list (see values.yaml). The CRS metric below re-emits the full
+# kube_storageclass_info family (name + provisioner + parameters); keeping the
+# built-in collector too would put two metric families with the same name into
+# one exposition, which scrapers may reject.
+kind: CustomResourceStateMetrics
+spec:
+  resources:
+    # --- StorageClass: kube_storageclass_info with parameter labels ---------
+    # Stock KSM emits kube_storageclass_info WITHOUT .parameters. The graph
+    # reader additionally consumes parameter-derived labels to build the
+    # StorageClass node's typed `parameters` attribute:
+    #   pool        <- storagePools | pool
+    #   fs          <- fsType | fsName
+    #   cluster_id  <- ClusterID
+    #   selector    <- selector
+    # The "*" wildcard flattens EVERY .parameters key into a label verbatim.
+    # NetApp Trident SCs (storagePools, fsType, selector) match directly.
+    # Ceph-CSI SCs use `clusterID` (lower-case c) — rename it to `ClusterID`
+    # at scrape time; see README.md "Label-name fixups".
+    - groupVersionKind:
+        group: storage.k8s.io
+        version: v1
+        kind: StorageClass
+      metricNamePrefix: kube
+      metrics:
+        - name: storageclass_info
+          help: StorageClass info with provisioner and parameters
+          each:
+            type: Info
+            info:
+              labelsFromPath:
+                storageclass: [metadata, name]
+                provisioner: [provisioner]
+                "*": [parameters]
+
+    # --- NetApp Trident: PVC -> PV -> backend -> SVM chain ------------------
+    # kube_tridentvolume_info: one series per TridentVolume CR. Trident names
+    # the CR after the bound PV (pvc-<uid>), so `name` == PV name — the join
+    # key against kube_persistentvolumeclaim_info's `volumename` label.
+    - groupVersionKind:
+        group: trident.netapp.io
+        version: v1
+        kind: TridentVolume
+      metricNamePrefix: kube
+      metrics:
+        - name: tridentvolume_info
+          help: TridentVolume CR info (name = bound PV name)
+          each:
+            type: Info
+            info:
+              labelsFromPath:
+                name: [metadata, name]
+                backendUUID: [backendUUID]
+
+    # kube_tridentbackend_info: one series per TridentBackend CR. `svm` is the
+    # ONTAP Storage VM serving the backend. The config path below matches the
+    # ONTAP driver family (ontap-nas / ontap-san); verify against your Trident
+    # version with:
+    #   kubectl get tridentbackends -n trident -o yaml | grep -A5 config
+    # and adjust the path if your driver nests it differently.
+    - groupVersionKind:
+        group: trident.netapp.io
+        version: v1
+        kind: TridentBackend
+      metricNamePrefix: kube
+      metrics:
+        - name: tridentbackend_info
+          help: TridentBackend CR info (backendUUID -> svm)
+          each:
+            type: Info
+            info:
+              labelsFromPath:
+                backendUUID: [backendUUID]
+                svm: [config, ontap_config, svm]

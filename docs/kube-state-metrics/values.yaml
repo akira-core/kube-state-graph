@@ -1,0 +1,147 @@
+# Helm values for prometheus-community/kube-state-metrics, tuned for
+# kube-state-graph. Install per cluster:
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm upgrade --install kube-state-metrics prometheus-community/kube-state-metrics \
+#     --namespace monitoring --create-namespace \
+#     -f values.yaml
+#
+# See README.md in this directory for the full walkthrough (including the
+# mandatory `cluster` external label on the scrape/remote-write path).
+
+# ---------------------------------------------------------------------------
+# Collectors. This list REPLACES the chart default. Deviations from default:
+#   + endpointslices  (NOT collected by default; needed for the D29
+#                      service -> pod endpoint join)
+#   - storageclasses  (removed: re-emitted with parameter labels by the
+#                      custom-resource-state config below — keeping both would
+#                      duplicate the kube_storageclass_info family)
+# The rest is the chart's stock list, kept so unrelated dashboards continue
+# to work. Trim freely if this KSM instance only feeds kube-state-graph — the
+# graph needs only: pods, nodes, services, endpointslices,
+# persistentvolumeclaims, replicasets (owner skip).
+# ---------------------------------------------------------------------------
+collectors:
+  - certificatesigningrequests
+  - configmaps
+  - cronjobs
+  - daemonsets
+  - deployments
+  - endpoints
+  - endpointslices
+  - horizontalpodautoscalers
+  - ingresses
+  - jobs
+  - leases
+  - limitranges
+  - mutatingwebhookconfigurations
+  - namespaces
+  - networkpolicies
+  - nodes
+  - persistentvolumeclaims
+  - persistentvolumes
+  - poddisruptionbudgets
+  - replicasets
+  - replicationcontrollers
+  - resourcequotas
+  - secrets
+  - services
+  - statefulsets
+  - validatingwebhookconfigurations
+  - volumeattachments
+
+# ---------------------------------------------------------------------------
+# Label allowlist.
+#   endpointslices=[kubernetes.io/service-name]
+#     -> kube_endpointslice_labels{label_kubernetes_io_service_name}
+#        REQUIRED for the endpointslice -> service join (D29). Without it the
+#        service -> pod fan-out is empty.
+#   nodes=[*]
+#     -> kube_node_labels{label_*}; the reader copies every label_* key onto
+#        the type="node" graph node (label_ prefix stripped). Narrow the list
+#        (e.g. nodes=[topology.kubernetes.io/zone,node-role.kubernetes.io/*])
+#        if node label cardinality is a concern — purely additive metadata.
+# ---------------------------------------------------------------------------
+metricLabelsAllowlist:
+  - endpointslices=[kubernetes.io/service-name]
+  - nodes=[*]
+
+# ---------------------------------------------------------------------------
+# Annotation allowlist. Feeds `data.application` (ArgoCD Application) on
+# service and PVC nodes:
+#   kube_service_annotations{annotation_argocd_argoproj_io_tracking_id}
+#   kube_persistentvolumeclaim_annotations{annotation_argocd_argoproj_io_tracking_id}
+# Requires ArgoCD annotation-based tracking
+# (application.resourceTrackingMethod: annotation).
+# ---------------------------------------------------------------------------
+metricAnnotationsAllowList:
+  - services=[argocd.argoproj.io/tracking-id]
+  - persistentvolumeclaims=[argocd.argoproj.io/tracking-id]
+
+# ---------------------------------------------------------------------------
+# Custom-resource-state config: StorageClass parameters + NetApp Trident
+# chain. Content mirrors custom-resource-state.yaml in this directory (the
+# chart renders `config` into a ConfigMap and passes
+# --custom-resource-state-config-file). On clusters WITHOUT Trident, drop the
+# two trident.netapp.io resources and the rbac.extraRules below — the graph
+# degrades gracefully (no svm label), but keep the StorageClass block.
+# ---------------------------------------------------------------------------
+customResourceState:
+  enabled: true
+  config:
+    kind: CustomResourceStateMetrics
+    spec:
+      resources:
+        - groupVersionKind:
+            group: storage.k8s.io
+            version: v1
+            kind: StorageClass
+          metricNamePrefix: kube
+          metrics:
+            - name: storageclass_info
+              help: StorageClass info with provisioner and parameters
+              each:
+                type: Info
+                info:
+                  labelsFromPath:
+                    storageclass: [metadata, name]
+                    provisioner: [provisioner]
+                    "*": [parameters]
+        - groupVersionKind:
+            group: trident.netapp.io
+            version: v1
+            kind: TridentVolume
+          metricNamePrefix: kube
+          metrics:
+            - name: tridentvolume_info
+              help: TridentVolume CR info (name = bound PV name)
+              each:
+                type: Info
+                info:
+                  labelsFromPath:
+                    name: [metadata, name]
+                    backendUUID: [backendUUID]
+        - groupVersionKind:
+            group: trident.netapp.io
+            version: v1
+            kind: TridentBackend
+          metricNamePrefix: kube
+          metrics:
+            - name: tridentbackend_info
+              help: TridentBackend CR info (backendUUID -> svm)
+              each:
+                type: Info
+                info:
+                  labelsFromPath:
+                    backendUUID: [backendUUID]
+                    svm: [config, ontap_config, svm]
+
+# ---------------------------------------------------------------------------
+# RBAC for the Trident CRDs (the chart's default ClusterRole covers built-in
+# resources only). StorageClass read access is already in the default role.
+# ---------------------------------------------------------------------------
+rbac:
+  extraRules:
+    - apiGroups: ["trident.netapp.io"]
+      resources: ["tridentvolumes", "tridentbackends"]
+      verbs: ["get", "list", "watch"]
