@@ -15,7 +15,7 @@ const (
 	EdgeTypePodCallsService   EdgeType = "pod-calls-service"
 	EdgeTypeServiceSelectsPod EdgeType = "service-selects-pod"
 	EdgeTypePodToNode         EdgeType = "pod-to-node"
-	EdgeTypePVCToStorageClass EdgeType = "pvc-to-storageclass"
+	EdgeTypePVCToNetAppAggr   EdgeType = "pvc-to-netapp-aggr"
 )
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are
@@ -48,6 +48,19 @@ type Edge struct {
 	Target  string
 	Labels  map[string]string
 	Metrics *EdgeMetrics // nil = no RED measurements for this edge
+	IO      *IOMetrics   // nil = no I/O measurements for this edge
+}
+
+// IOMetrics holds the four Harvest volume I/O measurements attached to a
+// pvc-to-netapp-aggr edge. Numeric values NEVER enter Labels. Each field is
+// a pointer so a missing family is omitted (distinct from 0). The RED
+// EdgeMetrics invariant is untouched; a single edge carries at most one
+// family (the builder never sets both).
+type IOMetrics struct {
+	ReadOps        *float64
+	WriteOps       *float64
+	ReadLatencyUs  *float64
+	WriteLatencyUs *float64
 }
 
 // NewEdge constructs an Edge with a deterministic UUIDv5 id derived from
@@ -77,6 +90,18 @@ func (e *Edge) WithMetrics(m EdgeMetrics) *Edge {
 	cp := *e
 	mm := m
 	cp.Metrics = &mm
+	return &cp
+}
+
+// WithIO returns a shallow copy of e carrying the given I/O measurements.
+// Identity fields are unchanged; the original *Edge is left untouched.
+func (e *Edge) WithIO(m IOMetrics) *Edge {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	mm := m
+	cp.IO = &mm
 	return &cp
 }
 

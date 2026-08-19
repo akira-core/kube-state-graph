@@ -40,6 +40,9 @@ func Project(g *Graph, scope Scope) View {
 
 	nodes := filterNodes(g, scope, reachable, excluded)
 	edges := filterEdges(g, scope, nodes, reachable, excluded)
+	// An aggregate admitted as an edge partner (e.g. ?name=<pvc>) still
+	// needs its owning controller — the compound parent must exist.
+	pullNetAppParents(g, nodes)
 
 	out := View{
 		Nodes: make([]GraphNode, 0, len(nodes)),
@@ -130,10 +133,10 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 			connectedPods[e.Target] = struct{}{}
 		case EdgeTypePodMountsPVC:
 			pvcMounters[e.Target] = append(pvcMounters[e.Target], e.Source)
-		case EdgeTypePodToNode, EdgeTypePVCToStorageClass:
-			// Infra edges (pod→node, pvc→storageclass) are NOT connectivity edges:
+		case EdgeTypePodToNode, EdgeTypePVCToNetAppAggr:
+			// Infra edges (pod→node, pvc→netapp-aggr) are NOT connectivity edges:
 			// they never make a pod or PVC connectivity-connected. Their endpoints
-			// (K8s nodes / StorageClasses) are reference-gated by
+			// (K8s nodes / NetApp aggregates) are reference-gated by
 			// infraNodePassesFilters, not by this set. Listed explicitly to keep
 			// the switch exhaustive over graph.EdgeType.
 		}
@@ -158,7 +161,8 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 				excluded[id] = struct{}{}
 			}
 		default:
-			// node / storageclass / service / external are not connectivity-pruned.
+			// node / netapp-aggr / netapp-node / service / external are not
+			// connectivity-pruned (NetApp types are reference-gated).
 		}
 	}
 	return excluded
@@ -166,37 +170,34 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 
 func filterNodes(g *Graph, scope Scope, reachable, excluded map[string]struct{}) map[string]GraphNode {
 	out := make(map[string]GraphNode, len(g.NodesByID))
-	// K8sNode and StorageClassNode admission is deferred: neither carries a
-	// namespace label, so each is retained iff referenced by an in-scope element
-	// — a K8s node hosts an in-scope pod (labels.node), a StorageClass backs an
-	// in-scope PVC (its StorageClass()) — or it is explicitly matched by a name
-	// filter. We first resolve every other node — recording the referenced ids —
-	// then admit the deferred infra nodes per infraNodePassesFilters. The
-	// reference sets are built for EVERY request shape (no filter, cluster,
-	// namespace) so the response only ever carries infra nodes connected to
-	// in-scope workload; an explicit ?name=<infra-node> is the one exception.
-	// See design.md D6 (generalises the namespace-only rule to all requests).
-	var deferred []GraphNode
+	// Infra admission is deferred: K8s nodes, NetApp aggregates, and NetApp
+	// controllers carry no namespace (NetApp types also carry no cluster), so
+	// each is retained iff referenced by an in-scope element — or explicitly
+	// matched by a name filter. Wave 1: netapp-aggr iff an admitted PVC has a
+	// pvc-to-netapp-aggr edge to it. Wave 2: netapp-node iff an admitted
+	// aggregate names it in labels.node. See design.md D6.
+	var deferredK8s, deferredAggr, deferredNetAppNode []GraphNode
 	hostNodes := map[string]struct{}{}
-	referencedSC := map[string]struct{}{}
 	for id, n := range g.NodesByID {
 		if reachable != nil {
 			if _, ok := reachable[id]; !ok {
 				continue
 			}
 		}
-		// Connectivity prune (default projection only; nil under name/traversal).
-		// An excluded pod/PVC is dropped before any other admission so it never
-		// feeds the deferred infra reference sets — its host node / backing
-		// StorageClass then prunes for free via infraNodePassesFilters.
 		if excluded != nil {
 			if _, ex := excluded[id]; ex {
 				continue
 			}
 		}
 		switch n.Type() {
-		case NodeTypeK8sNode, NodeTypeStorageClass:
-			deferred = append(deferred, n)
+		case NodeTypeK8sNode:
+			deferredK8s = append(deferredK8s, n)
+			continue
+		case NodeTypeNetAppAggr:
+			deferredAggr = append(deferredAggr, n)
+			continue
+		case NodeTypeNetAppNode:
+			deferredNetAppNode = append(deferredNetAppNode, n)
 			continue
 		default:
 			// pod / pvc / service / external are admitted directly below.
@@ -205,36 +206,80 @@ func filterNodes(g *Graph, scope Scope, reachable, excluded map[string]struct{})
 			continue
 		}
 		out[id] = n
-		// The reference sets feed only the default infra-admission path; under a
-		// name filter infraNodePassesFilters returns on the name branch and never
-		// consults them, so skip the population work entirely.
 		if scope.NameFilterActive() {
 			continue
 		}
-		switch n.Type() {
-		case NodeTypePod:
+		if n.Type() == NodeTypePod {
 			if hn := n.Labels()["node"]; hn != "" {
 				hostNodes[hn] = struct{}{}
 			}
-		case NodeTypePVC:
-			if sc := n.StorageClass(); sc != "" {
-				referencedSC[StorageClassID(n.Labels()["cluster"], sc)] = struct{}{}
-			}
-		default:
-			// other in-scope types reference no deferred infra node.
 		}
 	}
-	for _, n := range deferred {
-		referenced := hostNodes
-		if n.Type() == NodeTypeStorageClass {
-			referenced = referencedSC
+
+	referencedAggr := map[string]struct{}{}
+	if !scope.NameFilterActive() {
+		for _, e := range g.Edges {
+			if e.Type != EdgeTypePVCToNetAppAggr {
+				continue
+			}
+			if _, ok := out[e.Source]; ok {
+				referencedAggr[e.Target] = struct{}{}
+			}
 		}
-		if !infraNodePassesFilters(n, scope, referenced) {
+	}
+
+	for _, n := range deferredK8s {
+		if !infraNodePassesFilters(n, scope, hostNodes) {
 			continue
 		}
 		out[n.ID()] = n
 	}
+	for _, n := range deferredAggr {
+		if !netappInfraPassesFilters(n, scope, referencedAggr) {
+			continue
+		}
+		out[n.ID()] = n
+	}
+	referencedCtrl := map[string]struct{}{}
+	for _, n := range out {
+		if n.Type() != NodeTypeNetAppAggr {
+			continue
+		}
+		oc, node := n.Labels()["ontap_cluster"], n.Labels()["node"]
+		if oc != "" && node != "" {
+			referencedCtrl[NetAppNodeID(oc, node)] = struct{}{}
+		}
+	}
+	for _, n := range deferredNetAppNode {
+		if !netappInfraPassesFilters(n, scope, referencedCtrl) {
+			continue
+		}
+		out[n.ID()] = n
+	}
+	pullNetAppParents(g, out)
 	return out
+}
+
+// pullNetAppParents admits the owning netapp-node of every admitted
+// netapp-aggr so the real-node compound parent cannot dangle.
+func pullNetAppParents(g *Graph, nodes map[string]GraphNode) {
+	for _, n := range nodes {
+		if n.Type() != NodeTypeNetAppAggr {
+			continue
+		}
+		oc, node := n.Labels()["ontap_cluster"], n.Labels()["node"]
+		if oc == "" || node == "" {
+			continue
+		}
+		id := NetAppNodeID(oc, node)
+		if _, ok := nodes[id]; ok {
+			continue
+		}
+		parent, ok := g.NodesByID[id]
+		if ok {
+			nodes[id] = parent
+		}
+	}
 }
 
 func nodePassesFilters(n GraphNode, scope Scope) bool {
@@ -244,18 +289,20 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 			// External nodes have no cluster; exclude when caller scoped to clusters.
 			return false
 		}
-		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
+		if n.Type() == NodeTypeNetAppAggr || n.Type() == NodeTypeNetAppNode {
+			// NetApp types belong to no Kubernetes cluster; they pass the
+			// cluster check and are gated purely by reference (or name).
+		} else if _, ok := scope.Clusters[labels["cluster"]]; !ok {
 			return false
 		}
 	}
 	if len(scope.Namespaces) > 0 {
 		// ExternalNode is cluster-unscoped (no namespace label) and only ever
 		// enters a view as the re-added partner of a pod-calls-pod edge, so it
-		// is exempt from the namespace match. K8sNode and StorageClassNode are
-		// also namespace-less but are admitted separately by
-		// infraNodePassesFilters (referenced-by-in-scope rule), so they never
-		// reach this predicate. Every other node type must match the requested
-		// namespace.
+		// is exempt from the namespace match. K8sNode and NetApp types are
+		// also namespace-less but are admitted separately by the infra
+		// predicates (referenced-by-in-scope rule), so they never reach this
+		// predicate. Every other node type must match the requested namespace.
 		switch n.Type() {
 		case NodeTypeExternal:
 			// pass-through
@@ -320,6 +367,21 @@ func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]stru
 		return true
 	}
 	// Default: admit iff referenced by an in-scope element.
+	_, ok := referenced[n.ID()]
+	return ok
+}
+
+// netappInfraPassesFilters is the NetApp-type twin of infraNodePassesFilters.
+// Cluster filter is skipped (no cluster label); admission is name / root /
+// reference only.
+func netappInfraPassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
+	if scope.NameFilterActive() {
+		_, named := scope.Names[n.Name()]
+		return named
+	}
+	if scope.Root != "" && n.ID() == scope.Root {
+		return true
+	}
 	_, ok := referenced[n.ID()]
 	return ok
 }
@@ -416,8 +478,8 @@ func nodePassesNonClusterFilters(n GraphNode, scope Scope) bool {
 	labels := n.Labels()
 	if len(scope.Namespaces) > 0 {
 		switch n.Type() {
-		case NodeTypeExternal:
-			// pass-through; external endpoints carry no namespace.
+		case NodeTypeExternal, NodeTypeK8sNode, NodeTypeNetAppAggr, NodeTypeNetAppNode:
+			// pass-through; these types carry no namespace.
 		default:
 			if _, ok := scope.Namespaces[labels["namespace"]]; !ok {
 				return false

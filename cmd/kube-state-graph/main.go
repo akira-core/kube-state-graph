@@ -80,7 +80,6 @@ func run() error {
 		"listen_addr", cfg.ListenAddr,
 		"build_timeout", cfg.BuildTimeout,
 		"api_timeout", cfg.APITimeout,
-		"metric_prefix", cfg.MetricPrefix,
 		"otlp_enabled", telemetryProviders.Enabled,
 		// Boolean only — the credential values themselves are never logged.
 		"prom_basic_auth", cfg.PromUsername != "",
@@ -144,7 +143,6 @@ func run() error {
 	}
 
 	builder := build.New(promClient, build.Options{
-		MetricPrefix:        cfg.MetricPrefix,
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       routeResolver,
 		RouteResolveTimeout: cfg.RouteResolveTimeout,

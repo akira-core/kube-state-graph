@@ -5,9 +5,9 @@
 // JSON round-trip. The serialiser is presentation-only — it synthesises the
 // cluster / namespace / application / controller compound group nodes and the
 // data.parent nesting (design.md D6, which supersedes the D31 cluster>node>pod
-// grouping) without touching the core graph types. StorageClass is a real
-// graph node (not synthesised), and the pod→node and pvc→storageclass
-// relationships are edges, not nesting.
+// grouping) without touching the core graph types. NetApp aggregates nest
+// under the real netapp-node (the first real-node compound parent); the
+// pvc→aggregate relationship is an edge, not nesting.
 package cytoscape
 
 import (
@@ -46,18 +46,25 @@ type Node struct {
 // namespace / application / controller group nodes and the presentation-only
 // parent field).
 type NodeData struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Type        string            `json:"type"`
-	Parent      string            `json:"parent,omitempty"`
-	IPAddress   []string          `json:"ipaddress,omitempty"`
-	Owner       *graph.Owner      `json:"owner,omitempty"`
-	Application string            `json:"application,omitempty"`
-	Containers  []graph.Container `json:"containers,omitempty"`
-	ReadyStatus string            `json:"ready_status,omitempty"`
-	Provisioner string            `json:"provisioner,omitempty"`
-	Parameters  map[string]string `json:"parameters,omitempty"`
-	Labels      map[string]string `json:"labels"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Type         string            `json:"type"`
+	Parent       string            `json:"parent,omitempty"`
+	IPAddress    []string          `json:"ipaddress,omitempty"`
+	Owner        *graph.Owner      `json:"owner,omitempty"`
+	Application  string            `json:"application,omitempty"`
+	Containers   []graph.Container `json:"containers,omitempty"`
+	ReadyStatus  string            `json:"ready_status,omitempty"`
+	Health       string            `json:"health,omitempty"`
+	Usage        *UsageDTO         `json:"usage,omitempty"`
+	StorageClass string            `json:"storageclass,omitempty"`
+	Labels       map[string]string `json:"labels"`
+}
+
+// UsageDTO is the wire form of graph.UsageBytes. Either field may be omitted.
+type UsageDTO struct {
+	UsedBytes     *float64 `json:"used_bytes,omitempty"`
+	CapacityBytes *float64 `json:"capacity_bytes,omitempty"`
 }
 
 // Edge wraps an edge's data in the Cytoscape `{ "data": {...} }` shape.
@@ -74,14 +81,18 @@ type Edge struct {
 // when no usable classic histogram was available. All three values are JSON
 // numbers (never strings) and MAY appear in exponent form for small values.
 //
-//	@Description	RED measurements on a trace-derived edge whose two endpoints both resolved to a pod or a service node. rate is required when the object is present. error_rate is omitted when the failure counter was unreadable (do not treat absence as 0). p90_server_ms is omitted when no usable classic histogram was available. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
 type EdgeMetricsDTO struct {
-	// Rate is requests per second over the window (always > 0 when present).
-	Rate float64 `json:"rate" example:"5"`
+	// Rate is requests per second over the window (always > 0 when the RED family is present). Schema-optional because the object is a union.
+	Rate *float64 `json:"rate,omitempty" example:"5"`
 	// ErrorRate is the failed fraction in [0,1]. Omitted when the failure counter was unreadable; 0 means read successfully with no failures.
 	ErrorRate *float64 `json:"error_rate,omitempty" example:"0.1"`
 	// P90ServerMs is the 90th percentile server-observed request duration in milliseconds.
-	P90ServerMs *float64 `json:"p90_server_ms,omitempty" example:"12.5"`
+	P90ServerMs    *float64 `json:"p90_server_ms,omitempty" example:"12.5"`
+	ReadOps        *float64 `json:"read_ops,omitempty"`
+	WriteOps       *float64 `json:"write_ops,omitempty"`
+	ReadLatencyUs  *float64 `json:"read_latency_us,omitempty"`
+	WriteLatencyUs *float64 `json:"write_latency_us,omitempty"`
 }
 
 // EdgeData is the serialised form of a graph edge.
@@ -103,38 +114,81 @@ func round6(v float64) float64 {
 	return r
 }
 
-// metricsDTO converts graph.EdgeMetrics to the wire DTO with rounding applied.
-// Returns nil when m is nil so the metrics key is wholly absent.
-func metricsDTO(m *graph.EdgeMetrics) *EdgeMetricsDTO {
-	if m == nil {
+// metricsDTO merges at most one family into the wire DTO with rounding
+// applied. RED wins if both are set (the builder never sets both). Returns
+// nil when neither family is present so the metrics key is wholly absent.
+func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
+	if m != nil {
+		rate := round6(m.Rate)
+		dto := &EdgeMetricsDTO{Rate: &rate}
+		if m.ErrorRate != nil {
+			er := round6(*m.ErrorRate)
+			dto.ErrorRate = &er
+		}
+		if m.P90ServerMs != nil {
+			p90 := round6(*m.P90ServerMs)
+			dto.P90ServerMs = &p90
+		}
+		return dto
+	}
+	if io == nil {
 		return nil
 	}
-	dto := &EdgeMetricsDTO{Rate: round6(m.Rate)}
-	if m.ErrorRate != nil {
-		er := round6(*m.ErrorRate)
-		dto.ErrorRate = &er
+	dto := &EdgeMetricsDTO{}
+	filled := false
+	if io.ReadOps != nil {
+		v := round6(*io.ReadOps)
+		dto.ReadOps = &v
+		filled = true
 	}
-	if m.P90ServerMs != nil {
-		p90 := round6(*m.P90ServerMs)
-		dto.P90ServerMs = &p90
+	if io.WriteOps != nil {
+		v := round6(*io.WriteOps)
+		dto.WriteOps = &v
+		filled = true
+	}
+	if io.ReadLatencyUs != nil {
+		v := round6(*io.ReadLatencyUs)
+		dto.ReadLatencyUs = &v
+		filled = true
+	}
+	if io.WriteLatencyUs != nil {
+		v := round6(*io.WriteLatencyUs)
+		dto.WriteLatencyUs = &v
+		filled = true
+	}
+	if !filled {
+		return nil
 	}
 	return dto
+}
+
+func usageDTO(u *graph.UsageBytes) *UsageDTO {
+	if u == nil {
+		return nil
+	}
+	if u.UsedBytes == nil && u.CapacityBytes == nil {
+		return nil
+	}
+	return &UsageDTO{UsedBytes: u.UsedBytes, CapacityBytes: u.CapacityBytes}
 }
 
 // Synthetic compound group-node types. These exist only in the Cytoscape
 // presentation (to satisfy data.parent references); they are not
 // graph.GraphNodes. See design.md D6.
 const (
-	nodeTypeCluster     = "cluster"
-	nodeTypeNamespace   = "namespace"
-	nodeTypeApplication = "application"
-	nodeTypeController  = "controller"
+	nodeTypeCluster        = "cluster"
+	nodeTypeStorageCluster = "storage-cluster"
+	nodeTypeNamespace      = "namespace"
+	nodeTypeApplication    = "application"
+	nodeTypeController     = "controller"
 )
 
 // Synthetic group-node id constructors. Each id encodes its full ancestry path
 // so the compound tree is unambiguous by construction (a node has exactly one
 // parent) and no data.parent can dangle.
 func clusterParentID(cluster string) string { return "cluster/" + cluster }
+
+func storageClusterParentID(oc string) string { return "storage-cluster/" + oc }
 
 func namespaceParentID(cluster, ns string) string {
 	return cluster + "/namespace/" + ns
@@ -174,6 +228,7 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	// groups come from every node's cluster; namespace groups from any
 	// pod/service/pvc; application/controller groups from pods only.
 	clusterSeen := map[string]struct{}{}
+	storageClusterSeen := map[string]struct{}{}
 	nsSeen := map[nsKey]struct{}{}
 	appSeen := map[appKey]struct{}{}
 	ctrlSeen := map[ctrlKey]struct{}{}
@@ -182,6 +237,9 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		c := labels["cluster"]
 		if c != "" {
 			clusterSeen[c] = struct{}{}
+		}
+		if oc := labels["ontap_cluster"]; oc != "" {
+			storageClusterSeen[oc] = struct{}{}
 		}
 		switch n.Type() {
 		case graph.NodeTypePod:
@@ -207,8 +265,8 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				appSeen[appKey{c, ns, app}] = struct{}{}
 			}
 		default:
-			// node / storageclass / external: only the cluster group (collected
-			// above) applies; no workload group is derived from them.
+			// node / netapp / external: only cluster / storage-cluster groups
+			// (collected above) apply; no workload group is derived from them.
 		}
 	}
 
@@ -219,13 +277,18 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	body.Clusters = append(make([]string, 0, len(sortedClusters)), sortedClusters...)
 
 	body.Elements.Nodes = make([]Node, 0,
-		len(view.Nodes)+len(clusterSeen)+len(nsSeen)+len(appSeen)+len(ctrlSeen))
+		len(view.Nodes)+len(clusterSeen)+len(storageClusterSeen)+len(nsSeen)+len(appSeen)+len(ctrlSeen))
 
-	// Synthetic group nodes in tier order (cluster, namespace, application,
-	// controller), each tier sorted by id, before the real nodes (determinism, D6).
+	// Synthetic group nodes in tier order (cluster, storage-cluster, namespace,
+	// application, controller), each tier sorted by id, before the real nodes.
 	for _, c := range sortedClusters {
 		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
 			clusterParentID(c), c, nodeTypeCluster, ""))
+	}
+	sortedOC := slices.Sorted(maps.Keys(storageClusterSeen))
+	for _, oc := range sortedOC {
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
+			storageClusterParentID(oc), oc, nodeTypeStorageCluster, ""))
 	}
 	nsKeys := slices.SortedFunc(maps.Keys(nsSeen), func(a, b nsKey) int {
 		return cmp.Compare(namespaceParentID(a.cluster, a.ns), namespaceParentID(b.cluster, b.ns))
@@ -256,26 +319,21 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	}
 
 	for _, n := range view.Nodes {
-		var provisioner string
-		var parameters map[string]string
-		if info := n.StorageClassInfo(); info != nil {
-			provisioner = info.Provisioner
-			parameters = info.Parameters
-		}
 		body.Elements.Nodes = append(body.Elements.Nodes, Node{
 			Data: NodeData{
-				ID:          n.ID(),
-				Name:        n.Name(),
-				Type:        string(n.Type()),
-				Parent:      compoundParent(n),
-				IPAddress:   n.IPAddress(),
-				Owner:       n.Owner(),
-				Application: n.Application(),
-				Containers:  n.Containers(),
-				ReadyStatus: n.ReadyStatus(),
-				Provisioner: provisioner,
-				Parameters:  parameters,
-				Labels:      n.Labels(),
+				ID:           n.ID(),
+				Name:         n.Name(),
+				Type:         string(n.Type()),
+				Parent:       compoundParent(n),
+				IPAddress:    n.IPAddress(),
+				Owner:        n.Owner(),
+				Application:  n.Application(),
+				Containers:   n.Containers(),
+				ReadyStatus:  n.ReadyStatus(),
+				Health:       n.Health(),
+				Usage:        usageDTO(n.Usage()),
+				StorageClass: n.StorageClass(),
+				Labels:       n.Labels(),
 			},
 		})
 	}
@@ -289,7 +347,7 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				Source:  e.Source,
 				Target:  e.Target,
 				Labels:  e.Labels,
-				Metrics: metricsDTO(e.Metrics),
+				Metrics: metricsDTO(e.Metrics, e.IO),
 			},
 		})
 	}
@@ -319,10 +377,12 @@ func groupNode(id, name, typ, parent string) Node {
 //	               cluster > namespace > [application >] {service, pvc}); a
 //	               cluster-less or namespace-less service/pvc falls back to its
 //	               cluster group, else ""
-//	node, sc     → its cluster group (cluster > {node, storageclass})
+//	node         → its cluster group
+//	netapp-node  → storage-cluster/<ontap_cluster>
+//	netapp-aggr  → the real netapp-node id netapp/<oc>/<labels.node>
 //	external     → "" (no cluster identity)
 //
-// The pod→node and pvc→storageclass relationships are edges, not nesting.
+// The pod→node and pvc→netapp-aggr relationships are edges, not nesting.
 func compoundParent(n graph.GraphNode) string {
 	labels := n.Labels()
 	c := labels["cluster"]
@@ -345,8 +405,19 @@ func compoundParent(n graph.GraphNode) string {
 			}
 			return namespaceParentID(c, ns)
 		}
+	case graph.NodeTypeNetAppNode:
+		if oc := labels["ontap_cluster"]; oc != "" {
+			return storageClusterParentID(oc)
+		}
+		return ""
+	case graph.NodeTypeNetAppAggr:
+		oc, node := labels["ontap_cluster"], labels["node"]
+		if oc != "" && node != "" {
+			return graph.NetAppNodeID(oc, node)
+		}
+		return ""
 	default:
-		// node / storageclass / external: cluster-group fallback below.
+		// node / external: cluster-group fallback below.
 	}
 	if c != "" {
 		return clusterParentID(c)

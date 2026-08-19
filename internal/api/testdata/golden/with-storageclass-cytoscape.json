@@ -75,6 +75,11 @@
           "name": "data-mongo-0",
           "type": "pvc",
           "parent": "cluster-alpha/namespace/db",
+          "usage": {
+            "used_bytes": 5368709120,
+            "capacity_bytes": 10737418240
+          },
+          "storageclass": "gp3",
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db",
@@ -91,22 +96,6 @@
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db"
-          }
-        }
-      },
-      {
-        "data": {
-          "id": "cluster-alpha/storageclass/gp3",
-          "name": "gp3",
-          "type": "storageclass",
-          "parent": "cluster/cluster-alpha",
-          "provisioner": "ebs.csi.aws.com",
-          "parameters": {
-            "fs": "ext4",
-            "pool": "aggr1"
-          },
-          "labels": {
-            "cluster": "cluster-alpha"
           }
         }
       }
@@ -141,15 +130,6 @@
           "labels": {
             "claim_name": "legacy"
           }
-        }
-      },
-      {
-        "data": {
-          "id": "3752911a-89e2-5f7a-a578-b47c5fec9bbc",
-          "type": "pvc-to-storageclass",
-          "source": "cluster-alpha/db/data-mongo-0",
-          "target": "cluster-alpha/storageclass/gp3",
-          "labels": {}
         }
       }
     ]

@@ -211,8 +211,9 @@ func TestRED_TopologyEdges_NoMetrics(t *testing.T) {
 	assert.Nil(t, e.Metrics)
 	e = graph.NewEdge(graph.EdgeTypePodMountsPVC, "a", "b", nil)
 	assert.Nil(t, e.Metrics)
-	e = graph.NewEdge(graph.EdgeTypePVCToStorageClass, "a", "b", nil)
+	e = graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, "a", "b", nil)
 	assert.Nil(t, e.Metrics)
+	assert.Nil(t, e.IO)
 }
 
 // --- 7.2 Aggregation ---

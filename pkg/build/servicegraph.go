@@ -49,10 +49,7 @@ type ServiceGraphResult struct {
 // server label is a "://" connection string are resolved to in-cluster
 // service nodes (which fan out service-selects-pod edges to their backing
 // pods), falling back to an external node — there is no configurable pattern
-// knob. The Renderer is accepted for signature symmetry
-// with ReadTopology; the metric-name prefix is NOT applied to
-// traces_service_graph_request_total (different exporter family, design.md
-// D26), so r is effectively a no-op here today.
+// knob.
 //
 // resolver is the optional Istio route-resolution engine
 // (translate-global-fqdn-to-k8s-service): when non-nil, a pure prescan
@@ -64,7 +61,6 @@ type ServiceGraphResult struct {
 func ReadServiceGraph(
 	ctx context.Context,
 	q promql.Querier,
-	r promql.Renderer,
 	window time.Duration,
 	end time.Time,
 	topology Topology,
@@ -87,7 +83,7 @@ func ReadServiceGraph(
 	g.Go(func() error {
 		out, err := q.Instant(gctx,
 			string(promql.QServiceGraphTotal),
-			r.Render(promql.QServiceGraphTotal, window),
+			promql.Render(promql.QServiceGraphTotal, window),
 			end,
 		)
 		vec, totalErr = out, err
@@ -96,7 +92,7 @@ func ReadServiceGraph(
 	g.Go(func() error {
 		out, err := q.Instant(gctx,
 			string(promql.QServiceGraphFailedTotal),
-			r.Render(promql.QServiceGraphFailedTotal, window),
+			promql.Render(promql.QServiceGraphFailedTotal, window),
 			end,
 		)
 		failed, failErr = out, err
@@ -105,7 +101,7 @@ func ReadServiceGraph(
 	g.Go(func() error {
 		out, err := q.Instant(gctx,
 			string(promql.QServiceGraphServerSecondsBucket),
-			r.Render(promql.QServiceGraphServerSecondsBucket, window),
+			promql.Render(promql.QServiceGraphServerSecondsBucket, window),
 			end,
 		)
 		duration, durErr = out, err

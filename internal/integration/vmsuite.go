@@ -278,7 +278,6 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 		s.Require().NoError(ks.LoadFile(cfg.APIKeysFile))
 	}
 	builder := build.New(prom, build.Options{
-		MetricPrefix:        cfg.MetricPrefix,
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       o.routeResolver,
 		RouteResolveTimeout: o.routeResolveTimeout,

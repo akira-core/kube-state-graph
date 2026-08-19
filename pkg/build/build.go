@@ -26,23 +26,19 @@ var tracer = otel.Tracer("kube-state-graph")
 // multi-cluster Graph for one bucketed time window.
 type Builder struct {
 	q       promql.Querier
-	r       promql.Renderer
 	opts    Options
 	metrics Metrics
 	clk     clock.Clock
 }
 
 // New constructs a Builder. clk may be nil (falls back to clock.System); m may
-// be nil (no-op metrics). The Renderer is derived from opts.MetricPrefix and
-// held on the Builder so every PromQL query the build pipeline issues picks up
-// the configured upstream metric-name prefix (see design.md D26).
+// be nil (no-op metrics).
 func New(q promql.Querier, opts Options, m Metrics, clk clock.Clock) *Builder {
 	if clk == nil {
 		clk = clock.System{}
 	}
 	return &Builder{
 		q:       q,
-		r:       promql.Renderer{Prefix: opts.MetricPrefix},
 		opts:    opts,
 		metrics: m,
 		clk:     clk,
@@ -60,7 +56,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, b.q, b.r, window, end)
+	topology, err := ReadTopology(ctx, b.q, window, end)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
@@ -99,16 +95,15 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 				"start", startStr,
 				"end", endStr,
 				"window", window.String(),
-				"metric_prefix", b.opts.MetricPrefix,
 				"raw_series_counts", topology.RawSeriesCount,
-				"pod_info_query", b.r.Render(promql.QPodInfo, window),
-				"node_info_query", b.r.Render(promql.QNodeInfo, window),
+				"pod_info_query", promql.Render(promql.QPodInfo, window),
+				"node_info_query", promql.Render(promql.QNodeInfo, window),
 			)
 			return nil, err
 		}
 	}
 
-	sg, err := ReadServiceGraph(ctx, b.q, b.r, window, end, topology,
+	sg, err := ReadServiceGraph(ctx, b.q, window, end, topology,
 		b.opts.RouteResolver, b.opts.RouteResolveTimeout)
 	if err != nil {
 		return nil, classifyReadError(span, "service-graph read failed", err)
@@ -184,7 +179,7 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	// service-graph nodes. Reordering these appends silently flips the
 	// collision winner — see TestAssemble_TopologyWinsIDCollision.
 	total := len(topology.Pods) + len(topology.Nodes) + len(topology.PVCs) +
-		len(topology.StorageClasses) +
+		len(topology.NetAppAggrs) + len(topology.NetAppNodes) +
 		len(sg.SynthPods) + len(sg.ServiceNodes) + len(sg.ExternalNodes)
 	nodes := make([]graph.GraphNode, 0, total)
 	for _, p := range topology.Pods {
@@ -196,8 +191,11 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	for _, pv := range topology.PVCs {
 		nodes = append(nodes, pv)
 	}
-	for _, sc := range topology.StorageClasses {
-		nodes = append(nodes, sc)
+	for _, a := range topology.NetAppAggrs {
+		nodes = append(nodes, a)
+	}
+	for _, n := range topology.NetAppNodes {
+		nodes = append(nodes, n)
 	}
 	for _, p := range sg.SynthPods {
 		nodes = append(nodes, p)
@@ -212,6 +210,7 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	edges := make([]*graph.Edge, 0,
 		len(sg.Edges)+len(topology.Pods)+len(topology.PodPVCs))
 	edges = append(edges, TopologyEdges(topology)...)
+	edges = append(edges, topology.StorageEdges...)
 	edges = append(edges, sg.Edges...)
 	return nodes, edges
 }
@@ -227,7 +226,7 @@ func (b *Builder) upProbe(ctx context.Context) (bool, error) {
 		defer cancel()
 	}
 	vec, err := b.q.Instant(ctx, string(promql.QUpProbe),
-		b.r.Render(promql.QUpProbe, 0), b.clk.Now().UTC())
+		promql.Render(promql.QUpProbe, 0), b.clk.Now().UTC())
 	if err != nil {
 		return false, err
 	}

@@ -34,6 +34,16 @@ func genGraph(seed int64, clusters, podsPerCluster, extraEdges int) *Graph {
 		}
 	}
 
+	// Shared NetApp filer: one aggregate + controller referenced by every
+	// cluster's first pod via a PVC, so the default projection retains them
+	// whenever that pod is connectivity-connected.
+	aggrID := NetAppAggrID("ontap-prod", "aggr1")
+	ctrlID := NetAppNodeID("ontap-prod", "n1")
+	all = append(all,
+		&NetAppAggrNode{IDValue: aggrID, NameValue: "aggr1", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "n1"}},
+		&NetAppNode{IDValue: ctrlID, NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"}},
+	)
+
 	// One Service per cluster (D29). Added before the edge loop so podsOnly()
 	// still sees only pods.
 	for i := range clusters {
@@ -46,6 +56,21 @@ func genGraph(seed int64, clusters, podsPerCluster, extraEdges int) *Graph {
 
 	edges := []*Edge{}
 	pods := podsOnly(all)
+	for i := range clusters {
+		for _, p := range pods {
+			if p.Labels()["cluster"] != clusterNames[i] {
+				continue
+			}
+			pvcID := PVCID(clusterNames[i], "ns-0", "data")
+			all = append(all, &PVCNode{
+				IDValue: pvcID, NameValue: "data",
+				LabelsValue: map[string]string{"cluster": clusterNames[i], "namespace": "ns-0"},
+			})
+			edges = append(edges, NewEdge(EdgeTypePodMountsPVC, p.ID(), pvcID, nil))
+			edges = append(edges, NewEdge(EdgeTypePVCToNetAppAggr, pvcID, aggrID, nil))
+			break
+		}
+	}
 	// service-selects-pod edge from each cluster's Service to a backing pod.
 	for i := range clusters {
 		svcID := ServiceID(clusterNames[i], "ns-0", "svc")
@@ -137,6 +162,11 @@ func TestProperty_TraversalDepthRespected(t *testing.T) {
 				frontier = next
 			}
 			for _, n := range v.Nodes {
+				if n.Type() == NodeTypeNetAppNode {
+					// Compound parent of an admitted aggregate — pulled in
+					// even when it has no edge (so BFS never reaches it).
+					continue
+				}
 				dd, ok := dist[n.ID()]
 				assert.Truef(t, ok, "seed=%d depth=%d: node %s in view but not reachable from root", seed, d, n.ID())
 				assert.LessOrEqualf(t, dd, d, "seed=%d depth=%d: node %s at distance %d > depth", seed, d, n.ID(), dd)
@@ -206,7 +236,12 @@ func TestProperty_NameFilterEveryNodeMatchesOrIsRehydratedPartner(t *testing.T) 
 			}
 		}
 		for id := range returned {
-			if named[id] {
+			if named[id] || incident[id] {
+				continue
+			}
+			n := g.NodesByID[id]
+			if n != nil && n.Type() == NodeTypeNetAppNode {
+				// Compound parent of an admitted aggregate.
 				continue
 			}
 			assert.Truef(t, incident[id],
@@ -232,6 +267,32 @@ func TestProperty_ServiceSelectsPodEdgesWellFormed(t *testing.T) {
 			assert.Equalf(t, NodeTypePod, tgt.Type(), "seed=%d: target must be a pod node", seed)
 		}
 		assert.Positivef(t, count, "seed=%d: expected at least one service-selects-pod edge", seed)
+	}
+}
+
+func TestProperty_EmittedAggrImpliesOwningNode(t *testing.T) {
+	for seed := int64(1); seed <= 25; seed++ {
+		g := genGraph(seed, 3, 5, 12)
+		for _, scope := range []Scope{
+			{},
+			{Clusters: map[string]struct{}{"cluster-0": {}}},
+			{Namespaces: map[string]struct{}{"ns-0": {}}},
+		} {
+			v := Project(g, scope)
+			ids := map[string]bool{}
+			for _, n := range v.Nodes {
+				ids[n.ID()] = true
+			}
+			for _, n := range v.Nodes {
+				if n.Type() != NodeTypeNetAppAggr {
+					continue
+				}
+				oc, node := n.Labels()["ontap_cluster"], n.Labels()["node"]
+				parent := NetAppNodeID(oc, node)
+				assert.Truef(t, ids[parent],
+					"seed=%d: aggregate %s emitted without owning node %s", seed, n.ID(), parent)
+			}
+		}
 	}
 }
 

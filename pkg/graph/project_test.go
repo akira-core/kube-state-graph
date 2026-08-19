@@ -208,15 +208,17 @@ func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1+p2
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
 		&PVCNode{IDValue: "c/shop/data", NameValue: "data", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop"}, StorageClassValue: "gp3"},
-		&StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}},       // backs data
-		&StorageClassNode{IDValue: StorageClassID("c", "unused"), NameValue: "unused", LabelsValue: map[string]string{"cluster": "c"}}, // backs nothing
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "used"), NameValue: "used", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "unused"), NameValue: "unused", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n2"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1"), NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n2"), NameValue: "n2", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
 	}
 	edges := []*Edge{
 		NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"}),
 		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
 		NewEdge(EdgeTypePodToNode, "c/p2", "c/worker-0", nil),
 		NewEdge(EdgeTypePodMountsPVC, "c/p1", "c/shop/data", nil),
-		NewEdge(EdgeTypePVCToStorageClass, "c/shop/data", StorageClassID("c", "gp3"), nil),
+		NewEdge(EdgeTypePVCToNetAppAggr, "c/shop/data", NetAppAggrID("oc", "used"), nil),
 	}
 	g := NewGraph(all, edges, time.Now())
 
@@ -226,9 +228,11 @@ func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
 		ids[n.ID()] = true
 	}
 	assert.True(t, ids["c/worker-0"], "node hosting an in-graph pod is retained")
-	assert.True(t, ids[StorageClassID("c", "gp3")], "StorageClass backing an in-graph PVC is retained")
+	assert.True(t, ids[NetAppAggrID("oc", "used")], "aggregate serving an in-graph PVC is retained")
+	assert.True(t, ids[NetAppNodeID("oc", "n1")], "controller of the kept aggregate is retained")
 	assert.False(t, ids["c/worker-1"], "podless node dropped from the no-filter view")
-	assert.False(t, ids[StorageClassID("c", "unused")], "PVC-less StorageClass dropped from the no-filter view")
+	assert.False(t, ids[NetAppAggrID("oc", "unused")], "unreferenced aggregate dropped from the no-filter view")
+	assert.False(t, ids[NetAppNodeID("oc", "n2")], "controller of an unreferenced aggregate dropped")
 }
 
 // The name-filter exception: ?name=<infra-node> surfaces a referenced-by-nothing

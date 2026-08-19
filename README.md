@@ -89,8 +89,7 @@ per source cluster).
 | `kube_node_status_condition{condition="Ready"}` | Node Ready status `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`} from the active (`status` value 1) row; omitted when no Ready data — distinct from `Unknown` (kubelet lost contact) | `cluster`, `node`, `condition`, `status` | Optional (absent ⇒ no `data.ready_status`); a KSM default |
 | `kube_node_labels` | Node label propagation (`kubernetes.io/*` etc.) | `cluster`, `node`, `label_*` | Optional |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC nodes; pod-mounts-pvc edges | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | Optional (no PVCs ⇒ no PVC nodes/edges) |
-| `kube_persistentvolumeclaim_info` | PVC StorageClass → `pvc-to-storageclass` edge to the real `type="storageclass"` node (never a PVC `data` attribute or label) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass` | Optional (absent ⇒ no StorageClass edge; PVC nests under its namespace group) |
-| `kube_storageclass_info` | Real `type="storageclass"` nodes: `data.provisioner` (native label) + `data.parameters` object (`pool`←`storagePools`\|`pool`, `fs`←`fsType`\|`fsName`, `cluster_id`←`ClusterID`, `selector`) | `cluster`, `storageclass`, `provisioner`, `storagePools`, `pool`, `fsType`, `fsName`, `ClusterID`, `selector` | Optional (absent ⇒ PVC-referenced classes materialise bare). Parameter labels are operator-provided (`--metric-labels-allowlist`) |
+| `kube_persistentvolumeclaim_info` | PVC `data.storageclass` (the policy name, never a node) + `labels.volumename` (bound PV name; roots the Harvest join) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass`, `volumename` | Optional (absent ⇒ no `data.storageclass` / `volumename`; no Harvest join) |
 | `kube_pod_owner` | Pod controller-owner attribute `data.owner` = `{kind, name}` (ReplicaSet skipped to its Deployment; omitted when no controller owner); also the pod ArgoCD Application `data.application` (segment before the first `:` of the `argocd_tracking_id` label). The owner and Application additionally drive the `application` / `controller` compound groups in the workload hierarchy | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller`, `argocd_tracking_id` | Optional (absent ⇒ no `data.owner`). `argocd_tracking_id` is **operator-provided** (e.g. `--metric-labels-allowlist` / relabel), NOT a KSM default; absent ⇒ no `data.application` |
 | `kube_replicaset_owner` | Resolves a ReplicaSet pod-owner up to its owning Deployment | `cluster`, `namespace`, `replicaset`, `owner_kind`, `owner_name` | Optional (absent ⇒ ReplicaSet kept as owner) |
 | `kube_pod_container_info` | Pod container list `data.containers` = `[{name, image}]`, sorted by `(name, image)`; on a mid-window image change the latest-seen image wins per container | `cluster`, `namespace`, `pod`, `container`, `image` | Optional (absent ⇒ no `data.containers`); a KSM default |
@@ -99,6 +98,18 @@ per source cluster).
 | `kube_persistentvolumeclaim_annotations` | PVC ArgoCD Application `data.application` (same parse as the service), which nests the PVC under the `application` compound group | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | Optional (absent ⇒ no `data.application`). **Requires** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |
 | `kube_endpointslice_endpoints` | Service → backing-pod fan-out (`service-selects-pod` edges) | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | Optional |
 | `kube_endpointslice_labels` | Joins an EndpointSlice to its owning Service | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | Optional — **requires** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` (NOT a KSM default); absent ⇒ no `service-selects-pod` resolution |
+
+### Harvest + kubelet storage metrics
+
+| Metric | Used for | Labels read | Required? |
+|---|---|---|---|
+| `volume_read_ops` / `volume_write_ops` / `volume_read_latency` / `volume_write_latency` | PVC→aggregate join (`volume_name` = PV name) + I/O on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`). Read **verbatim** — Harvest already resolves ONTAP counters; never wrapped in `rate()` | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume_name` | Optional (absent ⇒ no NetApp nodes / edges / `svm`) |
+| `aggr_new_status` | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | `cluster`, `node`, `aggr` | Optional |
+| `aggr_space_used` / `aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `node`, `aggr` | Optional |
+| `node_new_status` | Controller `data.health` (same mapping as aggregate) | `cluster`, `node` | Optional |
+| `kubelet_volume_stats_used_bytes` / `kubelet_volume_stats_capacity_bytes` | PVC `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `namespace`, `persistentvolumeclaim` | Optional |
+
+`volume_name` is **not** a stock Harvest label — it is produced by the deployment's own relabel rule. See `docs/netapp-harvest-preconditions.md`.
 
 Each is wrapped in `last_over_time(<metric>[<window>]) @ <end>` so the result
 reflects the most recent value within the requested `[start, end]` window — except
@@ -157,7 +168,7 @@ No `metrics` key at all on:
   destination sharing one label string onto one identity);
 - synthesised edges: `service-selects-pod` fan-out, the ingress chain's
   gateway-pod → backend-service hop, and topology edges (`pod-to-node`,
-  `pod-mounts-pvc`, `pvc-to-storageclass`);
+  `pod-mounts-pvc`);
 - the route-hit ingress chain's **caller → ingress-service entry hop**. One
   series produces both that hop and the retained caller → backend edge; they are
   two projections of the same call, so only the backend edge — the one naming
@@ -172,9 +183,11 @@ When present:
 
 | Field | Meaning |
 |---|---|
-| `rate` | Requests per second over the window (always > 0) |
-| `error_rate` | Failed fraction in `[0, 1]`. **Absent** when the failure counter could not be read; **`0`** when it was read and reported no failures — do not conflate the two |
-| `p90_server_ms` | 90th percentile **server-observed** duration in milliseconds. Matches Grafana's service-graph **definition** (server side, p90), not necessarily Grafana's numbers (Grafana aggregates by service name; this API aggregates by pod pair) |
+| `rate` | RED family: requests per second over the window (always > 0). Schema-optional because `data.metrics` is a union |
+| `error_rate` | RED: failed fraction in `[0, 1]`. **Absent** when the failure counter could not be read; **`0`** when it was read and reported no failures — do not conflate the two |
+| `p90_server_ms` | RED: 90th percentile **server-observed** duration in milliseconds |
+| `read_ops` / `write_ops` | I/O family (`pvc-to-netapp-aggr` only): Harvest ops/s, verbatim |
+| `read_latency_us` / `write_latency_us` | I/O family: Harvest average latency in microseconds, verbatim |
 
 Both new series are **optional** and degrade gracefully: a missing metric,
 empty result, or query error omits only the affected field (or leaves
@@ -234,7 +247,7 @@ matcher of their own — `edge_relation!="link"` (see the table above).
 |---|---|
 | `pod-mounts-pvc` | `kube_pod_spec_volumes_persistentvolumeclaims_info` |
 | `pod-to-node` | `kube_pod_info` (`node` label; one per scheduled pod, intra-cluster) |
-| `pvc-to-storageclass` | `kube_persistentvolumeclaim_info` (`storageclass` label → `kube_storageclass_info` node; intra-cluster) |
+| `pvc-to-netapp-aggr` | Harvest `volume_*` joined on `volume_name` = PVC `volumename` (PV name) |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
 | `pod-calls-service` | `traces_service_graph_request_total` (when target resolves to a service node via connection-string resolution) |
 | `service-selects-pod` | `traces_service_graph_request_total` (connection-string resolution + `kube_endpointslice_*` join) |
@@ -260,7 +273,6 @@ service-graph behaviour.
 | `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. |
 | `--api-keys-reload-interval`    | `KSG_API_KEYS_RELOAD_INTERVAL`   | `30s`                | How often `--api-keys-file` is re-read. Set to `0` to disable hot reload. |
 | `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug | info | warn | error`. |
-| `--metric-prefix`               | `KSG_METRIC_PREFIX`              | (empty)              | Additive prefix prepended to every kube-state-metrics-shaped series the topology reader queries (e.g. `o11y_` → `o11y_kube_pod_info`). Does **not** affect `traces_service_graph_request_total` or `up{}`. The metric-name suffix and per-series label set are a fixed contract any compatible exporter must honour. |
 | —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
 | —                               | `KSG_PROM_PASSWORD`              | (empty)              | HTTP Basic Auth password for the upstream. Env-only, paired with `KSG_PROM_USERNAME` — setting exactly one of the two fails startup. Rotation requires a restart (no hot reload); changing a Secret-backed env var in a Deployment triggers a rollout anyway. |
 

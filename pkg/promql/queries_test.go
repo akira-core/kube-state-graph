@@ -47,62 +47,38 @@ func TestRender_NodeAddressesIncludesExternalIPSelector(t *testing.T) {
 	assert.Contains(t, got, `type=~"ExternalIP|InternalIP"`)
 }
 
-// TestRenderer_PrefixApplied covers the additive metric-name prefix knob
-// (design.md D26) across every kube-state-metrics-shaped query plus the
-// cluster-discovery query that wraps kube_node_info.
-func TestRenderer_PrefixApplied(t *testing.T) {
+// TestRender_BareKSMNames pins every surviving kube-state-metrics-shaped
+// query (and cluster-discovery) at its bare series name — there is no
+// configurable metric-name prefix.
+func TestRender_BareKSMNames(t *testing.T) {
 	cases := []struct {
 		name   string
 		q      Query
 		window time.Duration
 		want   string
 	}{
-		{"pod-info", QPodInfo, time.Minute, "last_over_time(o11y_kube_pod_info[1m])"},
-		{"node-info", QNodeInfo, time.Minute, "last_over_time(o11y_kube_node_info[1m])"},
-		{"node-addresses", QNodeAddresses, time.Minute, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[1m])`},
-		{"pvc-bindings", QPVCBindings, time.Minute, "last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[1m])"},
-		{"node-labels", QNodeLabels, time.Minute, "last_over_time(o11y_kube_node_labels[1m])"},
-		{"service-info", QServiceInfo, time.Minute, "last_over_time(o11y_kube_service_info[1m])"},
-		{"endpointslice-endpoints", QEndpointSliceEndpoints, time.Minute, "last_over_time(o11y_kube_endpointslice_endpoints[1m])"},
-		{"endpointslice-labels", QEndpointSliceLabels, time.Minute, "last_over_time(o11y_kube_endpointslice_labels[1m])"},
-		{"pod-owner", QPodOwner, time.Minute, "last_over_time(o11y_kube_pod_owner[1m])"},
-		{"replicaset-owner", QReplicaSetOwner, time.Minute, "last_over_time(o11y_kube_replicaset_owner[1m])"},
-		{"pvc-info", QPVCInfo, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])"},
-		{"storageclass-info", QStorageClassInfo, time.Minute, "last_over_time(o11y_kube_storageclass_info[1m])"},
-		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(o11y_kube_pod_container_info[1m])"},
-		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`},
-		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(o11y_kube_service_annotations[1m])"},
-		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])"},
-		{"tridentvolume-info", QTridentVolumeInfo, time.Minute, "last_over_time(o11y_kube_tridentvolume_info[1m])"},
-		{"tridentbackend-info", QTridentBackendInfo, time.Minute, "last_over_time(o11y_kube_tridentbackend_info[1m])"},
-		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(o11y_kube_node_info[1h]))"},
+		{"pod-info", QPodInfo, time.Minute, "last_over_time(kube_pod_info[1m])"},
+		{"node-info", QNodeInfo, time.Minute, "last_over_time(kube_node_info[1m])"},
+		{"node-addresses", QNodeAddresses, time.Minute, `last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[1m])`},
+		{"pvc-bindings", QPVCBindings, time.Minute, "last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info[1m])"},
+		{"node-labels", QNodeLabels, time.Minute, "last_over_time(kube_node_labels[1m])"},
+		{"service-info", QServiceInfo, time.Minute, "last_over_time(kube_service_info[1m])"},
+		{"endpointslice-endpoints", QEndpointSliceEndpoints, time.Minute, "last_over_time(kube_endpointslice_endpoints[1m])"},
+		{"endpointslice-labels", QEndpointSliceLabels, time.Minute, "last_over_time(kube_endpointslice_labels[1m])"},
+		{"pod-owner", QPodOwner, time.Minute, "last_over_time(kube_pod_owner[1m])"},
+		{"replicaset-owner", QReplicaSetOwner, time.Minute, "last_over_time(kube_replicaset_owner[1m])"},
+		{"pvc-info", QPVCInfo, time.Minute, "last_over_time(kube_persistentvolumeclaim_info[1m])"},
+		{"pod-container-info", QPodContainerInfo, time.Minute, "tlast_over_time(kube_pod_container_info[1m])"},
+		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(kube_node_status_condition{condition="Ready"}[1m])`},
+		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(kube_service_annotations[1m])"},
+		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(kube_persistentvolumeclaim_annotations[1m])"},
+		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(kube_node_info[1h]))"},
 	}
-	r := Renderer{Prefix: "o11y_"}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, r.Render(tc.q, tc.window))
+			assert.Equal(t, tc.want, Render(tc.q, tc.window))
 		})
 	}
-}
-
-// TestRenderer_PrefixNotAppliedToServiceGraphOrUp asserts the negative
-// scope rule: the configurable prefix targets only kube-state-metrics-shaped
-// series. Service-graph metrics (Alloy/Tempo family) and the Prometheus-native
-// `up{}` readiness probe MUST be unaffected.
-func TestRenderer_PrefixNotAppliedToServiceGraphOrUp(t *testing.T) {
-	r := Renderer{Prefix: "o11y_"}
-	sg := r.Render(QServiceGraphTotal, time.Minute)
-	assert.Equal(t, `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[1m])`, sg)
-	assert.NotContains(t, sg, "o11y_", "prefix must NOT apply to service-graph metric")
-
-	failed := r.Render(QServiceGraphFailedTotal, time.Minute)
-	assert.NotContains(t, failed, "o11y_", "prefix must NOT apply to failed_total")
-	bucket := r.Render(QServiceGraphServerSecondsBucket, time.Minute)
-	assert.NotContains(t, bucket, "o11y_", "prefix must NOT apply to server_seconds_bucket")
-
-	up := r.Render(QUpProbe, 0)
-	assert.Equal(t, "up", up)
-	assert.NotContains(t, up, "o11y_", "prefix must NOT apply to up{} probe")
 }
 
 // TestRender_ServiceGraphFailedTotal pins the OPTIONAL Errors counter render:
@@ -112,8 +88,6 @@ func TestRender_ServiceGraphFailedTotal(t *testing.T) {
 	want := `rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",edge_relation!="link"}[1m])`
 	assert.Equal(t, want, Render(QServiceGraphFailedTotal, time.Minute))
 	assert.Equal(t, "traces_service_graph_request_failed_total", string(QServiceGraphFailedTotal))
-	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphFailedTotal, time.Minute),
-		"prefix must NOT apply to failed_total")
 }
 
 // TestRender_ServiceGraphServerSecondsBucket pins the OPTIONAL Duration
@@ -127,8 +101,6 @@ func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
 	assert.NotContains(t, got, "sum by",
 		"the duration histogram must NOT be aggregated upstream — a group-by silently merges unrelated edges")
 	assert.Equal(t, "traces_service_graph_request_server_seconds_bucket", string(QServiceGraphServerSecondsBucket))
-	assert.Equal(t, want, Renderer{Prefix: "o11y_"}.Render(QServiceGraphServerSecondsBucket, time.Minute),
-		"prefix must NOT apply to server_seconds_bucket")
 }
 
 // TestRender_ServiceGraphTotalKeepsSpanLinkSeries pins the deliberate asymmetry
@@ -150,108 +122,53 @@ func TestRender_ServiceGraphTotalKeepsSpanLinkSeries(t *testing.T) {
 	}
 }
 
-// TestRender_ZeroPrefixIdenticalToBareNames pins the back-compat contract:
-// the package-level Render is a zero-prefix Renderer; a deployment that
-// leaves MetricPrefix empty issues bit-identical PromQL to the pre-D26
-// behaviour.
-func TestRender_ZeroPrefixIdenticalToBareNames(t *testing.T) {
-	r := Renderer{}
-	assert.Equal(t, Render(QPodInfo, time.Minute), r.Render(QPodInfo, time.Minute))
-	assert.Equal(t, Render(QNodeInfo, time.Minute), r.Render(QNodeInfo, time.Minute))
-	assert.Equal(t, Render(QClusterDiscovery, time.Hour), r.Render(QClusterDiscovery, time.Hour))
-	assert.Contains(t, r.Render(QPodInfo, time.Minute), "kube_pod_info")
+// TestRender_QueryConstantsStayBare pins that every Query constant equals
+// the bare series name so query=/query_name= self-metric dimensions stay
+// stable.
+func TestRender_QueryConstantsStayBare(t *testing.T) {
+	assert.Equal(t, "kube_persistentvolumeclaim_info", string(QPVCInfo))
+	assert.Equal(t, "kube_pod_container_info", string(QPodContainerInfo))
+	assert.Equal(t, "kube_node_status_condition", string(QNodeStatusCondition))
+	assert.Equal(t, "kube_service_annotations", string(QServiceAnnotations))
+	assert.Equal(t, "kube_persistentvolumeclaim_annotations", string(QPVCAnnotations))
 }
 
-// TestRender_PVCInfoPrefixAware pins the new kube_persistentvolumeclaim_info
-// query: bare by default (stable self-metric dimension), prefix-aware via
-// Renderer like every other KSM-shaped series.
-func TestRender_PVCInfoPrefixAware(t *testing.T) {
-	assert.Equal(t, "last_over_time(kube_persistentvolumeclaim_info[1m])", Render(QPVCInfo, time.Minute))
-	assert.Equal(t, "kube_persistentvolumeclaim_info", string(QPVCInfo),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_info[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QPVCInfo, time.Minute))
+// TestRender_HarvestAndKubeletLastOverTime pins the ten new legs: each
+// renders as last_over_time(<series>[w]) with no rate() and no sum by.
+func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
+	cases := []struct {
+		q    Query
+		want string
+	}{
+		{QVolumeReadOps, "last_over_time(volume_read_ops[1m])"},
+		{QVolumeWriteOps, "last_over_time(volume_write_ops[1m])"},
+		{QVolumeReadLatency, "last_over_time(volume_read_latency[1m])"},
+		{QVolumeWriteLatency, "last_over_time(volume_write_latency[1m])"},
+		{QAggrStatus, "last_over_time(aggr_new_status[1m])"},
+		{QAggrSpaceUsed, "last_over_time(aggr_space_used[1m])"},
+		{QAggrSpaceTotal, "last_over_time(aggr_space_total[1m])"},
+		{QNetAppNodeStatus, "last_over_time(node_new_status[1m])"},
+		{QKubeletVolumeUsedBytes, "last_over_time(kubelet_volume_stats_used_bytes[1m])"},
+		{QKubeletVolumeCapacityBytes, "last_over_time(kubelet_volume_stats_capacity_bytes[1m])"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.q), func(t *testing.T) {
+			got := Render(tc.q, time.Minute)
+			assert.Equal(t, tc.want, got)
+			assert.NotContains(t, got, "rate(")
+			assert.NotContains(t, got, "sum by")
+			assert.Contains(t, got, string(tc.q))
+		})
+	}
 }
 
-// TestRender_StorageClassInfoPrefixAware pins the new kube_storageclass_info
-// query: bare by default (stable self-metric dimension), prefix-aware via
-// Renderer like every other KSM-shaped series.
-func TestRender_StorageClassInfoPrefixAware(t *testing.T) {
-	assert.Equal(t, "last_over_time(kube_storageclass_info[1m])", Render(QStorageClassInfo, time.Minute))
-	assert.Equal(t, "kube_storageclass_info", string(QStorageClassInfo),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "last_over_time(o11y_kube_storageclass_info[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QStorageClassInfo, time.Minute))
-}
-
-// TestRender_PodContainerInfoPrefixAware pins the new kube_pod_container_info
-// query (per-container name/image). It uses tlast_over_time (NOT last_over_time)
-// so each image-variant series carries its last-sample timestamp as the value,
-// letting the resolver pick the latest image per container. The Query constant
-// stays the bare metric name (stable self-metric dimension); prefix-aware via
-// Renderer like every other KSM-shaped series.
-func TestRender_PodContainerInfoPrefixAware(t *testing.T) {
-	assert.Equal(t, "tlast_over_time(kube_pod_container_info[1m])", Render(QPodContainerInfo, time.Minute))
-	assert.Equal(t, "kube_pod_container_info", string(QPodContainerInfo),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "tlast_over_time(o11y_kube_pod_container_info[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QPodContainerInfo, time.Minute))
-}
-
-// TestRender_NodeStatusConditionPrefixAware pins the new
-// kube_node_status_condition query: bare by default (stable self-metric
-// dimension), prefix-aware via Renderer, and carrying the fixed condition="Ready"
-// metric-selection contract (not a caller filter) — the four other node
-// conditions are never surfaced.
-func TestRender_NodeStatusConditionPrefixAware(t *testing.T) {
+// TestRender_NodeStatusConditionSelector pins the fixed condition="Ready"
+// metric-selection contract (not a caller filter).
+func TestRender_NodeStatusConditionSelector(t *testing.T) {
 	got := Render(QNodeStatusCondition, time.Minute)
 	assert.Equal(t, `last_over_time(kube_node_status_condition{condition="Ready"}[1m])`, got)
 	assert.Contains(t, got, `condition="Ready"`)
 	assert.NotContains(t, got, "cluster=~", "PromQL must not push cluster filtering")
-	assert.Equal(t, "kube_node_status_condition", string(QNodeStatusCondition),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[1m])`,
-		Renderer{Prefix: "o11y_"}.Render(QNodeStatusCondition, time.Minute))
-}
-
-// TestRender_ServiceAnnotationsPrefixAware pins the new kube_service_annotations
-// query (carrying annotation_argocd_argoproj_io_tracking_id for the service
-// ArgoCD Application). Bare by default (stable self-metric dimension), prefix-aware
-// via Renderer like every other KSM-shaped series.
-func TestRender_ServiceAnnotationsPrefixAware(t *testing.T) {
-	assert.Equal(t, "last_over_time(kube_service_annotations[1m])", Render(QServiceAnnotations, time.Minute))
-	assert.Equal(t, "kube_service_annotations", string(QServiceAnnotations),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "last_over_time(o11y_kube_service_annotations[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QServiceAnnotations, time.Minute))
-}
-
-// TestRender_PVCAnnotationsPrefixAware pins the new
-// kube_persistentvolumeclaim_annotations query (carrying
-// annotation_argocd_argoproj_io_tracking_id for the PVC ArgoCD Application).
-func TestRender_PVCAnnotationsPrefixAware(t *testing.T) {
-	assert.Equal(t, "last_over_time(kube_persistentvolumeclaim_annotations[1m])", Render(QPVCAnnotations, time.Minute))
-	assert.Equal(t, "kube_persistentvolumeclaim_annotations", string(QPVCAnnotations),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "last_over_time(o11y_kube_persistentvolumeclaim_annotations[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QPVCAnnotations, time.Minute))
-}
-
-// TestRender_TridentPrefixAware pins the two NetApp Trident custom-resource
-// queries (kube_tridentvolume_info / kube_tridentbackend_info — the PVC
-// volumename→backendUUID→svm label chain). Bare by default (stable self-metric
-// dimension), prefix-aware via Renderer like every other KSM-shaped series.
-func TestRender_TridentPrefixAware(t *testing.T) {
-	assert.Equal(t, "last_over_time(kube_tridentvolume_info[1m])", Render(QTridentVolumeInfo, time.Minute))
-	assert.Equal(t, "last_over_time(kube_tridentbackend_info[1m])", Render(QTridentBackendInfo, time.Minute))
-	assert.Equal(t, "kube_tridentvolume_info", string(QTridentVolumeInfo),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "kube_tridentbackend_info", string(QTridentBackendInfo),
-		"Query constant stays the bare metric name for stable query/query_name dimensions")
-	assert.Equal(t, "last_over_time(o11y_kube_tridentvolume_info[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QTridentVolumeInfo, time.Minute))
-	assert.Equal(t, "last_over_time(o11y_kube_tridentbackend_info[1m])",
-		Renderer{Prefix: "o11y_"}.Render(QTridentBackendInfo, time.Minute))
 }
 
 func TestFormatDuration(t *testing.T) {

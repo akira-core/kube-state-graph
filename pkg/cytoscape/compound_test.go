@@ -108,12 +108,17 @@ func TestSerialiseCytoscape_Parents(t *testing.T) {
 			wantParent: map[string]string{"c1/shop/payments": "c1/namespace/shop", "c1/shop/data": "c1/namespace/shop"},
 		},
 		{
-			name: "node and storageclass parented to cluster",
+			name: "node parented to cluster; netapp nests under storage-cluster / real node",
 			nodes: []graph.GraphNode{
 				&graph.K8sNode{IDValue: "c1/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c1"}},
-				&graph.StorageClassNode{IDValue: "c1/storageclass/gp3", NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c1"}},
+				&graph.NetAppNode{IDValue: "netapp/oc/n1", NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
+				&graph.NetAppAggrNode{IDValue: "netapp/oc/aggr/a1", NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}},
 			},
-			wantParent: map[string]string{"c1/worker-0": "cluster/c1", "c1/storageclass/gp3": "cluster/c1"},
+			wantParent: map[string]string{
+				"c1/worker-0":       "cluster/c1",
+				"netapp/oc/n1":      "storage-cluster/oc",
+				"netapp/oc/aggr/a1": "netapp/oc/n1",
+			},
 		},
 		{
 			name: "external has no parent and no cluster group",

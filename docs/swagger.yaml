@@ -35,12 +35,12 @@ components:
           type: string
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.EdgeMetricsDTO:
-      description: RED measurements on a trace-derived edge whose two endpoints both
-        resolved to a pod or a service node. rate is required when the object is present.
-        error_rate is omitted when the failure counter was unreadable (do not treat
-        absence as 0). p90_server_ms is omitted when no usable classic histogram was
-        available. All values are JSON numbers rounded to 6 significant digits and
-        may appear in exponent form (e.g. 3.86e-7).
+      description: 'Union of two disjoint measurement families. RED family (trace-derived
+        call edges): rate (required within the family, > 0), error_rate, p90_server_ms.
+        I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us,
+        write_latency_us. A single edge carries fields from exactly one family. All
+        values are JSON numbers rounded to 6 significant digits and may appear in
+        exponent form (e.g. 3.86e-7).'
       properties:
         error_rate:
           description: ErrorRate is the failed fraction in [0,1]. Omitted when the
@@ -54,8 +54,16 @@ components:
           type: number
         rate:
           description: Rate is requests per second over the window (always > 0 when
-            present).
+            the RED family is present). Schema-optional because the object is a union.
           example: 5
+          type: number
+        read_latency_us:
+          type: number
+        read_ops:
+          type: number
+        write_latency_us:
+          type: number
+        write_ops:
           type: number
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.Elements:
@@ -85,6 +93,8 @@ components:
             $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Container'
           type: array
           uniqueItems: false
+        health:
+          type: string
         id:
           type: string
         ipaddress:
@@ -100,18 +110,23 @@ components:
           type: string
         owner:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Owner'
-        parameters:
-          additionalProperties:
-            type: string
-          type: object
         parent:
-          type: string
-        provisioner:
           type: string
         ready_status:
           type: string
+        storageclass:
+          type: string
         type:
           type: string
+        usage:
+          $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.UsageDTO'
+      type: object
+    github_com_akira-core_kube-state-graph_pkg_cytoscape.UsageDTO:
+      properties:
+        capacity_bytes:
+          type: number
+        used_bytes:
+          type: number
       type: object
     github_com_akira-core_kube-state-graph_pkg_graph.Container:
       properties:
@@ -127,7 +142,7 @@ components:
       - pod-calls-service
       - service-selects-pod
       - pod-to-node
-      - pvc-to-storageclass
+      - pvc-to-netapp-aggr
       type: string
       x-enum-varnames:
       - EdgeTypePodMountsPVC
@@ -135,7 +150,7 @@ components:
       - EdgeTypePodCallsService
       - EdgeTypeServiceSelectsPod
       - EdgeTypePodToNode
-      - EdgeTypePVCToStorageClass
+      - EdgeTypePVCToNetAppAggr
     github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition:
       properties:
         description:
@@ -178,7 +193,8 @@ components:
       - pvc
       - service
       - external
-      - storageclass
+      - netapp-aggr
+      - netapp-node
       type: string
       x-enum-varnames:
       - NodeTypePod
@@ -186,7 +202,8 @@ components:
       - NodeTypePVC
       - NodeTypeService
       - NodeTypeExternal
-      - NodeTypeStorageClass
+      - NodeTypeNetAppAggr
+      - NodeTypeNetAppNode
     github_com_akira-core_kube-state-graph_pkg_graph.Owner:
       properties:
         kind:
@@ -429,13 +446,13 @@ paths:
 
         **Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced; the pair is passed through to upstream PromQL verbatim. Bounded query cost is delegated to upstream VictoriaMetrics search limits. Each request triggers a fresh fan-out — there is no in-process result cache.
 
-        **Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `edge_type`, `name`. The `name` filter matches `n.Name()` exactly across every node type (pod, K8s node, PVC, service, StorageClass, external).
+        **Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `edge_type`, `name`. The `name` filter matches `n.Name()` exactly across every node type (pod, K8s node, PVC, service, external, netapp-aggr, netapp-node).
 
         **Traversal** (set `root` to enable): `depth` 0..6 (default 2), `direction` `in`/`out`/`both` (default `both`).
 
-        **Node types**: `pod`, `node`, `pvc`, `service`, `storageclass`, `external`, plus the presentation-only `cluster`, `namespace`, `application` and `controller` compound group nodes synthesised by the Cytoscape serialiser (`cluster > namespace > application > controller > pod`, with absent levels skipped; `cluster > namespace > [application >] {service, pvc}`; `cluster > {node, storageclass}`). **Edge types**: `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`, `pod-to-node`, `pvc-to-storageclass`. An ingress entry-point `service` node additionally carries `labels.role` — `ingress-gateway` (a routed hit's chain entry; gateway pods and a synthesized `pod-calls-service` hop to the backend exist behind it) or `ingress-lb` (the ingress LB fallback destination; no routed backend). The key is absent on every other service node.
+        **Node types**: `pod`, `node`, `pvc`, `service`, `external`, `netapp-aggr`, `netapp-node`, plus the presentation-only `cluster`, `storage-cluster`, `namespace`, `application` and `controller` compound group nodes synthesised by the Cytoscape serialiser (`cluster > namespace > application > controller > pod`, with absent levels skipped; `cluster > namespace > [application >] {service, pvc}`; `cluster > node`; `storage-cluster > netapp-node > netapp-aggr`, where the real `netapp-node` is the compound parent of its aggregates). **Edge types**: `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`, `pod-to-node`, `pvc-to-netapp-aggr`. An ingress entry-point `service` node additionally carries `labels.role` — `ingress-gateway` (a routed hit's chain entry; gateway pods and a synthesized `pod-calls-service` hop to the backend exist behind it) or `ingress-lb` (the ingress LB fallback destination; no routed backend). The key is absent on every other service node.
 
-        **Edge `data.metrics` (RED)**: a trace-derived edge whose both endpoints resolved to a pod or a service node MAY carry an optional `metrics` object with `rate` (req/s, required when present), `error_rate` (failed fraction in `[0,1]`, omitted when the failure counter was unreadable — never conflate absence with `0`), and `p90_server_ms` (90th percentile server-observed duration in ms; Grafana-definitional parity, not numeric parity). Both `pod-calls-pod` and `pod-calls-service` edges can carry it — how the endpoint was identified (pod UID, connection string, peer address, route resolution) does not matter. All three are JSON numbers rounded to 6 significant digits and MAY appear in exponent form (e.g. `3.86e-7`); consumers must not assume fixed-decimal rendering. The key is omitted entirely on: edges with an `external` endpoint, synthesised edges (`service-selects-pod`, the ingress chain's gateway-pod hop, topology edges), the ingress chain's caller→ingress entry hop (the retained caller→backend edge carries that call's measurement, so summing `rate` across the chain never double-counts), and edges built only from span-link series (`edge_relation="link"` — a queue/DB hop, not a request). The failure counter and duration histogram are optional upstream metrics; their absence degrades field-by-field without failing the build.
+        **Edge `data.metrics`**: a union of two disjoint families. RED (trace-derived call edges): `rate` (req/s, required within the family), `error_rate`, `p90_server_ms`. I/O (`pvc-to-netapp-aggr` edges): `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us` from Harvest, verbatim. Schema-level every field is optional (rate moved off `required`); a RED object always carries a positive `rate`. All values are JSON numbers rounded to 6 significant digits and MAY appear in exponent form. The key is omitted entirely when the edge has no measurements.
 
         **Endpoint resolution**: for a call endpoint whose pod UID is empty, the `client`/`server` label is inspected for a `://` connection string (no operator knob — detection is hardcoded). When present, the URL host is parsed (an optional `.svc.<domain>` suffix is stripped): both a `<service>.<namespace>` host and a headless `<pod>.<service>.<namespace>` host resolve to the addressed `(namespace, service)`. Resolution is anchored on ONE cluster — the UID-recovered client-pod cluster when available, else the trace-source label — and succeeds only when that cluster itself holds the same-named Service; a family sibling holding it is not enough, and there is no cross-family fallback, so this path is always intra-cluster. It materialises a single `service` node (`<cluster>/<ns>/<service>`) and one `pod-calls-service` edge. From that node, on-demand `service-selects-pod` edges fan out to the backing pods of EVERY same-family cluster holding the same-named Service (cluster names equal after normalising digit runs), so those edges MAY cross clusters; there is no endpoint-backed pruning — a sibling with zero endpoints simply contributes none. A `server="unknown"` endpoint whose client resolved to a real pod is instead classified from its peer address (in-cluster DNS name, bare short Service name in the client pod's namespace, or a ClusterIP literal looked up in the client's own cluster) and resolves under the same anchor rule. When the optional Istio route engine is configured, a global/ingress FQDN that would otherwise fall through resolves to the Service the selected ingress cluster's Gateway + VirtualService config routed it to — that cluster may be a family sibling of the caller's, so the resulting `pod-calls-service` edge MAY cross clusters, and the ingress entry point's own fan-out is locked to the selected cluster's endpoints. Anything unresolved yields an `external` node (`external/<value>`), as does a non-URL missing-UID label. Calls whose target is not a service stay typed `pod-calls-pod`. See `/v1/edge-types` for the authoritative per-type catalogue.
 
@@ -507,14 +524,15 @@ paths:
             - pod-calls-service
             - service-selects-pod
             - pod-to-node
-            - pvc-to-storageclass
+            - pvc-to-netapp-aggr
             type: string
           type: array
         style: form
       - description: Restrict to nodes whose name matches exactly across every node
-          type (pod, K8s node, PVC, service, external). Repeatable; name collisions
-          across types or clusters return all matches. Edges incident on a matching
-          node are kept and the partner endpoint is re-added subject to other filters.
+          type (pod, K8s node, PVC, service, external, netapp-aggr, netapp-node).
+          Repeatable; name collisions across types or clusters return all matches.
+          Edges incident on a matching node are kept and the partner endpoint is re-added
+          subject to other filters.
         example: checkout-7d9f6c8b8-abcde
         in: query
         name: name
@@ -523,9 +541,10 @@ paths:
             type: string
           type: array
         style: form
-      - description: Cluster-scoped node ID anchoring a traversal. Format depends
-          on type — pods `<cluster>/<uid>`, nodes `<cluster>/<node>`, PVCs `<cluster>/<ns>/<claim>`,
-          services `<cluster>/<ns>/<service>`, externals `external/<value>`.
+      - description: Node ID anchoring a traversal. Format depends on type — pods
+          `<cluster>/<uid>`, nodes `<cluster>/<node>`, PVCs `<cluster>/<ns>/<claim>`,
+          services `<cluster>/<ns>/<service>`, externals `external/<value>`, NetApp
+          aggregates `netapp/<ontap-cluster>/aggr/<aggr>`, NetApp nodes `netapp/<ontap-cluster>/<node>`.
         example: prod-eu/8f8d4f1a-1234-4abc-9def-0123456789ab
         in: query
         name: root

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
-	"github.com/akira-core/kube-state-graph/pkg/promql"
+
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
@@ -470,7 +470,7 @@ func TestReadServiceGraph_SameFQDNResolvedOnce(t *testing.T) {
 		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments", Port: 8080}, RouteHit, nil
 	}}
 
-	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
+	res, err := ReadServiceGraph(context.Background(), q,
 		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
 	require.NoError(t, err)
 	require.Len(t, resolver.requests(), 1,

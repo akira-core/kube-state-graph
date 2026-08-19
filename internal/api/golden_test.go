@@ -27,7 +27,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"with-service":         buildWithService(),
 		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
-		"with-netapp-trident":  buildWithNetAppTrident(),
+		"with-netapp-storage":  buildWithNetAppStorage(),
 		"name-filter":          buildNameFilter(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 		"link-relation":        buildLinkRelation(),
@@ -129,15 +129,10 @@ func buildFamilyFanout() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{pod, svc1, svc2, nats1, nats2}, Edges: edges}
 }
 
-// buildWithStorageClass snapshots the new StorageClass design (supersedes D31):
-// a real `type="storageclass"` node carrying its provisioner + parameters as
-// typed data attributes (labels stay {cluster}), nested under its cluster group;
-// the PVC nests under its namespace group with a `pvc-to-storageclass` edge to
-// the StorageClass node (a class-less PVC also nests under the namespace group,
-// with no such edge). The pod nests under its controller > application >
-// namespace hierarchy and links to its host node via a `pod-to-node` edge (the
-// node itself nests under the cluster group). The StorageClass surfaces as a
-// real node + edge — never as a PVC attribute or label.
+// buildWithStorageClass snapshots a PVC that still carries its StorageClass
+// *name* as data.storageclass (the StorageClass node and pvc-to-storageclass
+// edge are gone). The pod nests under its controller > application >
+// namespace hierarchy and links to its host node via a `pod-to-node` edge.
 func buildWithStorageClass() graph.View {
 	pod := &graph.PodNode{
 		IDValue:          "cluster-alpha/p1",
@@ -147,33 +142,31 @@ func buildWithStorageClass() graph.View {
 		OwnerValue:       &graph.Owner{Kind: "StatefulSet", Name: "mongo"},
 	}
 	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
-	pvcGP3 := &graph.PVCNode{IDValue: "cluster-alpha/db/data-mongo-0", NameValue: "data-mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db", "volume": "data"}, StorageClassValue: "gp3"}
-	pvcNone := &graph.PVCNode{IDValue: "cluster-alpha/db/legacy", NameValue: "legacy", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	sc := &graph.StorageClassNode{
-		IDValue:     graph.StorageClassID("cluster-alpha", "gp3"),
-		NameValue:   "gp3",
-		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		InfoValue:   &graph.StorageClassInfo{Provisioner: "ebs.csi.aws.com", Parameters: map[string]string{"pool": "aggr1", "fs": "ext4"}},
+	used, cap := 5368709120.0, 10737418240.0
+	pvcGP3 := &graph.PVCNode{
+		IDValue: "cluster-alpha/db/data-mongo-0", NameValue: "data-mongo-0",
+		LabelsValue:       map[string]string{"cluster": "cluster-alpha", "namespace": "db", "volume": "data"},
+		StorageClassValue: "gp3",
+		UsageValue:        &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
 	}
+	pvcNone := &graph.PVCNode{IDValue: "cluster-alpha/db/legacy", NameValue: "legacy", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	edges := []*graph.Edge{
 		graph.NewEdge(graph.EdgeTypePodToNode, pod.IDValue, node.IDValue, nil),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcGP3.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcNone.IDValue, map[string]string{"claim_name": "legacy"}),
-		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcGP3.IDValue, sc.IDValue, nil),
 	}
-	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone, sc}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone}, Edges: edges}
 }
 
-// buildWithNetAppTrident snapshots the NetApp Trident PVC label chain: a PVC
-// whose bound PV name (`labels.volumename`, from kube_persistentvolumeclaim_info)
-// and serving SVM (`labels.svm`, via kube_tridentvolume_info →
-// kube_tridentbackend_info) surface as plain additive labels — no
-// data.volumename / data.svm typed fields — coexisting with the pod-spec
-// `volume` key. A second PVC with an unresolved chain carries neither key
-// (absent, never empty-string).
-func buildWithNetAppTrident() graph.View {
+// buildWithNetAppStorage snapshots the Harvest-joined storage graph: a PVC
+// with volumename+svm labels, a pvc-to-netapp-aggr edge carrying I/O metrics,
+// an aggregate with health+usage nested under its real owning controller,
+// which nests under a storage-cluster group.
+func buildWithNetAppStorage() graph.View {
 	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	pvcTrident := &graph.PVCNode{
+	used, cap := 700000000000.0, 1000000000000.0
+	readOps, writeOps, readLat, writeLat := 150.0, 40.0, 830.0, 1200.0
+	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
 		LabelsValue: map[string]string{
@@ -183,18 +176,28 @@ func buildWithNetAppTrident() graph.View {
 		StorageClassValue: "netapp-nas",
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	sc := &graph.StorageClassNode{
-		IDValue:     graph.StorageClassID("cluster-alpha", "netapp-nas"),
-		NameValue:   "netapp-nas",
-		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		InfoValue:   &graph.StorageClassInfo{Provisioner: "csi.trident.netapp.io", Parameters: map[string]string{"pool": "aggr1", "fs": "nfs"}},
+	aggr := &graph.NetAppAggrNode{
+		IDValue:     graph.NetAppAggrID("ontap-prod", "aggr1"),
+		NameValue:   "aggr1",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-01"},
+		HealthValue: graph.HealthOnline,
+		UsageValue:  &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
 	}
+	ctrl := &graph.NetAppNode{
+		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
+		NameValue:   "ontap-prod-01",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+		HealthValue: graph.HealthOnline,
+	}
+	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
+		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
+	})
 	edges := []*graph.Edge{
-		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcTrident.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvc.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcPlain.IDValue, map[string]string{"claim_name": "scratch"}),
-		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcTrident.IDValue, sc.IDValue, nil),
+		ioEdge,
 	}
-	return graph.View{Nodes: []graph.GraphNode{pod, pvcTrident, pvcPlain, sc}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{pod, pvc, pvcPlain, aggr, ctrl}, Edges: edges}
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

@@ -5,16 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
-
-// metricPrefixPattern enforces the Prometheus metric-name charset
-// (https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels).
-// Empty MetricPrefix is allowed and bypasses this check.
-var metricPrefixPattern = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
 
 // Config holds the parsed runtime configuration for the kube-state-graph server.
 type Config struct {
@@ -26,11 +20,6 @@ type Config struct {
 	APIKeys               string
 	APIKeysReloadInterval time.Duration
 	LogLevel              string
-	// MetricPrefix is prepended verbatim to every kube-state-metrics-shaped
-	// series name the topology reader queries (and to the cluster-discovery
-	// query). Empty (the default) preserves stock kube-state-metrics behaviour.
-	// See design.md D26.
-	MetricPrefix string
 	// RouteStoreDSN is the ClickHouse DSN of the versioned Istio-config store
 	// backing global-FQDN route resolution (translate-global-fqdn-to-k8s-service).
 	// Empty (the default) disables the feature entirely: no store is dialed, no
@@ -86,7 +75,6 @@ func Defaults() Config {
 		APIKeys:               "",
 		APIKeysReloadInterval: 30 * time.Second,
 		LogLevel:              "info",
-		MetricPrefix:          "",
 		RouteStoreDSN:         "",
 		RouterCheckBin:        "/usr/local/bin/router_check_tool",
 		RouteResolveTimeout:   5 * time.Second,
@@ -119,7 +107,6 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
 	fs.BoolVar(&cfg.RouteStoreUniqueRows, "route-store-unique-rows", cfg.RouteStoreUniqueRows, "Enable the route store's pruned read mode (server-side valid_to filtering). ONLY when the exporter guarantees one physical row per version (closeMode=update); never against the default rewrite-close exporter.")
-	fs.StringVar(&cfg.MetricPrefix, "metric-prefix", cfg.MetricPrefix, "Additive prefix prepended to every kube-state-metrics-shaped series name the topology reader queries (e.g. \"o11y_\" → o11y_kube_pod_info). Empty (default) preserves stock kube-state-metrics behaviour. Trailing underscore is the operator's responsibility — none is injected. Does not affect traces_service_graph_request_total or up{}.")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -167,7 +154,6 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		return err
 	}
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
-	getStr("KSG_METRIC_PREFIX", &cfg.MetricPrefix)
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
 	// Env-only by design — no matching flags are registered in Parse
 	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
@@ -224,9 +210,6 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("invalid log-level: %q", c.LogLevel)
-	}
-	if c.MetricPrefix != "" && !metricPrefixPattern.MatchString(c.MetricPrefix) {
-		return fmt.Errorf("invalid metric-prefix %q: must match %s", c.MetricPrefix, metricPrefixPattern)
 	}
 	// Route-store credentials must be configured as a pair. The error names
 	// the env vars only — never echo the configured values.

@@ -22,10 +22,8 @@ import (
 // Options configures an Engine. Clock and Metrics are optional: a nil Clock
 // falls back to the system clock, and a nil Metrics disables build self-metrics
 // (an embedder that does not want kube-state-graph's Prometheus series leaves it
-// nil). MetricPrefix and APITimeout mirror the build-layer settings.
+// nil). APITimeout mirrors the build-layer setting.
 type Options struct {
-	// MetricPrefix is prepended to kube-state-metrics-shaped metric names (D26).
-	MetricPrefix string
 	// APITimeout bounds the cheap up{} retention probe inside the build.
 	APITimeout time.Duration
 	// Clock is the time source for "now"; nil means the system clock.
@@ -58,7 +56,6 @@ func New(q promql.Querier, opts Options) *Engine {
 		clk = clock.System{}
 	}
 	b := build.New(q, build.Options{
-		MetricPrefix:        opts.MetricPrefix,
 		APITimeout:          opts.APITimeout,
 		RouteResolver:       opts.RouteResolver,
 		RouteResolveTimeout: opts.RouteResolveTimeout,

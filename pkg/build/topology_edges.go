@@ -3,13 +3,11 @@ package build
 import "github.com/akira-core/kube-state-graph/pkg/graph"
 
 // TopologyEdges synthesises the topology relationship edges from a parsed
-// Topology: pod-mounts-pvc, pod-to-node, and pvc-to-storageclass. Edge IDs are
-// deterministic UUIDv5 — see graph.NewEdge. The pod→node and pvc→storageclass
-// relationships are explicit edges (this supersedes the D31 compound-nesting
-// representation); the workload hierarchy nesting is presentation-only in the
-// Cytoscape serialiser.
+// Topology: pod-mounts-pvc and pod-to-node. Edge IDs are deterministic
+// UUIDv5 — see graph.NewEdge. The pvc-to-netapp-aggr edge is produced by
+// the Harvest join (Topology.StorageEdges), not here.
 func TopologyEdges(t Topology) []*graph.Edge {
-	edges := make([]*graph.Edge, 0, len(t.PodPVCs)+len(t.Pods)+len(t.PVCs))
+	edges := make([]*graph.Edge, 0, len(t.PodPVCs)+len(t.Pods))
 
 	pvcByID := map[string]*graph.PVCNode{}
 	for _, pv := range t.PVCs {
@@ -43,24 +41,6 @@ func TopologyEdges(t Topology) []*graph.Edge {
 		}
 		seenPodNode[key] = true
 		edges = append(edges, graph.NewEdge(graph.EdgeTypePodToNode, p.ID(), nodeID, nil))
-	}
-
-	// pvc-to-storageclass: one edge per PVC with a resolved StorageClass, to the
-	// (real, possibly bare) StorageClass node in the PVC's own cluster. Always
-	// intra-cluster. Dedupe defensively by (pvcID, scID).
-	seenPVCSC := make(map[[2]string]bool, len(t.PVCs))
-	for _, pv := range t.PVCs {
-		sc := pv.StorageClass()
-		if sc == "" {
-			continue
-		}
-		scID := graph.StorageClassID(pv.Labels()["cluster"], sc)
-		key := [2]string{pv.ID(), scID}
-		if seenPVCSC[key] {
-			continue
-		}
-		seenPVCSC[key] = true
-		edges = append(edges, graph.NewEdge(graph.EdgeTypePVCToStorageClass, pv.ID(), scID, nil))
 	}
 
 	return edges

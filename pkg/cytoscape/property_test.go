@@ -28,7 +28,8 @@ func TestProperty_NoDanglingParent(t *testing.T) {
 			cl := fmt.Sprintf("cluster-%d", c)
 			nodeID := graph.K8sNodeID(cl, "worker-0")
 			nodes = append(nodes, &graph.K8sNode{IDValue: nodeID, NameValue: "worker-0", LabelsValue: map[string]string{"cluster": cl}})
-			nodes = append(nodes, &graph.StorageClassNode{IDValue: graph.StorageClassID(cl, "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": cl}})
+			nodes = append(nodes, &graph.NetAppNode{IDValue: graph.NetAppNodeID("oc", "n1"), NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "oc"}})
+			nodes = append(nodes, &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID("oc", "a1"), NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}})
 			for p := range r.Intn(4) {
 				labels := map[string]string{"cluster": cl, "namespace": fmt.Sprintf("ns-%d", p%2)}
 				if r.Intn(2) == 0 {

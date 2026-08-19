@@ -47,7 +47,8 @@ func TestSerialise_PartialMetricsOmitsMissingFields(t *testing.T) {
 		}
 	}
 	require.NotNil(t, found)
-	assert.InDelta(t, 5.0, found.Rate, 1e-12)
+	require.NotNil(t, found.Rate)
+	assert.InDelta(t, 5.0, *found.Rate, 1e-12)
 	require.NotNil(t, found.ErrorRate)
 	assert.InDelta(t, 0.1, *found.ErrorRate, 1e-12)
 	assert.Nil(t, found.P90ServerMs)
@@ -106,9 +107,50 @@ func TestSerialise_SmallRateExponentFormRoundTrip(t *testing.T) {
 		}
 	}
 	require.NotNil(t, found)
-	assert.NotZero(t, found.Rate)
+	require.NotNil(t, found.Rate)
+	assert.NotZero(t, *found.Rate)
 	require.NotNil(t, found.ErrorRate)
 	assert.NotZero(t, *found.ErrorRate)
+}
+
+func TestSerialise_IOMetricsOnly(t *testing.T) {
+	pvc := &graph.PVCNode{IDValue: "c/ns/claim", NameValue: "claim", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}}
+	aggr := &graph.NetAppAggrNode{IDValue: "netapp/oc/aggr/a1", NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}}
+	readOps, writeOps := 150.0, 40.0
+	e := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.ID(), aggr.ID(), nil).
+		WithIO(graph.IOMetrics{ReadOps: &readOps, WriteOps: &writeOps})
+	body := metricsView(t, []graph.GraphNode{pvc, aggr}, []*graph.Edge{e})
+	var found *EdgeMetricsDTO
+	for _, ed := range body.Elements.Edges {
+		found = ed.Data.Metrics
+	}
+	require.NotNil(t, found)
+	require.NotNil(t, found.ReadOps)
+	assert.InDelta(t, 150.0, *found.ReadOps, 1e-12)
+	require.NotNil(t, found.WriteOps)
+	assert.Nil(t, found.Rate)
+	assert.Nil(t, found.ErrorRate)
+	raw, err := json.Marshal(found)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"read_ops"`)
+	assert.NotContains(t, string(raw), `"rate"`)
+}
+
+func TestSerialise_NeitherFamilyOmitsMetrics(t *testing.T) {
+	e := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, "a", "b", nil)
+	body := metricsView(t, nil, []*graph.Edge{e})
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"metrics"`)
+}
+
+func TestMetricsDTO_REDPrecedence(t *testing.T) {
+	readOps := 1.0
+	dto := metricsDTO(&graph.EdgeMetrics{Rate: 5}, &graph.IOMetrics{ReadOps: &readOps})
+	require.NotNil(t, dto)
+	require.NotNil(t, dto.Rate)
+	assert.InDelta(t, 5.0, *dto.Rate, 1e-12)
+	assert.Nil(t, dto.ReadOps, "RED wins the impossible both-set case")
 }
 
 func TestRound6_SignificantDigits(t *testing.T) {

@@ -49,7 +49,8 @@ func TestApplication_PodServicePVCCarryIt(t *testing.T) {
 	never := []GraphNode{
 		&K8sNode{IDValue: "c/w"},
 		&ExternalNode{IDValue: "external/x"},
-		&StorageClassNode{IDValue: StorageClassID("c", "gp3")},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "aggr1")},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1")},
 	}
 	for _, n := range never {
 		assert.Emptyf(t, n.Application(), "%T must return empty Application", n)
@@ -76,7 +77,8 @@ func TestContainers_OnlyPodsCarryThem(t *testing.T) {
 		&PVCNode{IDValue: "c/n/claim", ApplicationValue: "mongo"},
 		&ServiceNode{IDValue: "c/n/s", ApplicationValue: "checkout"},
 		&ExternalNode{IDValue: "external/x"},
-		&StorageClassNode{IDValue: StorageClassID("c", "gp3")},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "aggr1")},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1")},
 	}
 	for _, n := range others {
 		assert.Nilf(t, n.Containers(), "%T must return nil Containers", n)
@@ -110,39 +112,48 @@ func TestReadyStatus_OnlyK8sNodesCarryIt(t *testing.T) {
 	}
 }
 
-// TestStorageClassNode_PayloadAndInfo — a StorageClassNode is a cluster-scoped
-// node whose provisioner/parameters live on the typed StorageClassInfo (never
-// Labels, which stay {cluster}); a bare node returns nil StorageClassInfo, and
-// every other node kind returns nil StorageClassInfo too.
-func TestStorageClassNode_PayloadAndInfo(t *testing.T) {
-	sc := &StorageClassNode{
-		IDValue:     StorageClassID("cluster-alpha", "netapp-nas"),
-		NameValue:   "netapp-nas",
-		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		InfoValue: &StorageClassInfo{
-			Provisioner: "csi.trident.netapp.io",
-			Parameters:  map[string]string{"pool": "aggr1", "fs": "nfs"},
-		},
+// TestHealthAndUsage_ZeroValuesPerType — Health/Usage are empty/nil on
+// every type except the NetApp types (Health) and PVC + NetApp aggr (Usage).
+func TestHealthAndUsage_ZeroValuesPerType(t *testing.T) {
+	used, cap := 10.0, 20.0
+	pvc := &PVCNode{IDValue: "c/n/claim", UsageValue: &UsageBytes{UsedBytes: &used, CapacityBytes: &cap}}
+	aggr := &NetAppAggrNode{
+		IDValue: NetAppAggrID("oc", "aggr1"), NameValue: "aggr1",
+		LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"},
+		HealthValue: HealthOnline, UsageValue: &UsageBytes{UsedBytes: &used},
 	}
-	assert.Equal(t, "cluster-alpha/storageclass/netapp-nas", sc.ID())
-	assert.Equal(t, NodeTypeStorageClass, sc.Type())
-	assert.Equal(t, map[string]string{"cluster": "cluster-alpha"}, sc.Labels())
-	assert.Equal(t, "csi.trident.netapp.io", sc.StorageClassInfo().Provisioner)
-	assert.Equal(t, "aggr1", sc.StorageClassInfo().Parameters["pool"])
-	assert.Nil(t, sc.IPAddress())
-	assert.Empty(t, sc.StorageClass(), "a StorageClass node does not USE a class")
-
-	bare := &StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}}
-	assert.Nil(t, bare.StorageClassInfo(), "bare StorageClass node carries no info")
-
-	others := []GraphNode{
+	ctrl := &NetAppNode{
+		IDValue: NetAppNodeID("oc", "n1"), NameValue: "n1",
+		LabelsValue: map[string]string{"ontap_cluster": "oc"},
+		HealthValue: HealthDegraded,
+	}
+	assert.Equal(t, HealthOnline, aggr.Health())
+	assert.Equal(t, &used, aggr.Usage().UsedBytes)
+	assert.Equal(t, HealthDegraded, ctrl.Health())
+	assert.Nil(t, ctrl.Usage())
+	assert.Empty(t, pvc.Health())
+	require := func(n GraphNode) {
+		t.Helper()
+		if n.Type() != NodeTypeNetAppAggr && n.Type() != NodeTypeNetAppNode {
+			assert.Emptyf(t, n.Health(), "%T Health must be empty", n)
+		}
+		if n.Type() != NodeTypePVC && n.Type() != NodeTypeNetAppAggr {
+			assert.Nilf(t, n.Usage(), "%T Usage must be nil", n)
+		}
+	}
+	for _, n := range []GraphNode{
 		&PodNode{IDValue: "c/u"},
 		&K8sNode{IDValue: "c/w"},
-		&PVCNode{IDValue: "c/n/claim"},
+		pvc,
 		&ServiceNode{IDValue: "c/n/s"},
 		&ExternalNode{IDValue: "external/x"},
+		aggr, ctrl,
+	} {
+		require(n)
 	}
-	for _, n := range others {
-		assert.Nilf(t, n.StorageClassInfo(), "%T must return nil StorageClassInfo", n)
-	}
+}
+
+func TestNetAppIDs(t *testing.T) {
+	assert.Equal(t, "netapp/ontap-prod/aggr/aggr1", NetAppAggrID("ontap-prod", "aggr1"))
+	assert.Equal(t, "netapp/ontap-prod/ontap-prod-01", NetAppNodeID("ontap-prod", "ontap-prod-01"))
 }

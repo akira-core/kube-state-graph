@@ -54,7 +54,7 @@ func TestHandleClusters_UsesInjectedClock(t *testing.T) {
 
 	logger := observability.NewLogger("error")
 	metrics := observability.NewMetrics()
-	builder := build.New(q, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, clk)
+	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clk)
 	srv := New(cfg, builder, q, metrics, logger, keys, clk)
 
 	httpSrv := httptest.NewServer(srv.Handler())

@@ -108,7 +108,6 @@ pod→node 關係**不**以邊表達，而是由 Cytoscape compound nesting（`c
 | `--api-keys` | `KSG_API_KEYS` | （空） | 逗號分隔字面 key；僅 dev 用途，設了 `--api-keys-file` 即忽略。 |
 | `--api-keys-reload-interval` | `KSG_API_KEYS_RELOAD_INTERVAL` | `30s` | `--api-keys-file` 重新讀取頻率；`0` 關閉熱重載。 |
 | `--log-level` | `KSG_LOG_LEVEL` | `info` | `debug \| info \| warn \| error`。 |
-| `--metric-prefix` | `KSG_METRIC_PREFIX` | （空） | 附加在拓樸 reader 查詢的 kube-state-metrics 系列名稱前的前綴（例如 `o11y_` → `o11y_kube_pod_info`）。**不**影響 `traces_service_graph_request_total` 或 `up{}`。metric 名稱字尾與每條 series 的標籤集，是任何相容 exporter 都必須遵守的固定合約。 |
 
 ## 文件
 

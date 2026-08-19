@@ -77,7 +77,7 @@ func newServerWithLogBuffer(t *testing.T, q *promqlmocks.MockQuerier) (*Server, 
 	buf := &syncLogBuffer{}
 	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	metrics := observability.NewMetrics()
-	builder := build.New(q, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, clock.System{})
+	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clock.System{})
 	return New(cfg, builder, q, metrics, logger, auth.NewKeySet(), clock.System{}), buf
 }
 

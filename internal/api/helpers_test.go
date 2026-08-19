@@ -109,7 +109,7 @@ func newServerWithMocksAndKeys(t *testing.T, q *promqlmocks.MockQuerier, ks *aut
 
 	logger := observability.NewLogger("error")
 	metrics := observability.NewMetrics()
-	builder := build.New(q, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, clock.System{})
+	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clock.System{})
 	return New(cfg, builder, q, metrics, logger, ks, clock.System{})
 }
 

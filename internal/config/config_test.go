@@ -83,68 +83,6 @@ func TestSplitAndTrim(t *testing.T) {
 	assert.Equal(t, []string{"a", "b", "c"}, splitAndTrim(" a, b ,, c "))
 }
 
-func TestParse_MetricPrefix_DefaultEmpty(t *testing.T) {
-	cfg, err := Parse(nil, func(string) (string, bool) { return "", false })
-	require.NoError(t, err)
-	assert.Empty(t, cfg.MetricPrefix, "metric-prefix default should be empty")
-}
-
-func TestParse_MetricPrefix_EnvAndFlag(t *testing.T) {
-	t.Run("env wins over default", func(t *testing.T) {
-		cfg, err := Parse(nil, func(k string) (string, bool) {
-			if k == "KSG_METRIC_PREFIX" {
-				return "o11y_", true
-			}
-			return "", false
-		})
-		require.NoError(t, err)
-		assert.Equal(t, "o11y_", cfg.MetricPrefix)
-	})
-	t.Run("flag wins over env", func(t *testing.T) {
-		cfg, err := Parse(
-			[]string{"--metric-prefix=beta_"},
-			func(k string) (string, bool) {
-				if k == "KSG_METRIC_PREFIX" {
-					return "acme_", true
-				}
-				return "", false
-			},
-		)
-		require.NoError(t, err)
-		assert.Equal(t, "beta_", cfg.MetricPrefix)
-	})
-}
-
-func TestValidate_MetricPrefix(t *testing.T) {
-	cases := map[string]struct {
-		prefix  string
-		wantErr bool
-	}{
-		"empty":             {prefix: "", wantErr: false},
-		"underscore suffix": {prefix: "o11y_", wantErr: false},
-		"colon allowed":     {prefix: "acme:tenant_", wantErr: false},
-		"alpha only":        {prefix: "acme", wantErr: false},
-		"hyphen rejected":   {prefix: "o11y-bad!", wantErr: true},
-		"leading digit":     {prefix: "1starts_with_digit", wantErr: true},
-		"trailing space":    {prefix: "o11y_ ", wantErr: true},
-		"embedded space":    {prefix: "o 11y_", wantErr: true},
-		"unicode rejected":  {prefix: "o11y✓_", wantErr: true},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			cfg := Defaults()
-			cfg.MetricPrefix = tc.prefix
-			err := cfg.Validate()
-			if tc.wantErr {
-				require.Error(t, err, "expected error for prefix %q", tc.prefix)
-				assert.Contains(t, err.Error(), "metric-prefix", "error should mention metric-prefix")
-			} else {
-				require.NoError(t, err, "did not expect error for prefix %q", tc.prefix)
-			}
-		})
-	}
-}
-
 // Upstream basic-auth credentials are env-only (D-A1) and must be configured
 // as a pair (D-A2); validation errors must never echo the configured values
 // (D-A5).
