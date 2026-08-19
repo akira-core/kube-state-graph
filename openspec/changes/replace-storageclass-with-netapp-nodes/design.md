@@ -42,7 +42,7 @@ how to implement them.
 **Goals:**
 
 - One-join storage topology: PV name → Harvest volume series → aggregate id +
-  owning controller + svm + four I/O figures, with zero extra topology queries.
+  owning controller + svm + six I/O figures, with zero extra topology queries.
 - Deterministic, byte-stable output under every duplicate/conflict shape
   (duplicate PV names, conflicting `aggr`/`node`/`svm` values, takeover inside
   the window).
@@ -63,11 +63,12 @@ how to implement them.
 
 ### D1 — Harvest + kubelet legs join the existing `ReadTopology` errgroup
 
-The eight new queries (`volume_read_ops`, `volume_write_ops`,
-`volume_read_latency`, `volume_write_latency`, `aggr_new_status`,
-`aggr_space_used`, `aggr_space_total`, `node_new_status`) and the two kubelet
+The ten new queries (`volume_read_ops`, `volume_write_ops`,
+`volume_read_latency`, `volume_write_latency`, `volume_read_data`,
+`volume_write_data`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`,
+`node_new_status`) and the two kubelet
 queries (`kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes`)
-are added to the **existing** `ReadTopology` fan-out (18 − 3 + 10 = 25 legs),
+are added to the **existing** `ReadTopology` fan-out (18 − 3 + 12 = 27 legs),
 not a third reader stage.
 
 *Why:* the join is rooted at `kube_persistentvolumeclaim_info.volumename` and
@@ -82,7 +83,7 @@ already runs all legs in parallel).
 depends on the **assembled** topology (pod-UID index), while the storage join
 is itself assembly input.
 
-All ten legs are OPTIONAL in the same sense as today's optional families: a
+All twelve legs are OPTIONAL in the same sense as today's optional families: a
 query error or empty vector degrades to absent nodes/edges/attributes, never a
 build failure. NOTE: today a failed leg aborts the build (`g.Wait` error).
 Harvest/kubelet legs MUST NOT — they wrap their fetch to log-and-continue
@@ -113,7 +114,7 @@ dimension values disappear with their queries.
 A new assembly step `resolveNetAppStorage` (pure function, no I/O) consumes:
 
 - the PVC→PV-name map already produced by `resolvePVCInfo`
-- the four volume vectors, keyed once into `volume_name → candidates`
+- the six volume vectors, keyed once into `volume_name → candidates`
 - the aggregate status/space vectors, keyed `(ontap_cluster, aggr)`
 - the node status vector, keyed `(ontap_cluster, node)`
 
@@ -170,12 +171,12 @@ rejected; violates the "serialisation via sealed methods" rule.
 
 `graph.Edge` gains a second nullable field: `IO *IOMetrics` alongside the
 existing `Metrics *EdgeMetrics`. `IOMetrics{ReadOps, WriteOps, ReadLatencyUs,
-WriteLatencyUs *float64}` — all pointers (each field rides its own OPTIONAL
-family). The RED struct and its "present ⇒ Rate > 0" invariant are untouched.
+WriteLatencyUs, ReadBytesPerSec, WriteBytesPerSec *float64}` — all pointers
+(each field rides its own OPTIONAL family). The RED struct and its "present ⇒ Rate > 0" invariant are untouched.
 
 At the boundary, `cytoscape.EdgeMetricsDTO` becomes the union:
 `Rate` moves from `float64` to `*float64 omitempty` (the OpenAPI `required`
-list drops it), and four `omitempty` I/O fields are added. `metricsDTO` takes
+list drops it), and six `omitempty` I/O fields are added. `metricsDTO` takes
 `(m *graph.EdgeMetrics, io *graph.IOMetrics)` and fills exactly one family —
 the builder never sets both (RED attaches in `servicegraph.go`, IO only in
 `netapp.go`), so cross-family mixing is structurally impossible, and a
@@ -230,7 +231,7 @@ proposal: consumers keep one place to look (`data.metrics`).
 
 `resolveNetAppStorage` counts claims with non-empty `volumename` whose join
 produced no edge (no match at all, or only empty-`aggr` matches), **iff** at
-least one volume series was read across the four families. Non-zero count ⇒
+least one volume series was read across the six families. Non-zero count ⇒
 one `slog.Warn("netapp_volume_join_miss", "count", n)` per build — the
 `failed_total_label_set_mismatch` pattern (aggregated, never per-claim, never
 an error). Zero volume series ⇒ silent (non-NetApp deployment is not a
@@ -269,7 +270,7 @@ coordination a normal version bump, not a lockstep deploy.
 
 - **Harvest metric names drift by version/template** (`aggr_space_used` /
   `aggr_space_total` / `node_new_status` naming varies across Harvest
-  releases) → verify all eight names against the production VictoriaMetrics
+  releases) → verify all ten names against the production VictoriaMetrics
   (`/api/v1/label/__name__/values` grep) as the FIRST implementation task; a
   mismatch is a mechanical rename in specs + queries before any code depends
   on it.
@@ -285,12 +286,12 @@ coordination a normal version bump, not a lockstep deploy.
   single `netapp-node > netapp-aggr` tier with an explicit prohibition on new
   real-parent tiers; projection rule D6.3 keeps the tree dangling-free.
 - **Optional-leg error semantics diverge from KSM legs** (D1: log-and-continue
-  vs abort) → contained to the ten new legs; a comment on each leg documents
+  vs abort) → contained to the twelve new legs; a comment on each leg documents
   why, and a unit test pins a failing Harvest leg not failing the build.
 - **`rate` moving to optional in the OpenAPI schema** can break strict
   consumers of the RED object → release note; the RED family behaviour is
   unchanged (present ⇒ rate > 0), only the schema-level `required` weakens.
-- **Cardinality of Harvest volume queries** (one series per FlexVol × 4
+- **Cardinality of Harvest volume queries** (one series per FlexVol × 6
   families) → bounded by filer volume count (thousands, not millions); same
   raw-vector pattern as the RED histogram read; upstream search limits govern.
 

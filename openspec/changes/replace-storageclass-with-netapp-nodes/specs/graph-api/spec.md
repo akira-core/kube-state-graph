@@ -83,7 +83,7 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 #### Scenario: Edge labels never carry numbers
 
 - **WHEN** the response contains an edge that carries a `data.metrics` object
-- **THEN** its `data.labels` still contains only string values and no `rate`, `error_rate`, `p90_server_ms`, `read_ops`, `write_ops`, `read_latency_us`, or `write_latency_us` key
+- **THEN** its `data.labels` still contains only string values and no `rate`, `error_rate`, `p90_server_ms`, `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, or `write_bytes_per_sec` key
 
 ### Requirement: Edge `metrics` attribute
 
@@ -96,6 +96,7 @@ An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding th
 - **I/O family** — on `pvc-to-netapp-aggr` edges only, presence rule defined by the `netapp-storage-graph` capability (each field present iff its own Harvest family matched):
   - `read_ops`, `write_ops` (numbers, OPTIONAL) — read/write requests per second, verbatim from Harvest.
   - `read_latency_us`, `write_latency_us` (numbers, OPTIONAL) — average read/write latency in microseconds, verbatim from Harvest.
+  - `read_bytes_per_sec`, `write_bytes_per_sec` (numbers, OPTIONAL) — read/write throughput in bytes per second, verbatim from Harvest.
 
 At the schema level every field of the union is therefore optional — a consequence the OpenAPI schema reflects by moving `rate` from required to optional. The RED invariant is preserved intact: a RED-family `metrics` object always carries a positive `rate`.
 
@@ -114,7 +115,7 @@ All values SHALL be JSON numbers, never strings. Each value SHALL be rounded to 
 #### Scenario: Storage edge carries I/O metrics only
 
 - **WHEN** the response contains a `pvc-to-netapp-aggr` edge whose joined Harvest families all matched
-- **THEN** its `data.metrics` is an object with numeric `read_ops`, `write_ops`, `read_latency_us`, and `write_latency_us` fields, and none of `rate`, `error_rate`, or `p90_server_ms`
+- **THEN** its `data.metrics` is an object with numeric `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, and `write_bytes_per_sec` fields, and none of `rate`, `error_rate`, or `p90_server_ms`
 
 #### Scenario: Edge without measurements omits the key
 

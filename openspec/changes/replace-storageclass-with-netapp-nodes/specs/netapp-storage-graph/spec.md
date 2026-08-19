@@ -6,22 +6,22 @@ Surfaces the physical NetApp ONTAP storage behind Kubernetes claims: one graph n
 
 ### Requirement: Harvest volume series as the storage join source
 
-The builder SHALL consume the NetApp Harvest volume-object series `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, and `volume_write_latency` from the same centralised VictoriaMetrics endpoint as every other series. The fixed, case-sensitive label contract each series MUST carry: `cluster` (the ONTAP cluster name — NOT a Kubernetes cluster; the two namespaces never mix), `node` (the ONTAP controller currently owning the containing aggregate), `aggr` (the containing aggregate), `svm` (the serving Storage Virtual Machine), and `volume_name` (the name of the Kubernetes PersistentVolume the FlexVol backs).
+The builder SHALL consume the NetApp Harvest volume-object series `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, `volume_write_latency`, `volume_read_data`, and `volume_write_data` from the same centralised VictoriaMetrics endpoint as every other series. The fixed, case-sensitive label contract each series MUST carry: `cluster` (the ONTAP cluster name — NOT a Kubernetes cluster; the two namespaces never mix), `node` (the ONTAP controller currently owning the containing aggregate), `aggr` (the containing aggregate), `svm` (the serving Storage Virtual Machine), and `volume_name` (the name of the Kubernetes PersistentVolume the FlexVol backs).
 
-Values SHALL be read **verbatim**: Harvest already resolves ONTAP's base counters, so the ops series are per-second rates and the latency series are averages in microseconds. The issued queries SHALL NOT wrap these series in `rate()` — the opposite of the service-graph RED counters, where the upstream series are raw counters.
+Values SHALL be read **verbatim**: Harvest already resolves ONTAP's base counters, so the ops series are per-second rates, the latency series are averages in microseconds, and the data series are throughput in bytes per second. The issued queries SHALL NOT wrap these series in `rate()` — the opposite of the service-graph RED counters, where the upstream series are raw counters.
 
 `volume_name` is NOT a stock Harvest label — it is produced by the deployment's own Prometheus relabel rule mapping each FlexVol to the PV it backs. That relabel rule is a **deployment precondition** with three known blind spots the graph inherits: a FlexVol whose name does not match the rule carries no `volume_name` (its claim never joins); the Trident "economy" drivers pack many claims into one shared FlexVol, so no per-claim volume series exists at all; and a FlexGroup volume spans aggregates, so its series carries no single usable `aggr` label (no aggregate edge can be drawn — see the join-coverage requirement).
 
-All four families are OPTIONAL. When none is present in the window — the normal case for a deployment without NetApp Harvest — the builder SHALL produce a valid graph with no `netapp-aggr` or `netapp-node` nodes, no `pvc-to-netapp-aggr` edges, and no PVC `svm` labels; PVC `volumename` labels are unaffected and the build SHALL NOT fail.
+All six families are OPTIONAL. When none is present in the window — the normal case for a deployment without NetApp Harvest — the builder SHALL produce a valid graph with no `netapp-aggr` or `netapp-node` nodes, no `pvc-to-netapp-aggr` edges, and no PVC `svm` labels; PVC `volumename` labels are unaffected and the build SHALL NOT fail.
 
 #### Scenario: Volume series read verbatim without rate()
 
-- **WHEN** the builder issues the four Harvest volume queries for a window
+- **WHEN** the builder issues the six Harvest volume queries for a window
 - **THEN** each query string references the bare series (e.g. an aggregation over `volume_read_ops` evaluated at the window end) and none wraps the series in `rate()`
 
 #### Scenario: Harvest absent entirely
 
-- **WHEN** the upstream contains topology series but no `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, or `volume_write_latency` series for the window
+- **WHEN** the upstream contains topology series but no `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, `volume_write_latency`, `volume_read_data`, or `volume_write_data` series for the window
 - **THEN** the build completes successfully with no `netapp-aggr` or `netapp-node` nodes, no `pvc-to-netapp-aggr` edges, and no PVC `svm` labels, while PVC `volumename` labels still resolve from `kube_persistentvolumeclaim_info`
 
 ### Requirement: NetApp aggregate entity
@@ -156,29 +156,31 @@ The edge SHALL carry empty `labels` (`{}`), a deterministic UUIDv5 `id` (canonic
 
 ### Requirement: I/O measurements on the storage edge
 
-Each `pvc-to-netapp-aggr` edge SHALL be able to carry up to four I/O measurements in its `data.metrics` object, each sourced from its own Harvest family for the claim's PV name:
+Each `pvc-to-netapp-aggr` edge SHALL be able to carry up to six I/O measurements in its `data.metrics` object, each sourced from its own Harvest family for the claim's PV name:
 
 - `read_ops` ← `volume_read_ops` — read requests per second (verbatim).
 - `write_ops` ← `volume_write_ops` — write requests per second (verbatim).
 - `read_latency_us` ← `volume_read_latency` — average read latency in microseconds (verbatim).
 - `write_latency_us` ← `volume_write_latency` — average write latency in microseconds (verbatim).
+- `read_bytes_per_sec` ← `volume_read_data` — read throughput in bytes per second (verbatim).
+- `write_bytes_per_sec` ← `volume_write_data` — write throughput in bytes per second (verbatim).
 
 Each field SHALL be present iff its own family matched at least one series for the join key, and absent otherwise — an absent field is distinct from `0`. When a family matches more than one series for one join key, the value SHALL be summed over the matched series in ascending order so the result is order-independent. Values are JSON numbers rounded to 6 significant digits at serialisation (graph-api "Edge `metrics` attribute") and MAY appear in exponent form. The RED fields (`rate`, `error_rate`, `p90_server_ms`) SHALL NEVER appear on a `pvc-to-netapp-aggr` edge, and an edge whose every family is absent SHALL carry no `metrics` key at all.
 
-#### Scenario: All four measurements present
+#### Scenario: All six measurements present
 
-- **WHEN** all four Harvest families carry a series for the joined PV name
-- **THEN** the edge's `data.metrics` contains numeric `read_ops`, `write_ops`, `read_latency_us`, and `write_latency_us`, and none of `rate` / `error_rate` / `p90_server_ms`
+- **WHEN** all six Harvest families carry a series for the joined PV name
+- **THEN** the edge's `data.metrics` contains numeric `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, and `write_bytes_per_sec`, and none of `rate` / `error_rate` / `p90_server_ms`
 
 #### Scenario: Missing family omits only its field
 
-- **WHEN** the joined PV name matches `volume_read_ops` and `volume_write_ops` series but no latency series
-- **THEN** the edge's `data.metrics` contains `read_ops` and `write_ops` and has no `read_latency_us` or `write_latency_us` key
+- **WHEN** the joined PV name matches `volume_read_ops`, `volume_write_ops`, `volume_read_data`, and `volume_write_data` series but no latency series
+- **THEN** the edge's `data.metrics` contains `read_ops`, `write_ops`, `read_bytes_per_sec`, and `write_bytes_per_sec` and has no `read_latency_us` or `write_latency_us` key
 
 #### Scenario: Verbatim values, no rate() derivation
 
-- **WHEN** the matched `volume_read_ops` series' value is `150` and the matched `volume_read_latency` series' value is `830`
-- **THEN** the edge reports `read_ops: 150` and `read_latency_us: 830` — the upstream values verbatim, not re-derived
+- **WHEN** the matched `volume_read_ops` series' value is `150`, the matched `volume_read_latency` series' value is `830`, and the matched `volume_read_data` series' value is `5242880`
+- **THEN** the edge reports `read_ops: 150`, `read_latency_us: 830`, and `read_bytes_per_sec: 5242880` — the upstream values verbatim, not re-derived
 
 ### Requirement: PVC svm label re-sourced from the Harvest join
 

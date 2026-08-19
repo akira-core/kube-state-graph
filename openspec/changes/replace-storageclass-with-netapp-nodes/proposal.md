@@ -37,11 +37,14 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
   to the Harvest volume series' `volume_name`; the aggregate comes from the
   `aggr` label and the owning controller from the `node` label on that **same
   series**, so **no separate topology query is needed**.
-- **Four I/O measurements on that edge** — `read_ops`, `write_ops`,
-  `read_latency_us`, `write_latency_us`, from `volume_read_ops` /
-  `volume_write_ops` / `volume_read_latency` / `volume_write_latency`.
+- **Six I/O measurements on that edge** — `read_ops`, `write_ops`,
+  `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`,
+  `write_bytes_per_sec`, from `volume_read_ops` / `volume_write_ops` /
+  `volume_read_latency` / `volume_write_latency` / `volume_read_data` /
+  `volume_write_data`.
   Harvest already resolves ONTAP's base counters, so these are read **verbatim**
-  (ops are already per-second, latency is already an average in microseconds) and
+  (ops are already per-second, latency is already an average in microseconds, and
+  the data families are already bytes per second) and
   are **never** wrapped in `rate()` — the opposite of the service-graph RED
   counters, and a distinction the specs must state explicitly.
 - **Per-aggregate health and usage** — `data.health` from `aggr_new_status`
@@ -114,7 +117,7 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
 
 - `netapp-storage-graph`: the NetApp aggregate and node entities, their
   identity and cluster scoping, the PVC-to-aggregate edge and its join
-  contract, the four I/O measurements, per-aggregate health and usage,
+  contract, the six I/O measurements, per-aggregate health and usage,
   controller health, and the join-coverage signal.
 
 ### Modified Capabilities
@@ -128,7 +131,7 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
 
 ## Impact
 
-**Code.** `pkg/promql` (eight queries added — four volume I/O, `aggr_new_status`,
+**Code.** `pkg/promql` (ten queries added — six volume I/O, `aggr_new_status`,
 `aggr_space_used`, `aggr_space_total`, `node_new_status` — three removed,
 `Renderer` reduced to a pure function); `pkg/build` (new NetApp reader and join,
 PVC usage resolver, storage-class and Trident resolvers deleted); `pkg/graph`
@@ -150,7 +153,11 @@ treats upstream label names.
 
 **Consumers.** `graph-api-gateway` embeds the engine through
 `pkg/kubegraph` and sets `Options.MetricPrefix`; that field disappears, so the
-two repositories must land in a coordinated order.
+two repositories must land in a coordinated order. The Grafana graph panel
+already renders the I/O family in its edge tooltip; the two throughput fields
+are a purely **additive** wire extension (an older panel ignores unknown keys),
+so surfacing them there is a separate change in that repository, not a
+coordination constraint on this one.
 
 **Upstream dependencies.** Adds NetApp Harvest (volume, aggregate, and node
 objects) and kubelet volume stats. The `volume_name` label is **not** stock
