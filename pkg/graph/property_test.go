@@ -239,12 +239,11 @@ func TestProperty_NameFilterEveryNodeMatchesOrIsRehydratedPartner(t *testing.T) 
 			if named[id] || incident[id] {
 				continue
 			}
-			n := g.NodesByID[id]
-			if n != nil && n.Type() == NodeTypeNetAppNode {
+			if n := g.NodesByID[id]; n != nil && n.Type() == NodeTypeNetAppNode {
 				// Compound parent of an admitted aggregate.
 				continue
 			}
-			assert.Truef(t, incident[id],
+			assert.Failf(t, "unexpected node in name-filtered view",
 				"seed=%d: node %s in result but neither matches name nor is incident on a retained edge to a named match", seed, id)
 		}
 	}

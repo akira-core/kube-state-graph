@@ -301,3 +301,37 @@ func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {
 	require.NoError(t, err, "a failing Harvest leg must not fail the build")
 	assert.Empty(t, tp.NetAppAggrs)
 }
+
+// A volume that moved aggregate (or a volume_name colliding across two ONTAP
+// clusters) yields series on more than one (cluster, aggr). The edge points at
+// exactly one aggregate, so only that aggregate's series may contribute I/O —
+// summing both would report throughput the picked aggregate never served.
+func TestResolveNetAppStorage_IOScopedToPickedAggregate(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
+	res := resolveNetApp(claims,
+		sampleVec(
+			volSample("pvc-x", "oc", "n1", "aggr-a", "svm", 10),
+			volSample("pvc-x", "oc", "n1", "aggr-b", "svm", 90),
+		),
+		nil, nil, nil, nil, nil, nil, nil)
+	require.Len(t, res.edges, 1)
+	assert.Equal(t, graph.NetAppAggrID("oc", "aggr-a"), res.edges[0].Target)
+	require.NotNil(t, res.edges[0].IO)
+	require.NotNil(t, res.edges[0].IO.ReadOps)
+	assert.InDelta(t, 10.0, *res.edges[0].IO.ReadOps, 1e-12,
+		"aggr-b's series must not be summed onto the aggr-a edge")
+}
+
+// Harvest volume series without a `node` label leave the aggregate owner-less:
+// the key is ABSENT (never empty-string, mirroring the PVC volumename/svm rule)
+// and no controller node is materialised.
+func TestResolveNetAppStorage_OwnerlessAggrOmitsNodeLabel(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
+	res := resolveNetApp(claims,
+		sampleVec(volSample("pvc-x", "oc", "", "aggr1", "svm", 1)),
+		nil, nil, nil, nil, nil, nil, nil)
+	require.Len(t, res.aggrs, 1)
+	_, hasNode := res.aggrs[0].Labels()["node"]
+	assert.False(t, hasNode, "node key must be absent, not empty-string")
+	assert.Empty(t, res.nodes, "no controller node without a resolved owner")
+}

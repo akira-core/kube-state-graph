@@ -27,7 +27,8 @@ func Project(g *Graph, scope Scope) View {
 	// that sit on a connectivity edge (pod-calls-pod / pod-calls-service /
 	// service-selects-pod) and the infra that hangs off them — an edgeless pod,
 	// the node hosting only edgeless pods, a PVC mounted only by edgeless pods,
-	// and a StorageClass backing only such PVCs are dropped. The exclusion set
+	// and the NetApp aggregate (then controller) serving only such PVCs are
+	// dropped. The exclusion set
 	// is a pure function of the graph (scope-independent), so it is computed once
 	// and consulted in both filterNodes (skip) and filterEdges (no partner
 	// re-add). It is suppressed under an explicit name filter or a root-anchored
@@ -116,10 +117,11 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 //     itself connectivity-connected.
 //
 // It is a pure function of g (independent of any Scope), so the result is stable
-// across requests and reusable by a future cache. K8s nodes and StorageClasses
-// are NOT listed here — they are already reference-gated by infraNodePassesFilters
-// (a node hosting only excluded pods, or a StorageClass backing only excluded
-// PVCs, falls out for free once those pods/PVCs are gone).
+// across requests and reusable by a future cache. K8s nodes and the NetApp types
+// are NOT listed here — they are already reference-gated by
+// infraNodePassesFilters / netappInfraPassesFilters (a node hosting only excluded
+// pods, or an aggregate serving only excluded PVCs — and then its controller —
+// falls out for free once those pods/PVCs are gone).
 func connectivityExcluded(g *Graph) map[string]struct{} {
 	connectedPods := make(map[string]struct{})
 	pvcMounters := make(map[string][]string)
@@ -321,14 +323,13 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 }
 
 // infraNodePassesFilters decides whether a cluster-scoped infrastructure node
-// (a K8sNode or a StorageClassNode) is admitted to a view. Neither carries a
-// namespace label, so admission is reference-driven: the node is kept iff
-// `referenced` contains its id — i.e. some in-scope element references it (a pod
-// scheduled on a K8s node via labels.node, or a PVC backed by a StorageClass via
-// its StorageClass()). This holds for EVERY request shape (no filter, cluster
-// filter, namespace filter), so the response only ever carries infra nodes
-// connected to in-scope workload — a node hosting no in-scope pod (and a
-// StorageClass backing no in-scope PVC) is dropped, not surfaced as an orphan.
+// (today: a K8sNode) is admitted to a view. It carries no namespace label, so
+// admission is reference-driven: the node is kept iff `referenced` contains its
+// id — i.e. some in-scope element references it (a pod scheduled on it via
+// labels.node). This holds for EVERY request shape (no filter, cluster filter,
+// namespace filter), so the response only ever carries infra nodes connected to
+// in-scope workload — a node hosting no in-scope pod is dropped, not surfaced as
+// an orphan. The cluster-less NetApp types use netappInfraPassesFilters instead.
 //
 // Two exceptions admit an infra node that is referenced by nothing, applied in
 // this order so ?root= and ?name= compose consistently across node kinds:
@@ -338,12 +339,12 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 //   - the explicit traversal anchor (scope.Root) is admitted when no name filter
 //     narrows it — a ?root=<infra-node> request focuses on that exact node, and
 //     traverse() already selected it as reachable, so it must not be pruned as
-//     an "orphan" (a podless K8s node or PVC-less StorageClass used as the root
-//     would otherwise yield an EMPTY view).
+//     an "orphan" (a podless K8s node used as the root would otherwise yield an
+//     EMPTY view).
 //
 // A name filter that does not name this node drops it here; if it is instead the
-// host of a named pod (or backs a named PVC), it re-enters the view as that
-// edge's re-added partner in filterEdges, not via this predicate.
+// host of a named pod, it re-enters the view as that edge's re-added partner in
+// filterEdges, not via this predicate.
 //
 // The cluster filter applies first and exactly as for other node types (the
 // node's own labels carry cluster). See design.md D6.

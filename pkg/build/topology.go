@@ -170,6 +170,15 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 	// edge to the read below.
 	var v topologyVectors
 
+	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
+	// fetchOptional must distinguish "the caller went away (build timeout /
+	// client disconnect)" from "a sibling leg failed and cancelled gctx" — only
+	// the former may fail an OPTIONAL leg. Passing the errgroup ctx would make
+	// every optional leg fatal whenever any required leg fails, masking the
+	// real error. Mirrors ReadServiceGraph, which keeps ctx and gctx apart for
+	// exactly this reason.
+	callerCtx := ctx
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	// fetch issues one query and stores its result into dst. It captures the
@@ -213,7 +222,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 			}()
 			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window), end)
 			if qerr != nil {
-				if cerr := optionalQueryFatal(ctx, qerr); cerr != nil {
+				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
 					return cerr
 				}
 				slog.WarnContext(ctx, "optional topology query failed; continuing with empty vector",

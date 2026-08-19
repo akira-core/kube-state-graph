@@ -78,3 +78,21 @@ func TestSerialise_HealthAndUsageOmittedWhenEmpty(t *testing.T) {
 	assert.NotContains(t, string(raw), `"usage"`)
 	assert.NotContains(t, string(raw), `"storageclass"`)
 }
+
+// An owner-less aggregate has no controller node to parent it; it must still
+// nest under its storage-cluster group rather than dangle at top level.
+func TestSerialise_OwnerlessAggrNestsUnderStorageCluster(t *testing.T) {
+	aggr := &graph.NetAppAggrNode{
+		IDValue:     graph.NetAppAggrID("ontap-prod", "aggr1"),
+		NameValue:   "aggr1",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+	}
+	body := Serialise(nil, graph.View{Nodes: []graph.GraphNode{aggr}})
+	var got string
+	for _, n := range body.Elements.Nodes {
+		if n.Data.ID == aggr.IDValue {
+			got = n.Data.Parent
+		}
+	}
+	require.Equal(t, "storage-cluster/ontap-prod", got)
+}

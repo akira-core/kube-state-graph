@@ -67,8 +67,8 @@ func resolveNetAppStorage(
 	harvestPresent := len(index) > 0
 
 	type joinHit struct {
-		oc, aggr, node string
-		io             *graph.IOMetrics
+		oc, aggr string
+		io       *graph.IOMetrics
 	}
 	hits := map[string]joinHit{} // pvcID → pick
 	misses := 0
@@ -87,8 +87,7 @@ func resolveNetAppStorage(
 		}
 		hits[c.id] = joinHit{
 			oc: oc, aggr: aggr,
-			node: pickOwner(cands, oc, aggr),
-			io:   sumIO(cands),
+			io: sumIO(cands, oc, aggr),
 		}
 	}
 
@@ -119,14 +118,21 @@ func resolveNetAppStorage(
 		if _, ok := aggrSeen[k]; ok {
 			continue
 		}
-		owner := pickOwner(allByAggr[k], hit.oc, hit.aggr)
-		if owner == "" {
-			owner = hit.node
+		// pickOwner over allByAggr[k] is a superset of this claim's own
+		// candidates for the same (cluster, aggr), so no per-claim fallback is
+		// needed — and none may exist: `hits` iterates in map order, so a
+		// fallback would make labels.node arrival-order dependent (D6).
+		labels := map[string]string{"ontap_cluster": hit.oc}
+		// The owner key is set only when it resolves non-empty — same rule as
+		// the PVC volumename/svm labels. An owner-less aggregate falls back to
+		// the storage-cluster compound group in the serialiser.
+		if owner := pickOwner(allByAggr[k], hit.oc, hit.aggr); owner != "" {
+			labels["node"] = owner
 		}
 		n := &graph.NetAppAggrNode{
 			IDValue:     graph.NetAppAggrID(hit.oc, hit.aggr),
 			NameValue:   hit.aggr,
-			LabelsValue: map[string]string{"ontap_cluster": hit.oc, "node": owner},
+			LabelsValue: labels,
 			HealthValue: aggrHealth[k],
 			UsageValue:  aggrUsage[k],
 		}
@@ -241,9 +247,17 @@ func pickSVM(cands []volumeCandidate) string {
 	return svm
 }
 
-func sumIO(cands []volumeCandidate) *graph.IOMetrics {
+// sumIO sums each I/O family over the candidates that belong to the aggregate
+// the edge actually points at. Candidates on another (cluster, aggr) — a volume
+// that moved inside the window, or a volume_name colliding across two ONTAP
+// clusters — MUST NOT contribute: their throughput belongs to a different
+// aggregate and would otherwise be double-counted onto this edge.
+func sumIO(cands []volumeCandidate, oc, aggr string) *graph.IOMetrics {
 	var readOps, writeOps, readLat, writeLat, readData, writeData []float64
 	for _, c := range cands {
+		if c.ontapCluster != oc || c.aggr != aggr {
+			continue
+		}
 		switch c.family {
 		case ioReadOps:
 			readOps = append(readOps, c.value)
@@ -387,7 +401,7 @@ func usageByAggr(used, total model.Vector) map[aggrKey]*graph.UsageBytes {
 
 // resolvePVCUsage joins kubelet volume-stats onto (cluster, ns, claim).
 // Per-field independent; smallest numeric value on duplicates.
-func resolvePVCUsage(used, cap model.Vector, mc missingClusterCounts) map[pvcKey]*graph.UsageBytes {
+func resolvePVCUsage(used, capacity model.Vector, mc missingClusterCounts) map[pvcKey]*graph.UsageBytes {
 	usedBy := map[pvcKey]float64{}
 	usedSeen := map[pvcKey]bool{}
 	for _, s := range used {
@@ -406,7 +420,7 @@ func resolvePVCUsage(used, cap model.Vector, mc missingClusterCounts) map[pvcKey
 	}
 	capBy := map[pvcKey]float64{}
 	capSeen := map[pvcKey]bool{}
-	for _, s := range cap {
+	for _, s := range capacity {
 		cluster := mc.bucket(promql.QKubeletVolumeCapacityBytes, string(s.Metric["cluster"]))
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])

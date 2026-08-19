@@ -391,7 +391,8 @@ func groupNode(id, name, typ, parent string) Node {
 //	               cluster group, else ""
 //	node         → its cluster group
 //	netapp-node  → storage-cluster/<ontap_cluster>
-//	netapp-aggr  → the real netapp-node id netapp/<oc>/<labels.node>
+//	netapp-aggr  → the real netapp-node id netapp/<oc>/<labels.node>,
+//	               falling back to storage-cluster/<oc> when no owner resolved
 //	external     → "" (no cluster identity)
 //
 // The pod→node and pvc→netapp-aggr relationships are edges, not nesting.
@@ -424,10 +425,17 @@ func compoundParent(n graph.GraphNode) string {
 		return ""
 	case graph.NodeTypeNetAppAggr:
 		oc, node := labels["ontap_cluster"], labels["node"]
-		if oc != "" && node != "" {
+		if oc == "" {
+			return ""
+		}
+		if node != "" {
 			return graph.NetAppNodeID(oc, node)
 		}
-		return ""
+		// Owner-less aggregate (the Harvest volume series carried no `node`
+		// label), so no controller node exists to parent it. Nest it directly
+		// under its storage-cluster group rather than leaving it orphaned at
+		// top level next to a group that was synthesised for it anyway.
+		return storageClusterParentID(oc)
 	default:
 		// node / external: cluster-group fallback below.
 	}

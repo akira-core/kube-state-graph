@@ -155,7 +155,7 @@ live under `openspec/specs/`.
   `traces_service_graph_request_total` series (the `pairs` map in the parse).
 - **Synthesised edge**: an edge with no originating series —
   `service-selects-pod` fan-out, topology edges (`pod-to-node`, `pod-mounts-pvc`,
-  `pvc-to-storageclass`), and the route-hit ingress-chain's gateway-pod →
+  `pvc-to-netapp-aggr`), and the route-hit ingress-chain's gateway-pod →
   backend-service `pod-calls-service` hop. Spelling is British **synthesised**
   in prose; Go identifiers may use `synthesized` (e.g. `routeChainEdges`
   comments). NOT synthesised: the chain's **caller → ingress entry hop**, which
