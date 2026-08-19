@@ -143,6 +143,8 @@ type topologyVectors struct {
 	VolumeWriteOps     model.Vector
 	VolumeReadLatency  model.Vector
 	VolumeWriteLatency model.Vector
+	VolumeReadData     model.Vector
+	VolumeWriteData    model.Vector
 	AggrStatus         model.Vector
 	AggrSpaceUsed      model.Vector
 	AggrSpaceTotal     model.Vector
@@ -244,6 +246,8 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 	g.Go(fetchOptional(promql.QVolumeWriteOps, &v.VolumeWriteOps))
 	g.Go(fetchOptional(promql.QVolumeReadLatency, &v.VolumeReadLatency))
 	g.Go(fetchOptional(promql.QVolumeWriteLatency, &v.VolumeWriteLatency))
+	g.Go(fetchOptional(promql.QVolumeReadData, &v.VolumeReadData))
+	g.Go(fetchOptional(promql.QVolumeWriteData, &v.VolumeWriteData))
 	g.Go(fetchOptional(promql.QAggrStatus, &v.AggrStatus))
 	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
 	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
@@ -275,6 +279,8 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 		string(promql.QVolumeWriteOps):             len(v.VolumeWriteOps),
 		string(promql.QVolumeReadLatency):          len(v.VolumeReadLatency),
 		string(promql.QVolumeWriteLatency):         len(v.VolumeWriteLatency),
+		string(promql.QVolumeReadData):             len(v.VolumeReadData),
+		string(promql.QVolumeWriteData):            len(v.VolumeWriteData),
 		string(promql.QAggrStatus):                 len(v.AggrStatus),
 		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
 		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
@@ -667,6 +673,7 @@ func parseTopology(v topologyVectors) Topology {
 	}
 	netapp := resolveNetAppStorage(claims,
 		v.VolumeReadOps, v.VolumeWriteOps, v.VolumeReadLatency, v.VolumeWriteLatency,
+		v.VolumeReadData, v.VolumeWriteData,
 		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal, v.NetAppNodeStatus)
 	for _, pv := range pvcs {
 		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {

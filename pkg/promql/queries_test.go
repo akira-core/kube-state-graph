@@ -133,8 +133,8 @@ func TestRender_QueryConstantsStayBare(t *testing.T) {
 	assert.Equal(t, "kube_persistentvolumeclaim_annotations", string(QPVCAnnotations))
 }
 
-// TestRender_HarvestAndKubeletLastOverTime pins the ten new legs: each
-// renders as last_over_time(<series>[w]) with no rate() and no sum by.
+// TestRender_HarvestAndKubeletLastOverTime pins the twelve Harvest/kubelet
+// legs: each renders as last_over_time(<series>[w]) with no rate() and no sum by.
 func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 	cases := []struct {
 		q    Query
@@ -144,6 +144,8 @@ func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 		{QVolumeWriteOps, "last_over_time(volume_write_ops[1m])"},
 		{QVolumeReadLatency, "last_over_time(volume_read_latency[1m])"},
 		{QVolumeWriteLatency, "last_over_time(volume_write_latency[1m])"},
+		{QVolumeReadData, "last_over_time(volume_read_data[1m])"},
+		{QVolumeWriteData, "last_over_time(volume_write_data[1m])"},
 		{QAggrStatus, "last_over_time(aggr_new_status[1m])"},
 		{QAggrSpaceUsed, "last_over_time(aggr_space_used[1m])"},
 		{QAggrSpaceTotal, "last_over_time(aggr_space_total[1m])"},

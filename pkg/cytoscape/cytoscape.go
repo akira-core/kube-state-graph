@@ -81,18 +81,20 @@ type Edge struct {
 // when no usable classic histogram was available. All three values are JSON
 // numbers (never strings) and MAY appear in exponent form for small values.
 //
-//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
 type EdgeMetricsDTO struct {
 	// Rate is requests per second over the window (always > 0 when the RED family is present). Schema-optional because the object is a union.
 	Rate *float64 `json:"rate,omitempty" example:"5"`
 	// ErrorRate is the failed fraction in [0,1]. Omitted when the failure counter was unreadable; 0 means read successfully with no failures.
 	ErrorRate *float64 `json:"error_rate,omitempty" example:"0.1"`
 	// P90ServerMs is the 90th percentile server-observed request duration in milliseconds.
-	P90ServerMs    *float64 `json:"p90_server_ms,omitempty" example:"12.5"`
-	ReadOps        *float64 `json:"read_ops,omitempty"`
-	WriteOps       *float64 `json:"write_ops,omitempty"`
-	ReadLatencyUs  *float64 `json:"read_latency_us,omitempty"`
-	WriteLatencyUs *float64 `json:"write_latency_us,omitempty"`
+	P90ServerMs      *float64 `json:"p90_server_ms,omitempty" example:"12.5"`
+	ReadOps          *float64 `json:"read_ops,omitempty"`
+	WriteOps         *float64 `json:"write_ops,omitempty"`
+	ReadLatencyUs    *float64 `json:"read_latency_us,omitempty"`
+	WriteLatencyUs   *float64 `json:"write_latency_us,omitempty"`
+	ReadBytesPerSec  *float64 `json:"read_bytes_per_sec,omitempty"`
+	WriteBytesPerSec *float64 `json:"write_bytes_per_sec,omitempty"`
 }
 
 // EdgeData is the serialised form of a graph edge.
@@ -154,6 +156,16 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 	if io.WriteLatencyUs != nil {
 		v := round6(*io.WriteLatencyUs)
 		dto.WriteLatencyUs = &v
+		filled = true
+	}
+	if io.ReadBytesPerSec != nil {
+		v := round6(*io.ReadBytesPerSec)
+		dto.ReadBytesPerSec = &v
+		filled = true
+	}
+	if io.WriteBytesPerSec != nil {
+		v := round6(*io.WriteBytesPerSec)
+		dto.WriteBytesPerSec = &v
 		filled = true
 	}
 	if !filled {

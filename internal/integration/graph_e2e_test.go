@@ -1373,6 +1373,10 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%q} 1 %d
 # HELP volume_read_ops dummy
 volume_read_ops{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 150 %d
+# HELP volume_read_data dummy
+volume_read_data{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 5242880 %d
+# HELP volume_write_data dummy
+volume_write_data{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 1000000 %d
 # HELP aggr_new_status dummy
 aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%q} 1 %d
 # HELP aggr_space_used dummy
@@ -1385,7 +1389,7 @@ node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%q} 1 %d
 kubelet_volume_stats_used_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%q} 50 %d
 # HELP kubelet_volume_stats_capacity_bytes dummy
 kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%q} 100 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
 	s.Require().True(
 		s.WaitForSeries(`volume_read_ops{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested volume_read_ops")
@@ -1432,6 +1436,10 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 			s.Require().NotNil(e.Data.Metrics)
 			s.Require().NotNil(e.Data.Metrics.ReadOps)
 			s.InDelta(150.0, *e.Data.Metrics.ReadOps, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.ReadBytesPerSec)
+			s.InDelta(5242880.0, *e.Data.Metrics.ReadBytesPerSec, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.WriteBytesPerSec)
+			s.InDelta(1000000.0, *e.Data.Metrics.WriteBytesPerSec, 1e-9)
 			s.Nil(e.Data.Metrics.Rate)
 		}
 	}

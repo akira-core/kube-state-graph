@@ -134,7 +134,9 @@
             "read_ops": 150,
             "write_ops": 40,
             "read_latency_us": 830,
-            "write_latency_us": 1200
+            "write_latency_us": 1200,
+            "read_bytes_per_sec": 5242880,
+            "write_bytes_per_sec": 1000000
           }
         }
       }

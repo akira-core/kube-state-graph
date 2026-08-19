@@ -100,13 +100,18 @@ func TestWithMetrics_ImmutableCopy(t *testing.T) {
 
 func TestWithIO_ImmutableCopy(t *testing.T) {
 	orig := NewEdge(EdgeTypePVCToNetAppAggr, "c/ns/claim", "netapp/oc/aggr/a1", nil)
-	readOps, writeOps := 10.0, 4.0
-	with := orig.WithIO(IOMetrics{ReadOps: &readOps, WriteOps: &writeOps})
+	readOps, writeOps, readBps, writeBps := 10.0, 4.0, 5242880.0, 1048576.0
+	with := orig.WithIO(IOMetrics{
+		ReadOps: &readOps, WriteOps: &writeOps,
+		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+	})
 	assert.Nil(t, orig.IO)
 	assert.Equal(t, orig.ID, with.ID)
 	require.NotNil(t, with.IO)
 	assert.InDelta(t, 10.0, *with.IO.ReadOps, 1e-12)
 	assert.InDelta(t, 4.0, *with.IO.WriteOps, 1e-12)
+	assert.InDelta(t, 5242880.0, *with.IO.ReadBytesPerSec, 1e-12)
+	assert.InDelta(t, 1048576.0, *with.IO.WriteBytesPerSec, 1e-12)
 	assert.Nil(t, with.IO.ReadLatencyUs)
 	assert.NotSame(t, orig, with)
 }

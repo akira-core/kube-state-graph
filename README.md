@@ -103,7 +103,7 @@ per source cluster).
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `volume_read_ops` / `volume_write_ops` / `volume_read_latency` / `volume_write_latency` | PVC→aggregate join (`volume_name` = PV name) + I/O on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`). Read **verbatim** — Harvest already resolves ONTAP counters; never wrapped in `rate()` | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume_name` | Optional (absent ⇒ no NetApp nodes / edges / `svm`) |
+| `volume_read_ops` / `volume_write_ops` / `volume_read_latency` / `volume_write_latency` / `volume_read_data` / `volume_write_data` | PVC→aggregate join (`volume_name` = PV name) + I/O on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`). Read **verbatim** — Harvest already resolves ONTAP counters (ops/s, average µs, bytes/s); never wrapped in `rate()` | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume_name` | Optional (absent ⇒ no NetApp nodes / edges / `svm`) |
 | `aggr_new_status` | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | `cluster`, `node`, `aggr` | Optional |
 | `aggr_space_used` / `aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `node`, `aggr` | Optional |
 | `node_new_status` | Controller `data.health` (same mapping as aggregate) | `cluster`, `node` | Optional |
@@ -188,6 +188,7 @@ When present:
 | `p90_server_ms` | RED: 90th percentile **server-observed** duration in milliseconds |
 | `read_ops` / `write_ops` | I/O family (`pvc-to-netapp-aggr` only): Harvest ops/s, verbatim |
 | `read_latency_us` / `write_latency_us` | I/O family: Harvest average latency in microseconds, verbatim |
+| `read_bytes_per_sec` / `write_bytes_per_sec` | I/O family: Harvest throughput in bytes per second, verbatim |
 
 Both new series are **optional** and degrade gracefully: a missing metric,
 empty result, or query error omits only the affected field (or leaves

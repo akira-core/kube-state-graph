@@ -34,11 +34,11 @@ have joined and did not". The builder does not interpret StorageClass names.
 
 | Series | Role |
 |---|---|
-| `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, `volume_write_latency` | Join + I/O (verbatim; no `rate()`) |
+| `volume_read_ops`, `volume_write_ops`, `volume_read_latency`, `volume_write_latency`, `volume_read_data`, `volume_write_data` | Join + I/O (verbatim; no `rate()`; data families are already bytes/s) |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | Aggregate health / usage |
 | `node_new_status` | Controller health |
 
-All ten Harvest/kubelet legs are OPTIONAL: a query error logs and continues
+All twelve Harvest/kubelet legs are OPTIONAL: a query error logs and continues
 with an empty vector and never fails the build.
 
 ## Trident custom-resource-state config is removable

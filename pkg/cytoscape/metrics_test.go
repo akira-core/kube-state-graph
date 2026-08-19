@@ -116,9 +116,12 @@ func TestSerialise_SmallRateExponentFormRoundTrip(t *testing.T) {
 func TestSerialise_IOMetricsOnly(t *testing.T) {
 	pvc := &graph.PVCNode{IDValue: "c/ns/claim", NameValue: "claim", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}}
 	aggr := &graph.NetAppAggrNode{IDValue: "netapp/oc/aggr/a1", NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}}
-	readOps, writeOps := 150.0, 40.0
+	readOps, writeOps, readBps, writeBps := 150.0, 40.0, 5242880.0, 1000000.0
 	e := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.ID(), aggr.ID(), nil).
-		WithIO(graph.IOMetrics{ReadOps: &readOps, WriteOps: &writeOps})
+		WithIO(graph.IOMetrics{
+			ReadOps: &readOps, WriteOps: &writeOps,
+			ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+		})
 	body := metricsView(t, []graph.GraphNode{pvc, aggr}, []*graph.Edge{e})
 	var found *EdgeMetricsDTO
 	for _, ed := range body.Elements.Edges {
@@ -128,11 +131,17 @@ func TestSerialise_IOMetricsOnly(t *testing.T) {
 	require.NotNil(t, found.ReadOps)
 	assert.InDelta(t, 150.0, *found.ReadOps, 1e-12)
 	require.NotNil(t, found.WriteOps)
+	require.NotNil(t, found.ReadBytesPerSec)
+	assert.InDelta(t, 5242880.0, *found.ReadBytesPerSec, 1e-12)
+	require.NotNil(t, found.WriteBytesPerSec)
+	assert.InDelta(t, 1000000.0, *found.WriteBytesPerSec, 1e-12)
 	assert.Nil(t, found.Rate)
 	assert.Nil(t, found.ErrorRate)
 	raw, err := json.Marshal(found)
 	require.NoError(t, err)
 	assert.Contains(t, string(raw), `"read_ops"`)
+	assert.Contains(t, string(raw), `"read_bytes_per_sec"`)
+	assert.Contains(t, string(raw), `"write_bytes_per_sec"`)
 	assert.NotContains(t, string(raw), `"rate"`)
 }
 
@@ -145,12 +154,13 @@ func TestSerialise_NeitherFamilyOmitsMetrics(t *testing.T) {
 }
 
 func TestMetricsDTO_REDPrecedence(t *testing.T) {
-	readOps := 1.0
-	dto := metricsDTO(&graph.EdgeMetrics{Rate: 5}, &graph.IOMetrics{ReadOps: &readOps})
+	readOps, readBps := 1.0, 5242880.0
+	dto := metricsDTO(&graph.EdgeMetrics{Rate: 5}, &graph.IOMetrics{ReadOps: &readOps, ReadBytesPerSec: &readBps})
 	require.NotNil(t, dto)
 	require.NotNil(t, dto.Rate)
 	assert.InDelta(t, 5.0, *dto.Rate, 1e-12)
 	assert.Nil(t, dto.ReadOps, "RED wins the impossible both-set case")
+	assert.Nil(t, dto.ReadBytesPerSec, "RED wins the impossible both-set case")
 }
 
 func TestRound6_SignificantDigits(t *testing.T) {

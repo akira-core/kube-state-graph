@@ -51,16 +51,18 @@ type Edge struct {
 	IO      *IOMetrics   // nil = no I/O measurements for this edge
 }
 
-// IOMetrics holds the four Harvest volume I/O measurements attached to a
+// IOMetrics holds the six Harvest volume I/O measurements attached to a
 // pvc-to-netapp-aggr edge. Numeric values NEVER enter Labels. Each field is
 // a pointer so a missing family is omitted (distinct from 0). The RED
 // EdgeMetrics invariant is untouched; a single edge carries at most one
 // family (the builder never sets both).
 type IOMetrics struct {
-	ReadOps        *float64
-	WriteOps       *float64
-	ReadLatencyUs  *float64
-	WriteLatencyUs *float64
+	ReadOps          *float64
+	WriteOps         *float64
+	ReadLatencyUs    *float64
+	WriteLatencyUs   *float64
+	ReadBytesPerSec  *float64
+	WriteBytesPerSec *float64
 }
 
 // NewEdge constructs an Edge with a deterministic UUIDv5 id derived from

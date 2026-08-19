@@ -98,15 +98,18 @@ const (
 
 	// NetApp Harvest volume I/O (replace-storageclass-with-netapp-nodes).
 	// Harvest has already resolved ONTAP base counters — ops are per-second,
-	// latency is an average in microseconds — so these are read verbatim
-	// via last_over_time, NEVER wrapped in rate(). OPTIONAL: a query error
-	// or empty vector degrades to no I/O field / no join, never a build
-	// failure. The `volume_name` label is a deployment relabel (not stock
-	// Harvest) mapping each FlexVol to the Kubernetes PV it backs.
+	// latency is an average in microseconds, data is bytes per second — so
+	// these are read verbatim via last_over_time, NEVER wrapped in rate().
+	// OPTIONAL: a query error or empty vector degrades to no I/O field /
+	// no join, never a build failure. The `volume_name` label is a
+	// deployment relabel (not stock Harvest) mapping each FlexVol to the
+	// Kubernetes PV it backs.
 	QVolumeReadOps      Query = "volume_read_ops"
 	QVolumeWriteOps     Query = "volume_write_ops"
 	QVolumeReadLatency  Query = "volume_read_latency"
 	QVolumeWriteLatency Query = "volume_write_latency"
+	QVolumeReadData     Query = "volume_read_data"
+	QVolumeWriteData    Query = "volume_write_data"
 
 	// NetApp Harvest aggregate + controller gauges. Same last_over_time
 	// verbatim read; OPTIONAL; log-and-continue on query error.
@@ -239,6 +242,10 @@ func Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(volume_read_latency[%s])`, w)
 	case QVolumeWriteLatency:
 		return fmt.Sprintf(`last_over_time(volume_write_latency[%s])`, w)
+	case QVolumeReadData:
+		return fmt.Sprintf(`last_over_time(volume_read_data[%s])`, w)
+	case QVolumeWriteData:
+		return fmt.Sprintf(`last_over_time(volume_write_data[%s])`, w)
 	case QAggrStatus:
 		return fmt.Sprintf(`last_over_time(aggr_new_status[%s])`, w)
 	case QAggrSpaceUsed:

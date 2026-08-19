@@ -61,12 +61,12 @@
 > families. Those task lines now read as the final contract (six families); the
 > outstanding work is listed here.
 
-- [ ] 10.1 Verify `volume_read_data` / `volume_write_data` against the production VictoriaMetrics (`/api/v1/label/__name__/values` + a sample `/api/v1/series` per name) — same `cluster`/`node`/`aggr`/`svm`/`volume_name` label contract as the four shipped volume families, and values already resolved by Harvest to bytes per second. On drift: mechanically rename in `specs/` + `design.md` before task 10.2.
-- [ ] 10.2 `pkg/promql`: add `QVolumeReadData` / `QVolumeWriteData` constants + `last_over_time` render cases (no `rate()`, no `sum by`); unit-test both rendered strings.
-- [ ] 10.3 `pkg/graph`: extend `IOMetrics` with `ReadBytesPerSec` / `WriteBytesPerSec *float64`; extend the `WithIO` copy test.
-- [ ] 10.4 `pkg/build`: add the two OPTIONAL legs to the `ReadTopology` fan-out with the same log-and-continue semantics (27 legs total); index both vectors in `resolveNetAppStorage` and sum each family in ascending value order; both families vote in the aggregate/owner/svm picks exactly like the shipped four (they carry the same labels), and either family alone counts as "a volume series was read" for the D8 coverage signal.
-- [ ] 10.5 `pkg/cytoscape`: add `read_bytes_per_sec` / `write_bytes_per_sec` `omitempty` DTO fields with `round6`; extend the IO-only and RED-precedence DTO tests.
-- [ ] 10.6 `pkg/build/netapp_test.go`: per-family presence/absence, multi-series ascending sum, and a claim matching only the data families.
-- [ ] 10.7 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries both fields, and extend the `internal/integration` Harvest fixture with both series.
-- [ ] 10.8 `CLAUDE.md`: Harvest leg count 8 → 10, topology fan-out 25 → 27, and the NetApp bullet's I/O field list.
+- [x] 10.1 Verify `volume_read_data` / `volume_write_data` against the production VictoriaMetrics (`/api/v1/label/__name__/values` + a sample `/api/v1/series` per name) — same `cluster`/`node`/`aggr`/`svm`/`volume_name` label contract as the four shipped volume families, and values already resolved by Harvest to bytes per second. On drift: mechanically rename in `specs/` + `design.md` before task 10.2.
+- [x] 10.2 `pkg/promql`: add `QVolumeReadData` / `QVolumeWriteData` constants + `last_over_time` render cases (no `rate()`, no `sum by`); unit-test both rendered strings.
+- [x] 10.3 `pkg/graph`: extend `IOMetrics` with `ReadBytesPerSec` / `WriteBytesPerSec *float64`; extend the `WithIO` copy test.
+- [x] 10.4 `pkg/build`: add the two OPTIONAL legs to the `ReadTopology` fan-out with the same log-and-continue semantics (27 legs total); index both vectors in `resolveNetAppStorage` and sum each family in ascending value order; both families vote in the aggregate/owner/svm picks exactly like the shipped four (they carry the same labels), and either family alone counts as "a volume series was read" for the D8 coverage signal.
+- [x] 10.5 `pkg/cytoscape`: add `read_bytes_per_sec` / `write_bytes_per_sec` `omitempty` DTO fields with `round6`; extend the IO-only and RED-precedence DTO tests.
+- [x] 10.6 `pkg/build/netapp_test.go`: per-family presence/absence, multi-series ascending sum, and a claim matching only the data families.
+- [x] 10.7 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries both fields, and extend the `internal/integration` Harvest fixture with both series.
+- [x] 10.8 `CLAUDE.md`: Harvest leg count 8 → 10, topology fan-out 25 → 27, and the NetApp bullet's I/O field list.
 - [ ] 10.9 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.

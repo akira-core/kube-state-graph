@@ -165,7 +165,7 @@ func buildWithStorageClass() graph.View {
 func buildWithNetAppStorage() graph.View {
 	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	used, cap := 700000000000.0, 1000000000000.0
-	readOps, writeOps, readLat, writeLat := 150.0, 40.0, 830.0, 1200.0
+	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
 	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
@@ -191,6 +191,7 @@ func buildWithNetAppStorage() graph.View {
 	}
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
 		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
+		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
 	})
 	edges := []*graph.Edge{
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvc.IDValue, map[string]string{"claim_name": "data-mongo-0"}),

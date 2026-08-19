@@ -77,7 +77,7 @@ parseGraphRequest        ── validates start/end (RFC 3339 or Unix seconds); 
    ▼
 context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; deadline exceeded → 504 timeout
    └─ Builder.Build(ctx, window, end)
-         ├─ ReadTopology  (errgroup of 25 PromQL queries in parallel: KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 8 Harvest + 2 kubelet; Harvest/kubelet legs log-and-continue)
+         ├─ ReadTopology  (errgroup of 27 PromQL queries in parallel: KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 10 Harvest + 2 kubelet; Harvest/kubelet legs log-and-continue)
          ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector — D30; joined with topology)
          └─ assemble + graph.NewGraph → *Graph (immutable, with adjacency)
    (no in-process concurrency cap; HPA + Pod resource limits handle load shedding)
@@ -726,7 +726,9 @@ live under `openspec/specs/`.
   service node fans out across same-family clusters holding the same-named
   Service, so it MAY be cross-cluster — `may_cross_cluster: true`), and
   `pvc-to-netapp-aggr` (PVC → ONTAP aggregate from the Harvest volume join;
-  `may_cross_cluster: false` — the target belongs to no Kubernetes cluster).
+  `may_cross_cluster: false` — the target belongs to no Kubernetes cluster;
+  I/O on `data.metrics`: `read_ops`, `write_ops`, `read_latency_us`,
+  `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`).
 - **API-key auth is the only HTTP auth in v1.** Header is `X-API-Key`. Keys
   come from `--api-keys-file` (K8s `Secret` mount, hot-reloaded) or
   `--api-keys`. Empty keyset = auth disabled (dev default). Open paths

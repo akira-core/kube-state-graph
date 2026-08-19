@@ -10,7 +10,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// ioFamily is one of the four Harvest volume I/O series.
+// ioFamily is one of the six Harvest volume I/O series.
 type ioFamily int
 
 const (
@@ -18,6 +18,8 @@ const (
 	ioWriteOps
 	ioReadLat
 	ioWriteLat
+	ioReadData
+	ioWriteData
 )
 
 // volumeCandidate is one Harvest volume-object sample used by the storage join.
@@ -51,7 +53,7 @@ type nodeKey struct{ oc, node string }
 // edges. Pure except for the aggregated coverage warning (D8).
 func resolveNetAppStorage(
 	claims []pvcVolume,
-	readOps, writeOps, readLat, writeLat model.Vector,
+	readOps, writeOps, readLat, writeLat, readData, writeData model.Vector,
 	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector,
 ) netappResult {
 	out := netappResult{svmByPVC: map[string]string{}}
@@ -60,6 +62,8 @@ func resolveNetAppStorage(
 	indexFamily(index, writeOps, ioWriteOps)
 	indexFamily(index, readLat, ioReadLat)
 	indexFamily(index, writeLat, ioWriteLat)
+	indexFamily(index, readData, ioReadData)
+	indexFamily(index, writeData, ioWriteData)
 	harvestPresent := len(index) > 0
 
 	type joinHit struct {
@@ -238,7 +242,7 @@ func pickSVM(cands []volumeCandidate) string {
 }
 
 func sumIO(cands []volumeCandidate) *graph.IOMetrics {
-	var readOps, writeOps, readLat, writeLat []float64
+	var readOps, writeOps, readLat, writeLat, readData, writeData []float64
 	for _, c := range cands {
 		switch c.family {
 		case ioReadOps:
@@ -249,9 +253,13 @@ func sumIO(cands []volumeCandidate) *graph.IOMetrics {
 			readLat = append(readLat, c.value)
 		case ioWriteLat:
 			writeLat = append(writeLat, c.value)
+		case ioReadData:
+			readData = append(readData, c.value)
+		case ioWriteData:
+			writeData = append(writeData, c.value)
 		}
 	}
-	if len(readOps)+len(writeOps)+len(readLat)+len(writeLat) == 0 {
+	if len(readOps)+len(writeOps)+len(readLat)+len(writeLat)+len(readData)+len(writeData) == 0 {
 		return nil
 	}
 	io := &graph.IOMetrics{}
@@ -266,6 +274,12 @@ func sumIO(cands []volumeCandidate) *graph.IOMetrics {
 	}
 	if v, ok := sumIOFamily(writeLat); ok {
 		io.WriteLatencyUs = &v
+	}
+	if v, ok := sumIOFamily(readData); ok {
+		io.ReadBytesPerSec = &v
+	}
+	if v, ok := sumIOFamily(writeData); ok {
+		io.WriteBytesPerSec = &v
 	}
 	return io
 }

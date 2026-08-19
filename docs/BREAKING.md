@@ -28,7 +28,8 @@ the same version bump.
 
 The wire `metrics` object is now a union of the RED family (`rate`,
 `error_rate`, `p90_server_ms`) and the I/O family (`read_ops`, `write_ops`,
-`read_latency_us`, `write_latency_us`). At the OpenAPI schema level every field
+`read_latency_us`, `write_latency_us`, `read_bytes_per_sec`,
+`write_bytes_per_sec`). At the OpenAPI schema level every field
 is optional. RED behaviour is unchanged: a RED-family object always carries a
 positive `rate`.
 

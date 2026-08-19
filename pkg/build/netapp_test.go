@@ -16,6 +16,14 @@ import (
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
+// resolveNetApp is the four-family wrapper used by the pre-throughput tests.
+func resolveNetApp(
+	claims []pvcVolume,
+	readOps, writeOps, readLat, writeLat, aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector,
+) netappResult {
+	return resolveNetAppStorage(claims, readOps, writeOps, readLat, writeLat, nil, nil, aggrStatus, aggrUsed, aggrTotal, nodeStatus)
+}
+
 func volSample(vn, oc, node, aggr, svm string, val float64) model.Sample {
 	m := model.Metric{
 		"volume_name": model.LabelValue(vn),
@@ -40,7 +48,7 @@ func aggrSample(oc, node, aggr string, val float64) model.Sample {
 
 func TestResolveNetAppStorage_JoinHit(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-9f3a"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(volSample("pvc-9f3a", "ontap-prod", "ontap-prod-01", "aggr1", "svm-prod", 150)),
 		sampleVec(volSample("pvc-9f3a", "ontap-prod", "ontap-prod-01", "aggr1", "svm-prod", 40)),
 		nil, nil, nil, nil, nil, nil)
@@ -60,7 +68,7 @@ func TestResolveNetAppStorage_JoinHit(t *testing.T) {
 func TestResolveNetAppStorage_JoinMiss(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-nope"}}
 	recs := captureDebugRecords(t, func() {
-		res := resolveNetAppStorage(claims,
+		res := resolveNetApp(claims,
 			sampleVec(volSample("pvc-other", "ontap-prod", "n1", "aggr1", "svm", 1)),
 			nil, nil, nil, nil, nil, nil, nil)
 		assert.Empty(t, res.edges)
@@ -72,7 +80,7 @@ func TestResolveNetAppStorage_JoinMiss(t *testing.T) {
 func TestResolveNetAppStorage_FlexGroupEmptyAggr(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-fg"}}
 	recs := captureDebugRecords(t, func() {
-		res := resolveNetAppStorage(claims,
+		res := resolveNetApp(claims,
 			sampleVec(volSample("pvc-fg", "ontap-prod", "n1", "", "svm-fg", 1)),
 			nil, nil, nil, nil, nil, nil, nil)
 		assert.Empty(t, res.edges, "empty aggr emits no edge")
@@ -84,7 +92,7 @@ func TestResolveNetAppStorage_FlexGroupEmptyAggr(t *testing.T) {
 func TestResolveNetAppStorage_HarvestAbsentSilent(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-9f3a"}}
 	recs := captureDebugRecords(t, func() {
-		res := resolveNetAppStorage(claims, nil, nil, nil, nil, nil, nil, nil, nil)
+		res := resolveNetApp(claims, nil, nil, nil, nil, nil, nil, nil, nil)
 		assert.Empty(t, res.edges)
 	})
 	assert.False(t, hasMsg(recs, "netapp_volume_join_miss"))
@@ -93,7 +101,7 @@ func TestResolveNetAppStorage_HarvestAbsentSilent(t *testing.T) {
 func TestResolveNetAppStorage_FullCoverageSilent(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-9f3a"}}
 	recs := captureDebugRecords(t, func() {
-		resolveNetAppStorage(claims,
+		resolveNetApp(claims,
 			sampleVec(volSample("pvc-9f3a", "oc", "n1", "a1", "svm", 1)),
 			nil, nil, nil, nil, nil, nil, nil)
 	})
@@ -102,7 +110,7 @@ func TestResolveNetAppStorage_FullCoverageSilent(t *testing.T) {
 
 func TestResolveNetAppStorage_DuplicateAggrPick(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(
 			volSample("pvc-x", "oc", "n1", "aggr-b", "svm-b", 1),
 			volSample("pvc-x", "oc", "n1", "aggr-a", "svm-a", 1),
@@ -115,7 +123,7 @@ func TestResolveNetAppStorage_DuplicateAggrPick(t *testing.T) {
 
 func TestResolveNetAppStorage_TakeoverPicksLexicalOwner(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(
 			volSample("pvc-x", "oc", "node-b", "aggr1", "svm", 1),
 			volSample("pvc-x", "oc", "node-a", "aggr1", "svm", 1),
@@ -128,7 +136,7 @@ func TestResolveNetAppStorage_TakeoverPicksLexicalOwner(t *testing.T) {
 
 func TestResolveNetAppStorage_HealthMapping(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm", 1)),
 		nil, nil, nil,
 		sampleVec(aggrSample("oc", "n1", "a1", 1)),
@@ -146,7 +154,7 @@ func TestResolveNetAppStorage_HealthMapping(t *testing.T) {
 
 func TestResolveNetAppStorage_AbsentHealthNotDegraded(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm", 1)),
 		nil, nil, nil, nil, nil, nil, nil)
 	assert.Empty(t, res.aggrs[0].Health())
@@ -155,7 +163,7 @@ func TestResolveNetAppStorage_AbsentHealthNotDegraded(t *testing.T) {
 
 func TestResolveNetAppStorage_IOSumAscending(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(
 			volSample("pvc-x", "oc", "n1", "a1", "svm", 3),
 			volSample("pvc-x", "oc", "n1", "a1", "svm", 2),
@@ -167,7 +175,7 @@ func TestResolveNetAppStorage_IOSumAscending(t *testing.T) {
 
 func TestResolveNetAppStorage_UnreferencedAggrNotMaterialised(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
-	res := resolveNetAppStorage(claims,
+	res := resolveNetApp(claims,
 		sampleVec(
 			volSample("pvc-x", "oc", "n1", "a1", "svm", 1),
 			volSample("other", "oc", "n1", "idle", "svm", 1),
@@ -217,6 +225,65 @@ func TestParseTopology_NetAppJoinAndUsage(t *testing.T) {
 	assert.InDelta(t, 50.0, *tp.PVCs[0].Usage().UsedBytes, 1e-12)
 	require.Len(t, tp.NetAppAggrs, 1)
 	require.Len(t, tp.StorageEdges, 1)
+}
+
+func TestResolveNetAppStorage_DataFamilyPresenceAbsence(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
+	res := resolveNetAppStorage(claims,
+		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm", 150)),
+		nil, nil, nil,
+		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm", 5242880)),
+		nil, nil, nil, nil, nil)
+	require.NotNil(t, res.edges[0].IO)
+	assert.InDelta(t, 150.0, *res.edges[0].IO.ReadOps, 1e-12)
+	assert.Nil(t, res.edges[0].IO.WriteOps)
+	assert.Nil(t, res.edges[0].IO.ReadLatencyUs)
+	assert.Nil(t, res.edges[0].IO.WriteLatencyUs)
+	assert.InDelta(t, 5242880.0, *res.edges[0].IO.ReadBytesPerSec, 1e-12)
+	assert.Nil(t, res.edges[0].IO.WriteBytesPerSec)
+}
+
+func TestResolveNetAppStorage_DataSumAscending(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
+	res := resolveNetAppStorage(claims,
+		nil, nil, nil, nil,
+		sampleVec(
+			volSample("pvc-x", "oc", "n1", "a1", "svm", 3),
+			volSample("pvc-x", "oc", "n1", "a1", "svm", 2),
+		),
+		nil, nil, nil, nil, nil)
+	require.NotNil(t, res.edges[0].IO)
+	assert.InDelta(t, 5.0, *res.edges[0].IO.ReadBytesPerSec, 1e-12)
+	assert.Nil(t, res.edges[0].IO.ReadOps)
+}
+
+func TestResolveNetAppStorage_DataFamiliesOnly(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}}
+	res := resolveNetAppStorage(claims,
+		nil, nil, nil, nil,
+		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm-data", 5242880)),
+		sampleVec(volSample("pvc-x", "oc", "n1", "a1", "svm-data", 1048576)),
+		nil, nil, nil, nil)
+	assert.Equal(t, "svm-data", res.svmByPVC["c/db/data"])
+	require.Len(t, res.aggrs, 1)
+	assert.Equal(t, "n1", res.aggrs[0].Labels()["node"])
+	require.Len(t, res.edges, 1)
+	require.NotNil(t, res.edges[0].IO)
+	assert.Nil(t, res.edges[0].IO.ReadOps)
+	assert.InDelta(t, 5242880.0, *res.edges[0].IO.ReadBytesPerSec, 1e-12)
+	assert.InDelta(t, 1048576.0, *res.edges[0].IO.WriteBytesPerSec, 1e-12)
+}
+
+func TestResolveNetAppStorage_DataFamilyCountsAsHarvestPresent(t *testing.T) {
+	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-nope"}}
+	recs := captureDebugRecords(t, func() {
+		res := resolveNetAppStorage(claims,
+			nil, nil, nil, nil,
+			sampleVec(volSample("pvc-other", "oc", "n1", "a1", "svm", 1)),
+			nil, nil, nil, nil, nil)
+		assert.Empty(t, res.edges)
+	})
+	assert.True(t, hasMsg(recs, "netapp_volume_join_miss"))
 }
 
 func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {
