@@ -69,7 +69,7 @@
 - [x] 10.6 `pkg/build/netapp_test.go`: per-family presence/absence, multi-series ascending sum, and a claim matching only the data families.
 - [x] 10.7 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries both fields, and extend the `internal/integration` Harvest fixture with both series.
 - [x] 10.8 `CLAUDE.md`: Harvest leg count 8 → 10, topology fan-out 25 → 27, and the NetApp bullet's I/O field list.
-- [ ] 10.9 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.
+- [x] 10.9 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.
 
 ## 11. QoS I/O source + fixed-policy throughput ceilings
 
@@ -93,4 +93,4 @@
 - [x] 11.8 `pkg/build/netapp_test.go`: LUN-series exclusion, edge-without-metrics, per-family presence/absence, multi-series ascending sum, policy-triple pick on conflicting `policy_group`, per-field ceiling presence, the converted value, and `svm` staying unaffected by which QoS families matched.
 - [x] 11.9 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries measurements plus ceilings, and re-fixture `internal/integration` with `volume_labels` + QoS + policy series — including a LUN-level series that must not be counted and a claim with topology but no QoS.
 - [x] 11.10 Docs: `docs/netapp-harvest-preconditions.md` — the relabel rule now covers both the volume and QoS workload series, the required Harvest templates, the `lun=""` volume-granularity contract, the fourth blind spot (no QoS workload ⇒ edge without measurements), and both coverage warnings. `CLAUDE.md` — Harvest leg count 10 → 13, topology fan-out 27 → 30, the NetApp bullet's I/O field list and metric sources.
-- [ ] 11.11 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.
+- [x] 11.11 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.

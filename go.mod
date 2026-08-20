@@ -2,7 +2,7 @@ module github.com/akira-core/kube-state-graph
 
 go 1.25.7
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0

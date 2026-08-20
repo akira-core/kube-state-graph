@@ -9,7 +9,7 @@ Works on **macOS** (Docker Desktop) and **Linux** (Docker Engine).
 
 ## What you get
 
-- Go pinned to **exactly** the `toolchain` version in `go.mod` (`go1.26.5`), so
+- Go pinned to **exactly** the `toolchain` version in `go.mod` (`go1.26.6`), so
   nothing is downloaded at run time — see [Go version pinning](#go-version-pinning).
 - `router_check_tool` baked into the image at `/usr/local/bin/router_check_tool`
   (copied from `envoyproxy/envoy:tools-v1.34-latest`, the same source the
@@ -29,7 +29,7 @@ The image is built `FROM golang:<GO_VERSION>-bookworm`, where `GO_VERSION`
 Why not the `mcr.microsoft.com/devcontainers/go` image: it only publishes minor
 tags (`1.26-bookworm`) that float within the patch series, so it can land on a
 different patch than `go.mod` pins — which makes Go download the pinned
-toolchain on first use (`go: downloading go1.26.5`). Pinning the base to the
+toolchain on first use (`go: downloading go1.26.6`). Pinning the base to the
 exact patch avoids that entirely.
 
 `GOTOOLCHAIN` is left at `auto` purely as a safety net: if someone bumps
@@ -89,7 +89,7 @@ Then *Dev Containers: Rebuild Container* in VS Code.
 ## Verify the setup
 
 ```bash
-go version                                   # go1.26.5
+go version                                   # go1.26.6
 router_check_tool --help                     # binary + glibc/libstdc++ resolve
 docker info                                  # DooD socket works
 make lint                                    # golangci-lint v2.11.4

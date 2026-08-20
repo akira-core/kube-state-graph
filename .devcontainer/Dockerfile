@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# Pinned to the EXACT toolchain go.mod declares (`toolchain go1.26.5`), so the
+# Pinned to the EXACT toolchain go.mod declares (`toolchain go1.26.6`), so the
 # container's Go IS the module's Go and nothing is downloaded at run time.
 # Bump this together with the go.mod toolchain directive.
 #
 # Note: the mcr.microsoft.com/devcontainers/go images only publish minor tags
 # (1.26-bookworm), which float within the 1.26.x patch series and therefore
 # cannot guarantee the pinned patch — hence the official image.
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 
 # Source the router_check_tool binary from the Envoy tools image — the SAME
 # image and path the production build uses (deploy/docker/server.Dockerfile).
