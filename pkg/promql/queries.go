@@ -61,7 +61,7 @@ const (
 	// nodes (never to materialise new ones). OPTIONAL — a KSM default, no
 	// --metric-labels-allowlist required. The StorageClass name is the PVC's
 	// own typed attribute (never a node); `volumename` roots the Harvest
-	// volume join (see QVolumeReadOps).
+	// volume join (see QVolumeLabels).
 	QPVCInfo Query = "kube_persistentvolumeclaim_info"
 
 	// Pod container list resolution. kube_pod_container_info emits one series
@@ -96,20 +96,37 @@ const (
 	QServiceAnnotations Query = "kube_service_annotations"
 	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
 
-	// NetApp Harvest volume I/O (replace-storageclass-with-netapp-nodes).
-	// Harvest has already resolved ONTAP base counters — ops are per-second,
-	// latency is an average in microseconds, data is bytes per second — so
-	// these are read verbatim via last_over_time, NEVER wrapped in rate().
-	// OPTIONAL: a query error or empty vector degrades to no I/O field /
-	// no join, never a build failure. The `volume_name` label is a
-	// deployment relabel (not stock Harvest) mapping each FlexVol to the
-	// Kubernetes PV it backs.
-	QVolumeReadOps      Query = "volume_read_ops"
-	QVolumeWriteOps     Query = "volume_write_ops"
-	QVolumeReadLatency  Query = "volume_read_latency"
-	QVolumeWriteLatency Query = "volume_write_latency"
-	QVolumeReadData     Query = "volume_read_data"
-	QVolumeWriteData    Query = "volume_write_data"
+	// NetApp Harvest volume label series — the SOLE source of the storage
+	// topology (hop A of design.md D3): the pvc-to-netapp-aggr edge, the
+	// netapp-aggr / netapp-node entities and the PVC `svm` label all derive
+	// from this one series and nothing else. It is an info series: its sample
+	// value is discarded, only its label set is consumed. The `volume_name`
+	// label is a deployment relabel (not stock Harvest) mapping each FlexVol
+	// to the Kubernetes PV it backs. OPTIONAL: a query error or empty vector
+	// degrades to no storage topology, never a build failure.
+	QVolumeLabels Query = "volume_labels"
+
+	// NetApp Harvest QoS workload I/O (hop B of design.md D3). Harvest has
+	// already resolved ONTAP base counters — ops are per-second, latency is an
+	// average in microseconds, data is bytes per second — so these are read
+	// verbatim via last_over_time, NEVER wrapped in rate(). Read at volume
+	// granularity only (see qosVolumeGranularitySelector). OPTIONAL and
+	// independent of the topology source: a miss leaves the claim's edge in
+	// place carrying no metrics at all.
+	QQoSReadOps      Query = "qos_read_ops"
+	QQoSWriteOps     Query = "qos_write_ops"
+	QQoSReadLatency  Query = "qos_read_latency"
+	QQoSWriteLatency Query = "qos_write_latency"
+	QQoSReadData     Query = "qos_read_data"
+	QQoSWriteData    Query = "qos_write_data"
+
+	// NetApp Harvest QoS fixed-policy ceilings (hop C of design.md D3),
+	// joined on the (ontap_cluster, svm, policy_group) triple recovered from
+	// the matched QoS workload series. Rendered bare — a policy object has no
+	// LUN dimension. OPTIONAL: absence means "no declared ceiling", which is
+	// never rendered as a number.
+	QQoSPolicyFixedMaxIOPS Query = "qos_policy_fixed_max_throughput_iops"
+	QQoSPolicyFixedMaxMBps Query = "qos_policy_fixed_max_throughput_mbps"
 
 	// NetApp Harvest aggregate + controller gauges. Same last_over_time
 	// verbatim read; OPTIONAL; log-and-continue on query error.
@@ -124,6 +141,12 @@ const (
 	QKubeletVolumeUsedBytes     Query = "kubelet_volume_stats_used_bytes"
 	QKubeletVolumeCapacityBytes Query = "kubelet_volume_stats_capacity_bytes"
 )
+
+// qosVolumeGranularitySelector keeps the Harvest QoS workload reads at volume
+// granularity. A PromQL empty-string matcher also matches series carrying no
+// such label at all, so the contract stays correct against a Harvest template
+// that omits `lun` entirely.
+const qosVolumeGranularitySelector = `lun=""`
 
 // ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
 // discovery. Sized to absorb transient KSM scrape gaps; not configurable.
@@ -234,18 +257,21 @@ func Render(q Query, window time.Duration) string {
 		return fmt.Sprintf(`last_over_time(kube_service_annotations[%s])`, w)
 	case QPVCAnnotations:
 		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations[%s])`, w)
-	case QVolumeReadOps:
-		return fmt.Sprintf(`last_over_time(volume_read_ops[%s])`, w)
-	case QVolumeWriteOps:
-		return fmt.Sprintf(`last_over_time(volume_write_ops[%s])`, w)
-	case QVolumeReadLatency:
-		return fmt.Sprintf(`last_over_time(volume_read_latency[%s])`, w)
-	case QVolumeWriteLatency:
-		return fmt.Sprintf(`last_over_time(volume_write_latency[%s])`, w)
-	case QVolumeReadData:
-		return fmt.Sprintf(`last_over_time(volume_read_data[%s])`, w)
-	case QVolumeWriteData:
-		return fmt.Sprintf(`last_over_time(volume_write_data[%s])`, w)
+	case QVolumeLabels:
+		return fmt.Sprintf(`last_over_time(volume_labels[%s])`, w)
+	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
+		// Volume-granularity restriction (design.md D2): ONTAP collects a
+		// workload per LUN as well as per volume, and a LUN workload carries
+		// the volume_name of its containing FlexVol once the deployment
+		// relabel rule has run — an unrestricted read would sum LUN traffic on
+		// top of volume traffic for the same claim. This is a fixed,
+		// request-invariant metric-selection contract (same class as the D30
+		// sentinel matcher and condition="Ready"), NOT a caller filter.
+		return fmt.Sprintf(`last_over_time(%s{%s}[%s])`, q, qosVolumeGranularitySelector, w)
+	case QQoSPolicyFixedMaxIOPS:
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops[%s])`, w)
+	case QQoSPolicyFixedMaxMBps:
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_mbps[%s])`, w)
 	case QAggrStatus:
 		return fmt.Sprintf(`last_over_time(aggr_new_status[%s])`, w)
 	case QAggrSpaceUsed:

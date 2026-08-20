@@ -1368,31 +1368,41 @@ func (s *GraphSuite) TestPVCNetAppHarvestJoin() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
-kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="netapp-data",volume="data",test=%q} 1 %d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="netapp-data",volume="data",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="qosless-data",volume="archive",test=%[1]q} 1 %[2]d
 # HELP kube_persistentvolumeclaim_info dummy
-kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%q} 1 %d
-# HELP volume_read_ops dummy
-volume_read_ops{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 150 %d
-# HELP volume_read_data dummy
-volume_read_data{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 5242880 %d
-# HELP volume_write_data dummy
-volume_write_data{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%q} 1000000 %d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="qosless-data",storageclass="netapp-nas",volumename="pvc-noqos",test=%[1]q} 1 %[2]d
+# HELP volume_labels dummy
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-noqos",test=%[1]q} 1 %[2]d
+# HELP qos_read_ops dummy
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 150 %[2]d
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",lun="/vol/pvc_9f3a/lun0",test=%[1]q} 90 %[2]d
+# HELP qos_read_data dummy
+qos_read_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 5242880 %[2]d
+# HELP qos_write_data dummy
+qos_write_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 1000000 %[2]d
+# HELP qos_policy_fixed_max_throughput_iops dummy
+qos_policy_fixed_max_throughput_iops{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 5000 %[2]d
+# HELP qos_policy_fixed_max_throughput_mbps dummy
+qos_policy_fixed_max_throughput_mbps{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 250 %[2]d
 # HELP aggr_new_status dummy
-aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%q} 1 %d
+aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1 %[2]d
 # HELP aggr_space_used dummy
-aggr_space_used{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%q} 700 %d
+aggr_space_used{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 700 %[2]d
 # HELP aggr_space_total dummy
-aggr_space_total{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%q} 1000 %d
+aggr_space_total{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1000 %[2]d
 # HELP node_new_status dummy
-node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%q} 1 %d
+node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 1 %[2]d
 # HELP kubelet_volume_stats_used_bytes dummy
-kubelet_volume_stats_used_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%q} 50 %d
+kubelet_volume_stats_used_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%[1]q} 50 %[2]d
 # HELP kubelet_volume_stats_capacity_bytes dummy
-kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%q} 100 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%[1]q} 100 %[2]d
+`, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`volume_read_ops{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
-		"VM did not observe ingested volume_read_ops")
+		s.WaitForSeries(`volume_labels{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested volume_labels")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -1415,6 +1425,14 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 	s.Require().NotNil(pvc.Usage)
 	s.InDelta(50.0, *pvc.Usage.UsedBytes, 1e-9)
 
+	// The QoS-less claim keeps its whole storage topology — svm included.
+	// Only its measurements are missing (design.md D3: the hops degrade
+	// independently).
+	qosless, ok := byID["cluster-alpha/shop/qosless-data"]
+	s.Require().True(ok, "qos-less pvc node must be present")
+	s.Equal("pvc-noqos", qosless.Labels["volumename"])
+	s.Equal("svm-prod", qosless.Labels["svm"])
+
 	aggr, ok := byID["netapp/ontap-prod/aggr/aggr1"]
 	s.Require().True(ok, "netapp-aggr node must be present")
 	s.Equal("online", aggr.Health)
@@ -1427,23 +1445,35 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 		s.NotEqual("ontap-prod", c)
 	}
 
-	var found bool
+	var found, foundQoSless bool
 	for _, e := range body.Elements.Edges {
-		if e.Data.Type == "pvc-to-netapp-aggr" &&
-			e.Data.Source == "cluster-alpha/shop/netapp-data" &&
-			e.Data.Target == "netapp/ontap-prod/aggr/aggr1" {
+		if e.Data.Type != "pvc-to-netapp-aggr" || e.Data.Target != "netapp/ontap-prod/aggr/aggr1" {
+			continue
+		}
+		switch e.Data.Source {
+		case "cluster-alpha/shop/netapp-data":
 			found = true
 			s.Require().NotNil(e.Data.Metrics)
 			s.Require().NotNil(e.Data.Metrics.ReadOps)
+			// 150, NOT 240: the LUN-level workload carries the same
+			// relabelled volume_name and is excluded upstream by lun="".
 			s.InDelta(150.0, *e.Data.Metrics.ReadOps, 1e-9)
 			s.Require().NotNil(e.Data.Metrics.ReadBytesPerSec)
 			s.InDelta(5242880.0, *e.Data.Metrics.ReadBytesPerSec, 1e-9)
 			s.Require().NotNil(e.Data.Metrics.WriteBytesPerSec)
 			s.InDelta(1000000.0, *e.Data.Metrics.WriteBytesPerSec, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.MaxIOPS)
+			s.InDelta(5000.0, *e.Data.Metrics.MaxIOPS, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.MaxBytesPerSec)
+			s.InDelta(262144000.0, *e.Data.Metrics.MaxBytesPerSec, 1e-9)
 			s.Nil(e.Data.Metrics.Rate)
+		case "cluster-alpha/shop/qosless-data":
+			foundQoSless = true
+			s.Nil(e.Data.Metrics, "no QoS workload ⇒ no metrics key, ceiling included")
 		}
 	}
 	s.True(found, "expected a pvc-to-netapp-aggr edge")
+	s.True(foundQoSless, "expected the qos-less claim to keep its aggregate edge")
 }
 
 // TestPVCNetAppHarvestAbsent — a PVC with volumename but no Harvest series

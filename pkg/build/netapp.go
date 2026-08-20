@@ -10,7 +10,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// ioFamily is one of the six Harvest volume I/O series.
+// ioFamily is one of the six Harvest QoS workload I/O series.
 type ioFamily int
 
 const (
@@ -22,12 +22,29 @@ const (
 	ioWriteData
 )
 
-// volumeCandidate is one Harvest volume-object sample used by the storage join.
-type volumeCandidate struct {
+// bytesPerMB scales a QoS fixed policy's megabytes-per-second ceiling to bytes
+// per second, so max_bytes_per_sec carries the unit of the measured
+// read_bytes_per_sec / write_bytes_per_sec and the two compare directly
+// (design.md D2 — the ONE value in this resolver not read verbatim).
+// Basis: ONTAP expresses QoS throughput limits in binary megabytes.
+const bytesPerMB = 1048576
+
+// volumeLabelCandidate is one Harvest volume_labels sample — hop A of the
+// storage join (design.md D3). This series is the SOLE source of the storage
+// topology; its sample value is discarded and only its labels are consumed.
+type volumeLabelCandidate struct {
 	ontapCluster string
 	node         string
 	aggr         string
 	svm          string
+}
+
+// qosCandidate is one Harvest QoS workload sample — hop B. It carries no
+// aggr/node dimension, which is exactly why hop A exists.
+type qosCandidate struct {
+	ontapCluster string
+	svm          string
+	policyGroup  string
 	family       ioFamily
 	value        float64
 }
@@ -47,58 +64,104 @@ type netappResult struct {
 
 type aggrKey struct{ oc, aggr string }
 type nodeKey struct{ oc, node string }
+type policyKey struct{ oc, svm, policy string }
 
-// resolveNetAppStorage joins PVC PV names to Harvest volume series and
-// materialises NetApp aggregate/controller nodes plus pvc-to-netapp-aggr
-// edges. Pure except for the aggregated coverage warning (D8).
+// resolveNetAppStorage runs the three-hop storage join of design.md D3:
+//
+//	hop A  volume_labels             → edge + aggregate + controller + PVC svm
+//	hop B  qos_* workload families   → the six measured I/O figures + policy group
+//	hop C  qos_policy_fixed_max_*    → the volume's declared throughput ceiling
+//
+// The hops degrade independently: a hop-B miss leaves a valid measurement-less
+// edge rather than erasing the claim's storage topology. Pure except for the
+// two aggregated coverage warnings (D8).
 func resolveNetAppStorage(
 	claims []pvcVolume,
+	volumeLabels model.Vector,
 	readOps, writeOps, readLat, writeLat, readData, writeData model.Vector,
+	policyMaxIOPS, policyMaxMBps model.Vector,
 	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector,
 ) netappResult {
 	out := netappResult{svmByPVC: map[string]string{}}
-	index := map[string][]volumeCandidate{}
-	indexFamily(index, readOps, ioReadOps)
-	indexFamily(index, writeOps, ioWriteOps)
-	indexFamily(index, readLat, ioReadLat)
-	indexFamily(index, writeLat, ioWriteLat)
-	indexFamily(index, readData, ioReadData)
-	indexFamily(index, writeData, ioWriteData)
-	harvestPresent := len(index) > 0
+
+	volIndex := map[string][]volumeLabelCandidate{}
+	for _, s := range volumeLabels {
+		vn, oc := string(s.Metric["volume_name"]), string(s.Metric["cluster"])
+		if vn == "" || oc == "" {
+			continue
+		}
+		volIndex[vn] = append(volIndex[vn], volumeLabelCandidate{
+			ontapCluster: oc,
+			node:         string(s.Metric["node"]),
+			aggr:         string(s.Metric["aggr"]),
+			svm:          string(s.Metric["svm"]),
+		})
+	}
+
+	qosIndex := map[string][]qosCandidate{}
+	indexQoSFamily(qosIndex, readOps, ioReadOps)
+	indexQoSFamily(qosIndex, writeOps, ioWriteOps)
+	indexQoSFamily(qosIndex, readLat, ioReadLat)
+	indexQoSFamily(qosIndex, writeLat, ioWriteLat)
+	indexQoSFamily(qosIndex, readData, ioReadData)
+	indexQoSFamily(qosIndex, writeData, ioWriteData)
+
+	policyIndex := indexPolicyCeilings(policyMaxIOPS, policyMaxMBps)
+
+	// Each coverage signal is gated on ITS OWN family having been read, so a
+	// deployment running the volume template without the QoS template gets its
+	// topology graph and no spurious I/O warning. Gating on the raw vectors
+	// rather than the built indexes is deliberate: a vector whose series carry
+	// no volume_name WAS read, and a broken relabel rule is exactly the
+	// coverage failure these signals exist to surface.
+	topoPresent := len(volumeLabels) > 0
+	qosPresent := len(readOps)+len(writeOps)+len(readLat)+len(writeLat)+len(readData)+len(writeData) > 0
 
 	type joinHit struct {
 		oc, aggr string
 		io       *graph.IOMetrics
 	}
 	hits := map[string]joinHit{} // pvcID → pick
-	misses := 0
+	topoMisses, qosMisses := 0, 0
 
 	for _, c := range claims {
-		cands := index[c.volumeName]
-		if svm := pickSVM(cands); svm != "" {
+		cands := volIndex[c.volumeName]
+		svm := pickSVM(cands)
+		if svm != "" {
 			out.svmByPVC[c.id] = svm
 		}
 		oc, aggr := pickAggr(cands)
 		if oc == "" || aggr == "" {
-			if harvestPresent {
-				misses++
+			if topoPresent {
+				topoMisses++
 			}
 			continue
 		}
-		hits[c.id] = joinHit{
-			oc: oc, aggr: aggr,
-			io: sumIO(cands, oc, aggr),
+		io := sumQoSIO(qosIndex[c.volumeName], oc, svm)
+		if io == nil {
+			if qosPresent {
+				qosMisses++
+			}
+		} else {
+			// Structural, not defensive: the ceiling is attached ONLY inside
+			// this branch, so a ceiling field can never appear on an edge that
+			// carries no measurement (design.md D3 hop C).
+			applyCeiling(io, policyIndex, pickPolicy(qosIndex[c.volumeName], oc, svm))
 		}
+		hits[c.id] = joinHit{oc: oc, aggr: aggr, io: io}
 	}
 
-	if harvestPresent && misses > 0 {
-		slog.Warn("netapp_volume_join_miss", "count", misses)
+	if topoPresent && topoMisses > 0 {
+		slog.Warn("netapp_volume_join_miss", "count", topoMisses)
+	}
+	if qosPresent && qosMisses > 0 {
+		slog.Warn("netapp_qos_join_miss", "count", qosMisses)
 	}
 
-	// Owner vote is across ALL volume series of the aggregate (takeover in
-	// window), not just the joining PVC's series. Status series never votes.
-	allByAggr := map[aggrKey][]volumeCandidate{}
-	for _, cands := range index {
+	// Owner vote is across ALL volume_labels series of the aggregate (takeover
+	// in window), not just the joining PVC's series. Status series never votes.
+	allByAggr := map[aggrKey][]volumeLabelCandidate{}
+	for _, cands := range volIndex {
 		for _, c := range cands {
 			if c.aggr == "" || c.ontapCluster == "" {
 				continue
@@ -191,25 +254,92 @@ func resolveNetAppStorage(
 	return out
 }
 
-func indexFamily(dst map[string][]volumeCandidate, vec model.Vector, fam ioFamily) {
+func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily) {
 	for _, s := range vec {
 		vn := string(s.Metric["volume_name"])
 		oc := string(s.Metric["cluster"])
 		if vn == "" || oc == "" {
 			continue
 		}
-		dst[vn] = append(dst[vn], volumeCandidate{
+		dst[vn] = append(dst[vn], qosCandidate{
 			ontapCluster: oc,
-			node:         string(s.Metric["node"]),
-			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
+			policyGroup:  string(s.Metric["policy_group"]),
 			family:       fam,
 			value:        float64(s.Value),
 		})
 	}
 }
 
-func pickAggr(cands []volumeCandidate) (oc, aggr string) {
+// indexPolicyCeilings keys the hop-C vectors by (ontap cluster, svm, policy).
+// The policy's identity label is read as `name` with a `policy_group` fallback:
+// Harvest names it differently across templates, and the spec pins the join
+// key's SHAPE, not the label's spelling. Smallest numeric value wins on a
+// duplicate, mirroring the usage rule.
+func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOMetrics {
+	smallest := func(vec model.Vector) map[policyKey]float64 {
+		out := map[policyKey]float64{}
+		seen := map[policyKey]bool{}
+		for _, s := range vec {
+			oc, svm := string(s.Metric["cluster"]), string(s.Metric["svm"])
+			policy := string(s.Metric["name"])
+			if policy == "" {
+				policy = string(s.Metric["policy_group"])
+			}
+			if oc == "" || policy == "" {
+				continue
+			}
+			k := policyKey{oc, svm, policy}
+			v := float64(s.Value)
+			if !seen[k] || v < out[k] {
+				out[k] = v
+				seen[k] = true
+			}
+		}
+		return out
+	}
+	iops := smallest(maxIOPS)
+	mbps := smallest(maxMBps)
+	keys := map[policyKey]struct{}{}
+	for k := range iops {
+		keys[k] = struct{}{}
+	}
+	for k := range mbps {
+		keys[k] = struct{}{}
+	}
+	out := make(map[policyKey]*graph.IOMetrics, len(keys))
+	for k := range keys {
+		c := &graph.IOMetrics{}
+		if v, ok := iops[k]; ok {
+			vv := v
+			c.MaxIOPS = &vv
+		}
+		if v, ok := mbps[k]; ok {
+			vv := v * bytesPerMB
+			c.MaxBytesPerSec = &vv
+		}
+		out[k] = c
+	}
+	return out
+}
+
+// applyCeiling copies the resolved ceiling onto io. A zero policyKey (the
+// volume is in no QoS policy group) or a policy with no fixed-policy series
+// leaves both fields absent — absence means "no declared ceiling" and is never
+// rendered as a number.
+func applyCeiling(io *graph.IOMetrics, index map[policyKey]*graph.IOMetrics, k policyKey) {
+	if k.policy == "" {
+		return
+	}
+	c, ok := index[k]
+	if !ok {
+		return
+	}
+	io.MaxIOPS = c.MaxIOPS
+	io.MaxBytesPerSec = c.MaxBytesPerSec
+}
+
+func pickAggr(cands []volumeLabelCandidate) (oc, aggr string) {
 	for _, c := range cands {
 		if c.aggr == "" || c.ontapCluster == "" {
 			continue
@@ -221,7 +351,7 @@ func pickAggr(cands []volumeCandidate) (oc, aggr string) {
 	return oc, aggr
 }
 
-func pickOwner(cands []volumeCandidate, oc, aggr string) string {
+func pickOwner(cands []volumeLabelCandidate, oc, aggr string) string {
 	var node string
 	for _, c := range cands {
 		if c.ontapCluster != oc || c.aggr != aggr || c.node == "" {
@@ -234,7 +364,7 @@ func pickOwner(cands []volumeCandidate, oc, aggr string) string {
 	return node
 }
 
-func pickSVM(cands []volumeCandidate) string {
+func pickSVM(cands []volumeLabelCandidate) string {
 	var svm string
 	for _, c := range cands {
 		if c.svm == "" {
@@ -247,15 +377,44 @@ func pickSVM(cands []volumeCandidate) string {
 	return svm
 }
 
-// sumIO sums each I/O family over the candidates that belong to the aggregate
-// the edge actually points at. Candidates on another (cluster, aggr) — a volume
-// that moved inside the window, or a volume_name colliding across two ONTAP
-// clusters — MUST NOT contribute: their throughput belongs to a different
-// aggregate and would otherwise be double-counted onto this edge.
-func sumIO(cands []volumeCandidate, oc, aggr string) *graph.IOMetrics {
+// qosInScope keeps a QoS candidate that belongs to the volume the edge was
+// drawn for. The ONTAP cluster must match the aggregate's — a volume_name
+// colliding across two filers sharing one VictoriaMetrics would otherwise be
+// double-counted onto this edge. The svm must match too when BOTH sides
+// resolved one; a candidate with no svm label still measures the volume and is
+// kept (it simply cannot contribute a policy key).
+func qosInScope(c qosCandidate, oc, svm string) bool {
+	if c.ontapCluster != oc {
+		return false
+	}
+	return svm == "" || c.svm == "" || c.svm == svm
+}
+
+// pickPolicy resolves the hop-C join key: the lexically-smallest non-empty
+// (ontap cluster, svm, policy_group) triple across the in-scope QoS
+// candidates, so a volume observed under two policy groups inside the window
+// collapses deterministically.
+func pickPolicy(cands []qosCandidate, oc, svm string) policyKey {
+	var best policyKey
+	for _, c := range cands {
+		if !qosInScope(c, oc, svm) || c.policyGroup == "" || c.svm == "" {
+			continue
+		}
+		k := policyKey{c.ontapCluster, c.svm, c.policyGroup}
+		if best.policy == "" || k.svm < best.svm || (k.svm == best.svm && k.policy < best.policy) {
+			best = k
+		}
+	}
+	return best
+}
+
+// sumQoSIO sums each I/O family over the in-scope QoS candidates for one
+// claim. nil means no family matched at all — the edge is still emitted, it
+// simply carries no metrics, and the claim counts toward netapp_qos_join_miss.
+func sumQoSIO(cands []qosCandidate, oc, svm string) *graph.IOMetrics {
 	var readOps, writeOps, readLat, writeLat, readData, writeData []float64
 	for _, c := range cands {
-		if c.ontapCluster != oc || c.aggr != aggr {
+		if !qosInScope(c, oc, svm) {
 			continue
 		}
 		switch c.family {

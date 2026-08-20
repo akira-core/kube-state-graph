@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -140,12 +141,15 @@ func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 		q    Query
 		want string
 	}{
-		{QVolumeReadOps, "last_over_time(volume_read_ops[1m])"},
-		{QVolumeWriteOps, "last_over_time(volume_write_ops[1m])"},
-		{QVolumeReadLatency, "last_over_time(volume_read_latency[1m])"},
-		{QVolumeWriteLatency, "last_over_time(volume_write_latency[1m])"},
-		{QVolumeReadData, "last_over_time(volume_read_data[1m])"},
-		{QVolumeWriteData, "last_over_time(volume_write_data[1m])"},
+		{QVolumeLabels, "last_over_time(volume_labels[1m])"},
+		{QQoSReadOps, `last_over_time(qos_read_ops{lun=""}[1m])`},
+		{QQoSWriteOps, `last_over_time(qos_write_ops{lun=""}[1m])`},
+		{QQoSReadLatency, `last_over_time(qos_read_latency{lun=""}[1m])`},
+		{QQoSWriteLatency, `last_over_time(qos_write_latency{lun=""}[1m])`},
+		{QQoSReadData, `last_over_time(qos_read_data{lun=""}[1m])`},
+		{QQoSWriteData, `last_over_time(qos_write_data{lun=""}[1m])`},
+		{QQoSPolicyFixedMaxIOPS, "last_over_time(qos_policy_fixed_max_throughput_iops[1m])"},
+		{QQoSPolicyFixedMaxMBps, "last_over_time(qos_policy_fixed_max_throughput_mbps[1m])"},
 		{QAggrStatus, "last_over_time(aggr_new_status[1m])"},
 		{QAggrSpaceUsed, "last_over_time(aggr_space_used[1m])"},
 		{QAggrSpaceTotal, "last_over_time(aggr_space_total[1m])"},
@@ -186,5 +190,30 @@ func TestFormatDuration(t *testing.T) {
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, FormatDuration(in), "FormatDuration(%s)", in)
+	}
+}
+
+// The `lun=""` matcher is a load-bearing metric-selection contract: without it
+// a LUN workload, which carries the volume_name of its containing FlexVol once
+// the deployment relabel rule has run, would be summed on top of the volume
+// workload for the same claim (design.md D2). Pin it on every QoS I/O leg, and
+// pin its ABSENCE on the policy legs, which have no LUN dimension.
+func TestRender_QoSVolumeGranularity(t *testing.T) {
+	t.Parallel()
+
+	for _, q := range []Query{QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData} {
+		got := Render(q, time.Minute)
+		if !strings.Contains(got, `{lun=""}`) {
+			t.Errorf("Render(%s) = %q, want the lun=\"\" volume-granularity matcher", q, got)
+		}
+		if strings.Contains(got, "rate(") {
+			t.Errorf("Render(%s) = %q, must not wrap a Harvest series in rate()", q, got)
+		}
+	}
+
+	for _, q := range []Query{QVolumeLabels, QQoSPolicyFixedMaxIOPS, QQoSPolicyFixedMaxMBps} {
+		if got := Render(q, time.Minute); strings.Contains(got, "lun=") {
+			t.Errorf("Render(%s) = %q, want no lun matcher", q, got)
+		}
 	}
 }

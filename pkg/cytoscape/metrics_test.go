@@ -117,10 +117,12 @@ func TestSerialise_IOMetricsOnly(t *testing.T) {
 	pvc := &graph.PVCNode{IDValue: "c/ns/claim", NameValue: "claim", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}}
 	aggr := &graph.NetAppAggrNode{IDValue: "netapp/oc/aggr/a1", NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}}
 	readOps, writeOps, readBps, writeBps := 150.0, 40.0, 5242880.0, 1000000.0
+	maxIOPS, maxBps := 5000.0, 262144000.0
 	e := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.ID(), aggr.ID(), nil).
 		WithIO(graph.IOMetrics{
 			ReadOps: &readOps, WriteOps: &writeOps,
 			ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+			MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps,
 		})
 	body := metricsView(t, []graph.GraphNode{pvc, aggr}, []*graph.Edge{e})
 	var found *EdgeMetricsDTO
@@ -135,6 +137,10 @@ func TestSerialise_IOMetricsOnly(t *testing.T) {
 	assert.InDelta(t, 5242880.0, *found.ReadBytesPerSec, 1e-12)
 	require.NotNil(t, found.WriteBytesPerSec)
 	assert.InDelta(t, 1000000.0, *found.WriteBytesPerSec, 1e-12)
+	require.NotNil(t, found.MaxIOPS)
+	assert.InDelta(t, 5000.0, *found.MaxIOPS, 1e-12)
+	require.NotNil(t, found.MaxBytesPerSec)
+	assert.InDelta(t, 262144000.0, *found.MaxBytesPerSec, 1e-12)
 	assert.Nil(t, found.Rate)
 	assert.Nil(t, found.ErrorRate)
 	raw, err := json.Marshal(found)
@@ -142,7 +148,17 @@ func TestSerialise_IOMetricsOnly(t *testing.T) {
 	assert.Contains(t, string(raw), `"read_ops"`)
 	assert.Contains(t, string(raw), `"read_bytes_per_sec"`)
 	assert.Contains(t, string(raw), `"write_bytes_per_sec"`)
+	assert.Contains(t, string(raw), `"max_iops"`)
+	assert.Contains(t, string(raw), `"max_bytes_per_sec"`)
 	assert.NotContains(t, string(raw), `"rate"`)
+}
+
+// A ceiling never makes a metrics object exist on its own. The builder cannot
+// produce this shape (the policy key rides on a matched workload series), and
+// the serialiser must not invent one if it ever could.
+func TestMetricsDTO_CeilingAloneOmitsMetrics(t *testing.T) {
+	maxIOPS := 5000.0
+	assert.Nil(t, metricsDTO(nil, &graph.IOMetrics{MaxIOPS: &maxIOPS}))
 }
 
 func TestSerialise_NeitherFamilyOmitsMetrics(t *testing.T) {
@@ -155,12 +171,16 @@ func TestSerialise_NeitherFamilyOmitsMetrics(t *testing.T) {
 
 func TestMetricsDTO_REDPrecedence(t *testing.T) {
 	readOps, readBps := 1.0, 5242880.0
-	dto := metricsDTO(&graph.EdgeMetrics{Rate: 5}, &graph.IOMetrics{ReadOps: &readOps, ReadBytesPerSec: &readBps})
+	maxIOPS := 5000.0
+	dto := metricsDTO(&graph.EdgeMetrics{Rate: 5}, &graph.IOMetrics{
+		ReadOps: &readOps, ReadBytesPerSec: &readBps, MaxIOPS: &maxIOPS,
+	})
 	require.NotNil(t, dto)
 	require.NotNil(t, dto.Rate)
 	assert.InDelta(t, 5.0, *dto.Rate, 1e-12)
 	assert.Nil(t, dto.ReadOps, "RED wins the impossible both-set case")
 	assert.Nil(t, dto.ReadBytesPerSec, "RED wins the impossible both-set case")
+	assert.Nil(t, dto.MaxIOPS, "RED wins the impossible both-set case")
 }
 
 func TestRound6_SignificantDigits(t *testing.T) {

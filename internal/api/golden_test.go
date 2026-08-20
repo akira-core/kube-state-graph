@@ -189,9 +189,11 @@ func buildWithNetAppStorage() graph.View {
 		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
 		HealthValue: graph.HealthOnline,
 	}
+	maxIOPS, maxBps := 5000.0, 262144000.0
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
 		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
 		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+		MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps,
 	})
 	edges := []*graph.Edge{
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvc.IDValue, map[string]string{"claim_name": "data-mongo-0"}),

@@ -138,17 +138,22 @@ type topologyVectors struct {
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id).
 	ServiceAnnotations model.Vector
 	PVCAnnotations     model.Vector
-	// NetApp Harvest volume / aggregate / controller series.
-	VolumeReadOps      model.Vector
-	VolumeWriteOps     model.Vector
-	VolumeReadLatency  model.Vector
-	VolumeWriteLatency model.Vector
-	VolumeReadData     model.Vector
-	VolumeWriteData    model.Vector
-	AggrStatus         model.Vector
-	AggrSpaceUsed      model.Vector
-	AggrSpaceTotal     model.Vector
-	NetAppNodeStatus   model.Vector
+	// NetApp Harvest storage series, in join order (design.md D3):
+	// hop A the volume label series (topology), hop B the QoS workload
+	// families (I/O), hop C the QoS fixed-policy ceilings.
+	VolumeLabels     model.Vector
+	QoSReadOps       model.Vector
+	QoSWriteOps      model.Vector
+	QoSReadLatency   model.Vector
+	QoSWriteLatency  model.Vector
+	QoSReadData      model.Vector
+	QoSWriteData     model.Vector
+	QoSPolicyMaxIOPS model.Vector
+	QoSPolicyMaxMBps model.Vector
+	AggrStatus       model.Vector
+	AggrSpaceUsed    model.Vector
+	AggrSpaceTotal   model.Vector
+	NetAppNodeStatus model.Vector
 	// Kubelet PVC usage.
 	KubeletVolumeUsed     model.Vector
 	KubeletVolumeCapacity model.Vector
@@ -251,12 +256,15 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
 	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
-	g.Go(fetchOptional(promql.QVolumeReadOps, &v.VolumeReadOps))
-	g.Go(fetchOptional(promql.QVolumeWriteOps, &v.VolumeWriteOps))
-	g.Go(fetchOptional(promql.QVolumeReadLatency, &v.VolumeReadLatency))
-	g.Go(fetchOptional(promql.QVolumeWriteLatency, &v.VolumeWriteLatency))
-	g.Go(fetchOptional(promql.QVolumeReadData, &v.VolumeReadData))
-	g.Go(fetchOptional(promql.QVolumeWriteData, &v.VolumeWriteData))
+	g.Go(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels))
+	g.Go(fetchOptional(promql.QQoSReadOps, &v.QoSReadOps))
+	g.Go(fetchOptional(promql.QQoSWriteOps, &v.QoSWriteOps))
+	g.Go(fetchOptional(promql.QQoSReadLatency, &v.QoSReadLatency))
+	g.Go(fetchOptional(promql.QQoSWriteLatency, &v.QoSWriteLatency))
+	g.Go(fetchOptional(promql.QQoSReadData, &v.QoSReadData))
+	g.Go(fetchOptional(promql.QQoSWriteData, &v.QoSWriteData))
+	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxIOPS, &v.QoSPolicyMaxIOPS))
+	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxMBps, &v.QoSPolicyMaxMBps))
 	g.Go(fetchOptional(promql.QAggrStatus, &v.AggrStatus))
 	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
 	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
@@ -284,12 +292,15 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 		string(promql.QNodeStatusCondition):        len(v.NodeStatus),
 		string(promql.QServiceAnnotations):         len(v.ServiceAnnotations),
 		string(promql.QPVCAnnotations):             len(v.PVCAnnotations),
-		string(promql.QVolumeReadOps):              len(v.VolumeReadOps),
-		string(promql.QVolumeWriteOps):             len(v.VolumeWriteOps),
-		string(promql.QVolumeReadLatency):          len(v.VolumeReadLatency),
-		string(promql.QVolumeWriteLatency):         len(v.VolumeWriteLatency),
-		string(promql.QVolumeReadData):             len(v.VolumeReadData),
-		string(promql.QVolumeWriteData):            len(v.VolumeWriteData),
+		string(promql.QVolumeLabels):               len(v.VolumeLabels),
+		string(promql.QQoSReadOps):                 len(v.QoSReadOps),
+		string(promql.QQoSWriteOps):                len(v.QoSWriteOps),
+		string(promql.QQoSReadLatency):             len(v.QoSReadLatency),
+		string(promql.QQoSWriteLatency):            len(v.QoSWriteLatency),
+		string(promql.QQoSReadData):                len(v.QoSReadData),
+		string(promql.QQoSWriteData):               len(v.QoSWriteData),
+		string(promql.QQoSPolicyFixedMaxIOPS):      len(v.QoSPolicyMaxIOPS),
+		string(promql.QQoSPolicyFixedMaxMBps):      len(v.QoSPolicyMaxMBps),
 		string(promql.QAggrStatus):                 len(v.AggrStatus),
 		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
 		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
@@ -681,8 +692,10 @@ func parseTopology(v topologyVectors) Topology {
 		}
 	}
 	netapp := resolveNetAppStorage(claims,
-		v.VolumeReadOps, v.VolumeWriteOps, v.VolumeReadLatency, v.VolumeWriteLatency,
-		v.VolumeReadData, v.VolumeWriteData,
+		v.VolumeLabels,
+		v.QoSReadOps, v.QoSWriteOps, v.QoSReadLatency, v.QoSWriteLatency,
+		v.QoSReadData, v.QoSWriteData,
+		v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps,
 		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal, v.NetAppNodeStatus)
 	for _, pv := range pvcs {
 		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {

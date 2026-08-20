@@ -103,13 +103,15 @@ per source cluster).
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `volume_read_ops` / `volume_write_ops` / `volume_read_latency` / `volume_write_latency` / `volume_read_data` / `volume_write_data` | PVC→aggregate join (`volume_name` = PV name) + I/O on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`). Read **verbatim** — Harvest already resolves ONTAP counters (ops/s, average µs, bytes/s); never wrapped in `rate()` | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume_name` | Optional (absent ⇒ no NetApp nodes / edges / `svm`) |
+| `volume_labels` | **Hop A — the whole storage topology.** PVC→aggregate join (`volume_name` = PV name), the `netapp-aggr` / `netapp-node` entities, and the PVC `svm` label. An info series: its value is ignored, only its labels are read | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume_name` | Optional (absent ⇒ no NetApp nodes / edges / `svm`) |
+| `qos_read_ops` / `qos_write_ops` / `qos_read_latency` / `qos_write_latency` / `qos_read_data` / `qos_write_data` | **Hop B — I/O** on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`). Read **verbatim** — Harvest already resolves ONTAP counters (ops/s, average µs, bytes/s); never wrapped in `rate()`. Queried at `{lun=""}` so a LUN workload, which carries its FlexVol's `volume_name`, is never summed on top | `cluster`, `svm`, `policy_group`, `lun`, `volume_name` | Optional (absent ⇒ edge with no `metrics`) |
+| `qos_policy_fixed_max_throughput_iops` / `qos_policy_fixed_max_throughput_mbps` | **Hop C — the declared ceiling** `max_iops` / `max_bytes_per_sec` on the same edge, joined on `(cluster, svm, policy_group)`. The `mbps` figure is the one converted value (× 1048576 → bytes/s) so it shares the unit of `read_bytes_per_sec` | `cluster`, `svm`, `name` (or `policy_group`) | Optional (absent ⇒ no ceiling fields; never `0`) |
 | `aggr_new_status` | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | `cluster`, `node`, `aggr` | Optional |
 | `aggr_space_used` / `aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `node`, `aggr` | Optional |
 | `node_new_status` | Controller `data.health` (same mapping as aggregate) | `cluster`, `node` | Optional |
 | `kubelet_volume_stats_used_bytes` / `kubelet_volume_stats_capacity_bytes` | PVC `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `namespace`, `persistentvolumeclaim` | Optional |
 
-`volume_name` is **not** a stock Harvest label — it is produced by the deployment's own relabel rule. See `docs/netapp-harvest-preconditions.md`.
+`volume_name` is **not** a stock Harvest label — it is produced by the deployment's own relabel rule, which must stamp **both** the volume-object and the QoS workload series. See `docs/netapp-harvest-preconditions.md`.
 
 Each is wrapped in `last_over_time(<metric>[<window>]) @ <end>` so the result
 reflects the most recent value within the requested `[start, end]` window — except

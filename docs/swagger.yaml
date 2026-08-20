@@ -38,14 +38,25 @@ components:
       description: 'Union of two disjoint measurement families. RED family (trace-derived
         call edges): rate (required within the family, > 0), error_rate, p90_server_ms.
         I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us,
-        write_latency_us, read_bytes_per_sec, write_bytes_per_sec. A single edge carries
-        fields from exactly one family. All values are JSON numbers rounded to 6 significant
-        digits and may appear in exponent form (e.g. 3.86e-7).'
+        write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume''s
+        declared QoS ceiling max_iops and max_bytes_per_sec (absent means no declared
+        ceiling, never 0; neither appears without at least one measurement). A single
+        edge carries fields from exactly one family. All values are JSON numbers rounded
+        to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).'
       properties:
         error_rate:
           description: ErrorRate is the failed fraction in [0,1]. Omitted when the
             failure counter was unreadable; 0 means read successfully with no failures.
           example: 0.1
+          type: number
+        max_bytes_per_sec:
+          description: MaxBytesPerSec is the volume's declared QoS throughput ceiling,
+            converted from the policy's MB/s figure so it shares the unit of read_bytes_per_sec
+            / write_bytes_per_sec.
+          type: number
+        max_iops:
+          description: MaxIOPS is the volume's declared QoS ceiling in requests per
+            second. Absent means no declared ceiling — never 0.
           type: number
         p90_server_ms:
           description: P90ServerMs is the 90th percentile server-observed request

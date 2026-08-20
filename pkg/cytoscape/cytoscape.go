@@ -81,7 +81,7 @@ type Edge struct {
 // when no usable classic histogram was available. All three values are JSON
 // numbers (never strings) and MAY appear in exponent form for small values.
 //
-//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume's declared QoS ceiling max_iops and max_bytes_per_sec (absent means no declared ceiling, never 0; neither appears without at least one measurement). A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
 type EdgeMetricsDTO struct {
 	// Rate is requests per second over the window (always > 0 when the RED family is present). Schema-optional because the object is a union.
 	Rate *float64 `json:"rate,omitempty" example:"5"`
@@ -95,6 +95,10 @@ type EdgeMetricsDTO struct {
 	WriteLatencyUs   *float64 `json:"write_latency_us,omitempty"`
 	ReadBytesPerSec  *float64 `json:"read_bytes_per_sec,omitempty"`
 	WriteBytesPerSec *float64 `json:"write_bytes_per_sec,omitempty"`
+	// MaxIOPS is the volume's declared QoS ceiling in requests per second. Absent means no declared ceiling — never 0.
+	MaxIOPS *float64 `json:"max_iops,omitempty"`
+	// MaxBytesPerSec is the volume's declared QoS throughput ceiling, converted from the policy's MB/s figure so it shares the unit of read_bytes_per_sec / write_bytes_per_sec.
+	MaxBytesPerSec *float64 `json:"max_bytes_per_sec,omitempty"`
 }
 
 // EdgeData is the serialised form of a graph edge.
@@ -167,6 +171,17 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 		v := round6(*io.WriteBytesPerSec)
 		dto.WriteBytesPerSec = &v
 		filled = true
+	}
+	// The ceilings deliberately do NOT set `filled`: the builder can only
+	// attach them alongside a measurement (design.md D3 hop C), so they can
+	// never be the sole reason a metrics object exists.
+	if io.MaxIOPS != nil {
+		v := round6(*io.MaxIOPS)
+		dto.MaxIOPS = &v
+	}
+	if io.MaxBytesPerSec != nil {
+		v := round6(*io.MaxBytesPerSec)
+		dto.MaxBytesPerSec = &v
 	}
 	if !filled {
 		return nil

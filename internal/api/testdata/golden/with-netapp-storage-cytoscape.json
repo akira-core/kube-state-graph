@@ -136,7 +136,9 @@
             "read_latency_us": 830,
             "write_latency_us": 1200,
             "read_bytes_per_sec": 5242880,
-            "write_bytes_per_sec": 1000000
+            "write_bytes_per_sec": 1000000,
+            "max_iops": 5000,
+            "max_bytes_per_sec": 262144000
           }
         }
       }
