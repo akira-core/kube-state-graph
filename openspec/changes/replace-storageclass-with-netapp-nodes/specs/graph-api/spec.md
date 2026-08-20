@@ -83,7 +83,7 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 #### Scenario: Edge labels never carry numbers
 
 - **WHEN** the response contains an edge that carries a `data.metrics` object
-- **THEN** its `data.labels` still contains only string values and no `rate`, `error_rate`, `p90_server_ms`, `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, or `write_bytes_per_sec` key
+- **THEN** its `data.labels` still contains only string values and no `rate`, `error_rate`, `p90_server_ms`, `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`, `max_iops`, or `max_bytes_per_sec` key
 
 ### Requirement: Edge `metrics` attribute
 
@@ -93,10 +93,11 @@ An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding th
   - `rate` (number, REQUIRED **within this family**, strictly greater than zero) — requests per second over the window.
   - `error_rate` (number, OPTIONAL, absence semantics) — the failed fraction in `[0, 1]`. Absent when the upstream failure counter could not be read; `0` when it was read and reported no failures.
   - `p90_server_ms` (number, OPTIONAL, absent when unavailable) — the 90th percentile server-observed request duration in milliseconds. The quantile and observation side match Grafana's documented service-graph queries by definition; the values are not expected to equal Grafana's numerically, because Grafana aggregates by service name while this API aggregates by pod pair.
-- **I/O family** — on `pvc-to-netapp-aggr` edges only, presence rule defined by the `netapp-storage-graph` capability (each field present iff its own Harvest family matched):
+- **I/O family** — on `pvc-to-netapp-aggr` edges only, presence rule defined by the `netapp-storage-graph` capability (each field present iff its own Harvest family matched; the six measurements come from the Harvest QoS workload families, the two ceilings from the QoS fixed-policy families):
   - `read_ops`, `write_ops` (numbers, OPTIONAL) — read/write requests per second, verbatim from Harvest.
   - `read_latency_us`, `write_latency_us` (numbers, OPTIONAL) — average read/write latency in microseconds, verbatim from Harvest.
   - `read_bytes_per_sec`, `write_bytes_per_sec` (numbers, OPTIONAL) — read/write throughput in bytes per second, verbatim from Harvest.
+  - `max_iops`, `max_bytes_per_sec` (numbers, OPTIONAL) — the volume's declared QoS throughput ceiling: `max_iops` verbatim from Harvest, `max_bytes_per_sec` converted from the policy's megabytes-per-second figure so that it carries the same unit as the measured throughput fields and the two compare directly. Absence means *no declared ceiling* — it SHALL NEVER be rendered as `0` or as an "unlimited" sentinel — and neither ceiling field can appear unless at least one measurement field does.
 
 At the schema level every field of the union is therefore optional — a consequence the OpenAPI schema reflects by moving `rate` from required to optional. The RED invariant is preserved intact: a RED-family `metrics` object always carries a positive `rate`.
 
@@ -114,8 +115,8 @@ All values SHALL be JSON numbers, never strings. Each value SHALL be rounded to 
 
 #### Scenario: Storage edge carries I/O metrics only
 
-- **WHEN** the response contains a `pvc-to-netapp-aggr` edge whose joined Harvest families all matched
-- **THEN** its `data.metrics` is an object with numeric `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, and `write_bytes_per_sec` fields, and none of `rate`, `error_rate`, or `p90_server_ms`
+- **WHEN** the response contains a `pvc-to-netapp-aggr` edge whose joined Harvest families all matched and whose volume is governed by a fixed QoS policy
+- **THEN** its `data.metrics` is an object with numeric `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`, `max_iops`, and `max_bytes_per_sec` fields, and none of `rate`, `error_rate`, or `p90_server_ms`
 
 #### Scenario: Edge without measurements omits the key
 
@@ -446,7 +447,7 @@ This retention is a node-admission rule of the projection over the freshly built
 A `type="pvc"` node's `data.labels` SHALL additively carry two further string entries whenever they resolve:
 
 - `volumename` — the name of the PersistentVolume bound to the claim (from the `volumename` label of `kube_persistentvolumeclaim_info`, per the `cluster-topology-source` capability).
-- `svm` — the NetApp ONTAP SVM serving the claim (from the `svm` label of the Harvest volume series matched by the `netapp-storage-graph` capability's PV-name join — the removed Trident custom-resource chain is no longer the source, with the label's shape unchanged).
+- `svm` — the NetApp ONTAP SVM serving the claim (from the `svm` label of the Harvest `volume_labels` series matched by the `netapp-storage-graph` capability's PV-name join — the removed Trident custom-resource chain is no longer the source, with the label's shape unchanged).
 
 Both are plain `labels` entries (strict `map[string]string`) — there SHALL be NO `data.volumename` or `data.svm` typed field on the PVC node. Each key SHALL be **absent** when its value is unresolved; an empty-string value SHALL never be emitted. `svm` SHALL never be present without `volumename`. The `volumename` key is distinct from the existing `volume` key (the pod-spec volume name); both MAY appear on the same node.
 

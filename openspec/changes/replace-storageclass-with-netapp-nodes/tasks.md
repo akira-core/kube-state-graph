@@ -70,3 +70,27 @@
 - [x] 10.7 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries both fields, and extend the `internal/integration` Harvest fixture with both series.
 - [x] 10.8 `CLAUDE.md`: Harvest leg count 8 → 10, topology fan-out 25 → 27, and the NetApp bullet's I/O field list.
 - [ ] 10.9 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.
+
+## 11. QoS I/O source + fixed-policy throughput ceilings
+
+> Delta on top of the shipped sections 1-10, which landed with the six
+> `volume_*` I/O families joined off the same series as the storage topology.
+> Those task lines record that shape; the contract they now serve is the
+> three-hop join (`volume_labels` → QoS workload → QoS fixed policy) of
+> `design.md` D1-D3, D5, D8.
+
+- [ ] 11.1 Verify against the production VictoriaMetrics (`/api/v1/label/__name__/values` + a sample `/api/v1/series` per name); on any drift, mechanically rename in `specs/` + `design.md` before 11.2:
+  - `volume_labels` exists and carries `cluster`/`node`/`aggr`/`svm`/`volume_name` (fallback if the Harvest template exports no instance labels: an always-present per-volume gauge with the same label set, e.g. `volume_size_used`);
+  - the six `qos_*` families exist, carry `volume_name` from the relabel rule, and carry `policy_group` + `lun`; sample the real distribution of `lun` to confirm volume-level workloads report it empty (or absent) while LUN workloads report it non-empty;
+  - `qos_policy_fixed_max_throughput_iops` / `_mbps` exist, and record which label names the policy group (`name` vs `policy_group`) — that label is hop C's join key;
+  - record ONTAP's byte basis for `mbps` (10^6 vs 2^20) next to the conversion constant introduced in 11.5.
+- [x] 11.2 `pkg/promql`: remove `QVolumeReadOps` / `QVolumeWriteOps` / `QVolumeReadLatency` / `QVolumeWriteLatency` / `QVolumeReadData` / `QVolumeWriteData` and their render cases; add `QVolumeLabels`, six QoS constants rendering `last_over_time(qos_<family>{lun=""}[<w>])`, and `QQoSPolicyFixedMaxIOPS` / `QQoSPolicyFixedMaxMBps` rendering bare; unit-test every rendered string, pinning the exact `{lun=""}` fragment on all six QoS legs and its absence on the two policy legs.
+- [x] 11.3 `pkg/graph`: extend `IOMetrics` with `MaxIOPS` / `MaxBytesPerSec *float64`; extend the `WithIO` copy test.
+- [x] 11.4 `pkg/build` fan-out: swap the six volume I/O legs for `volume_labels` + six QoS + two policy legs with the same log-and-continue semantics (30 legs total); pin the leg count and that a failing QoS leg neither fails the build nor drops an edge.
+- [x] 11.5 `pkg/build/netapp.go`: restructure `resolveNetAppStorage` into design D3's three hops — hop A (`volume_labels`) owns the aggregate/owner/`svm` picks and edge emission; hop B (QoS) owns the six per-family ascending sums and the `(ontap_cluster, svm, policy_group)` pick; hop C owns the ceiling lookup with the smallest-value duplicate rule and the `mbps × 1048576` conversion in one named constant. Make "no ceiling without a measurement" structural, not a runtime check.
+- [x] 11.6 Coverage: keep `netapp_volume_join_miss` gated on `volume_labels` presence; add `netapp_qos_join_miss` counting edge-drawing claims with no QoS match, gated on QoS presence; unit-test each gate independently (volume-only deployment, QoS-only upstream, neither, both).
+- [x] 11.7 `pkg/cytoscape`: add `max_iops` / `max_bytes_per_sec` `omitempty` DTO fields with `round6`; extend the IO-only and RED-precedence DTO tests.
+- [x] 11.8 `pkg/build/netapp_test.go`: LUN-series exclusion, edge-without-metrics, per-family presence/absence, multi-series ascending sum, policy-triple pick on conflicting `policy_group`, per-field ceiling presence, the converted value, and `svm` staying unaffected by which QoS families matched.
+- [x] 11.9 Update swag annotations for the two new `EdgeMetricsDTO` fields, run `make docs`, regenerate goldens (`go test ./internal/api -update -run Golden`) so `with-netapp-storage-cytoscape.json` carries measurements plus ceilings, and re-fixture `internal/integration` with `volume_labels` + QoS + policy series — including a LUN-level series that must not be counted and a claim with topology but no QoS.
+- [x] 11.10 Docs: `docs/netapp-harvest-preconditions.md` — the relabel rule now covers both the volume and QoS workload series, the required Harvest templates, the `lun=""` volume-granularity contract, the fourth blind spot (no QoS workload ⇒ edge without measurements), and both coverage warnings. `CLAUDE.md` — Harvest leg count 10 → 13, topology fan-out 27 → 30, the NetApp bullet's I/O field list and metric sources.
+- [ ] 11.11 Full gate: `make build test vet lint vuln check-docs` clean, `openspec validate --strict`, `openspec verify "replace-storageclass-with-netapp-nodes"`.

@@ -8,13 +8,17 @@ operators actually ask about storage: *which filer serves this claim, is it
 healthy, how much of it are we using, and how fast is it?*
 
 The centralised VictoriaMetrics already carries NetApp Harvest series that answer
-all four, and the deployment already relabels each ONTAP volume with the
-Kubernetes **PV name** it backs (`volume_name`). That one label collapses the
-whole PVC → PV → FlexVol → aggregate → NetApp-node chain into a **single join**,
-and the very same series carries the serving NetApp node — so topology and I/O
-figures arrive together at no extra query cost. Replacing the StorageClass entity
-with the physical node it stands in for turns the storage half of the graph from
-a restatement of Kubernetes config into an actual view of the infrastructure.
+all four, and the deployment already relabels every ONTAP **volume-object and QoS
+workload** series with the Kubernetes **PV name** it backs (`volume_name`). That
+one label collapses the whole PVC → PV → FlexVol → aggregate → NetApp-node chain
+into a **single join key**, resolved off that key in three hops: the volume label
+series carries the containing aggregate, its owning controller, and the serving
+SVM; the QoS workload series carries the live I/O figures and the volume's QoS
+policy group; and that policy group names the fixed throughput ceiling the volume
+is capped at. Replacing the StorageClass entity with the physical node it stands
+in for turns the storage half of the graph from a restatement of Kubernetes
+config into an actual view of the infrastructure — one that shows not just how
+fast a claim is going, but how fast it is *allowed* to go.
 
 ## What Changes
 
@@ -34,19 +38,35 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
   with edges from every cluster that uses it.
 - **`pvc-to-netapp-aggr` edge type** — PVC to the ONTAP aggregate holding its
   FlexVol. Derived by joining `kube_persistentvolumeclaim_info`'s `volumename`
-  to the Harvest volume series' `volume_name`; the aggregate comes from the
-  `aggr` label and the owning controller from the `node` label on that **same
-  series**, so **no separate topology query is needed**.
+  to the `volume_name` label of the Harvest **`volume_labels`** series; the
+  aggregate comes from that series' `aggr` label, the owning controller from its
+  `node` label, and the serving SVM from its `svm` label — **one series carries
+  the entire storage topology**, so no separate topology query is needed. The
+  series' own value is never read; it is consumed purely for its labels.
 - **Six I/O measurements on that edge** — `read_ops`, `write_ops`,
   `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`,
-  `write_bytes_per_sec`, from `volume_read_ops` / `volume_write_ops` /
-  `volume_read_latency` / `volume_write_latency` / `volume_read_data` /
-  `volume_write_data`.
-  Harvest already resolves ONTAP's base counters, so these are read **verbatim**
-  (ops are already per-second, latency is already an average in microseconds, and
-  the data families are already bytes per second) and
-  are **never** wrapped in `rate()` — the opposite of the service-graph RED
-  counters, and a distinction the specs must state explicitly.
+  `write_bytes_per_sec`, from the Harvest **QoS workload** families
+  `qos_read_ops` / `qos_write_ops` / `qos_read_latency` / `qos_write_latency` /
+  `qos_read_data` / `qos_write_data`, read at **volume granularity only**
+  (`{lun=""}`): an ONTAP LUN workload carries the same relabelled `volume_name`
+  as the FlexVol containing it, so an unfiltered read would double-count the
+  claim's I/O. Harvest already resolves ONTAP's base counters, so these are read
+  **verbatim** (ops are already per-second, latency is already an average in
+  microseconds, and the data families are already bytes per second) and are
+  **never** wrapped in `rate()` — the opposite of the service-graph RED counters,
+  and a distinction the specs must state explicitly.
+- **The volume's throughput ceiling on that same edge** — `max_iops` and
+  `max_bytes_per_sec`, recovered in a second hop off the I/O series: the QoS
+  workload carries the volume's `policy_group`, and
+  `qos_policy_fixed_max_throughput_iops` / `qos_policy_fixed_max_throughput_mbps`
+  carry that policy's fixed limits. The ceiling is what makes the measurement
+  actionable — `1200` read ops only answers an operator's question next to the
+  `5000` its policy caps it at. The `mbps` value is the **one** figure converted
+  rather than read verbatim (× 1048576 → bytes per second), so the ceiling and
+  `read_bytes_per_sec` / `write_bytes_per_sec` share one unit and compare without
+  client-side arithmetic; the specs must state that exception explicitly. A
+  volume in no QoS policy group carries neither field — absence means *no
+  declared ceiling*, and is never rendered as a number.
 - **Per-aggregate health and usage** — `data.health` from `aggr_new_status`
   (`1` = the aggregate is online, `0` = any other state; a 1:1 per-aggregate
   read, no cross-aggregate derivation) and `data.usage`
@@ -69,13 +89,17 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
   "relationships are edges, groups are synthesised" rule that the specs must
   state explicitly. An HA takeover moves an aggregate's parent (its
   `labels.node` follows the current owner) while its id stays put.
-- **Join-coverage observability** — the PVC-to-volume join is only as complete as
-  the deployment's relabel rule. Claims that should have matched but did not —
-  including claims whose matched series carries an **empty `aggr` label** (the
-  FlexGroup shape, where a volume spans aggregates and no single aggregate edge
-  can be drawn) — must be counted and surfaced, following the
-  `failed_total_label_set_mismatch` precedent, so an incomplete graph is never
-  silently indistinguishable from a complete one.
+- **Join-coverage observability, in two independent dimensions** — the join is
+  only as complete as the deployment's relabel rule, and it now has two halves
+  that fail separately. (1) *Topology*: claims that should have matched a
+  `volume_labels` series but did not — including claims whose matched series
+  carries an **empty `aggr` label** (the FlexGroup shape, where a volume spans
+  aggregates and no single aggregate edge can be drawn) — draw no edge at all.
+  (2) *I/O*: claims that DID draw an aggregate edge but matched no QoS workload
+  series — a volume ONTAP collects no workload for — leave that edge with no
+  measurements. Each is counted and surfaced on its own, following the
+  `failed_total_label_set_mismatch` precedent, so neither an edgeless claim nor a
+  measurement-less edge is ever silently indistinguishable from a complete one.
 
 ### Removed — **BREAKING**
 
@@ -131,9 +155,10 @@ a restatement of Kubernetes config into an actual view of the infrastructure.
 
 ## Impact
 
-**Code.** `pkg/promql` (ten queries added — six volume I/O, `aggr_new_status`,
-`aggr_space_used`, `aggr_space_total`, `node_new_status` — three removed,
-`Renderer` reduced to a pure function); `pkg/build` (new NetApp reader and join,
+**Code.** `pkg/promql` (thirteen queries added — `volume_labels`, the six
+`qos_*` I/O families at `{lun=""}`, the two `qos_policy_fixed_max_throughput_*`
+ceilings, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`,
+`node_new_status` — three removed, `Renderer` reduced to a pure function); `pkg/build` (new NetApp reader and join,
 PVC usage resolver, storage-class and Trident resolvers deleted); `pkg/graph`
 (two new node types, new edge type, new I/O value, registry entries,
 `ClusterNames()` exclusion); `pkg/cytoscape` (merged metrics DTO, `usage`
@@ -155,15 +180,19 @@ treats upstream label names.
 `pkg/kubegraph` and sets `Options.MetricPrefix`; that field disappears, so the
 two repositories must land in a coordinated order. The Grafana graph panel
 already renders the I/O family in its edge tooltip; the two throughput fields
-are a purely **additive** wire extension (an older panel ignores unknown keys),
-so surfacing them there is a separate change in that repository, not a
-coordination constraint on this one.
+and the two ceiling fields are purely **additive** wire extensions (an older
+panel ignores unknown keys) and the I/O source swap is invisible to it (the field
+names do not change), so surfacing them there is a separate change in that
+repository, not a coordination constraint on this one.
 
-**Upstream dependencies.** Adds NetApp Harvest (volume, aggregate, and node
-objects) and kubelet volume stats. The `volume_name` label is **not** stock
-Harvest — it is produced by the deployment's own Prometheus relabel rule, and
-the specs must record it as a deployment precondition together with its known
-blind spots: volumes whose names do not match the rule, the "economy" Trident
-drivers, where many claims share one FlexVol and per-claim I/O figures do not
-exist at all, and FlexGroup volumes, which span aggregates so their matched
-series carries no single usable `aggr` label (no aggregate edge can be drawn).
+**Upstream dependencies.** Adds NetApp Harvest (volume, QoS workload, QoS
+fixed-policy, aggregate, and node objects) and kubelet volume stats. The
+`volume_name` label is **not** stock Harvest — it is produced by the deployment's
+own Prometheus relabel rule, which must now stamp **both** the volume-object and
+the QoS workload series, and the specs must record it as a deployment
+precondition together with its known blind spots: volumes whose names do not
+match the rule; the "economy" Trident drivers, where many claims share one
+FlexVol and per-claim figures do not exist at all; FlexGroup volumes, which span
+aggregates so their matched series carries no single usable `aggr` label (no
+aggregate edge can be drawn); and volumes for which ONTAP collects no QoS
+workload, which draw their edge but carry no I/O and no ceiling.

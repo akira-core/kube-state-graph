@@ -14,7 +14,7 @@ The topology reader SHALL consume at minimum the following `kube-state-metrics` 
 - `kube_endpointslice_labels{cluster, namespace, endpointslice, label_kubernetes_io_service_name, ...}` (OPTIONAL — joins each slice back to its owning service)
 - `kube_pod_owner{cluster, namespace, pod, owner_kind, owner_name, owner_is_controller, argocd_tracking_id, ...}` (OPTIONAL — feeds the pod controller-owner labels and, via the `argocd_tracking_id` label, the pod ArgoCD Application attribute)
 - `kube_replicaset_owner{cluster, namespace, replicaset, owner_kind, owner_name, ...}` (OPTIONAL — resolves a ReplicaSet pod owner up to its owning Deployment)
-- `kube_persistentvolumeclaim_info{cluster, namespace, persistentvolumeclaim, storageclass, volumename, ...}` (OPTIONAL — feeds the PVC `storageclass` attribute and — via the `volumename` label — the PVC `volumename` label that roots the NetApp Harvest volume join defined by the `netapp-storage-graph` capability)
+- `kube_persistentvolumeclaim_info{cluster, namespace, persistentvolumeclaim, storageclass, volumename, ...}` (OPTIONAL — feeds the PVC `storageclass` attribute and — via the `volumename` label — the PVC `volumename` label that roots the NetApp Harvest join defined by the `netapp-storage-graph` capability)
 - `kube_pod_container_info{cluster, namespace, pod, uid, container, image, ...}` (OPTIONAL — feeds the per-pod container list attribute; one series per container)
 - `kube_node_status_condition{cluster, node, condition="Ready", status, ...}` (OPTIONAL — feeds the K8s node `ready_status` attribute; the `condition="Ready"` selector is a fixed, request-invariant metric-selection contract, and the `status` label carries `true`/`false`/`unknown` **matched case-insensitively** — stock kube-state-metrics lowercases the value, but an exporter re-publishing the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown` — with the active row's sample value being `1`)
 - `kube_persistentvolumeclaim_annotations{cluster, namespace, persistentvolumeclaim, annotation_argocd_argoproj_io_tracking_id, ...}` (OPTIONAL — feeds the PVC ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label is kube-state-metrics' sanitised form of the `argocd.argoproj.io/tracking-id` annotation and requires the operator's `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`)
@@ -60,7 +60,7 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 #### Scenario: Trident custom-resource metrics absent
 
 - **WHEN** the upstream contains (or lacks) `kube_tridentvolume_info` / `kube_tridentbackend_info` series for the window
-- **THEN** the reader never queries either metric (the Trident chain is removed from the topology fan-out) and the PVC `svm` label resolves solely via the `netapp-storage-graph` Harvest join
+- **THEN** the reader never queries either metric (the Trident chain is removed from the topology fan-out) and the PVC `svm` label resolves solely via the `netapp-storage-graph` capability's `volume_labels` join
 
 #### Scenario: Container info metric absent
 
@@ -131,7 +131,7 @@ The former `pvc-to-storageclass` edge is removed. The `pvc-to-netapp-aggr` edge 
 The topology reader SHALL resolve each PVC's bound **PersistentVolume name** and surface it, together with the **ONTAP SVM** serving it when the NetApp Harvest join resolves, as additive entries in the PVC entity's `labels` map (strict `map[string]string`):
 
 - `volumename` — the bound PV name, read from the `volumename` label of `kube_persistentvolumeclaim_info`, joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity (the same join as PVC StorageClass resolution; the two label reads are per-field independent — a series may carry `volumename` without `storageclass` and vice versa). The key SHALL be set only when the resolved value is non-empty.
-- `svm` — the NetApp SVM, resolved by the `netapp-storage-graph` capability's Harvest volume join rooted at the resolved PV name (the Trident custom-resource chain is removed; the `svm` label rides on the same Harvest series that provides the serving aggregate and controller). The key SHALL be set only when the join resolves a non-empty `svm` value. By construction `svm` SHALL never be present without `volumename`.
+- `svm` — the NetApp SVM, resolved by the `netapp-storage-graph` capability's Harvest join rooted at the resolved PV name (the Trident custom-resource chain is removed; the `svm` label rides on the same `volume_labels` series that provides the serving aggregate and controller, and never on the QoS families that carry the edge's I/O). The key SHALL be set only when the join resolves a non-empty `svm` value. By construction `svm` SHALL never be present without `volumename`.
 
 The `volumename` key is DISTINCT from the existing `volume` key (the pod-spec volume name from `kube_pod_spec_volumes_persistentvolumeclaims_info`); both MAY coexist on one PVC entity and neither replaces the other.
 
@@ -141,22 +141,22 @@ Resolution SHALL be deterministic: on duplicate series the reader SHALL pick the
 
 #### Scenario: Full chain resolves volumename and svm
 
-- **WHEN** the upstream provides a PVC entity `cluster-alpha/db/data-mongo-0` with `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", volumename="pvc-9f3a"}` and a Harvest volume series with `volume_name="pvc-9f3a", svm="svm-prod"`
+- **WHEN** the upstream provides a PVC entity `cluster-alpha/db/data-mongo-0` with `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", volumename="pvc-9f3a"}` and a Harvest `volume_labels` series with `volume_name="pvc-9f3a", svm="svm-prod"`
 - **THEN** the emitted PVC entity's `labels` contains `volumename="pvc-9f3a"` and `svm="svm-prod"`
 
 #### Scenario: PV without a TridentVolume row yields volumename only
 
-- **WHEN** a PVC resolves `volumename="pvc-9f3a"` but no Harvest volume series carries `volume_name="pvc-9f3a"` (the former Trident chain no longer exists; the Harvest join is the only `svm` source)
+- **WHEN** a PVC resolves `volumename="pvc-9f3a"` but no Harvest `volume_labels` series carries `volume_name="pvc-9f3a"` (the former Trident chain no longer exists; the Harvest join is the only `svm` source)
 - **THEN** the emitted PVC entity's `labels` contains `volumename="pvc-9f3a"` and no `svm` key, and the build does not fail
 
 #### Scenario: TridentVolume without a matching backend yields no svm
 
-- **WHEN** the Harvest volume series matched by a PVC's PV name carries an empty `svm` label (the former TridentVolume→backend hop no longer exists)
+- **WHEN** the Harvest `volume_labels` series matched by a PVC's PV name carries an empty `svm` label (the former TridentVolume→backend hop no longer exists)
 - **THEN** the emitted PVC entity carries `volumename` but no `svm` key — never an empty-string value — and the build does not fail
 
 #### Scenario: Trident metrics absent entirely
 
-- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` (with `volumename` labels) and no Harvest volume series for the window (the Trident custom-resource metrics are no longer read at all)
+- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` (with `volumename` labels) and no Harvest `volume_labels` series for the window (the Trident custom-resource metrics are no longer read at all)
 - **THEN** the reader produces a valid topology in which PVC entities carry `volumename` but no `svm` key, and the build does not fail
 
 #### Scenario: PVC info without volumename yields neither label
@@ -176,14 +176,14 @@ Resolution SHALL be deterministic: on duplicate series the reader SHALL pick the
 
 #### Scenario: Deterministic pick on duplicate series at every stage
 
-- **WHEN** the upstream reports two `kube_persistentvolumeclaim_info` series for `(cluster-alpha, db, data-mongo-0)` with `volumename="pvc-b"` and `volumename="pvc-a"`, and two Harvest volume series for `volume_name="pvc-a"` with `svm="svm-b"` and `svm="svm-a"`
+- **WHEN** the upstream reports two `kube_persistentvolumeclaim_info` series for `(cluster-alpha, db, data-mongo-0)` with `volumename="pvc-b"` and `volumename="pvc-a"`, and two Harvest `volume_labels` series for `volume_name="pvc-a"` with `svm="svm-b"` and `svm="svm-a"`
 - **THEN** the reader resolves `volumename="pvc-a"` and `svm="svm-a"` (the lexically-smallest non-empty value at each stage) deterministically across rebuilds, independent of upstream vector order
 
 ## ADDED Requirements
 
 ### Requirement: PVC usage from kubelet volume stats
 
-The topology reader SHALL resolve each PVC's storage usage from the kubelet volume-stats series `kubelet_volume_stats_used_bytes{cluster, namespace, persistentvolumeclaim, ...}` and `kubelet_volume_stats_capacity_bytes{cluster, namespace, persistentvolumeclaim, ...}`, joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity. This introduces **kubelet** as a further upstream metric family alongside kube-state-metrics and NetApp Harvest; the label contract above is fixed and case-sensitive. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
+The topology reader SHALL resolve each PVC's storage usage from the kubelet volume-stats series `kubelet_volume_stats_used_bytes{cluster, namespace, persistentvolumeclaim, ...}` and `kubelet_volume_stats_capacity_bytes{cluster, namespace, persistentvolumeclaim, ...}`, joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity. This introduces **kubelet** as a further upstream metric family alongside kube-state-metrics and NetApp Harvest (whose volume-label, QoS workload, QoS fixed-policy, aggregate, and node objects are read by the `netapp-storage-graph` capability); the label contract above is fixed and case-sensitive. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
 
 Both series are OPTIONAL and per-field independent: `used_bytes` resolves from the first, `capacity_bytes` from the second; the PVC's `usage` attribute (graph-api "PVC `storageclass` and `usage` attributes") SHALL be present iff at least one field resolved, with an unresolved field omitted from the object. When a metric is absent, or no series matches a given PVC, the affected field(s) are simply omitted — the reader SHALL still build a valid topology and SHALL NOT fail the build. On duplicate series for one `(cluster, namespace, claim)` the reader SHALL pick deterministically (the smallest numeric value) so the emitted attribute is byte-stable across rebuilds. The values SHALL never appear inside `labels`.
 
