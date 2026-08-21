@@ -280,3 +280,35 @@ func TestRender_EmptySelectorMatchesBaseline(t *testing.T) {
 	assert.Equal(t, want, got,
 		"unfiltered rendering drifted from the pre-change baseline (testdata/render-baseline.txt)")
 }
+
+// TestSelector_Reaches pins the "could THIS request have narrowed that series"
+// predicate the build layer attributes an empty metric family with. The
+// Harvest case is the load-bearing one: a cluster- or namespace-filtered
+// request never touches those series, so their emptiness is never the
+// request's doing.
+func TestSelector_Reaches(t *testing.T) {
+	tests := map[string]struct {
+		sel  Selector
+		q    Query
+		want bool
+	}{
+		"unfiltered reaches nothing":        {Selector{}, QPodInfo, false},
+		"empty values reach nothing":        {Selector{Cluster: []string{""}}, QPodInfo, false},
+		"cluster reaches pod info":          {Selector{Cluster: []string{"a"}}, QPodInfo, true},
+		"namespace reaches pod info":        {Selector{Namespace: []string{"ns"}}, QPodInfo, true},
+		"namespace misses node info":        {Selector{Namespace: []string{"ns"}}, QNodeInfo, false},
+		"cluster reaches node info":         {Selector{Cluster: []string{"a"}}, QNodeInfo, true},
+		"cluster misses Harvest":            {Selector{Cluster: []string{"a"}}, QVolumeLabels, false},
+		"namespace misses Harvest":          {Selector{Namespace: []string{"ns"}}, QVolumeLabels, false},
+		"az reaches Harvest":                {Selector{AZ: []string{"z"}}, QVolumeLabels, true},
+		"env reaches Harvest":               {Selector{Env: []string{"prod"}}, QVolumeLabels, true},
+		"az reaches kubelet":                {Selector{AZ: []string{"z"}}, QKubeletVolumeUsedBytes, true},
+		"nothing reaches the service graph": {Selector{AZ: []string{"z"}, Cluster: []string{"a"}}, QServiceGraphTotal, false},
+		"nothing reaches the up probe":      {Selector{Env: []string{"prod"}}, QUpProbe, false},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.sel.Reaches(tc.q))
+		})
+	}
+}

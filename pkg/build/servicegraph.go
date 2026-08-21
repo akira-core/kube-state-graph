@@ -320,6 +320,27 @@ func (r *sgResolver) noteExternal(reason string, t sgTrace, attrs ...any) {
 	slog.Debug("service-graph endpoint fell back to external", args...)
 }
 
+// noteConnStringShadowed records (for the aggregated summary) and logs one
+// "://" label that a populated pod UID short-circuited (D29 order). Shared by
+// resolveClient and resolveServer so the counter and the message cannot drift;
+// each side passes its own extra dimensions. Both call it only on a path that
+// really does resolve the endpoint to a pod — a filtered build's out-of-scope
+// UID resolves the "://" label instead, and must not be counted here.
+func (r *sgResolver) noteConnStringShadowed(t sgTrace, label, podUID string, attrs ...any) {
+	r.shadowed++
+	args := append([]any{
+		"reason", "conn_string_shadowed_by_uid",
+		"side", t.side,
+		"label", label,
+		"pod_uid", podUID,
+		"client", t.clientLabel,
+		"server", t.serverLabel,
+		"client_uid", t.clientUID,
+		"server_uid", t.serverUID,
+	}, attrs...)
+	slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)", args...)
+}
+
 // famSvcKey keys the D29 candidate index: the service identity a "://" host
 // classifies to, scoped by cluster family. Folding the family into the key
 // makes per-endpoint resolution a direct map hit and keeps the family rule
@@ -1021,30 +1042,30 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 	if podUID == "" {
 		return r.resolveEmptyUID(label, traceCluster, t), false
 	}
-	// A populated UID short-circuits connection-string resolution (D29 order):
-	// a "://" label on this side is therefore SKIPPED and the endpoint resolves
-	// to a pod, never the service it names. Surfaced as debug evidence because it
-	// is the usual reason a "://" peer resolves on one side (empty UID) but
-	// collapses to a pod on the other (populated UID).
-	if isConnString(label) {
-		r.shadowed++
-		slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)",
-			"reason", "conn_string_shadowed_by_uid", "side", t.side, "label", label,
-			"pod_uid", podUID, "trace_cluster", traceCluster,
-			"client", t.clientLabel, "server", t.serverLabel,
-			"client_uid", t.clientUID, "server_uid", t.serverUID)
-	}
-	if pod := r.lookupClientPod(traceCluster, podUID); pod != nil {
-		return []string{pod.ID()}, true
-	}
-	if r.filtered {
+	pod := r.lookupClientPod(traceCluster, podUID)
+	if pod == nil && r.filtered {
 		// FILTERED BUILD (design D5): the UID names a pod the request's
 		// selector did not load. Resolve the side exactly as if the UID were
 		// empty — the "://" ladder can still reach a LOADED service, a plain
 		// label becomes external/<label> via the D27 fallback, and an empty
 		// label makes the side wholly empty (the series is then dropped by
 		// the admission check). A filtered build NEVER synthesises a pod.
+		//
+		// Checked BEFORE the shadow evidence below: this path does NOT shadow
+		// the "://" label — it resolves it — so counting it as shadowed would
+		// report the opposite of what happened.
 		return r.resolveEmptyUID(label, traceCluster, t), false
+	}
+	// A populated UID short-circuits connection-string resolution (D29 order):
+	// a "://" label on this side is therefore SKIPPED and the endpoint resolves
+	// to a pod, never the service it names. Surfaced as debug evidence because it
+	// is the usual reason a "://" peer resolves on one side (empty UID) but
+	// collapses to a pod on the other (populated UID).
+	if isConnString(label) {
+		r.noteConnStringShadowed(t, label, podUID, "trace_cluster", traceCluster)
+	}
+	if pod != nil {
+		return []string{pod.ID()}, true
 	}
 	id := graph.PodID(traceCluster, podUID)
 	r.synthPod(id, traceCluster, namespace, podUID)
@@ -1242,35 +1263,37 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 		}
 		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
+	pod, known := r.podByUID[podUID]
+	if !known {
+		if label == sentinelUnknown {
+			return r.resolveUnknownServerPeer(clientPod, peer, t)
+		}
+		if r.filtered {
+			// FILTERED BUILD (design D5) — see resolveClient. The sentinel case
+			// above is checked FIRST, so an out-of-scope server whose label is
+			// "unknown" still goes through the peer ladder (which needs a real
+			// client pod and therefore drops an out-of-scope caller), exactly as
+			// an empty-UID series does. Both are checked BEFORE the shadow
+			// evidence below: neither SHADOWS a "://" label — the filtered path
+			// resolves it — so counting them as shadowed would report the
+			// opposite of what happened.
+			return r.resolveEmptyUID(label, anchorCluster, t)
+		}
+	}
 	// As in resolveClient: a populated server_k8s_pod_uid SKIPS connection-string
 	// resolution, so a "://" server label never maps to its service node (it
 	// collapses onto the UID's pod, or a synth pod when the UID is unknown to
 	// topology). This is the most common cause of a "://" peer resolving as a
 	// service on the client side yet falling through on the server side. Never
 	// fires for label == "unknown" — isConnString("unknown") is false — so this
-	// evidence path and the enrichment branch below are mutually exclusive.
+	// evidence path and the enrichment branch above are mutually exclusive.
 	if isConnString(label) {
-		r.shadowed++
-		_, known := r.podByUID[podUID]
-		slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)",
-			"reason", "conn_string_shadowed_by_uid", "side", t.side, "label", label,
-			"pod_uid", podUID, "uid_known_to_topology", known, "anchor_cluster", anchorCluster,
-			"client", t.clientLabel, "server", t.serverLabel,
-			"client_uid", t.clientUID, "server_uid", t.serverUID, "trace_cluster", t.traceCluster)
+		r.noteConnStringShadowed(t, label, podUID,
+			"uid_known_to_topology", known, "anchor_cluster", anchorCluster,
+			"trace_cluster", t.traceCluster)
 	}
-	if pod, ok := r.podByUID[podUID]; ok {
+	if known {
 		return []string{pod.ID()}
-	}
-	if label == sentinelUnknown {
-		return r.resolveUnknownServerPeer(clientPod, peer, t)
-	}
-	if r.filtered {
-		// FILTERED BUILD (design D5) — see resolveClient. The sentinel case
-		// above is checked FIRST, so an out-of-scope server whose label is
-		// "unknown" still goes through the peer ladder (which needs a real
-		// client pod and therefore drops an out-of-scope caller), exactly as
-		// an empty-UID series does.
-		return r.resolveEmptyUID(label, anchorCluster, t)
 	}
 	r.synthPod(graph.PodID("", podUID), "", namespace, podUID) // server cluster unknown
 	return []string{graph.PodID("", podUID)}

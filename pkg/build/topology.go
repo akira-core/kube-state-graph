@@ -320,16 +320,19 @@ func ReadTopology(
 }
 
 // warnSelectorFamilyEmpty surfaces the one operator mistake this change makes
-// silent: a metric family that does NOT carry the configured az / env labels
-// simply matches nothing under a filtered request, and because the default
-// projection keeps only connectivity-connected workload, the result can be an
-// empty graph rather than a partial one.
+// silent: a metric family that does NOT carry the labels the request filters on
+// simply matches nothing, and because the default projection keeps only
+// connectivity-connected workload, the result can be an empty graph rather than
+// a partial one.
 //
-// The signature is narrow on purpose — kube-state-metrics returned rows, so
-// the selector demonstrably matches the deployment's labelling, yet a kubelet
-// or Harvest family came back empty. A family that is simply not deployed
-// (no Harvest at all) trips this too; it is a Warn, not an error, and stays
-// quiet for every unfiltered build.
+// The signature is narrow on purpose — kube-state-metrics returned rows, so the
+// selector demonstrably matches the deployment's labelling, yet a kubelet or
+// Harvest family came back empty. A family is reported ONLY when a dimension
+// the request actually carries reaches it (promql.Selector.Reaches): the
+// Harvest families take az / env alone, so a `?cluster=` or `?namespace=`
+// request can never be the reason they are empty — reporting them there would
+// fire this Warn on every filtered request of every non-NetApp deployment. It
+// is a Warn, not an error, and stays quiet for every unfiltered build.
 func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
 	if !sel.Active() || raw[string(promql.QPodInfo)] == 0 {
 		return
@@ -338,7 +341,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 	for _, q := range []promql.Query{
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
 	} {
-		if raw[string(q)] == 0 {
+		if raw[string(q)] == 0 && sel.Reaches(q) {
 			empty = append(empty, string(q))
 		}
 	}
@@ -346,7 +349,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		return
 	}
 	keys = keys.OrDefault()
-	slog.WarnContext(ctx, "selector-filtered build: kube-state-metrics matched but another family returned nothing; check that it carries the configured az / env labels",
+	slog.WarnContext(ctx, "selector-filtered build: kube-state-metrics matched but another family returned nothing; check that it carries the labels this request filters on",
 		"reason", "selector_family_empty",
 		"empty_families", empty,
 		"az_label", keys.AZ,

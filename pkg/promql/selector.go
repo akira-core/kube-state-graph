@@ -212,3 +212,16 @@ func escapeLiteral(s string) string {
 	}
 	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
 }
+
+// Reaches reports whether any dimension this selector actually carries is one
+// that query q accepts — i.e. whether q's result set could have been narrowed
+// by THIS request. It is the queryDims table read from the other direction, so
+// the build layer can attribute an empty metric family to the request instead
+// of to the deployment without keeping its own copy of the contract.
+func (s Selector) Reaches(q Query) bool {
+	d := queryDims[q]
+	return (d&dimAZ != 0 && hasValue(s.AZ)) ||
+		(d&dimEnv != 0 && hasValue(s.Env)) ||
+		(d&dimCluster != 0 && hasValue(s.Cluster)) ||
+		(d&dimNamespace != 0 && hasValue(s.Namespace))
+}

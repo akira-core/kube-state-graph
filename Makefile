@@ -201,7 +201,10 @@ ci: lint vuln test check-docs verify-mocks check-route-containment
 	@echo "ci: all checks passed (lint + vuln + test + docs + mocks + containment)"
 
 cover:
-	go test ./... -coverprofile=coverage.out -covermode=atomic
+	# Same -timeout rationale as `test`: the container-backed suites in
+	# internal/integration exceed Go's 10m default, which aborts them with a
+	# panic dump instead of a clean failure.
+	go test ./... -coverprofile=coverage.out -covermode=atomic -timeout 30m
 	go tool cover -func=coverage.out | tail -1
 
 ## Regenerate the OpenAPI spec from swag annotations. Outputs only the JSON +

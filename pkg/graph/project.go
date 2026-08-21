@@ -230,7 +230,8 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 		}
 		if n.Type() == NodeTypeNetAppAggr || n.Type() == NodeTypeNetAppNode {
 			// NetApp types belong to no Kubernetes cluster; they pass the
-			// cluster check and are gated purely by reference (or name).
+			// cluster check and are gated purely by reference (see
+			// netappInfraPassesFilters).
 		} else if _, ok := scope.Clusters[labels["cluster"]]; !ok {
 			return false
 		}

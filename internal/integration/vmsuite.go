@@ -172,11 +172,18 @@ func StampLabels(exposition, extra string) string {
 	if extra == "" {
 		return exposition
 	}
-	var keys []string
-	for _, pair := range strings.Split(extra, ",") {
-		if k, _, ok := strings.Cut(pair, "="); ok {
-			keys = append(keys, strings.TrimSpace(k)+"=")
+	// Key and rendered text are carried together: deriving one from a second
+	// Split of `extra` by index silently stamps the WRONG pair as soon as one
+	// entry lacks an "=" and the two slices stop lining up.
+	type labelPair struct{ key, text string }
+	var pairs []labelPair
+	for _, p := range strings.Split(extra, ",") {
+		if k, _, ok := strings.Cut(p, "="); ok {
+			pairs = append(pairs, labelPair{key: strings.TrimSpace(k), text: strings.TrimSpace(p)})
 		}
+	}
+	if len(pairs) == 0 {
+		return exposition
 	}
 	lines := strings.Split(exposition, "\n")
 	for i, line := range lines {
@@ -200,9 +207,9 @@ func StampLabels(exposition, extra string) string {
 		}
 		labels := line[open+1 : closeIdx]
 		var missing []string
-		for j, k := range keys {
-			if !strings.Contains(labels, k) {
-				missing = append(missing, strings.Split(extra, ",")[j])
+		for _, p := range pairs {
+			if !hasLabelKey(labels, p.key) {
+				missing = append(missing, p.text)
 			}
 		}
 		if len(missing) == 0 {
@@ -215,6 +222,31 @@ func StampLabels(exposition, extra string) string {
 		lines[i] = line[:closeIdx] + sep + strings.Join(missing, ",") + line[closeIdx:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// hasLabelKey reports whether a label-set body already declares label `key`.
+// A bare strings.Contains(labels, key+"=") is wrong: `cluster=` is a suffix of
+// `ontap_cluster=`, so the Harvest series would silently keep the fixture's
+// ONTAP cluster and never receive the Kubernetes one. Require the match to
+// start a label name — at the beginning of the set or right after a separator.
+func hasLabelKey(labels, key string) bool {
+	needle := key + "="
+	for i := 0; i < len(labels); {
+		j := strings.Index(labels[i:], needle)
+		if j < 0 {
+			return false
+		}
+		at := i + j
+		if at == 0 {
+			return true
+		}
+		switch labels[at-1] {
+		case ',', ' ', '\t':
+			return true
+		}
+		i = at + len(needle)
+	}
+	return false
 }
 
 // IngestExpFmt POSTs Prometheus exposition-format text to VM's
