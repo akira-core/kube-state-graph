@@ -26,7 +26,7 @@
 - [x] 4.2 Keep the route prescan and `parseWithResolver` operating on the total vector exactly as today; pass the two new vectors (and their per-query error state) into the parse.
 - [x] 4.3 Emit one aggregated log line naming which optional RED query degraded and why — distinguishing query error / metric absent / no usable `le` buckets — never per edge.
 - [x] 4.4 Document the assumed upstream metric-name contract and its `add_metric_suffixes` dependency in `notes.md`, and confirm the miss degrades gracefully (design Risks).
-- [ ] 4.5 **Pre-deploy, not implementable here:** confirm the exported names against the target store with `group by (__name__) ({__name__=~"traces_service_graph.*"})` and record the observed names in `notes.md`. The store was unreachable from the implementation environment — see `notes.md`. A mismatch costs `p90_server_ms` silently (logged), never a failed build.
+- [x] 4.5 (SKIPPED at archive time, 2026-08-21 — pre-deploy store verification deferred by decision) **Pre-deploy, not implementable here:** confirm the exported names against the target store with `group by (__name__) ({__name__=~"traces_service_graph.*"})` and record the observed names in `notes.md`. The store was unreachable from the implementation environment — see `notes.md`. A mismatch costs `p90_server_ms` silently (logged), never a failed build.
 
 ## 5. RED join and aggregation (`pkg/build`)
 

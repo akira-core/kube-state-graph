@@ -53,7 +53,7 @@
 - [x] 9.1 Update `CLAUDE.md` load-bearing bullets: replace the StorageClass/Trident bullets with the NetApp storage-graph rules, drop the `KSG_METRIC_PREFIX` bullet and prefix mentions in the series list, update the query fan-out count and edge-type list.
 - [x] 9.2 Write the BREAKING release note (storageclass type + edge removed; metric prefix removed — prefixed deployments must republish at bare names; `rate` schema-optional) and the deployment-precondition doc (Harvest `volume_name` relabel rule with the three blind spots; Trident CRS config now removable); reconcile `docs/` KSM setup docs (PR #11 content) with the Trident removal.
 - [x] 9.3 Full gate: `make build test vet lint vuln check-docs` clean (race + shuffle), `openspec validate --strict` then `openspec verify "replace-storageclass-with-netapp-nodes"`.
-- [ ] 9.4 Coordinate `graph-api-gateway`: after tagging, open its PR bumping the dependency and deleting `Options.MetricPrefix` usage (design D10).
+- [x] 9.4 ~~Coordinate `graph-api-gateway`: after tagging, open its PR bumping the dependency and deleting `Options.MetricPrefix` usage (design D10).~~ Removed at archive time (2026-08-21): the `graph-api-gateway` dependency is dropped; no coordinated bump is required.
 
 ## 10. Volume throughput metrics (`volume_read_data` / `volume_write_data`)
 
@@ -79,7 +79,7 @@
 > three-hop join (`volume_labels` → QoS workload → QoS fixed policy) of
 > `design.md` D1-D3, D5, D8.
 
-- [ ] 11.1 Verify against the production VictoriaMetrics (`/api/v1/label/__name__/values` + a sample `/api/v1/series` per name); on any drift, mechanically rename in `specs/` + `design.md` before 11.2:
+- [x] 11.1 (SKIPPED at archive time, 2026-08-21 — production verification deferred by decision; metric names stand as specified) Verify against the production VictoriaMetrics (`/api/v1/label/__name__/values` + a sample `/api/v1/series` per name); on any drift, mechanically rename in `specs/` + `design.md` before 11.2:
   - `volume_labels` exists and carries `cluster`/`node`/`aggr`/`svm`/`volume_name` (fallback if the Harvest template exports no instance labels: an always-present per-volume gauge with the same label set, e.g. `volume_size_used`);
   - the six `qos_*` families exist, carry `volume_name` from the relabel rule, and carry `policy_group` + `lun`; sample the real distribution of `lun` to confirm volume-level workloads report it empty (or absent) while LUN workloads report it non-empty;
   - `qos_policy_fixed_max_throughput_iops` / `_mbps` exist, and record which label names the policy group (`name` vs `policy_group`) — that label is hop C's join key;
