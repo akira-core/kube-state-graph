@@ -1236,10 +1236,14 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 	return out
 }
 
-// bucketCluster returns "unknown" when the upstream cluster label is missing.
+// bucketCluster returns the missing-cluster bucket name when the upstream
+// cluster label is absent. The name is promql.ClusterUnknownValue rather than a
+// local literal because the query layer renders the SAME value as a request
+// matcher: rename it on one side only and `?cluster=<bucket>` silently stops
+// addressing the bucket it names.
 func bucketCluster(c string) string {
 	if c == "" {
-		return "unknown"
+		return promql.ClusterUnknownValue
 	}
 	return c
 }

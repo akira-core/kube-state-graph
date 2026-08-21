@@ -55,6 +55,7 @@ kube_pod_info{cluster="cluster-alpha",namespace="finance",pod="ledger",uid="alph
 kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="idle",uid="alpha-4",node="worker-9",test=%[1]q} 1 %[2]d
 kube_pod_info{cluster="cluster-beta",namespace="billing",pod="payments",uid="beta-1",node="worker-0",az="zone-b",test=%[1]q} 1 %[2]d
 kube_pod_info{namespace="orphan",pod="stray",uid="nocluster-1",node="worker-0",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="unknown",namespace="orphan",pod="literal",uid="nocluster-2",node="worker-0",test=%[1]q} 1 %[2]d
 # HELP kube_node_info dummy
 kube_node_info{cluster="cluster-alpha",node="worker-0",test=%[1]q} 1 %[2]d
 kube_node_info{cluster="cluster-alpha",node="worker-9",test=%[1]q} 1 %[2]d
@@ -196,6 +197,10 @@ func (s *FilterSuite) TestClusterUnknownMatchesUnlabelledSeries() {
 
 	ids := nodeIDs(body)
 	s.Contains(ids, "unknown/nocluster-1", "the unlabelled pod is addressable as cluster=unknown")
+	// Both spellings of the bucket must come back: bucketCluster maps an absent
+	// label to "unknown", so a series LABELLED "unknown" is indistinguishable
+	// from it downstream and the rendered matcher must accept both.
+	s.Contains(ids, "unknown/nocluster-2", "a literal cluster=\"unknown\" series is in the same bucket")
 	s.NotContains(ids, "cluster-alpha/alpha-1", "labelled series are excluded")
 	s.Equal([]string{"unknown"}, body.Clusters)
 }
@@ -212,6 +217,7 @@ func (s *FilterSuite) TestClusterUnknownMixedWithRealCluster() {
 
 	ids := nodeIDs(body)
 	s.Contains(ids, "unknown/nocluster-1")
+	s.Contains(ids, "unknown/nocluster-2")
 	s.Contains(ids, "cluster-alpha/alpha-1")
 	s.NotContains(ids, "cluster-beta/beta-1")
 }

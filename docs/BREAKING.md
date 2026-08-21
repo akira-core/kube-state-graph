@@ -115,6 +115,13 @@ a live dimension reaches returned nothing.
   cross-cluster partner is an `external` node, not a real pod — cross-cluster
   edge representation now requires BOTH clusters loaded.
 - A service-graph series that touches no loaded workload contributes nothing.
+- `?cluster=unknown` addresses the missing-cluster-label bucket and now renders
+  `cluster=~"unknown|"` rather than `cluster=""`, so a series whose `cluster`
+  label is literally `unknown` — which the parse layer buckets identically and
+  the projection filter already accepted — is loaded too.
+- A filtered request that matches no topology at all issues no
+  `traces_service_graph_*` queries: no series could survive admission, so the
+  read is skipped rather than scanning the whole estate for an empty answer.
 - An empty filtered result is a `200` with `elements: []` and `clusters: []`,
   never `outside_retention` (which stays an unfiltered-build classification).
 
@@ -129,6 +136,12 @@ D32 embedders must update call sites:
 | `build.Builder.Build(ctx, window, end)` | `Build(ctx, window, end, promql.Selector{})` |
 | `build.ReadTopology(ctx, q, window, end)` | `ReadTopology(ctx, q, window, end, promql.LabelKeys{}, promql.Selector{})` |
 | `promql.Render(q, window)` | `Render(q, window, promql.LabelKeys{}, promql.Selector{})` |
+
+`graph.Graph` no longer carries the `Forward` / `Reverse` adjacency maps. They
+existed only for the withdrawn `?root=&depth=` traversal; every surviving
+consumer scans `Edges` once, so building them was two allocations and 2×|E|
+appends per request that nothing read. An embedder that needs adjacency builds
+it from `Edges` itself.
 
 `graph.Scope` is now `{Clusters, Namespaces, EdgeTypes, Inventory}`;
 `graph.NewScope(clusters, namespaces, edgeTypes, inventory)` takes four

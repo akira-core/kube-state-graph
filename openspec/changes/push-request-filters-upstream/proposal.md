@@ -57,9 +57,10 @@ escape hatches were built around, and removes `/v1/clusters`.
     narrowed by **reference** (an aggregate materialises only when a loaded
     claim's `volumename` joins to it — the existing rule).
   - **None**: the three `traces_service_graph_*` series and the `up{}` probe.
-  A request value `cluster=unknown` renders `cluster=""` (PromQL's
-  empty-string matcher matches an absent label), preserving the
-  "series missing the cluster label are bucketed as `unknown`" contract.
+  A request value `cluster=unknown` renders `cluster=~"unknown|"` — the
+  literal plus PromQL's empty alternative, which matches an absent label —
+  preserving the "series missing the cluster label are bucketed as `unknown`"
+  contract for BOTH spellings that land in that bucket.
 - **`prune` parameter, default `true`.** `prune=false` turns the default
   connectivity prune off: every loaded pod is emitted with its `pod-to-node`,
   `pod-mounts-pvc`, `pvc-to-netapp-aggr` chain regardless of traffic. It also

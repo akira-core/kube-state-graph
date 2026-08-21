@@ -147,6 +147,15 @@ func TestBuild_SelectorReachesTopologyQueriesOnly(t *testing.T) {
 			mu.Lock()
 			seen[name] = query
 			mu.Unlock()
+			// One pod keeps the topology non-empty. A filtered build that
+			// loads NOTHING skips the service-graph read entirely (no series
+			// could survive admission), and this test is about what the
+			// service-graph queries look like when they ARE issued.
+			if name == string(promql.QPodInfo) {
+				return model.Vector{{Metric: model.Metric{
+					"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
+				}, Value: 1}}, nil
+			}
 			return model.Vector{}, nil
 		}).
 		Maybe()

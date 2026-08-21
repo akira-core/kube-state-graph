@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
@@ -139,6 +140,16 @@ func validateSelectorValues(param string, values []string) error {
 		}
 		if len(val) > maxSelectorValueLen {
 			return &ParseError{"invalid_scope", fmt.Sprintf("%s value exceeds %d bytes", param, maxSelectorValueLen)}
+		}
+		// Checked BEFORE the control-character scan, which cannot see this:
+		// ranging over a string decodes an invalid byte as U+FFFD, and
+		// RuneError is not a control rune. The raw byte would then survive
+		// escapeLiteral (it is neither a quote nor a backslash) and reach
+		// VictoriaMetrics inside a PromQL string literal, where the parse
+		// error surfaces as a 502 upstream failure instead of the 400 this
+		// validator exists to produce.
+		if !utf8.ValidString(val) {
+			return &ParseError{"invalid_scope", fmt.Sprintf("%s value is not valid UTF-8", param)}
 		}
 		for _, r := range val {
 			if unicode.IsControl(r) {

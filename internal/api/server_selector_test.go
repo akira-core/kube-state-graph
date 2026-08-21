@@ -22,7 +22,12 @@ import (
 // query name. The MockQuerier cannot itself honour a label matcher, so the
 // captured strings — not the response body — are what prove the push-down
 // reached the wire.
-func recordingQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() map[string]string) {
+//
+// podInfo, when supplied, is what the kube_pod_info leg answers with. A
+// filtered build that loads NO topology skips the service-graph read entirely
+// (no series could survive admission), so a test asserting what those queries
+// look like has to keep the topology non-empty.
+func recordingQuerier(t *testing.T, podInfo ...*model.Sample) (*promqlmocks.MockQuerier, func() map[string]string) {
 	t.Helper()
 	var mu sync.Mutex
 	seen := map[string]string{}
@@ -32,6 +37,9 @@ func recordingQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() map[string
 			mu.Lock()
 			seen[name] = query
 			mu.Unlock()
+			if name == "kube_pod_info" && len(podInfo) > 0 {
+				return model.Vector(podInfo), nil
+			}
 			return model.Vector{}, nil
 		}).Maybe()
 	return q, func() map[string]string {
@@ -50,7 +58,9 @@ func recordingQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() map[string
 // handler, each series receiving exactly the dimensions its labels support,
 // and the service-graph family receiving none.
 func TestGraph_SelectorQueriesCaptured(t *testing.T) {
-	q, captured := recordingQuerier(t)
+	q, captured := recordingQuerier(t, &model.Sample{Metric: model.Metric{
+		"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
+	}, Value: 1})
 	s := newServerWithMocks(t, q, nil)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)

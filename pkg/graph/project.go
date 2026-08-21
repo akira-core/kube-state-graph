@@ -40,8 +40,11 @@ func Project(g *Graph, scope Scope) View {
 
 	nodes := filterNodes(g, scope, excluded)
 	edges := filterEdges(g, scope, nodes, excluded)
-	// An aggregate admitted as an edge partner (e.g. via a pvc-to-netapp-aggr
-	// edge) still needs its owning controller — the compound parent must exist.
+	// The single parent sweep, deliberately after filterEdges: an aggregate
+	// admitted as an edge partner (via a pvc-to-netapp-aggr edge) still needs
+	// its owning controller, because the compound parent must exist. No edge
+	// type has a netapp-node endpoint, so running it here rather than inside
+	// filterNodes cannot change which edges survive.
 	pullNetAppParents(g, nodes)
 
 	out := View{
@@ -195,12 +198,17 @@ func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string
 		}
 		out[n.ID()] = n
 	}
-	pullNetAppParents(g, out)
+	// No pullNetAppParents here: referencedCtrl above already names the owning
+	// netapp-node of every aggregate admitted by this pass, so the sweep would
+	// find nothing. Project runs it once AFTER filterEdges, which is the only
+	// remaining way an aggregate can enter the view without having passed this
+	// loop.
 	return out
 }
 
 // pullNetAppParents admits the owning netapp-node of every admitted
-// netapp-aggr so the real-node compound parent cannot dangle.
+// netapp-aggr so the real-node compound parent cannot dangle. Called exactly
+// once per projection, from Project, after both filter passes.
 func pullNetAppParents(g *Graph, nodes map[string]GraphNode) {
 	for _, n := range nodes {
 		if n.Type() != NodeTypeNetAppAggr {

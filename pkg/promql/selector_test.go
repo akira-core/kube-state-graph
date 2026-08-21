@@ -66,14 +66,23 @@ func TestSelector_Render(t *testing.T) {
 			`az="zone-a",env="prod"`,
 		},
 		{
-			"unknown cluster alone renders the empty-string matcher",
+			// Both spellings of the bucket must match: a series with no
+			// cluster label (the empty alternative) and one labelled
+			// literally "unknown" — build.bucketCluster cannot tell them
+			// apart, so neither may the matcher.
+			"unknown cluster alone matches the literal and the absent label",
 			Selector{Cluster: []string{"unknown"}}, LabelKeys{}, dimsNamespaced,
-			`cluster=""`,
+			`cluster=~"unknown|"`,
 		},
 		{
-			"unknown cluster mixed keeps raw sort order",
+			"unknown cluster mixed appends the absent-label alternative last",
 			Selector{Cluster: []string{"unknown", "alpha"}}, LabelKeys{}, dimsNamespaced,
-			`cluster=~"alpha|"`,
+			`cluster=~"alpha|unknown|"`,
+		},
+		{
+			"a cluster set without unknown stays an ordinary matcher",
+			Selector{Cluster: []string{"beta", "alpha"}}, LabelKeys{}, dimsNamespaced,
+			`cluster=~"alpha|beta"`,
 		},
 		{
 			"regex metacharacters are quoted for the literal AND the regex",

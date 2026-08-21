@@ -14,22 +14,20 @@ type Graph struct {
 
 	NodesByID map[string]GraphNode
 	Edges     []*Edge
-
-	// Forward[id] = edges where Source == id.
-	// Reverse[id] = edges where Target == id.
-	Forward map[string][]*Edge
-	Reverse map[string][]*Edge
 }
 
-// NewGraph builds a Graph from the supplied nodes + edges and pre-computes
-// forward / reverse adjacency maps.
+// NewGraph builds a Graph from the supplied nodes + edges.
+//
+// It deliberately keeps NO adjacency index. The Forward / Reverse maps this
+// type once carried existed for the withdrawn `?root=&depth=` traversal; every
+// surviving consumer — projection, the connectivity prune, serialisation —
+// scans Edges once, so an index would be two allocations and 2×|E| appends per
+// request that nothing reads.
 func NewGraph(nodes []GraphNode, edges []*Edge, builtAt time.Time) *Graph {
 	g := &Graph{
 		BuiltAt:   builtAt,
 		NodesByID: make(map[string]GraphNode, len(nodes)),
 		Edges:     edges,
-		Forward:   make(map[string][]*Edge, len(nodes)),
-		Reverse:   make(map[string][]*Edge, len(nodes)),
 	}
 	for _, n := range nodes {
 		// ServiceID mirrors PVCID keying, so a Service and a PVC sharing
@@ -57,10 +55,6 @@ func NewGraph(nodes []GraphNode, edges []*Edge, builtAt time.Time) *Graph {
 			continue
 		}
 		g.NodesByID[n.ID()] = n
-	}
-	for _, e := range edges {
-		g.Forward[e.Source] = append(g.Forward[e.Source], e)
-		g.Reverse[e.Target] = append(g.Reverse[e.Target], e)
 	}
 	return g
 }

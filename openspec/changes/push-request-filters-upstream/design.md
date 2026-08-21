@@ -81,9 +81,10 @@ when non-empty, so a query with no fixed selector and no active dimension
 renders exactly today's string. Rendering a dimension: values are
 de-duplicated and sorted; one value → `key="v"` with `\` and `"` escaped; two
 or more → `key=~"<QuoteMeta(v1)>|<QuoteMeta(v2)>"`; the `Cluster` value
-`unknown` is mapped to `""` before rendering (so a single value renders
-`cluster=""` and a mixed set renders `cluster=~"alpha|"`, both of which match
-an absent label). Dimension order inside the selector is fixed
+`unknown` contributes TWO alternatives — the literal and the empty string —
+and forces the regex form (`cluster=~"unknown|"` alone, `cluster=~"alpha|unknown|"`
+mixed), because the bucket is reachable under both spellings and the parse
+layer cannot tell them apart. Dimension order inside the selector is fixed
 (`az`, `env`, `cluster`, `namespace`) after the fixed part.
 
 *Why a table, not per-case code:* the contract is "series × dimension", and a
@@ -288,11 +289,11 @@ descriptions only as prose (the OpenAPI parameter names are fixed).
 - [Same-named out-of-scope peers merge into one `external/<label>`] →
   Accepted; `external` has no cluster/namespace dimension by design, and the
   merge is what keeps a namespace view readable.
-- [`cluster=~"alpha|"` relies on regex-empty matching an absent label] →
-  Prometheus and VictoriaMetrics both treat an absent label as `""` for
+- [`cluster=~"alpha|unknown|"` relies on regex-empty matching an absent label]
+  → Prometheus and VictoriaMetrics both treat an absent label as `""` for
   matchers; verified by an integration test. If a store disagreed, the
-  fallback is to render `cluster=""` only when `unknown` is the sole value and
-  document the limitation — no approach change.
+  fallback is to render the empty alternative as its own `cluster=""` matcher
+  in a separate query and union the results — no approach change.
 - [Withdrawn parameters silently ignored] → A client sending `?name=` gets a
   bigger response than before rather than an error. Accepted per proposal;
   the release note calls it out.

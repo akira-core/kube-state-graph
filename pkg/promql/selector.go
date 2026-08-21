@@ -15,11 +15,16 @@ const (
 	DefaultEnvLabel = "env"
 )
 
-// clusterUnknownValue is the request value that addresses the "series carries
-// no `cluster` label" bucket the topology reader reports as cluster="unknown".
-// It renders as the EMPTY-STRING matcher, which PromQL evaluates as "the label
-// is absent or empty", so the bucket stays addressable at the query layer.
-const clusterUnknownValue = "unknown"
+// ClusterUnknownValue is the name of the bucket a series lands in when it
+// carries no `cluster` label. It is the single spelling shared by the query
+// layer (which renders it) and the parse layer (build.bucketCluster, which
+// assigns it) — a request value and a rendered node label that must agree, so
+// neither side keeps its own literal.
+//
+// A series whose `cluster` label is literally "unknown" lands in the SAME
+// bucket, so the rendered matcher must match both spellings; see
+// appendClusterMatcher.
+const ClusterUnknownValue = "unknown"
 
 // LabelKeys names the upstream labels the availability-zone and environment
 // request dimensions are matched against. The zero value means "use the
@@ -129,43 +134,63 @@ func (s Selector) render(d dims, keys LabelKeys) string {
 	keys = keys.OrDefault()
 	var out []string
 	if d&dimAZ != 0 {
-		out = appendMatcher(out, keys.AZ, s.AZ, nil)
+		out = appendMatcher(out, keys.AZ, s.AZ)
 	}
 	if d&dimEnv != 0 {
-		out = appendMatcher(out, keys.Env, s.Env, nil)
+		out = appendMatcher(out, keys.Env, s.Env)
 	}
 	if d&dimCluster != 0 {
-		out = appendMatcher(out, "cluster", s.Cluster, clusterMatcherValue)
+		out = appendClusterMatcher(out, s.Cluster)
 	}
 	if d&dimNamespace != 0 {
-		out = appendMatcher(out, "namespace", s.Namespace, nil)
+		out = appendMatcher(out, "namespace", s.Namespace)
 	}
 	return strings.Join(out, ",")
 }
 
-// clusterMatcherValue maps the request value "unknown" onto the empty-string
-// matcher so the missing-cluster-label bucket is addressable. Applied AFTER
-// sorting, so the rendered order follows the caller's raw values: a
-// {alpha, unknown} request renders `cluster=~"alpha|"`.
-func clusterMatcherValue(v string) string {
-	if v == clusterUnknownValue {
-		return ""
+// appendClusterMatcher renders the `cluster` dimension. It is the one
+// dimension whose request values are not all literal label values:
+// ClusterUnknownValue names the bucket build.bucketCluster assigns to a series
+// carrying NO cluster label, and a series whose label is literally "unknown"
+// is bucketed there too — the parse layer cannot tell them apart and the
+// projection filter matches both. The matcher must therefore match both, so
+// `unknown` contributes TWO alternatives (the literal, and the empty string
+// that PromQL evaluates as "absent or empty") and forces the regex form even
+// when it is the only requested value.
+//
+// The empty alternative is appended after the sorted literals, so the rendered
+// string stays a pure function of the value set: `?cluster=unknown` renders
+// `cluster=~"unknown|"` and `?cluster=alpha&cluster=unknown` renders
+// `cluster=~"alpha|unknown|"`.
+func appendClusterMatcher(dst []string, values []string) []string {
+	vals := normaliseValues(values)
+	if len(vals) == 0 {
+		return dst
 	}
-	return v
+	unknown := false
+	for _, v := range vals {
+		if v == ClusterUnknownValue {
+			unknown = true
+			break
+		}
+	}
+	if !unknown {
+		return appendMatcher(dst, "cluster", vals)
+	}
+	alts := make([]string, 0, len(vals)+1)
+	for _, v := range vals {
+		alts = append(alts, escapeLiteral(regexp.QuoteMeta(v)))
+	}
+	return append(dst, `cluster=~"`+strings.Join(append(alts, ""), "|")+`"`)
 }
 
 // appendMatcher renders one dimension. A single value becomes an exact
 // matcher; two or more become ONE fully-anchored alternation (PromQL anchors
 // `=~` as ^(?:...)$, so top-level alternation is exactly "any of these").
-func appendMatcher(dst []string, key string, values []string, xform func(string) string) []string {
+func appendMatcher(dst []string, key string, values []string) []string {
 	vals := normaliseValues(values)
 	if len(vals) == 0 {
 		return dst
-	}
-	if xform != nil {
-		for i := range vals {
-			vals[i] = xform(vals[i])
-		}
 	}
 	if len(vals) == 1 {
 		return append(dst, key+`="`+escapeLiteral(vals[0])+`"`)

@@ -35,6 +35,11 @@ func TestParseValues_Errors(t *testing.T) {
 		{"prune not a boolean", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "prune": {"maybe"}}, "invalid_scope"},
 		{"selector value with a control character", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "env": {"prod\n"}}, "invalid_scope"},
 		{"selector value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {strings.Repeat("z", 254)}}, "invalid_scope"},
+		// An invalid byte decodes to U+FFFD when ranged over, which is not a
+		// control rune, so the control-character scan alone would let it
+		// through into a rendered PromQL string literal.
+		{"selector value with an invalid UTF-8 byte", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "namespace": {"\xffpayments"}}, "invalid_scope"},
+		{"cluster value with a lone surrogate half", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "cluster": {"\xed\xa0\x80"}}, "invalid_scope"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -176,6 +181,14 @@ func TestBuildFromValues_PushesSelectorIntoTopologyQueries(t *testing.T) {
 			mu.Lock()
 			seen[name] = query
 			mu.Unlock()
+			// One pod keeps the topology non-empty: a filtered build that
+			// loads nothing skips the service-graph read, and this test
+			// asserts what those queries look like when issued.
+			if name == "kube_pod_info" {
+				return model.Vector{{Metric: model.Metric{
+					"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
+				}, Value: 1}}, nil
+			}
 			return model.Vector{}, nil
 		}).Maybe()
 

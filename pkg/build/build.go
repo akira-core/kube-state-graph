@@ -114,10 +114,31 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		}
 	}
 
-	sg, err := ReadServiceGraph(ctx, b.q, window, end, topology,
-		b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
-	if err != nil {
-		return nil, classifyReadError(span, "service-graph read failed", err)
+	// A filtered build that loaded NO topology cannot admit a single
+	// service-graph series, so the three traces_service_graph_* queries are
+	// skipped entirely. They are the most expensive leg of the fan-out and the
+	// one leg no selector narrows (queryDims gives them no dimension), so a
+	// mistyped `?namespace=` would otherwise scan the whole estate to build an
+	// empty response, on every request, with no cache in front.
+	//
+	// Provably wasted, not heuristically: admission (design D6) keeps a series
+	// only when a resolved endpoint names loaded topology — podByID, built from
+	// Pods, or an already-materialised service, which can only come from
+	// ServicesByNameNS via anchorHolds. Both empty ⇒ every series is rejected
+	// and every side effect rolled back.
+	//
+	// Gated on `filtered` so the unfiltered empty-topology case stays exactly
+	// the outside-retention path above.
+	var sg ServiceGraphResult
+	if filtered && len(topology.Pods) == 0 && len(topology.ServicesByNameNS) == 0 {
+		slog.DebugContext(ctx, "service-graph read skipped: selector matched no topology",
+			"reason", "filtered_empty_topology")
+	} else {
+		sg, err = ReadServiceGraph(ctx, b.q, window, end, topology,
+			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
+		if err != nil {
+			return nil, classifyReadError(span, "service-graph read failed", err)
+		}
 	}
 
 	nodes, edges := assemble(topology, sg)

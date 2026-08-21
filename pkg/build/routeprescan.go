@@ -332,10 +332,7 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 		}
 		clientLabel := string(s.Metric["client"])
 		serverLabel := string(s.Metric["server"])
-		traceCluster := string(s.Metric["cluster"])
-		if traceCluster == "" {
-			traceCluster = "unknown" // mirrors missingClusterCounts.bucket
-		}
+		traceCluster := bucketCluster(string(s.Metric["cluster"]))
 		clientUID := string(s.Metric["client_k8s_pod_uid"])
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)

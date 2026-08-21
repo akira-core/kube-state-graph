@@ -86,7 +86,7 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 
 ### Requirement: Series missing the cluster label
 
-A topology series that is missing the `cluster` label SHALL be bucketed under `cluster="unknown"`. The reader SHALL surface the count of such series via the `kube_state_graph_clusters_observed` gauge (the value `unknown` will appear in the gauge's label set when present). A request-scoped `cluster` filter whose value is `unknown` SHALL be rendered as the empty-string matcher `cluster=""` — PromQL's empty-string equality matches a series that carries no such label — so the bucket remains addressable at the source; any other value renders as the literal value.
+A topology series that is missing the `cluster` label SHALL be bucketed under `cluster="unknown"`. The reader SHALL surface the count of such series via the `kube_state_graph_clusters_observed` gauge (the value `unknown` will appear in the gauge's label set when present). A request-scoped `cluster` filter whose value is `unknown` SHALL be rendered as an anchored alternation carrying BOTH spellings of the bucket — the literal `unknown` and the empty string, i.e. `cluster=~"unknown|"` — because a series whose `cluster` label is literally `unknown` and one carrying no `cluster` label are indistinguishable after bucketing and both belong to the bucket. (PromQL's empty alternative matches a series that carries no such label.) The alternation form SHALL be used even when `unknown` is the only requested value. Any other value renders as the literal value.
 
 #### Scenario: Legacy series without cluster label
 
@@ -95,8 +95,8 @@ A topology series that is missing the `cluster` label SHALL be bucketed under `c
 
 #### Scenario: Filtering on the unknown bucket
 
-- **WHEN** a build runs with the cluster filter `unknown` against an upstream where some `kube_pod_info` series carry no `cluster` label and others carry `cluster="cluster-alpha"`
-- **THEN** the query is issued with `cluster=""`, only the unlabelled series are loaded, and the resulting pod entities all have `cluster: "unknown"`
+- **WHEN** a build runs with the cluster filter `unknown` against an upstream where some `kube_pod_info` series carry no `cluster` label, one carries `cluster="unknown"`, and others carry `cluster="cluster-alpha"`
+- **THEN** the query is issued with `cluster=~"unknown|"`, the unlabelled series AND the literally-`unknown` series are loaded, `cluster-alpha` is not, and the resulting pod entities all have `cluster: "unknown"`
 
 ## ADDED Requirements
 
@@ -109,7 +109,7 @@ The build SHALL accept four request-scoped selector dimensions — `az`, `env`, 
 - `namespace`: every kube-state-metrics and kubelet series that carries a `namespace` label (the pod-, claim-, Service-, and EndpointSlice-scoped series). Never a node series, never a Harvest series, never a service-graph series.
 - The three `traces_service_graph_*` series and the `up{}` probe SHALL carry **no** request-scoped matcher under any request.
 
-Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=""` (see "Series missing the cluster label"). Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
+Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=~"unknown|"` (see "Series missing the cluster label"), the one value that is not rendered as a plain literal. Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
 
 A build with every dimension empty SHALL issue each query exactly as it is issued today. Zero rows under a non-empty dimension is a valid, empty topology — not a failure and not a retention miss.
 

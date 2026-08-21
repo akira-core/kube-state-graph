@@ -970,10 +970,10 @@ func betterSrcCluster(next, prev string) bool {
 	if next == prev {
 		return false
 	}
-	if prev == "unknown" {
+	if prev == promql.ClusterUnknownValue {
 		return true
 	}
-	if next == "unknown" {
+	if next == promql.ClusterUnknownValue {
 		return false
 	}
 	return next < prev
