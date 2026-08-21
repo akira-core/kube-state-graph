@@ -5,8 +5,10 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+	"unicode"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // ParseError is a typed request-parsing failure. Reason is a stable,
@@ -20,69 +22,131 @@ type ParseError struct {
 
 func (e *ParseError) Error() string { return e.Message }
 
-// ParseValues parses the /v1/graph query parameters into a build window
-// (start, end) and a projection Scope. It is the single source of truth for the
-// request contract, shared by the kube-state-graph HTTP handler and by any
-// embedding application (via Engine.BuildFromValues), so the two can never
-// drift. It performs no I/O and is independent of any HTTP framework.
+// Request is the parsed /v1/graph request: a build window, the upstream
+// selector the build pushes into PromQL, and the projection scope applied to
+// the built graph.
+//
+// `cluster` and `namespace` deliberately appear in BOTH Selector and Scope —
+// they narrow the queries at the source and are re-applied over the result as
+// defence in depth. `az` / `env` are selector-only (no node carries them), and
+// `edge_type` / `prune` are projection-only.
+type Request struct {
+	Start    time.Time
+	End      time.Time
+	Scope    graph.Scope
+	Selector promql.Selector
+}
+
+// maxSelectorValueLen bounds a single selector value. 253 is the longest legal
+// DNS subdomain (so every Kubernetes cluster / namespace name fits) and is a
+// generous ceiling for the operator-defined zone / environment vocabularies.
+const maxSelectorValueLen = 253
+
+// ParseValues parses the /v1/graph query parameters into a Request. It is the
+// single source of truth for the request contract, shared by the
+// kube-state-graph HTTP handler and by any embedding application (via
+// Engine.BuildFromValues), so the two can never drift. It performs no I/O and
+// is independent of any HTTP framework.
+//
+// Unknown parameters are ignored, which is how the withdrawn `name`, `root`,
+// `depth` and `direction` parameters degrade: an old client receives the
+// unanchored view rather than an error.
 //
 // On failure it returns a *ParseError carrying the stable reason code.
-func ParseValues(v url.Values) (start, end time.Time, scope graph.Scope, err error) {
+func ParseValues(v url.Values) (Request, error) {
+	var req Request
+
 	startStr := v.Get("start")
 	endStr := v.Get("end")
 	if startStr == "" {
-		return start, end, scope, &ParseError{"missing_start", "start query parameter is required"}
+		return req, &ParseError{"missing_start", "start query parameter is required"}
 	}
 	if endStr == "" {
-		return start, end, scope, &ParseError{"missing_end", "end query parameter is required"}
+		return req, &ParseError{"missing_end", "end query parameter is required"}
 	}
 	start, perr := parseTimestamp(startStr)
 	if perr != nil {
-		return start, end, scope, &ParseError{"invalid_start", perr.Error()}
+		return req, &ParseError{"invalid_start", perr.Error()}
 	}
-	end, perr = parseTimestamp(endStr)
+	end, perr := parseTimestamp(endStr)
 	if perr != nil {
-		return start, end, scope, &ParseError{"invalid_end", perr.Error()}
+		return req, &ParseError{"invalid_end", perr.Error()}
 	}
 	if !end.After(start) {
-		return start, end, scope, &ParseError{"invalid_range", "end must be after start"}
+		return req, &ParseError{"invalid_range", "end must be after start"}
+	}
+	req.Start, req.End = start, end
+
+	// Selector-level dimensions are validated ONCE, here: promql.Render only
+	// escapes, and an embedder constructing a Selector directly is trusted
+	// code. Rejecting control characters and absurd lengths (quoting already
+	// makes injection impossible) keeps a malformed request out of the
+	// upstream query rather than turning it into an obscure store error.
+	for _, p := range []string{"cluster", "namespace", "az", "env"} {
+		if err := validateSelectorValues(p, v[p]); err != nil {
+			return req, err
+		}
 	}
 
-	depth := 0
-	if s := v.Get("depth"); s != "" {
-		d, derr := strconv.Atoi(s)
-		if derr != nil {
-			return start, end, scope, &ParseError{"invalid_depth", "depth must be an integer"}
-		}
-		depth = d
-	}
-	if depth < 0 {
-		// strconv.Atoi accepts a negative integer; reject it here with the same
-		// reason code as a non-integer depth (graph.NewScope would otherwise
-		// surface it as the less-specific invalid_scope).
-		return start, end, scope, &ParseError{"invalid_depth", "depth must be non-negative"}
-	}
-	if depth > graph.MaxTraversalDepth {
-		return start, end, scope, &ParseError{"depth_too_large", "depth exceeds maximum"}
+	prune, err := parsePrune(v.Get("prune"))
+	if err != nil {
+		return req, err
 	}
 
 	// Unknown ?edge_type= values are rejected by graph.NewScope itself
 	// (validated against the registry /v1/edge-types serves), so D32 embedders
 	// constructing scopes directly get the same 400-not-silent-empty guard;
 	// the error surfaces below as the usual invalid_scope ParseError.
-	scope, serr := graph.NewScope(
-		v["cluster"],
-		v["namespace"],
-		v["edge_type"],
-		v["name"],
-		v.Get("root"),
-		depth,
-		v.Get("direction"),
-	)
+	//
+	// Inventory is the INVERSE of `prune` so the zero Scope keeps prune on.
+	scope, serr := graph.NewScope(v["cluster"], v["namespace"], v["edge_type"], !prune)
 	if serr != nil {
-		return start, end, scope, &ParseError{"invalid_scope", serr.Error()}
+		return req, &ParseError{"invalid_scope", serr.Error()}
 	}
-	return start, end, scope, nil
+	req.Scope = scope
+	req.Selector = promql.Selector{
+		AZ:        v["az"],
+		Env:       v["env"],
+		Cluster:   v["cluster"],
+		Namespace: v["namespace"],
+	}
+	return req, nil
+}
+
+// parsePrune reads the single-valued `prune` parameter. Absent ⇒ true (the
+// default connectivity prune); anything other than the two literals is a 400
+// rather than a silently-ignored typo that would return the wrong graph.
+func parsePrune(raw string) (bool, error) {
+	switch raw {
+	case "":
+		return true, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, &ParseError{"invalid_scope", fmt.Sprintf("prune must be true or false, got %q", raw)}
+	}
+}
+
+// validateSelectorValues rejects values that must never reach an upstream
+// query. Empty values are skipped rather than rejected: a bare `?namespace=`
+// is a no-op, matching graph.Scope's own set construction.
+func validateSelectorValues(param string, values []string) error {
+	for _, val := range values {
+		if val == "" {
+			continue
+		}
+		if len(val) > maxSelectorValueLen {
+			return &ParseError{"invalid_scope", fmt.Sprintf("%s value exceeds %d bytes", param, maxSelectorValueLen)}
+		}
+		for _, r := range val {
+			if unicode.IsControl(r) {
+				return &ParseError{"invalid_scope", fmt.Sprintf("%s value contains a control character", param)}
+			}
+		}
+	}
+	return nil
 }
 
 // parseTimestamp accepts an RFC 3339 timestamp or Unix seconds, returning UTC.

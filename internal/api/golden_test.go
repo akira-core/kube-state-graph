@@ -28,7 +28,8 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
 		"with-netapp-storage":  buildWithNetAppStorage(),
-		"name-filter":          buildNameFilter(),
+		"prune-false":          buildPruneFalse(),
+		"filtered-external":    buildFilteredExternalPartner(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 		"link-relation":        buildLinkRelation(),
 		"with-red-metrics":     buildWithREDMetrics(),
@@ -234,25 +235,44 @@ func buildLinkRelation() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{producer, consumer, broker, brokerPod}, Edges: edges}
 }
 
-// buildNameFilter snapshots the projection of a two-cluster graph through
-// `?name=checkout`. The matching pod (cluster-alpha/p1) is the anchor; the
-// cross-cluster partner pod (cluster-beta/p2) is re-added via the unified
-// edge-endpoint partner rule on the pod-calls-pod edge. This fixture's graph
-// carries no pod-to-node edges, so the name-filtered view does not pull in the
-// host K8s nodes (a graph that did include them would, via the pod-to-node edge
-// re-add — see the projection unit tests).
-func buildNameFilter() graph.View {
-	a := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}}
-	b := &graph.PodNode{IDValue: "cluster-beta/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing", "node": "cluster-beta/worker-0"}}
-	nodeA := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
-	nodeB := &graph.K8sNode{IDValue: "cluster-beta/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-beta"}}
-	er := 0.0
+// buildPruneFalse snapshots `?prune=false`: the inventory view. A
+// connectivity-disconnected pod keeps its whole storage chain (host node,
+// claim, NetApp aggregate, owning controller) and an unreferenced podless node
+// is admitted too — the shape that replaces the withdrawn ?name= / ?root=
+// escape hatches.
+func buildPruneFalse() graph.View {
+	idle := &graph.PodNode{IDValue: "cluster-alpha/p9", NameValue: "idle", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-1"}}
+	worker1 := &graph.K8sNode{IDValue: "cluster-alpha/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
+	worker9 := &graph.K8sNode{IDValue: "cluster-alpha/worker-9", NameValue: "worker-9", LabelsValue: map[string]string{"cluster": "cluster-alpha"}, ReadyStatusValue: "NotReady"}
+	pvc := &graph.PVCNode{IDValue: "cluster-alpha/shop/idle-data", NameValue: "idle-data", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "volume": "data"}}
+	aggr := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID("ontap-prod", "aggr2"), NameValue: "aggr2", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-02"}}
+	ctrl := &graph.NetAppNode{IDValue: graph.NetAppNodeID("ontap-prod", "ontap-prod-02"), NameValue: "ontap-prod-02", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"}}
 	edges := []*graph.Edge{
-		graph.NewEdge(graph.EdgeTypePodCallsPod, a.IDValue, b.IDValue, map[string]string{"cluster": "cluster-alpha"}).
-			WithMetrics(graph.EdgeMetrics{Rate: 2, ErrorRate: &er}),
+		graph.NewEdge(graph.EdgeTypePodToNode, idle.IDValue, worker1.IDValue, nil),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, idle.IDValue, pvc.IDValue, map[string]string{"claim_name": "idle-data"}),
+		graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil),
 	}
-	g := graph.NewGraph([]graph.GraphNode{a, b, nodeA, nodeB}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
-	return graph.Project(g, graph.Scope{Names: map[string]struct{}{"checkout": {}}})
+	g := graph.NewGraph([]graph.GraphNode{idle, worker1, worker9, pvc, aggr, ctrl}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
+	return graph.Project(g, graph.Scope{Inventory: true})
+}
+
+// buildFilteredExternalPartner snapshots the filtered-build wire shape: a
+// caller loaded by the request talks to a peer the request's selector did NOT
+// load, so the peer renders as `external/<label>` with empty labels rather
+// than as a synthesised pod. The edge keeps labels.cluster (the client side is
+// a real pod) and carries no metrics (an external endpoint is never measured).
+func buildFilteredExternalPartner() graph.View {
+	caller := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}}
+	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
+	outbound := &graph.ExternalNode{IDValue: graph.ExternalID("cart"), NameValue: "cart", LabelsValue: map[string]string{}}
+	inbound := &graph.ExternalNode{IDValue: graph.ExternalID("frontend"), NameValue: "frontend", LabelsValue: map[string]string{}}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodCallsPod, caller.IDValue, outbound.IDValue, map[string]string{"cluster": "cluster-alpha"}),
+		graph.NewEdge(graph.EdgeTypePodCallsPod, inbound.IDValue, caller.IDValue, map[string]string{}),
+		graph.NewEdge(graph.EdgeTypePodToNode, caller.IDValue, node.IDValue, nil),
+	}
+	g := graph.NewGraph([]graph.GraphNode{caller, node, outbound, inbound}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
+	return graph.Project(g, graph.Scope{Namespaces: map[string]struct{}{"shop": {}}})
 }
 
 // buildWithREDMetrics exercises every wire shape of data.metrics in one body:

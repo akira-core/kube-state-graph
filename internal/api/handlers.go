@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -64,16 +63,15 @@ import (
 //	@Produce		json
 //	@Param			start		query		string		true	"Window start. RFC 3339 (`2026-05-05T11:00:00Z`) or Unix seconds (`1746442800`)."	example(2026-05-05T11:00:00Z)
 //	@Param			end			query		string		true	"Window end. RFC 3339 or Unix seconds. Must be > start."	example(2026-05-05T12:00:00Z)
-//	@Param			cluster		query		[]string	false	"Restrict to listed clusters (repeatable, OR-combined). Names match the upstream `cluster` label."	collectionFormat(multi)	example(prod-eu)
-//	@Param			namespace	query		[]string	false	"Restrict to listed Kubernetes namespaces (repeatable, OR-combined)."	collectionFormat(multi)	example(payments)
+//	@Param			cluster		query		[]string	false	"Restrict to listed clusters (repeatable, OR-combined). Pushed into every cluster-labelled upstream query. The value `unknown` addresses series carrying no `cluster` label."	collectionFormat(multi)	example(prod-eu)
+//	@Param			namespace	query		[]string	false	"Restrict to listed Kubernetes namespaces (repeatable, OR-combined). Pushed into every namespace-labelled upstream query; nodes and NetApp aggregates follow by reference."	collectionFormat(multi)	example(payments)
+//	@Param			az			query		[]string	false	"Restrict to listed availability zones (repeatable, OR-combined). Pushed into every topology query as a matcher on the deployment's configured zone label (default `az`, see --az-label)."	collectionFormat(multi)	example(eu-west-1a)
+//	@Param			env			query		[]string	false	"Restrict to listed environments (repeatable, OR-combined). Pushed into every topology query as a matcher on the deployment's configured environment label (default `env`, see --env-label)."	collectionFormat(multi)	example(prod)
 //	@Param			edge_type	query		[]string	false	"Restrict to listed edge types. Repeatable, OR-combined."	collectionFormat(multi)	Enums(pod-mounts-pvc,pod-calls-pod,pod-calls-service,service-selects-pod,pod-to-node,pvc-to-netapp-aggr)	example(pod-calls-pod)
-//	@Param			name		query		[]string	false	"Restrict to nodes whose name matches exactly across every node type (pod, K8s node, PVC, service, external, netapp-aggr, netapp-node). Repeatable; name collisions across types or clusters return all matches. Edges incident on a matching node are kept and the partner endpoint is re-added subject to other filters."	collectionFormat(multi)	example(checkout-7d9f6c8b8-abcde)
-//	@Param			root		query		string		false	"Node ID anchoring a traversal. Format depends on type — pods `<cluster>/<uid>`, nodes `<cluster>/<node>`, PVCs `<cluster>/<ns>/<claim>`, services `<cluster>/<ns>/<service>`, externals `external/<value>`, NetApp aggregates `netapp/<ontap-cluster>/aggr/<aggr>`, NetApp nodes `netapp/<ontap-cluster>/<node>`."	example(prod-eu/8f8d4f1a-1234-4abc-9def-0123456789ab)
-//	@Param			depth		query		int			false	"BFS traversal depth in hops. Range `0..6`. Defaults to `2` when `root` is set, ignored otherwise."	minimum(0)	maximum(6)	default(2)	example(2)
-//	@Param			direction	query		string		false	"Traversal direction relative to `root`. `out` = downstream edges, `in` = upstream edges, `both` = undirected. Defaults to `both`."	Enums(in,out,both)	default(both)	example(both)
+//	@Param			prune		query		boolean		false	"Keep only workload on a connectivity edge (the default). `false` returns the inventory instead: every loaded pod with its node / PVC / NetApp chain, plus unreferenced infrastructure when no cluster or namespace filter narrows it."	default(true)	example(true)
 //	@Param			X-API-Key	header		string		false	"API key. Required when the server is started with API keys configured."
 //	@Success		200			{object}	cytoscape.Body
-//	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, invalid_range, invalid_depth, depth_too_large, invalid_scope, outside_retention)"
+//	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, invalid_range, invalid_scope, outside_retention)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502			{object}	errorBody	"Upstream VictoriaMetrics returned an error (RFC 9110 §15.6.3)"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout (RFC 9110 §15.6.5)"
@@ -134,7 +132,7 @@ func (s *Server) runBuild(ctx context.Context, req graphRequest) (*graph.Graph, 
 	defer cancel()
 
 	start := time.Now()
-	g, err := s.builder.Build(buildCtx, req.end.Sub(req.start), req.end)
+	g, err := s.builder.Build(buildCtx, req.end.Sub(req.start), req.end, req.sel)
 	s.metrics.BuildDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -146,105 +144,10 @@ func (s *Server) runBuild(ctx context.Context, req graphRequest) (*graph.Graph, 
 	return g, nil
 }
 
-// clustersBody is the response shape of GET /v1/clusters.
-type clustersBody struct {
-	APIVersion string        `json:"apiVersion"`
-	Clusters   []ClusterInfo `json:"clusters"`
-}
-
 // edgeTypesBody is the response shape of GET /v1/edge-types.
 type edgeTypesBody struct {
 	APIVersion string                     `json:"apiVersion"`
 	EdgeTypes  []graph.EdgeTypeDefinition `json:"edge_types"`
-}
-
-// ----- /v1/clusters ---------------------------------------------------------
-
-// ClusterInfo is one entry in /v1/clusters.
-type ClusterInfo struct {
-	Name string `json:"name"`
-}
-
-// handleClusters returns the list of clusters with data in centralised
-// VictoriaMetrics over a fixed 1 h discovery lookback.
-//
-//	@Summary		List clusters
-//	@Description	Returns the set of clusters observed in `kube_node_info` over a fixed 1 h lookback. Each request hits VictoriaMetrics directly under `--api-timeout`.
-//	@Description
-//	@Description	<details><summary><b>Sample response</b></summary>
-//	@Description
-//	@Description	```json
-//	@Description	{
-//	@Description	  "apiVersion": "v1",
-//	@Description	  "clusters": [
-//	@Description	    { "name": "prod-eu" },
-//	@Description	    { "name": "prod-us" },
-//	@Description	    { "name": "stage-eu" }
-//	@Description	  ]
-//	@Description	}
-//	@Description	```
-//	@Description
-//	@Description	</details>
-//	@Tags			discovery
-//	@Produce		json
-//	@Param			X-API-Key	header		string		false	"API key. Required when the server is started with API keys configured."
-//	@Success		200	{object}	clustersBody
-//	@Failure		401	{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
-//	@Failure		502	{object}	errorBody	"Upstream VictoriaMetrics returned an error"
-//	@Failure		504	{object}	errorBody	"Discovery query exceeded --api-timeout"
-//	@Security		ApiKeyAuth
-//	@Router			/v1/clusters [get]
-func (s *Server) handleClusters(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), s.cfg.APITimeout)
-	defer cancel()
-
-	clusters, err := s.discoverClusters(ctx)
-	if err != nil {
-		// Classify into the typed build.Reason and delegate, so the
-		// status/reason/redaction contract lives in exactly one switch
-		// (mapBuildError): canceled → 499, deadline → 504 with the static
-		// build-authored message, anything else → sanitised 502 — the raw
-		// error embeds the internal VictoriaMetrics URL/host/IP and is kept
-		// server-side only.
-		switch {
-		case errors.Is(err, context.Canceled):
-			err = build.NewError(build.ReasonCanceled, "request canceled", err)
-		case errors.Is(err, context.DeadlineExceeded):
-			err = build.NewError(build.ReasonTimeout, "cluster discovery timed out", err)
-		default:
-			err = build.NewError(build.ReasonUpstream, "cluster discovery failed", err)
-		}
-		s.mapBuildError(c, err)
-		return
-	}
-	body := clustersBody{
-		APIVersion: APIVersion,
-		Clusters:   clusters,
-	}
-	raw, _ := json.Marshal(body)
-	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
-}
-
-func (s *Server) discoverClusters(ctx context.Context) ([]ClusterInfo, error) {
-	q := promql.Render(promql.QClusterDiscovery, promql.ClusterDiscoveryLookback)
-	vec, err := s.prom.Instant(ctx, string(promql.QClusterDiscovery), q, s.clk.Now().UTC())
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]struct{}{}
-	for _, sample := range vec {
-		c := string(sample.Metric["cluster"])
-		if c == "" {
-			c = "unknown"
-		}
-		seen[c] = struct{}{}
-	}
-	out := make([]ClusterInfo, 0, len(seen))
-	for c := range seen {
-		out = append(out, ClusterInfo{Name: c})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
 }
 
 // ----- /v1/edge-types -------------------------------------------------------
@@ -312,7 +215,7 @@ func (s *Server) handleLivez(c *gin.Context) {
 func (s *Server) handleReadyz(c *gin.Context) {
 	probeCtx, cancel := context.WithTimeout(c.Request.Context(), s.cfg.APITimeout)
 	defer cancel()
-	_, err := s.prom.Instant(probeCtx, string(promql.QUpProbe), promql.Render(promql.QUpProbe, 0), s.clk.Now().UTC())
+	_, err := s.prom.Instant(probeCtx, string(promql.QUpProbe), promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), s.clk.Now().UTC())
 	if err != nil {
 		// /readyz is unauthenticated; the raw upstream error embeds the internal
 		// VictoriaMetrics URL/host/IP. Return a static message and keep the
@@ -330,6 +233,7 @@ type graphRequest struct {
 	start  time.Time
 	end    time.Time
 	scope  graph.Scope
+	sel    promql.Selector
 	format string
 }
 
@@ -338,7 +242,7 @@ type graphRequest struct {
 // Engine.BuildFromValues), then maps a *kubegraph.ParseError to the existing
 // HTTP 400 response with its stable reason code.
 func (s *Server) parseGraphRequest(c *gin.Context) (graphRequest, error) {
-	start, end, scope, err := kubegraph.ParseValues(c.Request.URL.Query())
+	req, err := kubegraph.ParseValues(c.Request.URL.Query())
 	if err != nil {
 		var pe *kubegraph.ParseError
 		if errors.As(err, &pe) {
@@ -349,9 +253,10 @@ func (s *Server) parseGraphRequest(c *gin.Context) (graphRequest, error) {
 		return graphRequest{}, err
 	}
 	return graphRequest{
-		start:  start,
-		end:    end,
-		scope:  scope,
+		start:  req.Start,
+		end:    req.End,
+		scope:  req.Scope,
+		sel:    req.Selector,
 		format: "cytoscape",
 	}, nil
 }

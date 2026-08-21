@@ -29,9 +29,9 @@ func TestParseValues_EdgeType_AcceptsEveryRegistryEntry(t *testing.T) {
 		t.Run(string(def.Type), func(t *testing.T) {
 			v := edgeTypeBaseValues()
 			v.Set("edge_type", string(def.Type))
-			_, _, scope, err := kubegraph.ParseValues(v)
+			req, err := kubegraph.ParseValues(v)
 			require.NoError(t, err)
-			assert.Contains(t, scope.EdgeTypes, def.Type)
+			assert.Contains(t, req.Scope.EdgeTypes, def.Type)
 		})
 	}
 }
@@ -39,9 +39,9 @@ func TestParseValues_EdgeType_AcceptsEveryRegistryEntry(t *testing.T) {
 func TestParseValues_EdgeType_AcceptsMultipleValid(t *testing.T) {
 	v := edgeTypeBaseValues()
 	v["edge_type"] = []string{"pod-calls-pod", "pod-mounts-pvc"}
-	_, _, scope, err := kubegraph.ParseValues(v)
+	req, err := kubegraph.ParseValues(v)
 	require.NoError(t, err)
-	assert.Len(t, scope.EdgeTypes, 2)
+	assert.Len(t, req.Scope.EdgeTypes, 2)
 }
 
 // An unregistered edge_type (e.g. the plural typo "pod-calls-pods") is a 400,
@@ -60,7 +60,7 @@ func TestParseValues_EdgeType_UnknownRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := edgeTypeBaseValues()
 			v.Set("edge_type", tc.value)
-			_, _, _, err := kubegraph.ParseValues(v)
+			_, err := kubegraph.ParseValues(v)
 			require.Error(t, err)
 			var pe *kubegraph.ParseError
 			require.ErrorAs(t, err, &pe)
@@ -75,7 +75,7 @@ func TestParseValues_EdgeType_UnknownRejected(t *testing.T) {
 func TestParseValues_EdgeType_UnknownAmongValidRejected(t *testing.T) {
 	v := edgeTypeBaseValues()
 	v["edge_type"] = []string{"pod-calls-pod", "pod-calls-pods"}
-	_, _, _, err := kubegraph.ParseValues(v)
+	_, err := kubegraph.ParseValues(v)
 	require.Error(t, err)
 	var pe *kubegraph.ParseError
 	require.ErrorAs(t, err, &pe)
@@ -88,7 +88,7 @@ func TestParseValues_EdgeType_UnknownAmongValidRejected(t *testing.T) {
 func TestParseValues_EdgeType_EmptyValueIgnored(t *testing.T) {
 	v := edgeTypeBaseValues()
 	v.Set("edge_type", "")
-	_, _, scope, err := kubegraph.ParseValues(v)
+	req, err := kubegraph.ParseValues(v)
 	require.NoError(t, err)
-	assert.Empty(t, scope.EdgeTypes)
+	assert.Empty(t, req.Scope.EdgeTypes)
 }

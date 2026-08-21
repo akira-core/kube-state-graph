@@ -38,6 +38,9 @@ type Options struct {
 	RouteResolver build.RouteResolver
 	// RouteResolveTimeout mirrors build.Options.RouteResolveTimeout.
 	RouteResolveTimeout time.Duration
+	// LabelKeys names the upstream labels the request's `az` / `env` filter
+	// dimensions are matched against. Zero value ⇒ the defaults (`az`, `env`).
+	LabelKeys promql.LabelKeys
 }
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
@@ -59,6 +62,7 @@ func New(q promql.Querier, opts Options) *Engine {
 		APITimeout:          opts.APITimeout,
 		RouteResolver:       opts.RouteResolver,
 		RouteResolveTimeout: opts.RouteResolveTimeout,
+		LabelKeys:           opts.LabelKeys,
 	}, opts.Metrics, clk)
 	return &Engine{builder: b, q: q, clk: clk}
 }
@@ -71,9 +75,11 @@ func (e *Engine) Probe(ctx context.Context) error {
 }
 
 // Build runs the multi-cluster build for [end-window, end] and returns the
-// immutable graph. The caller supplies any build deadline via ctx.
-func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time) (*graph.Graph, error) {
-	return e.builder.Build(ctx, window, end)
+// immutable graph. sel carries the request-scoped selector dimensions pushed
+// into the upstream queries; a zero Selector is the unfiltered build. The
+// caller supplies any build deadline via ctx.
+func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	return e.builder.Build(ctx, window, end, sel)
 }
 
 // BuildFromValues parses the /v1/graph query parameters, builds the graph,
@@ -82,13 +88,13 @@ func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time)
 // in kube-state-graph's API); build failures propagate the build layer's typed
 // errors. The caller supplies any build deadline via ctx.
 func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
-	start, end, scope, err := ParseValues(v)
+	req, err := ParseValues(v)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	g, err := e.builder.Build(ctx, end.Sub(start), end)
+	g, err := e.builder.Build(ctx, req.End.Sub(req.Start), req.End, req.Selector)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	return cytoscape.Serialise(g, graph.Project(g, scope)), nil
+	return cytoscape.Serialise(g, graph.Project(g, req.Scope)), nil
 }

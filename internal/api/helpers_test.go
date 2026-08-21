@@ -16,6 +16,7 @@ import (
 	"github.com/akira-core/kube-state-graph/internal/observability"
 	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/clock"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
@@ -109,7 +110,12 @@ func newServerWithMocksAndKeys(t *testing.T, q *promqlmocks.MockQuerier, ks *aut
 
 	logger := observability.NewLogger("error")
 	metrics := observability.NewMetrics()
-	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clock.System{})
+	// Mirror cmd/kube-state-graph's wiring so a test that rebinds a label key
+	// through Config exercises the same path production does.
+	builder := build.New(q, build.Options{
+		APITimeout: cfg.APITimeout,
+		LabelKeys:  promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
+	}, metrics, clock.System{})
 	return New(cfg, builder, q, metrics, logger, ks, clock.System{})
 }
 

@@ -1,7 +1,7 @@
 package api
 
 import (
-	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,11 +21,11 @@ import (
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
-// TestHandleClusters_UsesInjectedClock proves the discovery handler queries
+// TestHandleReadyz_UsesInjectedClock proves the readiness handler queries
 // upstream at the injected Clock's Now(), not at wall-clock time. Demonstrates
 // the mockery-generated MockQuerier + MockClock + MockValidator working
 // together against the production handler with no httptest fixtures.
-func TestHandleClusters_UsesInjectedClock(t *testing.T) {
+func TestHandleReadyz_UsesInjectedClock(t *testing.T) {
 	pinned := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 
 	clk := clockmocks.NewMockClock(t)
@@ -35,14 +35,11 @@ func TestHandleClusters_UsesInjectedClock(t *testing.T) {
 	q.EXPECT().
 		Instant(
 			mock.Anything,
-			string(promql.QClusterDiscovery),
+			string(promql.QUpProbe),
 			mock.AnythingOfType("string"),
 			pinned,
 		).
-		Return(model.Vector{
-			&model.Sample{Metric: model.Metric{"cluster": "alpha"}, Value: 1, Timestamp: 0},
-			&model.Sample{Metric: model.Metric{"cluster": "beta"}, Value: 1, Timestamp: 0},
-		}, nil).
+		Return(model.Vector{&model.Sample{Metric: model.Metric{"job": "vm"}, Value: 1}}, nil).
 		Once()
 
 	keys := authmocks.NewMockValidator(t)
@@ -60,22 +57,12 @@ func TestHandleClusters_UsesInjectedClock(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
 
-	resp, err := http.Get(httpSrv.URL + "/v1/clusters") //nolint:noctx,gosec // test server URL
+	resp, err := http.Get(httpSrv.URL + "/readyz") //nolint:noctx,gosec // test server URL
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var body struct {
-		APIVersion string `json:"apiVersion"`
-		Clusters   []struct {
-			Name string `json:"name"`
-		} `json:"clusters"`
-	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, "v1", body.APIVersion)
-	got := make([]string, 0, len(body.Clusters))
-	for _, c := range body.Clusters {
-		got = append(got, c.Name)
-	}
-	assert.ElementsMatch(t, []string{"alpha", "beta"}, got)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(body))
 }

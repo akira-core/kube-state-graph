@@ -307,29 +307,6 @@
                 },
                 "type": "object"
             },
-            "internal_api.ClusterInfo": {
-                "properties": {
-                    "name": {
-                        "type": "string"
-                    }
-                },
-                "type": "object"
-            },
-            "internal_api.clustersBody": {
-                "properties": {
-                    "apiVersion": {
-                        "type": "string"
-                    },
-                    "clusters": {
-                        "items": {
-                            "$ref": "#/components/schemas/internal_api.ClusterInfo"
-                        },
-                        "type": "array",
-                        "uniqueItems": false
-                    }
-                },
-                "type": "object"
-            },
             "internal_api.edgeTypesBody": {
                 "properties": {
                     "apiVersion": {
@@ -502,72 +479,6 @@
                 ]
             }
         },
-        "/v1/clusters": {
-            "get": {
-                "description": "Returns the set of clusters observed in `kube_node_info` over a fixed 1 h lookback. Each request hits VictoriaMetrics directly under `--api-timeout`.\n\n\u003cdetails\u003e\u003csummary\u003e\u003cb\u003eSample response\u003c/b\u003e\u003c/summary\u003e\n\n```json\n{\n\"apiVersion\": \"v1\",\n\"clusters\": [\n{ \"name\": \"prod-eu\" },\n{ \"name\": \"prod-us\" },\n{ \"name\": \"stage-eu\" }\n]\n}\n```\n\n\u003c/details\u003e",
-                "parameters": [
-                    {
-                        "description": "API key. Required when the server is started with API keys configured.",
-                        "in": "header",
-                        "name": "X-API-Key",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/internal_api.clustersBody"
-                                }
-                            }
-                        },
-                        "description": "OK"
-                    },
-                    "401": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/internal_api.errorBody"
-                                }
-                            }
-                        },
-                        "description": "Missing or invalid `X-API-Key` (only when API key auth is configured)"
-                    },
-                    "502": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/internal_api.errorBody"
-                                }
-                            }
-                        },
-                        "description": "Upstream VictoriaMetrics returned an error"
-                    },
-                    "504": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/internal_api.errorBody"
-                                }
-                            }
-                        },
-                        "description": "Discovery query exceeded --api-timeout"
-                    }
-                },
-                "security": [
-                    {
-                        "ApiKeyAuth": []
-                    }
-                ],
-                "summary": "List clusters",
-                "tags": [
-                    "discovery"
-                ]
-            }
-        },
         "/v1/edge-types": {
             "get": {
                 "description": "Static catalogue of edge types this server can produce — directionality, valid source/target node types, supported labels, and whether the edge may cross cluster boundaries. No upstream calls; served with `Cache-Control: public, max-age=3600`. Use this to validate the `edge_type` filter on `/v1/graph` and to drive UI legends.\n\n\u003cdetails\u003e\u003csummary\u003e\u003cb\u003eEdge type matrix\u003c/b\u003e\u003c/summary\u003e\n\n| type | source → target | directed | cross-cluster |\n|---|---|---|---|\n| `pod-mounts-pvc` | pod → pvc | yes | no |\n| `pod-calls-pod` | pod \\| service \\| external → pod \\| external | yes | yes |\n| `pod-calls-service` | pod \\| service \\| external → service | yes | yes |\n| `service-selects-pod` | service → pod | yes | yes |\n\nAn ingress entry-point `service` node carries `labels.role`: `ingress-gateway` (chain entry hop; gateway pods and a synthesized `pod-calls-service` hop to the backend exist behind it) or `ingress-lb` (ingress LB fallback destination, no routed backend).\n\nA call endpoint whose pod UID is empty and whose `client`/`server` label is a `://` connection string is resolved (detection hardcoded, no operator knob) against every loaded cluster in the caller's family (cluster names equal after normalising digit runs; anchored on the UID-recovered client-pod cluster when available, else the trace-source label): each surviving family cluster holding the addressed Service yields a `service` node and a `pod-calls-service` edge (which may therefore cross clusters). Candidates provably without backing pods (zero endpoints in an endpoint-visible cluster) are pruned when an endpoint-backed sibling exists; an anchor naming no loaded family falls back to the single loaded family holding the Service (multi-family names are ambiguous and stay external). Zero surviving candidates yield an `external` node. A non-URL missing-UID label resolves to an `external` node. `service-selects-pod` edges are materialised on demand from `service` nodes to their own cluster's backing pods.\n\n\u003c/details\u003e",
@@ -639,7 +550,7 @@
                         }
                     },
                     {
-                        "description": "Restrict to listed clusters (repeatable, OR-combined). Names match the upstream `cluster` label.",
+                        "description": "Restrict to listed clusters (repeatable, OR-combined). Pushed into every cluster-labelled upstream query. The value `unknown` addresses series carrying no `cluster` label.",
                         "example": "prod-eu",
                         "in": "query",
                         "name": "cluster",
@@ -652,10 +563,36 @@
                         "style": "form"
                     },
                     {
-                        "description": "Restrict to listed Kubernetes namespaces (repeatable, OR-combined).",
+                        "description": "Restrict to listed Kubernetes namespaces (repeatable, OR-combined). Pushed into every namespace-labelled upstream query; nodes and NetApp aggregates follow by reference.",
                         "example": "payments",
                         "in": "query",
                         "name": "namespace",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Restrict to listed availability zones (repeatable, OR-combined). Pushed into every topology query as a matcher on the deployment's configured zone label (default `az`, see --az-label).",
+                        "example": "eu-west-1a",
+                        "in": "query",
+                        "name": "az",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Restrict to listed environments (repeatable, OR-combined). Pushed into every topology query as a matcher on the deployment's configured environment label (default `env`, see --env-label).",
+                        "example": "prod",
+                        "in": "query",
+                        "name": "env",
                         "schema": {
                             "items": {
                                 "type": "string"
@@ -686,52 +623,13 @@
                         "style": "form"
                     },
                     {
-                        "description": "Restrict to nodes whose name matches exactly across every node type (pod, K8s node, PVC, service, external, netapp-aggr, netapp-node). Repeatable; name collisions across types or clusters return all matches. Edges incident on a matching node are kept and the partner endpoint is re-added subject to other filters.",
-                        "example": "checkout-7d9f6c8b8-abcde",
+                        "description": "Keep only workload on a connectivity edge (the default). `false` returns the inventory instead: every loaded pod with its node / PVC / NetApp chain, plus unreferenced infrastructure when no cluster or namespace filter narrows it.",
+                        "example": true,
                         "in": "query",
-                        "name": "name",
+                        "name": "prune",
                         "schema": {
-                            "items": {
-                                "type": "string"
-                            },
-                            "type": "array"
-                        },
-                        "style": "form"
-                    },
-                    {
-                        "description": "Node ID anchoring a traversal. Format depends on type — pods `\u003ccluster\u003e/\u003cuid\u003e`, nodes `\u003ccluster\u003e/\u003cnode\u003e`, PVCs `\u003ccluster\u003e/\u003cns\u003e/\u003cclaim\u003e`, services `\u003ccluster\u003e/\u003cns\u003e/\u003cservice\u003e`, externals `external/\u003cvalue\u003e`, NetApp aggregates `netapp/\u003contap-cluster\u003e/aggr/\u003caggr\u003e`, NetApp nodes `netapp/\u003contap-cluster\u003e/\u003cnode\u003e`.",
-                        "example": "prod-eu/8f8d4f1a-1234-4abc-9def-0123456789ab",
-                        "in": "query",
-                        "name": "root",
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    {
-                        "description": "BFS traversal depth in hops. Range `0..6`. Defaults to `2` when `root` is set, ignored otherwise.",
-                        "example": 2,
-                        "in": "query",
-                        "name": "depth",
-                        "schema": {
-                            "default": 2,
-                            "maximum": 6,
-                            "minimum": 0,
-                            "type": "integer"
-                        }
-                    },
-                    {
-                        "description": "Traversal direction relative to `root`. `out` = downstream edges, `in` = upstream edges, `both` = undirected. Defaults to `both`.",
-                        "example": "both",
-                        "in": "query",
-                        "name": "direction",
-                        "schema": {
-                            "default": "both",
-                            "enum": [
-                                "in",
-                                "out",
-                                "both"
-                            ],
-                            "type": "string"
+                            "default": true,
+                            "type": "boolean"
                         }
                     },
                     {
@@ -762,7 +660,7 @@
                                 }
                             }
                         },
-                        "description": "Invalid parameters (missing/invalid start|end, invalid_range, invalid_depth, depth_too_large, invalid_scope, outside_retention)"
+                        "description": "Invalid parameters (missing/invalid start|end, invalid_range, invalid_scope, outside_retention)"
                     },
                     "401": {
                         "content": {

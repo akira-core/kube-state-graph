@@ -47,22 +47,33 @@ func New(q promql.Querier, opts Options, m Metrics, clk clock.Clock) *Builder {
 
 // Build runs all upstream queries for [end - window, end] and returns the
 // joined multi-cluster Graph.
-func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time) (*graph.Graph, error) {
+//
+// sel carries the request-scoped selector dimensions (`az`, `env`, `cluster`,
+// `namespace`). A zero Selector is the unfiltered build: every query is issued
+// exactly as it was before request-scoped selectors existed, and every
+// filtered-build rule below stays inert.
+func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	filtered := sel.Active()
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
+			attribute.Bool("kube_state_graph.selector_active", filtered),
 		),
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, b.q, window, end)
+	topology, err := ReadTopology(ctx, b.q, window, end, b.opts.LabelKeys, sel)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
 
 	// Outside-retention check: zero pods + healthy upstream ⇒ retention miss.
-	if len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
+	// Only meaningful for an UNFILTERED build. With any selector-level filter
+	// active, zero rows means "nothing in scope" — a legitimate empty result,
+	// not a client-classifiable retention error — so the classification (and
+	// its up{} probe) is skipped entirely.
+	if !filtered && len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
 		up, probeErr := b.upProbe(ctx)
 		if probeErr != nil {
 			// A failed probe must not fail the build (control flow / status
@@ -96,15 +107,15 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 				"end", endStr,
 				"window", window.String(),
 				"raw_series_counts", topology.RawSeriesCount,
-				"pod_info_query", promql.Render(promql.QPodInfo, window),
-				"node_info_query", promql.Render(promql.QNodeInfo, window),
+				"pod_info_query", promql.Render(promql.QPodInfo, window, b.opts.LabelKeys, sel),
+				"node_info_query", promql.Render(promql.QNodeInfo, window, b.opts.LabelKeys, sel),
 			)
 			return nil, err
 		}
 	}
 
 	sg, err := ReadServiceGraph(ctx, b.q, window, end, topology,
-		b.opts.RouteResolver, b.opts.RouteResolveTimeout)
+		b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
 	if err != nil {
 		return nil, classifyReadError(span, "service-graph read failed", err)
 	}
@@ -127,6 +138,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		}
 	}
 	slog.InfoContext(ctx, "graph built",
+		"selector_active", filtered,
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
@@ -226,7 +238,7 @@ func (b *Builder) upProbe(ctx context.Context) (bool, error) {
 		defer cancel()
 	}
 	vec, err := b.q.Instant(ctx, string(promql.QUpProbe),
-		promql.Render(promql.QUpProbe, 0), b.clk.Now().UTC())
+		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), b.clk.Now().UTC())
 	if err != nil {
 		return false, err
 	}

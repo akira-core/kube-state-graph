@@ -615,7 +615,7 @@ func TestReadServiceGraph_ResolverErrorDegradesToExternal(t *testing.T) {
 	}}
 
 	res, err := ReadServiceGraph(context.Background(), q,
-		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
+		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err, "a resolver error must never fail the read")
 	require.Len(t, resolver.requests(), 1, "the prescan collected the endpoint")
 
@@ -636,7 +636,7 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 	}}
 
 	res, err := ReadServiceGraph(context.Background(), q,
-		window, end, sampleTopologyWithServices(), resolver, time.Second)
+		window, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err)
 	require.Len(t, resolver.requests(), 1)
 	assert.Equal(t, RouteRequest{
@@ -670,7 +670,7 @@ func TestReadServiceGraph_NoDNSAnswersNeverConsultsResolver(t *testing.T) {
 	}}
 
 	res, err := ReadServiceGraph(context.Background(), q,
-		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
+		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err)
 	assert.Empty(t, resolver.requests(), "no engine call for an IP-less endpoint")
 
@@ -687,7 +687,7 @@ func TestReadServiceGraph_NilResolverNeverPrescans(t *testing.T) {
 	expectServiceGraphQueries(q, end, vec)
 
 	res, err := ReadServiceGraph(context.Background(), q,
-		5*time.Minute, end, sampleTopologyWithServices(), nil, 0)
+		5*time.Minute, end, sampleTopologyWithServices(), nil, 0, false)
 	require.NoError(t, err)
 	require.Len(t, res.ExternalNodes, 1, "feature off: pre-change external fallback")
 }

@@ -109,7 +109,7 @@ The build SHALL accept four request-scoped selector dimensions — `az`, `env`, 
 - `namespace`: every kube-state-metrics and kubelet series that carries a `namespace` label (the pod-, claim-, Service-, and EndpointSlice-scoped series). Never a node series, never a Harvest series, never a service-graph series.
 - The three `traces_service_graph_*` series and the `up{}` probe SHALL carry **no** request-scoped matcher under any request.
 
-Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted; an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=""` (see "Series missing the cluster label"). Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
+Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=""` (see "Series missing the cluster label"). Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
 
 A build with every dimension empty SHALL issue each query exactly as it is issued today. Zero rows under a non-empty dimension is a valid, empty topology — not a failure and not a retention miss.
 
@@ -136,7 +136,7 @@ A build with every dimension empty SHALL issue each query exactly as it is issue
 #### Scenario: Regex metacharacters in a value are quoted
 
 - **WHEN** a build runs with `env={prod.eu, prod-us}`
-- **THEN** the rendered alternation is `env=~"prod-us|prod\.eu"` and a series with `env="prodXeu"` does not match
+- **THEN** the rendered alternation is `env=~"prod-us|prod\\.eu"` — the metacharacter is regex-quoted AND the resulting backslash is escaped for the PromQL string literal, which rejects an unknown escape sequence — so a series with `env="prodXeu"` does not match
 
 #### Scenario: Empty dimensions render nothing
 

@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/akira-core/kube-state-graph/internal/config"
-	"github.com/akira-core/kube-state-graph/pkg/clock"
 	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
@@ -200,15 +199,13 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 	s.Require().True(s.WaitForSeries(`kube_node_status_condition{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_node_status_condition")
 
-	// These probe nodes host no pod, so the default view hides them (generalised
-	// D6: a no-filter response only carries nodes referenced by an in-scope pod).
-	// `ready_status` still surfaces — fetch each node directly via ?name= (the
-	// name-filter exception admits a podless infra node by name).
+	// These probe nodes host no pod, so the default view hides them (a no-filter
+	// response only carries nodes referenced by an in-scope pod). `ready_status`
+	// still surfaces — `prune=false` is the escape hatch that admits an
+	// unreferenced infra node (the withdrawn ?name= exception's replacement).
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
-		q.Add("name", "ready-probe-ready")
-		q.Add("name", "ready-probe-unknown")
-		q.Add("name", "ready-probe-nocond")
+		q.Set("prune", "false")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
@@ -248,32 +245,6 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 		"node with no Ready series is still present")
 	s.Empty(status["cluster-alpha/ready-probe-nocond"],
 		"no Ready series → ready_status omitted, DISTINCT from Unknown")
-}
-
-func (s *GraphSuite) TestNameFilter_PodAnchor() {
-	srv := s.StartAPIServer(func(cfg *config.Config) {})
-	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("name", "checkout") }))
-	defer func() { _ = resp.Body.Close() }()
-	s.Require().Equal(http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	s.Contains(bodyStr, `"id":"cluster-alpha/alpha-1"`, "checkout pod present")
-	// Cross-cluster partner pod IS re-added by the unified edge-endpoint
-	// rule on pod-calls-pod, so the cross-cluster edge can render with
-	// both endpoints visible.
-	s.Contains(bodyStr, `"id":"cluster-beta/beta-1"`,
-		"cross-cluster partner pod re-added as edge endpoint of named anchor")
-}
-
-func (s *GraphSuite) TestNameFilter_UnknownReturnsEmpty() {
-	srv := s.StartAPIServer(func(cfg *config.Config) {})
-	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("name", "does-not-exist") }))
-	defer func() { _ = resp.Body.Close() }()
-	s.Require().Equal(http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	s.Contains(bodyStr, `"nodes":[]`)
-	s.Contains(bodyStr, `"edges":[]`)
 }
 
 // TestPodOwnerAttributeSkipReplicaSet — D34. Ingest kube_pod_owner for the
@@ -1195,16 +1166,21 @@ traces_service_graph_request_total{client="xfam-client",server="unknown",cluster
 	s.NotContains(bodyStr, `external/10.244.9.9`, "the Pod IP literal must not leak as an external node")
 }
 
-func (s *GraphSuite) TestClustersDiscovery() {
-	// Discovery handler evaluates "now" via the injected Clock. Pin it to
-	// fixedNow so the 1h discovery lookback covers the statically-timestamped
-	// fixtures.
-	srv := s.StartAPIServer(nil, WithClock(clock.Fake{T: fixedNow}))
+// /v1/clusters is removed (BREAKING): the cluster list lives in the graph
+// body instead, derived from the built graph's node labels and sorted.
+func (s *GraphSuite) TestClustersEndpointRemoved() {
+	srv := s.StartAPIServer(nil)
 	resp := s.httpGet(srv.URL + "/v1/clusters")
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	s.Contains(string(body), "cluster-alpha")
-	s.Contains(string(body), "cluster-beta")
+	s.Equal(http.StatusNotFound, resp.StatusCode)
+
+	graphResp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = graphResp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, graphResp.StatusCode)
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(graphResp.Body).Decode(&body))
+	s.Contains(body.Clusters, "cluster-alpha")
+	s.Contains(body.Clusters, "cluster-beta")
 }
 
 func (s *GraphSuite) TestEdgeTypesCatalogue() {

@@ -30,7 +30,7 @@ func parseServiceGraphREDRoutes(vec, failed, duration model.Vector, topology Top
 	if len(vec) == 0 {
 		return ServiceGraphResult{}
 	}
-	return parseWithResolver(vec, newSGResolver(topology), routes, redInputs{
+	return parseWithResolver(vec, newSGResolver(topology, false), routes, redInputs{
 		Failed:   failed,
 		Duration: duration,
 	})
@@ -487,7 +487,7 @@ func TestRED_ShuffleInputByteIdentical(t *testing.T) {
 
 func TestRED_FailureQueryError_OmitsErrorRate(t *testing.T) {
 	vec := sampleVec(uidPodSample("abc", "def", 5))
-	res := parseWithResolver(vec, newSGResolver(sampleTopology()), nil, redInputs{
+	res := parseWithResolver(vec, newSGResolver(sampleTopology(), false), nil, redInputs{
 		FailedErr: assertAnError{},
 	})
 	m := edgeMetrics(t, res, "cluster-alpha/abc", "cluster-beta/def")
@@ -546,7 +546,7 @@ func TestRED_DurationNoLe_OmitsP90(t *testing.T) {
 
 func TestRED_BothREDQueriesError_RateOnly(t *testing.T) {
 	vec := sampleVec(uidPodSample("abc", "def", 7))
-	res := parseWithResolver(vec, newSGResolver(sampleTopology()), nil, redInputs{
+	res := parseWithResolver(vec, newSGResolver(sampleTopology(), false), nil, redInputs{
 		FailedErr:   assertAnError{},
 		DurationErr: assertAnError{},
 	})

@@ -1,43 +1,36 @@
 package graph
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 )
 
-// Direction governs traversal direction.
-type Direction string
-
-const (
-	DirectionIn   Direction = "in"
-	DirectionOut  Direction = "out"
-	DirectionBoth Direction = "both"
-)
-
-// MaxTraversalDepth is the hard upper bound on traversal depth (D7 / spec).
-const MaxTraversalDepth = 6
-
-// Scope describes the projection filter applied at response time.
+// Scope describes the projection filter applied at response time, over the
+// freshly built graph.
+//
+// `cluster` and `namespace` appear here AND as upstream selector dimensions
+// (promql.Selector): the build narrows the topology at the source, and the
+// projection applies the same two filters again as defence in depth — a node
+// that reached the graph anyway (an unlabelled series bucketed to
+// cluster="unknown", say) must not slip into a filtered view.
 type Scope struct {
 	Clusters   map[string]struct{}   // empty ⇒ no cluster filter
 	Namespaces map[string]struct{}   // empty ⇒ no namespace filter
 	EdgeTypes  map[EdgeType]struct{} // empty ⇒ all edge types
-	Names      map[string]struct{}   // empty ⇒ no name filter
 
-	Root      string    // empty ⇒ no traversal
-	Depth     int       // 0..MaxTraversalDepth
-	Direction Direction // in | out | both
+	// Inventory turns the default connectivity prune OFF: every pod is emitted
+	// with its pod-to-node / pod-mounts-pvc / pvc-to-netapp-aggr chain
+	// regardless of traffic, and an infrastructure node is admitted even when
+	// nothing in scope references it (bounded by the filters that CAN exclude
+	// it by its own labels — see infraNodePassesFilters).
+	//
+	// It is the INVERSE of the request's `prune` parameter (`prune=false` ⇒
+	// Inventory=true) so the zero Scope keeps today's meaning: prune on.
+	Inventory bool
 }
 
-// NewScope constructs a Scope from raw query parameter values, validating ranges.
-func NewScope(clusters, namespaces, edgeTypes, names []string, root string, depth int, direction string) (Scope, error) {
-	if depth < 0 {
-		return Scope{}, errors.New("depth must be non-negative")
-	}
-	if depth > MaxTraversalDepth {
-		return Scope{}, errors.New("depth exceeds maximum")
-	}
+// NewScope constructs a Scope from raw query parameter values, validating them.
+func NewScope(clusters, namespaces, edgeTypes []string, inventory bool) (Scope, error) {
 	// Validate edge types against the single in-code registry (EdgeTypes) so a
 	// typo like "pod-calls-pods" is an error, not a scope that silently
 	// filters every edge out. Living here (not in the HTTP parser) gives D32
@@ -51,39 +44,18 @@ func NewScope(clusters, namespaces, edgeTypes, names []string, root string, dept
 			return Scope{}, fmt.Errorf("unknown edge_type %q", et)
 		}
 	}
-	if root != "" {
-		if depth == 0 {
-			depth = 2
-		}
-		switch Direction(direction) {
-		case "":
-			direction = string(DirectionBoth)
-		case DirectionIn, DirectionOut, DirectionBoth:
-		default:
-			return Scope{}, errors.New("invalid direction")
-		}
-	}
 	return Scope{
 		Clusters:   stringSet(clusters),
 		Namespaces: stringSet(namespaces),
 		EdgeTypes:  edgeTypeSet(edgeTypes),
-		Names:      stringSet(names),
-		Root:       root,
-		Depth:      depth,
-		Direction:  Direction(direction),
+		Inventory:  inventory,
 	}, nil
 }
 
-// NameFilterActive reports whether the scope restricts to a named node set
-// (matched by Name() across every node type).
-func (s Scope) NameFilterActive() bool {
-	return len(s.Names) > 0
-}
-
 // edgeTypeAllowed reports whether an edge of type t is permitted by the
-// edge-type filter (an empty filter permits every type). Traversal consults
-// this so BFS only crosses in-scope edge types — a node reachable solely via a
-// filtered-out edge must not enter the view as an orphan (no incident edge).
+// edge-type filter (an empty filter permits every type). filterEdges is its
+// only caller; it stays a method so the "empty means all" convention lives
+// with the field it governs.
 func (s Scope) edgeTypeAllowed(t EdgeType) bool {
 	if len(s.EdgeTypes) == 0 {
 		return true

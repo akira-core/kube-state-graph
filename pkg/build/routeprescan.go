@@ -271,7 +271,9 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	if len(vec) == 0 {
 		return nil
 	}
-	return collectRouteQueriesWith(vec, newSGResolver(topology))
+	// The prescan is pure lookup — it materialises nothing — so the filtered
+	// flag is irrelevant here; ReadServiceGraph shares its own resolver anyway.
+	return collectRouteQueriesWith(vec, newSGResolver(topology, false))
 }
 
 // viaRouteKey derives the route key for one endpoint anchored on its OWN

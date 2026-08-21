@@ -1,8 +1,7 @@
 {
   "apiVersion": "v1",
   "clusters": [
-    "cluster-alpha",
-    "cluster-beta"
+    "cluster-alpha"
   ],
   "elements": {
     "nodes": [
@@ -16,27 +15,10 @@
       },
       {
         "data": {
-          "id": "cluster/cluster-beta",
-          "name": "cluster-beta",
-          "type": "cluster",
-          "labels": {}
-        }
-      },
-      {
-        "data": {
           "id": "cluster-alpha/namespace/shop",
           "name": "shop",
           "type": "namespace",
           "parent": "cluster/cluster-alpha",
-          "labels": {}
-        }
-      },
-      {
-        "data": {
-          "id": "cluster-beta/namespace/billing",
-          "name": "billing",
-          "type": "namespace",
-          "parent": "cluster/cluster-beta",
           "labels": {}
         }
       },
@@ -55,32 +37,60 @@
       },
       {
         "data": {
-          "id": "cluster-beta/p2",
-          "name": "payments",
-          "type": "pod",
-          "parent": "cluster-beta/namespace/billing",
+          "id": "cluster-alpha/worker-0",
+          "name": "worker-0",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
           "labels": {
-            "cluster": "cluster-beta",
-            "namespace": "billing",
-            "node": "cluster-beta/worker-0"
+            "cluster": "cluster-alpha"
           }
+        }
+      },
+      {
+        "data": {
+          "id": "external/cart",
+          "name": "cart",
+          "type": "external",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "external/frontend",
+          "name": "frontend",
+          "type": "external",
+          "labels": {}
         }
       }
     ],
     "edges": [
       {
         "data": {
-          "id": "9db88ec6-f174-5bfc-9fba-7f29b361f7dd",
+          "id": "4a665ead-99ab-516a-be8a-be7c3e3efabf",
           "type": "pod-calls-pod",
           "source": "cluster-alpha/p1",
-          "target": "cluster-beta/p2",
+          "target": "external/cart",
           "labels": {
             "cluster": "cluster-alpha"
-          },
-          "metrics": {
-            "rate": 2,
-            "error_rate": 0
           }
+        }
+      },
+      {
+        "data": {
+          "id": "b7907bfd-4f08-5a4f-b8b8-bbac465b1f33",
+          "type": "pod-to-node",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/worker-0",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "bd4954cd-033a-54bb-9328-1a9f22854331",
+          "type": "pod-calls-pod",
+          "source": "external/frontend",
+          "target": "cluster-alpha/p1",
+          "labels": {}
         }
       }
     ]

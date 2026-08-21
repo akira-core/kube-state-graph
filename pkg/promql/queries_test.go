@@ -9,14 +9,14 @@ import (
 )
 
 func TestRender_PodInfoNoClusterFilter(t *testing.T) {
-	got := Render(QPodInfo, time.Minute)
+	got := Render(QPodInfo, time.Minute, LabelKeys{}, Selector{})
 	assert.Contains(t, got, "kube_pod_info")
 	assert.Contains(t, got, "[1m]")
 	assert.NotContains(t, got, "cluster=~", "PromQL must not push cluster filtering")
 }
 
 func TestRender_ServiceGraphTotal(t *testing.T) {
-	got := Render(QServiceGraphTotal, time.Minute)
+	got := Render(QServiceGraphTotal, time.Minute, LabelKeys{}, Selector{})
 	assert.Contains(t, got, "traces_service_graph_request_total")
 	assert.NotContains(t, got, "client_cluster")
 	assert.NotContains(t, got, "server_cluster")
@@ -30,7 +30,7 @@ func TestRender_ServiceGraphTotal(t *testing.T) {
 // The match is exact (RE2 is fully anchored) and case-sensitive, so a
 // connection string such as "http://user/..." is NOT excluded.
 func TestRender_ServiceGraphExcludesSentinelPeers(t *testing.T) {
-	got := Render(QServiceGraphTotal, time.Minute)
+	got := Render(QServiceGraphTotal, time.Minute, LabelKeys{}, Selector{})
 	assert.Equal(t, `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[1m])`, got)
 	assert.Contains(t, got, `client!~"user|unknown"`)
 	assert.Contains(t, got, `server!~"user"`)
@@ -44,7 +44,7 @@ func TestRender_ServiceGraphExcludesSentinelPeers(t *testing.T) {
 }
 
 func TestRender_NodeAddressesIncludesExternalIPSelector(t *testing.T) {
-	got := Render(QNodeAddresses, time.Minute)
+	got := Render(QNodeAddresses, time.Minute, LabelKeys{}, Selector{})
 	assert.Contains(t, got, `type=~"ExternalIP|InternalIP"`)
 }
 
@@ -73,11 +73,10 @@ func TestRender_BareKSMNames(t *testing.T) {
 		{"node-status-condition", QNodeStatusCondition, time.Minute, `last_over_time(kube_node_status_condition{condition="Ready"}[1m])`},
 		{"service-annotations", QServiceAnnotations, time.Minute, "last_over_time(kube_service_annotations[1m])"},
 		{"pvc-annotations", QPVCAnnotations, time.Minute, "last_over_time(kube_persistentvolumeclaim_annotations[1m])"},
-		{"cluster-discovery", QClusterDiscovery, time.Hour, "group by (cluster) (last_over_time(kube_node_info[1h]))"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, Render(tc.q, tc.window))
+			assert.Equal(t, tc.want, Render(tc.q, tc.window, LabelKeys{}, Selector{}))
 		})
 	}
 }
@@ -87,7 +86,7 @@ func TestRender_BareKSMNames(t *testing.T) {
 // metric name (no prefix), stable Query constant.
 func TestRender_ServiceGraphFailedTotal(t *testing.T) {
 	want := `rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",edge_relation!="link"}[1m])`
-	assert.Equal(t, want, Render(QServiceGraphFailedTotal, time.Minute))
+	assert.Equal(t, want, Render(QServiceGraphFailedTotal, time.Minute, LabelKeys{}, Selector{}))
 	assert.Equal(t, "traces_service_graph_request_failed_total", string(QServiceGraphFailedTotal))
 }
 
@@ -97,7 +96,7 @@ func TestRender_ServiceGraphFailedTotal(t *testing.T) {
 // identity. Sentinel + span-link selectors, bare metric name (no prefix).
 func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
 	want := `rate(traces_service_graph_request_server_seconds_bucket{client!~"user|unknown",server!~"user",edge_relation!="link"}[1m])`
-	got := Render(QServiceGraphServerSecondsBucket, time.Minute)
+	got := Render(QServiceGraphServerSecondsBucket, time.Minute, LabelKeys{}, Selector{})
 	assert.Equal(t, want, got)
 	assert.NotContains(t, got, "sum by",
 		"the duration histogram must NOT be aggregated upstream — a group-by silently merges unrelated edges")
@@ -110,15 +109,15 @@ func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
 // so filtering it out of the request-total query would delete the edge itself,
 // not just its numbers.
 func TestRender_ServiceGraphTotalKeepsSpanLinkSeries(t *testing.T) {
-	total := Render(QServiceGraphTotal, time.Minute)
+	total := Render(QServiceGraphTotal, time.Minute, LabelKeys{}, Selector{})
 	assert.Equal(t, `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[1m])`, total)
 	assert.NotContains(t, total, "edge_relation",
 		"the request-total selector must not exclude span-link series")
 
 	for _, q := range []Query{QServiceGraphFailedTotal, QServiceGraphServerSecondsBucket} {
-		assert.Contains(t, Render(q, time.Minute), `edge_relation!="link"`,
+		assert.Contains(t, Render(q, time.Minute, LabelKeys{}, Selector{}), `edge_relation!="link"`,
 			"RED selector %s must exclude span-link series", q)
-		assert.NotContains(t, Render(q, time.Minute), "client_k8s_pod_uid",
+		assert.NotContains(t, Render(q, time.Minute, LabelKeys{}, Selector{}), "client_k8s_pod_uid",
 			"RED selector %s must not filter on pod UIDs — peer-resolved edges are eligible", q)
 	}
 }
@@ -159,7 +158,7 @@ func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.q), func(t *testing.T) {
-			got := Render(tc.q, time.Minute)
+			got := Render(tc.q, time.Minute, LabelKeys{}, Selector{})
 			assert.Equal(t, tc.want, got)
 			assert.NotContains(t, got, "rate(")
 			assert.NotContains(t, got, "sum by")
@@ -171,7 +170,7 @@ func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 // TestRender_NodeStatusConditionSelector pins the fixed condition="Ready"
 // metric-selection contract (not a caller filter).
 func TestRender_NodeStatusConditionSelector(t *testing.T) {
-	got := Render(QNodeStatusCondition, time.Minute)
+	got := Render(QNodeStatusCondition, time.Minute, LabelKeys{}, Selector{})
 	assert.Equal(t, `last_over_time(kube_node_status_condition{condition="Ready"}[1m])`, got)
 	assert.Contains(t, got, `condition="Ready"`)
 	assert.NotContains(t, got, "cluster=~", "PromQL must not push cluster filtering")
@@ -202,7 +201,7 @@ func TestRender_QoSVolumeGranularity(t *testing.T) {
 	t.Parallel()
 
 	for _, q := range []Query{QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData} {
-		got := Render(q, time.Minute)
+		got := Render(q, time.Minute, LabelKeys{}, Selector{})
 		if !strings.Contains(got, `{lun=""}`) {
 			t.Errorf("Render(%s) = %q, want the lun=\"\" volume-granularity matcher", q, got)
 		}
@@ -212,7 +211,7 @@ func TestRender_QoSVolumeGranularity(t *testing.T) {
 	}
 
 	for _, q := range []Query{QVolumeLabels, QQoSPolicyFixedMaxIOPS, QQoSPolicyFixedMaxMBps} {
-		if got := Render(q, time.Minute); strings.Contains(got, "lun=") {
+		if got := Render(q, time.Minute, LabelKeys{}, Selector{}); strings.Contains(got, "lun=") {
 			t.Errorf("Render(%s) = %q, want no lun matcher", q, got)
 		}
 	}

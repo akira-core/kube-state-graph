@@ -1,6 +1,10 @@
 package build
 
-import "time"
+import (
+	"time"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
+)
 
 // Options configures a Builder. It carries only the build-relevant settings,
 // decoupled from any server-side configuration struct, so the package is
@@ -18,4 +22,8 @@ type Options struct {
 	// during the pre-parse resolution pass. Zero means each call inherits
 	// only the build context's deadline.
 	RouteResolveTimeout time.Duration
+	// LabelKeys names the upstream labels the request's `az` / `env` filter
+	// dimensions are matched against. The zero value means the defaults
+	// (`az`, `env`); validation lives where the keys are configured.
+	LabelKeys promql.LabelKeys
 }

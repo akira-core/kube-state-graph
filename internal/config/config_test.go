@@ -194,3 +194,47 @@ func TestParse_RouteStoreAuth_NoFlagsRegistered(t *testing.T) {
 		})
 	}
 }
+
+// The az / env label keys default to the built-in binding, are overridable by
+// env and then by flag, and are validated as PromQL label names at startup —
+// an invalid key would otherwise break every topology query at request time.
+func TestParse_LabelKeys(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+
+	cfg, err := Parse(nil, noEnv)
+	require.NoError(t, err)
+	assert.Equal(t, "az", cfg.AZLabel)
+	assert.Equal(t, "env", cfg.EnvLabel)
+
+	env := map[string]string{"KSG_AZ_LABEL": "topology_zone", "KSG_ENV_LABEL": "deployment_tier"}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	cfg, err = Parse(nil, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "topology_zone", cfg.AZLabel)
+	assert.Equal(t, "deployment_tier", cfg.EnvLabel)
+
+	cfg, err = Parse([]string{"--az-label=zone"}, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "zone", cfg.AZLabel, "flag overrides env")
+	assert.Equal(t, "deployment_tier", cfg.EnvLabel)
+}
+
+func TestParse_LabelKeysRejected(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"dotted az key", []string{"--az-label=topology.kubernetes.io/zone"}, "KSG_AZ_LABEL"},
+		{"empty env key", []string{"--env-label="}, "KSG_ENV_LABEL"},
+		{"identical keys", []string{"--az-label=scope", "--env-label=scope"}, "must differ"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.args, noEnv)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}

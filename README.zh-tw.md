@@ -22,8 +22,9 @@ cluster N: kube-state-metrics ──┤
 - 依呼叫端指定的 `[start, end]`，從**單一**集中式 VictoriaMetrics 讀取 `kube_*` 拓樸與 `traces_service_graph_*` 執行期指標。
 - Join 成多叢集圖，節點鍵為帶叢集範圍的 pod UID 與 node 名稱。
 - 回傳 Cytoscape.js JSON（`/v1/graph`）。
-- 提供叢集探索（`/v1/clusters`）與靜態邊類型目錄（`/v1/edge-types`）。
+- 提供靜態邊類型目錄（`/v1/edge-types`）。有資料的叢集清單改由任一 `/v1/graph` 回應的 `clusters` 欄位提供。
 - 每次請求都重新建圖——v1 **不附帶 in-process result cache、singleflight，也不發 HTTP cache validator**（無 `ETag` / `If-None-Match` / `304`）。後續分散式部署的水平擴展 cache 機制留待另案。`start` / `end` 接受 RFC 3339 或 Unix 秒，server 僅強制 `end > start`，其後原樣 pass through 給上游 PromQL——**不做** bucketing、alignment、視窗上限或未來時間擋板；bounded query cost 交由 VictoriaMetrics 搜尋限制負責。序列化輸出為確定性 body，僅含 `apiVersion`、`clusters`、`elements`；pod／node／service 的 IP 在頂層 `ipaddress`，不在 `labels`。Pod 另帶具型別的 `data` 屬性——`owner`（`{kind, name}`）、`application`（ArgoCD 應用）、`containers`（`[{name, image}]`）——皆 `omitempty` 且絕不在 `labels`。
+- **在來源端收斂**：`cluster`、`namespace`、`az`、`env` 會被渲染成上游 PromQL 的 label matcher，由 VictoriaMetrics 先過濾，樣本才上線。service-graph 系列刻意完整讀取，詳見[請求過濾參數](#請求過濾參數)。
 
 ## 快速開始
 
@@ -37,11 +38,47 @@ make build
 查詢範例（`start`／`end` 為 Unix 秒，下列寫法在 macOS 與 Linux 皆可）：
 
 ```bash
-curl 'http://localhost:8080/v1/clusters'
 end=$(date -u +%s)
 start=$((end - 300))
 curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
+
+# 單一 namespace 的儲存拓樸，含無流量的工作負載。
+curl "http://localhost:8080/v1/graph?start=${start}&end=${end}&namespace=payments&prune=false" | jq '.elements'
+
+# 單一可用區／環境。
+curl "http://localhost:8080/v1/graph?start=${start}&end=${end}&az=eu-west-1a&env=prod" | jq '.clusters'
 ```
+
+## 請求過濾參數
+
+`GET /v1/graph` 必填 `start`、`end`，另有六個選填參數。同一參數多值為 OR，不同參數為 AND。
+
+| 參數 | 生效層 | 說明 |
+|---|---|---|
+| `cluster` | 上游 **與** projection | 可重複。`unknown` 代表未帶 `cluster` label 的系列。 |
+| `namespace` | 上游 **與** projection | 可重複。收斂 pod／claim／Service／EndpointSlice 系列；node 與 NetApp aggregate 則**靠參照**跟著收斂。 |
+| `az` | 上游 | 可重複。比對 `--az-label`（預設 `az`），套用於所有拓樸查詢。 |
+| `env` | 上游 | 可重複。比對 `--env-label`（預設 `env`）。 |
+| `edge_type` | projection | 可重複，依 `/v1/edge-types` 驗證。 |
+| `prune` | projection | `true`（預設）只保留位於 connectivity edge 上的工作負載；`false` 回傳完整清單：所有已載入 pod 及其 node／PVC／NetApp 鏈，且在未帶 `cluster`／`namespace` 時連未被參照的基礎設施也一併列出。 |
+
+**哪個 matcher 進到哪條系列**是硬編碼契約：
+
+| 系列 | `az` | `env` | `cluster` | `namespace` |
+|---|---|---|---|---|
+| pod／claim／Service／EndpointSlice KSM 系列、kubelet volume stats | ✅ | ✅ | ✅ | ✅ |
+| `kube_node_*` | ✅ | ✅ | ✅ | —（無此 label） |
+| NetApp Harvest（`volume_labels`、`qos_*`、`aggr_*`、`node_new_status`） | ✅ | ✅ | —（其 `cluster` 是 **ONTAP** 叢集） | — |
+| `traces_service_graph_*`、`up` | — | — | — | — |
+
+service-graph 系列**每次請求都完整讀取**：其 `cluster` label 常缺漏且來自 trace 來源端，namespace label 也只描述呼叫端自身視角，在此收斂會丟掉已載入拓樸仍需要的邊。取而代之，帶過濾參數的建圖套用兩條規則：
+
+- endpoint 的 pod **未載入**時，比照 UID 為空處理——`"://"` label 仍可解析到已載入的 Service，其餘一律成為 `external/<label>`（`labels` 為空），且**永不產生 synthesised pod**；
+- 一條系列至少要有**一端**觸及已載入拓樸才會被採用，範圍外的其他部分因此不會渲染成 external 節點網。
+
+可見後果：帶 `?cluster=` 或 `?namespace=` 時，過濾範圍外的 peer 會以 `external` 節點呈現而非真實 pod——不必載入其餘估整體，也能看見該範圍的進出相依。
+
+> **部署前提**：所有拓樸系列族（kube-state-metrics、kubelet、Harvest）都必須帶上所設定的 `az` / `env` label。缺少者在該過濾條件下不會匹配到任何資料；又因預設 projection 只保留有連線的工作負載，缺 label 可能讓帶過濾參數的請求回傳空圖而非部分圖。
 
 ## 上游指標
 
@@ -78,8 +115,7 @@ curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
 
 | PromQL | 用途 |
 |---|---|
-| `group by (cluster) (last_over_time(kube_node_info[1h]))` | 驅動 `GET /v1/clusters` |
-| `up` | 區分「視窗內無資料」（`outside_retention`）與「上游正常但視窗為空」 |
+| `up` | 支撐 `GET /readyz`，並區分「視窗內無資料」（`outside_retention`）與「上游正常但視窗為空」。僅在**未帶過濾參數**的建圖才發送——只要帶了任一過濾參數，零筆結果即代表「範圍內無資料」，回 200 空圖。 |
 
 ### 邊類型 ↔ 指標
 
@@ -103,11 +139,13 @@ pod→node 關係**不**以邊表達，而是由 Cytoscape compound nesting（`c
 | `--prom-url` | `KSG_PROM_URL` | `http://localhost:8428` | VictoriaMetrics Prometheus 相容 endpoint。 |
 | `--listen-addr` | `KSG_LISTEN_ADDR` | `:8080` | HTTP 監聽位址。 |
 | `--build-timeout` | `KSG_BUILD_TIMEOUT` | `15s` | `/v1/graph` 的單次建圖 context 逾時。 |
-| `--api-timeout` | `KSG_API_TIMEOUT` | `5s` | 非 graph 端點的 upstream 呼叫逾時（`/v1/clusters`、`/readyz`）。 |
+| `--api-timeout` | `KSG_API_TIMEOUT` | `5s` | 建圖以外的 upstream 呼叫逾時（`/readyz` 探針、outside-retention 探針）。 |
 | `--api-keys-file` | `KSG_API_KEYS_FILE` | （空） | 接受的 API key 檔案路徑（每行一個，`#` 為註解）。為 K8s `Secret` 掛載而設計，會週期性重新讀取。 |
 | `--api-keys` | `KSG_API_KEYS` | （空） | 逗號分隔字面 key；僅 dev 用途，設了 `--api-keys-file` 即忽略。 |
 | `--api-keys-reload-interval` | `KSG_API_KEYS_RELOAD_INTERVAL` | `30s` | `--api-keys-file` 重新讀取頻率；`0` 關閉熱重載。 |
 | `--log-level` | `KSG_LOG_LEVEL` | `info` | `debug \| info \| warn \| error`。 |
+| `--az-label` | `KSG_AZ_LABEL` | `az` | `?az=` 參數比對的上游 label。請求參數名稱固定不變，只有 label 綁定會改；必須是合法 PromQL label name 且與 `--env-label` 不同。 |
+| `--env-label` | `KSG_ENV_LABEL` | `env` | `?env=` 參數比對的上游 label。 |
 
 ## 文件
 

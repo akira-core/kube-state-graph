@@ -5,9 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // Config holds the parsed runtime configuration for the kube-state-graph server.
@@ -59,6 +62,15 @@ type Config struct {
 	// openspec/changes/add-prom-basic-auth/design.md D-A1/D-A2.
 	PromUsername string
 	PromPassword string
+	// AZLabel / EnvLabel name the UPSTREAM labels the `az` and `env` request
+	// parameters are matched against (KSG_AZ_LABEL / KSG_ENV_LABEL,
+	// --az-label / --env-label). The request parameter names themselves are
+	// fixed — only the label binding moves, so a deployment whose scrape
+	// config stamps e.g. `topology_zone` configures it here rather than
+	// asking clients to rename their queries. Validated as PromQL label names
+	// and required to differ.
+	AZLabel  string
+	EnvLabel string
 }
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
@@ -83,6 +95,8 @@ func Defaults() Config {
 		RouteStorePassword:    "",
 		PromUsername:          "",
 		PromPassword:          "",
+		AZLabel:               promql.DefaultAZLabel,
+		EnvLabel:              promql.DefaultEnvLabel,
 	}
 }
 
@@ -98,11 +112,13 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.PromURL, "prom-url", cfg.PromURL, "VictoriaMetrics Prometheus-compatible URL.")
 	fs.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTP listen address.")
 	fs.DurationVar(&cfg.BuildTimeout, "build-timeout", cfg.BuildTimeout, "Per-build context timeout for /v1/graph.")
-	fs.DurationVar(&cfg.APITimeout, "api-timeout", cfg.APITimeout, "Per-request context timeout for non-graph endpoints with upstream calls (/v1/clusters, /readyz).")
+	fs.DurationVar(&cfg.APITimeout, "api-timeout", cfg.APITimeout, "Per-request context timeout for upstream calls outside a graph build (/readyz probe, outside-retention probe).")
 	fs.StringVar(&cfg.APIKeysFile, "api-keys-file", cfg.APIKeysFile, "Path to a file holding accepted API keys (one per line, # comments allowed). Reloaded periodically. Takes precedence over --api-keys.")
 	fs.StringVar(&cfg.APIKeys, "api-keys", cfg.APIKeys, "Comma-separated list of accepted API keys. Used when --api-keys-file is unset.")
 	fs.DurationVar(&cfg.APIKeysReloadInterval, "api-keys-reload-interval", cfg.APIKeysReloadInterval, "How often to re-read --api-keys-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error.")
+	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
+	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
@@ -154,6 +170,8 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		return err
 	}
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
+	getStr("KSG_AZ_LABEL", &cfg.AZLabel)
+	getStr("KSG_ENV_LABEL", &cfg.EnvLabel)
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
 	// Env-only by design — no matching flags are registered in Parse
 	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
@@ -225,8 +243,23 @@ func (c Config) Validate() error {
 	if c.RouteResolveTimeout < 0 {
 		return errors.New("route-resolve-timeout must be >= 0 (0 inherits the build deadline)")
 	}
+	// The az / env label keys are rendered verbatim into every topology query,
+	// so an invalid key would produce a PromQL parse error on every request
+	// instead of a startup failure. Reject it here, naming the setting.
+	if !labelNameRE.MatchString(c.AZLabel) {
+		return fmt.Errorf("az-label (KSG_AZ_LABEL) is not a valid PromQL label name: %q", c.AZLabel)
+	}
+	if !labelNameRE.MatchString(c.EnvLabel) {
+		return fmt.Errorf("env-label (KSG_ENV_LABEL) is not a valid PromQL label name: %q", c.EnvLabel)
+	}
+	if c.AZLabel == c.EnvLabel {
+		return fmt.Errorf("az-label and env-label must differ (both %q): one matcher would overwrite the other", c.AZLabel)
+	}
 	return nil
 }
+
+// labelNameRE is the PromQL label-name grammar.
+var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 func splitAndTrim(v string) []string {
 	if v == "" {

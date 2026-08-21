@@ -226,21 +226,6 @@ components:
         name:
           type: string
       type: object
-    internal_api.ClusterInfo:
-      properties:
-        name:
-          type: string
-      type: object
-    internal_api.clustersBody:
-      properties:
-        apiVersion:
-          type: string
-        clusters:
-          items:
-            $ref: '#/components/schemas/internal_api.ClusterInfo'
-          type: array
-          uniqueItems: false
-      type: object
     internal_api.edgeTypesBody:
       properties:
         apiVersion:
@@ -356,61 +341,6 @@ paths:
       summary: Readiness
       tags:
       - health
-  /v1/clusters:
-    get:
-      description: |-
-        Returns the set of clusters observed in `kube_node_info` over a fixed 1 h lookback. Each request hits VictoriaMetrics directly under `--api-timeout`.
-
-        <details><summary><b>Sample response</b></summary>
-
-        ```json
-        {
-        "apiVersion": "v1",
-        "clusters": [
-        { "name": "prod-eu" },
-        { "name": "prod-us" },
-        { "name": "stage-eu" }
-        ]
-        }
-        ```
-
-        </details>
-      parameters:
-      - description: API key. Required when the server is started with API keys configured.
-        in: header
-        name: X-API-Key
-        schema:
-          type: string
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/internal_api.clustersBody'
-          description: OK
-        "401":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/internal_api.errorBody'
-          description: Missing or invalid `X-API-Key` (only when API key auth is configured)
-        "502":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/internal_api.errorBody'
-          description: Upstream VictoriaMetrics returned an error
-        "504":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/internal_api.errorBody'
-          description: Discovery query exceeded --api-timeout
-      security:
-      - ApiKeyAuth: []
-      summary: List clusters
-      tags:
-      - discovery
   /v1/edge-types:
     get:
       description: |-
@@ -508,8 +438,9 @@ paths:
         required: true
         schema:
           type: string
-      - description: Restrict to listed clusters (repeatable, OR-combined). Names
-          match the upstream `cluster` label.
+      - description: Restrict to listed clusters (repeatable, OR-combined). Pushed
+          into every cluster-labelled upstream query. The value `unknown` addresses
+          series carrying no `cluster` label.
         example: prod-eu
         in: query
         name: cluster
@@ -519,9 +450,33 @@ paths:
           type: array
         style: form
       - description: Restrict to listed Kubernetes namespaces (repeatable, OR-combined).
+          Pushed into every namespace-labelled upstream query; nodes and NetApp aggregates
+          follow by reference.
         example: payments
         in: query
         name: namespace
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: Restrict to listed availability zones (repeatable, OR-combined).
+          Pushed into every topology query as a matcher on the deployment's configured
+          zone label (default `az`, see --az-label).
+        example: eu-west-1a
+        in: query
+        name: az
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: Restrict to listed environments (repeatable, OR-combined). Pushed
+          into every topology query as a matcher on the deployment's configured environment
+          label (default `env`, see --env-label).
+        example: prod
+        in: query
+        name: env
         schema:
           items:
             type: string
@@ -543,50 +498,16 @@ paths:
             type: string
           type: array
         style: form
-      - description: Restrict to nodes whose name matches exactly across every node
-          type (pod, K8s node, PVC, service, external, netapp-aggr, netapp-node).
-          Repeatable; name collisions across types or clusters return all matches.
-          Edges incident on a matching node are kept and the partner endpoint is re-added
-          subject to other filters.
-        example: checkout-7d9f6c8b8-abcde
+      - description: 'Keep only workload on a connectivity edge (the default). `false`
+          returns the inventory instead: every loaded pod with its node / PVC / NetApp
+          chain, plus unreferenced infrastructure when no cluster or namespace filter
+          narrows it.'
+        example: true
         in: query
-        name: name
+        name: prune
         schema:
-          items:
-            type: string
-          type: array
-        style: form
-      - description: Node ID anchoring a traversal. Format depends on type — pods
-          `<cluster>/<uid>`, nodes `<cluster>/<node>`, PVCs `<cluster>/<ns>/<claim>`,
-          services `<cluster>/<ns>/<service>`, externals `external/<value>`, NetApp
-          aggregates `netapp/<ontap-cluster>/aggr/<aggr>`, NetApp nodes `netapp/<ontap-cluster>/<node>`.
-        example: prod-eu/8f8d4f1a-1234-4abc-9def-0123456789ab
-        in: query
-        name: root
-        schema:
-          type: string
-      - description: BFS traversal depth in hops. Range `0..6`. Defaults to `2` when
-          `root` is set, ignored otherwise.
-        example: 2
-        in: query
-        name: depth
-        schema:
-          default: 2
-          maximum: 6
-          minimum: 0
-          type: integer
-      - description: Traversal direction relative to `root`. `out` = downstream edges,
-          `in` = upstream edges, `both` = undirected. Defaults to `both`.
-        example: both
-        in: query
-        name: direction
-        schema:
-          default: both
-          enum:
-          - in
-          - out
-          - both
-          type: string
+          default: true
+          type: boolean
       - description: API key. Required when the server is started with API keys configured.
         in: header
         name: X-API-Key
@@ -605,7 +526,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/internal_api.errorBody'
           description: Invalid parameters (missing/invalid start|end, invalid_range,
-            invalid_depth, depth_too_large, invalid_scope, outside_retention)
+            invalid_scope, outside_retention)
         "401":
           content:
             application/json:

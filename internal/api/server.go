@@ -73,7 +73,6 @@ func (s *Server) Handler() http.Handler {
 		s.spanEnrichMiddleware(),
 	)
 	v1.GET("/graph", s.handleGraph)
-	v1.GET("/clusters", s.handleClusters)
 	v1.GET("/edge-types", s.handleEdgeTypes)
 
 	r.GET("/livez", s.handleLivez)

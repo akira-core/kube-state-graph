@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -180,79 +178,45 @@ func TestGraphEndpoint_UpstreamError_Returns502(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
 }
 
-// --- /v1/clusters --------------------------------------------------------
+// --- removed endpoint ----------------------------------------------------
 
-// clustersFixture returns three sample series matching the discovery query.
-func clustersFixture() fixtureSet {
-	return fixtureSet{
-		"group by (cluster)": vec(
-			map[string]string{"cluster": "prod-east"},
-			map[string]string{"cluster": "prod-west"},
-			map[string]string{"cluster": "stg"},
-		),
-	}
-}
-
-func TestClustersEndpoint_SortedOutput(t *testing.T) {
-	s := newServerWithMocks(t, newMockQuerier(t, clustersFixture()), nil)
-	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(srv.Close)
-
-	resp, err := http.Get(srv.URL + "/v1/clusters")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var body clustersBody
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	require.Len(t, body.Clusters, 3)
-	assert.Equal(t, "prod-east", body.Clusters[0].Name)
-	assert.Equal(t, "prod-west", body.Clusters[1].Name)
-	assert.Equal(t, "stg", body.Clusters[2].Name)
-}
-
-func TestClustersEndpoint_HitsUpstreamPerRequest(t *testing.T) {
-	// Counting variant: a thin RunAndReturn around the substring matcher
-	// records how many times the discovery query was dispatched. Mockery's
-	// .Times(n) covers this too, but here we want to assert the *minimum*
-	// independent-request count without coupling to call ordering.
-	var calls atomic.Int32
+// /v1/clusters is removed (BREAKING). A removed v1 route must 404 like any
+// unknown path — no redirect, no 410, and no upstream call.
+func TestClustersEndpoint_Removed(t *testing.T) {
 	q := promqlmocks.NewMockQuerier(t)
 	q.EXPECT().
 		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, _, query string, _ time.Time) (model.Vector, error) {
-			if strings.Contains(query, "group by (cluster)") {
-				calls.Add(1)
-				return vec(
-					map[string]string{"cluster": "prod-east"},
-					map[string]string{"cluster": "prod-west"},
-					map[string]string{"cluster": "stg"},
-				), nil
-			}
+		RunAndReturn(func(_ context.Context, _, _ string, _ time.Time) (model.Vector, error) {
+			t.Error("a removed route must not query upstream")
 			return model.Vector{}, nil
 		}).
-		Times(3)
+		Maybe()
 
 	s := newServerWithMocks(t, q, nil)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	for range 3 {
-		resp, err := http.Get(srv.URL + "/v1/clusters")
-		require.NoError(t, err)
-		resp.Body.Close()
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-	}
-	assert.Equal(t, int32(3), calls.Load(), "each /v1/clusters request must hit upstream (no in-process cache)")
-}
-
-func TestClustersEndpoint_UpstreamError_Returns502(t *testing.T) {
-	s := newServerWithMocks(t, newErrQuerier(t, errors.New("upstream 500: boom")), nil)
-	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(srv.Close)
-
 	resp, err := http.Get(srv.URL + "/v1/clusters")
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// The clusters list now lives in the graph body, derived from the built
+// graph's node labels and sorted.
+func TestGraphEndpoint_ClustersFieldListsObservedClusters(t *testing.T) {
+	s := newServerWithMocks(t, newMockQuerier(t, happyFixtures()), nil)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&prune=false")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var body struct {
+		Clusters []string `json:"clusters"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, []string{"test"}, body.Clusters, "derived from the built graph's node labels")
 }

@@ -1,0 +1,138 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "storage-cluster/ontap-prod",
+          "name": "ontap-prod",
+          "type": "storage-cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/p9",
+          "name": "idle",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/idle-data",
+          "name": "idle-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "volume": "data"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-1",
+          "name": "worker-1",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-9",
+          "name": "worker-9",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "ready_status": "NotReady",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/aggr/aggr2",
+          "name": "aggr2",
+          "type": "netapp-aggr",
+          "parent": "netapp/ontap-prod/ontap-prod-02",
+          "labels": {
+            "node": "ontap-prod-02",
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/ontap-prod-02",
+          "name": "ontap-prod-02",
+          "type": "netapp-node",
+          "parent": "storage-cluster/ontap-prod",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "073584ad-7120-56bf-8571-e01c9b3a17df",
+          "type": "pod-mounts-pvc",
+          "source": "cluster-alpha/p9",
+          "target": "cluster-alpha/shop/idle-data",
+          "labels": {
+            "claim_name": "idle-data"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "2d0b7e1d-da31-5680-b7e5-01ed7fd8e84f",
+          "type": "pvc-to-netapp-aggr",
+          "source": "cluster-alpha/shop/idle-data",
+          "target": "netapp/ontap-prod/aggr/aggr2",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "afee87c7-bb44-595b-90fc-ce72147cf17a",
+          "type": "pod-to-node",
+          "source": "cluster-alpha/p9",
+          "target": "cluster-alpha/worker-1",
+          "labels": {}
+        }
+      }
+    ]
+  }
+}

@@ -46,6 +46,12 @@ type VMSuite struct {
 	HTTPAuthUsername string
 	HTTPAuthPassword string
 
+	// ExtraLabels is stamped onto every series ingested through IngestExpFmt
+	// that does not already carry the key — the scrape-time external labels a
+	// real deployment applies. Set it in SetupSuite/SetupTest; leave empty for
+	// suites whose fixtures spell every label out.
+	ExtraLabels string
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	container testcontainers.Container
@@ -156,10 +162,67 @@ func (s *VMSuite) WaitForReady(budget time.Duration) {
 	s.Require().FailNowf("vm_not_ready", "VictoriaMetrics did not become ready within %s", budget)
 }
 
+// StampLabels injects extra label pairs into every series line of an
+// exposition block, skipping any key the line already carries. It models the
+// scrape-time external labels a real deployment adds (`az`, `env`, `cluster`),
+// so a fixture written for topology shape does not have to repeat them on
+// every line — and a test that wants a DIFFERENT value (or none) simply
+// spells that key out itself.
+func StampLabels(exposition, extra string) string {
+	if extra == "" {
+		return exposition
+	}
+	var keys []string
+	for _, pair := range strings.Split(extra, ",") {
+		if k, _, ok := strings.Cut(pair, "="); ok {
+			keys = append(keys, strings.TrimSpace(k)+"=")
+		}
+	}
+	lines := strings.Split(exposition, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		open := strings.Index(line, "{")
+		if open < 0 {
+			// `metric value ts` — give it a label set.
+			name, rest, ok := strings.Cut(line, " ")
+			if !ok {
+				continue
+			}
+			lines[i] = name + "{" + extra + "} " + rest
+			continue
+		}
+		closeIdx := strings.LastIndex(line, "}")
+		if closeIdx < open {
+			continue
+		}
+		labels := line[open+1 : closeIdx]
+		var missing []string
+		for j, k := range keys {
+			if !strings.Contains(labels, k) {
+				missing = append(missing, strings.Split(extra, ",")[j])
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		sep := ","
+		if strings.TrimSpace(labels) == "" {
+			sep = ""
+		}
+		lines[i] = line[:closeIdx] + sep + strings.Join(missing, ",") + line[closeIdx:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 // IngestExpFmt POSTs Prometheus exposition-format text to VM's
-// /api/v1/import/prometheus endpoint. Each line is one sample.
+// /api/v1/import/prometheus endpoint. Each line is one sample. When
+// ExtraLabels is set it is stamped onto every series first (see StampLabels).
 func (s *VMSuite) IngestExpFmt(exposition string) {
 	s.T().Helper()
+	exposition = StampLabels(exposition, s.ExtraLabels)
 	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost,
 		s.vmURL+"/api/v1/import/prometheus", strings.NewReader(exposition))
 	s.Require().NoError(err)
@@ -281,6 +344,7 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       o.routeResolver,
 		RouteResolveTimeout: o.routeResolveTimeout,
+		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
 	}, metrics, o.clk)
 	srv := api.New(cfg, builder, prom, metrics, logger, ks, o.clk)
 

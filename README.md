@@ -27,8 +27,8 @@ cluster N: kube-state-metrics ──┤
 - Joins them into a multi-cluster graph keyed by cluster-scoped pod UIDs and
   node names.
 - Returns the graph as Cytoscape.js JSON (`/v1/graph`).
-- Exposes cluster discovery (`/v1/clusters`) and a static edge-type catalogue
-  (`/v1/edge-types`).
+- Exposes a static edge-type catalogue (`/v1/edge-types`). The set of clusters
+  with data is the `clusters` field of any `/v1/graph` response.
 - Builds the graph on every request — v1 ships **no in-process result cache**,
   **no singleflight**, and **no HTTP cache validators** (`ETag` /
   `If-None-Match` / `304`). A horizontally scalable cache mechanism for
@@ -44,6 +44,11 @@ cluster N: kube-state-metrics ──┤
   `labels`. Pods additionally carry typed `data` attributes — `owner`
   (`{kind, name}`), `application` (the ArgoCD Application), and `containers`
   (`[{name, image}]`) — all `omitempty` and never inside `labels`.
+- Narrows the build **at the source**: `cluster`, `namespace`, `az` and `env`
+  are rendered into the upstream PromQL queries as label matchers, so
+  VictoriaMetrics does the filtering before a sample crosses the wire. The
+  service-graph series are deliberately read in full (see
+  [Request filters](#request-filters)).
 
 ## Quick start
 
@@ -57,20 +62,72 @@ make build
 Then:
 
 ```bash
-curl 'http://localhost:8080/v1/clusters'
 curl 'http://localhost:8080/v1/graph?start=$(date -u -d "-5 min" +%s)&end=$(date -u +%s)' | jq '.elements'
+
+# One namespace's storage topology, including workload with no traffic.
+curl 'http://localhost:8080/v1/graph?start=…&end=…&namespace=payments&prune=false' | jq '.elements'
+
+# One zone / environment.
+curl 'http://localhost:8080/v1/graph?start=…&end=…&az=eu-west-1a&env=prod' | jq '.clusters'
 ```
 
 When the server is started with API keys configured (`--api-keys-file` or
 `--api-keys`), every `/v1/*` request must carry an `X-API-Key: <key>` header:
 
 ```bash
-curl -H 'X-API-Key: my-secret-key' 'http://localhost:8080/v1/clusters'
+curl -H 'X-API-Key: my-secret-key' 'http://localhost:8080/v1/edge-types'
 ```
 
 Health probes (`/livez`, `/readyz`), `/metrics`, and the docs routes
 (`/openapi.*`, `/docs`) are exempt and require no key. With no keys configured
 the middleware is a no-op and every route is open.
+
+## Request filters
+
+`GET /v1/graph` takes `start`, `end` (both required) plus six optional
+parameters. Values within one parameter are OR-combined, different parameters
+are AND-combined.
+
+| Parameter | Applied | Notes |
+|---|---|---|
+| `cluster` | upstream **and** projection | Repeatable. `unknown` addresses series carrying no `cluster` label. |
+| `namespace` | upstream **and** projection | Repeatable. Narrows the pod-, claim-, Service- and EndpointSlice-scoped series; nodes and NetApp aggregates follow **by reference**. |
+| `az` | upstream | Repeatable. Matched against `--az-label` (default `az`) on every topology query. |
+| `env` | upstream | Repeatable. Matched against `--env-label` (default `env`). |
+| `edge_type` | projection | Repeatable; validated against `/v1/edge-types`. |
+| `prune` | projection | `true` (default) keeps only workload on a connectivity edge. `false` returns the inventory: every loaded pod with its node / PVC / NetApp chain, plus unreferenced infrastructure when no `cluster` or `namespace` filter narrows it. |
+
+**Which matcher reaches which series** is a hardcoded contract:
+
+| Series | `az` | `env` | `cluster` | `namespace` |
+|---|---|---|---|---|
+| pod / claim / Service / EndpointSlice KSM series, kubelet volume stats | ✅ | ✅ | ✅ | ✅ |
+| `kube_node_*` | ✅ | ✅ | ✅ | — (no such label) |
+| NetApp Harvest (`volume_labels`, `qos_*`, `aggr_*`, `node_new_status`) | ✅ | ✅ | — (its `cluster` is the **ONTAP** cluster) | — |
+| `traces_service_graph_*`, `up` | — | — | — | — |
+
+The service-graph family is read **in full for every request**: its `cluster`
+label is the frequently-missing trace-source cluster and its namespace labels
+describe only the caller's own view, so narrowing there would drop edges the
+loaded topology still needs. Instead, a filtered build applies two rules:
+
+- an endpoint whose pod is **not loaded** resolves as if its UID were empty —
+  a `"://"` label can still reach a loaded Service, anything else becomes
+  `external/<label>` (with empty `labels`), and **no synthesised pod is ever
+  created**;
+- a series is kept only if **at least one** endpoint reaches loaded topology,
+  so the out-of-scope estate never renders as a web of external nodes.
+
+The visible consequence: under `?cluster=` or `?namespace=`, a peer outside the
+filter appears as an `external` node rather than a real pod — the request's
+inbound and outbound dependencies stay visible without loading the rest of the
+estate.
+
+> **Operator precondition.** Every topology family (kube-state-metrics,
+> kubelet, Harvest) must carry the configured `az` / `env` labels. A family that
+> does not simply matches nothing under those filters, and because the default
+> projection keeps only connectivity-connected workload, a missing label can
+> turn a filtered request into an empty graph rather than a partial one.
 
 ## Upstream metrics consumed
 
@@ -241,8 +298,7 @@ matcher of their own — `edge_relation!="link"` (see the table above).
 
 | PromQL | Purpose |
 |---|---|
-| `group by (cluster) (last_over_time(kube_node_info[1h]))` | Powers `GET /v1/clusters` discovery |
-| `up` | Distinguishes "no data in window" (`outside_retention`) from "upstream healthy but window empty" |
+| `up` | Backs `GET /readyz`, and distinguishes "no data in window" (`outside_retention`) from "upstream healthy but window empty". Issued only for an **unfiltered** build — under any request filter, zero rows means "nothing in scope" and returns an empty `200`. |
 
 ### Edge → metric mapping
 
@@ -271,11 +327,13 @@ service-graph behaviour.
 | `--prom-url`                    | `KSG_PROM_URL`                   | `http://localhost:8428` | VictoriaMetrics Prometheus-compatible endpoint. |
 | `--listen-addr`                 | `KSG_LISTEN_ADDR`                | `:8080`              | HTTP listen address. |
 | `--build-timeout`               | `KSG_BUILD_TIMEOUT`              | `15s`                | Per-build context timeout for `/v1/graph`. |
-| `--api-timeout`                 | `KSG_API_TIMEOUT`                | `5s`                 | Per-request timeout for non-graph endpoints with upstream calls (`/v1/clusters`, `/readyz`). |
+| `--api-timeout`                 | `KSG_API_TIMEOUT`                | `5s`                 | Per-request timeout for upstream calls outside a graph build (`/readyz` probe, outside-retention probe). |
 | `--api-keys-file`               | `KSG_API_KEYS_FILE`              | (empty)              | Path to a file holding accepted API keys (one per line, `#` comments allowed). Designed for K8s `Secret` mounts. Reloaded periodically. |
 | `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. |
 | `--api-keys-reload-interval`    | `KSG_API_KEYS_RELOAD_INTERVAL`   | `30s`                | How often `--api-keys-file` is re-read. Set to `0` to disable hot reload. |
 | `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug | info | warn | error`. |
+| `--az-label`                    | `KSG_AZ_LABEL`                   | `az`                 | Upstream label the `?az=` parameter is matched against. The request parameter name never changes — only the label binding. Must be a valid PromQL label name and differ from `--env-label`. |
+| `--env-label`                   | `KSG_ENV_LABEL`                  | `env`                | Upstream label the `?env=` parameter is matched against. |
 | —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
 | —                               | `KSG_PROM_PASSWORD`              | (empty)              | HTTP Basic Auth password for the upstream. Env-only, paired with `KSG_PROM_USERNAME` — setting exactly one of the two fails startup. Rotation requires a restart (no hot reload); changing a Secret-backed env var in a Deployment triggers a rollout anyway. |
 

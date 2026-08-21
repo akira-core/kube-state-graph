@@ -500,7 +500,7 @@ func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC())
+	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
 	require.NoError(t, err, "a failing Harvest leg must not fail the build")
 	assert.Empty(t, tp.NetAppAggrs)
 }
@@ -516,7 +516,7 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC())
+	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
@@ -537,7 +537,7 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC())
+	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
 	require.NoError(t, err)
 
 	mu.Lock()

@@ -169,7 +169,14 @@ type topologyVectors struct {
 // Harvest and kubelet legs are OPTIONAL with log-and-continue error
 // semantics (a non-NetApp deployment must build cleanly); existing KSM
 // legs keep abort-on-error semantics.
-func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, end time.Time) (Topology, error) {
+func ReadTopology(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	keys promql.LabelKeys,
+	sel promql.Selector,
+) (Topology, error) {
 	// Each goroutine writes a distinct field, so concurrent writes to v are
 	// race-free (no overlapping memory); g.Wait() establishes the happens-before
 	// edge to the read below.
@@ -205,7 +212,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, err := q.Instant(ctx, string(name), promql.Render(name, window), end)
+			out, err := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
 			*dst = out
 			return err
 		}
@@ -225,7 +232,7 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window), end)
+			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
 			if qerr != nil {
 				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
 					return cerr
@@ -308,7 +315,43 @@ func ReadTopology(ctx context.Context, q promql.Querier, window time.Duration, e
 		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
 		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
 	}
+	warnSelectorFamilyEmpty(ctx, sel, keys, t.RawSeriesCount)
 	return t, nil
+}
+
+// warnSelectorFamilyEmpty surfaces the one operator mistake this change makes
+// silent: a metric family that does NOT carry the configured az / env labels
+// simply matches nothing under a filtered request, and because the default
+// projection keeps only connectivity-connected workload, the result can be an
+// empty graph rather than a partial one.
+//
+// The signature is narrow on purpose — kube-state-metrics returned rows, so
+// the selector demonstrably matches the deployment's labelling, yet a kubelet
+// or Harvest family came back empty. A family that is simply not deployed
+// (no Harvest at all) trips this too; it is a Warn, not an error, and stays
+// quiet for every unfiltered build.
+func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
+	if !sel.Active() || raw[string(promql.QPodInfo)] == 0 {
+		return
+	}
+	var empty []string
+	for _, q := range []promql.Query{
+		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
+	} {
+		if raw[string(q)] == 0 {
+			empty = append(empty, string(q))
+		}
+	}
+	if len(empty) == 0 {
+		return
+	}
+	keys = keys.OrDefault()
+	slog.WarnContext(ctx, "selector-filtered build: kube-state-metrics matched but another family returned nothing; check that it carries the configured az / env labels",
+		"reason", "selector_family_empty",
+		"empty_families", empty,
+		"az_label", keys.AZ,
+		"env_label", keys.Env,
+	)
 }
 
 // nodeAddrs holds the best (lexically-smallest) address seen per type for one

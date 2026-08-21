@@ -471,7 +471,7 @@ func TestReadServiceGraph_SameFQDNResolvedOnce(t *testing.T) {
 	}}
 
 	res, err := ReadServiceGraph(context.Background(), q,
-		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
+		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err)
 	require.Len(t, resolver.requests(), 1,
 		"one broker FQDN in one anchor cluster = ONE route-store read, link and plain series included")

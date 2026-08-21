@@ -70,27 +70,45 @@ func TestProject_SharedFilerVisibleFromEitherCluster(t *testing.T) {
 	assert.True(t, idSet(b)[NetAppNodeID("ontap-prod", "ontap-prod-01")])
 }
 
-func TestProject_NameFilterSurfacesNetAppAggrAndParent(t *testing.T) {
-	v := Project(netappGraph(), Scope{Names: map[string]struct{}{"idle": {}}})
+// prune=false with NO cluster / namespace filter is the full inventory: an
+// aggregate serving no claim (and its controller) is admitted unreferenced.
+func TestProject_InventorySurfacesUnreferencedNetAppChain(t *testing.T) {
+	v := Project(netappGraph(), Scope{Inventory: true})
 	ids := idSet(v)
-	assert.True(t, ids[NetAppAggrID("ontap-prod", "idle")], "named aggregate surfaced")
-	assert.True(t, ids[NetAppNodeID("ontap-prod", "ontap-prod-02")], "owning controller pulled as compound parent")
-	assert.False(t, ids[NetAppAggrID("ontap-prod", "aggr1")])
+	assert.True(t, ids[NetAppAggrID("ontap-prod", "idle")], "unreferenced aggregate surfaced")
+	assert.True(t, ids[NetAppNodeID("ontap-prod", "ontap-prod-02")], "its controller surfaced as compound parent")
+	assert.True(t, ids[NetAppAggrID("ontap-prod", "aggr1")], "referenced aggregate still present")
 }
 
-func TestProject_NameFilterSurfacesNetAppNode(t *testing.T) {
-	v := Project(netappGraph(), Scope{Names: map[string]struct{}{"ontap-prod-02": {}}})
-	ids := idSet(v)
-	assert.True(t, ids[NetAppNodeID("ontap-prod", "ontap-prod-02")])
-	assert.False(t, ids[NetAppAggrID("ontap-prod", "idle")], "naming the controller does not pull unused aggregates")
+// The NetApp Inventory lift requires BOTH filters absent: a cluster or a
+// namespace filter reaches these nodes only through the claims that join them,
+// so lifting under either would emit a filer no in-scope claim sits on.
+func TestProject_InventoryLiftGatedByClusterAndNamespaceFilters(t *testing.T) {
+	withCluster := idSet(Project(netappGraph(), Scope{
+		Inventory: true,
+		Clusters:  map[string]struct{}{"cluster-alpha": {}},
+	}))
+	assert.False(t, withCluster[NetAppAggrID("ontap-prod", "idle")],
+		"cluster filter keeps NetApp admission reference-driven")
+	assert.True(t, withCluster[NetAppAggrID("ontap-prod", "aggr1")],
+		"the aggregate cluster-alpha's claim joins is still admitted")
+
+	withNS := idSet(Project(netappGraph(), Scope{
+		Inventory:  true,
+		Namespaces: map[string]struct{}{"shop": {}},
+	}))
+	assert.False(t, withNS[NetAppAggrID("ontap-prod", "idle")],
+		"namespace filter keeps NetApp admission reference-driven")
 }
 
-func TestProject_NameFilterOnPVCPullsAggregate(t *testing.T) {
-	v := Project(netappGraph(), Scope{Names: map[string]struct{}{"claim-a": {}}})
+// An aggregate re-added as an edge partner still pulls its owning controller
+// (the compound parent must exist) — here via a namespace-filtered claim.
+func TestProject_NamespaceFilteredPVCPullsAggregateAndParent(t *testing.T) {
+	v := Project(netappGraph(), Scope{Namespaces: map[string]struct{}{"shop": {}}})
 	ids := idSet(v)
 	assert.True(t, ids["cluster-alpha/shop/claim-a"])
-	assert.True(t, ids[NetAppAggrID("ontap-prod", "aggr1")], "aggregate re-added as edge partner")
-	assert.True(t, ids[NetAppNodeID("ontap-prod", "ontap-prod-01")], "controller pulled after partner re-add")
+	assert.True(t, ids[NetAppAggrID("ontap-prod", "aggr1")], "aggregate admitted by reference")
+	assert.True(t, ids[NetAppNodeID("ontap-prod", "ontap-prod-01")], "controller pulled as compound parent")
 }
 
 func TestProject_EdgeTypeFilterSelectsNetAppEdges(t *testing.T) {

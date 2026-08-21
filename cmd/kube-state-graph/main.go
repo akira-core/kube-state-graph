@@ -146,6 +146,7 @@ func run() error {
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       routeResolver,
 		RouteResolveTimeout: cfg.RouteResolveTimeout,
+		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
 	}, metrics, nil)
 	server := api.New(cfg, builder, promClient, metrics, logger, keys, nil)
 

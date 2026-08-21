@@ -108,27 +108,17 @@ func TestProject_ServiceSelectsPodBackingPodKept(t *testing.T) {
 	assert.True(t, ids["c/worker-0"], "node hosting backing pod kept")
 }
 
-// Escape hatch: an explicit ?name= surfaces an otherwise-pruned edgeless pod
-// (symmetric with the D6 infra-node name exception).
-func TestProject_NameFilterSurfacesEdgelessPod(t *testing.T) {
-	v := Project(prunableGraph(), Scope{Names: map[string]struct{}{"p9": {}}})
+// Escape hatch: `prune=false` surfaces an otherwise-pruned edgeless pod. It is
+// the ONLY hatch — the former ?name= / ?root= exceptions are withdrawn.
+func TestProject_InventorySurfacesEdgelessPod(t *testing.T) {
+	v := Project(prunableGraph(), Scope{Inventory: true})
 	ids := idSet(v)
-	assert.True(t, ids["c/p9"], "explicit name filter must surface the edgeless pod on demand")
+	assert.True(t, ids["c/p9"], "prune=false must surface the edgeless pod")
+	assert.True(t, ids["c/worker-1"], "and the node hosting only that pod")
 }
 
-// Escape hatch: a root-anchored traversal still includes reachable nodes even if
-// they have no connectivity edge (the prune is off under traversal).
-func TestProject_TraversalSurfacesEdgelessNeighbour(t *testing.T) {
-	// Root on worker-1 (the otherwise-pruned node), depth 1 over pod-to-node
-	// reaches the edgeless pod p9.
-	v := Project(prunableGraph(), Scope{Root: "c/worker-1", Depth: 1, Direction: DirectionBoth})
-	ids := idSet(v)
-	assert.True(t, ids["c/worker-1"], "traversal root kept")
-	assert.True(t, ids["c/p9"], "edgeless pod reachable from root kept under traversal")
-}
-
-// Namespace filter still prunes edgeless pods (prune is active for cluster/ns
-// filters, only name/traversal disable it).
+// Namespace filter still prunes edgeless pods by default (only prune=false
+// disables the prune).
 func TestProject_NamespaceFilterStillPrunes(t *testing.T) {
 	v := Project(prunableGraph(), Scope{Namespaces: map[string]struct{}{"ns": {}}})
 	ids := idSet(v)
