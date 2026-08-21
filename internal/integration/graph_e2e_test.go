@@ -28,18 +28,31 @@ type GraphSuite struct {
 }
 
 func TestGraphSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(GraphSuite))
 }
 
-// SetupTest seeds the standard multi-cluster fixture set before each test
-// using the per-test name as a discriminator label.
+// SetupSuite seeds the standard multi-cluster fixture set ONCE.
+//
+// It is deliberately not SetupTest. VictoriaMetrics makes a brand-new series
+// queryable only after ~10s (measured: an existing series takes ~17ms for a new
+// sample), and stamping the per-test name into a `test` label made every test
+// re-register the whole fixture and pay that latency again — ~10s x 32 tests of
+// pure waiting. The discriminator bought nothing: the API's queries carry no
+// `test` matcher, so every test always saw every other test's series anyway; it
+// was only ever the WaitForSeries probe key.
 //
 // Service-graph series are ingested as TWO monotonic counter samples (t0 and
 // t1 = t0 + 60s) so that `rate(traces_service_graph_request_total[w])` over
 // the test window can recover a non-zero per-second rate. Without two samples
 // the rate() result is empty and every pod-call edge silently disappears.
-func (s *GraphSuite) SetupTest() {
-	disc := s.T().Name()
+func (s *GraphSuite) SetupSuite() {
+	s.VMSuite.SetupSuite()
+
+	const disc = "base"
 	t1 := fixedNow.Unix() * 1000 // ms timestamps for /api/v1/import/prometheus
 	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
 	const counterStep = 60.0 // seconds between t0 and t1 (matches rate denominator)

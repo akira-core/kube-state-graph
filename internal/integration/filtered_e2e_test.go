@@ -24,6 +24,10 @@ type FilterSuite struct {
 }
 
 func TestFilterSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(FilterSuite))
 }
 
@@ -40,10 +44,16 @@ func TestFilterSuite(t *testing.T) {
 //
 // Traffic: checkout→cart (same namespace), checkout→payments (cross-cluster,
 // cross-zone), checkout→ledger (cross-namespace).
-func (s *FilterSuite) SetupTest() {
+// SetupSuite seeds the filtered-build fixture ONCE — see GraphSuite.SetupSuite
+// for why this is not SetupTest (VM charges ~10s to make a brand-new series
+// queryable, and a per-test discriminator label re-registered the whole set on
+// every test).
+func (s *FilterSuite) SetupSuite() {
+	s.VMSuite.SetupSuite()
+
 	s.ExtraLabels = `az="zone-a",env="prod"`
 
-	disc := s.T().Name()
+	const disc = "base"
 	t1 := fixedNow.Unix() * 1000
 	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
 	const step = 60.0
