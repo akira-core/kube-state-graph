@@ -156,6 +156,12 @@ per source cluster).
 | `kube_endpointslice_endpoints` | Service → backing-pod fan-out (`service-selects-pod` edges) | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | Optional |
 | `kube_endpointslice_labels` | Joins an EndpointSlice to its owning Service | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | Optional — **requires** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` (NOT a KSM default); absent ⇒ no `service-selects-pod` resolution |
 
+These 15 series come from six kube-state-metrics collectors (`pods`, `nodes`,
+`services`, `persistentvolumeclaims`, `replicasets`, `endpointslices`), needing
+`list` + `watch` on six resource kinds and nothing else. A minimal Helm values
+file, the exact ClusterRole it generates, and the `cluster` / `az` / `env`
+external-label requirements are in `docs/kube-state-metrics-preconditions.md`.
+
 ### Harvest + kubelet storage metrics
 
 | Metric | Used for | Labels read | Required? |
