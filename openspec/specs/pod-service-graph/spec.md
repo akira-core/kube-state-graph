@@ -3,7 +3,6 @@
 ## Purpose
 TBD - created by archiving change add-k8s-pod-graph-api. Update Purpose after archive.
 ## Requirements
-
 ### Requirement: Pod-UID-resolved edge source
 
 The pod-service-graph reader SHALL build edges from service-graph metrics scraped into centralised VictoriaMetrics. The reader SHALL consume at minimum the following series, joined by pod UID:
@@ -13,6 +12,8 @@ The pod-service-graph reader SHALL build edges from service-graph metrics scrape
 - `traces_service_graph_request_server_seconds_bucket{ ...same labels..., le }`
 
 Each series carries exactly one `cluster` external label, applied by the trace pipeline that produced it (typically Tempo's metrics-generator running in a single source cluster). The reader SHALL treat that `cluster` value as the **client-side cluster** — the cluster originating the call — and SHALL resolve the client pod via `(cluster, client_k8s_pod_uid)`. The server-side pod SHALL be resolved by looking up `server_k8s_pod_uid` against a global pod-UID index built from topology (Kubernetes pod UIDs are unique across clusters in practice). When the server UID matches a topology pod, the resolved pod's own `cluster` value provides the server-side cluster for the edge `target` ID.
+
+The three series SHALL be read **in full for every request**: no request-scoped selector dimension (`az`, `env`, `cluster`, `namespace`) is ever rendered into a service-graph query. The trace-side `cluster` label is frequently missing or disagrees with topology, and the namespace labels describe only the caller's own view, so narrowing here would drop edges the loaded topology still needs; instead the loaded topology decides which series survive (see "Filtered-build admission and out-of-scope endpoints"). The only selectors on these queries remain the fixed, request-invariant sentinel and `edge_relation!="link"` matchers.
 
 Edges SHALL be derived by computing `rate(...[<window>]) @ <end>` over each counter. The `client` and `server` string labels are consumed by the connection-string endpoint resolution rule (see "Connection-string endpoint resolution") and the missing pod-UID human-label fallback, and are otherwise ignored for pod-resolved endpoints. Before any endpoint resolution runs, the reader SHALL exclude virtual sentinel peers at the query layer (see "Virtual sentinel endpoint exclusion (user / unknown)"); excluded series never reach the resolution stages below.
 
@@ -25,6 +26,11 @@ Edges SHALL be derived by computing `rate(...[<window>]) @ <end>` over each coun
 
 - **WHEN** `rate(traces_service_graph_request_total{...})` evaluates to exactly zero for a series in the window
 - **THEN** no edge is emitted for that series
+
+#### Scenario: Service-graph queries ignore request filters
+
+- **WHEN** a build runs with `namespace={shop}` and `cluster={cluster-alpha}`
+- **THEN** the three service-graph queries are issued exactly as for an unfiltered build, and the series for callers and servers outside `shop` / `cluster-alpha` reach the resolver (to be admitted or dropped by the filtered-build rule)
 
 ### Requirement: Virtual sentinel endpoint exclusion (user / unknown)
 
@@ -321,7 +327,7 @@ A series with a **wholly empty side** (its pod UID AND its human label both empt
 
 ### Requirement: Synthesised pod node fallback
 
-When a service-graph series references a **non-empty** pod-UID endpoint that does not appear in the topology produced for the same window, the reader SHALL synthesise a pod node and SHALL NOT drop the edge. (Empty pod UIDs are handled by the "Missing pod-UID human-label fallback" requirement above, not by this rule.)
+In an **unfiltered** build (no request-scoped selector dimension active), when a service-graph series references a **non-empty** pod-UID endpoint that does not appear in the topology produced for the same window, the reader SHALL synthesise a pod node and SHALL NOT drop the edge. (Empty pod UIDs are handled by the "Missing pod-UID human-label fallback" requirement above, not by this rule.) In a **filtered** build no pod is ever synthesised; the same situation is governed by "Filtered-build admission and out-of-scope endpoints".
 
 For the **client** side, the synthesised pod uses the metric's `cluster` label as its cluster value: `id="<cluster>/<client_k8s_pod_uid>"`, `labels.cluster=<cluster>`.
 
@@ -331,8 +337,13 @@ In both cases, `name="<pod-uid>"`, `type="pod"`, and `labels` SHALL contain `nam
 
 #### Scenario: Server pod missing from topology
 
-- **WHEN** a service-graph series has `cluster="cluster-alpha"` and `server_k8s_pod_uid="missing-uid"` but no pod with `uid="missing-uid"` exists in the topology global pod-UID index
+- **WHEN** an unfiltered build sees a service-graph series with `cluster="cluster-alpha"` and `server_k8s_pod_uid="missing-uid"` but no pod with `uid="missing-uid"` exists in the topology global pod-UID index
 - **THEN** the resulting graph contains a synthesised pod node with `id: "/missing-uid"`, `name: "missing-uid"`, `type: "pod"`, `labels.cluster: ""` (server-side cluster is unknown), no `labels.ghost` key, and the edge is emitted with this node as `target`
+
+#### Scenario: No synthesised pod in a filtered build
+
+- **WHEN** a build with `namespace={shop}` sees the same series, the client pod being a loaded `shop` pod and `missing-uid` not loaded
+- **THEN** no pod node is synthesised; the server side resolves to `external/<server label>` under the filtered-build rule
 
 ### Requirement: Edge identity is a deterministic UUID
 
@@ -393,8 +404,10 @@ The order ranks the labels by what the classification stages below can resolve, 
 recency of spelling. Classification is strong on names — the Kubernetes Service-DNS grammar
 and the bare-short-name form both yield a `(namespace, service)` pair that resolves to a
 Service node with its family-wide fan-out — and weak on IP literals, whose `ClusterIP`
-lookup is deliberately restricted to the anchor cluster, so a pod IP, a loopback address,
-or any off-cluster IP resolves to nothing and falls to `external`. `server.address` is the
+lookup is deliberately restricted to the anchor cluster and whose Pod-IP lookup resolves
+only an unambiguous holder within the caller's cluster family, so a loopback address, a
+NodePort or load-balancer address, or any off-cluster IP resolves to nothing and falls to
+`external`. `server.address` is the
 name-valued stable attribute and therefore leads; `network.peer.address` is the IP-valued
 stable attribute and follows; the deprecated `net.peer.name`, superseded by
 `server.address`, trails.
@@ -414,7 +427,9 @@ following stages, in order:
   value — the reader does NOT track which label a value came from; the index-0 condition is
   a property of the value's shape, not of its source.
 - **(b) Port strip.** Strip an optional trailing `:<port>` suffix (best-effort host/port
-  split; a value with no splittable port is used unchanged). A bracketed IPv6 authority
+  split; a value with no splittable port is used unchanged). The split-out port is NOT
+  discarded: it is carried to the Istio route-resolution step below as that step's
+  highest-precedence listener-port hint. A bracketed IPv6 authority
   that reaches this stage intact SHALL yield the IPv6 address without its brackets.
 - **(c) Service-DNS grammar.** Apply the same Kubernetes Service-DNS grammar used by
   connection-string resolution (2-label `<service>.<namespace>`, or 3-label headless
@@ -441,8 +456,32 @@ following stages, in order:
   classification, scoped ONLY to this requirement's trigger condition, and it is evaluated
   after, and independently of, stage (d) (an IP literal never satisfies stage (d), since
   stage (d) explicitly excludes IP literals).
-- **(f) Unresolvable.** Any other shape (multi-label non-`.svc` FQDN, an IP literal absent
-  from the anchor cluster's own Service `ClusterIP` set, any other value no earlier stage
+- **(f) Pod IP.** When stage (e) matched no Service `ClusterIP` AND the host is a valid IP
+  literal, the reader SHALL look it up as a **Pod IP** against the loaded topology's pods,
+  scoped to the **caller's cluster family** (the same family key connection-string
+  resolution uses). This covers a caller that dialled another pod's address directly,
+  bypassing any Service — including across a cluster boundary, which is ordinary traffic
+  wherever clusters share a flat routable network. Selection is:
+  1. If the **anchor cluster itself** holds a pod at that address, that pod — always, even
+     when family siblings also hold it.
+  2. Otherwise, if **exactly one** cluster in the family holds it, that cluster's pod.
+  3. Otherwise (two or more family clusters hold it), the address is **ambiguous**: the
+     reader SHALL resolve no pod and SHALL fall through to stage (g), with the distinct
+     external-fallback reason `unknown_server_peer_pod_ip_ambiguous`. There SHALL be no
+     tie-break across clusters.
+
+  A cluster outside the anchor cluster's family SHALL never be a candidate. Being the
+  family's only holder is itself the evidence that those clusters' pod CIDRs do not overlap
+  at that address, which is why no service-mesh precondition is required: cross-cluster
+  pod-to-pod reachability is a network-layer property, and a sidecar is neither necessary
+  (a flat network needs none) nor sufficient (in a multi-network mesh the caller's sidecar
+  is handed the east-west gateway address, never a remote Pod IP). Stage (e) is evaluated
+  first and wins unconditionally — a Service `ClusterIP` always beats a Pod IP — and a pod
+  that reports no address is never a candidate. This stage is evaluated BEFORE the Istio
+  route-resolution step below, so in-cluster (or in-family) pod traffic is never handed to
+  the route engine.
+- **(g) Unresolvable.** Any other shape (multi-label non-`.svc` FQDN, an IP literal that matched
+  neither an anchor-cluster Service `ClusterIP` nor an unambiguous family Pod IP, any other value no earlier stage
   matched) is **unresolvable** at this step. Note that a bracketed IPv6 authority in its
   plain (non-IPv4-embedded) form that stages (a) and (b) cannot reduce to a parseable host
   does NOT reach this stage: being dot-free and not an IP literal, it is matched by stage
@@ -465,13 +504,37 @@ Service address — including the family-wide `service-selects-pod` fan-out — 
 *identification* step (stage e itself) is restricted to the anchor cluster. Resolution is
 likewise identical regardless of which of the three labels supplied the peer address.
 
+When stage (f) yields a topology **pod**, the reader SHALL resolve the endpoint directly to
+that pod. It SHALL NOT materialise a service node and SHALL NOT emit any
+`service-selects-pod` edge, so the generic target-driven rule makes the resulting edge
+`pod-calls-pod` — which MAY therefore cross clusters.
+
 If two or more Services within the SAME anchor cluster share the identical `ClusterIP`
 value (a data anomaly Kubernetes itself prevents in a healthy cluster, but the reader
 stays defensive), stage (e) SHALL deterministically select the Service with the
 lexically-smaller `(namespace, service)` pair.
 
-When classification is unresolvable (stage f), OR the anchor cluster does not hold the
-addressed Service, the reader SHALL fall back to an **external** node from the RAW peer-address
+If two or more pods within the SAME cluster report the identical `pod_ip` — which happens
+legitimately for `hostNetwork` pods, all of which report their node's address, and
+transiently on address reuse within the window — stage (f) SHALL deterministically select
+the pod with the lexically-smallest cluster-scoped id, so an intra-cluster duplicate never
+makes the family look ambiguous.
+
+When classification is unresolvable (stage g), OR the anchor cluster does not hold the
+addressed Service, the reader SHALL — **before** falling back to an external node —
+consult the Istio route-resolution engine as specified in "Istio route resolution of global
+FQDN peers" (subject to that requirement's own preconditions: in particular, an endpoint
+carrying no destination IPs is NEVER consulted and falls external directly). This
+route-resolution step SHALL be reached from EVERY path that would otherwise produce an
+external node under this requirement, without exception. In particular, a global or ingress
+FQDN such as `api.example.com` is a 3-label host and is therefore *successfully* classified
+by stage (c) — as service `example` in namespace `com` — before failing the anchor-cluster
+membership test, so it reaches route resolution via the "anchor cluster does not hold the
+addressed Service" path, NOT via the unresolvable path. An implementation that consults the
+engine only on stage-(g) unresolvability does NOT satisfy this requirement.
+
+When route resolution is disabled, or does not yield a destination, the reader SHALL fall
+back to an **external** node from the RAW peer-address
 value — the label's value exactly as read from the series, with NEITHER the bracket
 truncation of stage (a) NOR the port strip of stage (b) applied:
 
@@ -619,6 +682,78 @@ resolved pod. No new node type and no new edge type are introduced by this requi
 - **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="172.20.10.5"`, and (as a data anomaly) `cluster-alpha` holds two Services with `cluster_ip="172.20.10.5"` — `(namespace="ops", service="zeta")` and `(namespace="ops", service="alpha")`
 - **THEN** the endpoint resolves to `(namespace="ops", service="alpha")` — the lexically-smaller `(namespace, service)` pair — deterministically and identically across rebuilds of the same upstream data
 
+#### Scenario: Global FQDN reaches route resolution via the anchor-lacks-service path
+
+- **WHEN** a `server="unknown"` series has a client resolving to a real topology pod and
+  `client_net_peer_name="api.example.com"`
+- **THEN** DNS-grammar classification (step 2) succeeds, yielding `(namespace="com",
+  service="example")`
+- **AND** the anchor cluster does not hold that Service, so same-cluster Service-node
+  resolution misses
+- **AND** the reader SHALL consult the route-resolution engine before emitting any external
+  node
+
+#### Scenario: Route resolution disabled falls back to external unchanged
+
+- **WHEN** route resolution is not configured
+- **AND** a `server="unknown"` endpoint's peer address is unresolvable by steps 2–4, or the
+  anchor cluster does not hold the classified Service
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>` with `labels = {}`,
+  byte-for-byte identical to the behaviour before route resolution existed
+
+#### Scenario: In-cluster classification is unaffected by route resolution
+
+- **WHEN** a `server="unknown"` endpoint's peer address classifies to a `(namespace,
+  service)` pair the anchor cluster DOES hold — via `.svc` DNS, bare short name, or
+  ClusterIP literal
+- **THEN** the reader SHALL resolve it to that service node exactly as before
+- **AND** the route-resolution engine SHALL NOT be consulted
+
+#### Scenario: IP-literal peer address matches a pod's own IP in the anchor cluster
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no Service in `cluster-alpha` has `cluster_ip="10.244.1.9"`, and a topology pod with UID `def` in `cluster-alpha` has `pod_ip="10.244.1.9"`
+- **THEN** the resulting edge has `type: "pod-calls-pod"`, `target: "cluster-alpha/def"`, `labels.cluster: "cluster-alpha"`; no service node is materialised and no `service-selects-pod` edge is emitted for this resolution
+
+#### Scenario: Pod-IP peer address with a port suffix is stripped before matching
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_net_peer_name="10.244.1.9:8080"`, and a topology pod with UID `def` in `cluster-alpha` has `pod_ip="10.244.1.9"`
+- **THEN** the `:8080` suffix is stripped before IP-literal classification, and the endpoint resolves to `cluster-alpha/def`
+
+#### Scenario: Service ClusterIP takes priority over a colliding Pod IP
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.96.0.7"`, `cluster-alpha` holds a `payments` service in namespace `shop` with `cluster_ip="10.96.0.7"`, AND a pod in `cluster-alpha` also reports `pod_ip="10.96.0.7"`
+- **THEN** the endpoint resolves to the service node `cluster-alpha/shop/payments` with `type: "pod-calls-service"` — the Service `ClusterIP` step is evaluated first and the Pod-IP step is never reached
+
+#### Scenario: Pod IP held only by a family sibling resolves across the cluster boundary
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no Service or pod in `prod-1` carries that address, and exactly one same-family sibling cluster `prod-2` has a pod (UID `sib`) with `pod_ip="10.244.1.9"`
+- **THEN** the resulting edge has `type: "pod-calls-pod"`, `target: "prod-2/sib"`, `labels.cluster: "prod-1"` (the client side, unchanged); no external node is produced, no service node is materialised, and no `service-selects-pod` edge is emitted
+
+#### Scenario: Anchor cluster wins over a family sibling holding the same Pod IP
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, a pod in `prod-1` (UID `own`) has `pod_ip="10.244.1.9"`, AND a pod in the same-family sibling `prod-2` also has `pod_ip="10.244.1.9"`
+- **THEN** the endpoint resolves to `prod-1/own` — the anchor cluster's own holder is always preferred, regardless of how many family siblings carry the address
+
+#### Scenario: Two family siblings hold the Pod IP — external, no tie-break
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, no pod in `prod-1` carries that address, and BOTH same-family siblings `prod-2` and `prod-3` have a pod with `pod_ip="10.244.1.9"`
+- **THEN** the endpoint falls back to `external/10.244.1.9` and NO `pod-calls-pod` edge targets either sibling pod — two holders is direct evidence that the family's pod CIDRs overlap at this address, so the reader degrades rather than tie-breaking
+
+#### Scenario: Pod IP present only outside the anchor cluster's family — external
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `prod-1` (family `prod-0`), `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and the only pod carrying that address lives in `staging-1` (family `staging-0`)
+- **THEN** the endpoint falls back to `external/10.244.1.9` — a cluster outside the anchor cluster's family is never a candidate
+
+#### Scenario: Pod without a known IP is never a Pod-IP candidate
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and every pod in `cluster-alpha`'s family has an empty or absent `pod_ip`
+- **THEN** the endpoint falls back to `external/10.244.1.9`
+
+#### Scenario: Duplicate Pod IP within one cluster resolves deterministically
+
+- **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="10.244.1.9"`, and two pods in `cluster-alpha` — node ids `cluster-alpha/zzz` and `cluster-alpha/aaa` — both report `pod_ip="10.244.1.9"` (for example two `hostNetwork` pods on the same node)
+- **THEN** the endpoint resolves to `cluster-alpha/aaa` — the lexically-smallest node id — deterministically, independently of the order in which the pods were loaded and identically across rebuilds of the same upstream data; the intra-cluster duplicate does NOT make the cluster an ambiguous candidate, since ambiguity is counted per cluster, not per pod
+
 ### Requirement: RED edge metrics on trace-derived pod / service edges
 
 The reader SHALL attach a typed, nullable numeric metrics object to an emitted edge **iff all four** of the following hold:
@@ -648,7 +783,7 @@ The reader SHALL NOT attach the metrics object to any other edge. In particular,
 - a `service-selects-pod` edge (synthesised fan-out; no series names the individual backing pod);
 - the synthesised ingress-chain hop from an ingress-gateway pod to the backend service (no contributing series exists);
 - the route-hit ingress chain's caller → ingress-service entry hop. That edge and the retained caller → backend edge are two projections of the SAME observed call, so measuring both would make one request contribute twice to any sum taken over the chain. The measurement SHALL be carried by the caller → backend edge, which names the actual destination;
-- a topology-derived edge (`pod-mounts-pvc`, `pod-to-node`, `pvc-to-storageclass`).
+- a topology-derived edge (`pod-mounts-pvc`, `pod-to-node`, `pvc-to-netapp-aggr`).
 
 Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remains strictly `map[string]string`. Attaching the metrics object SHALL NOT change an edge's `id`, `type`, `source`, `target`, or `labels`.
 
@@ -709,7 +844,7 @@ Numeric values SHALL NOT appear anywhere in an edge's `labels` map, which remain
 
 #### Scenario: Topology-derived edges never carry metrics
 
-- **WHEN** the response contains a `pod-mounts-pvc`, `pod-to-node`, or `pvc-to-storageclass` edge
+- **WHEN** the response contains a `pod-mounts-pvc`, `pod-to-node`, or `pvc-to-netapp-aggr` edge
 - **THEN** that edge carries NO metrics object
 
 #### Scenario: Numeric values never enter edge labels
@@ -867,3 +1002,1032 @@ Each degradation SHALL be surfaced as aggregated operator evidence in the logs, 
 
 - **WHEN** the `traces_service_graph_request_total` query returns an upstream error
 - **THEN** the build fails as it does today — the graceful degradation applies only to the two new queries
+
+### Requirement: Span-link logical edge relation marking
+
+The reader SHALL read the `edge_relation` label of every
+`traces_service_graph_request_total` series. A series whose value is exactly
+`"link"` (a span-link-derived logical edge: client = producer pod, server =
+consumer pod, joined across trace IDs through a broker) SHALL resolve both
+endpoints through the ordinary resolution ladder unchanged, and the resulting
+edge SHALL carry `labels.relation = "link"`. Any other `edge_relation` value
+(absent, empty, or an unrecognised string) SHALL be ignored — the series is
+processed exactly as before this requirement, and its edge carries no
+`relation` key.
+
+For each side of a `"link"` series that resolved to a **real topology pod**,
+the reader SHALL additionally derive that side's broker (via) node ID from the
+side's own client-recorded peer-address labels — the client side from
+`client_server_address` / `client_net_peer_name` (with `client_dns_answers` /
+`client_server_port` as route-resolution dimensions), the server side from the
+mirrored `server_server_address` / `server_net_peer_name` (with
+`server_dns_answers` / `server_server_port`) — using the SAME classification
+chain as the unknown-server peer-label enrichment (bracket truncation and
+port split, Kubernetes `.svc` DNS grammar, bare short name in the pod's own
+namespace, anchor-cluster ClusterIP, family Pod IP, prefetched route-engine
+index, raw-value external fallback), anchored on that side's own pod cluster.
+The pair `(that side's pod, derived broker node ID)` SHALL be recorded as a
+**transport** pair. A side with no peer-address value, or a side that did not
+resolve to a real topology pod, contributes no transport pair; the other side
+is unaffected.
+
+Via derivation SHALL be **lookup-only**: it MUST NOT materialise any service,
+external, or synthesised node, MUST NOT emit any `service-selects-pod` or
+route-chain edge, and MUST NOT log route-engine external-fallback reasons.
+For a route-index entry whose outcome is a routed hit, the derived ID is the
+BACKEND service ID only (never the ingress entry-point), with no `role`
+marking and no chain synthesis; every other index outcome, a missing entry,
+absent destination IPs, or an unconfigured engine derives the external node ID
+of the raw peer-address value — identical to the ID the materialising path
+would have produced for the same series.
+
+At edge-build time, an emitted `pod-calls-pod` or `pod-calls-service` edge
+whose `(source, target)` pair was recorded as a link pair SHALL carry
+`labels.relation = "link"`; otherwise, if recorded as a transport pair, it
+SHALL carry `labels.relation = "transport"`; otherwise no `relation` key.
+`link` SHALL take precedence over `transport` for the same pair, and over any
+plain series that aggregated into the same edge. `service-selects-pod` edges
+and synthesized route-chain edges SHALL never carry a `relation` key. A
+transport pair with no matching emitted edge is a no-op (the reader MAY log
+one aggregated debug line); the reader MUST NOT synthesise an edge for it.
+Marking SHALL be a pure function of the accumulated pair sets — independent of
+sample arrival order — and MUST NOT alter edge identity (the UUIDv5 input
+remains `type|source|target`).
+
+A `"link"` series whose raw `server` label is exactly `"unknown"` AND whose
+server side has no resolvable topology pod recovered no consumer: it SHALL
+contribute **no relation markers at all** — its pair is recorded as neither
+link (the resolved target is the broker, not the consumer) nor transport, and
+no per-side via pair is recorded from it. Its server side still resolves
+through the unknown-server peer-label enrichment exactly as an ordinary
+`server="unknown"` series would, so the producer → broker edge it produces is
+byte-identical to the enrichment's ordinary outcome (an unmarked network
+edge). Rationale: the frontend contract is "transport = the network hop
+backing a rendered logical edge"; a transport marker with no accompanying
+link edge would demote a real network dependency to a dashed line that backs
+nothing. Consequently, transport pairs SHALL be recorded ONLY by series that
+also record their link pair — a transport-marked edge in the built graph
+always coexists with at least one link-marked edge originating from the same
+series set (projection filters MAY still exclude either edge from a filtered
+view; marking itself never depends on the projection). A `"link"` series
+whose server side degrades to a synthesised pod or to the missing-UID
+external fallback keeps its **link** marking (the logical claim stands even
+when an endpoint is degraded).
+
+The prescan SHALL collect route keys for both sides' peer labels of `"link"`
+series (each side only when its own pod resolved, anchored on that pod's
+cluster, subject to the same skip chain as the unknown-server collection:
+in-cluster-resolvable and IP-less endpoints are not collected), deduplicated
+with the keys ordinary `server="unknown"` series derive — a broker FQDN shared
+by link and non-link series in one anchor cluster SHALL cost at most ONE
+route-engine store read per build.
+
+#### Scenario: Link series between two resolved pods
+
+- **WHEN** a series with `edge_relation="link"` carries client and server pod
+  UIDs that both resolve to topology pods
+- **THEN** one `pod-calls-pod` edge is emitted from producer to consumer with
+  `labels.relation = "link"`
+
+#### Scenario: Link wins over a plain series for the same pair
+
+- **WHEN** a plain series and an `edge_relation="link"` series resolve to the
+  same `(source, target)` pair, in either ingestion order
+- **THEN** the single aggregated edge carries `labels.relation = "link"`
+
+#### Scenario: Transport marking of the existing broker edge
+
+- **WHEN** a `"link"` series' client side resolves to a real topology pod and
+  its `client_server_address` classifies to a Service the pod's own cluster
+  holds, AND a plain series already produces the pod → that-Service edge
+- **THEN** that `pod-calls-service` edge carries `labels.relation =
+  "transport"`, and the link edge itself stays `"link"`
+
+#### Scenario: Link beats transport on pair collision
+
+- **WHEN** the same `(source, target)` pair is recorded both as a link pair
+  and as a transport pair within one build
+- **THEN** the emitted edge carries `labels.relation = "link"`
+
+#### Scenario: server="unknown" link series contributes no markers
+
+- **WHEN** a `"link"` series has `server="unknown"`, no resolvable server pod,
+  and a client that resolved to a real topology pod with a classifiable peer
+  address
+- **THEN** the emitted producer → broker edge carries NO `relation` key —
+  byte-identical to the edge an ordinary `server="unknown"` series produces,
+  including when a plain series merges into the same pair — and the series
+  records neither a link pair nor any transport pair
+
+#### Scenario: A transport-marked edge always accompanies a link-marked edge
+
+- **WHEN** any build's emitted edge carries `labels.relation = "transport"`
+- **THEN** the same built graph contains at least one edge carrying
+  `labels.relation = "link"` recorded by the same series set (a transport
+  marker can only originate from a series that also recorded its link pair)
+
+#### Scenario: Degraded server endpoints keep the link marking
+
+- **WHEN** a `"link"` series' server side degrades to a synthesised pod
+  (unknown UID) or to the missing-UID external fallback (non-`"unknown"`
+  label)
+- **THEN** the emitted edge still carries `labels.relation = "link"`
+
+#### Scenario: Per-side independence of via marking
+
+- **WHEN** a `"link"` series' client side does not resolve to a real topology
+  pod but its server side does, and the server side carries
+  `server_server_address`
+- **THEN** no client-side transport pair is recorded, and the server-side
+  pair `(consumer pod, broker node)` is still recorded as transport
+
+#### Scenario: Via lookup never materialises
+
+- **WHEN** a build's ONLY series are `"link"` series (no plain network
+  series), with peer-address labels that would classify to Services,
+  externals, or route-engine destinations
+- **THEN** the response contains no service node, no external node, no
+  `service-selects-pod` edge, and no route-chain edge attributable to via
+  derivation — the unmatched transport pairs are marker-only
+
+#### Scenario: Fan-out edges are never marked
+
+- **WHEN** a broker Service node materialises via a plain series and fans out
+  `service-selects-pod` edges, while link/transport marking touches edges into
+  that Service
+- **THEN** no `service-selects-pod` edge carries a `relation` key
+
+#### Scenario: Self-loop link series
+
+- **WHEN** a `"link"` series carries the same resolvable pod UID on both
+  sides with no `"://"` label (the D33 guard does not fire)
+- **THEN** one self-loop `pod-calls-pod` edge is emitted with
+  `labels.relation = "link"`
+
+#### Scenario: Non-link edge_relation values are ignored
+
+- **WHEN** a series carries `edge_relation="database"` (or any value other
+  than `"link"`)
+- **THEN** it is processed as an ordinary series and its edge carries no
+  `relation` key
+
+#### Scenario: Shared broker FQDN resolves through one route-engine read
+
+- **WHEN** several series in one anchor cluster — link series (either side)
+  and ordinary `server="unknown"` series — carry the same unclassifiable
+  broker FQDN with the same destination IPs and port
+- **THEN** the route-resolution engine is consulted exactly once for that key,
+  and every dependent edge/marker derives from the same prefetched answer
+
+### Requirement: Ingress route-path marking
+
+The two shapes emitted by a routed global-FQDN hit ("Full ingress chain for routed global-FQDN
+hits") — the ingress chain and the direct `caller pod → backend service` edge — SHALL be
+distinguishable in the emitted graph without traversal, so a consumer can render or toggle the
+gateway path independently of the direct dependency.
+
+**Ingress node marker.** A `service` node materialised as an ingress entry point SHALL carry a
+`role` key on its `labels`, with exactly one of two values:
+
+- `ingress-gateway` — the entry hop of a routed hit's chain; gateway pods and a synthesized
+  `pod-calls-service` hop to the backend exist behind it;
+- `ingress-lb` — the destination of the "Ingress LB Service fallback" (no routed backend behind
+  it).
+
+The key SHALL be absent (not empty-valued) on every `service` node that is not an ingress entry
+point, and the node SHALL remain `type="service"` — no new node type is introduced. The
+synthesized `ingress gateway pod → backend service` hop SHALL remain typed `pod-calls-service`
+(no dedicated edge type).
+
+**Determinism.** Marking SHALL be monotone and order-free. When one Service is materialised as
+both a chain entry hop and an LB-fallback destination within a single build, the resulting value
+SHALL be `ingress-gateway` regardless of the order in which the upstream series are resolved
+(`ingress-gateway` overwrites; `ingress-lb` is written only into an unset value). Marking SHALL be
+idempotent under repeated series that share one route key, and SHALL never clear or downgrade a
+value.
+
+**Degrade invariance.** Marking SHALL occur only after an ingress `service` node has been
+successfully materialised. Every chain-precondition degrade of the parent requirement
+materialises no ingress node and SHALL therefore produce no marker, leaving the degraded output
+identical to the pre-existing direct-edge shape. The direct `caller pod → backend service` edge
+SHALL be emitted unchanged — it carries no additional label. No resolution behaviour,
+precondition, external fallback, external-fallback reason, engine outcome, upstream query, or
+store read is altered by this requirement, and output with route resolution disabled SHALL be
+unchanged.
+
+#### Scenario: Chained routed hit marks its ingress node
+
+- **WHEN** route resolution is enabled and a `server="unknown"` endpoint resolves to a routed hit
+  whose chain preconditions all hold
+- **THEN** the ingress `service` node SHALL carry `labels.role = "ingress-gateway"` (and keep
+  `type="service"`)
+- **AND** each synthesized edge from an ingress gateway pod to the backend `service` node SHALL
+  have type `pod-calls-service`, carrying the ingress cluster as its `cluster` label
+- **AND** the `caller pod → ingress service` edge, the `caller pod → backend service` direct edge,
+  and both `service-selects-pod` fan-outs SHALL be emitted exactly as before, the direct edge
+  carrying no additional label
+
+#### Scenario: Ingress LB Service fallback marks its node distinguishably
+
+- **WHEN** the Istio pipeline misses with no Gateway and the destination IPs resolve to a unique
+  ingress LB Service ("Ingress LB Service fallback")
+- **THEN** the materialised `service` node SHALL carry `labels.role = "ingress-lb"`
+
+#### Scenario: One Service resolved by both paths is marked deterministically
+
+- **WHEN** within a single build one endpoint resolves a chained hit whose entry hop is a given
+  Service, and another endpoint's resolution falls back to that same Service as its ingress LB
+  Service
+- **THEN** that single `service` node SHALL carry `labels.role = "ingress-gateway"` irrespective
+  of the order in which the two endpoints are resolved
+
+#### Scenario: Degraded chain emits no marker
+
+- **WHEN** a routed hit's chain degrades for any precondition reason (no unique ingress identity,
+  ingress identity equal to the backend identity, selected cluster's topology lacking the ingress
+  Service, or the ingress Service having no backing pod in the selected cluster)
+- **THEN** no `service` node SHALL carry a `role` label for that endpoint
+- **AND** the emitted nodes and edges SHALL be identical to the pre-existing direct-edge shape
+
+#### Scenario: Backend service node is never marked
+
+- **WHEN** a routed hit resolves a backend `service` node that is not itself an ingress entry
+  point
+- **THEN** that node's `labels` SHALL NOT contain a `role` key
+
+### Requirement: Optional env-only ClickHouse credentials for the route store
+
+When route resolution is enabled (`KSG_ROUTE_STORE_DSN` / `--route-store-dsn` non-empty), the server SHALL accept optional ClickHouse native auth credentials from `KSG_ROUTE_STORE_USERNAME` and `KSG_ROUTE_STORE_PASSWORD` only. The server MUST NOT register CLI flags for these credentials. Both env vars MUST be set together or both left unset; a half-configured pair MUST fail startup with an error that names both env vars and MUST NOT echo their values. When both are set, dial SHALL use those credentials (overriding any userinfo embedded in the DSN). When both are unset, DSN-embedded credentials SHALL continue to work. Credential values MUST NEVER appear in logs, spans, metric labels, or error messages — startup MAY log only a boolean indicating whether route-store auth is configured.
+
+#### Scenario: Env credentials dial successfully
+
+- **WHEN** `KSG_ROUTE_STORE_DSN` is a credential-free ClickHouse URL and `KSG_ROUTE_STORE_USERNAME` / `KSG_ROUTE_STORE_PASSWORD` are both set to valid credentials for that server
+- **THEN** the process starts and the route store connection is established
+
+#### Scenario: Half-configured credentials rejected at startup
+
+- **WHEN** exactly one of `KSG_ROUTE_STORE_USERNAME` or `KSG_ROUTE_STORE_PASSWORD` is set
+- **THEN** startup fails with an error naming both env vars and not containing either configured value
+
+#### Scenario: DSN-embedded credentials remain valid when env unset
+
+- **WHEN** `KSG_ROUTE_STORE_DSN` embeds `user:pass` and both route-store auth env vars are unset
+- **THEN** the route store dials using the DSN userinfo (backward compatible)
+
+### Requirement: Route-resolution snapshot integrity
+
+The configuration state the route-resolution engine translates SHALL name each resource
+version exactly once, regardless of how many destination IPs the request carries.
+
+When the request carries several destination IPs, the engine loads the selected ingress
+cluster's configuration once per IP and unions the results. Two IPs served by the same
+ingress Service — a dual-stack Service publishing an IPv4 and an IPv6 address, or several
+addresses of one load balancer — return overlapping rows. The union SHALL deduplicate by
+resource identity (cluster, namespace, name, and version start), and the per-gateway
+translate input SHALL contain at most one configuration entry per `(kind, namespace, name)`
+and at most one registry entry per backend Service.
+
+A multi-IP request SHALL therefore produce the same outcome a single-IP request against
+the same configuration produces. A duplicated resource SHALL NOT surface as a translation
+error, and SHALL NOT cause the endpoint to fall back to an external node.
+
+#### Scenario: Dual-stack ingress resolves
+
+- **GIVEN** an ingress Service whose ingress addresses include both an IPv4 and an IPv6 address
+- **AND** a Gateway and VirtualService serving the requested host
+- **WHEN** the endpoint's destination IPs contain both addresses
+- **THEN** the engine resolves the routed backend Service, identically to a request carrying either address alone
+
+#### Scenario: Overlapping loads do not error
+
+- **GIVEN** two destination IPs whose configuration loads return the same VirtualService version
+- **WHEN** the engine builds the translate input for the selected gateway
+- **THEN** that VirtualService appears exactly once and translation succeeds
+
+### Requirement: Backend destination host resolution
+
+The engine SHALL resolve a VirtualService route's `destination.host` to a backend Service
+identity using the same rules istiod itself applies, so that the destination the engine
+reports is the destination a real mesh would route to.
+
+A `destination.host` containing no dot is a short name and SHALL be resolved within the
+owning VirtualService's namespace to the in-cluster Service FQDN
+(`<name>.<namespace>.svc.<cluster domain>`). The resolved identity SHALL be used
+consistently for the backend Service lookup, the translation registry, and the parse of
+the resulting Envoy cluster string.
+
+A `destination.host` containing a dot SHALL NOT be expanded — istiod treats it as already
+qualified. A dotted value that is not a full in-cluster Service FQDN (for example
+`checkout.shop` or `checkout.shop.svc`) therefore names no Service in the registry; the
+engine SHALL NOT infer a Service identity from it, and the endpoint SHALL fall back to an
+external node as it does for any unresolvable destination.
+
+An Envoy cluster string's host SHALL be parsed as a Service identity only when it is a
+well-formed `<name>.<namespace>.svc.<cluster domain>` with exactly two leading labels; any
+other shape SHALL be treated as unresolvable rather than parsed by prefix.
+
+#### Scenario: Bare short destination host resolves
+
+- **GIVEN** a VirtualService in namespace `shop` routing to `destination: {host: checkout}`
+- **AND** a Service `checkout` in namespace `shop`
+- **WHEN** the engine resolves a request routed by that VirtualService
+- **THEN** the destination is the Service `checkout` in namespace `shop`
+
+#### Scenario: Dotted relative destination host does not resolve
+
+- **GIVEN** a VirtualService routing to `destination: {host: checkout.shop}`
+- **WHEN** the engine resolves a request routed by that VirtualService
+- **THEN** no Service identity is inferred and the endpoint falls back to an external node
+
+#### Scenario: Per-pod headless host is not a Service identity
+
+- **WHEN** an Envoy cluster string names the host `mysql-0.mysql.db.svc.cluster.local`
+- **THEN** it is treated as unresolvable rather than parsed as the Service `mysql-0` in namespace `mysql`
+
+### Requirement: Deterministic ingress 3-hop selection
+
+The IP-to-Gateway 3-hop SHALL be a pure function of the configuration state at the
+resolution instant, independent of the order in which the store returns rows.
+
+**Hop 1 (IP to ingress Service).** When more than one distinct Service identity is live at
+the instant carrying the destination IP, the hop SHALL degrade rather than select one:
+no candidate gateways are produced, matching the ambiguity rule the ingress LB Service
+identity dedup already applies to the same situation. A single identity with several
+versions is not an ambiguity — version liveness resolves it before this rule applies.
+
+**Hop 2 (ingress Service selector to workload labels).** When more than one ingress
+Deployment satisfies the Service selector — the normal state during a revision-based
+canary gateway upgrade — the hop SHALL take the **union** of their pod labels, matching
+the label union the store query itself computes. It SHALL NOT select one Deployment.
+
+**Gateway identity.** A candidate Gateway SHALL be identified by `(namespace, name)`
+throughout resolution, including when its configuration and bound VirtualServices are
+rebuilt for translation. A same-named Gateway in another namespace present in the loaded
+rows SHALL NOT be selectable, and SHALL NOT contribute its bound VirtualServices to the
+translated configuration.
+
+#### Scenario: Same-named gateway in another namespace is never translated
+
+- **GIVEN** live Gateways `istio-system/public-gw` and `nginx-ingress/public-gw` in the loaded rows
+- **AND** the ingress Service selecting the candidate lives in `istio-system`
+- **WHEN** the engine rebuilds the gateway's configuration for translation
+- **THEN** only `istio-system/public-gw` and the VirtualServices bound to it are translated
+
+#### Scenario: Canary gateway Deployment does not change the candidate set
+
+- **GIVEN** two live ingress Deployments whose pod labels both satisfy the ingress Service selector
+- **WHEN** the engine derives candidate Gateways
+- **THEN** the candidate set is derived from the union of both Deployments' pod labels and does not depend on row order
+
+#### Scenario: Ambiguous ingress Service identity degrades
+
+- **GIVEN** two distinct Service identities live at the instant carrying the destination IP
+- **WHEN** the engine runs the 3-hop for that IP
+- **THEN** no candidate gateway is produced
+
+### Requirement: Bounded route-resolution work per build
+
+Route resolution SHALL NOT let its per-build cost grow without bound on the request path.
+
+Within one build the deduplicated route keys SHALL be resolved with bounded concurrency,
+and the number of keys resolved SHALL be capped. When the cap truncates the key set, the
+reader SHALL log the number of dropped keys; truncation SHALL NOT be silent. Dropped keys
+fall back to their pre-existing external-node behaviour, exactly as an unanswered key does
+when the build deadline fires.
+
+Concurrent resolution SHALL NOT change the resolved index's contents: each key's answer is
+independent of every other key's. Any per-build memoisation shared across concurrent
+resolutions SHALL be safe for concurrent use.
+
+#### Scenario: Independent keys resolve concurrently
+
+- **GIVEN** several distinct route keys collected from one service-graph vector
+- **WHEN** the reader resolves them
+- **THEN** the resulting index is identical to the index a strictly serial resolution produces
+
+#### Scenario: Truncation is reported
+
+- **GIVEN** a build whose collected route keys exceed the cap
+- **WHEN** the reader resolves them
+- **THEN** the number of dropped keys is logged and the corresponding endpoints fall back to external nodes
+
+### Requirement: Resolution errors carry no routing outcome
+
+When route resolution fails with an error — a store read failure, a translation failure,
+or a matcher failure — the engine SHALL NOT also report a routing outcome that is
+meaningful to the caller. In particular it SHALL NOT report the outcome that gates the
+ingress LB Service fallback, so that an infrastructure failure can never be mistaken for
+"no Istio Gateway serves this host".
+
+The matcher's per-query results SHALL be recovered for every query posed or reported as an
+error; a partially recovered result set SHALL NOT be returned.
+
+#### Scenario: Store failure is not reported as a missing gateway
+
+- **GIVEN** the route store fails a read
+- **WHEN** the engine resolves an endpoint
+- **THEN** the failure is reported as an error with no routing outcome, and the endpoint falls back to an external node
+
+#### Scenario: Incomplete matcher output errors
+
+- **GIVEN** the matcher's output yields fewer results than the number of queries posed
+- **WHEN** the engine parses that output
+- **THEN** the parse reports an error rather than returning a result for any query
+
+### Requirement: Filtered-build admission and out-of-scope endpoints
+
+When any request-scoped selector dimension (`az`, `env`, `cluster`, `namespace`) is active, the topology is a subset of the estate while the service-graph series are complete. The reader SHALL therefore apply the following rules to every series that survives the sentinel exclusion and the wholly-empty-side drop; none of them applies to an unfiltered build, whose output is unchanged.
+
+1. **Admission.** A series SHALL be admitted only if **at least one** of its two endpoints resolves to **loaded topology** — a pod present in the topology, or a Service present in the loaded service index (via connection-string resolution, the unknown-server peer ladder, or route resolution). A series whose endpoints both fail to reach loaded topology SHALL be dropped before any node or edge is materialised — whatever the unresolved sides would otherwise have become. This keeps the out-of-scope estate from rendering as a web of `external` nodes and bounds the output to the in-scope workload's direct neighbourhood.
+2. **Out-of-scope endpoint becomes external.** For an admitted series, an endpoint that does not reach loaded topology SHALL resolve to `external/<raw label>` with `labels={}`: a non-empty pod UID that is not loaded falls to that side's `client` / `server` human label exactly as the missing-UID human-label fallback does (`external/cart`); a `"://"` connection string whose Service is not loaded keeps the verbatim label; a peer address that matches no loaded Service `ClusterIP` or Pod IP keeps the raw peer value. A side whose UID is not loaded AND whose human label is empty SHALL be dropped together with its series, as a wholly empty side is today.
+3. **No synthesised pods.** A filtered build SHALL NOT create a synthesised pod node for any endpoint.
+4. **Two-phase materialisation.** Service nodes, `service-selects-pod` fan-out edges, route-chain edges, and external nodes SHALL be materialised only for admitted series; resolution of a series that is later dropped SHALL leave no node or edge behind.
+5. **Unchanged conventions.** An edge with an `external` endpoint carries no `labels.cluster` when the external is the client side and never carries `metrics`; the unknown-server peer-label enrichment still requires the client to be a loaded topology pod (an out-of-scope client with `server="unknown"` is dropped, as today); same-named out-of-scope peers collapse into one external node; an out-of-scope caller of a loaded pod or Service appears as an inbound external.
+
+The rules are a pure function of the series set and the loaded topology (order-free; deterministic).
+
+#### Scenario: Cross-namespace call renders the peer as external
+
+- **WHEN** a build with `namespace={shop}` sees a series from loaded pod `shop/checkout` (`client_k8s_pod_uid="c1"`) to `server="cart"`, `server_k8s_pod_uid="s1"`, where `s1` lives in namespace `payments` and is not loaded
+- **THEN** the reader emits one `pod-calls-pod` edge from `<cluster>/c1` to `external/cart`; `external/cart` has `type: "external"`, `name: "cart"`, `labels: {}`; no pod node exists for `s1`
+
+#### Scenario: Series between two out-of-scope pods is dropped
+
+- **WHEN** a build with `namespace={shop}` sees a series whose client UID and server UID both belong to `payments` pods (neither loaded)
+- **THEN** no edge and no node is produced for the series — in particular no `external/<client>` → `external/<server>` edge
+
+#### Scenario: Inbound call from an out-of-scope caller
+
+- **WHEN** a build with `namespace={shop}` sees a series from `client="frontend"`, `client_k8s_pod_uid="f1"` (a `web` namespace pod, not loaded) to loaded pod `shop/checkout`
+- **THEN** the reader emits one `pod-calls-pod` edge from `external/frontend` to `<cluster>/<checkout-uid>` with no `labels.cluster` and no `metrics`
+
+#### Scenario: Out-of-scope Service via connection string
+
+- **WHEN** a build with `namespace={shop}` sees a series from a loaded `shop` pod whose `server` label is `http://cart.payments.svc.cluster.local:8080` with an empty server UID, and `payments/cart` is not in the loaded service index
+- **THEN** the reader emits a `pod-calls-pod` edge to `external/http://cart.payments.svc.cluster.local:8080` with `labels={}`; no service node is materialised
+
+#### Scenario: In-scope Service called by an out-of-scope pod is materialised with its fan-out
+
+- **WHEN** a build with `namespace={shop}` sees a series from an unloaded `web` pod (`client="frontend"`) whose `server` label is `http://api.shop.svc.cluster.local` and `shop/api` is loaded with backing pods in `shop`
+- **THEN** the reader admits the series (the server reaches loaded topology), materialises `<cluster>/shop/api` with its `service-selects-pod` edges to the loaded backing pods, and emits a `pod-calls-service` edge from `external/frontend` to the service node
+
+#### Scenario: Peer IP of an out-of-scope pod becomes an external IP node
+
+- **WHEN** a build with `namespace={shop}` sees a series from a loaded `shop` pod with `server="unknown"`, empty server UID, and `client_network_peer_address="10.1.2.3"`, where `10.1.2.3` is the Pod IP of an unloaded `payments` pod
+- **THEN** the endpoint resolves to `external/10.1.2.3` (the ClusterIP and Pod-IP lookups see only loaded topology) and the edge is emitted to it
+
+#### Scenario: Dropped series leaves no trace
+
+- **WHEN** a build with `cluster={cluster-alpha}` sees a series from an unloaded `cluster-beta` pod to `http://cart.payments.svc.cluster.local` where `payments/cart` is also not loaded
+- **THEN** the series is dropped and the built graph contains neither an `external/cart…` node nor any edge for it
+
+#### Scenario: Cross-cluster partner under a cluster filter
+
+- **WHEN** a build with `cluster={cluster-alpha}` sees a series from a loaded `cluster-alpha` pod to `server="cart"`, `server_k8s_pod_uid="s9"` where `s9` is a `cluster-beta` pod
+- **THEN** the reader emits a `pod-calls-pod` edge to `external/cart` with `labels.cluster: "cluster-alpha"`; no `cluster-beta` pod node is synthesised or loaded
+
+#### Scenario: Unfiltered build keeps the synthesised-pod behaviour
+
+- **WHEN** a build with no request-scoped dimension sees a series whose server UID is absent from topology
+- **THEN** the existing "Synthesised pod node fallback" applies unchanged and a synthesised pod node is produced
+
+### Requirement: Istio route resolution of global FQDN peers
+
+The reader SHALL support an OPTIONAL Istio route-resolution engine that resolves a
+global / ingress FQDN peer to the Kubernetes Service that the Istio Gateway and
+VirtualService configuration routed it to **at a single instant** — the END of the
+request's own time window. The engine is consulted ONLY from "Unknown-server peer-label
+enrichment", at every point that would otherwise emit an external node.
+
+The engine SHALL evaluate the configuration **as of that one instant** and SHALL NOT
+resolve per-version over the window: exactly one configuration state is consulted, exactly
+one outcome is produced, and the request window's start plays no part in route resolution.
+
+The engine SHALL be configured by a route-store connection string. When that setting is
+empty the engine is **disabled**, and the reader's behaviour SHALL be byte-for-byte
+identical to its behaviour before this requirement existed. Disabled is the default.
+
+**Inputs.** For one candidate endpoint the reader SHALL supply:
+
+- the **caller cluster** — the already-resolved client pod's own cluster, used ONLY to
+  derive the cluster-family key and to break candidate ties in ingress-cluster selection;
+  it SHALL NOT by itself scope any route-store query;
+- the **host** — the port-stripped peer address;
+- the **path** — fixed to `"/"`. The service-graph metric carries no HTTP path or route
+  dimension, so no per-request path is available;
+- the **listener port** — derived as specified below;
+- the **destination IPs** — from the `client_dns_answers` dimension. These are a
+  **precondition**: when the endpoint carries no parseable destination IP, the engine
+  SHALL NOT be consulted at all — no store read occurs, the endpoint falls back to the
+  external node directly, and the reader SHALL record a distinct diagnostic reason for
+  the skip (separate from every engine outcome);
+- the **resolution instant** — the END of the build's own time window. It is fixed (not
+  configurable) and is the same instant the service-graph samples are evaluated at.
+
+**Listener-port derivation.** The port SHALL be derived by this precedence:
+
+1. the `:<port>` suffix split from the peer-address value, when present;
+2. otherwise the OPTIONAL `client_server_port` or `client_net_peer_port` dimension, when
+   present;
+3. otherwise the default **443**.
+
+**Ingress-cluster selection.** The destination IPs select the ingress cluster; the caller
+cluster contributes only its family key and a tie-break. For each destination IP the
+engine SHALL probe the store for the candidate set `G` — the clusters whose ingress Service
+carrying that IP was live at the resolution instant — and derive `F`, the subset of `G` in the
+caller's cluster family (the same digit-run-collapsing family rule used by
+`service-selects-pod` fan-out). Selection per IP:
+
+1. exactly one family candidate → that cluster;
+2. several family candidates → the caller's own cluster if it is among them, otherwise
+   **ambiguous**;
+3. no family candidate and exactly one global candidate → that cluster;
+4. no family candidate and several global candidates → the caller's own cluster if it is
+   among them, otherwise **ambiguous**;
+5. no candidate at all → **no ingress**.
+
+With several destination IPs, each IP SHALL be selected independently and all selections
+MUST agree on one cluster; every IP yielding "no ingress" degrades as **no ingress**, and
+any other combination — an ambiguous IP, disagreeing selections, or a mix of "no ingress"
+and a selected cluster — degrades as **ambiguous**. Candidate sets and store snapshots SHALL
+NEVER be unioned across clusters. Once a cluster is selected, every subsequent resolution
+step — snapshot load, gateway narrowing, host disambiguation, translation, route matching —
+SHALL operate on that single cluster only, and the engine SHALL narrow the candidate
+Gateways to those reachable from the destination IPs within it.
+
+**Store scoping.** Every route-store *snapshot* query SHALL be scoped to the selected
+ingress cluster. The ONLY cross-cluster store read SHALL be the ingress probe that answers
+"which clusters had an ingress Service with this IP at the resolution instant", and its result SHALL
+be deterministic (deduplicated and ordered). The reader SHALL be strictly read-only
+against the store: it SHALL NOT create schema and SHALL NOT write. The reader SHALL
+validate the expected schema at startup and fail fast on drift, rather than silently
+returning empty results.
+
+**Store-shape tolerance.** The store is written by an exporter whose version-close
+operation REWRITES the previous open row; until background merges collapse them, a stale
+open row and its closing rewrite coexist. The reader SHALL NOT treat such a pair as two
+live versions (deduplicating at query time), so results do not depend on merge timing.
+Stored resource specs are the API server's JSON verbatim, whose field set follows the
+cluster's CRD version: the reader SHALL tolerate unknown spec fields rather than failing
+the query. A VirtualService binding its gateway by the bare `<name>` form (Istio shorthand
+for a gateway in the VirtualService's own namespace) SHALL bind exactly as the qualified
+`<namespace>/<name>` form does.
+
+**Version selection (as-of).** Every resource version the engine consults — ingress Service,
+ingress Deployment, Gateway, VirtualService, backend Service — SHALL be the version **live at
+the resolution instant**: its validity interval starts at or before that instant and ends
+strictly after it. Versions that ended at or before the instant, and versions that begin after
+it, SHALL NOT participate in resolution, translation, or ingress identification. The
+duplicate-row discipline above SHALL be applied BEFORE the liveness test, so a stale open row
+whose closing rewrite has not yet merged can never present itself as the live version.
+
+**Resolution.** A hit yields a destination `(cluster, namespace, service)`, where the
+cluster is the engine-selected ingress cluster. The reader SHALL resolve that triple
+through the SAME same-cluster Service-node resolution every other path uses — anchored on
+the **selected ingress cluster**, materialising AT MOST ONE service node iff that cluster
+holds the Service in topology, with the same cross-cluster `service-selects-pod` fan-out
+over its family. Because the selected cluster may differ from the caller's, the resulting
+`pod-calls-service` edge MAY cross clusters, and the edge-type registry SHALL declare
+`may_cross_cluster: true` for `pod-calls-service` (connection-string-resolved edges remain
+intra-cluster by construction; per-edge cross-cluster status is still derived by comparing
+the resolved endpoints' clusters). The destination's port and DestinationRule subset SHALL
+be discarded. **No new node type, no new edge type, no new node attribute, and no new
+`labels` key** are introduced.
+
+**Degradation.** Every failure — engine disabled, endpoint carrying no destination IPs,
+store error, no candidate ingress cluster for the IPs, an ambiguous candidate set, no
+Gateway serving the host, no route matched, no listener on the derived port, or a
+resolution timeout — SHALL fall back to the external node specified in "Unknown-server
+peer-label enrichment". Route resolution SHALL NEVER fail a build. The reader SHALL record
+distinct diagnostic reasons for a "no listener on the derived port" outcome (separate from
+"no route matched", so a mis-derived port is diagnosable), for a "no candidate ingress
+cluster" outcome, and for an "ambiguous ingress cluster" outcome.
+
+**Determinism.** Route resolution SHALL be performed outside the pure service-graph parse
+and its results supplied to the parse as a prefetched index, so the emitted graph remains a
+deterministic function of the upstream data and the resolved destinations.
+
+#### Scenario: Global FQDN resolves to its routed Service
+
+- **WHEN** route resolution is enabled and a `server="unknown"` endpoint's peer address is
+  `api.example.com` with a destination IP selecting the caller's own cluster as ingress,
+  whose Istio Gateway and VirtualService route the host to Service `checkout` in namespace
+  `shop` at the resolution instant
+- **THEN** the reader SHALL emit a `service` node for `(selected cluster, shop, checkout)`
+- **AND** a `pod-calls-service` edge from the client pod to it
+- **AND** SHALL NOT emit `external/api.example.com`
+
+#### Scenario: Listener port taken from the peer address
+
+- **WHEN** the peer address is `api.example.com:8080`
+- **THEN** the host SHALL be `api.example.com` and the derived listener port SHALL be `8080`
+
+#### Scenario: Listener port defaults to 443
+
+- **WHEN** the peer address carries no port and neither `client_server_port` nor
+  `client_net_peer_port` is present
+- **THEN** the derived listener port SHALL be `443`
+
+#### Scenario: No listener on the derived port degrades to external
+
+- **WHEN** the selected ingress cluster's Gateway serves the host but declares no routable
+  HTTP listener on the derived port
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>`
+- **AND** SHALL record a diagnostic reason distinct from the "no route matched" reason
+
+#### Scenario: The server owning the host on the port is selected
+
+- **WHEN** the selected ingress cluster's Gateway declares two TLS-terminated HTTPS servers
+  on the derived port — one whose hosts match the peer FQDN and one whose hosts do not —
+  in either declaration order
+- **THEN** the reader SHALL resolve the request through the RouteConfiguration of the
+  server whose hosts most-specifically match the peer FQDN (Istio exact/wildcard
+  semantics, any `<ns>/` binding prefix stripped before matching)
+
+#### Scenario: No server on the derived port serves the host
+
+- **WHEN** the selected ingress cluster's Gateway declares servers on the derived port but
+  none of their hosts match the peer FQDN
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>`
+- **AND** SHALL record a diagnostic reason distinct from both the "no listener on the
+  derived port" reason and the "no route matched" reason
+
+#### Scenario: Store failure never fails the build
+
+- **WHEN** the route store is unreachable or returns an error while resolving an endpoint
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>` for that endpoint
+- **AND** the build SHALL complete successfully
+
+#### Scenario: Destination IP narrows the candidate Gateways within the selected cluster
+
+- **WHEN** `client_dns_answers` supplies a destination IP that, within the selected ingress
+  cluster, reaches exactly one of two Gateways whose server hosts both match the peer FQDN
+- **THEN** the reader SHALL resolve the host against that Gateway only
+
+#### Scenario: No destination IPs means the engine is not consulted
+
+- **WHEN** route resolution is enabled and a `server="unknown"` endpoint's peer address
+  would fall external, but the series carries no parseable `client_dns_answers` IP
+- **THEN** the engine SHALL NOT be consulted (no store read for this endpoint)
+- **AND** the reader SHALL emit `external/<raw_peer_address_value>` exactly as when route
+  resolution is disabled
+- **AND** SHALL record a diagnostic reason distinct from every engine outcome
+
+#### Scenario: Same-family ingress candidate wins over a cross-family one
+
+- **WHEN** a destination IP's candidate ingress clusters are one cluster in the caller's
+  family and one cluster outside it
+- **THEN** the engine SHALL select the same-family cluster
+
+#### Scenario: Caller breaks a same-family ingress-IP collision
+
+- **WHEN** a destination IP's candidate ingress clusters include the caller's own cluster
+  and a family sibling
+- **THEN** the engine SHALL select the caller's own cluster
+
+#### Scenario: Unresolvable ingress-cluster tie degrades to external
+
+- **WHEN** a destination IP's candidate ingress clusters are two family siblings, neither
+  of which is the caller's own cluster
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>`
+- **AND** the reader SHALL record the "ambiguous ingress cluster" diagnostic reason
+
+#### Scenario: No cluster serves the destination IP
+
+- **WHEN** no cluster had an ingress Service carrying any of the destination IPs live at the
+  resolution instant
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>`
+- **AND** the reader SHALL record the "no candidate ingress cluster" diagnostic reason
+
+#### Scenario: Disagreeing multi-IP selections degrade to external
+
+- **WHEN** `client_dns_answers` supplies two IPs whose independent selections pick two
+  different ingress clusters
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>` with the
+  "ambiguous ingress cluster" diagnostic reason
+
+#### Scenario: Cross-cluster ingress resolves to a Service in the sibling cluster
+
+- **WHEN** the caller pod lives in cluster A and the destination IP selects ingress
+  cluster B, whose Gateway and VirtualService route the host to Service `payments` in
+  namespace `shop`, and B holds that Service in topology
+- **THEN** the reader SHALL emit the `service` node `B/shop/payments`
+- **AND** a `pod-calls-service` edge from the cluster-A client pod to it (a cross-cluster
+  edge)
+- **AND** SHALL NOT emit an external node for the peer
+
+#### Scenario: A rewritten (closed) version does not double-count
+
+- **WHEN** the store carries both a stale open row (far-future `valid_to`) and its closing
+  rewrite (same version key, higher ingest sequence) for one Gateway version
+- **THEN** the reader SHALL see exactly one live version per instant, regardless of
+  whether the store's background merge has run
+
+#### Scenario: Unknown spec fields do not fail the query
+
+- **WHEN** a stored Gateway or VirtualService spec carries a field unknown to the reader's
+  compiled Istio API version
+- **THEN** the reader SHALL parse the known fields and resolve routing from them
+
+#### Scenario: Bare gateway reference binds
+
+- **WHEN** a VirtualService in the gateway's own namespace lists the gateway by bare name
+  in `spec.gateways`
+- **THEN** its routes SHALL bind to that gateway exactly as a qualified
+  `<namespace>/<name>` reference would
+
+#### Scenario: Only the configuration live at the resolution instant is used
+
+- **WHEN** the selected ingress cluster's store holds one Gateway version that ended inside the
+  request window and a newer version live at the window's end, and only the newer version serves
+  the peer FQDN on the derived port
+- **THEN** the engine SHALL resolve the request through the newer version
+- **AND** SHALL NOT consult the version that ended before the resolution instant
+
+#### Scenario: Configuration that stopped serving the host degrades to external
+
+- **WHEN** a Gateway routed the peer FQDN earlier in the request window but the version live at
+  the window's end no longer serves that host
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>` with the
+  corresponding miss diagnostic reason
+
+#### Scenario: Cross-namespace Gateway is not a candidate
+
+- **WHEN** the selected ingress cluster's ingress Service and Deployment live in namespace
+  `istio-system`, and the only Gateway whose selector matches the ingress Deployment's pod
+  labels and whose server hosts serve the peer FQDN lives in namespace `team-b`
+- **THEN** that Gateway SHALL NOT be a candidate and the pipeline SHALL miss with the
+  "no Gateway serves the host" outcome
+- **AND** the ingress LB Service fallback SHALL still apply per its own requirement
+
+#### Scenario: Identical host patterns resolve to the lexically-smallest gateway
+
+- **WHEN** two candidate Gateways in the ingress namespace declare the identical, equally
+  specific server-host pattern matching the peer FQDN, in either declaration or storage
+  order
+- **THEN** the engine SHALL resolve the request through the Gateway with the
+  lexically-smallest name
+
+### Requirement: Full ingress chain for routed global-FQDN hits
+
+When the Istio route-resolution engine produces a routed hit ("Istio route resolution of global
+FQDN peers"), the engine SHALL additionally attempt to recover the identity of the **ingress LB
+Service** the destination IP set uniquely maps to inside the already-selected ingress cluster's
+loaded snapshot, using the same as-of identity-dedup rule as the "Ingress LB Service fallback"
+requirement (per-IP distinct `(namespace, name)` sets; same-IP collision or disagreeing
+singletons → no identity; any IP with zero rows → no identity; all singletons agreeing → that
+identity). Identity recovery SHALL NOT read the store again and SHALL NEVER demote the hit: an
+ambiguous or absent identity leaves the hit's destination without an ingress identity and the
+reader emits the pre-existing direct shape.
+
+**Chain emission.** When the hit's destination carries an ingress identity AND every chain
+precondition below holds, the reader SHALL emit — instead of the direct
+`caller pod → backend service` edge — the full chain:
+
+- a `service` node for the ingress LB Service in the selected ingress cluster, with
+  `service-selects-pod` edges to **the selected cluster's own backing pods only** (locked-cluster
+  fan-out — NOT the family-wide union: an LB IP is a per-cluster address, so a family sibling's
+  same-named Service is not behind it);
+- one `pod-calls-service` edge from the client pod to the ingress `service` node (this edge MAY
+  cross clusters, exactly as the direct edge it replaces);
+- one synthesized `pod-calls-service` edge from EACH of those locked-cluster ingress backing pods
+  to the backend `service` node, carrying the ingress cluster as the edge's `cluster` label (the
+  client side is a pod in that cluster);
+- the backend `service` node and its family-wide `service-selects-pod` fan-out, unchanged from
+  the pre-existing hit resolution.
+
+The direct `caller pod → backend service` edge SHALL NOT be emitted alongside the chain. A
+synthesized ingress-pod→backend edge whose `(source pod, target service)` pair already exists as
+a trace-derived edge SHALL be skipped — the traced edge wins (the two would otherwise share one
+deterministic edge ID). Synthesized-edge emission SHALL be deterministic (order-free over the
+endpoint set; idempotent under repeated series sharing one route key). **No new node type, no new
+edge type, no new node attribute, and no new `labels` key** are introduced.
+
+**Chain preconditions (each failure degrades to the pre-existing direct shape).** The chain SHALL
+be emitted only when ALL hold:
+
+1. the destination carries an ingress identity (recovered as above);
+2. the ingress identity differs from the backend destination's `(namespace, service)` in the
+   selected cluster (a destination that IS the ingress entry point keeps the direct shape);
+3. the selected ingress cluster holds the ingress Service in topology;
+4. that Service has at least one backing pod in the selected cluster's endpoints (an empty middle
+   would disconnect the caller from the backend).
+
+Degradation SHALL be observable via a debug-level diagnostic only — it SHALL NOT emit an external
+node, SHALL NOT count toward external-fallback reasons, and SHALL leave no partially-materialised
+ingress node or edge. A topology miss on the **backend** Service keeps the existing "selected
+cluster lacks the Service" external path, with the ingress Service never materialised. Route
+resolution SHALL still NEVER fail a build.
+
+**Locked-cluster fan-out for the LB fallback.** The "Ingress LB Service fallback" requirement's
+resolution SHALL likewise fan out `service-selects-pod` edges over the selected ingress cluster's
+own backing pods only (superseding its family-wide fan-out): the fallback answers "which ingress
+LB Service owns this IP", and the pods behind that IP are the owning cluster's endpoints. No
+synthesized pod-calls-service edges are emitted on the fallback path (there is no routed backend
+behind the LB entry point).
+
+#### Scenario: Routed hit with recoverable ingress identity emits the full chain
+
+- **WHEN** route resolution is enabled, a `server="unknown"` endpoint's destination IP selects an
+  ingress cluster whose snapshot uniquely maps the IP set to one ingress LB Service, the pipeline
+  routes `(host, path, port)` to a backend Service, and the selected cluster's topology holds
+  both Services with at least one ingress backing pod
+- **THEN** the reader SHALL emit `service` nodes for the ingress LB Service and the backend
+  Service
+- **AND** a `pod-calls-service` edge from the client pod to the ingress `service` node
+- **AND** `service-selects-pod` edges from the ingress node to the selected cluster's own ingress
+  backing pods only
+- **AND** one synthesized `pod-calls-service` edge from each such ingress pod to the backend
+  `service` node
+- **AND** the family-wide `service-selects-pod` fan-out from the backend node
+- **AND** SHALL NOT emit a direct `pod-calls-service` edge from the client pod to the backend
+  node, and SHALL NOT emit an external node
+
+#### Scenario: Ambiguous ingress identity keeps the hit as a direct edge
+
+- **WHEN** the pipeline produces a routed hit but the destination IPs map to more than one
+  ingress LB Service identity live at the resolution instant in the selected cluster (or some IP
+  maps to none)
+- **THEN** the reader SHALL resolve the hit exactly as without this change: a direct
+  `pod-calls-service` edge from the client pod to the backend `service` node and the family-wide
+  backend fan-out
+- **AND** the engine SHALL still report the routed hit (never a miss)
+
+#### Scenario: Ingress Service missing from topology degrades to the direct edge
+
+- **WHEN** a routed hit carries an ingress identity but the selected ingress cluster does not
+  hold that Service in topology
+- **THEN** the reader SHALL emit the direct-edge shape
+- **AND** SHALL NOT emit an ingress `service` node or an external node for the peer
+
+#### Scenario: Ingress Service with no backing pods degrades to the direct edge
+
+- **WHEN** a routed hit carries an ingress identity, the selected cluster holds the ingress
+  Service in topology, but the Service has no backing pods in that cluster's endpoints
+- **THEN** the reader SHALL emit the direct-edge shape
+- **AND** SHALL NOT emit an ingress `service` node
+
+#### Scenario: Destination equal to the ingress identity keeps the direct edge
+
+- **WHEN** a routed hit's backend destination `(namespace, service)` equals the recovered ingress
+  identity in the selected cluster
+- **THEN** the reader SHALL emit the direct-edge shape with that single `service` node
+
+#### Scenario: Backend missing from topology stays external, ingress never materialised
+
+- **WHEN** a routed hit carries an ingress identity but the selected ingress cluster does not
+  hold the BACKEND Service in topology
+- **THEN** the endpoint SHALL fall back to the external node with the existing "selected cluster
+  lacks the Service" diagnostic reason
+- **AND** SHALL NOT emit an ingress `service` node or any `service-selects-pod` edge
+
+#### Scenario: Traced edge wins over the synthesized edge
+
+- **WHEN** the chain is emitted and the service graph also carries a trace-derived
+  `pod-calls-service` edge from one of the ingress backing pods to the same backend `service`
+  node
+- **THEN** the response SHALL carry exactly one edge for that `(pod, service)` pair
+
+#### Scenario: LB fallback fans out over the selected cluster only
+
+- **WHEN** the ingress LB Service fallback resolves an ingress Service that a family sibling
+  cluster also holds under the same `(namespace, name)` with its own backing pods
+- **THEN** the reader SHALL emit `service-selects-pod` edges to the selected ingress cluster's
+  backing pods only
+- **AND** SHALL NOT emit edges to the sibling cluster's pods
+
+#### Scenario: Chain ingress fan-out ignores family siblings while the backend keeps them
+
+- **WHEN** the chain is emitted in a cluster family where a sibling cluster holds a same-named
+  ingress Service (with its own pods) and the backend Service is also held by the sibling (with
+  its own endpoints)
+- **THEN** the ingress node's `service-selects-pod` edges and the synthesized
+  ingress-pod→backend edges SHALL cover the selected cluster's ingress pods only
+- **AND** the backend node's `service-selects-pod` fan-out SHALL still cover the family-wide
+  endpoint union
+
+### Requirement: Ingress LB Service fallback for unresolved global FQDN peers
+
+When the Istio route-resolution engine ("Istio route resolution of global FQDN peers") has
+selected an ingress cluster, loaded its snapshot at the resolution instant, and run the Gateway +
+VirtualService pipeline WITHOUT producing a hit AND without progressing past gateway
+resolution (the pipeline's miss is the "no gateway serves the host" outcome — the
+signature of a non-Istio ingress such as nginx, whose Hop 3 finds no Gateway CR), the engine
+SHALL — before returning that miss — attempt one fallback: resolve the destination IP set to a
+**unique ingress LB Service** inside the already-selected ingress cluster's loaded snapshot.
+
+The fallback SHALL NOT run when the pipeline produced a hit (a routed `hit` always wins), SHALL
+NOT run when the miss is any deeper pipeline outcome ("no listener on the derived
+port", "no server for host", "no route matched" — an Istio Gateway DID serve the host and its
+diagnostic reason MUST NOT be masked by an LB-entry-point edge), and CANNOT run when
+ingress-cluster selection itself failed (the "no candidate ingress cluster" and "ambiguous
+ingress cluster" outcomes return before any snapshot is loaded).
+
+**Candidate set (as-of the resolution instant).** For each destination IP, the candidates are
+every ingress Service version in the loaded (selected-cluster) snapshot that is **live at the
+resolution instant** and whose ingress IPs (external or load-balancer) contain that IP,
+deduplicated to distinct `(namespace, name)` identities. An identity that was replaced BEFORE
+the resolution instant therefore does not count — only owners live at that instant do. The
+fallback SHALL NOT read the store again — it operates on the rows already loaded for the
+pipeline.
+
+**Uniqueness rule (order-free over IPs).** Per destination IP the identity set `S_ip` is
+computed independently; then:
+
+1. any `|S_ip| > 1` → the fallback degrades as **ambiguous ingress Service**;
+2. otherwise any `|S_ip| == 0` → the fallback yields nothing and the engine SHALL return the
+   Istio pipeline's own miss unchanged;
+3. otherwise all (singleton) candidates MUST be the same identity → that identity is the
+   fallback destination; disagreeing identities degrade as **ambiguous ingress Service**.
+
+No lexicographic or recency tie-break SHALL be applied — ambiguity degrades rather than guesses.
+
+**Resolution.** A fallback destination yields `(cluster, namespace, service)` with the cluster
+being the engine-selected ingress cluster, reported under a distinct engine outcome (separate
+from `hit`). The reader SHALL resolve it through the SAME same-cluster Service-node resolution
+as a routed hit — anchored on the selected ingress cluster, AT MOST ONE service node iff that
+cluster holds the Service in topology (a topology miss follows the existing
+"selected cluster lacks the Service" external path), the same cross-cluster
+`service-selects-pod` fan-out over its family, and a `pod-calls-service` edge that MAY cross
+clusters. The destination's port and subset are absent/discarded. The fallback's semantics are
+deliberately coarse — "which ingress LB Service owns this IP" — and SHALL ignore the request's
+host, path, and derived listener port. **No new node type, no new edge type, no new node
+attribute, and no new `labels` key** are introduced.
+
+**Degradation.** The **ambiguous ingress Service** outcome SHALL fall back to the external node
+with its own diagnostic reason, distinct from every existing engine reason. When the fallback
+yields nothing (rule 2), the engine's outcome and diagnostic reason SHALL be byte-for-byte the
+ones the pipeline would have returned without the fallback. Route resolution SHALL still NEVER
+fail a build.
+
+#### Scenario: nginx ingress resolves to its LB Service
+
+- **WHEN** route resolution is enabled and a `server="unknown"` endpoint's destination IP selects
+  an ingress cluster whose snapshot holds exactly one ingress LB Service carrying that IP, with
+  no Istio Gateway CR reachable from the IP (the pipeline misses at gateway resolution)
+- **THEN** the reader SHALL emit a `service` node for that `(selected cluster, namespace,
+  service)`
+- **AND** a `pod-calls-service` edge from the client pod to it
+- **AND** the family-wide `service-selects-pod` fan-out to the Service's backing pods (the
+  ingress controller pods)
+- **AND** SHALL NOT emit an external node for the peer
+
+#### Scenario: A deep Istio miss is not masked by the fallback
+
+- **WHEN** the selected ingress cluster's Gateway serves the host but the pipeline misses at a
+  stage past gateway resolution (no listener on the derived port, no server for the host, or no
+  route matched), and the snapshot also holds an ingress LB Service carrying the destination IP
+- **THEN** the engine SHALL return that deeper miss outcome and diagnostic reason unchanged
+- **AND** SHALL NOT resolve the ingress LB Service
+
+#### Scenario: A routed hit always beats the fallback
+
+- **WHEN** the selected ingress cluster's Gateway and VirtualService route the host to a backend
+  Service at the resolution instant, and the snapshot also holds an ingress LB Service carrying
+  the destination IP
+- **THEN** the reader SHALL resolve the routed backend Service (`hit`), not the LB Service
+
+#### Scenario: Two LB Services on one IP degrade to external
+
+- **WHEN** the pipeline misses and the selected cluster's snapshot holds two differently-named
+  ingress LB Services, both live at the resolution instant, whose ingress IPs both contain the
+  destination IP
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>`
+- **AND** the reader SHALL record the "ambiguous ingress Service" diagnostic reason
+
+#### Scenario: A superseded identity does not make the IP ambiguous
+
+- **WHEN** the pipeline misses and one ingress LB Service identity carrying the destination IP
+  ended BEFORE the resolution instant while a differently-named one carrying the same IP is live
+  at it
+- **THEN** the fallback SHALL resolve the identity live at the resolution instant
+- **AND** SHALL NOT report the "ambiguous ingress Service" diagnostic reason
+
+#### Scenario: Version churn of one identity still resolves
+
+- **WHEN** the pipeline misses and the store holds several versions (rows) of the SAME
+  `(namespace, name)` ingress LB Service carrying the destination IP, one of them live at the
+  resolution instant
+- **THEN** the fallback SHALL resolve that single identity
+
+#### Scenario: No LB Service keeps the pipeline miss
+
+- **WHEN** the pipeline misses and no ingress Service live at the resolution instant in the
+  selected cluster carries the destination IP
+- **THEN** the engine SHALL return the pipeline's own miss outcome and diagnostic reason,
+  byte-for-byte as without the fallback
+
+#### Scenario: Disagreeing per-IP identities degrade to external
+
+- **WHEN** the pipeline misses and two destination IPs each resolve to exactly one ingress LB
+  Service, but to different identities
+- **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>` with the
+  "ambiguous ingress Service" diagnostic reason
+
+#### Scenario: Fallback hit whose Service is absent from topology
+
+- **WHEN** the fallback resolves an ingress LB Service but the selected cluster does not hold
+  that Service in topology
+- **THEN** the endpoint SHALL fall back to the external node with the existing "selected cluster
+  lacks the Service" diagnostic reason
+

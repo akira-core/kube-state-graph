@@ -63,7 +63,9 @@ following stages, in order:
   value — the reader does NOT track which label a value came from; the index-0 condition is
   a property of the value's shape, not of its source.
 - **(b) Port strip.** Strip an optional trailing `:<port>` suffix (best-effort host/port
-  split; a value with no splittable port is used unchanged). A bracketed IPv6 authority
+  split; a value with no splittable port is used unchanged). The split-out port is NOT
+  discarded: it is carried to the Istio route-resolution step below as that step's
+  highest-precedence listener-port hint. A bracketed IPv6 authority
   that reaches this stage intact SHALL yield the IPv6 address without its brackets.
 - **(c) Service-DNS grammar.** Apply the same Kubernetes Service-DNS grammar used by
   connection-string resolution (2-label `<service>.<namespace>`, or 3-label headless
@@ -111,7 +113,9 @@ following stages, in order:
   (a flat network needs none) nor sufficient (in a multi-network mesh the caller's sidecar
   is handed the east-west gateway address, never a remote Pod IP). Stage (e) is evaluated
   first and wins unconditionally — a Service `ClusterIP` always beats a Pod IP — and a pod
-  that reports no address is never a candidate.
+  that reports no address is never a candidate. This stage is evaluated BEFORE the Istio
+  route-resolution step below, so in-cluster (or in-family) pod traffic is never handed to
+  the route engine.
 - **(g) Unresolvable.** Any other shape (multi-label non-`.svc` FQDN, an IP literal that matched
   neither an anchor-cluster Service `ClusterIP` nor an unambiguous family Pod IP, any other value no earlier stage
   matched) is **unresolvable** at this step. Note that a bracketed IPv6 authority in its
@@ -153,7 +157,20 @@ the pod with the lexically-smallest cluster-scoped id, so an intra-cluster dupli
 makes the family look ambiguous.
 
 When classification is unresolvable (stage g), OR the anchor cluster does not hold the
-addressed Service, the reader SHALL fall back to an **external** node from the RAW peer-address
+addressed Service, the reader SHALL — **before** falling back to an external node —
+consult the Istio route-resolution engine as specified in "Istio route resolution of global
+FQDN peers" (subject to that requirement's own preconditions: in particular, an endpoint
+carrying no destination IPs is NEVER consulted and falls external directly). This
+route-resolution step SHALL be reached from EVERY path that would otherwise produce an
+external node under this requirement, without exception. In particular, a global or ingress
+FQDN such as `api.example.com` is a 3-label host and is therefore *successfully* classified
+by stage (c) — as service `example` in namespace `com` — before failing the anchor-cluster
+membership test, so it reaches route resolution via the "anchor cluster does not hold the
+addressed Service" path, NOT via the unresolvable path. An implementation that consults the
+engine only on stage-(g) unresolvability does NOT satisfy this requirement.
+
+When route resolution is disabled, or does not yield a destination, the reader SHALL fall
+back to an **external** node from the RAW peer-address
 value — the label's value exactly as read from the series, with NEITHER the bracket
 truncation of stage (a) NOR the port strip of stage (b) applied:
 
@@ -300,6 +317,33 @@ resolved pod. No new node type and no new edge type are introduced by this requi
 
 - **WHEN** a series has `client_k8s_pod_uid="abc"` resolving to a pod in `cluster-alpha`, `server="unknown"`, `server_k8s_pod_uid=""`, `client_server_address="172.20.10.5"`, and (as a data anomaly) `cluster-alpha` holds two Services with `cluster_ip="172.20.10.5"` — `(namespace="ops", service="zeta")` and `(namespace="ops", service="alpha")`
 - **THEN** the endpoint resolves to `(namespace="ops", service="alpha")` — the lexically-smaller `(namespace, service)` pair — deterministically and identically across rebuilds of the same upstream data
+
+#### Scenario: Global FQDN reaches route resolution via the anchor-lacks-service path
+
+- **WHEN** a `server="unknown"` series has a client resolving to a real topology pod and
+  `client_net_peer_name="api.example.com"`
+- **THEN** DNS-grammar classification (step 2) succeeds, yielding `(namespace="com",
+  service="example")`
+- **AND** the anchor cluster does not hold that Service, so same-cluster Service-node
+  resolution misses
+- **AND** the reader SHALL consult the route-resolution engine before emitting any external
+  node
+
+#### Scenario: Route resolution disabled falls back to external unchanged
+
+- **WHEN** route resolution is not configured
+- **AND** a `server="unknown"` endpoint's peer address is unresolvable by steps 2–4, or the
+  anchor cluster does not hold the classified Service
+- **THEN** the reader SHALL emit `external/<raw_peer_address_value>` with `labels = {}`,
+  byte-for-byte identical to the behaviour before route resolution existed
+
+#### Scenario: In-cluster classification is unaffected by route resolution
+
+- **WHEN** a `server="unknown"` endpoint's peer address classifies to a `(namespace,
+  service)` pair the anchor cluster DOES hold — via `.svc` DNS, bare short name, or
+  ClusterIP literal
+- **THEN** the reader SHALL resolve it to that service node exactly as before
+- **AND** the route-resolution engine SHALL NOT be consulted
 
 #### Scenario: IP-literal peer address matches a pod's own IP in the anchor cluster
 

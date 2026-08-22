@@ -97,3 +97,24 @@ then implementation (GREEN).
       must not change), `make verify-mocks`, `make check-route-containment`.
 - [x] 8.2 Docker integration: `go test ./internal/integration/ -run
       'TestRouteStoreSuite|TestRouteSuite' -count=1` (full chain needs `KSG_ROUTER_CHECK_BIN`).
+
+## Archive note: one scenario is deliberately dropped
+
+This change was archived with `openspec archive --no-validate`. The validator refuses a
+MODIFIED block that omits a scenario the promoted requirement still has — it cannot tell a
+silent regression from an intentional retirement, and OpenSpec has no scenario-level
+REMOVED.
+
+The dropped scenario is "Identity change within the window degrades to external" on
+"Ingress LB Service fallback for unresolved global FQDN peers". It asserts the OLD
+window-based behaviour that D5 removes: with resolution pinned to a single instant, an
+identity that ended before that instant is simply not a candidate, so the case resolves
+instead of degrading. Two scenarios in this change replace it — "A superseded identity does
+not make the IP ambiguous" and "Version churn of one identity still resolves". Keeping the
+old title would have re-asserted behaviour the implementation no longer has.
+
+Two other scenarios the validator flagged were genuine omissions, not retirements, and were
+copied in before archiving: "Cross-namespace Gateway is not a candidate"
+(scope-gateway-candidates-to-ingress-namespace) and "Identical host patterns resolve to the
+lexically-smallest gateway" (harden-istio-route-resolution), both of which remain true under
+point-in-time resolution.

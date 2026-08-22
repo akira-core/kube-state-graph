@@ -260,6 +260,23 @@ deterministic function of the upstream data and the resolved destinations.
 - **THEN** the endpoint SHALL fall back to `external/<raw_peer_address_value>` with the
   corresponding miss diagnostic reason
 
+#### Scenario: Cross-namespace Gateway is not a candidate
+
+- **WHEN** the selected ingress cluster's ingress Service and Deployment live in namespace
+  `istio-system`, and the only Gateway whose selector matches the ingress Deployment's pod
+  labels and whose server hosts serve the peer FQDN lives in namespace `team-b`
+- **THEN** that Gateway SHALL NOT be a candidate and the pipeline SHALL miss with the
+  "no Gateway serves the host" outcome
+- **AND** the ingress LB Service fallback SHALL still apply per its own requirement
+
+#### Scenario: Identical host patterns resolve to the lexically-smallest gateway
+
+- **WHEN** two candidate Gateways in the ingress namespace declare the identical, equally
+  specific server-host pattern matching the peer FQDN, in either declaration or storage
+  order
+- **THEN** the engine SHALL resolve the request through the Gateway with the
+  lexically-smallest name
+
 ### Requirement: Ingress LB Service fallback for unresolved global FQDN peers
 
 When the Istio route-resolution engine ("Istio route resolution of global FQDN peers") has

@@ -2,9 +2,7 @@
 
 ## Purpose
 Surfaces the physical NetApp ONTAP storage behind Kubernetes claims: one graph node per ONTAP aggregate and per ONTAP controller, a PVC-to-aggregate edge derived from a single Harvest label series, per-edge I/O measurements and the volume's declared throughput ceiling from the Harvest QoS families, per-aggregate health and usage, controller health, and coverage signals for claims that should have joined but did not.
-
 ## Requirements
-
 ### Requirement: Harvest volume-label series as the storage topology source
 
 The builder SHALL consume the NetApp Harvest volume-object label series `volume_labels` from the same centralised VictoriaMetrics endpoint as every other series. The fixed, case-sensitive label contract it MUST carry: `cluster` (the ONTAP cluster name — NOT a Kubernetes cluster; the two namespaces never mix), `node` (the ONTAP controller currently owning the containing aggregate), `aggr` (the containing aggregate), `svm` (the serving Storage Virtual Machine), and `volume_name` (the name of the Kubernetes PersistentVolume the FlexVol backs). It is an **info series**: its sample value SHALL be ignored entirely and only its label set consumed.
@@ -323,3 +321,32 @@ The PVC's retained `data.storageclass` value is the operator's discriminator bet
 
 - **WHEN** every PVC with a non-empty `volumename` joins a `volume_labels` series with a non-empty `aggr` label and matches at least one QoS workload family
 - **THEN** neither warning is emitted
+
+### Requirement: Harvest legs under request-scoped selectors
+
+Every NetApp Harvest query the builder issues — `volume_labels`, the six `qos_*` workload families, the two `qos_policy_fixed_max_throughput_*` families, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, and `node_new_status` — SHALL carry the request-scoped `az` and `env` matchers (under the operator-configured label keys) and SHALL NEVER carry a `cluster` or `namespace` matcher. Harvest's `cluster` label is the **ONTAP** cluster name and never a Kubernetes cluster, so a Kubernetes `cluster` value pushed into it would match nothing; Harvest carries no `namespace` at all. The `qos_*` families keep their fixed `lun=""` selector, composed with the request matchers.
+
+Within a filtered build the storage chain is therefore narrowed **by reference**: an aggregate and its owning controller materialise only when a **loaded** claim's `volumename` joins a `volume_labels` series, so a `cluster` or `namespace` filter reaches the NetApp graph solely through the claims it loads. A filer shared across clusters, zones, or environments is one node set, reached from whichever loaded claims join it.
+
+The operator SHALL ensure the deployment stamps the configured `az` / `env` labels on the Harvest series exactly as on the Kubernetes series. A Harvest family lacking the label under an `az` / `env` filter returns nothing: the build completes with no `netapp-aggr` / `netapp-node` nodes and no `pvc-to-netapp-aggr` edges for that request, which the join-coverage signal reports as unmatched claims.
+
+#### Scenario: Cluster and namespace filters never reach Harvest
+
+- **WHEN** a build runs with `cluster={cluster-alpha}` and `namespace={shop}` and no `az` / `env` value
+- **THEN** every Harvest query is issued exactly as in an unfiltered build (the `qos_*` families with `lun=""` only), and the aggregates in the response are exactly those joined by the loaded `cluster-alpha` / `shop` claims
+
+#### Scenario: Zone filter reaches Harvest
+
+- **WHEN** a build runs with `az={zone-a}`
+- **THEN** every Harvest query carries `az="zone-a"` in addition to any fixed selector, and a `volume_labels` series stamped `az="zone-b"` is not loaded even if a loaded claim's `volumename` would join it
+
+#### Scenario: Shared filer reached by reference from either filtered cluster
+
+- **WHEN** claims in `cluster-alpha` and `cluster-beta` both join `netapp/ontap-prod/aggr/aggr1` and a build runs with `cluster={cluster-alpha}`
+- **THEN** `netapp/ontap-prod/aggr/aggr1` and its owning `netapp-node` are materialised with a `pvc-to-netapp-aggr` edge from the `cluster-alpha` claim only; a `cluster={cluster-beta}` build materialises the same two nodes from the `cluster-beta` claim
+
+#### Scenario: Harvest lacking the environment label under an env filter
+
+- **WHEN** the Harvest series carry no `env` label and a build runs with `env={prod}`
+- **THEN** every Harvest leg returns zero rows, the build completes with no NetApp nodes or storage edges, every loaded claim with a `volumename` is counted as an unmatched claim by the join-coverage signal, and the build does not fail
+
