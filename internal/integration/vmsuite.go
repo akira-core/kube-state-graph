@@ -267,6 +267,33 @@ func (s *VMSuite) IngestExpFmt(exposition string) {
 	body, _ := io.ReadAll(resp.Body)
 	s.Require().Truef(resp.StatusCode >= 200 && resp.StatusCode < 300,
 		"VM ingest returned %d: %s", resp.StatusCode, body)
+	s.ForceFlush()
+}
+
+// ForceFlush makes everything ingested so far immediately queryable.
+//
+// This is the single reason the suites are not dominated by waiting.
+// VictoriaMetrics registers a brand-NEW series into the searchable index on a
+// periodic tick, so a fixture's first sample is invisible for ~10s (measured
+// on the pinned image: 10.59s for a fresh label set, versus 0.017s for a new
+// sample on a series that already exists). Every test seeds its own label sets,
+// so every test paid it. /internal/force_flush is VM's test-oriented endpoint
+// for exactly this and collapses the wait to ~30ms.
+//
+// A non-2xx is NOT fatal: the endpoint is an internal convenience, and the
+// WaitForSeries polls that follow every ingest remain the actual correctness
+// gate — losing the flush costs latency, never a wrong result.
+func (s *VMSuite) ForceFlush() {
+	s.T().Helper()
+	resp, err := s.vmGet(s.vmURL + "/internal/force_flush")
+	if err != nil {
+		s.T().Logf("force_flush failed (falling back to the ingest-visibility wait): %v", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.T().Logf("force_flush returned %d (falling back to the ingest-visibility wait)", resp.StatusCode)
+	}
 }
 
 // WaitForSeries polls VM until the supplied PromQL returns a non-empty
