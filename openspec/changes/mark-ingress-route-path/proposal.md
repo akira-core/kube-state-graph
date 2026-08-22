@@ -55,11 +55,14 @@ the dependency entirely. The two ingress nodes must be told apart.
 - `pod-service-graph`: adds a "Ingress route-path marking" requirement extending "Full ingress
   chain for routed global-FQDN hits" — the `labels.role` marker with its two values and monotone
   precedence, and the invariant that a degrade produces no marker.
-- `graph-api`: the "Edge-type discovery endpoint" requirement corrects pre-existing drift — the
-  promoted spec's `pod-calls-service` scenario still said `may_cross_cluster: false`, while
-  `translate-global-fqdn-to-k8s-service` made it `true` in `registry.go` without a `graph-api`
-  delta. The MODIFIED requirement reproduces the accurate value (`true`, with the route-engine
-  ingress-cluster anchoring as the reason). No new catalogue entry.
+- `graph-api`: none. This change originally carried a MODIFIED "Edge-type discovery endpoint"
+  delta to correct pre-existing drift — the promoted spec's `pod-calls-service` scenario said
+  `may_cross_cluster: false` while `translate-global-fqdn-to-k8s-service` had made it `true` in
+  `registry.go` without a delta. That correction has since landed in the promoted spec through a
+  later archived change, so the delta became a verbatim copy of a requirement that has ALSO moved
+  on (`pvc-to-netapp-aggr` replacing `pvc-to-storageclass`, the `relation` label contract).
+  Because a MODIFIED requirement replaces the whole block, archiving it would have regressed both.
+  The delta is withdrawn; this change touches no `graph-api` requirement.
 
 ## Impact
 

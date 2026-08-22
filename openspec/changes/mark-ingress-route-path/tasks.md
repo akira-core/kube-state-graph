@@ -67,15 +67,21 @@ type). No resolution behaviour changes.
       role marker; `/v1/edge-types` bullet lists no dedicated routes type.
 - [x] 7.2 `docs/istio-virtualservice-routing-history-design.md`: §4.3 comparison table "圖上標記"
       row and consumer toggle rule use `labels.role` only.
-- [x] 7.3 Note in the change: the `graph-api` delta also corrects pre-existing drift — the
-      promoted spec's `pod-calls-service` scenario still says `may_cross_cluster: false`, while
-      `translate-global-fqdn-to-k8s-service` made it `true` in `registry.go` without a `graph-api`
-      delta. The MODIFIED requirement reproduces the accurate value.
+- [x] 7.3 WITHDRAWN. The `graph-api` delta existed only to correct pre-existing drift
+      (`pod-calls-service` `may_cross_cluster: false` in the promoted spec vs `true` in
+      `registry.go` since `translate-global-fqdn-to-k8s-service`). A later archived change already
+      carried that correction, and the promoted requirement has since gained `pvc-to-netapp-aggr`
+      and the `relation` label contract — so this delta, a verbatim copy of the OLD block, would
+      have reverted both on archive (a MODIFIED requirement replaces the whole block; `openspec
+      validate` caught the dropped `pvc-to-netapp-aggr` scenario). Delta removed.
 
 ## 8. Verification
 
 - [x] 8.1 `make build && make vet && make lint`
 - [x] 8.2 Targeted tests: `go test ./pkg/graph/ ./pkg/build/ ./internal/api/`
 - [x] 8.3 `make check-route-containment` (`pkg/build` still must not import `pkg/route`)
-- [ ] 8.4 Docker + `router_check_tool` (optional locally):
+- [x] 8.4 Docker + `router_check_tool` (optional locally):
       `KSG_ROUTER_CHECK_BIN=$(which router_check_tool) go test ./internal/integration/ -run TestRouteSuite`
+      — PASS (9.54s). On macOS the extracted binary is a Linux ELF, so
+      `KSG_ROUTER_CHECK_BIN` pointed at a shim running the same digest-pinned
+      Envoy tools image under `docker run` with `/var/folders` mounted.

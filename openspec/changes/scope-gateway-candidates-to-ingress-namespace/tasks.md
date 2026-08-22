@@ -64,7 +64,12 @@ tests first (RED), then implementation (GREEN).
 - [x] 5.1 `go build ./... && go vet ./...`, `go vet -tags oracle ./pkg/route/`,
       `go test ./pkg/route/... ./pkg/build/... -count=1`, `make test` (golden files
       unchanged), `make lint`, `make verify-mocks`, `make check-route-containment`.
-- [ ] 5.2 Docker integration: `go test ./internal/integration/ -run
+- [x] 5.2 Docker integration: `go test ./internal/integration/ -run
       'TestRouteStoreSuite|TestRouteSuite' -count=1` (full chain needs
       `KSG_ROUTER_CHECK_BIN`). `openspec validate
-      scope-gateway-candidates-to-ingress-namespace`.
+      scope-gateway-candidates-to-ingress-namespace`. Both suites PASS
+      (RouteStoreSuite 4.76s, RouteSuite 9.54s); validate clean. On macOS the
+      extracted `router_check_tool` is a Linux ELF, so `KSG_ROUTER_CHECK_BIN`
+      pointed at a shim that runs the SAME digest-pinned Envoy tools image via
+      `docker run` with `/var/folders` mounted (the tool takes absolute -c / -t
+      paths in the caller's temp dir).
