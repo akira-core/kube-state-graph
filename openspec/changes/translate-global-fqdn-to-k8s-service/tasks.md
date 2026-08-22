@@ -274,3 +274,16 @@ testcontainer in group 8 seeds the schema itself, so implementation is not block
 - [x] 14.5 Docs: design.md D5 rewritten (host+bind selection, `Intersection` early-exit argument,
       three distinct miss reasons); CLAUDE.md route bullet (3) updated; spec delta scenario for
       host-aware server selection; `openspec validate translate-global-fqdn-to-k8s-service`.
+
+## Archive ordering (both changes MODIFY "Unknown-server peer-label enrichment")
+
+`resolve-unknown-server-pod-ip-peer` and `translate-global-fqdn-to-k8s-service` both carry a
+MODIFIED block for the SAME `pod-service-graph` requirement, and each was rebased onto the
+CURRENT promoted spec — which today has neither the Pod-IP stage nor the route-resolution
+hook. A MODIFIED requirement replaces the whole block, so archiving them naively would let
+the second one silently drop the first one's content.
+
+Whichever archives FIRST is fine. Before archiving the SECOND, re-rebase its MODIFIED block
+onto the then-promoted requirement (copy the promoted block, re-apply this change's own
+additions, keep its own scenarios). `openspec validate` catches the omission if this is
+skipped — that is exactly how this defect was found.

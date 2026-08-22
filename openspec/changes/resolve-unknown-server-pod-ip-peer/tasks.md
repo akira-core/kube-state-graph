@@ -103,3 +103,16 @@ cluster boundary within the family. No new PromQL query, no new node/edge type.
 - [x] 7.4 `go test ./internal/api/ -run TestGolden` passes WITHOUT `-update` — no golden
       file changes.
 - [x] 7.5 `openspec validate "resolve-unknown-server-pod-ip-peer"` passes.
+
+## Archive ordering (both changes MODIFY "Unknown-server peer-label enrichment")
+
+`resolve-unknown-server-pod-ip-peer` and `translate-global-fqdn-to-k8s-service` both carry a
+MODIFIED block for the SAME `pod-service-graph` requirement, and each was rebased onto the
+CURRENT promoted spec — which today has neither the Pod-IP stage nor the route-resolution
+hook. A MODIFIED requirement replaces the whole block, so archiving them naively would let
+the second one silently drop the first one's content.
+
+Whichever archives FIRST is fine. Before archiving the SECOND, re-rebase its MODIFIED block
+onto the then-promoted requirement (copy the promoted block, re-apply this change's own
+additions, keep its own scenarios). `openspec validate` catches the omission if this is
+skipped — that is exactly how this defect was found.
