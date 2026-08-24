@@ -787,7 +787,7 @@ live under `openspec/specs/`.
   `slog.Warn("netapp_volume_join_miss", "count", n)` (hop-A miss or
   empty-`aggr`) and `slog.Warn("netapp_qos_join_miss", "count", n)` (edge drawn,
   no QoS match). No signal for a missing ceiling — a volume in no policy group
-  is normal. Tests: `pkg/build/netapp_test.go` (incl. the 30-leg fan-out pin),
+  is normal. Tests: `pkg/build/netapp_test.go` (incl. the 37-leg fan-out pin),
   `pkg/promql/queries_test.go` (`TestRender_QoSVolumeGranularity` pins
   `{lun=""}`),
   `internal/api/testdata/golden/with-netapp-storage-cytoscape.json`,

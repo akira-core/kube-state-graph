@@ -1079,6 +1079,12 @@ func resolveControllerApplications(v topologyVectors, mc missingClusterCounts) m
 	return out
 }
 
+// jobKey identifies a Job by its cluster-scoped namespace/name. It is
+// deliberately NOT podNameKey: the two are structurally identical, so sharing
+// one type would let a Job key silently satisfy a pod-keyed lookup (and vice
+// versa) with no compiler complaint.
+type jobKey struct{ cluster, namespace, job string }
+
 // resolveJobCronJobOwners builds the (cluster, namespace, job) → owning CronJob
 // name index from kube_job_owner. It exists only for ArgoCD Application
 // resolution: the Kubernetes CronJob controller copies only
@@ -1094,8 +1100,8 @@ func resolveControllerApplications(v topologyVectors, mc missingClusterCounts) m
 //
 // This index is NEVER read by resolvePodOwners, which is what makes "the hop
 // cannot change data.owner" a structural property rather than a convention.
-func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[podNameKey]string {
-	out := make(map[podNameKey]string, len(vec))
+func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[jobKey]string {
+	out := make(map[jobKey]string, len(vec))
 	for _, s := range vec {
 		if string(s.Metric["owner_kind"]) != "CronJob" || string(s.Metric["owner_is_controller"]) != "true" {
 			continue
@@ -1105,7 +1111,7 @@ func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[podN
 		if job == "" || cronJob == "" {
 			continue
 		}
-		key := podNameKey{mc.bucket(promql.QJobOwner, string(s.Metric["cluster"])), string(s.Metric["namespace"]), job}
+		key := jobKey{mc.bucket(promql.QJobOwner, string(s.Metric["cluster"])), string(s.Metric["namespace"]), job}
 		if cur, ok := out[key]; ok && cur <= cronJob {
 			continue
 		}
@@ -1134,7 +1140,7 @@ func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[podN
 func resolvePodApplications(
 	owners map[podNameKey]ownerRef,
 	ctrlApps map[controllerKey]string,
-	jobCronJobs map[podNameKey]string,
+	jobCronJobs map[jobKey]string,
 ) map[podNameKey]string {
 	out := make(map[podNameKey]string, len(owners))
 	for pod, owner := range owners {
@@ -1147,7 +1153,7 @@ func resolvePodApplications(
 		if owner.kind != "Job" {
 			continue
 		}
-		cronJob, ok := jobCronJobs[podNameKey{pod.cluster, pod.namespace, owner.name}]
+		cronJob, ok := jobCronJobs[jobKey{pod.cluster, pod.namespace, owner.name}]
 		if !ok {
 			continue
 		}
