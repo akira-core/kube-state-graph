@@ -551,3 +551,177 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 	}
 	assert.Equal(t, 37, total, "each leg issued exactly once")
 }
+
+// legFixture is one topology leg's canned answer.
+type legFixture struct {
+	vec model.Vector
+	err error
+}
+
+// legQuerier answers each named leg with its fixture and every OTHER leg with an
+// empty vector.
+//
+// Two things are load-bearing. (1) The per-leg expectations are registered
+// BEFORE the catch-all: testify returns the first registered expectation whose
+// arguments match, so a catch-all registered first would shadow every specific
+// one. (2) They are deliberately NOT .Maybe() — the catch-all answers
+// successfully, so a query name that stops matching (a renamed Query constant, a
+// reordered Instant signature) would otherwise let the whole test pass
+// vacuously. Requiring the call makes that a loud failure instead.
+func legQuerier(t *testing.T, legs map[promql.Query]legFixture) *promqlmocks.MockQuerier {
+	t.Helper()
+	q := promqlmocks.NewMockQuerier(t)
+	for name, f := range legs { // keys are distinct legs, so order is irrelevant
+		q.EXPECT().
+			Instant(mock.Anything, string(name), mock.Anything, mock.Anything).
+			Return(f.vec, f.err)
+	}
+	q.EXPECT().
+		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(model.Vector{}, nil).
+		Maybe()
+	return q
+}
+
+// failingLegs builds the map form for the common "these legs all fail the same
+// way" case.
+func failingLegs(vec model.Vector, err error, names ...promql.Query) map[promql.Query]legFixture {
+	out := make(map[promql.Query]legFixture, len(names))
+	for _, name := range names {
+		out[name] = legFixture{vec, err}
+	}
+	return out
+}
+
+// readTopologyDefaults runs ReadTopology with the zero LabelKeys / Selector —
+// the shape every leg-failure test wants.
+func readTopologyDefaults(ctx context.Context, q promql.Querier) (Topology, error) {
+	return ReadTopology(ctx, q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+}
+
+func TestReadTopology_AccumulatingAnnotationLegDegrades(t *testing.T) {
+	// Samples returned ALONGSIDE the error: fetchOptional must discard them.
+	discarded := sampleVec(ctrlAnn("replicaset", "shop", "rs-1", "app:apps/ReplicaSet:shop/rs-1"))
+	legs := failingLegs(discarded, errors.New("search.maxUniqueTimeseries exceeded"),
+		promql.QReplicaSetAnnotations, promql.QJobAnnotations)
+
+	// A sibling family that SUCCEEDS, and a pod that depends on it. Without them
+	// the whole fixture is empty, so a degrade that clobbered more than its own
+	// destination (a shared dst, a parseTopology that bails on one nil vector)
+	// would be invisible.
+	survivor := sampleVec(
+		ctrlAnn("deployment", "shop", "web", "storefront:apps/Deployment:shop/web"),
+		ctrlAnn("deployment", "shop", "api", "storefront:apps/Deployment:shop/api"),
+	)
+	legs[promql.QDeploymentAnnotations] = legFixture{survivor, nil}
+	legs[promql.QPodInfo] = legFixture{sampleVec(appPod("shop", "web-1", "uid-web-1")), nil}
+	legs[promql.QPodOwner] = legFixture{sampleVec(appOwner("shop", "web-1", "Deployment", "web")), nil}
+	q := legQuerier(t, legs)
+
+	tp, err := readTopologyDefaults(context.Background(), q)
+	require.NoError(t, err, "an accumulating-cardinality annotation leg must not fail the build")
+	for _, name := range []promql.Query{promql.QReplicaSetAnnotations, promql.QJobAnnotations} {
+		require.Contains(t, tp.RawSeriesCount, string(name),
+			"%s must still be counted after degrading (an absent key is not the same as 0)", name)
+		assert.Zero(t, tp.RawSeriesCount[string(name)],
+			"%s: a query error must yield an empty vector, discarding any samples returned with the error", name)
+	}
+	assert.Equal(t, len(survivor), tp.RawSeriesCount[string(promql.QDeploymentAnnotations)],
+		"a degrading leg must not disturb a sibling family that succeeded")
+	require.Len(t, tp.Pods, 1, "the surviving pod family must still parse")
+	assert.Equal(t, "storefront", tp.Pods[0].Application(),
+		"a pod owned by the surviving family must still resolve its Application end to end")
+}
+
+// TestReadTopology_DegradedJobAnnotationsSuppressCronJobHop pins the one
+// degrade that could substitute a WRONG value rather than omit one. The
+// Job -> CronJob hop's precondition is "the Job carries no annotation of its
+// own", which is only knowable when kube_job_annotations was actually READ:
+// after a degrade a Job that DOES carry its own tracking-id is indistinguishable
+// from one that does not, so following the hop would silently re-attribute the
+// pod to the CronJob's Application. Every other optional leg is subtractive;
+// this one must be too.
+//
+// The subtests are a matched pair: the SAME fixture with the leg alive must
+// still take the hop, so a broken fixture cannot make the suppression look
+// correct.
+func TestReadTopology_DegradedJobAnnotationsSuppressCronJobHop(t *testing.T) {
+	fixture := func(jobAnn legFixture) map[promql.Query]legFixture {
+		return map[promql.Query]legFixture{
+			promql.QJobAnnotations: jobAnn,
+			promql.QPodInfo:        {sampleVec(appPod("shop", "migrate-1-xyz", "uid-1")), nil},
+			promql.QPodOwner:       {sampleVec(appOwner("shop", "migrate-1-xyz", "Job", "migrate-1")), nil},
+			promql.QJobOwner: {sampleVec(model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "shop", "job_name": "migrate-1",
+				"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
+			}}), nil},
+			promql.QCronJobAnnotations: {
+				sampleVec(ctrlAnn("cronjob", "shop", "nightly", "reports:batch/CronJob:shop/nightly")), nil},
+		}
+	}
+
+	t.Run("degraded suppresses the hop", func(t *testing.T) {
+		q := legQuerier(t, fixture(legFixture{nil, errors.New("search.maxUniqueTimeseries exceeded")}))
+
+		tp, err := readTopologyDefaults(context.Background(), q)
+		require.NoError(t, err, "the leg must still degrade rather than fail the build")
+		require.Len(t, tp.Pods, 1)
+		assert.Empty(t, tp.Pods[0].Application(),
+			"a degraded kube_job_annotations must omit the Application, never attribute the pod to the CronJob")
+		require.NotNil(t, tp.Pods[0].Owner())
+		assert.Equal(t, graph.Owner{Kind: "Job", Name: "migrate-1"}, *tp.Pods[0].Owner(),
+			"suppressing the hop must not disturb the owner attribute")
+	})
+
+	t.Run("alive leg still takes the hop", func(t *testing.T) {
+		// An empty vector is the genuine "this Job carries no annotation" answer.
+		q := legQuerier(t, fixture(legFixture{model.Vector{}, nil}))
+
+		tp, err := readTopologyDefaults(context.Background(), q)
+		require.NoError(t, err)
+		require.Len(t, tp.Pods, 1)
+		assert.Equal(t, "reports", tp.Pods[0].Application(),
+			"a read-but-empty family is a real answer: the hop still resolves the CronJob's Application")
+	})
+}
+
+// TestReadTopology_RequiredAnnotationLegFailsBuild covers every leg the
+// abort-on-error half of the split names — the four controller-annotation
+// families that stayed on `fetch` plus kube_job_owner. Only the two
+// accumulating-cardinality families are allowed to degrade, so flipping any of
+// these five to fetchOptional must fail here (TestReadTopology_FanOutLegCount
+// pins the total, not which leg is on which side).
+func TestReadTopology_RequiredAnnotationLegFailsBuild(t *testing.T) {
+	for _, name := range []promql.Query{
+		promql.QDeploymentAnnotations,
+		promql.QStatefulSetAnnotations,
+		promql.QDaemonSetAnnotations,
+		promql.QCronJobAnnotations,
+		promql.QJobOwner,
+	} {
+		t.Run(string(name), func(t *testing.T) {
+			q := legQuerier(t, failingLegs(nil, errors.New("upstream 5xx"), name))
+
+			_, err := readTopologyDefaults(context.Background(), q)
+			require.Error(t, err, "%s is abort-on-error and must fail the build", name)
+		})
+	}
+}
+
+func TestReadTopology_DegradingLegHonoursCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	q := legQuerier(t, failingLegs(nil, errors.New("context canceled"), promql.QJobAnnotations))
+
+	_, err := readTopologyDefaults(ctx, q)
+	require.Error(t, err, "caller cancellation must fail a degrading family rather than swallow it")
+
+	// Positive control: the SAME leg and the SAME error under a live caller ctx
+	// must degrade. Without it this test passes byte-identically whether the leg
+	// is on fetch or fetchOptional, so it would not actually pin
+	// optionalQueryFatal's callerCtx branch — only the pair does.
+	live := legQuerier(t, failingLegs(nil, errors.New("upstream 5xx"), promql.QJobAnnotations))
+	_, err = readTopologyDefaults(context.Background(), live)
+	require.NoError(t, err, "the same leg and error must degrade when the caller is still alive")
+}

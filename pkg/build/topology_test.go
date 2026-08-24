@@ -1,6 +1,7 @@
 package build
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/prometheus/common/model"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // TestParseTopology_PodRestartCollapsesToLatestUID — when the same
@@ -1044,6 +1046,113 @@ func TestResolveApplications_MalformedSiblingDoesNotSuppressValid(t *testing.T) 
 	), missingClusterCounts{})
 	assert.Equal(t, "checkout", fwd[serviceKey{"c", "shop", "checkout"}], "valid Application survives a malformed sibling")
 	assert.Equal(t, fwd[serviceKey{"c", "shop", "checkout"}], rev[serviceKey{"c", "shop", "checkout"}], "order-independent")
+}
+
+// TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving pins that the
+// rows the kube_job_owner fixed selector will exclude are already invisible to
+// the reader: owner_kind!="CronJob", owner_is_controller!="true", and a row
+// missing owner_is_controller. They are dropped before mc.bucket, so even the
+// missing-cluster tally is identical to a vector that never contained them.
+func TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving(t *testing.T) {
+	row := func(cluster, job, ownerKind, ownerName, isController string, includeController bool) model.Sample {
+		m := model.Metric{
+			"namespace":  "batch",
+			"job_name":   model.LabelValue(job),
+			"owner_kind": model.LabelValue(ownerKind),
+			"owner_name": model.LabelValue(ownerName),
+		}
+		if cluster != "" {
+			m["cluster"] = model.LabelValue(cluster)
+		}
+		if includeController {
+			m["owner_is_controller"] = model.LabelValue(isController)
+		}
+		return model.Sample{Metric: m}
+	}
+
+	admitted := []model.Sample{
+		row("c", "nightly-1", "CronJob", "nightly", "true", true),
+		row("", "orphan-1", "CronJob", "orphan", "true", true), // missing cluster → tally
+	}
+	excluded := []model.Sample{
+		row("c", "ci-1", "Job", "parent", "true", true),            // owner_kind="Job"
+		row("c", "nightly-2", "CronJob", "nightly", "false", true), // owner_is_controller="false"
+		row("c", "nightly-3", "CronJob", "nightly", "", false),     // missing owner_is_controller
+		row("", "ghost-1", "Job", "x", "true", true),               // excluded + missing cluster → must not tally
+	}
+
+	mcFull, mcKept := missingClusterCounts{}, missingClusterCounts{}
+	gotFull := resolveJobCronJobOwners(sampleVec(slices.Concat(admitted, excluded)...), mcFull)
+	gotKept := resolveJobCronJobOwners(sampleVec(admitted...), mcKept)
+
+	require.NotEmpty(t, gotKept, "sanity: admitted CronJob-controller rows must resolve")
+	assert.Equal(t, gotKept, gotFull, "rows the selector excludes must not change the index")
+	assert.Equal(t, mcKept, mcFull, "excluded rows must not reach mc.bucket")
+}
+
+// TestResolveApplications_TrackingIDPresenceIsOutputPreserving pins the same
+// property for the six controller-annotation families: empty-tracking-id and
+// absent-tracking-id series are skipped before keyOf, so they never reach
+// mc.bucket. The index and the tally match a vector that only held the
+// annotated series.
+func TestResolveApplications_TrackingIDPresenceIsOutputPreserving(t *testing.T) {
+	ann := func(nameLabel, cluster, ns, name, tracking string, includeTracking bool) model.Sample {
+		m := model.Metric{
+			"namespace":                model.LabelValue(ns),
+			model.LabelName(nameLabel): model.LabelValue(name),
+		}
+		if cluster != "" {
+			m["cluster"] = model.LabelValue(cluster)
+		}
+		if includeTracking {
+			m["annotation_argocd_argoproj_io_tracking_id"] = model.LabelValue(tracking)
+		}
+		return model.Sample{Metric: m}
+	}
+
+	// Only the setter is test-local — the family list and its identity labels
+	// are read from production's controllerAnnotationFamilies, so a seventh
+	// family (or a renamed identity label, `job_name` being the perennial
+	// hazard) is covered automatically instead of silently skipped.
+	setters := map[promql.Query]func(*topologyVectors, model.Vector){
+		promql.QDeploymentAnnotations:  func(v *topologyVectors, vec model.Vector) { v.DeploymentAnnotations = vec },
+		promql.QStatefulSetAnnotations: func(v *topologyVectors, vec model.Vector) { v.StatefulSetAnnotations = vec },
+		promql.QDaemonSetAnnotations:   func(v *topologyVectors, vec model.Vector) { v.DaemonSetAnnotations = vec },
+		promql.QReplicaSetAnnotations:  func(v *topologyVectors, vec model.Vector) { v.ReplicaSetAnnotations = vec },
+		promql.QJobAnnotations:         func(v *topologyVectors, vec model.Vector) { v.JobAnnotations = vec },
+		promql.QCronJobAnnotations:     func(v *topologyVectors, vec model.Vector) { v.CronJobAnnotations = vec },
+	}
+
+	for _, f := range controllerAnnotationFamilies {
+		t.Run(string(f.query), func(t *testing.T) {
+			set, ok := setters[f.query]
+			require.True(t, ok, "controllerAnnotationFamilies gained %s with no setter here", f.query)
+			nameLabel := string(f.nameLabel)
+
+			admitted := []model.Sample{
+				ann(nameLabel, "c", "shop", "checkout", "checkout:apps/x", true),
+				ann(nameLabel, "", "shop", "orphan", "orphan:apps/x", true), // missing cluster → tally
+			}
+			excluded := []model.Sample{
+				ann(nameLabel, "c", "shop", "empty", "", true),   // empty tracking-id
+				ann(nameLabel, "c", "shop", "absent", "", false), // absent tracking-id
+				ann(nameLabel, "", "shop", "ghost", "", true),    // empty + missing cluster → must not tally
+				ann(nameLabel, "", "shop", "ghost2", "", false),  // absent + missing cluster → must not tally
+			}
+
+			var full, kept topologyVectors
+			set(&full, sampleVec(slices.Concat(admitted, excluded)...))
+			set(&kept, sampleVec(admitted...))
+
+			mcFull, mcKept := missingClusterCounts{}, missingClusterCounts{}
+			gotFull := resolveControllerApplications(full, mcFull)
+			gotKept := resolveControllerApplications(kept, mcKept)
+
+			require.NotEmpty(t, gotKept, "sanity: annotated series must resolve")
+			assert.Equal(t, gotKept, gotFull, "un-annotated series must not change the index")
+			assert.Equal(t, mcKept, mcFull, "un-annotated series must not reach mc.bucket")
+		})
+	}
 }
 
 // TestParseTopology_NodeReadyStatusAttribute — kube_node_status_condition's

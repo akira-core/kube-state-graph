@@ -196,6 +196,55 @@ The topology fan-out grows from 30 to 37 legs. `ReplicationController`, `Node`
 (static / mirror pods) and CRD controllers such as argo-rollouts `Rollout` have
 no kube-state-metrics annotation family and resolve no Application.
 
+## Controller-annotation legs: tighter upstream selector, two now degrade
+
+Two changes to the seven controller-annotation / owner legs above.
+
+**1. Fixed selectors are pushed upstream.** `kube_job_owner` is now read as
+`kube_job_owner{owner_kind="CronJob",owner_is_controller="true"}` and the six
+`kube_*_annotations` families as
+`kube_*_annotations{annotation_argocd_argoproj_io_tracking_id!=""}`. Both mirror
+a discard the Go reader already performed, so **no graph output changes**. What
+changes is the upstream contract: a series that does not match is never
+fetched. An exporter that spells `owner_is_controller` differently, or one whose
+tracking-id label is not exactly `annotation_argocd_argoproj_io_tracking_id`,
+now yields an empty family instead of rows the reader silently dropped.
+`Topology.RawSeriesCount` for those seven legs likewise counts matched
+(annotated / CronJob-controlled) objects, not every object of that kind — a
+`0` there no longer means "the collector is off".
+
+**2. `kube_replicaset_annotations` and `kube_job_annotations` no longer fail the
+build.** Their cardinality accumulates with history (`revisionHistoryLimit`,
+Job history limits) rather than live object count, so they moved from
+abort-on-error `fetch` to log-and-continue `fetchOptional` — the same semantics
+the Harvest and kubelet legs already had. The other four families and
+`kube_job_owner` still abort.
+
+**This is an operator-visible outcome change.** An upstream error on those two
+legs (for example `search.maxUniqueTimeseries exceeded`) previously returned a
+mapped HTTP 5xx; it now returns **200** with `data.application` silently absent
+for bare-ReplicaSet-owned and Job-owned pods. The absence itself is
+subtractive — never a substituted value — but it still moves the graph:
+affected pods reparent in the Cytoscape compound hierarchy, a sole-member
+`application` group node disappears, and a PVC that inherited its Application
+from such a pod re-inherits from a different mounter.
+
+A degraded `kube_job_annotations` additionally **suppresses the Job → CronJob
+hop for that build**. The hop's precondition is "this Job carries no annotation
+of its own", which a family that was never read cannot establish — so following
+it would attribute a directly-managed Job's pod to its CronJob's Application, a
+wrong value rather than a missing one. The cost is that a genuinely
+annotation-less Job under an annotated CronJob also loses `data.application`
+while the leg is degraded.
+
+If you alert on `/v1/graph` 5xx for these families, move the alert to the
+self-metric
+`kube_state_graph_upstream_query_failures_total{query="kube_replicaset_annotations"}`
+(and `{query="kube_job_annotations"}`), which is incremented for every failed
+query regardless of which fetch helper issued it, or to the
+`optional topology query failed; continuing with empty vector` Warn. Caller
+cancellation (build timeout / client disconnect) still fails the request.
+
 ## NOT changed
 
 `data.owner` and the `controller` compound group are untouched: the Job → CronJob

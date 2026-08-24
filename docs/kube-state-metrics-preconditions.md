@@ -249,6 +249,13 @@ owning CronJob and the CronJob's annotation is used. A Job ArgoCD manages
 directly keeps its own Application — the hop runs only on a miss. The hop is
 **resolution-only**: a CronJob-managed pod's `data.owner` still names the Job.
 
+The hop is **suppressed for a build in which the `kube_job_annotations` query
+itself errored** (that family degrades rather than failing the request — see
+`docs/upstream-metrics.md`). A miss is only evidence that a Job carries no
+annotation when the family was actually read, so while the leg is degraded
+CronJob-managed pods carry no `data.application` instead of being attributed to
+their CronJob.
+
 **Kinds that cannot be covered.** `ReplicationController` has no
 `kube_replicationcontroller_annotations` family in kube-state-metrics; `Node`
 (static / mirror pods) and third-party CRD controllers (argo-rollouts
@@ -336,3 +343,30 @@ count(kube_job_owner{owner_kind="CronJob",owner_is_controller="true"})
 # 6. az / env reach the pod family too, not just nodes.
 count by (az, env) (kube_pod_info)
 ```
+
+The six probes in step 4 — and the one in step 5 — are the shape the builder
+itself now issues: each query carries the same fixed matcher, so the
+`raw_series_counts` debug map counts **annotated** objects for the six
+annotation families and **CronJob-controlled** Jobs for `kube_job_owner`,
+not every object of that kind. Once a resource IS allowlisted,
+kube-state-metrics emits one series per object of that kind whether or not
+the object holds the annotation; the fixed matcher drops that un-annotated
+majority before it is counted. (It saves nothing on an **un**-allowlisted
+resource — as noted above, KSM already emits an empty `_annotations` family
+for one.)
+
+The cost is that `0` is now **ambiguous** and can no longer, on its own,
+tell an install fault from an ordinary state. A `0` means any of:
+
+- the collector is off / not scraped / RBAC-blocked (the install fault),
+- the per-resource `--metric-annotations-allowlist` entry is missing,
+- there simply are no ArgoCD-managed workloads of that kind (no CronJob-owned
+  Jobs, for step 5),
+- the request's own `?az=` / `?env=` / `?cluster=` / `?namespace=` narrowed
+  the family to nothing, **or**
+- for `kube_replicaset_annotations` and `kube_job_annotations` only, the query
+  errored and the leg degraded to an empty vector — look for the
+  `optional topology query failed; continuing with empty vector` Warn.
+
+Probe 1 (all 22 series present) is what still separates "the collector is
+off" from the rest: it queries the bare family names with no matcher.

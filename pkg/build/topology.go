@@ -105,12 +105,24 @@ type Topology struct {
 
 	ClustersObserved []string // sorted unique cluster values
 
-	// RawSeriesCount records how many raw upstream series each topology query
-	// returned BEFORE parsing/filtering, keyed by query name. Diagnostic only:
-	// the build pipeline uses it to enrich the outside-retention error so an
-	// operator can tell which upstream metric came back empty (0 raw series)
-	// versus returned rows that were all filtered out (raw > 0 but parsed 0,
-	// e.g. kube_pod_info samples with an empty uid).
+	// RawSeriesCount records how many series each topology query returned,
+	// keyed by query name. Diagnostic only: the build pipeline uses it to
+	// enrich the outside-retention error so an operator can tell which
+	// upstream metric came back empty (0 series) versus returned rows that
+	// were all discarded in Go (count > 0 but parsed 0, e.g. kube_pod_info
+	// samples with an empty uid).
+	//
+	// It is a POST-selector count, not a raw object count. Seven legs carry a
+	// fixed selector that pre-filters what the reader would have discarded
+	// anyway — kube_job_owner (CronJob controllers only) and the six
+	// controller-annotation families (annotated objects only) — so for those a
+	// 0 means "nothing matched the fixed selector", never "the collector is
+	// off". Every leg is also narrowed by the request's own az/env/cluster/
+	// namespace matchers per promql.queryDims. And because
+	// kube_replicaset_annotations / kube_job_annotations are fetchOptional, a
+	// 0 for those two ALSO covers "the query errored and the leg degraded" —
+	// the accompanying `optional topology query failed` Warn is the only thing
+	// that separates the two.
 	RawSeriesCount map[string]int
 }
 
@@ -150,6 +162,17 @@ type topologyVectors struct {
 	ReplicaSetAnnotations  model.Vector
 	JobAnnotations         model.Vector
 	CronJobAnnotations     model.Vector
+	// JobAnnotationsDegraded records that the kube_job_annotations leg came back
+	// empty BECAUSE THE QUERY FAILED, as opposed to genuinely matching nothing.
+	// resolvePodApplications needs the two told apart: its Job → CronJob hop is
+	// gated on "this Job carries no annotation of its own", which only a leg that
+	// was actually read can establish.
+	//
+	// kube_replicaset_annotations — the other degrading family — needs no such
+	// flag: a bare ReplicaSet has no further ancestor to consult, so a miss
+	// resolves no Application either way and the degrade stays subtractive on
+	// its own.
+	JobAnnotationsDegraded bool
 	// NetApp Harvest storage series, in join order (design.md D3):
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
@@ -179,8 +202,10 @@ type topologyVectors struct {
 // --resources=services,endpointslices) yields empty indexes, and "://"
 // connection-string endpoints simply fall back to `external/<label>`.
 // Harvest and kubelet legs are OPTIONAL with log-and-continue error
-// semantics (a non-NetApp deployment must build cleanly); existing KSM
-// legs keep abort-on-error semantics.
+// semantics (a non-NetApp deployment must build cleanly). Existing KSM
+// legs keep abort-on-error semantics, except kube_replicaset_annotations
+// and kube_job_annotations whose cardinality accumulates with history
+// and which degrade like Harvest (harden-controller-annotation-legs D3).
 func ReadTopology(
 	ctx context.Context,
 	q promql.Querier,
@@ -229,10 +254,16 @@ func ReadTopology(
 			return err
 		}
 	}
-	// fetchOptional is the Harvest/kubelet twin: a query error logs and
-	// yields an empty vector instead of failing the build (design D1).
-	// Caller cancellation still fails the group.
-	fetchOptional := func(name promql.Query, dst *model.Vector) func() error {
+	// fetchOptionalTracking is the OPTIONAL-leg twin of fetch: a query error logs
+	// and yields an empty vector instead of failing the build. Caller
+	// cancellation still fails the group. Used for Harvest, kubelet, and
+	// the two accumulating-cardinality annotation families.
+	//
+	// A non-nil degraded is set when — and only when — an error was swallowed,
+	// so a reader that infers something from the family's ABSENCE can tell
+	// "read, matched nothing" from "never read". Only kube_job_annotations
+	// needs that today; every other optional leg passes nil via fetchOptional.
+	fetchOptionalTracking := func(name promql.Query, dst *model.Vector, degraded *bool) func() error {
 		return func() (err error) {
 			defer func() {
 				if rec := recover(); rec != nil {
@@ -253,11 +284,19 @@ func ReadTopology(
 					"query", string(name),
 					"error", qerr)
 				*dst = nil
+				if degraded != nil {
+					*degraded = true
+				}
 				return nil
 			}
 			*dst = out
 			return nil
 		}
+	}
+	// fetchOptional is fetchOptionalTracking for the legs whose degrade needs no
+	// downstream signal.
+	fetchOptional := func(name promql.Query, dst *model.Vector) func() error {
+		return fetchOptionalTracking(name, dst, nil)
 	}
 
 	g.Go(fetch(promql.QPodInfo, &v.Pod))
@@ -275,17 +314,21 @@ func ReadTopology(
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
 	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
-	// The controller-annotation families use `fetch`, not `fetchOptional`: the
-	// families being ABSENT is the normal case and an absent metric returns an
-	// empty vector, not an error, so fail-fast never fires on the common path.
-	// The only trigger is a genuine upstream failure, which is exactly how the
-	// sibling service / PVC annotation legs above already behave.
+	// The four live-object-count controller-annotation families and
+	// kube_job_owner use `fetch`: an upstream fault is rare and fail-fast
+	// is the right response. kube_replicaset_annotations and
+	// kube_job_annotations use `fetchOptional` — their cardinality
+	// accumulates with history (revisionHistoryLimit / Job history limits)
+	// and can exceed an upstream series limit in an otherwise ordinary
+	// estate; losing an `application` string is never worth failing the
+	// whole graph (harden-controller-annotation-legs D3). Caller cancellation
+	// still fails the request.
 	g.Go(fetch(promql.QJobOwner, &v.JobOwner))
 	g.Go(fetch(promql.QDeploymentAnnotations, &v.DeploymentAnnotations))
 	g.Go(fetch(promql.QStatefulSetAnnotations, &v.StatefulSetAnnotations))
 	g.Go(fetch(promql.QDaemonSetAnnotations, &v.DaemonSetAnnotations))
-	g.Go(fetch(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
-	g.Go(fetch(promql.QJobAnnotations, &v.JobAnnotations))
+	g.Go(fetchOptional(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
+	g.Go(fetchOptionalTracking(promql.QJobAnnotations, &v.JobAnnotations, &v.JobAnnotationsDegraded))
 	g.Go(fetch(promql.QCronJobAnnotations, &v.CronJobAnnotations))
 	g.Go(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels))
 	g.Go(fetchOptional(promql.QQoSReadOps, &v.QoSReadOps))
@@ -434,6 +477,7 @@ func parseTopology(v topologyVectors) Topology {
 		podOwners,
 		resolveControllerApplications(v, mc),
 		resolveJobCronJobOwners(v.JobOwner, mc),
+		v.JobAnnotationsDegraded,
 	)
 
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id). Built
@@ -1137,10 +1181,22 @@ func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[jobK
 // A pod with no controller owner, or an owner of a kind outside
 // controllerAnnotationFamilies, is absent from the returned map so the caller
 // omits data.application entirely rather than emitting "".
+//
+// jobAnnotationsDegraded suppresses the hop wholesale. The hop's precondition
+// is "the Job carries no annotation of its OWN", and a degraded
+// kube_job_annotations cannot establish it: every Job misses, the annotated
+// ones included. Taking the hop then would attribute a directly-managed Job's
+// pod to its CronJob's Application — the one degrade that SUBSTITUTES a wrong
+// value instead of omitting a right one, which no other optional leg does. The
+// cost of suppressing is that a genuinely annotation-less Job under an
+// annotated CronJob also loses its Application for that build; losing a string
+// is strictly better than reporting the wrong one, and it keeps every degrade
+// in this package subtractive (harden-controller-annotation-legs D3).
 func resolvePodApplications(
 	owners map[podNameKey]ownerRef,
 	ctrlApps map[controllerKey]string,
 	jobCronJobs map[jobKey]string,
+	jobAnnotationsDegraded bool,
 ) map[podNameKey]string {
 	out := make(map[podNameKey]string, len(owners))
 	for pod, owner := range owners {
@@ -1149,8 +1205,9 @@ func resolvePodApplications(
 			out[pod] = app
 			continue
 		}
-		// Job → CronJob: the only hop, and only on a miss.
-		if owner.kind != "Job" {
+		// Job → CronJob: the only hop, and only on a miss the Job family was
+		// actually read to establish.
+		if owner.kind != "Job" || jobAnnotationsDegraded {
 			continue
 		}
 		cronJob, ok := jobCronJobs[jobKey{pod.cluster, pod.namespace, owner.name}]

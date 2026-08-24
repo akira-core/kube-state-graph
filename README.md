@@ -138,7 +138,8 @@ selectors, query-error vs empty-vector semantics, and the per-request fan-out
 — is [`docs/upstream-metrics.md`](docs/upstream-metrics.md).
 
 Summary: one `/v1/graph` request fans out **37** topology queries in parallel
-(22 kube-state-metrics abort-on-error + 13 Harvest + 2 kubelet
+(20 kube-state-metrics abort-on-error + 2 accumulating-cardinality
+annotation families log-and-continue + 13 Harvest + 2 kubelet
 log-and-continue), then **3** service-graph queries (skipped when a filtered
 build loaded neither pods nor services), plus `up{}` only for an unfiltered
 empty topology. There is **no metric-name prefix**; every series is queried at
@@ -151,8 +152,10 @@ Harvest's `cluster` is the **ONTAP** cluster and is never used as
 
 The **"Required?"** column below is about an **empty vector** (the series is
 absent from the store, or matched nothing in the window). A **query error**
-(timeout / 5xx) on any of the 22 kube-state-metrics legs or on
-`traces_service_graph_request_total` **fails the build**; Harvest, kubelet, and
+(timeout / 5xx) on any of the 20 abort-on-error kube-state-metrics legs or on
+`traces_service_graph_request_total` **fails the build**;
+`kube_replicaset_annotations` and `kube_job_annotations` (cardinality
+accumulates with history, not live object count), Harvest, kubelet, and
 the two RED series log-and-continue. Details in the catalog.
 
 ### Topology metrics — produced by [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
@@ -168,8 +171,8 @@ the two RED series log-and-continue. Details in the catalog.
 | `kube_persistentvolumeclaim_info` | PVC `data.storageclass` (the policy name, never a node) + `labels.volumename` (bound PV name; roots the Harvest join) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass`, `volumename` | Optional (absent ⇒ no `data.storageclass` / `volumename`; no Harvest join) |
 | `kube_pod_owner` | Pod controller-owner attribute `data.owner` = `{kind, name}` (ReplicaSet skipped to its Deployment; omitted when no controller owner). The resolved owner is also the join key for the pod's ArgoCD Application, and both drive the `application` / `controller` compound groups in the workload hierarchy | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller` | Optional (absent ⇒ no `data.owner`, and no `data.application` — the Application is keyed on the controller) |
 | `kube_replicaset_owner` | Resolves a ReplicaSet pod-owner up to its owning Deployment | `cluster`, `namespace`, `replicaset`, `owner_kind`, `owner_name` | Optional (absent ⇒ ReplicaSet kept as owner) |
-| `kube_job_owner` | Resolves a Job up to its owning CronJob, **for pod ArgoCD Application resolution only** — the Kubernetes CronJob controller copies only `spec.jobTemplate.metadata` annotations onto the Jobs it creates, so ArgoCD's tracking-id never reaches a Job. Never alters `data.owner` | `cluster`, `namespace`, `job_name`, `owner_kind`, `owner_name`, `owner_is_controller` | Optional (absent ⇒ CronJob-managed pods carry no `data.application`); a KSM default |
-| `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_replicaset_annotations`, `kube_job_annotations`, `kube_cronjob_annotations` | Pod ArgoCD Application `data.application` (segment before the first `:` of the tracking-id), joined on `(cluster, namespace, kind, name)` against the pod's resolved controller owner — ArgoCD stamps the annotation on the workload object it applies, never on the pods a controller spawns. Nests the pod under the `application` compound group | `cluster`, `namespace`, the family's identity label (`deployment` / `statefulset` / `daemonset` / `replicaset` / **`job_name`** / `cronjob`), `annotation_argocd_argoproj_io_tracking_id` | Optional, **per family** (absent ⇒ no `data.application` for pods of that controller kind). Each **requires** `--metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |
+| `kube_job_owner{owner_kind="CronJob",owner_is_controller="true"}` | Resolves a Job up to its owning CronJob, **for pod ArgoCD Application resolution only** — the Kubernetes CronJob controller copies only `spec.jobTemplate.metadata` annotations onto the Jobs it creates, so ArgoCD's tracking-id never reaches a Job. Never alters `data.owner` | `cluster`, `namespace`, `job_name`, `owner_kind`, `owner_name`, `owner_is_controller` | Optional (absent ⇒ CronJob-managed pods carry no `data.application`); a KSM default |
+| `kube_{deployment,statefulset,daemonset,replicaset,job,cronjob}_annotations{annotation_argocd_argoproj_io_tracking_id!=""}` | Pod ArgoCD Application `data.application` (segment before the first `:` of the tracking-id), joined on `(cluster, namespace, kind, name)` against the pod's resolved controller owner — ArgoCD stamps the annotation on the workload object it applies, never on the pods a controller spawns. Nests the pod under the `application` compound group | `cluster`, `namespace`, the family's identity label (`deployment` / `statefulset` / `daemonset` / `replicaset` / **`job_name`** / `cronjob`), `annotation_argocd_argoproj_io_tracking_id` | Optional, **per family** (absent ⇒ no `data.application` for pods of that controller kind). Each **requires** `--metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id]` (NOT a KSM default). On a **query error** `replicaset` / `job` log-and-continue (cardinality accumulates with history); the other four fail the build |
 | `kube_pod_container_info` | Pod container list `data.containers` = `[{name, image}]`, sorted by `(name, image)`; on a mid-window image change the latest-seen image wins per container | `cluster`, `namespace`, `pod`, `container`, `image` | Optional (absent ⇒ no `data.containers`); a KSM default |
 | `kube_service_info` | Service nodes for `://` connection-string resolution (D29); `cluster_ip` (headless `None` ⇒ no `data.ipaddress`) | `cluster`, `namespace`, `service`, `cluster_ip` | Optional (absent ⇒ `://` endpoints fall back to `external`) |
 | `kube_service_annotations` | Service ArgoCD Application `data.application` (segment before the first `:` of the tracking-id), which nests the service under the `application` compound group | `cluster`, `namespace`, `service`, `annotation_argocd_argoproj_io_tracking_id` | Optional (absent ⇒ no `data.application`). **Requires** `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |

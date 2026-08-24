@@ -141,6 +141,47 @@ probability of hitting an upstream limit, the degrade bounds the consequence whe
 it is hit anyway. Splitting them would land a change whose stated purpose —
 "a decoration cannot take the API down" — is only half true in either half.
 
+### D5: A degrade must stay subtractive, so the Job → CronJob hop is gated on the family having been read
+
+Making `kube_job_annotations` optional is not purely subtractive on its own.
+`resolvePodApplications` tries the Job's own annotation first and falls through
+to the owning CronJob's only **on a miss** — the "nearest managed ancestor wins"
+rule. A degraded family makes every Job miss, the annotated ones included, so
+the fallthrough would attribute a directly-managed Job's pod to its CronJob's
+Application. That is a *different value*, not an absent one: alone among the
+package's optional legs, this degrade would report something wrong rather than
+report less.
+
+The fix is to carry one bit out of the fan-out — `topologyVectors.
+JobAnnotationsDegraded`, set by `fetchOptionalTracking` on the swallowed-error
+path only — and suppress the hop when it is set. The hop's precondition ("this
+Job carries no annotation of its own") is unknowable from an unread family, so
+the correct response to not knowing is to not infer.
+
+The cost is a second-order loss: a Job that genuinely carries no annotation,
+under a CronJob that does, also loses its Application for that build. Losing a
+string is strictly better than reporting the wrong one, and it restores the
+invariant that every optional leg in this package is subtractive.
+
+`kube_replicaset_annotations` — the other degrading family — needs no flag. It
+is consulted only for a **bare** ReplicaSet (the D34 skip has already collapsed
+a Deployment-owned one), and a bare ReplicaSet has no further ancestor, so its
+miss resolves no Application either way. Only a family with a fallback hop
+behind it needs the distinction, which is why the flag is one named bool rather
+than a general per-family degraded map.
+
+**Alternative rejected — leave `kube_job_annotations` on `fetch`.** It removes
+the mis-attribution by removing the degrade, but Job annotations are one of the
+two accumulating-cardinality families D3 exists to protect, and it is the
+likelier of the two to blow a series limit (every CI and Helm-hook Job in the
+estate). Keeping the degrade and gating the inference costs one bool.
+
+**Alternative rejected — thread a general `map[promql.Query]bool` of degraded
+families through the parse.** Only one reader has an inference to gate; a map
+would be state nobody reads, and the compiler would stop catching a new
+fallthrough that forgot to consult it. Add a second bool when a second hop
+appears.
+
 ## Risks / Trade-offs
 
 - **A future edit to `resolveApplications` or `resolveJobCronJobOwners` loosens

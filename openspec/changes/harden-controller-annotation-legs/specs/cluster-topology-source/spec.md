@@ -46,6 +46,8 @@ The six controller-annotation families and `kube_job_owner` are likewise OPTIONA
 
 **Query error is a separate axis from an empty vector**, and the seven split on it. `kube_replicaset_annotations` and `kube_job_annotations` SHALL degrade on a query error: the failure is logged, the family is treated as an empty vector, and the build completes without the Applications that family would have supplied. The other five — the Deployment, StatefulSet, DaemonSet and CronJob annotation families and `kube_job_owner` — SHALL fail the build on a query error, as every other kube-state-metrics leg does. The two that degrade are the two whose cardinality **accumulates with history** rather than tracking the live object count (one series per ReplicaSet retained by a Deployment's `revisionHistoryLimit`, one per Job retained by a CronJob's history limits), so they are the two that can exceed an upstream series or sample limit in an estate whose live object count is unremarkable — and losing an `application` string is never worth failing the whole graph. Caller-originated cancellation — a build timeout or a disconnected client — SHALL still fail the request for these two, since the caller is no longer waiting for any result.
 
+A degrade SHALL be **subtractive**: it removes Applications the failed family would have supplied and never substitutes a different one. This requires one gate. The Job → CronJob hop is taken only when the Job carries no annotation of its own, a fact a family that was never read cannot establish — so when the `kube_job_annotations` query fails, the reader SHALL suppress the hop for that build rather than let every Job miss fall through to its owning CronJob's Application. A Job that genuinely carries no annotation of its own therefore also resolves no Application while that leg is degraded. `kube_replicaset_annotations` needs no equivalent gate: a bare ReplicaSet has no further ancestor to consult, so its miss resolves nothing either way.
+
 `kube_node_status_condition` is likewise OPTIONAL: when absent — or when no `condition="Ready"` series matches a given node — the reader SHALL still build a valid topology, the affected K8s node entities carry no `ready_status` attribute, and the build does not fail.
 
 `kube_persistentvolumeclaim_annotations` and `kube_service_annotations` are likewise OPTIONAL: when absent — or when no series matches a given `(cluster, namespace, claim)` / `(cluster, namespace, service)`, or its `annotation_argocd_argoproj_io_tracking_id` label is empty — the reader SHALL still build a valid topology, the affected PVC / service entities carry no `application` attribute and nest under their namespace group, and the build does not fail.
@@ -110,6 +112,11 @@ The six controller-annotation families and `kube_job_owner` are likewise OPTIONA
 - **WHEN** the `kube_replicaset_annotations` or `kube_job_annotations` query fails upstream — a timeout, a 5xx, or a series/sample limit exceeded — while the caller's own deadline has not expired
 - **THEN** the failure is logged, that family is treated as an empty vector, every other family still resolves, pods owned by a bare ReplicaSet (or a Job) carry no `application` attribute, and the request returns a valid `200` graph
 
+#### Scenario: A degraded Job annotation family suppresses the CronJob hop
+
+- **WHEN** the `kube_job_annotations` query fails upstream while `kube_job_owner` and `kube_cronjob_annotations` both resolve, and a pod is owned by a Job that carries its own tracking-id under a CronJob that carries a different one
+- **THEN** the pod carries no `application` attribute — the hop is suppressed for the build, so the pod is never attributed to the CronJob's Application — while the same fixture with the Job family read but genuinely empty still resolves the CronJob's Application through the hop
+
 #### Scenario: A required annotation family still fails the build
 
 - **WHEN** the `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_cronjob_annotations`, or `kube_job_owner` query fails upstream
@@ -146,7 +153,7 @@ The build SHALL accept four request-scoped selector dimensions — `az`, `env`, 
 
 Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=~"unknown|"` (see "Series missing the cluster label"), the one value that is not rendered as a plain literal. Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
 
-A build with every dimension empty SHALL issue each query exactly as it is issued today. Zero rows under a non-empty dimension is a valid, empty topology — not a failure and not a retention miss.
+A build with every dimension empty SHALL add **no** request-scoped matcher to any query, so each query renders exactly its fixed form. Zero rows under a non-empty dimension is a valid, empty topology — not a failure and not a retention miss.
 
 #### Scenario: Fixed selector composed with request matchers
 
@@ -186,4 +193,4 @@ A build with every dimension empty SHALL issue each query exactly as it is issue
 #### Scenario: Empty dimensions render nothing
 
 - **WHEN** a build runs with all four dimensions empty
-- **THEN** every issued query string is byte-identical to the query issued before request-scoped selectors existed
+- **THEN** every issued query string carries only its own fixed selector — byte-identical to the recorded unfiltered rendering, with no request-scoped matcher appended

@@ -60,7 +60,14 @@ const (
 	// Keyed (cluster, namespace, job_name); the identity label is `job_name`,
 	// NOT `job` (kube-state-metrics avoids Prometheus' reserved target label).
 	// This leg NEVER alters the pod `owner` attribute — resolvePodOwners does
-	// not read it. OPTIONAL — a KSM default, absence degrades gracefully.
+	// not read it. Queried at the fixed selector
+	// `owner_kind="CronJob",owner_is_controller="true"`
+	// (jobOwnerCronJobSelector) — a request-invariant metric-selection
+	// contract mirroring resolveJobCronJobOwners, NOT a caller filter — so
+	// Topology.RawSeriesCount counts CronJob-controlled Jobs, not all Jobs.
+	// OPTIONAL on the EMPTY-VECTOR axis (a KSM default, absence degrades
+	// gracefully to no Application for CronJob-managed pods); on the
+	// QUERY-ERROR axis it is abort-on-error (`fetch`).
 	QJobOwner Query = "kube_job_owner"
 
 	// PVC StorageClass name + bound PV name. kube_persistentvolumeclaim_info
@@ -124,12 +131,25 @@ const (
 	// Prometheus' reserved `job` target label. Joined on
 	// (cluster, namespace, kind, name) against the pod's already-resolved
 	// controller owner, so the Deployment case needs no extra owner hop (the
-	// D34 ReplicaSet skip has already collapsed it). ALL are OPTIONAL — each
-	// annotation label requires the operator's
+	// D34 ReplicaSet skip has already collapsed it). ALL are OPTIONAL on the
+	// EMPTY-VECTOR axis — each annotation label requires the operator's
 	// --metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id],
 	// and because that flag is per-resource the degradation is per-family: an
 	// operator may enable `deployments` alone. Absence degrades gracefully to no
 	// `application` attribute.
+	//
+	// All six are queried at the fixed selector
+	// `annotation_argocd_argoproj_io_tracking_id!=""`
+	// (argoTrackingIDPresentSelector) — a request-invariant metric-selection
+	// contract mirroring resolveApplications' skip, NOT a caller filter — so an
+	// ALLOWLISTED family returns only its annotated objects rather than one
+	// series per workload object, and Topology.RawSeriesCount counts ANNOTATED
+	// objects. An UN-allowlisted family was already empty at the KSM end.
+	//
+	// On the QUERY-ERROR axis they split: kube_replicaset_annotations and
+	// kube_job_annotations are `fetchOptional` (log-and-continue — their
+	// cardinality accumulates with revisionHistoryLimit / Job history limits);
+	// the other four are abort-on-error `fetch`. See ReadTopology.
 	QDeploymentAnnotations  Query = "kube_deployment_annotations"
 	QStatefulSetAnnotations Query = "kube_statefulset_annotations"
 	QDaemonSetAnnotations   Query = "kube_daemonset_annotations"
@@ -271,6 +291,30 @@ var queryDims = map[Query]dims{
 // that omits `lun` entirely.
 const qosVolumeGranularitySelector = `lun=""`
 
+// jobOwnerCronJobSelector keeps kube_job_owner at the rows
+// resolveJobCronJobOwners retains: CronJob controller owners. It is a
+// request-invariant metric-selection contract, NOT a caller filter — the
+// reader already drops every other row before it is keyed or counted, so
+// selecting them upstream is output-preserving
+// (harden-controller-annotation-legs D1).
+const jobOwnerCronJobSelector = `owner_kind="CronJob",owner_is_controller="true"`
+
+// argoTrackingIDPresentSelector keeps each controller-annotation family at
+// series that actually carry a tracking-id. It is a request-invariant
+// metric-selection contract, NOT a caller filter — resolveApplications
+// skips an empty or absent tracking-id before keyOf, so selecting them
+// upstream is output-preserving (harden-controller-annotation-legs D1).
+//
+// What it actually saves is the ALLOWLISTED-BUT-UNANNOTATED majority: once
+// --metric-annotations-allowlist names the resource, kube-state-metrics emits
+// one series per object of that kind and attaches the annotation label only to
+// the objects that hold the annotation. PromQL treats the missing label as "",
+// so this matcher drops the rest. It saves NOTHING on the un-allowlisted case —
+// KSM short-circuits an un-allowlisted resource to an EMPTY family (no series
+// at all), as docs/kube-state-metrics-preconditions.md records; there is
+// nothing there to drop.
+const argoTrackingIDPresentSelector = `annotation_argocd_argoproj_io_tracking_id!=""`
+
 // serviceGraphSentinelSelector excludes the servicegraph connector's virtual
 // peers from the service-graph series at the query layer (design.md D30): an
 // uninstrumented caller surfaces as client="user", an unresolved peer as
@@ -333,8 +377,10 @@ const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 //
 // Two selector layers meet here and MUST NOT be conflated. A query's FIXED
 // selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`,
-// the service-graph sentinel and link matchers) is a request-invariant
-// metric-selection contract, identical for every request. `sel` carries the
+// `owner_kind="CronJob",owner_is_controller="true"`,
+// `annotation_argocd_argoproj_io_tracking_id!=""`, the service-graph
+// sentinel and link matchers) is a request-invariant metric-selection
+// contract, identical for every request. `sel` carries the
 // caller's `az` / `env` / `cluster` / `namespace` values and reaches only the
 // dimensions queryDims grants this query. The fixed part is always rendered
 // FIRST, so composing the two never reorders an existing matcher.
@@ -386,7 +432,7 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 	case QReplicaSetOwner:
 		return fmt.Sprintf(`last_over_time(kube_replicaset_owner%s[%s])`, braces(""), w)
 	case QJobOwner:
-		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, braces(jobOwnerCronJobSelector), w)
 	case QPVCInfo:
 		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_info%s[%s])`, braces(""), w)
 	case QPodContainerInfo:
@@ -407,18 +453,14 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		return fmt.Sprintf(`last_over_time(kube_service_annotations%s[%s])`, braces(""), w)
 	case QPVCAnnotations:
 		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations%s[%s])`, braces(""), w)
-	case QDeploymentAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_deployment_annotations%s[%s])`, braces(""), w)
-	case QStatefulSetAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_statefulset_annotations%s[%s])`, braces(""), w)
-	case QDaemonSetAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_daemonset_annotations%s[%s])`, braces(""), w)
-	case QReplicaSetAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_replicaset_annotations%s[%s])`, braces(""), w)
-	case QJobAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_job_annotations%s[%s])`, braces(""), w)
-	case QCronJobAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_cronjob_annotations%s[%s])`, braces(""), w)
+	case QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
+		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations:
+		// One grouped arm for the six controller-annotation families (same
+		// shape as the QQoS* arm below): each Query constant IS its bare
+		// metric name, so `q` renders it and a seventh family costs one
+		// constant in the case list rather than a copy-pasted Sprintf whose
+		// hand-typed metric name only render-baseline.txt would catch.
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(argoTrackingIDPresentSelector), w)
 	case QVolumeLabels:
 		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, braces(""), w)
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:

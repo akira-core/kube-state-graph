@@ -250,17 +250,21 @@ func TestQueryDims_ControllerAnnotationFamiliesAreNamespaced(t *testing.T) {
 	}
 
 	// The rendered form, not just the table entry: all four matchers present,
-	// in the fixed az, env, cluster, namespace order, composed after the (here
-	// absent) fixed selector.
+	// in the fixed az, env, cluster, namespace order, composed after each
+	// family's own fixed selector.
 	sel := Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"},
 		Cluster: []string{"cluster-alpha"}, Namespace: []string{"shop"},
 	}
 	const matchers = `az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"`
 	for _, q := range families {
-		want := `last_over_time(` + string(q) + `{` + matchers + `}[1m])`
+		fixed := argoTrackingIDPresentSelector
+		if q == QJobOwner {
+			fixed = jobOwnerCronJobSelector
+		}
+		want := `last_over_time(` + string(q) + `{` + fixed + `,` + matchers + `}[1m])`
 		assert.Equal(t, want, Render(q, time.Minute, LabelKeys{}, sel),
-			"%s must carry every request dimension", q)
+			"%s must carry every request dimension after its fixed selector", q)
 	}
 }
 
@@ -278,6 +282,10 @@ func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
 			`last_over_time(kube_node_status_condition{condition="Ready",az="zone-a",cluster="cluster-alpha"}[1m])`},
 		"qos volume granularity": {QQoSReadOps,
 			`last_over_time(qos_read_ops{lun="",az="zone-a"}[1m])`},
+		"job owner cronjob": {QJobOwner,
+			`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
+		"deployment annotations": {QDeploymentAnnotations,
+			`last_over_time(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
 		"pod info (no fixed selector)": {QPodInfo,
 			`last_over_time(kube_pod_info{az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
 		"service graph total (unfiltered)": {QServiceGraphTotal,
@@ -290,11 +298,19 @@ func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
 	}
 }
 
-// TestRender_EmptySelectorMatchesBaseline is the byte-identity proof for the
-// unfiltered build: every query renders exactly the string it rendered before
-// request-scoped selectors existed. testdata/render-baseline.txt was captured
-// from the pre-change tree; the only expected difference is the deleted
-// cluster_discovery query.
+// TestRender_EmptySelectorMatchesBaseline is the proof that a zero Selector
+// adds NO request matcher: every query renders exactly its fixed form.
+// testdata/render-baseline.txt is the recorded unfiltered rendering, minus the
+// deleted cluster_discovery query.
+//
+// The baseline is NOT immutable. It moves whenever a query's FIXED selector
+// changes (a request-invariant metric-selection contract — see Render's doc
+// comment), and it must NOT move for anything else. A diff here is a
+// regression only when the changed line is not a deliberate fixed-selector
+// edit: the last such edit added
+// `owner_kind="CronJob",owner_is_controller="true"` to kube_job_owner and
+// `annotation_argocd_argoproj_io_tracking_id!=""` to the six
+// controller-annotation families (seven lines).
 func TestRender_EmptySelectorMatchesBaseline(t *testing.T) {
 	const removed = "cluster_discovery"
 
