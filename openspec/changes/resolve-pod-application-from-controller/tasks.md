@@ -4,6 +4,7 @@
 - [x] 1.2 Add seven `Render` cases emitting `last_over_time(<bare metric name>[w])` with no fixed selector; verify `go test ./pkg/promql/ -run 'TestRender'` passes.
 - [x] 1.3 Add seven `queryDims` entries as `dimsNamespaced` (design D5: all four dimensions); verify `go test ./pkg/promql/ -run TestQueryDims_EveryQueryListed` passes with no "has no queryDims entry" error.
 - [x] 1.4 Append the seven rendered lines to `pkg/promql/testdata/render-baseline.txt` (tab-separated `<query-name>\t<rendered PromQL>`, matching the existing `kube_service_annotations` row's style); verify `go test ./pkg/promql/ -run TestRender_EmptySelectorMatchesBaseline` passes.
+- [x] 1.5 Add `TestQueryDims_ControllerAnnotationFamiliesAreNamespaced` to `pkg/promql/selector_test.go` pinning all seven families to `dimsNamespaced` AND to the rendered `az,env,cluster,namespace` matcher set (spec scenario "Controller-annotation families receive all four dimensions"; design D5 — the sibling of the existing `dimsNone` / Harvest group pins); verify it fails when any family is switched to `dimsClusterScoped`.
 
 ## 2. Topology fan-out
 
@@ -15,7 +16,7 @@
 - [x] 3.1 Add a `controllerKey{cluster, namespace, kind, name}` type and `resolveControllerApplications(v topologyVectors, mc missingClusterCounts) map[controllerKey]string` that calls the existing generic `resolveApplications` once per annotation family with a `keyOf` stamping the constant owner kind, then merges the six disjoint results (design D1); verify a new unit test asserts one entry per family and that the merge is independent of call order.
 - [x] 3.2 Add `resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[jobKey]string` over `kube_job_owner`, keeping only `owner_kind="CronJob"` AND `owner_is_controller="true"` and picking the lexically-smallest `owner_name` on collision (design D3); verify a unit test covers the controller filter and the collision pick.
 - [x] 3.3 Rewrite `resolvePodApplications` to take `(owners map[podNameKey]ownerRef, ctrlApps map[controllerKey]string, jobCronJobs map[jobKey]string)` and resolve per pod: look up the pod's own resolved owner, and on a miss where the owner kind is `Job` follow the CronJob hop and look up again (design D2 — own annotation first, hop second); verify `git diff pkg/build/topology.go` shows `resolvePodOwners` and `rsToDeployment` unchanged.
-- [x] 3.4 Delete the `argocd_tracking_id` read and the `bucketCluster`-instead-of-`mc.bucket` workaround comment, switching every new family to `mc.bucket(promql.Q…, …)` (design D6); verify no `argocd_tracking_id` reference remains in `pkg/build/` via `grep -rn argocd_tracking_id pkg/`.
+- [x] 3.4 Delete the `argocd_tracking_id` read and the `bucketCluster`-instead-of-`mc.bucket` workaround comment, switching every new family to `mc.bucket(promql.Q…, …)` (design D6); verify no `argocd_tracking_id` reference remains in production code via `grep -rn argocd_tracking_id pkg/ --include='*.go' | grep -v _test.go` (task 4.7 deliberately keeps one in a test fixture).
 - [x] 3.5 Wire the three resolvers into `parseTopology` so each pod's `ApplicationValue` is set before `graph.NewGraph` freezes the nodes, leaving the PVC inheritance pass (`pvcInheritedApps`) untouched; verify `go test ./pkg/build/ -run TestParseTopology_PVCInheritsApplicationFromMountingPod` still passes after its fixture is migrated in task 4.5.
 
 ## 4. Unit tests
@@ -49,4 +50,4 @@
 - [x] 7.1 Run `make lint` and `make vet`; verify both report clean.
 - [x] 7.2 Run `make test`; verify the full unit / component / golden / property suite passes with `-race -shuffle=on`.
 - [x] 7.3 Run the integration suite with Docker available (`go test ./internal/integration/ -run TestGraphSuite`); verify the migrated and new Application cases pass.
-- [x] 7.4 Run `openspec verify "resolve-pod-application-from-controller"`; verify it reports no outstanding artifact or task issues.
+- [x] 7.4 Run `openspec validate "resolve-pod-application-from-controller"`; verify it reports the change valid with no outstanding artifact or task issues.

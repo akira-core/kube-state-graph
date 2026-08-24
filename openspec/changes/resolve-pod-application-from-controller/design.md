@@ -135,9 +135,16 @@ Applications inside the requested scope.
 `mc.bucket` to avoid double-tallying `kube_pod_owner`'s missing-`cluster` samples,
 which `resolvePodOwners` already counts for the same vector. After this change the
 pod Application reads seven vectors that nothing else reads, so each one tallies
-normally through `mc.bucket(promql.Q…, …)` and the documented diagnostic gap
-("a tracking-id carried only on a non-controller row with a missing cluster label
-is bucketed silently") goes away.
+normally through `mc.bucket(promql.Q…, …)` and the double-tally hazard that
+forced the workaround goes away.
+
+This does NOT close the missing-`cluster` diagnostic gap in general: the generic
+`resolveApplications` calls `keyOf` — and therefore `mc.bucket` — only for series
+that already survived the "raw tracking-id yields a non-empty Application" filter,
+so a family arriving with no `cluster` label AND no allowlisted annotation is still
+bucketed with a zero tally. That is exactly how the sibling service and PVC
+resolvers behave, and closing it means changing the shared generic; it is out of
+scope here.
 
 ### D7: Unsupported owner kinds degrade, and the degrade is per-family
 

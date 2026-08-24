@@ -231,6 +231,39 @@ func TestQueryDims_HarvestNeverCarriesClusterOrNamespace(t *testing.T) {
 	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod"}[1m])`, got)
 }
 
+// TestQueryDims_ControllerAnnotationFamiliesAreNamespaced pins the third
+// dimension group, the one design D5 of resolve-pod-application-from-controller
+// calls "required for correctness under a filter": a pod's controller always
+// lives in the pod's own (cluster, namespace), so the seven families that
+// resolve a pod's ArgoCD Application must be narrowed by exactly the same
+// matchers as the pods referencing them. A family narrowed differently — say
+// dimsClusterScoped — would silently drop Applications inside the requested
+// scope, with every other test still green.
+func TestQueryDims_ControllerAnnotationFamiliesAreNamespaced(t *testing.T) {
+	families := []Query{
+		QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
+		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations, QJobOwner,
+	}
+	for _, q := range families {
+		assert.Equal(t, dimsNamespaced, queryDims[q],
+			"%s resolves a pod's Application and must take all four request dimensions", q)
+	}
+
+	// The rendered form, not just the table entry: all four matchers present,
+	// in the fixed az, env, cluster, namespace order, composed after the (here
+	// absent) fixed selector.
+	sel := Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"},
+		Cluster: []string{"cluster-alpha"}, Namespace: []string{"shop"},
+	}
+	const matchers = `az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"`
+	for _, q := range families {
+		want := `last_over_time(` + string(q) + `{` + matchers + `}[1m])`
+		assert.Equal(t, want, Render(q, time.Minute, LabelKeys{}, sel),
+			"%s must carry every request dimension", q)
+	}
+}
+
 // TestRender_ComposesFixedSelectorFirst pins that a query's request-invariant
 // selector is never reordered or replaced by the request matchers.
 func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
