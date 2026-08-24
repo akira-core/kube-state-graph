@@ -266,9 +266,17 @@ two expensive families — old ReplicaSets are retained under a Deployment's
 and the ReplicaSet family is only ever consulted for a **bare** ReplicaSet, since
 the normal case is already collapsed to its Deployment. If you run no
 ArgoCD-managed bare ReplicaSets or Jobs, omit those two entries from
-`metricAnnotationsAllowList` (and their collectors) and pay nothing. The
-per-resource allowlist is the lever; the API server has no knob, because which
-families are worth their cardinality is a deployment-shaped question.
+`metricAnnotationsAllowList` (and, if you also run `metricAllowlist`, drop
+`kube_replicaset_annotations` / `kube_job_annotations` from it) and pay nothing —
+kube-state-metrics emits an empty `_annotations` family when nothing is
+allowlisted for that resource. Do **not** drop the `replicasets` or `jobs`
+*collectors* to achieve this: `replicasets` also carries `kube_replicaset_owner`,
+without which the ReplicaSet → Deployment owner skip stops and every
+Deployment-managed pod loses both its `data.owner` collapse and its Application,
+and `jobs` also carries `kube_job_owner`, without which the Job → CronJob hop
+stops and CronJob-managed pods lose their Application. The per-resource
+allowlist is the lever; the API server has no knob, because which families are
+worth their cardinality is a deployment-shaped question.
 
 **A note for deployments migrating off a custom exporter.** An earlier
 arrangement had a customised exporter copy each pod's tracking-id annotation onto

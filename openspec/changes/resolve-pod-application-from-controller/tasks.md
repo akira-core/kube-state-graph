@@ -46,7 +46,7 @@
 
 ## 7. Verification gate
 
-- [ ] 7.1 Run `make lint` and `make vet`; verify both report clean.
-- [ ] 7.2 Run `make test`; verify the full unit / component / golden / property suite passes with `-race -shuffle=on`.
-- [ ] 7.3 Run the integration suite with Docker available (`go test ./internal/integration/ -run TestGraphSuite`); verify the migrated and new Application cases pass.
-- [ ] 7.4 Run `openspec verify "resolve-pod-application-from-controller"`; verify it reports no outstanding artifact or task issues.
+- [x] 7.1 Run `make lint` and `make vet`; verify both report clean.
+- [x] 7.2 Run `make test`; verify the full unit / component / golden / property suite passes with `-race -shuffle=on`.
+- [x] 7.3 Run the integration suite with Docker available (`go test ./internal/integration/ -run TestGraphSuite`); verify the migrated and new Application cases pass.
+- [x] 7.4 Run `openspec verify "resolve-pod-application-from-controller"`; verify it reports no outstanding artifact or task issues.
