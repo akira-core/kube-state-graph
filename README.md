@@ -21,9 +21,11 @@ cluster N: kube-state-metrics ──┤
 
 ## What it does
 
-- Reads `kube_*` topology and `traces_service_graph_*` runtime metrics from a
-  single centralised VictoriaMetrics, on demand for a caller-specified
-  `[start, end]` time range.
+- Reads `kube_*` topology, Harvest / kubelet storage series, and
+  `traces_service_graph_*` runtime metrics from a single centralised
+  VictoriaMetrics, on demand for a caller-specified `[start, end]` time range.
+  Every series the builder queries is listed in
+  [`docs/upstream-metrics.md`](docs/upstream-metrics.md).
 - Joins them into a multi-cluster graph keyed by cluster-scoped pod UIDs and
   node names.
 - Returns the graph as Cytoscape.js JSON (`/v1/graph`).
@@ -131,10 +133,27 @@ estate.
 
 ## Upstream metrics consumed
 
-The graph build issues these PromQL queries against centralised VictoriaMetrics
-on every request (v1 has no result cache). Every series is expected to carry a
-`cluster` external label (injected by `vmagent` / Prometheus `external_labels`
-per source cluster).
+The complete operator catalog — all **41** series, PromQL wrappers, fixed
+selectors, query-error vs empty-vector semantics, and the per-request fan-out
+— is [`docs/upstream-metrics.md`](docs/upstream-metrics.md).
+
+Summary: one `/v1/graph` request fans out **37** topology queries in parallel
+(22 kube-state-metrics abort-on-error + 13 Harvest + 2 kubelet
+log-and-continue), then **3** service-graph queries (skipped when a filtered
+build loaded neither pods nor services), plus `up{}` only for an unfiltered
+empty topology. There is **no metric-name prefix**; every series is queried at
+its bare name. v1 has no result cache.
+
+Every Kubernetes-shaped series is expected to carry a `cluster` external label
+(injected by `vmagent` / Prometheus `external_labels` per source cluster).
+Harvest's `cluster` is the **ONTAP** cluster and is never used as
+`?cluster=`.
+
+The **"Required?"** column below is about an **empty vector** (the series is
+absent from the store, or matched nothing in the window). A **query error**
+(timeout / 5xx) on any of the 22 kube-state-metrics legs or on
+`traces_service_graph_request_total` **fails the build**; Harvest, kubelet, and
+the two RED series log-and-continue. Details in the catalog.
 
 ### Topology metrics — produced by [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
 
@@ -142,7 +161,7 @@ per source cluster).
 |---|---|---|---|
 | `kube_pod_info` | Pod nodes (`node` label drives the `pod-to-node` edge; pods nest under the `cluster > namespace > application > controller > pod` workload hierarchy) | `cluster`, `namespace`, `pod`, `uid`, `node`, `pod_ip` (→ `data.ipaddress`; `host_ip` not exported) | **Yes** |
 | `kube_node_info` | K8sNode nodes | `cluster`, `node` | **Yes** |
-| `kube_node_status_addresses{type="ExternalIP"}` | Node external IP (→ `data.ipaddress`) | `cluster`, `node`, `address` | Optional |
+| `kube_node_status_addresses{type=~"ExternalIP\|InternalIP"}` | Node `data.ipaddress` — ExternalIP preferred, InternalIP fallback when the node has no ExternalIP | `cluster`, `node`, `type`, `address` | Optional (absent ⇒ no `ipaddress`) |
 | `kube_node_status_condition{condition="Ready"}` | Node Ready status `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`} from the active (`status` value 1) row; omitted when no Ready data — distinct from `Unknown` (kubelet lost contact) | `cluster`, `node`, `condition`, `status` | Optional (absent ⇒ no `data.ready_status`); a KSM default |
 | `kube_node_labels` | Node label propagation (`kubernetes.io/*` etc.) | `cluster`, `node`, `label_*` | Optional |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC nodes; pod-mounts-pvc edges | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | Optional (no PVCs ⇒ no PVC nodes/edges) |
@@ -154,7 +173,7 @@ per source cluster).
 | `kube_pod_container_info` | Pod container list `data.containers` = `[{name, image}]`, sorted by `(name, image)`; on a mid-window image change the latest-seen image wins per container | `cluster`, `namespace`, `pod`, `container`, `image` | Optional (absent ⇒ no `data.containers`); a KSM default |
 | `kube_service_info` | Service nodes for `://` connection-string resolution (D29); `cluster_ip` (headless `None` ⇒ no `data.ipaddress`) | `cluster`, `namespace`, `service`, `cluster_ip` | Optional (absent ⇒ `://` endpoints fall back to `external`) |
 | `kube_service_annotations` | Service ArgoCD Application `data.application` (segment before the first `:` of the tracking-id), which nests the service under the `application` compound group | `cluster`, `namespace`, `service`, `annotation_argocd_argoproj_io_tracking_id` | Optional (absent ⇒ no `data.application`). **Requires** `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |
-| `kube_persistentvolumeclaim_annotations` | PVC ArgoCD Application `data.application` (same parse as the service), which nests the PVC under the `application` compound group | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | Optional (absent ⇒ no `data.application`). **Requires** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |
+| `kube_persistentvolumeclaim_annotations` | PVC ArgoCD Application `data.application` (same parse as the service), which nests the PVC under the `application` compound group. An app-less PVC additionally **inherits** the lexically-smallest Application among the pods that mount it | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | Optional (absent ⇒ no own annotation; inheritance may still fill `data.application`). **Requires** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]` (NOT a KSM default) |
 | `kube_endpointslice_endpoints` | Service → backing-pod fan-out (`service-selects-pod` edges) | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | Optional |
 | `kube_endpointslice_labels` | Joins an EndpointSlice to its owning Service | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | Optional — **requires** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` (NOT a KSM default); absent ⇒ no `service-selects-pod` resolution |
 
@@ -192,7 +211,7 @@ per container (a recency pick that is accurate for near-now windows; see
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (intra-cluster), `service-selects-pod` (may cross-cluster) edges; denominator for `data.metrics.rate` | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, plus peer-address labels used only for `server="unknown"` enrichment | Optional (no series ⇒ no call edges) |
+| `traces_service_graph_request_total` | `pod-calls-pod` (intra/cross-cluster), `pod-calls-service` (may cross-cluster — the route-engine path anchors on the selected ingress cluster), `service-selects-pod` (may cross-cluster) edges; denominator for `data.metrics.rate`. A query **error** fails the build; an empty vector does not | `cluster`, `client`, `server`, `client_k8s_pod_uid`, `server_k8s_pod_uid`, plus peer-address labels used only for `server="unknown"` enrichment (`client_server_address`, then `client_network_peer_address`, then `client_net_peer_name`) | Optional as data (no series ⇒ no call edges); query error is fatal |
 | `traces_service_graph_request_failed_total` | `data.metrics.error_rate` on measured edges | Same identity labels as `_total` (joined by exact series identity minus `__name__`) | Optional — absence / query error omits `error_rate` (never reports `0`) |
 | `traces_service_graph_request_server_seconds_bucket` | `data.metrics.p90_server_ms` on measured edges (server-observed classic histogram) | Same identity labels as `_total`, plus `le` — read **raw**, no upstream aggregation, joined by identity minus `le` | Optional — absence / non-classic buckets omit `p90_server_ms` |
 | `edge_relation` (a **dimension**, not a metric) | Value `link` marks a connector-materialised **span-link** edge: the edge is still emitted, but it measures a queue/DB hop rather than a request, so it contributes nothing to `data.metrics` | Read on all three series; excluded from the two RED selectors via `edge_relation!="link"` | Optional — a producer that does not set it is unaffected (a negative matcher retains series where the label is absent) |
@@ -208,8 +227,10 @@ resolve. When an endpoint's pod-UID label is empty, the human-readable
 `client`/`server` label is resolved by built-in **connection-string detection**
 (no knob): a label containing the literal `://` is parsed as a URL — an
 in-cluster `<service>.<namespace>.svc` name becomes a **single** `type="service"`
-node **in the caller's own cluster** (so `pod-calls-service` is always
-intra-cluster), provided that cluster holds the same-named Service. That service
+node **in the caller's own cluster** (so this connection-string path is always
+intra-cluster; the route-engine path below may anchor on a family sibling, which
+is why the edge type is registered `may_cross_cluster: true`), provided that
+cluster holds the same-named Service. That service
 node then fans out on-demand `service-selects-pod` edges to its backing pods
 across **every same-family cluster** holding the same-named Service — so
 `service-selects-pod` **may cross clusters**, modelling multi-cluster
@@ -259,6 +280,7 @@ When present:
 | `read_ops` / `write_ops` | I/O family (`pvc-to-netapp-aggr` only): Harvest ops/s, verbatim |
 | `read_latency_us` / `write_latency_us` | I/O family: Harvest average latency in microseconds, verbatim |
 | `read_bytes_per_sec` / `write_bytes_per_sec` | I/O family: Harvest throughput in bytes per second, verbatim |
+| `max_iops` / `max_bytes_per_sec` | I/O family: declared QoS ceiling on the same edge. `max_bytes_per_sec` is `qos_policy_fixed_max_throughput_mbps × 1048576`. Neither field can appear without a measurement; absence means "no declared ceiling", never `0` |
 
 Both new series are **optional** and degrade gracefully: a missing metric,
 empty result, or query error omits only the affected field (or leaves
@@ -298,7 +320,8 @@ as nodes or edges. The match is exact and case-sensitive, so a `://` host that
 merely *contains* `user` is unaffected. The **server side is narrowed to
 `server!~"user"`** so a `server="unknown"` series still reaches the reader: when
 its client resolves to a **real** pod and the client-recorded peer address
-(`client_net_peer_name` / `client_server_address`) names a Kubernetes Service,
+(`client_server_address`, then `client_network_peer_address`, then
+`client_net_peer_name` — first non-empty wins) names a Kubernetes Service,
 that peer is recovered into a `pod-calls-service` edge (or an `external` node
 for a non-cluster address) instead of being dropped; every other
 `server="unknown"` case is still dropped, byte-for-byte as before. The same
@@ -309,7 +332,16 @@ matcher of their own — `edge_relation!="link"` (see the table above).
 
 | PromQL | Purpose |
 |---|---|
-| `up` | Backs `GET /readyz`, and distinguishes "no data in window" (`outside_retention`) from "upstream healthy but window empty". Issued only for an **unfiltered** build — under any request filter, zero rows means "nothing in scope" and returns an empty `200`. |
+| `up` | Backs `GET /readyz`, and distinguishes "no data in window" (`outside_retention`) from "upstream healthy but window empty". Issued only for an **unfiltered** build — under any request filter, zero rows means "nothing in scope" and returns an empty `200`. Not graph data. |
+
+The three `traces_service_graph_*` queries are also **skipped** when a filtered
+build loaded neither pods nor services — admission cannot keep any series, and
+those three are the one family no request matcher narrows.
+
+**Not VictoriaMetrics series, not graph-input metrics:** the optional ClickHouse
+Istio route store (`--route-store-dsn`) resolves global FQDN peers to Services
+(off by default; a miss degrades to `external`); `kube_state_graph_*` are the
+API's own `/metrics` self-metrics.
 
 ### Edge → metric mapping
 
@@ -317,7 +349,7 @@ matcher of their own — `edge_relation!="link"` (see the table above).
 |---|---|
 | `pod-mounts-pvc` | `kube_pod_spec_volumes_persistentvolumeclaims_info` |
 | `pod-to-node` | `kube_pod_info` (`node` label; one per scheduled pod, intra-cluster) |
-| `pvc-to-netapp-aggr` | Harvest `volume_*` joined on `volume_name` = PVC `volumename` (PV name) |
+| `pvc-to-netapp-aggr` | Harvest `volume_labels` joined on `volume_name` = PVC `volumename` (PV name) |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
 | `pod-calls-service` | `traces_service_graph_request_total` (when target resolves to a service node via connection-string resolution) |
 | `service-selects-pod` | `traces_service_graph_request_total` (connection-string resolution + `kube_endpointslice_*` join) |
@@ -342,7 +374,7 @@ service-graph behaviour.
 | `--api-keys-file`               | `KSG_API_KEYS_FILE`              | (empty)              | Path to a file holding accepted API keys (one per line, `#` comments allowed). Designed for K8s `Secret` mounts. Reloaded periodically. |
 | `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. |
 | `--api-keys-reload-interval`    | `KSG_API_KEYS_RELOAD_INTERVAL`   | `30s`                | How often `--api-keys-file` is re-read. Set to `0` to disable hot reload. |
-| `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug | info | warn | error`. |
+| `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug \| info \| warn \| error`. |
 | `--az-label`                    | `KSG_AZ_LABEL`                   | `az`                 | Upstream label the `?az=` parameter is matched against. The request parameter name never changes — only the label binding. Must be a valid PromQL label name and differ from `--env-label`. |
 | `--env-label`                   | `KSG_ENV_LABEL`                  | `env`                | Upstream label the `?env=` parameter is matched against. |
 | —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
@@ -369,6 +401,10 @@ Every upstream request (topology, service-graph, cluster discovery, the
 never appear in logs, traces, metrics, or error responses.
 
 ## Documentation
+
+- **Upstream metrics catalog (all 41 series):** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
+- **kube-state-metrics install / RBAC / allowlists:** [`docs/kube-state-metrics-preconditions.md`](docs/kube-state-metrics-preconditions.md)
+- **NetApp Harvest relabel and hops:** [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)
 
 The full API reference is served by the running server:
 

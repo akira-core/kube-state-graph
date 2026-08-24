@@ -11,7 +11,10 @@ them and the graph is unchanged except that pods of that controller kind carry
 no `data.application`.
 
 This document is the install-side companion to the *Topology metrics* table in
-`README.md`, which specifies what each series is read for.
+`README.md` and the complete catalog in
+[`upstream-metrics.md`](upstream-metrics.md), which lists every name the
+builder queries — 40 graph-input series (kube-state-metrics, Harvest, kubelet,
+service-graph) plus the `up` diagnostic probe.
 
 ## Series → collector → RBAC
 

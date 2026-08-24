@@ -1,5 +1,10 @@
 # Deployment preconditions — NetApp Harvest storage graph
 
+This document is the install-side companion to the Harvest + kubelet table in
+`README.md` and the complete catalog in
+[`upstream-metrics.md`](upstream-metrics.md) — all 40 graph-input series plus
+the `up` diagnostic probe.
+
 The PVC → ONTAP aggregate join is a single label match:
 
 ```
