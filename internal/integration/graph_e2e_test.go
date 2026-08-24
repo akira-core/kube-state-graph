@@ -322,10 +322,13 @@ kube_replicaset_owner{cluster="cluster-alpha",namespace="shop",replicaset="check
 }
 
 // TestPodApplicationAndContainersAttributes — ingest kube_pod_container_info
-// (two containers) and a kube_pod_owner carrying an argocd_tracking_id for a
-// dedicated pod; assert /v1/graph sets the pod node's typed data.application
-// (segment before the first ":") and ordered data.containers, neither leaking
-// into labels, while a sibling pod with no such series omits both. The pods
+// (two containers), a kube_pod_owner naming a DaemonSet, and a
+// kube_daemonset_annotations series carrying that DaemonSet's
+// annotation_argocd_argoproj_io_tracking_id; assert /v1/graph sets the pod
+// node's typed data.application (segment before the first ":") and ordered
+// data.containers, neither leaking into labels, while a sibling pod with no such
+// series omits both. The Application is joined from the CONTROLLER — ArgoCD
+// annotates the managed workload object, never the pods it spawns. The pods
 // live in a dedicated namespace ("appcat") so the owner/container series cannot
 // collide with the shared `checkout`/`cart` fixtures other tests assert on.
 //
@@ -347,12 +350,13 @@ func (s *GraphSuite) TestPodApplicationAndContainersAttributes() {
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",uid="alpha-app-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-bare",uid="alpha-app-2",node="worker-0",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",argocd_tracking_id="storefront:apps/Deployment:appcat/ksg",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",test=%q} 1 %d
+kube_daemonset_annotations{cluster="cluster-alpha",namespace="appcat",daemonset="ksg-ds",annotation_argocd_argoproj_io_tracking_id="storefront:apps/DaemonSet:appcat/ksg-ds",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="app",image="reg/ksg:1.4",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="istio-proxy",image="reg/proxy:0.9",test=%q} 1 %d
 traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 0 %d
 traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 60 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_container_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_container_info")
 	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="ksg-enriched",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
@@ -400,12 +404,12 @@ traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",clust
 		{Name: "istio-proxy", Image: "reg/proxy:0.9"},
 	}, enriched.Containers, "data.containers ordered by (name, image)")
 	_, appInLabels := enriched.Labels["application"]
-	_, trackInLabels := enriched.Labels["argocd_tracking_id"]
+	_, trackInLabels := enriched.Labels["annotation_argocd_argoproj_io_tracking_id"]
 	s.False(appInLabels || trackInLabels, "application must NOT appear inside labels")
 
 	bare, ok := podByName("ksg-bare")
 	s.Require().True(ok, "bare pod node must be present")
-	s.Empty(bare.Application, "pod with no argocd label omits data.application")
+	s.Empty(bare.Application, "pod with no controller annotation omits data.application")
 	s.Nil(bare.Containers, "pod with no container series omits data.containers")
 }
 
@@ -483,7 +487,9 @@ traces_service_graph_request_total{client="argo-pod",server="https://argo-svc.ar
 // it (via the pod-mounts-pvc binding), surfacing data.application and nesting
 // under the inherited application group — indistinguishable from an
 // annotation-sourced value. A PVC carrying its OWN annotation keeps it (own
-// wins over inheritance). Objects live in a dedicated namespace ("argoinh") so
+// wins over inheritance). Each mounting pod's own Application comes from its
+// Deployment's annotation, so this also exercises the controller join feeding
+// the inheritance pass. Objects live in a dedicated namespace ("argoinh") so
 // they cannot collide with the shared fixtures.
 func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
 	disc := s.T().Name()
@@ -495,14 +501,16 @@ func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",uid="inh-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",uid="own-1",node="worker-0",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",owner_kind="Deployment",owner_name="inh",owner_is_controller="true",argocd_tracking_id="checkout:apps/Deployment:argoinh/checkout",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_kind="Deployment",owner_name="own",owner_is_controller="true",argocd_tracking_id="web:apps/Deployment:argoinh/web",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",owner_kind="Deployment",owner_name="inh",owner_is_controller="true",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_kind="Deployment",owner_name="own",owner_is_controller="true",test=%q} 1 %d
+kube_deployment_annotations{cluster="cluster-alpha",namespace="argoinh",deployment="inh",annotation_argocd_argoproj_io_tracking_id="checkout:apps/Deployment:argoinh/inh",test=%q} 1 %d
+kube_deployment_annotations{cluster="cluster-alpha",namespace="argoinh",deployment="own",annotation_argocd_argoproj_io_tracking_id="web:apps/Deployment:argoinh/own",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",claim_name="inh-data",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",claim_name="own-data",test=%q} 1 %d
 kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argoinh",persistentvolumeclaim="own-data",annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:argoinh/mongo",test=%q} 1 %d
 traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 0 %d
 traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 60 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_spec_volumes_persistentvolumeclaims_info")
 	s.Require().True(s.WaitForSeries(`kube_pod_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
@@ -537,6 +545,67 @@ traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cl
 	s.Equal("mongo", own.Application, "PVC's own annotation wins over inheritance")
 	s.Equal("cluster-alpha/namespace/argoinh/application/mongo", own.Parent,
 		"own-annotation PVC nests under its own application group")
+}
+
+// TestPodApplicationFromCronJobHop — a CronJob-created Job carries no ArgoCD
+// tracking-id of its own (the Kubernetes CronJob controller copies only
+// spec.jobTemplate.metadata annotations onto the Jobs it creates, never the
+// CronJob object's own annotations), so the pod's Application resolves one level
+// up through kube_job_owner to kube_cronjob_annotations. The hop is
+// resolution-only: data.owner must STILL name the Job, and the pod must nest
+// under its Job controller group inside the CronJob's application group. Objects
+// live in a dedicated namespace ("argocj") so they cannot collide with the
+// shared fixtures.
+func (s *GraphSuite) TestPodApplicationFromCronJobHop() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	// The two pods are wired by a pod-calls-pod edge so both survive the default
+	// connectivity prune; peer-pod carries no owner at all, so it must report no
+	// application even though the CronJob annotation is in the same namespace.
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="argocj",pod="nightly-28901-abc",uid="cj-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="argocj",pod="peer-pod",uid="cj-2",node="worker-0",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argocj",pod="nightly-28901-abc",owner_kind="Job",owner_name="nightly-28901",owner_is_controller="true",test=%q} 1 %d
+kube_job_owner{cluster="cluster-alpha",namespace="argocj",job_name="nightly-28901",owner_kind="CronJob",owner_name="nightly",owner_is_controller="true",test=%q} 1 %d
+kube_cronjob_annotations{cluster="cluster-alpha",namespace="argocj",cronjob="nightly",annotation_argocd_argoproj_io_tracking_id="reports:batch/CronJob:argocj/nightly",test=%q} 1 %d
+traces_service_graph_request_total{client="nightly-28901-abc",server="peer-pod",cluster="cluster-alpha",client_k8s_pod_uid="cj-1",server_k8s_pod_uid="cj-2",client_k8s_namespace_name="argocj",server_k8s_namespace_name="argocj",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="nightly-28901-abc",server="peer-pod",cluster="cluster-alpha",client_k8s_pod_uid="cj-1",server_k8s_pod_uid="cj-2",client_k8s_namespace_name="argocj",server_k8s_namespace_name="argocj",connection_type="virtual_node",test=%q} 60 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+	s.Require().True(s.WaitForSeries(`kube_cronjob_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_cronjob_annotations")
+	s.Require().True(s.WaitForSeries(`kube_job_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_job_owner")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="nightly-28901-abc",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero nightly→peer service-graph rate")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	pod, ok := byID["cluster-alpha/cj-1"]
+	s.Require().True(ok, "CronJob-managed pod node must be present")
+	s.Equal("reports", pod.Application, "Application resolves through the Job → CronJob hop")
+	s.Require().NotNil(pod.Owner, "the pod keeps its controller owner")
+	s.Equal("Job", pod.Owner.Kind, "the hop must NOT rewrite the owner kind to CronJob")
+	s.Equal("nightly-28901", pod.Owner.Name, "the hop must NOT rewrite the owner name")
+	s.Equal("cluster-alpha/namespace/argocj/application/reports/controller/Job/nightly-28901", pod.Parent,
+		"the pod nests under its Job controller group inside the CronJob's application group")
+	_, appInLabels := pod.Labels["application"]
+	_, trackInLabels := pod.Labels["annotation_argocd_argoproj_io_tracking_id"]
+	s.False(appInLabels || trackInLabels, "application must NOT appear inside labels")
+
+	peer, ok := byID["cluster-alpha/cj-2"]
+	s.Require().True(ok, "peer pod node must be present")
+	s.Empty(peer.Application, "a pod with no controller owner resolves no Application")
 }
 
 func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {

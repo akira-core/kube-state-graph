@@ -45,13 +45,23 @@ const (
 	// owner refs; kube_replicaset_owner resolves a ReplicaSet owner up to
 	// its owning Deployment (the ReplicaSet is skipped). The
 	// owner_kind/owner_name/owner_is_controller labels are KSM defaults
-	// (no --metric-labels-allowlist required). NOTE: the optional
-	// `argocd_tracking_id` label the application resolver reads off kube_pod_owner
-	// (resolvePodApplications) is NOT a KSM default — it is operator-provided
-	// (e.g. via --metric-labels-allowlist or a relabel); absence degrades
-	// gracefully to no `application` attribute. See design.md D-A4.
+	// (no --metric-labels-allowlist required). kube_pod_owner carries NO
+	// application information: ArgoCD stamps its tracking-id on the managed
+	// controller, never on the pods a controller spawns, so the pod's
+	// Application is resolved from the controller-annotation families below.
 	QPodOwner        Query = "kube_pod_owner"
 	QReplicaSetOwner Query = "kube_replicaset_owner"
+
+	// Job → CronJob resolution, for ArgoCD Application resolution ONLY.
+	// The Kubernetes CronJob controller copies only spec.jobTemplate.metadata
+	// annotations onto the Jobs it creates — never the CronJob object's own
+	// annotations — so ArgoCD's tracking-id never reaches a Job and a
+	// CronJob-managed pod can only resolve its Application one level up.
+	// Keyed (cluster, namespace, job_name); the identity label is `job_name`,
+	// NOT `job` (kube-state-metrics avoids Prometheus' reserved target label).
+	// This leg NEVER alters the pod `owner` attribute — resolvePodOwners does
+	// not read it. OPTIONAL — a KSM default, absence degrades gracefully.
+	QJobOwner Query = "kube_job_owner"
 
 	// PVC StorageClass name + bound PV name. kube_persistentvolumeclaim_info
 	// carries the `storageclass` and `volumename` labels that the pod→PVC
@@ -86,14 +96,46 @@ const (
 	// kube_service_annotations / kube_persistentvolumeclaim_annotations
 	// carry the `annotation_argocd_argoproj_io_tracking_id` label — KSM's sanitised
 	// form of the argocd.argoproj.io/tracking-id annotation — whose value uses the
-	// same <app>:<group>/<kind>:<ns>/<name> grammar as the pod's argocd_tracking_id,
-	// so the Application is the segment before the first ":". Joined on
+	// <app>:<group>/<kind>:<ns>/<name> grammar, so the Application is the segment
+	// before the first ":". Joined on
 	// (cluster, namespace, service) / (cluster, namespace, persistentvolumeclaim) to
 	// enrich existing service / PVC nodes (never new nodes). OPTIONAL — the
 	// annotation label requires the operator's --metric-annotations-allowlist;
 	// absence degrades gracefully to no `application` attribute.
 	QServiceAnnotations Query = "kube_service_annotations"
 	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
+
+	// Pod ArgoCD Application resolution — the controller-annotation families.
+	// ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it
+	// applies, never on the pods a controller spawns, so a pod's Application is
+	// read from its CONTROLLER's annotation series. Each family carries the same
+	// sanitised `annotation_argocd_argoproj_io_tracking_id` label and the same
+	// <app>:<group>/<kind>:<ns>/<name> grammar as the service / PVC families
+	// above, and each is keyed by its own resource-identity label:
+	//
+	//	Deployment   kube_deployment_annotations   `deployment`
+	//	StatefulSet  kube_statefulset_annotations  `statefulset`
+	//	DaemonSet    kube_daemonset_annotations    `daemonset`
+	//	ReplicaSet   kube_replicaset_annotations   `replicaset`
+	//	Job          kube_job_annotations          `job_name`   (NOT `job`)
+	//	CronJob      kube_cronjob_annotations      `cronjob`
+	//
+	// The Job family's identity label is `job_name` — kube-state-metrics avoids
+	// Prometheus' reserved `job` target label. Joined on
+	// (cluster, namespace, kind, name) against the pod's already-resolved
+	// controller owner, so the Deployment case needs no extra owner hop (the
+	// D34 ReplicaSet skip has already collapsed it). ALL are OPTIONAL — each
+	// annotation label requires the operator's
+	// --metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id],
+	// and because that flag is per-resource the degradation is per-family: an
+	// operator may enable `deployments` alone. Absence degrades gracefully to no
+	// `application` attribute.
+	QDeploymentAnnotations  Query = "kube_deployment_annotations"
+	QStatefulSetAnnotations Query = "kube_statefulset_annotations"
+	QDaemonSetAnnotations   Query = "kube_daemonset_annotations"
+	QReplicaSetAnnotations  Query = "kube_replicaset_annotations"
+	QJobAnnotations         Query = "kube_job_annotations"
+	QCronJobAnnotations     Query = "kube_cronjob_annotations"
 
 	// NetApp Harvest volume label series — the SOLE source of the storage
 	// topology (hop A of design.md D3): the pvc-to-netapp-aggr edge, the
@@ -173,10 +215,23 @@ var queryDims = map[Query]dims{
 	QEndpointSliceLabels:    dimsNamespaced,
 	QPodOwner:               dimsNamespaced,
 	QReplicaSetOwner:        dimsNamespaced,
+	QJobOwner:               dimsNamespaced,
 	QPVCInfo:                dimsNamespaced,
 	QPodContainerInfo:       dimsNamespaced,
 	QServiceAnnotations:     dimsNamespaced,
 	QPVCAnnotations:         dimsNamespaced,
+
+	// kube-state-metrics — the controller-annotation families feeding the pod
+	// ArgoCD Application. Namespaced like every other workload family, which is
+	// not merely permissible but REQUIRED for correctness under a filter: a
+	// pod's controller always lives in the pod's own (cluster, namespace), so
+	// narrowing both sides by the same matcher keeps every join intact.
+	QDeploymentAnnotations:  dimsNamespaced,
+	QStatefulSetAnnotations: dimsNamespaced,
+	QDaemonSetAnnotations:   dimsNamespaced,
+	QReplicaSetAnnotations:  dimsNamespaced,
+	QJobAnnotations:         dimsNamespaced,
+	QCronJobAnnotations:     dimsNamespaced,
 
 	// kubelet — namespaced.
 	QKubeletVolumeUsedBytes:     dimsNamespaced,
@@ -330,6 +385,8 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		return fmt.Sprintf(`last_over_time(kube_pod_owner%s[%s])`, braces(""), w)
 	case QReplicaSetOwner:
 		return fmt.Sprintf(`last_over_time(kube_replicaset_owner%s[%s])`, braces(""), w)
+	case QJobOwner:
+		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, braces(""), w)
 	case QPVCInfo:
 		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_info%s[%s])`, braces(""), w)
 	case QPodContainerInfo:
@@ -350,6 +407,18 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		return fmt.Sprintf(`last_over_time(kube_service_annotations%s[%s])`, braces(""), w)
 	case QPVCAnnotations:
 		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations%s[%s])`, braces(""), w)
+	case QDeploymentAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_deployment_annotations%s[%s])`, braces(""), w)
+	case QStatefulSetAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_statefulset_annotations%s[%s])`, braces(""), w)
+	case QDaemonSetAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_daemonset_annotations%s[%s])`, braces(""), w)
+	case QReplicaSetAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_replicaset_annotations%s[%s])`, braces(""), w)
+	case QJobAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_job_annotations%s[%s])`, braces(""), w)
+	case QCronJobAnnotations:
+		return fmt.Sprintf(`last_over_time(kube_cronjob_annotations%s[%s])`, braces(""), w)
 	case QVolumeLabels:
 		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, braces(""), w)
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:

@@ -520,7 +520,9 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
-// The fan-out is 30 legs (design.md D1: 18 KSM − 3 removed + 15 storage).
+// The fan-out is 37 legs (design.md D1: 18 KSM − 3 removed + 15 storage, plus
+// the 7 controller-annotation / kube_job_owner legs that resolve a pod's ArgoCD
+// Application from its controller).
 // Pinning the count catches a leg silently dropped or double-registered.
 func TestReadTopology_FanOutLegCount(t *testing.T) {
 	var mu sync.Mutex
@@ -542,10 +544,10 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Len(t, seen, 30, "one query per leg, no duplicates")
+	assert.Len(t, seen, 37, "one query per leg, no duplicates")
 	total := 0
 	for _, n := range seen {
 		total += n
 	}
-	assert.Equal(t, 30, total, "each leg issued exactly once")
+	assert.Equal(t, 37, total, "each leg issued exactly once")
 }

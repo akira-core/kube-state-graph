@@ -150,3 +150,57 @@ arguments. `Names`, `Root`, `Depth`, `Direction`, `MaxTraversalDepth`,
 `promql.Selector` / `promql.LabelKeys` reproduce every pre-change query string
 byte-for-byte, so an embedder that wants the old behaviour passes them and
 changes nothing else.
+
+# BREAKING changes — resolve pod ArgoCD Application from the controller
+
+## Withdrawn upstream source: `argocd_tracking_id` on `kube_pod_owner`
+
+The pod `data.application` attribute is no longer read from an
+`argocd_tracking_id` label on `kube_pod_owner`. That label has no
+kube-state-metrics producer — ArgoCD stamps `argocd.argoproj.io/tracking-id` on
+the workload objects it applies, never on the pods a controller spawns, and
+neither `--metric-labels-allowlist` nor `--metric-annotations-allowlist` can
+enrich `kube_pod_owner` from another resource's annotations. A deployment that
+synthesised the label (a customised exporter, or a recording rule joining
+`kube_pod_labels`' `label_app_kubernetes_io_instance`) loses pod Applications
+until it configures the controller-annotation families below. The label is
+ignored, not rejected: the build never fails and nothing else changes.
+
+## New upstream requirements — controller annotations
+
+Pod `data.application` is now joined on `(cluster, namespace, owner_kind,
+owner_name)` — the controller owner already resolved for `data.owner`, with the
+ReplicaSet skipped to its Deployment — against one annotation family per
+controller kind:
+
+| Pod's resolved owner kind | Series | Identity label |
+|---|---|---|
+| `Deployment` | `kube_deployment_annotations` | `deployment` |
+| `StatefulSet` | `kube_statefulset_annotations` | `statefulset` |
+| `DaemonSet` | `kube_daemonset_annotations` | `daemonset` |
+| `ReplicaSet` (bare) | `kube_replicaset_annotations` | `replicaset` |
+| `Job` | `kube_job_annotations` | `job_name` |
+| `CronJob` (via `kube_job_owner`) | `kube_cronjob_annotations` | `cronjob` |
+
+Each family needs
+`--metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id]`
+and its collector. The flag is per-resource, so the degradation is per-family:
+enable `deployments` alone and only Deployment-managed pods gain Applications.
+`kube_job_owner` is added for the Job → CronJob hop — the Kubernetes CronJob
+controller copies only `spec.jobTemplate.metadata` annotations onto the Jobs it
+creates, so ArgoCD's tracking-id never reaches a Job. Full install-side detail,
+including the widened ClusterRole and the cardinality guidance for the
+ReplicaSet / Job families, is in `docs/kube-state-metrics-preconditions.md`.
+
+The topology fan-out grows from 30 to 37 legs. `ReplicationController`, `Node`
+(static / mirror pods) and CRD controllers such as argo-rollouts `Rollout` have
+no kube-state-metrics annotation family and resolve no Application.
+
+## NOT changed
+
+`data.owner` and the `controller` compound group are untouched: the Job → CronJob
+hop is resolution-only, so a CronJob-managed pod still reports
+`owner={kind:"Job", …}`. `data.application`'s wire shape, `omitempty` semantics,
+`<app>:<group>/<kind>:<ns>/<name>` parse and determinism rules are unchanged, as
+are the service and PVC Application sources and the PVC inheritance rule. No
+node type, edge type, `labels` key, request parameter, or HTTP route changes.

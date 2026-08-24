@@ -35,9 +35,11 @@ type GraphNode interface {
 	// with no controller owner, return nil.
 	Owner() *Owner
 	// Application is the node's ArgoCD Application name (the segment before the
-	// first ":" of the tracking-id value). For pods it is resolved from the
-	// argocd_tracking_id label on kube_pod_owner; for services and PVCs from the
-	// annotation_argocd_argoproj_io_tracking_id label on kube_service_annotations /
+	// first ":" of the tracking-id value), always read from the
+	// annotation_argocd_argoproj_io_tracking_id label: for pods off their
+	// CONTROLLER's annotation family (kube_deployment_annotations and its five
+	// siblings — ArgoCD annotates the managed workload object, never the pods it
+	// spawns), for services and PVCs off kube_service_annotations /
 	// kube_persistentvolumeclaim_annotations. Surfaced as a top-level attribute,
 	// never inside Labels. Only pods, services, and PVCs carry one; K8s nodes,
 	// externals, NetApp types, and any pod/service/PVC with no ArgoCD

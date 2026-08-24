@@ -1,8 +1,14 @@
 # Deployment preconditions — kube-state-metrics
 
-The graph reads **15** `kube_*` series. They come from **six** kube-state-metrics
-collectors, which need `list` + `watch` on **six** resource kinds and nothing
-else — no `get`, no `secrets`, no `configmaps`, no write verb.
+The graph reads **22** `kube_*` series. They come from **eleven**
+kube-state-metrics collectors, which need `list` + `watch` on **eleven** resource
+kinds and nothing else — no `get`, no `secrets`, no `configmaps`, no write verb.
+
+Six collectors carry the graph itself. The other five
+(`deployments`, `statefulsets`, `daemonsets`, `jobs`, `cronjobs`) exist **solely
+to resolve pod ArgoCD Applications** and are individually optional — omit any of
+them and the graph is unchanged except that pods of that controller kind carry
+no `data.application`.
 
 This document is the install-side companion to the *Topology metrics* table in
 `README.md`, which specifies what each series is read for.
@@ -15,12 +21,17 @@ This document is the install-side companion to the *Topology metrics* table in
 | `nodes` | `""` / `nodes` | `kube_node_info`, `kube_node_labels`, `kube_node_status_addresses`, `kube_node_status_condition` |
 | `services` | `""` / `services` | `kube_service_info`, `kube_service_annotations` |
 | `persistentvolumeclaims` | `""` / `persistentvolumeclaims` | `kube_persistentvolumeclaim_info`, `kube_persistentvolumeclaim_annotations` |
-| `replicasets` | `apps` / `replicasets` | `kube_replicaset_owner` |
+| `replicasets` | `apps` / `replicasets` | `kube_replicaset_owner`, `kube_replicaset_annotations` |
 | `endpointslices` | `discovery.k8s.io` / `endpointslices` | `kube_endpointslice_endpoints`, `kube_endpointslice_labels` |
+| `deployments` | `apps` / `deployments` | `kube_deployment_annotations` |
+| `statefulsets` | `apps` / `statefulsets` | `kube_statefulset_annotations` |
+| `daemonsets` | `apps` / `daemonsets` | `kube_daemonset_annotations` |
+| `jobs` | `batch` / `jobs` | `kube_job_owner`, `kube_job_annotations` |
+| `cronjobs` | `batch` / `cronjobs` | `kube_cronjob_annotations` |
 
-Everything else KSM can collect — deployments, statefulsets, daemonsets, jobs,
-cronjobs, secrets, configmaps, ingresses, storageclasses, horizontalpodautoscalers,
-resourcequotas, certificatesigningrequests, … — is **unused**. The `storageclass`
+Everything else KSM can collect — secrets, configmaps, ingresses, storageclasses,
+horizontalpodautoscalers, resourcequotas, certificatesigningrequests, … — is
+**unused**. The `storageclass`
 node type was removed; a claim's StorageClass name is read from
 `kube_persistentvolumeclaim_info`, not from the `storageclasses` collector.
 
@@ -39,7 +50,9 @@ allowlists inconsistently — `metricLabelsAllowlist` (lowercase `l`) vs
 # ksm-values.yaml — minimal kube-state-metrics for kube-state-graph.
 
 # The chart's ClusterRole template is generated FROM this list, so trimming the
-# collectors is what trims the RBAC. Six collectors cover all 15 series.
+# collectors is what trims the RBAC. Eleven collectors cover all 22 series;
+# the last five serve pod ArgoCD Applications only and can be dropped
+# individually (see "Pod ArgoCD Application" below).
 collectors:
   - endpointslices
   - nodes
@@ -47,6 +60,13 @@ collectors:
   - pods
   - replicasets
   - services
+  # Pod ArgoCD Application only — drop any of these and pods of that controller
+  # kind carry no data.application. Nothing else in the graph changes.
+  - cronjobs
+  - daemonsets
+  - deployments
+  - jobs
+  - statefulsets
 
 # Optional cardinality guard: expose only the series the graph reads. Drop this
 # block if other consumers scrape the same KSM.
@@ -66,6 +86,14 @@ metricAllowlist:
   - kube_replicaset_owner
   - kube_endpointslice_endpoints
   - kube_endpointslice_labels
+  # Pod ArgoCD Application.
+  - kube_job_owner
+  - kube_deployment_annotations
+  - kube_statefulset_annotations
+  - kube_daemonset_annotations
+  - kube_replicaset_annotations
+  - kube_job_annotations
+  - kube_cronjob_annotations
 
 # Labels and annotations that are NOT KSM defaults.
 metricLabelsAllowlist:
@@ -75,14 +103,21 @@ metricLabelsAllowlist:
   - endpointslices=[kubernetes.io/service-name]
   # Optional: propagates node labels into a node entry's data.labels.
   # - nodes=[topology.kubernetes.io/zone,topology.kubernetes.io/region]
-  # Only for the recording-rule route to pod-level data.application (see below).
-  # Feeds kube_pod_labels, which the graph does NOT read directly.
-  # - pods=[app.kubernetes.io/instance]
 
-# Optional: ArgoCD Application on service / PVC nodes (data.application).
+# Optional: ArgoCD Application (data.application) on service / PVC nodes and —
+# through the pod's controller — on pod nodes. The flag is per-resource, so each
+# line can be dropped on its own; see "Pod ArgoCD Application" below for which
+# families are worth their cardinality.
 metricAnnotationsAllowList:
   - services=[argocd.argoproj.io/tracking-id]
   - persistentvolumeclaims=[argocd.argoproj.io/tracking-id]
+  # Pod ArgoCD Application — one entry per controller kind you run.
+  - deployments=[argocd.argoproj.io/tracking-id]
+  - statefulsets=[argocd.argoproj.io/tracking-id]
+  - daemonsets=[argocd.argoproj.io/tracking-id]
+  - replicasets=[argocd.argoproj.io/tracking-id]
+  - jobs=[argocd.argoproj.io/tracking-id]
+  - cronjobs=[argocd.argoproj.io/tracking-id]
 
 # Generate RBAC from `collectors` above.
 rbac:
@@ -124,12 +159,25 @@ rules:
       - persistentvolumeclaims
     verbs: ["list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["replicasets"]
+    resources:
+      - replicasets
+      # Pod ArgoCD Application only.
+      - deployments
+      - statefulsets
+      - daemonsets
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    # Pod ArgoCD Application only.
+    resources: ["jobs", "cronjobs"]
     verbs: ["list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list", "watch"]
 ```
+
+Drop the `batch` rule and the three `apps` entries marked *Pod ArgoCD
+Application only* — together with their collectors — if pod-level
+`data.application` is not wanted; nothing else in the graph depends on them.
 
 `list` + `watch` is the informer contract — KSM lists once and then watches, so
 neither verb can be dropped. `get` is never used. The role must stay cluster-wide:
@@ -140,7 +188,7 @@ per entry in `.Values.namespaces` instead, which cannot grant `nodes`.
 
 The collector list can also be edited in place with `collectorsExclude` /
 `collectorsExtra`, which layer onto `.Values.collectors` rather than onto KSM's
-own defaults. Spelling out the six wanted collectors is the clearer form here:
+own defaults. Spelling out the eleven wanted collectors is the clearer form here:
 the RBAC is a direct read of that list.
 
 ## What KSM cannot supply — `cluster`, `az`, `env`
@@ -165,47 +213,74 @@ upstream as **raw** label matchers (`az="…"`, `env="…"`, configurable per ke
   rather than thin it. The build logs `selector_family_empty` (Warn) when KSM
   matched but kubelet / Harvest returned nothing.
 
-## Pod-level ArgoCD Application is not reachable by KSM config
+## Pod ArgoCD Application comes from the pod's controller
 
-`data.application` on **service** and **PVC** nodes comes from
-`kube_service_annotations` / `kube_persistentvolumeclaim_annotations` and is fully
-covered by `metricAnnotationsAllowList` above.
+ArgoCD stamps `argocd.argoproj.io/tracking-id` on the resources it **applies** —
+the Deployment, StatefulSet, DaemonSet, CronJob — and **not** on the pods a
+controller spawns. Services and PVCs are therefore straightforward: they are
+ArgoCD-managed objects themselves, so `kube_service_annotations` /
+`kube_persistentvolumeclaim_annotations` carry the annotation directly.
 
-The **pod**-level value is read from an `argocd_tracking_id` label on
-`kube_pod_owner` (`resolvePodApplications` in `pkg/build/topology.go`) — one
-hardcoded label name on one metric, with no fallback source.
+For pods the value is joined from the pod's **controller**. The reader keys on
+`(cluster, namespace, owner_kind, owner_name)` — the controller owner it has
+already resolved for `data.owner`, with the ReplicaSet skipped to its
+Deployment — against one annotation family per controller kind:
 
-Stock KSM cannot produce it. Both allowlist flags write to their own metric
-family and never enrich another one: `--metric-labels-allowlist` adds `label_*`
-labels to `kube_<resource>_labels`, and `--metric-annotations-allowlist` adds
-`annotation_*` labels to `kube_<resource>_annotations`. Neither touches
-`kube_pod_owner`. Scrape-time `metric_relabel_configs` cannot help either — it
-rewrites one series in isolation and cannot join a value in from another.
+| Pod's resolved owner kind | Series | Identity label |
+|---|---|---|
+| `Deployment` | `kube_deployment_annotations` | `deployment` |
+| `StatefulSet` | `kube_statefulset_annotations` | `statefulset` |
+| `DaemonSet` | `kube_daemonset_annotations` | `daemonset` |
+| `ReplicaSet` (bare, no owning Deployment) | `kube_replicaset_annotations` | `replicaset` |
+| `Job` | `kube_job_annotations` | `job_name` |
+| `CronJob` (via the hop below) | `kube_cronjob_annotations` | `cronjob` |
 
-It is **not required**: absence degrades gracefully — pods carry no
-`data.application` and no `application` compound group, while service and PVC
-Applications keep working from their own annotations. The only loss beyond the
-pod itself is the PVC *inheritance* path (an app-less PVC borrows the
-lexically-smallest Application among its mounting pods), which has nothing to
-borrow.
+The Job family's identity label is **`job_name`**, not `job` —
+kube-state-metrics avoids Prometheus' reserved `job` target label.
 
-If pod-level Application is wanted, the two honest routes are:
+**The Job → CronJob hop.** The Kubernetes CronJob controller copies only
+`spec.jobTemplate.metadata` annotations onto the Jobs it creates, never the
+CronJob object's own annotations, so ArgoCD's tracking-id never reaches a Job.
+When a Job carries no annotation of its own, `kube_job_owner` resolves it to its
+owning CronJob and the CronJob's annotation is used. A Job ArgoCD manages
+directly keeps its own Application — the hop runs only on a miss. The hop is
+**resolution-only**: a CronJob-managed pod's `data.owner` still names the Job.
 
-1. **A recording rule** that re-publishes `kube_pod_owner` with the label joined
-   in from a series that does carry it — e.g. `kube_pod_labels`'
-   `label_app_kubernetes_io_instance` or `label_argocd_argoproj_io_instance`,
-   which reach pods whenever the chart puts the tracking label in the pod
-   template — via `group_left` + `label_replace`. Workable without touching the
-   API server, at the cost of duplicating `kube_pod_owner`'s cardinality; a rule
-   that records under a name it also reads is self-referential, so give it a
-   guarded expression or accept the idempotent re-join.
-2. **A code change** giving pods the same annotation path services and PVCs
-   already use (`kube_pod_annotations` +
-   `--metric-annotations-allowlist=pods=[argocd.argoproj.io/tracking-id]`).
-   That metric is not currently queried, so it needs an OpenSpec change, not a
-   config edit — and it only pays off where the annotation actually reaches the
-   pod template, since ArgoCD stamps the tracking id on the managed Deployment,
-   not on the pods it spawns.
+**Kinds that cannot be covered.** `ReplicationController` has no
+`kube_replicationcontroller_annotations` family in kube-state-metrics; `Node`
+(static / mirror pods) and third-party CRD controllers (argo-rollouts
+`Rollout`, OpenKruise `CloneSet`, …) have none either. Pods owned by those kinds
+keep their `owner` and carry no `application`.
+
+**Nothing here is required.** Absence degrades gracefully and **per family**,
+because `--metric-annotations-allowlist` is per-resource: enable `deployments`
+alone and Deployment-managed pods get Applications while every other kind stays
+absent. A pod with no Application carries no `data.application` and no
+`application` compound group; the only knock-on is the PVC *inheritance* path
+(an app-less PVC borrows the lexically-smallest Application among its mounting
+pods), which then has nothing to borrow.
+
+**Cardinality.** `kube_replicaset_annotations` and `kube_job_annotations` are the
+two expensive families — old ReplicaSets are retained under a Deployment's
+`revisionHistoryLimit`, and Jobs accumulate under a CronJob's history limits —
+and the ReplicaSet family is only ever consulted for a **bare** ReplicaSet, since
+the normal case is already collapsed to its Deployment. If you run no
+ArgoCD-managed bare ReplicaSets or Jobs, omit those two entries from
+`metricAnnotationsAllowList` (and their collectors) and pay nothing. The
+per-resource allowlist is the lever; the API server has no knob, because which
+families are worth their cardinality is a deployment-shaped question.
+
+**A note for deployments migrating off a custom exporter.** An earlier
+arrangement had a customised exporter copy each pod's tracking-id annotation onto
+`kube_pod_owner` as an `argocd_tracking_id` label. That label is **no longer
+read**. It never had a stock producer — both allowlist flags write only to their
+own metric family (`--metric-labels-allowlist` adds `label_*` to
+`kube_<resource>_labels`, `--metric-annotations-allowlist` adds `annotation_*` to
+`kube_<resource>_annotations`) and neither can enrich `kube_pod_owner`, while
+scrape-time `metric_relabel_configs` rewrites one series in isolation and cannot
+join a value in from another. Configure the controller-annotation families above
+instead; the values are real ArgoCD tracking-ids, so a pod, its Service and its
+PVC finally agree on one Application.
 
 ## HA and duplicate series
 
@@ -221,19 +296,32 @@ deduplication rule is required for correctness.
 Against the centralised VictoriaMetrics, per source cluster:
 
 ```promql
-# 1. All 15 series present, and the `cluster` external label is stamped.
+# 1. All 22 series present, and the `cluster` external label is stamped.
 count by (__name__, cluster) (
-  {__name__=~"kube_(pod|node|service|endpointslice|persistentvolumeclaim|replicaset)_.+"}
+  {__name__=~"kube_(pod|node|service|endpointslice|persistentvolumeclaim|replicaset|deployment|statefulset|daemonset|job|cronjob)_.+"}
 )
 
 # 2. The one REQUIRED non-default label — empty result means no
 #    service-selects-pod edges and every "://" endpoint falls to `external`.
 count(kube_endpointslice_labels{label_kubernetes_io_service_name!=""})
 
-# 3. Optional ArgoCD annotations.
+# 3. Optional ArgoCD annotations — service / PVC nodes.
 count(kube_service_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
 count(kube_persistentvolumeclaim_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
 
-# 4. az / env reach the pod family too, not just nodes.
+# 4. Optional ArgoCD annotations — pod nodes, one probe per controller kind.
+#    An empty result for a family means pods of that controller kind carry no
+#    data.application; it is not an error.
+count(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+count(kube_statefulset_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+count(kube_daemonset_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+count(kube_replicaset_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+count(kube_job_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+count(kube_cronjob_annotations{annotation_argocd_argoproj_io_tracking_id!=""})
+
+# 5. The Job → CronJob hop that CronJob-managed pods depend on.
+count(kube_job_owner{owner_kind="CronJob",owner_is_controller="true"})
+
+# 6. az / env reach the pod family too, not just nodes.
 count by (az, env) (kube_pod_info)
 ```

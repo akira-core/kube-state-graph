@@ -129,6 +129,9 @@ type topologyVectors struct {
 	// Pod controller-owner resolution (D34).
 	PodOwner        model.Vector
 	ReplicaSetOwner model.Vector
+	// Job → CronJob resolution, for pod ArgoCD Application resolution ONLY:
+	// resolvePodOwners never reads it, so the pod `owner` attribute cannot move.
+	JobOwner model.Vector
 	// PVC StorageClass name + bound PV name.
 	PVCInfo model.Vector
 	// Pod container list resolution (name/image per container).
@@ -138,6 +141,15 @@ type topologyVectors struct {
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id).
 	ServiceAnnotations model.Vector
 	PVCAnnotations     model.Vector
+	// Pod ArgoCD Application resolution — one annotation family per controller
+	// kind kube-state-metrics can describe. ArgoCD stamps its tracking-id on the
+	// managed controller, never on the pods it spawns.
+	DeploymentAnnotations  model.Vector
+	StatefulSetAnnotations model.Vector
+	DaemonSetAnnotations   model.Vector
+	ReplicaSetAnnotations  model.Vector
+	JobAnnotations         model.Vector
+	CronJobAnnotations     model.Vector
 	// NetApp Harvest storage series, in join order (design.md D3):
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
@@ -263,6 +275,18 @@ func ReadTopology(
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
 	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
+	// The controller-annotation families use `fetch`, not `fetchOptional`: the
+	// families being ABSENT is the normal case and an absent metric returns an
+	// empty vector, not an error, so fail-fast never fires on the common path.
+	// The only trigger is a genuine upstream failure, which is exactly how the
+	// sibling service / PVC annotation legs above already behave.
+	g.Go(fetch(promql.QJobOwner, &v.JobOwner))
+	g.Go(fetch(promql.QDeploymentAnnotations, &v.DeploymentAnnotations))
+	g.Go(fetch(promql.QStatefulSetAnnotations, &v.StatefulSetAnnotations))
+	g.Go(fetch(promql.QDaemonSetAnnotations, &v.DaemonSetAnnotations))
+	g.Go(fetch(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
+	g.Go(fetch(promql.QJobAnnotations, &v.JobAnnotations))
+	g.Go(fetch(promql.QCronJobAnnotations, &v.CronJobAnnotations))
 	g.Go(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels))
 	g.Go(fetchOptional(promql.QQoSReadOps, &v.QoSReadOps))
 	g.Go(fetchOptional(promql.QQoSWriteOps, &v.QoSWriteOps))
@@ -299,6 +323,13 @@ func ReadTopology(
 		string(promql.QNodeStatusCondition):        len(v.NodeStatus),
 		string(promql.QServiceAnnotations):         len(v.ServiceAnnotations),
 		string(promql.QPVCAnnotations):             len(v.PVCAnnotations),
+		string(promql.QJobOwner):                   len(v.JobOwner),
+		string(promql.QDeploymentAnnotations):      len(v.DeploymentAnnotations),
+		string(promql.QStatefulSetAnnotations):     len(v.StatefulSetAnnotations),
+		string(promql.QDaemonSetAnnotations):       len(v.DaemonSetAnnotations),
+		string(promql.QReplicaSetAnnotations):      len(v.ReplicaSetAnnotations),
+		string(promql.QJobAnnotations):             len(v.JobAnnotations),
+		string(promql.QCronJobAnnotations):         len(v.CronJobAnnotations),
 		string(promql.QVolumeLabels):               len(v.VolumeLabels),
 		string(promql.QQoSReadOps):                 len(v.QoSReadOps),
 		string(promql.QQoSWriteOps):                len(v.QoSWriteOps),
@@ -395,10 +426,15 @@ func parseTopology(v topologyVectors) Topology {
 
 	// Pod container list + ArgoCD Application resolution. Both feed typed pod
 	// attributes (never labels) set during the per-pod assembly below. The
-	// Application is read from the SAME kube_pod_owner vector as the controller
-	// owner but independently of the controller pick (it is a pod-level fact).
+	// Application is joined from the pod's controller — ArgoCD annotates the
+	// managed workload object, never the pods it spawns — reusing the controller
+	// owner resolved above, so the Deployment case needs no extra owner hop.
 	podContainers := resolvePodContainers(v.PodContainerInfo, mc)
-	podApplications := resolvePodApplications(v.PodOwner)
+	podApplications := resolvePodApplications(
+		podOwners,
+		resolveControllerApplications(v, mc),
+		resolveJobCronJobOwners(v.JobOwner, mc),
+	)
 
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id). Built
 	// up-front: the PVC index enriches each PVC at the per-PVC assembly below; the
@@ -976,34 +1012,150 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 	return out
 }
 
-// resolvePodApplications builds the (cluster, namespace, pod) → ArgoCD
-// Application index from the argocd_tracking_id label on kube_pod_owner. The
-// Application is the segment of the tracking-id value before the first ":"
-// (ArgoCD annotation-based form <app>:<group>/<kind>:<ns>/<name>); a value with
-// no ":" is surfaced verbatim. The label is read independently of the
-// controller-owner pick — it is a pod-level fact that must survive even when no
-// kube_pod_owner row is a controller.
+// controllerKey identifies one workload controller by its cluster-scoped
+// namespace, its owner kind and its name — exactly the tuple resolvePodOwners
+// already produces per pod, so the pod → Application join is a single lookup.
+type controllerKey struct{ cluster, namespace, kind, name string }
+
+// controllerAnnotationFamily binds one owner kind to the kube-state-metrics
+// annotation family that describes it and to that family's resource-identity
+// label. The Job family's identity label is `job_name`, NOT `job` —
+// kube-state-metrics avoids Prometheus' reserved `job` target label.
+type controllerAnnotationFamily struct {
+	kind      string
+	query     promql.Query
+	nameLabel model.LabelName
+	vec       func(topologyVectors) model.Vector
+}
+
+// controllerAnnotationFamilies is the complete set of pod controller kinds a
+// stock kube-state-metrics can describe. A resolved owner kind absent from this
+// table — ReplicationController (KSM exposes no annotations family for it),
+// Node (static / mirror pods), or any CRD controller such as argo-rollouts
+// Rollout or OpenKruise CloneSet — resolves no Application, keeps the pod's
+// owner attribute, and never fails the build.
+var controllerAnnotationFamilies = []controllerAnnotationFamily{
+	{"Deployment", promql.QDeploymentAnnotations, "deployment", func(v topologyVectors) model.Vector { return v.DeploymentAnnotations }},
+	{"StatefulSet", promql.QStatefulSetAnnotations, "statefulset", func(v topologyVectors) model.Vector { return v.StatefulSetAnnotations }},
+	{"DaemonSet", promql.QDaemonSetAnnotations, "daemonset", func(v topologyVectors) model.Vector { return v.DaemonSetAnnotations }},
+	{"ReplicaSet", promql.QReplicaSetAnnotations, "replicaset", func(v topologyVectors) model.Vector { return v.ReplicaSetAnnotations }},
+	{"Job", promql.QJobAnnotations, "job_name", func(v topologyVectors) model.Vector { return v.JobAnnotations }},
+	{"CronJob", promql.QCronJobAnnotations, "cronjob", func(v topologyVectors) model.Vector { return v.CronJobAnnotations }},
+}
+
+// resolveControllerApplications builds the (cluster, namespace, kind, name) →
+// ArgoCD Application index from the six controller-annotation families. Each
+// family goes through the SAME generic resolveApplications the service and PVC
+// resolvers use — same tracking-id label, same segment-before-":" parse, same
+// lexically-smallest-raw tie-break, same drop-when-the-Application-would-be-
+// empty rule — with a keyOf that stamps the family's constant owner kind.
 //
-// OPTIONAL: pods with no non-empty argocd_tracking_id label are absent from the
-// returned map (the caller omits the attribute rather than emitting ""). The
-// returned map is a deterministic function of the input vector — on a per-pod
-// collision the lexically-smallest non-empty tracking-id wins. It uses the pure
-// bucketCluster helper (NOT mc.bucket): resolvePodOwners already tallies this
-// vector's missing-cluster samples for its controller rows, so using mc.bucket
-// here would double-count those. (A tracking-id carried only on a non-controller
-// row with a missing cluster label is therefore bucketed silently — an
-// acceptable diagnostic gap, not a wrong-output one.)
-func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
-	// kube_pod_owner's missing-cluster tally is owned by resolvePodOwners (the
-	// controller pick reads the SAME vector), so this pass buckets without
-	// re-tallying — hence bucketCluster, not mc.bucket.
-	return resolveApplications(ownerVec, "argocd_tracking_id", func(m model.Metric) (podNameKey, bool) {
-		pod := string(m["pod"])
-		if pod == "" {
-			return podNameKey{}, false
+// The six results are merged into one map. Their key spaces are disjoint by
+// construction (the kind component differs), so the merge needs no cross-family
+// tie-break and is independent of iteration order (D6 determinism).
+//
+// OPTIONAL: every family is empty unless the operator allowlisted the
+// annotation, which is the stock kube-state-metrics state. An empty input
+// yields an empty index and no pod resolves an Application.
+func resolveControllerApplications(v topologyVectors, mc missingClusterCounts) map[controllerKey]string {
+	out := map[controllerKey]string{}
+	for _, f := range controllerAnnotationFamilies {
+		apps := resolveApplications(f.vec(v), "annotation_argocd_argoproj_io_tracking_id",
+			func(m model.Metric) (controllerKey, bool) {
+				name := string(m[f.nameLabel])
+				if name == "" {
+					return controllerKey{}, false
+				}
+				return controllerKey{
+					cluster:   mc.bucket(f.query, string(m["cluster"])),
+					namespace: string(m["namespace"]),
+					kind:      f.kind,
+					name:      name,
+				}, true
+			})
+		// Key spaces are disjoint by kind, so a plain copy is order-free.
+		maps.Copy(out, apps)
+	}
+	return out
+}
+
+// resolveJobCronJobOwners builds the (cluster, namespace, job) → owning CronJob
+// name index from kube_job_owner. It exists only for ArgoCD Application
+// resolution: the Kubernetes CronJob controller copies only
+// spec.jobTemplate.metadata annotations onto the Jobs it creates — never the
+// CronJob object's own annotations — so ArgoCD's tracking-id never reaches a
+// Job and a CronJob-managed pod can only resolve its Application one level up.
+//
+// Only controller rows naming a CronJob are retained. Unlike the pre-existing
+// rsToDeployment pass in resolvePodOwners, this one DOES filter
+// owner_is_controller: new code honours the authoritative label, while
+// tightening rsToDeployment would move the pod `owner` attribute and is out of
+// scope. On a defensive collision the lexically-smallest CronJob name wins (D6).
+//
+// This index is NEVER read by resolvePodOwners, which is what makes "the hop
+// cannot change data.owner" a structural property rather than a convention.
+func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[podNameKey]string {
+	out := make(map[podNameKey]string, len(vec))
+	for _, s := range vec {
+		if string(s.Metric["owner_kind"]) != "CronJob" || string(s.Metric["owner_is_controller"]) != "true" {
+			continue
 		}
-		return podNameKey{bucketCluster(string(m["cluster"])), string(m["namespace"]), pod}, true
-	})
+		job := string(s.Metric["job_name"])
+		cronJob := string(s.Metric["owner_name"])
+		if job == "" || cronJob == "" {
+			continue
+		}
+		key := podNameKey{mc.bucket(promql.QJobOwner, string(s.Metric["cluster"])), string(s.Metric["namespace"]), job}
+		if cur, ok := out[key]; ok && cur <= cronJob {
+			continue
+		}
+		out[key] = cronJob
+	}
+	return out
+}
+
+// resolvePodApplications builds the (cluster, namespace, pod) → ArgoCD
+// Application index by joining each pod's already-resolved controller owner to
+// the controller-annotation index. ArgoCD stamps
+// `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on
+// the pods a controller spawns, so the controller is the only place the value
+// exists — no pod-level label is read.
+//
+// Because the D34 ReplicaSet skip has already collapsed a ReplicaSet owner to
+// its Deployment, the Deployment case needs no extra hop. The ONE fallback is
+// Job → CronJob: when the owner is a Job that carries no annotation of its own,
+// the owning CronJob is consulted. The Job's own annotation is tried FIRST, so
+// a Job that ArgoCD manages directly keeps its own Application — the same
+// "nearest managed ancestor wins" rule the ReplicaSet collapse implies.
+//
+// A pod with no controller owner, or an owner of a kind outside
+// controllerAnnotationFamilies, is absent from the returned map so the caller
+// omits data.application entirely rather than emitting "".
+func resolvePodApplications(
+	owners map[podNameKey]ownerRef,
+	ctrlApps map[controllerKey]string,
+	jobCronJobs map[podNameKey]string,
+) map[podNameKey]string {
+	out := make(map[podNameKey]string, len(owners))
+	for pod, owner := range owners {
+		key := controllerKey{pod.cluster, pod.namespace, owner.kind, owner.name}
+		if app, ok := ctrlApps[key]; ok {
+			out[pod] = app
+			continue
+		}
+		// Job → CronJob: the only hop, and only on a miss.
+		if owner.kind != "Job" {
+			continue
+		}
+		cronJob, ok := jobCronJobs[podNameKey{pod.cluster, pod.namespace, owner.name}]
+		if !ok {
+			continue
+		}
+		if app, ok := ctrlApps[controllerKey{pod.cluster, pod.namespace, "CronJob", cronJob}]; ok {
+			out[pod] = app
+		}
+	}
+	return out
 }
 
 // resolveServiceApplications builds the (cluster, namespace, service) → ArgoCD

@@ -15,9 +15,11 @@ import (
 )
 
 // TestGraphEndpoint_PodApplicationAndContainers — end-to-end the pod node
-// carries data.application (parsed from the kube_pod_owner argocd_tracking_id
-// label) and data.containers (from kube_pod_container_info, ordered by
-// (name, image)); neither leaks into labels, and a non-pod node omits both.
+// carries data.application (joined from the CONTROLLER's
+// annotation_argocd_argoproj_io_tracking_id, here the Deployment the pod's
+// ReplicaSet resolves up to) and data.containers (from kube_pod_container_info,
+// ordered by (name, image)); neither leaks into labels, and a non-pod node omits
+// both.
 func TestGraphEndpoint_PodApplicationAndContainers(t *testing.T) {
 	fixtures := happyFixtures()
 	fixtures["last_over_time(kube_pod_owner"] = vec(map[string]string{
@@ -27,7 +29,21 @@ func TestGraphEndpoint_PodApplicationAndContainers(t *testing.T) {
 		"owner_kind":          "ReplicaSet",
 		"owner_name":          "web-7f9c",
 		"owner_is_controller": "true",
-		"argocd_tracking_id":  "storefront:apps/Deployment:default/web",
+	})
+	// The D34 ReplicaSet skip resolves the owner to the Deployment, which is the
+	// object ArgoCD actually annotates — no extra owner hop is needed.
+	fixtures["last_over_time(kube_replicaset_owner"] = vec(map[string]string{
+		"cluster":    "test",
+		"namespace":  "default",
+		"replicaset": "web-7f9c",
+		"owner_kind": "Deployment",
+		"owner_name": "web",
+	})
+	fixtures["last_over_time(kube_deployment_annotations"] = vec(map[string]string{
+		"cluster":    "test",
+		"namespace":  "default",
+		"deployment": "web",
+		"annotation_argocd_argoproj_io_tracking_id": "storefront:apps/Deployment:default/web",
 	})
 	fixtures["tlast_over_time(kube_pod_container_info"] = vec(
 		map[string]string{
@@ -66,7 +82,7 @@ func TestGraphEndpoint_PodApplicationAndContainers(t *testing.T) {
 				{Name: "istio-proxy", Image: "reg/proxy:0.9"},
 			}, n.Data.Containers, "data.containers ordered by (name, image)")
 			_, hasApp := n.Data.Labels["application"]
-			_, hasTrack := n.Data.Labels["argocd_tracking_id"]
+			_, hasTrack := n.Data.Labels["annotation_argocd_argoproj_io_tracking_id"]
 			_, hasCtr := n.Data.Labels["containers"]
 			assert.False(t, hasApp || hasTrack, "application must not appear in labels")
 			assert.False(t, hasCtr, "containers must not appear in labels")

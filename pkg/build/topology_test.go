@@ -449,42 +449,63 @@ func TestParseTopology_PodContainersSkipsEmptyImage(t *testing.T) {
 		"empty image must not win even if seen later; container with only an empty image is dropped")
 }
 
-// TestParseTopology_PodApplicationAttribute — the ArgoCD Application is parsed
-// from the argocd_tracking_id label on kube_pod_owner (segment before the first
-// ":"), surfaced on the typed Application attribute (never labels); a value with
-// no ":" is verbatim; absent label → empty.
-func TestParseTopology_PodApplicationAttribute(t *testing.T) {
-	pod := func(name, uid string) model.Sample {
-		return model.Sample{Metric: model.Metric{
-			"cluster": "c", "namespace": "shop",
-			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
-		}}
-	}
-	owner := func(name, tracking string) model.Sample {
-		m := model.Metric{
-			"cluster": "c", "namespace": "shop", "pod": model.LabelValue(name),
-			"owner_kind": "DaemonSet", "owner_name": "rs", "owner_is_controller": "true",
-		}
-		if tracking != "" {
-			m["argocd_tracking_id"] = model.LabelValue(tracking)
-		}
-		return model.Sample{Metric: m}
-	}
+// appPod is a kube_pod_info sample for the Application tests below.
+func appPod(ns, name, uid string) model.Sample {
+	return model.Sample{Metric: model.Metric{
+		"cluster": "c", "namespace": model.LabelValue(ns),
+		"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
+	}}
+}
 
+// appOwner is a controller kube_pod_owner row. It deliberately never carries an
+// argocd_tracking_id label: that label has no producer and is not read.
+func appOwner(ns, pod, kind, name string) model.Sample {
+	return model.Sample{Metric: model.Metric{
+		"cluster": "c", "namespace": model.LabelValue(ns), "pod": model.LabelValue(pod),
+		"owner_kind": model.LabelValue(kind), "owner_name": model.LabelValue(name),
+		"owner_is_controller": "true",
+	}}
+}
+
+// ctrlAnn is one kube_<controller>_annotations series: nameLabel is the family's
+// resource-identity label (`deployment`, `statefulset`, …, `job_name`).
+func ctrlAnn(nameLabel, ns, name, tracking string) model.Sample {
+	m := model.Metric{
+		"cluster": "c", "namespace": model.LabelValue(ns),
+		model.LabelName(nameLabel): model.LabelValue(name),
+	}
+	if tracking != "" {
+		m["annotation_argocd_argoproj_io_tracking_id"] = model.LabelValue(tracking)
+	}
+	return model.Sample{Metric: m}
+}
+
+// TestParseTopology_PodApplicationAttribute — the ArgoCD Application is joined
+// from the pod's CONTROLLER's annotation_argocd_argoproj_io_tracking_id (segment
+// before the first ":"), surfaced on the typed Application attribute (never
+// labels); a value with no ":" is verbatim; an empty leading segment and an
+// absent annotation both yield no Application.
+func TestParseTopology_PodApplicationAttribute(t *testing.T) {
 	podVec := sampleVec(
-		pod("checkout-1", "u1"), // full tracking-id
-		pod("bare-1", "u2"),     // tracking-id with no colon
-		pod("plain-1", "u3"),    // no argocd label
-		pod("colon-1", "u4"),    // tracking-id beginning with ":" → empty segment
+		appPod("shop", "checkout-1", "u1"), // full tracking-id
+		appPod("shop", "bare-1", "u2"),     // tracking-id with no colon
+		appPod("shop", "plain-1", "u3"),    // controller with no annotation
+		appPod("shop", "colon-1", "u4"),    // tracking-id beginning with ":"
 	)
 	ownerVec := sampleVec(
-		owner("checkout-1", "checkout:apps/Deployment:shop/checkout"),
-		owner("bare-1", "billing"),
-		owner("plain-1", ""),
-		owner("colon-1", ":apps/Deployment:shop/x"),
+		appOwner("shop", "checkout-1", "Deployment", "checkout"),
+		appOwner("shop", "bare-1", "Deployment", "billing"),
+		appOwner("shop", "plain-1", "Deployment", "plain"),
+		appOwner("shop", "colon-1", "Deployment", "colon"),
+	)
+	deployVec := sampleVec(
+		ctrlAnn("deployment", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+		ctrlAnn("deployment", "shop", "billing", "billing"),
+		ctrlAnn("deployment", "shop", "plain", ""),
+		ctrlAnn("deployment", "shop", "colon", ":apps/Deployment:shop/x"),
 	)
 
-	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec})
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, DeploymentAnnotations: deployVec})
 	byName := map[string]*graph.PodNode{}
 	for _, p := range tp.Pods {
 		byName[p.Name()] = p
@@ -492,66 +513,232 @@ func TestParseTopology_PodApplicationAttribute(t *testing.T) {
 
 	assert.Equal(t, "checkout", byName["checkout-1"].Application(), "segment before the first ':'")
 	assert.Equal(t, "billing", byName["bare-1"].Application(), "value with no ':' is verbatim")
-	assert.Empty(t, byName["plain-1"].Application(), "no argocd label → empty Application")
+	assert.Empty(t, byName["plain-1"].Application(), "controller with no annotation → no Application")
 	assert.Empty(t, byName["colon-1"].Application(), "leading ':' → empty segment → no Application (absent, not present-but-empty)")
 
-	// argocd_tracking_id / application must NEVER leak into labels.
+	// The tracking-id / application must NEVER leak into labels.
 	for _, p := range tp.Pods {
-		_, hasTrack := p.Labels()["argocd_tracking_id"]
+		_, hasTrack := p.Labels()["annotation_argocd_argoproj_io_tracking_id"]
+		_, hasLegacy := p.Labels()["argocd_tracking_id"]
 		_, hasApp := p.Labels()["application"]
-		assert.Falsef(t, hasTrack || hasApp, "application must not appear in labels for pod %q", p.Name())
+		assert.Falsef(t, hasTrack || hasLegacy || hasApp, "application must not appear in labels for pod %q", p.Name())
 	}
 
-	// Owner series absent entirely → valid topology, no application.
-	tp2 := parseTopology(topologyVectors{Pod: podVec})
+	// Annotation families absent entirely → valid topology, no application.
+	tp2 := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec})
 	for _, p := range tp2.Pods {
-		assert.Emptyf(t, p.Application(), "no owner series → pod %q carries no application", p.Name())
+		assert.Emptyf(t, p.Application(), "no annotation series → pod %q carries no application", p.Name())
+		assert.NotNilf(t, p.Owner(), "pod %q keeps its controller owner", p.Name())
 	}
 }
 
-// TestParseTopology_PodApplicationDeterministic — on a per-pod collision the
-// lexically-smallest non-empty tracking-id wins, independent of vector order.
-func TestParseTopology_PodApplicationDeterministic(t *testing.T) {
-	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w0"}}
-	owner := func(tracking string) model.Sample {
+// TestParseTopology_PodApplicationPerOwnerKind — every controller kind
+// kube-state-metrics can describe resolves through its own annotation family.
+// The Deployment case goes through the D34 ReplicaSet skip, proving the join
+// keys on the ALREADY-RESOLVED owner and needs no extra hop of its own.
+func TestParseTopology_PodApplicationPerOwnerKind(t *testing.T) {
+	v := topologyVectors{
+		Pod: sampleVec(
+			appPod("shop", "via-rs", "u1"),
+			appPod("db", "mongo-0", "u2"),
+			appPod("platform", "fluentd-x", "u3"),
+			appPod("shop", "adhoc-1", "u4"),
+		),
+		PodOwner: sampleVec(
+			appOwner("shop", "via-rs", "ReplicaSet", "checkout-7f9c"),
+			appOwner("db", "mongo-0", "StatefulSet", "mongo"),
+			appOwner("platform", "fluentd-x", "DaemonSet", "fluentd"),
+			appOwner("shop", "adhoc-1", "ReplicaSet", "adhoc-rs"),
+		),
+		// via-rs' ReplicaSet resolves up to a Deployment; adhoc-rs is bare.
+		ReplicaSetOwner: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop", "replicaset": "checkout-7f9c",
+			"owner_kind": "Deployment", "owner_name": "checkout",
+		}}),
+		DeploymentAnnotations:  sampleVec(ctrlAnn("deployment", "shop", "checkout", "storefront:apps/Deployment:shop/checkout")),
+		StatefulSetAnnotations: sampleVec(ctrlAnn("statefulset", "db", "mongo", "mongo:apps/StatefulSet:db/mongo")),
+		DaemonSetAnnotations:   sampleVec(ctrlAnn("daemonset", "platform", "fluentd", "logging:apps/DaemonSet:platform/fluentd")),
+		ReplicaSetAnnotations:  sampleVec(ctrlAnn("replicaset", "shop", "adhoc-rs", "adhoc:apps/ReplicaSet:shop/adhoc-rs")),
+	}
+
+	tp := parseTopology(v)
+	got := map[string]string{}
+	for _, p := range tp.Pods {
+		got[p.Name()] = p.Application()
+	}
+
+	assert.Equal(t, map[string]string{
+		"via-rs":    "storefront",
+		"mongo-0":   "mongo",
+		"fluentd-x": "logging",
+		"adhoc-1":   "adhoc",
+	}, got)
+}
+
+// TestParseTopology_PodApplicationCronJobHop — a CronJob-created Job carries no
+// tracking-id of its own (the CronJob controller copies only
+// spec.jobTemplate.metadata annotations), so the Application resolves one level
+// up via kube_job_owner. The hop is resolution-only: the pod's owner attribute
+// MUST still name the Job.
+func TestParseTopology_PodApplicationCronJobHop(t *testing.T) {
+	tp := parseTopology(topologyVectors{
+		Pod:      sampleVec(appPod("batch", "nightly-28901-abc", "u1")),
+		PodOwner: sampleVec(appOwner("batch", "nightly-28901-abc", "Job", "nightly-28901")),
+		JobOwner: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "batch", "job_name": "nightly-28901",
+			"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
+		}}),
+		CronJobAnnotations: sampleVec(ctrlAnn("cronjob", "batch", "nightly", "reports:batch/CronJob:batch/nightly")),
+	})
+
+	require.Len(t, tp.Pods, 1)
+	assert.Equal(t, "reports", tp.Pods[0].Application(), "Application resolves through the CronJob hop")
+	require.NotNil(t, tp.Pods[0].Owner())
+	assert.Equal(t, graph.Owner{Kind: "Job", Name: "nightly-28901"}, *tp.Pods[0].Owner(),
+		"the hop must not rewrite the owner attribute")
+}
+
+// TestParseTopology_PodApplicationJobOwnAnnotationWins — a Job ArgoCD manages
+// directly keeps its own Application; the CronJob hop runs only on a miss
+// ("nearest managed ancestor wins", as the ReplicaSet collapse implies).
+func TestParseTopology_PodApplicationJobOwnAnnotationWins(t *testing.T) {
+	tp := parseTopology(topologyVectors{
+		Pod:      sampleVec(appPod("shop", "migrate-1-xyz", "u1")),
+		PodOwner: sampleVec(appOwner("shop", "migrate-1-xyz", "Job", "migrate-1")),
+		JobOwner: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop", "job_name": "migrate-1",
+			"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
+		}}),
+		JobAnnotations:     sampleVec(ctrlAnn("job_name", "shop", "migrate-1", "migrations:batch/Job:shop/migrate-1")),
+		CronJobAnnotations: sampleVec(ctrlAnn("cronjob", "shop", "nightly", "reports:batch/CronJob:shop/nightly")),
+	})
+
+	require.Len(t, tp.Pods, 1)
+	assert.Equal(t, "migrations", tp.Pods[0].Application(), "the Job's own annotation wins over the CronJob's")
+}
+
+// TestParseTopology_PodApplicationJobOwnerNonController — kube_job_owner rows
+// that are not the controller, or do not name a CronJob, must not be followed.
+func TestParseTopology_PodApplicationJobOwnerNonController(t *testing.T) {
+	jobOwner := func(kind, name, isController string) model.Sample {
 		return model.Sample{Metric: model.Metric{
-			"cluster": "c", "namespace": "n", "pod": "p",
-			"owner_kind": "DaemonSet", "owner_name": "rs", "owner_is_controller": "true",
-			"argocd_tracking_id": model.LabelValue(tracking),
+			"cluster": "c", "namespace": "batch", "job_name": "j1",
+			"owner_kind": model.LabelValue(kind), "owner_name": model.LabelValue(name),
+			"owner_is_controller": model.LabelValue(isController),
 		}}
 	}
-	a := owner("alpha:apps/Deployment:n/alpha")
-	b := owner("beta:apps/Deployment:n/beta")
+	base := topologyVectors{
+		Pod:                sampleVec(appPod("batch", "j1-pod", "u1")),
+		PodOwner:           sampleVec(appOwner("batch", "j1-pod", "Job", "j1")),
+		CronJobAnnotations: sampleVec(ctrlAnn("cronjob", "batch", "nightly", "reports:batch/CronJob:batch/nightly")),
+	}
 
-	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(a, b)})
-	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(b, a)})
+	for _, tc := range []struct {
+		name string
+		row  model.Sample
+	}{
+		{"non-controller row", jobOwner("CronJob", "nightly", "false")},
+		{"owner is not a CronJob", jobOwner("Workflow", "nightly", "true")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := base
+			v.JobOwner = sampleVec(tc.row)
+			tp := parseTopology(v)
+			require.Len(t, tp.Pods, 1)
+			assert.Empty(t, tp.Pods[0].Application(), "the hop must not be followed")
+		})
+	}
+
+	// Defensive collision: two controller CronJob owners → lexically smallest.
+	v := base
+	v.JobOwner = sampleVec(jobOwner("CronJob", "zeta", "true"), jobOwner("CronJob", "alpha", "true"))
+	v.CronJobAnnotations = sampleVec(
+		ctrlAnn("cronjob", "batch", "zeta", "zed:batch/CronJob:batch/zeta"),
+		ctrlAnn("cronjob", "batch", "alpha", "aye:batch/CronJob:batch/alpha"),
+	)
+	tp := parseTopology(v)
+	require.Len(t, tp.Pods, 1)
+	assert.Equal(t, "aye", tp.Pods[0].Application(), "lexically-smallest CronJob name wins")
+}
+
+// TestParseTopology_PodApplicationDeterministic — on a per-controller collision
+// the lexically-smallest non-empty raw tracking-id wins, independent of vector
+// order.
+func TestParseTopology_PodApplicationDeterministic(t *testing.T) {
+	pod := appPod("n", "p", "u")
+	owner := appOwner("n", "p", "Deployment", "d")
+	a := ctrlAnn("deployment", "n", "d", "alpha:apps/Deployment:n/alpha")
+	b := ctrlAnn("deployment", "n", "d", "beta:apps/Deployment:n/beta")
+
+	forward := parseTopology(topologyVectors{
+		Pod: sampleVec(pod), PodOwner: sampleVec(owner), DeploymentAnnotations: sampleVec(a, b),
+	})
+	reverse := parseTopology(topologyVectors{
+		Pod: sampleVec(pod), PodOwner: sampleVec(owner), DeploymentAnnotations: sampleVec(b, a),
+	})
 
 	require.Len(t, forward.Pods, 1)
 	assert.Equal(t, "alpha", forward.Pods[0].Application(), "lexically-smallest tracking-id wins")
 	assert.Equal(t, forward.Pods[0].Application(), reverse.Pods[0].Application(), "order-independent")
 }
 
-// TestParseTopology_PodApplicationFromNonControllerRow — the Application is read
-// independently of the controller-owner pick: a pod whose argocd_tracking_id
-// appears ONLY on a non-controller kube_pod_owner row (owner_is_controller other
-// than "true") still resolves its Application. This guards the documented reason
-// resolvePodApplications does not filter on owner_is_controller (unlike
-// resolvePodOwners), so a copy-pasted controller-only skip would fail here.
-func TestParseTopology_PodApplicationFromNonControllerRow(t *testing.T) {
-	pod := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "shop", "pod": "checkout", "uid": "u1", "node": "w0"}}
-	// Only a non-controller owner row carries the tracking-id (no controller row).
-	owner := model.Sample{Metric: model.Metric{
-		"cluster": "c", "namespace": "shop", "pod": "checkout",
-		"owner_kind": "Node", "owner_name": "w0", "owner_is_controller": "false",
-		"argocd_tracking_id": "storefront:apps/Deployment:shop/checkout",
-	}}
+// TestParseTopology_PodApplicationNoControllerOwner — the Application is keyed
+// on the controller owner, so a pod with none resolves nothing. This replaces
+// the withdrawn "resolves from a non-controller row" case: with no pod-level
+// label there is no source that can bypass the controller pick.
+func TestParseTopology_PodApplicationNoControllerOwner(t *testing.T) {
+	tp := parseTopology(topologyVectors{
+		Pod: sampleVec(appPod("shop", "checkout", "u1")),
+		// Only a non-controller owner row exists.
+		PodOwner: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "shop", "pod": "checkout",
+			"owner_kind": "Node", "owner_name": "w0", "owner_is_controller": "false",
+		}}),
+		DeploymentAnnotations: sampleVec(ctrlAnn("deployment", "shop", "checkout", "storefront:apps/Deployment:shop/checkout")),
+	})
 
-	tp := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(owner)})
 	require.Len(t, tp.Pods, 1)
-	assert.Equal(t, "storefront", tp.Pods[0].Application(),
-		"Application resolves even when no kube_pod_owner row is a controller")
-	// The non-controller row must not produce a controller owner.
 	assert.Nil(t, tp.Pods[0].Owner(), "non-controller row must not set an owner")
+	assert.Empty(t, tp.Pods[0].Application(), "no controller owner → no Application lookup")
+}
+
+// TestParseTopology_PodApplicationUnsupportedOwnerKind — an owner kind with no
+// kube-state-metrics annotation family (a CRD controller, ReplicationController)
+// keeps its owner, resolves no Application, and never fails the parse.
+func TestParseTopology_PodApplicationUnsupportedOwnerKind(t *testing.T) {
+	tp := parseTopology(topologyVectors{
+		Pod: sampleVec(appPod("shop", "canary-1", "u1"), appPod("shop", "legacy-1", "u2")),
+		PodOwner: sampleVec(
+			appOwner("shop", "canary-1", "Rollout", "canary"),
+			appOwner("shop", "legacy-1", "ReplicationController", "legacy"),
+		),
+		DeploymentAnnotations: sampleVec(ctrlAnn("deployment", "shop", "canary", "nope:apps/Deployment:shop/canary")),
+	})
+
+	require.Len(t, tp.Pods, 2)
+	for _, p := range tp.Pods {
+		require.NotNilf(t, p.Owner(), "pod %q keeps its owner", p.Name())
+		assert.Emptyf(t, p.Application(), "pod %q resolves no Application", p.Name())
+	}
+}
+
+// TestParseTopology_PodLevelTrackingIDIgnored — a populated argocd_tracking_id
+// on kube_pod_owner is NOT a source. The label has no stock producer, so a
+// deployment still synthesising it must not resolve an Application from it.
+func TestParseTopology_PodLevelTrackingIDIgnored(t *testing.T) {
+	owner := appOwner("shop", "checkout-1", "Deployment", "checkout")
+	owner.Metric["argocd_tracking_id"] = "legacy:apps/Deployment:shop/checkout"
+
+	tp := parseTopology(topologyVectors{
+		Pod:      sampleVec(appPod("shop", "checkout-1", "u1")),
+		PodOwner: sampleVec(owner),
+	})
+
+	require.Len(t, tp.Pods, 1)
+	assert.Empty(t, tp.Pods[0].Application(),
+		"the pod-level label is not read; only the controller's annotation is")
+	_, hasTrack := tp.Pods[0].Labels()["argocd_tracking_id"]
+	assert.False(t, hasTrack, "the label must not leak into labels either")
 }
 
 // TestParseTopology_NoServiceSeriesYieldsEmptyIndexes — absence of
@@ -719,16 +906,6 @@ func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
 			"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "w0",
 		}}
 	}
-	owner := func(name, tracking string) model.Sample {
-		m := model.Metric{
-			"cluster": "c", "namespace": "shop", "pod": model.LabelValue(name),
-			"owner_kind": "Deployment", "owner_name": "d", "owner_is_controller": "true",
-		}
-		if tracking != "" {
-			m["argocd_tracking_id"] = model.LabelValue(tracking)
-		}
-		return model.Sample{Metric: m}
-	}
 	mount := func(name, claim string) model.Sample {
 		return model.Sample{Metric: model.Metric{
 			"cluster": "c", "namespace": "shop",
@@ -749,11 +926,18 @@ func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
 		podInfo("noapp", "un"),      // no app
 		podInfo("declarer", "ud"),   // app web; mounts a PVC carrying its OWN annotation
 	)
+	// Each pod sits under its own Deployment; the Application comes from that
+	// Deployment's annotation, never from the pod.
 	ownerVec := sampleVec(
-		owner("checkout-a", "checkout:apps/Deployment:shop/checkout"),
-		owner("checkout-b", "billing:apps/Deployment:shop/billing"),
-		owner("noapp", ""),
-		owner("declarer", "web:apps/Deployment:shop/web"),
+		appOwner("shop", "checkout-a", "Deployment", "checkout"),
+		appOwner("shop", "checkout-b", "Deployment", "billing"),
+		appOwner("shop", "noapp", "Deployment", "noapp"),
+		appOwner("shop", "declarer", "Deployment", "web"),
+	)
+	deployVec := sampleVec(
+		ctrlAnn("deployment", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
+		ctrlAnn("deployment", "shop", "billing", "billing:apps/Deployment:shop/billing"),
+		ctrlAnn("deployment", "shop", "web", "web:apps/Deployment:shop/web"),
 	)
 	// shared:   mounted by checkout-a (checkout) + checkout-b (billing) → inherits billing
 	// lonely:   mounted by noapp only → stays app-less
@@ -768,7 +952,10 @@ func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
 		pvcAnn("declared", "mongo:apps/StatefulSet:shop/mongo"),
 	)
 
-	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, PVC: pvcVec, PVCAnnotations: annVec})
+	tp := parseTopology(topologyVectors{
+		Pod: podVec, PodOwner: ownerVec, DeploymentAnnotations: deployVec,
+		PVC: pvcVec, PVCAnnotations: annVec,
+	})
 	byID := map[string]*graph.PVCNode{}
 	for _, p := range tp.PVCs {
 		byID[p.ID()] = p
