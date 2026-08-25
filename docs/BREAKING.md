@@ -253,3 +253,102 @@ hop is resolution-only, so a CronJob-managed pod still reports
 `<app>:<group>/<kind>:<ns>/<name>` parse and determinism rules are unchanged, as
 are the service and PVC Application sources and the PVC inheritance rule. No
 node type, edge type, `labels` key, request parameter, or HTTP route changes.
+
+---
+
+# NOT breaking — upstream backend routing
+
+`add-multi-backend-query-routing` lets one process assemble a graph from several
+Prometheus-compatible installations, selected by availability zone and by metric
+family. It is recorded here because it changes how the upstream is *configured*
+and adds one operational behaviour change — but **no client-visible contract
+moves**. See [`upstream-backend-routing.md`](upstream-backend-routing.md) for
+the full configuration reference.
+
+## Unchanged
+
+- **Request surface.** No new parameter, none withdrawn. `?az=` keeps its exact
+  current meaning as a PromQL label matcher and *additionally* selects which
+  stores are asked; the two compose, and the rendered query string for a given
+  query is identical across every backend it is issued to.
+- **Response body.** No node type, edge type, `labels` key, or `data.*`
+  attribute changes. The determinism contract is unchanged: the fan-out merge
+  is a pure function of the value sets returned, ordered by backend name, so it
+  cannot depend on which store answered first.
+- **Self-metric contracts.** `kube_state_graph_upstream_query_duration_seconds`
+  and `kube_state_graph_upstream_query_failures_total` keep their `query`-only
+  label sets. Per-backend detail lives on three NEW metrics —
+  `kube_state_graph_upstream_backends`,
+  `kube_state_graph_backend_config_reload_total{result}`, and
+  `kube_state_graph_backend_query_failures_total{backend}`.
+- **`--prom-url` and `KSG_PROM_USERNAME` / `KSG_PROM_PASSWORD`.** Retained. With
+  no routing file configured, an implicit backend named `default` at
+  `--prom-url` serves every family with no zones, carrying the global
+  credentials.
+- **Embedding API.** No exported signature in `pkg/promql`, `pkg/build`, or
+  `pkg/kubegraph` changed. Routing is an OPTIONAL upgrade interface
+  (`promql.QuerierSource`) that `build.New` type-asserts, so a consumer passing
+  a plain `promql.Querier` — a `*promql.Client`, a mock, an embedder's own
+  implementation — behaves exactly as before.
+
+## What a deployment that configures nothing gets
+
+Byte-identical output. Every existing unit, component, golden, and integration
+test runs through the router in its degenerate single-backend configuration —
+the compatibility mode is a one-entry routing table, not a separate code path,
+precisely so that the claim is exercised rather than asserted.
+
+## The one operational behaviour change
+
+**A single unreachable backend now fails builds that a one-backend deployment
+would have served.** When a query is fanned out and any backend errors, the
+query fails and the error names that backend; a partial result is never
+returned in its place.
+
+This is deliberate. A partial fan-out is indistinguishable from a smaller
+estate: missing pods lose their edges, the connectivity prune then removes their
+nodes, claims and aggregates, and the response is a plausible, smaller, wrong
+graph — the failure mode this repository's "invariants that fail silently" list
+exists to prevent.
+
+Blast radius is unchanged for a single-backend deployment (one store down was
+already a 502). It grows with the number of backends, which is why:
+
+- `/readyz` probes **every** backend within the one `--api-timeout` budget and
+  names the ones that did not answer, and
+- `kube_state_graph_backend_query_failures_total{backend}` is materialised at
+  zero for every configured backend, so a healthy store is a visible zero series
+  rather than an absent one.
+
+Legs the builder already treats as optional (Harvest, kubelet,
+`kube_replicaset_annotations`, `kube_job_annotations`) keep degrading exactly as
+they do for any other upstream error.
+
+## Two configuration rules that fail loudly on purpose
+
+- **A family served by no backend is a validation error**, not a degrade. Its
+  queries would have nowhere to go, and the empty vector that produced would be
+  indistinguishable from an estate that genuinely holds nothing.
+- **A backend naming a credential environment variable that is unset or empty is
+  a load failure**, not a quiet fallback to the global pair or to no
+  credentials. A typo'd variable name would otherwise become 401s from one
+  store, which — since a backend failure fails the whole query — surfaces as an
+  error pointing at the wrong thing.
+
+An invalid routing file at **startup** is fatal. An invalid file at **reload**
+is rejected wholesale: the previous table keeps serving and the failure is
+counted every tick until it is fixed.
+
+## New configuration
+
+- `--backends-file` / `KSG_BACKENDS_FILE` — path to the routing table (YAML or
+  JSON). Unset keeps the implicit single backend.
+- `--backends-reload-interval` / `KSG_BACKENDS_RELOAD_INTERVAL` — default `30s`,
+  matching the API-key reloader. `0` disables reloading.
+
+## New dependency
+
+`sigs.k8s.io/yaml` is promoted from an indirect to a direct dependency. It was
+already in the module graph (via `istio.io/istio`), so **no new module enters
+the build**; it is imported from `internal/config` only, never from `pkg/`, so
+an embedder inherits nothing.

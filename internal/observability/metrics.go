@@ -19,6 +19,14 @@ type Metrics struct {
 	UpstreamQueryFail *prometheus.CounterVec
 	HTTPRequests      *prometheus.CounterVec
 	AuthRejected      *prometheus.CounterVec
+
+	// Upstream backend routing. These are SEPARATE metrics rather than a
+	// `backend` label on UpstreamQueryDur / UpstreamQueryFail: adding a label
+	// to an established self-metric is a contract change that breaks every
+	// dashboard and recording rule built on it.
+	UpstreamBackends   prometheus.Gauge
+	BackendReload      *prometheus.CounterVec
+	BackendQueryFailed *prometheus.CounterVec
 }
 
 // NewMetrics registers and returns a fresh Metrics bundle.
@@ -74,6 +82,18 @@ func NewMetrics() *Metrics {
 			Name: "kube_state_graph_auth_rejected_total",
 			Help: "API-key authentication rejections by reason (missing | invalid).",
 		}, []string{"reason"}),
+		UpstreamBackends: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kube_state_graph_upstream_backends",
+			Help: "Number of upstream backends in the live routing table.",
+		}),
+		BackendReload: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kube_state_graph_backend_config_reload_total",
+			Help: "Routing-table reload attempts by result (ok | error | unchanged).",
+		}, []string{"result"}),
+		BackendQueryFailed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kube_state_graph_backend_query_failures_total",
+			Help: "Upstream PromQL query failures by backend.",
+		}, []string{"backend"}),
 	}
 
 	reg.MustRegister(
@@ -88,6 +108,15 @@ func NewMetrics() *Metrics {
 		m.UpstreamQueryFail,
 		m.HTTPRequests,
 		m.AuthRejected,
+		m.UpstreamBackends,
+		m.BackendReload,
+		m.BackendQueryFailed,
 	)
+	// The reload results are a closed set, so every one is materialised at
+	// zero: a reload counter that appears only after the first failure gives
+	// an alert nothing to compare against.
+	for _, result := range []string{"ok", "error", "unchanged"} {
+		m.BackendReload.WithLabelValues(result)
+	}
 	return m
 }

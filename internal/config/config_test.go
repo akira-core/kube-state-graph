@@ -238,3 +238,55 @@ func TestParse_LabelKeysRejected(t *testing.T) {
 		})
 	}
 }
+
+// --- backend routing configuration ---------------------------------------
+
+func TestParse_BackendsDefaults(t *testing.T) {
+	cfg := Defaults()
+	assert.Empty(t, cfg.BackendsFile, "no routing file by default — the implicit single backend serves")
+	assert.Equal(t, 30*time.Second, cfg.BackendsReloadInterval,
+		"the routing table reloads on the same cadence as the API-key file")
+	require.NoError(t, cfg.Validate())
+}
+
+func TestParse_BackendsFlagOverridesEnv(t *testing.T) {
+	env := map[string]string{
+		"KSG_BACKENDS_FILE":            "/from/env.yaml",
+		"KSG_BACKENDS_RELOAD_INTERVAL": "45s",
+	}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+
+	// Env alone.
+	cfg, err := Parse(nil, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "/from/env.yaml", cfg.BackendsFile)
+	assert.Equal(t, 45*time.Second, cfg.BackendsReloadInterval)
+
+	// Flags win.
+	cfg, err = Parse([]string{"--backends-file=/from/flag.yaml", "--backends-reload-interval=10s"}, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "/from/flag.yaml", cfg.BackendsFile)
+	assert.Equal(t, 10*time.Second, cfg.BackendsReloadInterval)
+}
+
+func TestParse_RejectsInvalidBackendsReloadIntervalEnv(t *testing.T) {
+	_, err := Parse(nil, func(k string) (string, bool) {
+		if k == "KSG_BACKENDS_RELOAD_INTERVAL" {
+			return "45", true // missing unit
+		}
+		return "", false
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "KSG_BACKENDS_RELOAD_INTERVAL")
+}
+
+// Zero stays the documented disable sentinel; a negative value is rejected
+// rather than silently disabling reloads.
+func TestValidate_RejectsNegativeBackendsReloadInterval(t *testing.T) {
+	cfg := Defaults()
+	cfg.BackendsReloadInterval = -time.Second
+	require.Error(t, cfg.Validate())
+
+	cfg.BackendsReloadInterval = 0
+	assert.NoError(t, cfg.Validate())
+}

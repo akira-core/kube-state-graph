@@ -29,6 +29,7 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	istio.io/api v1.29.0-alpha.0.0.20260327042620-ea30db2515c3
 	istio.io/istio v0.0.0-20260410004459-189832a289c1
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
@@ -236,7 +237,6 @@ require (
 	sigs.k8s.io/mcs-api v0.4.0 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
-	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
 tool (

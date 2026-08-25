@@ -323,8 +323,9 @@ paths:
       - docs
   /readyz:
     get:
-      description: Returns 200 only when an `up{}` probe against the configured upstream
-        succeeds within --api-timeout.
+      description: Returns 200 only when an `up{}` probe against every configured
+        upstream backend succeeds within --api-timeout. With no routing table configured
+        there is exactly one implicit backend, so the behaviour is unchanged.
       responses:
         "200":
           content:

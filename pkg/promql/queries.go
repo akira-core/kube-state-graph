@@ -285,6 +285,162 @@ var queryDims = map[Query]dims{
 	QUpProbe:                         dimsNone,
 }
 
+// Family classifies a Query by the upstream metric family it belongs to. It is
+// the routing counterpart of queryDims: queryDims decides which request
+// dimension narrows a query, Family decides which upstream installation is
+// asked to answer it (see the upstream-backend-routing capability).
+//
+// The two are deliberately separate contracts. A deployment may ingest the
+// NetApp Harvest series into a different VictoriaMetrics installation from the
+// kube-state-metrics series without that changing one character of either
+// query string.
+type Family string
+
+const (
+	// FamilyKSM is every kube-state-metrics `kube_*` series — pod, node,
+	// claim, Service, EndpointSlice, owner and controller-annotation.
+	FamilyKSM Family = "ksm"
+	// FamilyKubelet is the kubelet volume-stats pair. Separate from KSM
+	// because it is a different exporter with its own scrape job, which a
+	// deployment may route elsewhere.
+	FamilyKubelet Family = "kubelet"
+	// FamilyHarvest is every NetApp Harvest series. This is the split the
+	// routing capability exists for: ONTAP metrics commonly land in their own
+	// installation.
+	FamilyHarvest Family = "harvest"
+	// FamilyServiceGraph is the three traces_service_graph_* series.
+	FamilyServiceGraph Family = "servicegraph"
+	// FamilyProbe is the up{} store-health probe.
+	FamilyProbe Family = "probe"
+)
+
+// Families lists every declared family in a fixed order. It is the set a
+// routing table validates against and the set it must cover — a family served
+// by no backend is a configuration error, because the queries in it would have
+// nowhere to go.
+var Families = []Family{
+	FamilyKSM,
+	FamilyKubelet,
+	FamilyHarvest,
+	FamilyServiceGraph,
+	FamilyProbe,
+}
+
+// ParseFamily resolves a configured family name. The bool reports whether the
+// name is one of Families; an unknown name is a validation error at the
+// configuration boundary, never a silent no-op.
+func ParseFamily(s string) (Family, bool) {
+	for _, f := range Families {
+		if Family(s) == f {
+			return f, true
+		}
+	}
+	return "", false
+}
+
+// queryFamily is the hardcoded "which series belongs to which upstream family"
+// contract. It is a TABLE, not per-case logic, for the same reason queryDims
+// is: the contract stays greppable in one place and a new Query constant
+// cannot silently default into a family.
+// TestQueryFamily_EveryQueryListed parses this file's Query constants and
+// fails on a missing entry.
+var queryFamily = map[Query]Family{
+	// kube-state-metrics.
+	QPodInfo:                FamilyKSM,
+	QNodeInfo:               FamilyKSM,
+	QNodeAddresses:          FamilyKSM,
+	QNodeLabels:             FamilyKSM,
+	QNodeStatusCondition:    FamilyKSM,
+	QPVCBindings:            FamilyKSM,
+	QPVCInfo:                FamilyKSM,
+	QPVCAnnotations:         FamilyKSM,
+	QServiceInfo:            FamilyKSM,
+	QServiceAnnotations:     FamilyKSM,
+	QEndpointSliceEndpoints: FamilyKSM,
+	QEndpointSliceLabels:    FamilyKSM,
+	QPodOwner:               FamilyKSM,
+	QReplicaSetOwner:        FamilyKSM,
+	QJobOwner:               FamilyKSM,
+	QPodContainerInfo:       FamilyKSM,
+	QDeploymentAnnotations:  FamilyKSM,
+	QStatefulSetAnnotations: FamilyKSM,
+	QDaemonSetAnnotations:   FamilyKSM,
+	QReplicaSetAnnotations:  FamilyKSM,
+	QJobAnnotations:         FamilyKSM,
+	QCronJobAnnotations:     FamilyKSM,
+
+	// kubelet.
+	QKubeletVolumeUsedBytes:     FamilyKubelet,
+	QKubeletVolumeCapacityBytes: FamilyKubelet,
+
+	// NetApp Harvest.
+	QVolumeLabels:          FamilyHarvest,
+	QQoSReadOps:            FamilyHarvest,
+	QQoSWriteOps:           FamilyHarvest,
+	QQoSReadLatency:        FamilyHarvest,
+	QQoSWriteLatency:       FamilyHarvest,
+	QQoSReadData:           FamilyHarvest,
+	QQoSWriteData:          FamilyHarvest,
+	QQoSPolicyFixedMaxIOPS: FamilyHarvest,
+	QQoSPolicyFixedMaxMBps: FamilyHarvest,
+	QAggrStatus:            FamilyHarvest,
+	QAggrSpaceUsed:         FamilyHarvest,
+	QAggrSpaceTotal:        FamilyHarvest,
+	QNetAppNodeStatus:      FamilyHarvest,
+
+	// Service graph.
+	QServiceGraphTotal:               FamilyServiceGraph,
+	QServiceGraphFailedTotal:         FamilyServiceGraph,
+	QServiceGraphServerSecondsBucket: FamilyServiceGraph,
+
+	// Store health.
+	QUpProbe: FamilyProbe,
+}
+
+// FamilyOf returns the family query q belongs to. The bool reports whether q
+// is a known Query; a caller reaching an unknown query has bypassed the
+// constant set, which the completeness test makes impossible for code in this
+// repository.
+func FamilyOf(q Query) (Family, bool) {
+	f, ok := queryFamily[q]
+	return f, ok
+}
+
+// familyAcceptsAZ is derived from queryDims once, at package initialisation:
+// a family is zone-routable iff EVERY query in it accepts the `az` dimension.
+//
+// Deriving it (rather than restating it) is what keeps backend selection and
+// matcher rendering reading the same fact from the same place. The service-
+// graph and probe families accept no request dimension at all, so narrowing
+// them by zone at the routing layer would drop exactly the series the matcher
+// layer deliberately keeps — see the design's D4.
+//
+// A family whose queries disagreed would resolve to false (not zone-routable,
+// so fanned out to every backend serving it), which is the safe direction.
+// TestFamilyAcceptsAZ_HomogeneousWithinFamily fails on such a disagreement.
+var familyAcceptsAZ = buildFamilyAcceptsAZ()
+
+func buildFamilyAcceptsAZ() map[Family]bool {
+	out := make(map[Family]bool, len(Families))
+	seen := make(map[Family]bool, len(Families))
+	for q, f := range queryFamily {
+		az := queryDims[q]&dimAZ != 0
+		if !seen[f] {
+			seen[f] = true
+			out[f] = az
+			continue
+		}
+		out[f] = out[f] && az
+	}
+	return out
+}
+
+// AcceptsAZ reports whether the queries in family f carry the `az` request
+// dimension, and therefore whether backend selection may narrow this family by
+// the requested zones. A family that accepts no dimension is always fanned out
+// to every backend serving it.
+func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
+
 // qosVolumeGranularitySelector keeps the Harvest QoS workload reads at volume
 // granularity. A PromQL empty-string matcher also matches series carrying no
 // such label at all, so the contract stays correct against a Harvest template

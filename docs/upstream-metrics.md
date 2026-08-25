@@ -1,7 +1,14 @@
 # Upstream metrics used to build the graph
 
 This is the operator catalog of every PromQL series `kube-state-graph` reads
-from centralised VictoriaMetrics when it builds a `/v1/graph` response.
+from VictoriaMetrics when it builds a `/v1/graph` response.
+
+The upstream is **one or more** installations. Each series below belongs to one
+query family (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`), and a
+routing table decides which installation answers it — see
+[`upstream-backend-routing.md`](upstream-backend-routing.md). With no routing
+table configured every family is served by the single `--prom-url` endpoint and
+the queries below are issued exactly as written.
 
 The names are the `Query` constants in `pkg/promql/queries.go`. There is **no
 configurable metric-name prefix**: every series is queried at its **bare**

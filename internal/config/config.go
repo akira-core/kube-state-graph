@@ -71,6 +71,20 @@ type Config struct {
 	// and required to differ.
 	AZLabel  string
 	EnvLabel string
+	// BackendsFile is the path to the mounted routing table declaring the
+	// upstream backends queries are dispatched across (--backends-file /
+	// KSG_BACKENDS_FILE). Empty (the default) synthesises a single implicit
+	// backend addressed at PromURL, serving every family with no zones, so a
+	// deployment that configures nothing new behaves exactly as it did before
+	// backend routing existed.
+	//
+	// When set, it takes precedence over PromURL, which is then ignored.
+	BackendsFile string
+	// BackendsReloadInterval is how often the routing table file is re-read.
+	// Zero disables reloading: the table read at startup serves for the
+	// process lifetime. Mirrors APIKeysReloadInterval, the existing
+	// mounted-file hot-reload precedent.
+	BackendsReloadInterval time.Duration
 }
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
@@ -97,6 +111,10 @@ func Defaults() Config {
 		PromPassword:          "",
 		AZLabel:               promql.DefaultAZLabel,
 		EnvLabel:              promql.DefaultEnvLabel,
+		BackendsFile:          "",
+		// Matches APIKeysReloadInterval: the same mounted-file cadence, so an
+		// operator reasons about one reload period, not two.
+		BackendsReloadInterval: 30 * time.Second,
 	}
 }
 
@@ -117,6 +135,8 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.APIKeys, "api-keys", cfg.APIKeys, "Comma-separated list of accepted API keys. Used when --api-keys-file is unset.")
 	fs.DurationVar(&cfg.APIKeysReloadInterval, "api-keys-reload-interval", cfg.APIKeysReloadInterval, "How often to re-read --api-keys-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error.")
+	fs.StringVar(&cfg.BackendsFile, "backends-file", cfg.BackendsFile, "Path to the routing table (YAML or JSON) declaring the upstream backends queries are dispatched across. Unset uses a single implicit backend at --prom-url.")
+	fs.DurationVar(&cfg.BackendsReloadInterval, "backends-reload-interval", cfg.BackendsReloadInterval, "How often to re-read --backends-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
@@ -167,6 +187,10 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	getStr("KSG_API_KEYS_FILE", &cfg.APIKeysFile)
 	getStr("KSG_API_KEYS", &cfg.APIKeys)
 	if err := getDur("KSG_API_KEYS_RELOAD_INTERVAL", &cfg.APIKeysReloadInterval); err != nil {
+		return err
+	}
+	getStr("KSG_BACKENDS_FILE", &cfg.BackendsFile)
+	if err := getDur("KSG_BACKENDS_RELOAD_INTERVAL", &cfg.BackendsReloadInterval); err != nil {
 		return err
 	}
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
@@ -223,6 +247,9 @@ func (c Config) Validate() error {
 	}
 	if c.APIKeysReloadInterval < 0 {
 		return errors.New("api-keys-reload-interval must be >= 0 (0 disables hot reload)")
+	}
+	if c.BackendsReloadInterval < 0 {
+		return errors.New("backends-reload-interval must be >= 0 (0 disables hot reload)")
 	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":

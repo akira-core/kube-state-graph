@@ -30,6 +30,12 @@ var tracer = otel.Tracer("kube-state-graph")
 type Client struct {
 	api     v1.API
 	metrics Metrics
+	base    *http.Transport
+	// backend names the routing-table entry this client serves. Empty in a
+	// single-upstream deployment. It is a span attribute only — the existing
+	// kube_state_graph_upstream_query_* metrics deliberately keep their label
+	// sets, so per-backend detail never lands on them.
+	backend string
 }
 
 // Option configures optional Client behaviour at construction time.
@@ -38,6 +44,7 @@ type Option func(*clientOptions)
 type clientOptions struct {
 	username string
 	password string
+	backend  string
 }
 
 // WithBasicAuth attaches HTTP Basic Auth credentials to outbound upstream
@@ -49,6 +56,14 @@ func WithBasicAuth(username, password string) Option {
 		o.username = username
 		o.password = password
 	}
+}
+
+// WithBackendName labels this client with the routing-table backend it serves,
+// so every upstream query span can be attributed to the installation that
+// answered it. Empty (the default) omits the attribute entirely, which is what
+// a single-upstream deployment emits today.
+func WithBackendName(name string) Option {
+	return func(o *clientOptions) { o.backend = name }
 }
 
 // basicAuthTransport sets an Authorization: Basic header on a clone of each
@@ -110,20 +125,34 @@ func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prometheus client: %w", err)
 	}
-	return &Client{api: v1.NewAPI(c), metrics: metrics}, nil
+	return &Client{api: v1.NewAPI(c), metrics: metrics, base: base, backend: o.backend}, nil
+}
+
+// CloseIdleConnections releases the connection pool this client holds. It is
+// called when a routing-table reload retires the backend this client served:
+// without it every reload would leave a pool behind for an endpoint nothing
+// dispatches to any more.
+func (c *Client) CloseIdleConnections() {
+	if c.base != nil {
+		c.base.CloseIdleConnections()
+	}
 }
 
 // Instant runs an instant PromQL query at ts, recording duration / failure
 // metrics labelled with the supplied query name and emitting a `prometheus.query`
 // span carrying the rendered statement.
 func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) (model.Vector, error) {
+	attrs := []attribute.KeyValue{
+		semconv.DBSystemKey.String("prometheus"),
+		attribute.String("db.statement", query),
+		attribute.String("kube_state_graph.query_name", name),
+	}
+	if c.backend != "" {
+		attrs = append(attrs, attribute.String("kube_state_graph.backend", c.backend))
+	}
 	ctx, span := tracer.Start(ctx, "prometheus.query",
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(
-			semconv.DBSystemKey.String("prometheus"),
-			attribute.String("db.statement", query),
-			attribute.String("kube_state_graph.query_name", name),
-		),
+		trace.WithAttributes(attrs...),
 	)
 	defer span.End()
 

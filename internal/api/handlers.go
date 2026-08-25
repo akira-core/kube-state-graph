@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -206,7 +207,7 @@ func (s *Server) handleLivez(c *gin.Context) {
 // --api-timeout. Probe failure → 503 Service Unavailable (k8s probe convention).
 //
 //	@Summary	Readiness
-//	@Description	Returns 200 only when an `up{}` probe against the configured upstream succeeds within --api-timeout.
+//	@Description	Returns 200 only when an `up{}` probe against every configured upstream backend succeeds within --api-timeout. With no routing table configured there is exactly one implicit backend, so the behaviour is unchanged.
 //	@Tags		health
 //	@Produce	plain
 //	@Success	200	{string}	string	"ok"
@@ -215,16 +216,42 @@ func (s *Server) handleLivez(c *gin.Context) {
 func (s *Server) handleReadyz(c *gin.Context) {
 	probeCtx, cancel := context.WithTimeout(c.Request.Context(), s.cfg.APITimeout)
 	defer cancel()
-	_, err := s.prom.Instant(probeCtx, string(promql.QUpProbe), promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), s.clk.Now().UTC())
+
+	err := s.probeUpstream(probeCtx)
 	if err != nil {
 		// /readyz is unauthenticated; the raw upstream error embeds the internal
 		// VictoriaMetrics URL/host/IP. Return a static message and keep the
 		// detail server-side (the promql client already logs it at Error level).
+		//
+		// A routed deployment appends the BACKEND NAMES that did not answer —
+		// operator-chosen labels from the operator's own routing file, never a
+		// URL, host, or IP. With several upstreams, "upstream probe failed" is
+		// not actionable on its own.
+		message := "upstream probe failed"
+		var probeErr *promql.ProbeError
+		if errors.As(err, &probeErr) && len(probeErr.Failed) > 0 {
+			message += ": " + strings.Join(probeErr.Failed, ", ")
+		}
 		s.logger.WarnContext(c.Request.Context(), "readyz upstream probe failed", "err", err)
-		writeError(c, http.StatusServiceUnavailable, "upstream_unreachable", "upstream probe failed")
+		writeError(c, http.StatusServiceUnavailable, "upstream_unreachable", message)
 		return
 	}
 	c.String(http.StatusOK, "ok")
+}
+
+// probeUpstream asks every configured backend whether it is reachable.
+//
+// A *promql.Router satisfies promql.Prober and probes all of its backends
+// concurrently within the one budget, reporting every one that did not answer.
+// Anything else — a plain *promql.Client, a mock — falls back to the single
+// up{} query this endpoint has always issued.
+func (s *Server) probeUpstream(ctx context.Context) error {
+	if prober, ok := s.prom.(promql.Prober); ok {
+		return prober.ProbeAll(ctx, s.clk.Now().UTC())
+	}
+	_, err := s.prom.Instant(ctx, string(promql.QUpProbe),
+		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), s.clk.Now().UTC())
+	return err
 }
 
 // ----- request parsing ------------------------------------------------------

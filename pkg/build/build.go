@@ -26,6 +26,7 @@ var tracer = otel.Tracer("kube-state-graph")
 // multi-cluster Graph for one bucketed time window.
 type Builder struct {
 	q       promql.Querier
+	src     promql.QuerierSource
 	opts    Options
 	metrics Metrics
 	clk     clock.Clock
@@ -33,16 +34,39 @@ type Builder struct {
 
 // New constructs a Builder. clk may be nil (falls back to clock.System); m may
 // be nil (no-op metrics).
+//
+// When q ALSO satisfies promql.QuerierSource — a *promql.Router does — the
+// builder resolves a per-build Querier from it, so the request's `az`
+// dimension can select which upstream installations answer. This is an
+// OPTIONAL upgrade, deliberately shaped like BuildScopedRouteResolver: a plain
+// Querier (a *promql.Client, a mock) leaves src nil and every query is issued
+// exactly as it was before backend routing existed.
 func New(q promql.Querier, opts Options, m Metrics, clk clock.Clock) *Builder {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	return &Builder{
+	b := &Builder{
 		q:       q,
 		opts:    opts,
 		metrics: m,
 		clk:     clk,
 	}
+	if src, ok := q.(promql.QuerierSource); ok && src != nil {
+		b.src = src
+	}
+	return b
+}
+
+// querierFor resolves the Querier this build dispatches through. The routing
+// snapshot is taken ONCE per build and threaded through every leg — topology,
+// service graph, and the retention probe — so a routing-table reload cannot
+// change which backends a build in flight reaches, and the build cannot end up
+// probing a different set of stores than it read from.
+func (b *Builder) querierFor(sel promql.Selector) promql.Querier {
+	if b.src == nil {
+		return b.q
+	}
+	return b.src.QuerierFor(sel)
 }
 
 // Build runs all upstream queries for [end - window, end] and returns the
@@ -54,6 +78,7 @@ func New(q promql.Querier, opts Options, m Metrics, clk clock.Clock) *Builder {
 // filtered-build rule below stays inert.
 func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
 	filtered := sel.Active()
+	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
@@ -63,7 +88,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, b.q, window, end, b.opts.LabelKeys, sel)
+	topology, err := ReadTopology(ctx, q, window, end, b.opts.LabelKeys, sel)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
@@ -74,7 +99,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// not a client-classifiable retention error — so the classification (and
 	// its up{} probe) is skipped entirely.
 	if !filtered && len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
-		up, probeErr := b.upProbe(ctx)
+		up, probeErr := b.upProbe(ctx, q)
 		if probeErr != nil {
 			// A failed probe must not fail the build (control flow / status
 			// mapping unchanged — that is a spec-level decision), but it must
@@ -134,7 +159,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		slog.DebugContext(ctx, "service-graph read skipped: selector matched no topology",
 			"reason", "filtered_empty_topology")
 	} else {
-		sg, err = ReadServiceGraph(ctx, b.q, window, end, topology,
+		sg, err = ReadServiceGraph(ctx, q, window, end, topology,
 			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
 		if err != nil {
 			return nil, classifyReadError(span, "service-graph read failed", err)
@@ -248,7 +273,12 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	return nodes, edges
 }
 
-func (b *Builder) upProbe(ctx context.Context) (bool, error) {
+// upProbe measures store health through the SAME per-build querier the
+// topology read used. Routing it any other way would let the classification
+// consult a different set of backends than the build read from — and the probe
+// family accepts no request dimension, so it still reaches every backend
+// serving it regardless of the request's zones.
+func (b *Builder) upProbe(ctx context.Context, q promql.Querier) (bool, error) {
 	// Honour the documented contract (Options.APITimeout): zero means inherit
 	// the caller's context deadline. context.WithTimeout(ctx, 0) would otherwise
 	// produce an immediately-expired context, silently failing the probe (and
@@ -258,7 +288,7 @@ func (b *Builder) upProbe(ctx context.Context) (bool, error) {
 		ctx, cancel = context.WithTimeout(ctx, b.opts.APITimeout)
 		defer cancel()
 	}
-	vec, err := b.q.Instant(ctx, string(promql.QUpProbe),
+	vec, err := q.Instant(ctx, string(promql.QUpProbe),
 		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), b.clk.Now().UTC())
 	if err != nil {
 		return false, err

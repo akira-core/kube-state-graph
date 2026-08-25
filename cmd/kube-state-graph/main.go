@@ -83,21 +83,25 @@ func run() error {
 		"otlp_enabled", telemetryProviders.Enabled,
 		// Boolean only — the credential values themselves are never logged.
 		"prom_basic_auth", cfg.PromUsername != "",
+		"backends_file", cfg.BackendsFile,
 		"route_store_auth", cfg.RouteStoreUsername != "",
 	)
 
 	metrics := observability.NewMetrics()
-	// Upstream basic auth is env-only (KSG_PROM_USERNAME / KSG_PROM_PASSWORD);
-	// config.Validate guarantees the pair is set together or not at all. The
-	// startup log above must never carry the credential values.
-	var promOpts []promql.Option
-	if cfg.PromUsername != "" {
-		promOpts = append(promOpts, promql.WithBasicAuth(cfg.PromUsername, cfg.PromPassword))
-	}
-	promClient, err := promql.New(cfg.PromURL, metrics, promOpts...)
+	// Every upstream call is dispatched through the router, including the
+	// single-backend case: with no --backends-file an implicit `default`
+	// backend at --prom-url serves every family, so the compatibility claim is
+	// exercised by the whole existing test suite rather than by a branch.
+	//
+	// Upstream basic auth is env-only (KSG_PROM_USERNAME / KSG_PROM_PASSWORD,
+	// or a backend's own usernameEnv / passwordEnv); config.Validate
+	// guarantees the global pair is set together or not at all. Neither the
+	// startup log nor the routing table's rendered form carries a value.
+	promRouter, err := buildRouter(cfg, metrics, logger, os.LookupEnv)
 	if err != nil {
-		return fmt.Errorf("promql client: %w", err)
+		return fmt.Errorf("upstream backends: %w", err)
 	}
+	startBackendReload(appCtx, promRouter, cfg, logger, metrics, os.LookupEnv)
 
 	keys, err := loadAPIKeys(appCtx, cfg, logger)
 	if err != nil {
@@ -142,13 +146,16 @@ func run() error {
 		)
 	}
 
-	builder := build.New(promClient, build.Options{
+	// promRouter satisfies promql.QuerierSource as well as promql.Querier, so
+	// build.New upgrades it and resolves a per-request querier from the live
+	// routing table.
+	builder := build.New(promRouter, build.Options{
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       routeResolver,
 		RouteResolveTimeout: cfg.RouteResolveTimeout,
 		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
 	}, metrics, nil)
-	server := api.New(cfg, builder, promClient, metrics, logger, keys, nil)
+	server := api.New(cfg, builder, promRouter, metrics, logger, keys, nil)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
