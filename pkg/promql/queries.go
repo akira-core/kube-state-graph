@@ -220,7 +220,10 @@ const (
 //   - dimsHarvest — every NetApp Harvest series. Their `cluster` label is the
 //     ONTAP cluster name, NOT a Kubernetes cluster, so pushing a Kubernetes
 //     cluster value into it would match nothing; they carry no namespace
-//     either. Narrowed by reference through the loaded claims' volumename join.
+//     either; and they take no az/env matcher — the family is zone-ROUTED
+//     (dimAZRoute: the request's az picks the Harvest backend) while the query
+//     string stays unfiltered. Narrowed by reference through the loaded
+//     claims' volumename join.
 //   - dimsNone — the three traces_service_graph_* series (read in full for
 //     every request: their `cluster` label is the unreliable trace-source
 //     cluster and their namespace labels describe only the caller's own view,
@@ -263,7 +266,7 @@ var queryDims = map[Query]dims{
 	QNodeLabels:          dimsClusterScoped,
 	QNodeStatusCondition: dimsClusterScoped,
 
-	// NetApp Harvest — zone/environment only.
+	// NetApp Harvest — zone-routed, no request matcher.
 	QVolumeLabels:          dimsHarvest,
 	QQoSReadOps:            dimsHarvest,
 	QQoSWriteOps:           dimsHarvest,
@@ -407,13 +410,14 @@ func FamilyOf(q Query) (Family, bool) {
 }
 
 // familyAcceptsAZ is derived from queryDims once, at package initialisation:
-// a family is zone-routable iff EVERY query in it accepts the `az` dimension.
+// a family is zone-routable iff EVERY query in it carries dimAZ (az rendered
+// as a matcher AND routed) or dimAZRoute (routed only — the Harvest family).
 //
 // Deriving it (rather than restating it) is what keeps backend selection and
-// matcher rendering reading the same fact from the same place. The service-
-// graph and probe families accept no request dimension at all, so narrowing
-// them by zone at the routing layer would drop exactly the series the matcher
-// layer deliberately keeps — see the design's D4.
+// matcher rendering reading the same table. The service-graph and probe
+// families carry neither bit, so narrowing them by zone at the routing layer
+// would drop exactly the series the matcher layer deliberately keeps — see the
+// design's D4.
 //
 // A family whose queries disagreed would resolve to false (not zone-routable,
 // so fanned out to every backend serving it), which is the safe direction.
@@ -424,7 +428,7 @@ func buildFamilyAcceptsAZ() map[Family]bool {
 	out := make(map[Family]bool, len(Families))
 	seen := make(map[Family]bool, len(Families))
 	for q, f := range queryFamily {
-		az := queryDims[q]&dimAZ != 0
+		az := queryDims[q]&(dimAZ|dimAZRoute) != 0
 		if !seen[f] {
 			seen[f] = true
 			out[f] = az

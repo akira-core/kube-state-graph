@@ -208,13 +208,16 @@ upstream as **raw** label matchers (`az="…"`, `env="…"`, configurable per ke
 - `az` / `env` must likewise be agent-stamped **external** labels. A node label
   exposed through `metricLabelsAllowlist` arrives as `label_topology_kubernetes_io_zone`
   on `kube_node_labels` **only** — it reaches neither the pod/claim/service series
-  nor the kubelet and Harvest families, so it cannot serve as the `--az-label` key.
-- The precondition is per-family: kube-state-metrics, kubelet **and** Harvest must
-  all carry the configured `az` / `env` labels. A family that does not matches
+  nor the kubelet family, so it cannot serve as the `--az-label` key.
+- The precondition is per-family: kube-state-metrics **and** kubelet must both
+  carry the configured `az` / `env` labels. A family that does not matches
   nothing under those filters, and since the default projection keeps only
   connectivity-connected workload, one missing label can empty a filtered graph
   rather than thin it. The build logs `selector_family_empty` (Warn) when KSM
-  matched but kubelet / Harvest returned nothing.
+  matched but kubelet returned nothing. Harvest is **not** in this set: its
+  legs carry no `az` / `env` matcher (`?az=` routes them to a backend instead —
+  see `upstream-backend-routing.md`), so Harvest series need no such label and
+  are never named by that Warn.
 
 ## Pod ArgoCD Application comes from the pod's controller
 

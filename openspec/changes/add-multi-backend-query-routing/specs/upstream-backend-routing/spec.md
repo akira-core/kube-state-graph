@@ -71,10 +71,10 @@ A query with no declared family SHALL be a build-time failure of the repository'
 For a query of family `F` under a request whose `az` dimension carries the value set `A`, the set of backends the query is issued to SHALL be derived as follows:
 
 1. Candidates are the backends whose `families` contains `F`.
-2. If `F` is a family whose queries accept the `az` dimension (`ksm`, `kubelet`, `harvest`), candidates are further restricted to those whose `zones` set is empty (catch-all) **or** intersects `A`. When `A` is empty, no restriction is applied — every candidate is selected.
-3. If `F` is a family whose queries accept **no** request dimension (`servicegraph`, `probe`), the `zones` field SHALL be ignored entirely and every candidate is selected regardless of `A`. Narrowing these families by zone would drop edges the loaded topology still needs.
+2. If `F` is a **zone-routed** family (`ksm`, `kubelet`, `harvest`), candidates are further restricted to those whose `zones` set is empty (catch-all) **or** intersects `A`. When `A` is empty, no restriction is applied — every candidate is selected.
+3. If `F` is not zone-routed (`servicegraph`, `probe`), the `zones` field SHALL be ignored entirely and every candidate is selected regardless of `A`. Narrowing these families by zone would drop edges the loaded topology still needs.
 
-Backend selection SHALL be composed **with**, never instead of, the request-scoped PromQL matchers: an `az` value that selects a backend is still rendered as a label matcher on every query that accepts it.
+Backend selection SHALL be composed **with**, never instead of, the request-scoped PromQL matchers: an `az` value that selects a backend is still rendered as a label matcher on every query that accepts it. The `harvest` family is zone-routed but accepts NO `az` matcher: for it, backend selection is the only effect the `az` dimension has, and the query string issued to the selected backends is the unfiltered one (see the `netapp-storage-graph` capability). Zone-routability is therefore a property of the family, declared alongside the matcher table and pinned by the same exhaustiveness test, not inferred from whether the family renders an `az` matcher.
 
 When step 2 yields an empty candidate set — a requested zone that no backend declares — the query SHALL return an empty result rather than an error, and the build SHALL log a Warn naming the family and the unmatched zone values. An empty result under an active selector is a legitimate empty graph, not a retention miss.
 
@@ -106,7 +106,7 @@ When step 2 yields an empty candidate set — a requested zone that no backend d
 #### Scenario: Harvest routed by zone like kube-state-metrics
 
 - **WHEN** backends `netapp-a` (`families: [harvest]`, `zones: [zone-a]`) and `netapp-b` (`families: [harvest]`, `zones: [zone-b]`) are declared and a request carries `az=zone-b`
-- **THEN** every Harvest query is issued only to `netapp-b`, carrying the `az="zone-b"` matcher
+- **THEN** every Harvest query is issued only to `netapp-b`, as the bare unfiltered query string — no `az` matcher is rendered
 
 #### Scenario: Unmatched zone yields an empty result, not an error
 

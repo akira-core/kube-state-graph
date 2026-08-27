@@ -109,7 +109,8 @@ func TestParseFamily(t *testing.T) {
 // TestFamilyAcceptsAZ pins the zone-routable set. The service-graph and probe
 // families accept no request dimension, so backend selection must never narrow
 // them by zone — narrowing them would drop edges the loaded topology needs
-// (design D4).
+// (design D4). Harvest is zone-routable through the routing-only dimAZRoute
+// bit even though it renders no az matcher.
 func TestFamilyAcceptsAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.AcceptsAZ())
 	assert.True(t, FamilyKubelet.AcceptsAZ())
@@ -120,14 +121,15 @@ func TestFamilyAcceptsAZ(t *testing.T) {
 }
 
 // TestFamilyAcceptsAZ_HomogeneousWithinFamily is the guard the derivation
-// depends on: every query in a family must agree about the `az` dimension.
+// depends on: every query in a family must agree about zone-routability
+// (dimAZ or dimAZRoute).
 // A family whose queries disagreed would resolve to the conservative false,
 // silently widening its fan-out — so the disagreement is caught here instead.
 func TestFamilyAcceptsAZ_HomogeneousWithinFamily(t *testing.T) {
 	seen := map[Family]bool{}
 	first := map[Family]Query{}
 	for q, f := range queryFamily {
-		az := queryDims[q]&dimAZ != 0
+		az := queryDims[q]&(dimAZ|dimAZRoute) != 0
 		if prev, ok := seen[f]; ok {
 			assert.Equal(t, prev, az,
 				"family %q is inhomogeneous: %s and %s disagree about the az dimension",

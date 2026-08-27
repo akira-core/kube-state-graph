@@ -3,6 +3,10 @@
 - [x] 1.1 Add the `Family` type and its five constants (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`) in `pkg/promql/queries.go`, beside `queryDims`, and verify `go build ./...` succeeds
 - [x] 1.2 Add the exhaustive `queryFamily map[Query]Family` table covering every declared `Query` constant, and verify a new `TestQueryFamily_EveryQueryListed` (modelled on `TestQueryDims_EveryQueryListed`, parsing this file's `Query` constants) fails when an entry is removed and passes with the full table
 - [x] 1.3 Add `func (f Family) AcceptsAZ() bool` derived from `queryDims` (true iff the family's queries carry `dimAZ`), and verify a unit test pins `ksm`/`kubelet`/`harvest` true and `servicegraph`/`probe` false
+- [x] 1.4 Add the routing-only `dimAZRoute` bit to `pkg/promql/selector.go` with a comment stating `Selector.render` never emits it, set `dimsHarvest = dimAZRoute`, and verify `Render(QVolumeLabels, …, Selector{AZ: {"zone-a"}, Env: {"prod"}})` returns `last_over_time(volume_labels[<window>])` and every `qos_*` query renders `{lun=""}` only under the same selector (rewrite `TestQueryDims_HarvestNeverCarriesClusterOrNamespace` and the `dimsHarvest` case in `selector_test.go`)
+- [x] 1.5 Change `buildFamilyAcceptsAZ` to read `dimAZ | dimAZRoute`, and verify `TestFamilyAcceptsAZ` still pins `harvest` true and `TestFamilyAcceptsAZ_HomogeneousWithinFamily` compares against the widened predicate
+- [x] 1.6 Verify `Selector.Reaches` returns false for `az` / `env` against every Harvest query (new table-driven case), update the `warnSelectorFamilyEmpty` comment in `pkg/build/topology.go` to say Harvest can no longer be emptied by the request, and verify a `pkg/build` test asserts an active `az` selector with an empty `volume_labels` vector emits no `selector_family_empty` Warn naming it
+- [x] 1.7 Verify `pkg/promql/testdata/render-baseline.txt` is unchanged (the zero selector never rendered a Harvest matcher) and `TestRender_EmptySelectorMatchesBaseline` passes
 
 ## 2. Routing table value type (`pkg/promql`)
 
@@ -70,6 +74,8 @@
 - [x] 10.2 Verify `make test` (`-count=1 -race -shuffle=on`), `make vet`, and `make lint` all pass
 - [x] 10.3 Add an `internal/integration` test starting **two** VictoriaMetrics containers, ingesting kube-state-metrics fixtures into one and Harvest `volume_labels` fixtures into the other, and verify the assembled graph carries `pvc-to-netapp-aggr` edges joining across them
 - [x] 10.4 Add an `internal/integration` test asserting zone routing: two containers holding `zone-a` and `zone-b` series, `?az=zone-a` returning only the `zone-a` pods and an unfiltered request returning both
+- [x] 10.7 Extend the zone-routing integration coverage so the Harvest fixtures ingested into each zone's container carry NO `az` / `env` label, and verify `?az=zone-a` still draws the `pvc-to-netapp-aggr` edge for the zone-a claim while a zone-b `volume_labels` series with the same `volume_name` is not loaded
+- [x] 10.8 Verify by a `pkg/build` routed-fan-out test that the thirteen Harvest legs issued to the selected backend under `?az=` carry byte-identical unfiltered query strings, and that a catch-all `harvest` backend receives the same strings
 - [x] 10.5 Add an `internal/integration` test asserting a duplicate service-graph series present in both containers yields the single-backend `data.metrics.rate`, not twice it
 - [x] 10.6 Verify `make check-route-containment` still passes and that `pkg/` imports no `internal/*` and no YAML parser
 
@@ -79,3 +85,5 @@
 - [x] 11.2 Add a `docs/BREAKING.md` entry recording that this change is **not** breaking, what the implicit single-backend fallback guarantees, and the one operational behaviour change (a single unreachable backend now fails builds)
 - [x] 11.3 Update `CLAUDE.md`'s architecture notes with the routing seam (D1 upgrade interface, D4 zone-routable families, D5 merge rule, D6 fail-closed) and verify no stale "single configurable endpoint" claim remains
 - [x] 11.4 Run `make docs` and verify `make check-docs` reports no drift
+- [x] 11.5 Update `docs/upstream-backend-routing.md` ("Routed by zone?" table — mark `harvest` as routed **without** a matcher; the "Routing composes with the PromQL matchers" paragraph gains the Harvest exception) and `docs/netapp-harvest-preconditions.md` (drop the `az` / `env` stamping requirement; add the cross-zone `volume_name` collision note), and verify the routing example file still parses
+- [x] 11.6 Update `CLAUDE.md` (the "Only `az`-accepting families are zone-routed" bullet under upstream backend routing, and the `queryDims` sentence "NetApp Harvest = az/env only" under the filter-classes bullet) to state that Harvest is zone-routed with no matcher, and verify no remaining sentence claims Harvest carries `az` / `env`

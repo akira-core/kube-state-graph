@@ -79,8 +79,8 @@ func TestGraph_SelectorQueriesCaptured(t *testing.T) {
 		`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",env="prod",cluster="cluster-alpha"}[1h])`,
 		seen["kube_node_status_addresses"], "the fixed selector stays ahead of the request matchers")
 	assert.Equal(t,
-		`last_over_time(qos_read_ops{lun="",az="zone-a",env="prod"}[1h])`,
-		seen["qos_read_ops"], "Harvest takes az/env only")
+		`last_over_time(qos_read_ops{lun=""}[1h])`,
+		seen["qos_read_ops"], "Harvest takes no request matcher — az only routes it, env is inert")
 	assert.Equal(t,
 		`last_over_time(kubelet_volume_stats_used_bytes{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[1h])`,
 		seen["kubelet_volume_stats_used_bytes"])

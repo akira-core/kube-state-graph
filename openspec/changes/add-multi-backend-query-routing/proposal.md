@@ -37,6 +37,15 @@ Secret.
   keeps serving and the failure is logged and counted.
 - **Harvest backends are `az`-routed too**, using the same zone table as the
   kube-state-metrics families; they simply resolve to different backend entries.
+  **Routing is the ONLY effect `az` / `env` have on the Harvest legs**: the
+  thirteen Harvest queries are issued as their bare, unfiltered strings (the
+  `qos_*` families keeping `lun=""`) to the zone-selected backends. A per-zone
+  Harvest store already holds only its zone, so the matcher was redundant there,
+  and dropping it removes the requirement that the Harvest pipeline stamp the
+  configured `az` / `env` labels at all. `env` has no routing dimension and so no
+  longer touches Harvest. A `volume_name` shared across zones or environments
+  resolves by reference through the loaded claims, exactly as an unfiltered build
+  already does.
 - **Per-backend credentials stay out of the ConfigMap.** A backend names the
   environment variables holding its basic-auth pair; the values never appear in
   the routing file. The existing global `KSG_PROM_USERNAME` / `KSG_PROM_PASSWORD`
@@ -77,9 +86,17 @@ Secret.
   interval flags/env), `cmd/kube-state-graph` (construct the table, start the
   reload loop, close retired clients), `internal/api` (multi-backend `/readyz`),
   `internal/observability` (new metrics).
-- **API surface**: none. No new request parameter, no response-body change, no
-  new node or edge type. `?az=` keeps its current meaning and gains a second
-  effect.
+- **API surface**: no new request parameter, no response-body change, no new
+  node or edge type. `?az=` keeps its matcher meaning for kube-state-metrics and
+  kubelet and gains backend selection; for the Harvest legs it becomes
+  backend selection **only** (the `az` matcher is withdrawn from them) and
+  `?env=` stops reaching them. A `?az=` request against a catch-all Harvest
+  backend, or any `?env=` request, therefore joins the loaded claims against the
+  whole Harvest estate rather than one zone's or environment's slice.
+- **Operators**: the Harvest series no longer need the configured `az` / `env`
+  labels; a deployment that stamps them keeps working unchanged. The
+  `kube-state-graph-demo` repository's three-stamper invariant reduces to two
+  (vmagent, collector) — a separate repository, tracked separately.
 - **Configuration**: new `--backends-file` / `KSG_BACKENDS_FILE` and
   `--backends-reload-interval`; `--prom-url` retained as the single-backend
   fallback.

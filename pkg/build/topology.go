@@ -400,13 +400,16 @@ func ReadTopology(
 // a partial one.
 //
 // The signature is narrow on purpose — kube-state-metrics returned rows, so the
-// selector demonstrably matches the deployment's labelling, yet a kubelet or
-// Harvest family came back empty. A family is reported ONLY when a dimension
-// the request actually carries reaches it (promql.Selector.Reaches): the
-// Harvest families take az / env alone, so a `?cluster=` or `?namespace=`
-// request can never be the reason they are empty — reporting them there would
-// fire this Warn on every filtered request of every non-NetApp deployment. It
-// is a Warn, not an error, and stays quiet for every unfiltered build.
+// selector demonstrably matches the deployment's labelling, yet a kubelet
+// family came back empty. A family is reported ONLY when a dimension the
+// request actually carries reaches it (promql.Selector.Reaches). In practice
+// that is the kubelet pair alone: the Harvest families render NO request
+// matcher (az only routes them to a backend, env is inert), so Reaches is
+// false for every dimension and an empty volume_labels can never be the
+// request's doing — reporting it would fire this Warn on every filtered
+// request of every non-NetApp deployment. QVolumeLabels stays in the list so
+// the contract is enforced by the table rather than by omission. It is a
+// Warn, not an error, and stays quiet for every unfiltered build.
 func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
 	if !sel.Active() || raw[string(promql.QPodInfo)] == 0 {
 		return

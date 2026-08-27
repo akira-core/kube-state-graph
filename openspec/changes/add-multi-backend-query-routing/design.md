@@ -102,7 +102,7 @@ Alternative considered: JSON-only via `encoding/json` for a zero-dependency
 parse. Rejected — a JSON-only routing file inside a YAML ConfigMap is a papercut
 operators would hit on day one, and the dependency is already resolved.
 
-### D4 — Zone routing applies only to families whose queries accept `az`
+### D4 — Zone routing is declared per query beside the matcher table; Harvest routes without a matcher
 
 `servicegraph` and `probe` are `dimsNone` in `queryDims`: they take no
 request-scoped matcher at all, because the service-graph `cluster` label is the
@@ -112,10 +112,38 @@ exactly the loss the matcher layer deliberately avoids — a `?az=zone-a` reques
 would drop every edge whose series happens to live in the `zone-b` store, and the
 connectivity prune would then delete the pods on both ends.
 
-So backend selection reads the same fact from the same place: a family is
-zone-routable iff its queries accept `dimAZ`. `zones` on a backend serving only
-non-`az` families is inert, and validation does not object to it — a backend
-commonly serves both kinds.
+The Harvest family is the opposite case: it IS zone-routed, but it renders no
+`az` / `env` matcher. Two reasons. First, the matcher was redundant with the
+routing for the deployment shape this change exists for — a per-zone Harvest
+store already holds only that zone's series, so `{az="zone-a"}` on a query sent
+only to the zone-a store selects everything it would have returned anyway.
+Second, the matcher was the only reason a Harvest series needed the configured
+`az` / `env` labels at all: Harvest carries no Kubernetes `cluster` and no
+`namespace`, and its reader consumes only `cluster` (ONTAP), `node`, `aggr`,
+`svm`, `volume_name` and the QoS/policy keys. Requiring an operator to stamp two
+extra external labels on the Harvest pipeline — and fail silently (an empty
+storage chain) when the stamp drifted from the kube-state-metrics one — bought
+nothing that the store boundary does not already provide.
+
+So the two facts are declared side by side rather than one derived from the
+other. `queryDims` gains a routing-only bit, `dimAZRoute`, that `Selector.render`
+never emits: `dimsHarvest = dimAZRoute`, while the kube-state-metrics and kubelet
+families keep `dimAZ` (matcher AND route) and `servicegraph` / `probe` keep
+`dimsNone`. `Family.AcceptsAZ()` — the routing predicate `Table.Select` reads — is
+derived as "every query in the family carries `dimAZ` OR `dimAZRoute`", and the
+homogeneity test still fails a family whose queries disagree. `Selector.Reaches`
+is unchanged and therefore answers **false** for `az` / `env` against a Harvest
+query, which is exactly right: the `selector_family_empty` Warn must stop naming
+`volume_labels`, because an empty Harvest family can no longer be the request's
+doing.
+
+Consequences the operator must know: `env` has no routing counterpart, so it
+now has NO effect on the Harvest legs; and a catch-all `harvest` backend (no
+`zones`) under `?az=` returns every zone's series, narrowed by reference through
+the loaded claims only. Both are the unfiltered build's existing behaviour, not
+a new mode. `zones` on a backend serving only `servicegraph` / `probe` remains
+inert, and validation does not object to it — a backend commonly serves both
+kinds.
 
 ### D5 — Merge de-duplicates by label-set identity, and the rule is mandatory
 
@@ -261,6 +289,16 @@ than the sum. The failure body names the backends that did not answer, because
   service-graph series into only one installation declares only that backend as
   serving the family, which reduces the multiplier to one without any code
   support.
+- **A Harvest `volume_name` shared across zones or environments can join the
+  wrong aggregate under a catch-all `harvest` backend or an `env` filter.** →
+  Inherent to D4 dropping the Harvest matcher: `pickAggr` resolves the collision
+  to the lexically-smallest `(ontap_cluster, aggr)` and the join-coverage signal
+  does not see it. Bounded in practice because the PV name is the join key and
+  Kubernetes-assigned PV names (`pvc-<uuid>`) do not collide; a deterministic
+  relabel scheme that reuses names across environments is the operator's risk
+  and is called out in `docs/netapp-harvest-preconditions.md`. An unfiltered
+  build has always carried this exposure; per-zone Harvest backends keep the
+  `?az=` case as tight as the matcher did.
 - **The reload goroutine reads a file on every tick for the process lifetime.** →
   Same cost profile as the existing API-key reloader; the swap only happens when
   content differs.

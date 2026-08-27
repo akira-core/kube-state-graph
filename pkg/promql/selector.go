@@ -60,8 +60,9 @@ func (k LabelKeys) OrDefault() LabelKeys {
 // WHICH dimension reaches WHICH series is the hardcoded queryDims contract in
 // queries.go — not a property of this value. Notably the three
 // traces_service_graph_* queries and the up{} probe accept NO dimension at all,
-// and the NetApp Harvest queries accept only AZ / Env (their `cluster` label
-// names an ONTAP cluster, not a Kubernetes one).
+// and neither do the NetApp Harvest queries: their `cluster` label names an
+// ONTAP cluster, not a Kubernetes one, and the `az` dimension reaches them
+// only as backend selection (dimAZRoute), never as a matcher.
 //
 // The zero value is the unfiltered build: every query renders exactly the
 // string it rendered before request-scoped selectors existed.
@@ -102,6 +103,15 @@ const (
 	dimEnv
 	dimCluster
 	dimNamespace
+	// dimAZRoute is a ROUTING-ONLY bit. It makes the query's family
+	// zone-routable (Family.AcceptsAZ, which Table.Select reads) without the
+	// `az` value ever being rendered as a matcher: render never emits it and
+	// Reaches never reads it. It exists for the Harvest family alone — a
+	// per-zone Harvest store already holds only its own zone's series, so the
+	// store boundary IS the zone filter, and a matcher would only force the
+	// operator to stamp the configured az/env labels onto series whose reader
+	// never consumes them.
+	dimAZRoute
 )
 
 const (
@@ -111,9 +121,13 @@ const (
 	// probe (which measures the store, not the data).
 	dimsNone dims = 0
 	// dimsHarvest: NetApp Harvest series carry neither a Kubernetes `cluster`
-	// nor a `namespace` label; they are narrowed by reference instead (an
-	// aggregate materialises only when a loaded claim joins it).
-	dimsHarvest = dimAZ | dimEnv
+	// nor a `namespace` label, and take no `az` / `env` matcher either. The
+	// family is zone-ROUTED (dimAZRoute) — the request's az selects which
+	// Harvest backend is asked — but the query string issued to it is the
+	// unfiltered one, and `env` does not reach Harvest at all. Narrowing is by
+	// reference instead (an aggregate materialises only when a loaded claim
+	// joins it).
+	dimsHarvest = dimAZRoute
 	// dimsClusterScoped: series keyed by cluster but not by namespace
 	// (the kube_node_* family).
 	dimsClusterScoped = dimAZ | dimEnv | dimCluster

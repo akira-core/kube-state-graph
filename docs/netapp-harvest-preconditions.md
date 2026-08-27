@@ -35,6 +35,25 @@ the claim its storage topology.
 4. **Volumes with no QoS workload.** ONTAP does not collect a workload for every
    volume, so hop B can miss where hop A hit. The claim keeps its edge,
    aggregate, controller and `svm` and simply carries no `metrics` key.
+5. **A `volume_name` reused across zones or environments.** The Harvest legs
+   carry no `az` / `env` matcher (see below), so whenever one build reads more
+   than one zone's Harvest series — an unfiltered request, a catch-all
+   `harvest` backend, or any `?env=` request — two filers relabelling different
+   FlexVols to the same PV name both become candidates, and the claim joins the
+   lexically-smallest `(ontap_cluster, aggr)` with no warning. Kubernetes-
+   assigned PV names (`pvc-<uuid>`) do not collide; a deterministic relabel
+   scheme that does is the operator's risk.
+
+## Zone and environment labels are NOT required on Harvest
+
+The `az` / `env` request filters are pushed down as PromQL matchers on the
+kube-state-metrics and kubelet families only. The Harvest family is **routed**
+by zone instead — `?az=` selects which `harvest` backend of the routing table is
+asked (see `upstream-backend-routing.md`) and the query it receives is the
+unfiltered one. Stamping the configured `az` / `env` labels onto Harvest series
+is therefore unnecessary; a deployment that already does so keeps working
+unchanged, since the labels are simply not read. `?env=` has no effect on the
+Harvest legs at all.
 
 Two coverage signals, each gated on its OWN family being present:
 

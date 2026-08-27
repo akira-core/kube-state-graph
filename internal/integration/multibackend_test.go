@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -148,12 +149,18 @@ const (
 // seedFixtures splits one estate across the two containers:
 //
 //   - container A holds the kube-state-metrics side for BOTH zones, plus the
-//     service-graph counter;
+//     service-graph counter, plus a SHADOW volume_labels series for the same PV
+//     name bound to a different aggregate;
 //   - container B holds the NetApp Harvest volume labels, and a byte-identical
 //     copy of the same service-graph counter.
 //
-// That split is what the three tests below need: a storage join spanning two
-// installations, zone routing over the kube-state-metrics family, and a
+// Neither Harvest series carries an `az` or `env` label: the family is routed
+// by zone, never narrowed by matcher, so the store a query is sent to is the
+// only thing deciding which of the two colliding series joins the claim.
+//
+// That split is what the tests below need: a storage join spanning two
+// installations, zone routing over the kube-state-metrics AND Harvest
+// families (observable through which aggregate the claim joins), and a
 // duplicated service-graph series whose rate must not double.
 func (s *MultiBackendSuite) seedFixtures() {
 	s.T().Helper()
@@ -168,6 +175,7 @@ kube_node_info{cluster="mb-alpha",node="mb-worker-0",az="zone-a"} 1 %[1]d
 kube_node_info{cluster="mb-alpha",node="mb-worker-1",az="zone-b"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="mb-alpha",namespace="db",persistentvolumeclaim="mb-data",storageclass="netapp-nas",volumename="pvc-mb-9f3a",az="zone-a"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="mb-alpha",namespace="db",pod="mongo-0",volume="data",persistentvolumeclaim="mb-data",az="zone-a"} 1 %[1]d
+volume_labels{volume_name="pvc-mb-9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -176,13 +184,15 @@ traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb
 	// service-graph counter. Both containers serve the service-graph family,
 	// so the fan-out sees the series twice and must collapse it.
 	s.ingestInto(s.secondURL, fmt.Sprintf(`
-volume_labels{volume_name="pvc-mb-9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb",az="zone-a"} 1 %[1]d
+volume_labels{volume_name="pvc-mb-9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
 
 	s.Require().True(s.WaitForSeries(`kube_persistentvolumeclaim_info{volumename="pvc-mb-9f3a"}`, fixedNow, 30*time.Second),
 		"container A did not observe the claim fixture")
+	s.Require().True(s.WaitForSeries(`volume_labels{volume_name="pvc-mb-9f3a",aggr="aggr-shadow"}`, fixedNow, 30*time.Second),
+		"container A did not observe the shadow volume_labels fixture")
 	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{volume_name="pvc-mb-9f3a"}`, fixedNow, 30*time.Second),
 		"container B did not observe the volume_labels fixture")
 	s.Require().True(s.waitForSeriesAt(s.secondURL, `rate(traces_service_graph_request_total[5m]) > 0`, fixedNow, 30*time.Second),
@@ -281,26 +291,20 @@ func (s *MultiBackendSuite) TestStorageJoinAcrossTwoBackends() {
 // A family served only by container B must never be asked of container A, and
 // vice versa — otherwise the split buys nothing.
 func (s *MultiBackendSuite) TestFamiliesReachOnlyTheirOwnBackend() {
-	// Point the Harvest family at the kube-state-metrics store, which holds no
-	// volume_labels at all: the storage chain must then vanish while the rest
-	// of the graph is untouched.
+	// Point EVERY family at the kube-state-metrics store. It holds the shadow
+	// volume_labels for the same PV name, so the claim must join the shadow
+	// aggregate and never container B's — the destination, not the data,
+	// decides.
 	srv := s.startRoutedAPI([]promql.Backend{
 		promql.NewBackend("k8s", s.VMURL(), promql.Families, nil, "", ""),
 	})
 	body := s.fetchGraph(srv, inventory)
 
-	for _, e := range body.Elements.Edges {
-		s.NotEqual(string(graph.EdgeTypePVCToNetAppAggr), e.Data.Type,
-			"the kube-state-metrics store holds no volume_labels, so no storage edge may appear")
-	}
-	// The claim itself still loads — it is a kube-state-metrics series.
-	var pvc bool
-	for _, n := range body.Elements.Nodes {
-		if n.Data.ID == "mb-alpha/db/mb-data" {
-			pvc = true
-		}
-	}
-	s.True(pvc, "the claim is unaffected by the Harvest family's destination")
+	s.Equal([]string{"netapp/ontap-mb-shadow/aggr/aggr-shadow"}, storageTargets(body),
+		"only the store the Harvest family is routed to may supply the join")
+	ids := nodeIDs(body)
+	s.Contains(ids, "mb-alpha/db/mb-data", "the claim is unaffected by the Harvest family's destination")
+	s.NotContains(ids, "netapp/ontap-mb/aggr/aggr-mb", "container B was never asked")
 }
 
 // Zone routing: with one backend per zone, a `?az=` request reaches only that
@@ -325,6 +329,14 @@ func (s *MultiBackendSuite) TestZoneRoutingSelectsTheBackend() {
 		q.Set("az", "zone-a")
 	})
 	s.True(hasPod(zoneA, "mb-alpha/mb-uid-1"), "the zone-a pod is served by the zone-a store")
+
+	// Harvest is zone-routed WITHOUT a matcher. Neither store's volume_labels
+	// carries an az label, both hold the claim's PV name, and only the zone-a
+	// store's copy may join: routing alone keeps the zone-b series out.
+	s.Equal([]string{"netapp/ontap-mb-shadow/aggr/aggr-shadow"}, storageTargets(zoneA),
+		"the zone-a claim joins the zone-a store's Harvest series, which carries no az label")
+	s.NotContains(nodeIDs(zoneA), "netapp/ontap-mb/aggr/aggr-mb",
+		"the zone-b store's colliding volume_labels is not loaded under ?az=zone-a")
 
 	zoneB := s.fetchGraph(srv, func(q url.Values) {
 		inventory(q)
@@ -381,6 +393,23 @@ func (s *MultiBackendSuite) TestDuplicateServiceGraphSeriesDoesNotDoubleTheRate(
 			*e.Data.Metrics.Rate, mbRate)
 	}
 	s.Equal(1, found, "expected exactly one pod-calls-pod edge")
+}
+
+// storageTargets lists the distinct pvc-to-netapp-aggr edge targets in the
+// serialised graph, sorted.
+func storageTargets(body cytoscape.Body) []string {
+	seen := map[string]bool{}
+	for _, e := range body.Elements.Edges {
+		if e.Data.Type == string(graph.EdgeTypePVCToNetAppAggr) {
+			seen[e.Data.Target] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // hasPod reports whether the serialised graph carries a pod node with id.

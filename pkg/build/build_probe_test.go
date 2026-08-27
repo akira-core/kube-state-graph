@@ -174,8 +174,8 @@ func TestBuild_SelectorReachesTopologyQueriesOnly(t *testing.T) {
 		`last_over_time(kube_node_info{az="zone-a",env="prod",cluster="cluster-alpha"}[5m])`,
 		seen[string(promql.QNodeInfo)], "node series carry no namespace")
 	assert.Equal(t,
-		`last_over_time(volume_labels{az="zone-a",env="prod"}[5m])`,
-		seen[string(promql.QVolumeLabels)], "Harvest carries az/env only")
+		`last_over_time(volume_labels[5m])`,
+		seen[string(promql.QVolumeLabels)], "Harvest carries no request matcher — az only routes it, env is inert")
 	assert.Equal(t,
 		`last_over_time(kubelet_volume_stats_used_bytes{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[5m])`,
 		seen[string(promql.QKubeletVolumeUsedBytes)], "kubelet is namespaced")

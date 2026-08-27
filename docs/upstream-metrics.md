@@ -97,14 +97,18 @@ hardcoded (`pkg/promql/queryDims`):
 |---|---|---|---|---|
 | namespaced KSM (pod / owner / claim / Service / EndpointSlice / ReplicaSet — every `kube_*` series except the `kube_node_*` family) + kubelet volume stats | yes | yes | yes | yes |
 | `kube_node_*` | yes | yes | yes | no (nodes have no namespace; they follow **by reference** from scheduled pods) |
-| NetApp Harvest | yes | yes | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
+| NetApp Harvest | **no** matcher — `?az=` only *routes* the leg to a zone's `harvest` backend | no | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
 | `traces_service_graph_*`, `up` | no | no | no | no |
 
 `az` / `env` match `--az-label` / `--env-label` (defaults `az` / `env`). Every
 topology family that a live dimension actually reaches must carry those labels;
 a family that does not matches nothing, and the default connectivity prune can
 then empty the graph. A `selector_family_empty` warning fires when KSM matched
-but a kubelet / Harvest family that the selector *can* narrow returned nothing.
+but a kubelet family that the selector *can* narrow returned nothing. Harvest
+is never in that set: its thirteen legs carry no request matcher at all, so
+Harvest series need no `az` / `env` label — `?az=` selects which `harvest`
+backend is asked (see `upstream-backend-routing.md`) and `?env=` does not reach
+the family.
 
 The `cluster` value `unknown` is rendered `cluster=~"unknown|"` (literal plus
 the empty alternative) because an absent `cluster` label and a literal
@@ -165,7 +169,9 @@ Helm values are in
 ## NetApp Harvest (13)
 
 All 13 are OPTIONAL (log-and-continue). Harvest `cluster` is the ONTAP cluster
-and is **never** used as a Kubernetes `?cluster=` matcher.
+and is **never** used as a Kubernetes `?cluster=` matcher. The family carries no
+`?az=` / `?env=` matcher either: `?az=` routes the legs to a zone's `harvest`
+backend and the query string stays unfiltered.
 
 The storage join is three independently-degrading hops. Hops A and B are keyed
 by PVC `volumename` (bound PV name) = Harvest `volume_name`; hop C rides on a

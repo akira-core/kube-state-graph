@@ -80,7 +80,7 @@ Every query belongs to exactly one family. The mapping is hardcoded
 |---|---|---|
 | `ksm` | every `kube_*` kube-state-metrics series — pod, node, claim, Service, EndpointSlice, owner, controller-annotation | yes |
 | `kubelet` | `kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes` | yes |
-| `harvest` | every NetApp Harvest series: `volume_labels`, the six `qos_*` families, the two `qos_policy_fixed_max_throughput_*`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status` | yes |
+| `harvest` | every NetApp Harvest series: `volume_labels`, the six `qos_*` families, the two `qos_policy_fixed_max_throughput_*`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status` | yes — **without a matcher** |
 | `servicegraph` | the three `traces_service_graph_*` series | **no** |
 | `probe` | the `up{}` store-health probe | **no** |
 
@@ -89,6 +89,16 @@ are never narrowed by zone: a `?az=`-scoped request still reaches **every**
 backend serving them. Narrowing them would drop edges whose series happen to
 live in another zone's store, and the connectivity prune would then delete the
 pods on both ends.
+
+`harvest` is the opposite special case: it **is** routed by zone, but the query
+string sent to the selected backend is the unfiltered one — no `az` and no
+`env` matcher (the `qos_*` families keep their fixed `lun=""`). A per-zone
+Harvest store already holds only its own zone's series, so the store boundary is
+the zone filter, and the Harvest series therefore need **not** carry the
+configured `az` / `env` labels at all. Two consequences: `?env=` has no effect
+on the Harvest legs, and a catch-all `harvest` backend (no `zones`) under
+`?az=` returns every zone's series, narrowed only by reference through the
+loaded claims — both exactly what an unfiltered build already does.
 
 ## Backend selection
 
@@ -104,7 +114,8 @@ Routing composes **with** the PromQL matchers, never instead of them: an `az`
 value that selects a backend is still rendered as a label matcher on every query
 that accepts it. Routing narrows *which store is asked*; the matcher narrows
 *what that store returns*. `env`, `cluster` and `namespace` play no part in
-backend selection.
+backend selection. The one family that routes without a matcher is `harvest`
+(above): for it, backend selection is the *only* effect `az` has.
 
 A requested zone that no backend declares yields an **empty result, not an
 error** — an empty filtered result is a legitimate empty graph. A `WARN` names

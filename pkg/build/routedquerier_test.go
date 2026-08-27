@@ -338,8 +338,61 @@ func TestRoutedBuild_ZoneMatcherStillRendered(t *testing.T) {
 		"selecting a backend must not replace the pushed-down matcher")
 	assert.Empty(t, fb.queryFor(promql.QPodInfo), "the other zone's store is not asked")
 
-	// The Harvest leg carries az too, and is zone-routed the same way.
-	assert.Contains(t, fa.queryFor(promql.QVolumeLabels), `az="zone-a"`)
+	// The Harvest leg is zone-routed the same way but carries NO matcher: for
+	// that family the selected store is the zone boundary.
+	hv := fa.queryFor(promql.QVolumeLabels)
+	require.NotEmpty(t, hv, "the zone-a store must have been asked for Harvest")
+	assert.Equal(t, `last_over_time(volume_labels[1m])`, hv,
+		"Harvest is routed by zone, never narrowed by matcher")
+	assert.Empty(t, fb.queryFor(promql.QVolumeLabels), "the other zone's Harvest store is not asked")
+}
+
+// harvestQueries is the thirteen-leg Harvest family, listed here so the
+// routing test below cannot silently cover a subset.
+var harvestQueries = []promql.Query{
+	promql.QVolumeLabels,
+	promql.QQoSReadOps, promql.QQoSWriteOps, promql.QQoSReadLatency, promql.QQoSWriteLatency,
+	promql.QQoSReadData, promql.QQoSWriteData,
+	promql.QQoSPolicyFixedMaxIOPS, promql.QQoSPolicyFixedMaxMBps,
+	promql.QAggrStatus, promql.QAggrSpaceUsed, promql.QAggrSpaceTotal, promql.QNetAppNodeStatus,
+}
+
+// Under a zone-scoped request every Harvest leg reaches the zone's backend AND
+// any catch-all backend, and each receives the byte-identical UNFILTERED
+// string — the same one an unscoped build renders. Routing is the only effect
+// `az` has on the family.
+func TestRoutedBuild_HarvestLegsAreUnfilteredOnZoneAndCatchAllBackends(t *testing.T) {
+	zone := newQueryRecordingFake()
+	catchAll := newQueryRecordingFake()
+	tbl, err := promql.NewTable([]promql.Backend{
+		promql.NewBackend("zone-a", "http://vm-a:8428", allFamilies(), []string{"zone-a"}, "", ""),
+		promql.NewBackend("netapp-all", "http://vm-netapp:8428", []promql.Family{promql.FamilyHarvest}, nil, "", ""),
+	})
+	require.NoError(t, err)
+	r, err := promql.NewRouter(tbl, nil, func(b promql.Backend) (promql.Querier, error) {
+		if b.Name() == "zone-a" {
+			return zone, nil
+		}
+		return catchAll, nil
+	})
+	require.NoError(t, err)
+
+	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
+	_, err = ReadTopology(context.Background(), r.QuerierFor(sel),
+		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, sel)
+	require.NoError(t, err)
+
+	require.Len(t, harvestQueries, 13)
+	for _, q := range harvestQueries {
+		want := promql.Render(q, time.Minute, promql.LabelKeys{}, promql.Selector{})
+		assert.Equal(t, want, zone.queryFor(q), "%s on the zone backend must be the unfiltered string", q)
+		assert.Equal(t, want, catchAll.queryFor(q), "%s on the catch-all backend must be the unfiltered string", q)
+		assert.NotContains(t, want, `az=`, "%s must render no az matcher", q)
+		assert.NotContains(t, want, `env=`, "%s must render no env matcher", q)
+	}
+	// The kube-state-metrics leg on the same backend keeps its matcher, which
+	// is what makes this a per-family contract rather than a router quirk.
+	assert.Contains(t, zone.queryFor(promql.QPodInfo), `az="zone-a",env="prod"`)
 }
 
 // Only `az` routes. A namespace-scoped request must reach every backend
