@@ -293,3 +293,40 @@ Every upstream query SHALL be traceable to the backend it was issued to: the cli
 
 - **WHEN** a query is issued to backend `zone-b` with tracing enabled
 - **THEN** the emitted client span carries an attribute identifying `zone-b`
+
+### Requirement: Embeddable routing configuration surface
+
+The routing file's schema, its parse, its credential resolution, and its hot-reload loop SHALL live in an importable package outside `internal/`, so a Go module embedding the graph engine configures routing with the same code the server runs. `internal/` MAY keep wrappers over that package, but SHALL NOT be the only place a routing table can be produced from a file, and SHALL NOT be the only place the reload behaviour is implemented.
+
+The package holding the routing table and the router SHALL itself remain free of file I/O and of any configuration-file parser, so a module that builds its table in code inherits neither.
+
+#### Scenario: An embedder parses the operator's routing file
+
+- **WHEN** an external module calls the exported reader with the path of a routing file
+- **THEN** it receives the identical validated table the server would build from that file, subject to every validation and credential rule of this capability
+- **AND** a file the server would reject is rejected with the same error
+
+#### Scenario: An embedder builds the implicit table without a file
+
+- **WHEN** an external module has a single upstream endpoint and no routing file
+- **THEN** an exported helper produces the single-backend compatibility table — one catch-all backend named `default` serving all five families — without touching the filesystem
+
+#### Scenario: An embedder hot-reloads without re-implementing the loop
+
+- **WHEN** an external module arms the exported reload loop against a path and a positive interval
+- **THEN** the file is re-read on that interval, an unchanged file is not re-parsed, a file that fails to read/parse/validate leaves the previous table serving, and an accepted file is swapped atomically — the behaviour this capability already requires of the server
+
+#### Scenario: The embedder inherits no telemetry it did not ask for
+
+- **WHEN** an external module arms the reload loop supplying neither a logger nor a metrics recorder
+- **THEN** the loop reloads as specified while emitting no log lines and recording no self-metrics
+
+#### Scenario: An embedder wires routing into the graph engine
+
+- **WHEN** an external module constructs the engine facade from a router over a two-backend table
+- **THEN** the build dispatches through the routing table, and the request's `az` values select backends exactly as they do in the server
+
+#### Scenario: Importing the query layer alone pulls in no parser
+
+- **WHEN** a module imports the package holding the routing table and router but not the configuration package
+- **THEN** its build graph gains no configuration-file parser and no file I/O from this capability

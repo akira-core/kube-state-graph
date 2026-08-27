@@ -210,6 +210,77 @@ Every upstream query span (`prometheus.query`) carries
 `kube_state_graph.backend` when routing is configured; the attribute is omitted
 entirely in a single-upstream deployment.
 
+## Embedding the engine
+
+The graph engine is importable (`pkg/kubegraph`, `pkg/build`, `pkg/promql`), and
+routing is configured through the **same code this binary runs** — an external
+module cannot import `internal/`, so nothing here asks you to re-derive the
+schema, the validation, or the credential rules.
+
+```go
+import (
+    "github.com/akira-core/kube-state-graph/pkg/kubegraph"
+    "github.com/akira-core/kube-state-graph/pkg/promql"
+    "github.com/akira-core/kube-state-graph/pkg/promql/backendsfile"
+)
+
+// The operator's file — identical schema, identical errors. A nil lookup reads
+// the process environment for the credential variables the file names.
+table, err := backendsfile.Read("/etc/ksg/backends.yaml", nil)
+if err != nil {
+    return err // an invalid file at startup is fatal: there is no table to fall back to
+}
+
+router, err := promql.NewRouter(table, nil, nil) // nil metrics, default client factory
+if err != nil {
+    return err
+}
+
+engine := kubegraph.NewRouted(router, kubegraph.Options{APITimeout: 30 * time.Second})
+
+// `az` selects the backend per request, exactly as ?az= does over HTTP.
+g, err := engine.Build(ctx, window, end, promql.Selector{AZ: []string{"zone-a"}})
+```
+
+Three ways to obtain the table, all producing the same validated value:
+
+| Source | Call |
+|---|---|
+| The operator's mounted file | `backendsfile.Read(path, lookup)` |
+| Bytes you already hold (a ConfigMap read through your own client) | `backendsfile.Parse(data, lookup)` |
+| A table assembled in code | `promql.NewBackend(…)` + `promql.NewTable(…)` |
+| A single upstream endpoint | `promql.SingleBackendTable(url, user, pass)` |
+
+Hot reload is the same loop the binary arms, so the digest short-circuit, the
+wholesale rejection and the atomic swap behave identically:
+
+```go
+backendsfile.Start(ctx, router, backendsfile.ReloaderOptions{
+    Path:    "/etc/ksg/backends.yaml",
+    Lookup:  nil, // process environment
+    Logger:  nil, // nil = silent
+    Metrics: nil, // nil = records nothing
+}, 30*time.Second)
+```
+
+`Logger` and `Metrics` are optional: leaving them nil means an embedder inherits
+neither kube-state-graph's log format nor its `kube_state_graph_*` series. Pass
+`backendsfile.NewReloader(...)` instead of `Start` when you want to drive
+`Once()` yourself.
+
+Two containment rules hold, and CI enforces the second
+(`make check-parser-containment`):
+
+- `pkg/` imports no `internal/*`, so the engine is importable at all.
+- `pkg/promql` itself reaches **no YAML parser and no file I/O** — the parser
+  lives one package down, in `pkg/promql/backendsfile`. A module that builds its
+  table in code imports `pkg/promql` alone and inherits neither.
+
+Credential **values** never come from the file: a backend names the environment
+variables holding its pair, and the same rules apply here as to the binary — a
+half-declared pair is rejected, and a named-but-unset variable is a load failure
+rather than a quiet fallback.
+
 ## Rollout
 
 1. Ship with no routing file. Verify `kube_state_graph_upstream_backends` is 1.

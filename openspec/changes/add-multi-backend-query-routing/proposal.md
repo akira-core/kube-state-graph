@@ -46,6 +46,14 @@ Secret.
   longer touches Harvest. A `volume_name` shared across zones or environments
   resolves by reference through the loaded claims, exactly as an unfiltered build
   already does.
+- **New: the routing configuration surface is importable.** The file schema, the
+  parser, the credential resolution and the reload loop live in
+  `pkg/promql/backendsfile`; `internal/config` and `cmd/` become callers. A Go
+  module embedding the graph engine gets `backendsfile.Read` / `.Parse`,
+  `backendsfile.Reloader`, `promql.SingleBackendTable` and
+  `kubegraph.NewRouted` — the same code the binary runs, rather than a
+  hand-rolled second copy of a schema whose failure mode is a silently
+  mis-routed family. All additive: no existing exported signature changes.
 - **Per-backend credentials stay out of the ConfigMap.** A backend names the
   environment variables holding its basic-auth pair; the values never appear in
   the routing file. The existing global `KSG_PROM_USERNAME` / `KSG_PROM_PASSWORD`
@@ -64,7 +72,8 @@ Secret.
   its schema and validation, the `Query → Family` classification, `az`-based
   backend selection, fan-out and deterministic merge, partial-failure semantics,
   hot reload with atomic swap and rejected-file fallback, per-backend credential
-  sourcing, and the single-backend compatibility mode.
+  sourcing, the single-backend compatibility mode, and the importable
+  configuration surface an embedding module configures routing through.
 
 ### Modified Capabilities
 - `cluster-topology-source`: "Centralised VictoriaMetrics as the only topology
@@ -80,14 +89,19 @@ Secret.
 
 ## Impact
 
-- **Code**: `pkg/promql` (new routing/family/merge code, `Querier` gains a
-  selector-aware dispatch seam), `pkg/build` (Builder resolves a per-request
-  querier from the routing table), `internal/config` (new file path + reload
-  interval flags/env), `cmd/kube-state-graph` (construct the table, start the
-  reload loop, close retired clients), `internal/api` (multi-backend `/readyz`),
+- **Code**: `pkg/promql` (new routing/family/merge code, the implicit
+  single-backend table, `Querier` gains a selector-aware dispatch seam),
+  `pkg/promql/backendsfile` (**new**: file schema, parse, credential resolution,
+  reload loop), `pkg/build` (Builder resolves a per-request querier from the
+  routing table), `pkg/kubegraph` (routed engine constructor), `internal/config`
+  (new file path + reload interval flags/env; the routing-file functions become
+  delegations), `cmd/kube-state-graph` (construct the table, arm the reload loop,
+  close retired clients), `internal/api` (multi-backend `/readyz`),
   `internal/observability` (new metrics).
 - **API surface**: no new request parameter, no response-body change, no new
-  node or edge type. `?az=` keeps its matcher meaning for kube-state-metrics and
+  node or edge type. The Go surface grows only additively (`backendsfile`,
+  `promql.SingleBackendTable`, `kubegraph.NewRouted`), so `graph-api-gateway`
+  keeps compiling untouched. `?az=` keeps its matcher meaning for kube-state-metrics and
   kubelet and gains backend selection; for the Harvest legs it becomes
   backend selection **only** (the `az` matcher is withdrawn from them) and
   `?env=` stops reaching them. A `?az=` request against a catch-all Harvest
@@ -100,8 +114,11 @@ Secret.
 - **Configuration**: new `--backends-file` / `KSG_BACKENDS_FILE` and
   `--backends-reload-interval`; `--prom-url` retained as the single-backend
   fallback.
-- **Dependencies**: none added — the file is parsed with the standard library and
-  polled on a ticker, deliberately avoiding an fsnotify dependency.
+- **Dependencies**: no module added — the file is parsed with
+  `sigs.k8s.io/yaml`, already a direct dependency, and polled on a ticker,
+  deliberately avoiding an fsnotify dependency. The parser is imported from
+  `pkg/promql/backendsfile` only, so a module importing `pkg/promql` alone gains
+  no parser and no file I/O.
 - **Operational**: an unreachable backend now fails a build that would previously
   have succeeded against a smaller estate; `/readyz` surfaces it. Query fan-out
   multiplies the per-build upstream call count by the number of matched backends.

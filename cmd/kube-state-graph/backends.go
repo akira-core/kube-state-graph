@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"fmt"
 	"log/slog"
-	"os"
-	"runtime/debug"
-	"time"
 
 	"github.com/akira-core/kube-state-graph/internal/config"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
+	"github.com/akira-core/kube-state-graph/pkg/promql/backendsfile"
 )
 
 // buildRouter constructs the upstream router from the configured routing table,
@@ -68,110 +64,18 @@ func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEn
 	return table, nil
 }
 
-// backendReloader re-reads the routing table on a ticker and swaps it into the
-// live router when its content changed.
-//
-// Polling rather than fsnotify: a Kubernetes ConfigMap update replaces the
-// ..data symlink rather than writing the file, so a watch has to be on the
-// directory with a subtle event shape — and fsnotify would be a new direct
-// dependency in a repository where that needs justification. One interval of
-// latency is irrelevant for a topology change.
-type backendReloader struct {
-	router  *promql.Router
-	path    string
-	logger  *slog.Logger
-	metrics promql.RouterMetrics
-	lookup  config.LookupEnvFunc
-
-	// lastDigest is the digest of the file content the live table was built
-	// from, so an unchanged file costs one read and no re-parse.
-	lastDigest [sha256.Size]byte
-}
-
-func newBackendReloader(r *promql.Router, path string, logger *slog.Logger, m promql.RouterMetrics, lookup config.LookupEnvFunc) *backendReloader {
-	rl := &backendReloader{router: r, path: path, logger: logger, metrics: m, lookup: lookup}
-	// Seed the digest from the file the startup table was built from, so the
-	// first tick after boot does not re-parse an unchanged file.
-	if data, err := os.ReadFile(path); err == nil { //nolint:gosec // operator-supplied config path
-		rl.lastDigest = sha256.Sum256(data)
-	}
-	return rl
-}
-
-func (rl *backendReloader) run(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			rl.once()
-		}
-	}
-}
-
-// once performs one reload tick.
-//
-// A file that fails to read, parse, or validate is rejected WHOLESALE: the
-// previously live table keeps serving, the failure is logged and counted, and
-// the next tick retries. Applying the valid subset of a broken file would
-// silently route a family to fewer stores — a partial graph with no error.
-//
-// It runs on a bare goroutine with no recover above it, so a panic here would
-// kill the whole process; recover, log, and let the next tick retry instead.
-func (rl *backendReloader) once() {
-	defer func() {
-		if r := recover(); r != nil {
-			rl.logger.Error("backends reload panicked",
-				"path", rl.path,
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
-			rl.metrics.IncBackendConfigReload(promql.ReloadResultError)
-		}
-	}()
-
-	data, err := os.ReadFile(rl.path) //nolint:gosec // operator-supplied config path
-	if err != nil {
-		rl.logger.Error("backends reload failed", "path", rl.path, "err", err)
-		rl.metrics.IncBackendConfigReload(promql.ReloadResultError)
-		return
-	}
-	digest := sha256.Sum256(data)
-	if digest == rl.lastDigest {
-		rl.metrics.IncBackendConfigReload(promql.ReloadResultUnchanged)
-		return
-	}
-
-	table, err := config.ParseBackendsFile(data, rl.lookup)
-	if err != nil {
-		// The digest is deliberately NOT advanced: the same broken content is
-		// re-reported every interval until it is fixed, rather than failing
-		// once and going quiet.
-		rl.logger.Error("backends reload rejected; keeping the previous routing table",
-			"path", rl.path, "err", err)
-		rl.metrics.IncBackendConfigReload(promql.ReloadResultError)
-		return
-	}
-	if err := rl.router.Swap(table); err != nil {
-		rl.logger.Error("backends reload rejected; keeping the previous routing table",
-			"path", rl.path, "err", err)
-		rl.metrics.IncBackendConfigReload(promql.ReloadResultError)
-		return
-	}
-
-	rl.lastDigest = digest
-	rl.metrics.IncBackendConfigReload(promql.ReloadResultOK)
-	rl.logger.Info("routing table reloaded", "path", rl.path, "backends", table.String())
-}
-
 // startBackendReload arms the reload loop when a routing file and a positive
 // interval are both configured. A zero interval leaves the startup table
 // serving for the process lifetime.
+//
+// The loop itself lives in pkg/promql/backendsfile, so an embedding module arms
+// the identical behaviour instead of re-deriving the digest short-circuit and
+// the keep-the-previous-table rule (design D14).
 func startBackendReload(ctx context.Context, r *promql.Router, cfg config.Config, logger *slog.Logger, m promql.RouterMetrics, lookup config.LookupEnvFunc) {
-	if cfg.BackendsFile == "" || cfg.BackendsReloadInterval <= 0 {
-		return
-	}
-	go newBackendReloader(r, cfg.BackendsFile, logger, m, lookup).run(ctx, cfg.BackendsReloadInterval)
+	backendsfile.Start(ctx, r, backendsfile.ReloaderOptions{
+		Path:    cfg.BackendsFile,
+		Lookup:  backendsfile.LookupEnvFunc(lookup),
+		Logger:  logger,
+		Metrics: m,
+	}, cfg.BackendsReloadInterval)
 }

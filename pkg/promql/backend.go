@@ -283,3 +283,25 @@ func (t *Table) String() string {
 	}
 	return "[" + strings.Join(parts, " ") + "]"
 }
+
+// DefaultBackendName is the name the implicit single-backend table uses. It
+// appears in logs, in the per-backend failure metric, and on query spans.
+const DefaultBackendName = "default"
+
+// SingleBackendTable synthesises the implicit routing table a deployment with
+// no routing file runs on: one backend named "default", addressed at the given
+// endpoint, serving EVERY family, with no zones (a catch-all).
+//
+// It is a table rather than a separate unrouted code path so the compatibility
+// claim is exercised by the whole existing test suite: every current unit,
+// component, golden, and integration test runs through the router in this
+// degenerate configuration.
+//
+// It lives beside the Table it constructs rather than beside the file parser
+// because it needs no parser and no file I/O — it is what an embedder with a
+// single upstream endpoint wants (design D14).
+func SingleBackendTable(promURL, username, password string) (*Table, error) {
+	return NewTable([]Backend{
+		NewBackend(DefaultBackendName, promURL, Families, nil, username, password),
+	})
+}

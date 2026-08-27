@@ -1,4 +1,5 @@
-.PHONY: build test vet lint vuln ci cover docs check-docs check-route-containment clean \
+.PHONY: build test vet lint vuln ci cover docs check-docs check-route-containment \
+        check-parser-containment clean \
         docker-build docker-push docker-buildx docker-run docker-docs docker-docs-stop \
         init init-go init-tools init-hooks doctor mocks verify-mocks tools-versions \
         router-check-tool
@@ -177,6 +178,25 @@ check-route-containment:
 	fi
 	@echo "route-engine containment OK (pkg/kubegraph and pkg/build never reach pkg/route or client-go)"
 
+## The routing-file parser is a pkg/promql SUBPACKAGE, never pkg/promql itself:
+## a module that builds its table in code imports pkg/promql alone and must
+## inherit no YAML parser and no file I/O (design D3). Moving the import up into
+## pkg/promql would break that quietly — nothing fails to compile.
+check-parser-containment:
+	@if go list -deps ./pkg/promql | grep -q '^sigs.k8s.io/yaml'; then \
+	    echo "FAIL: pkg/promql links sigs.k8s.io/yaml — the routing-file parser belongs in pkg/promql/backendsfile"; \
+	    exit 1; \
+	fi
+	@if go list -deps ./pkg/promql | grep -q 'kube-state-graph/pkg/promql/backendsfile'; then \
+	    echo "FAIL: pkg/promql imports pkg/promql/backendsfile — the dependency runs the other way"; \
+	    exit 1; \
+	fi
+	@if go list -deps ./pkg/promql ./pkg/build ./pkg/graph ./pkg/cytoscape | grep -q 'kube-state-graph/internal/'; then \
+	    echo "FAIL: a pkg/ package imports internal/ — an external module could not import the engine"; \
+	    exit 1; \
+	fi
+	@echo "parser containment OK (pkg/promql reaches no YAML parser and no internal/ package)"
+
 ## Extract router_check_tool from the digest-pinned Envoy tools image into
 ## $(ROUTER_CHECK_BIN). The route-engine e2e (internal/integration TestRouteSuite)
 ## needs the native binary and FAILS rather than skips under CI, so this is the
@@ -197,7 +217,7 @@ router-check-tool:
 ## in .github/workflows/ci.yml (lint, vuln, test, docs-drift, mocks-drift), in
 ## order. Invoked by the pre-push hook (see `make init-hooks`). Run directly to
 ## reproduce CI locally before pushing.
-ci: lint vuln test check-docs verify-mocks check-route-containment
+ci: lint vuln test check-docs verify-mocks check-route-containment check-parser-containment
 	@echo "ci: all checks passed (lint + vuln + test + docs + mocks + containment)"
 
 cover:

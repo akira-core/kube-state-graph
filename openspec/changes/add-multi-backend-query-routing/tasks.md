@@ -77,7 +77,7 @@
 - [x] 10.7 Extend the zone-routing integration coverage so the Harvest fixtures ingested into each zone's container carry NO `az` / `env` label, and verify `?az=zone-a` still draws the `pvc-to-netapp-aggr` edge for the zone-a claim while a zone-b `volume_labels` series with the same `volume_name` is not loaded
 - [x] 10.8 Verify by a `pkg/build` routed-fan-out test that the thirteen Harvest legs issued to the selected backend under `?az=` carry byte-identical unfiltered query strings, and that a catch-all `harvest` backend receives the same strings
 - [x] 10.5 Add an `internal/integration` test asserting a duplicate service-graph series present in both containers yields the single-backend `data.metrics.rate`, not twice it
-- [x] 10.6 Verify `make check-route-containment` still passes and that `pkg/` imports no `internal/*` and no YAML parser
+- [x] 10.6 Verify `make check-route-containment` still passes and that `pkg/` imports no `internal/*`, with the YAML parser confined to the `pkg/promql/backendsfile` subpackage (re-verified by 12.7)
 
 ## 11. Documentation
 
@@ -87,3 +87,14 @@
 - [x] 11.4 Run `make docs` and verify `make check-docs` reports no drift
 - [x] 11.5 Update `docs/upstream-backend-routing.md` ("Routed by zone?" table — mark `harvest` as routed **without** a matcher; the "Routing composes with the PromQL matchers" paragraph gains the Harvest exception) and `docs/netapp-harvest-preconditions.md` (drop the `az` / `env` stamping requirement; add the cross-zone `volume_name` collision note), and verify the routing example file still parses
 - [x] 11.6 Update `CLAUDE.md` (the "Only `az`-accepting families are zone-routed" bullet under upstream backend routing, and the `queryDims` sentence "NetApp Harvest = az/env only" under the filter-classes bullet) to state that Harvest is zone-routed with no matcher, and verify no remaining sentence claims Harvest carries `az` / `env`
+
+## 12. Embeddable routing configuration (`pkg/promql/backendsfile`, `pkg/kubegraph`)
+
+- [x] 12.1 Create `pkg/promql/backendsfile` and move the routing-file schema, `ParseBackendsFile`, `ReadBackendsFile`, and `resolveBackendCredentials` there from `internal/config/backends.go` (exported as `Parse` / `Read`, with a package-local `LookupEnvFunc`), and verify the moved unit tests pass unchanged against the new names
+- [x] 12.2 Reduce `internal/config`'s `ReadBackendsFile` / `ParseBackendsFile` to delegations over `backendsfile`, and verify `internal/config`'s existing backend tests pass untouched
+- [x] 12.3 Move `SingleBackendTable` and `DefaultBackendName` into `pkg/promql` beside `Table` (no parser dependency), leave delegations in `internal/config`, and verify the single-backend compatibility tests asserting the implicit `default` backend still pass
+- [x] 12.4 Move `backendReloader` out of `cmd/kube-state-graph/backends.go` into `backendsfile.Reloader` (`NewReloader`, `Run`, `Once`) with an OPTIONAL logger and `promql.RouterMetrics` — nil meaning silent and unrecorded — and verify a unit test asserts a nil-logger nil-metrics reloader neither panics nor emits, while the digest short-circuit, the wholesale rejection, the non-advanced digest, and the atomic swap behave exactly as the `cmd/` tests already pin
+- [x] 12.5 Rewire `cmd/kube-state-graph` onto `backendsfile.Read` and `backendsfile.NewReloader`, and verify the existing `cmd` backend tests pass with no behaviour change
+- [x] 12.6 Add `kubegraph.NewRouted(*promql.Router, Options) *Engine` documenting that it is `New` plus the D1 routing seam, and verify a unit test asserts an engine built over a two-backend router dispatches an `?az=`-scoped build to that zone's backend only
+- [x] 12.7 Add a containment check in the shape of `make check-route-containment` asserting `pkg/promql` imports no YAML parser and no file I/O, and verify it fails when `backendsfile`'s import is moved up into `pkg/promql`
+- [x] 12.8 Document the embedding path — a worked `backendsfile.Read` → `promql.NewRouter` → `kubegraph.NewRouted` example plus the reloader — in `docs/upstream-backend-routing.md` and the routing bullet of `CLAUDE.md`, and verify the example compiles as an example test under `pkg/promql/backendsfile`

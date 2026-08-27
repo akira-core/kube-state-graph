@@ -67,6 +67,23 @@ func New(q promql.Querier, opts Options) *Engine {
 	return &Engine{builder: b, q: q, clk: clk}
 }
 
+// NewRouted constructs an Engine dispatching through a routing table, so a
+// build's `az` values select which upstream installation answers each query
+// family.
+//
+// It is New plus the routing seam made visible in the signature. Passing the
+// router to New works identically — *promql.Router satisfies promql.Querier,
+// and the builder type-asserts the promql.QuerierSource upgrade — but that is a
+// fact an embedder would have to be told in prose; a named constructor states
+// it instead (design D1 / D14).
+//
+// Build the table with promql.SingleBackendTable for a single upstream, with
+// promql.NewTable for one assembled in code, or with backendsfile.Read for the
+// file an operator mounts.
+func NewRouted(r *promql.Router, opts Options) *Engine {
+	return New(r, opts)
+}
+
 // Probe reports upstream reachability via a cheap up{} instant query — the same
 // signal the build's retention check uses — suitable for a readiness check.
 func (e *Engine) Probe(ctx context.Context) error {

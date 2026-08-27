@@ -116,6 +116,9 @@ jobs:
       - name: Verify route-engine containment
         run: make check-route-containment
 
+      - name: Verify routing-file parser containment
+        run: make check-parser-containment
+
   mocks-drift:
     runs-on: ubuntu-latest
     steps:

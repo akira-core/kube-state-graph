@@ -30,6 +30,9 @@ See proposal.md — Why. The relevant current state:
   files included.
 - No exported signature in `pkg/promql`, `pkg/build`, or `pkg/kubegraph` changes,
   so `graph-api-gateway` keeps compiling untouched.
+- An external module embedding the graph engine configures, validates, and
+  hot-reloads the **same** routing file the binary reads, without copying
+  `internal/config`.
 
 **Non-Goals:**
 
@@ -84,23 +87,41 @@ Routing the retention probe through the same bound querier is deliberate: the
 probe-serving backend, and the build cannot end up asking a different set of
 stores than it read from.
 
-### D3 — Parsing lives in `internal/config`; `pkg/promql` receives a validated table
+### D3 — Parsing lives in `pkg/promql/backendsfile`; `pkg/promql` receives a validated table
 
 `pkg/promql` stays free of file I/O and of any parser dependency. It exports an
-immutable, already-validated `Table` value plus its constructor/validator;
-`internal/config` reads the mounted file and produces one. `cmd/` owns the
-ticker, the swap, and the client lifecycle.
+immutable, already-validated `Table` value plus its constructor/validator. The
+routing file's schema, its parse, and its credential resolution live one package
+down in `pkg/promql/backendsfile`, which imports `pkg/promql` and is imported by
+`cmd/` and by any embedder that wants the same file. `internal/config` keeps
+`ReadBackendsFile` / `ParseBackendsFile` as thin delegations, so the binary's
+call sites and their tests are untouched. `cmd/` still owns the process
+lifecycle: the ticker's interval, the router, and the client lifetime.
+
+The parser is a `pkg/` subpackage rather than `internal/config` because the graph
+engine is an importable library (archived design D32): an external module CANNOT
+import `internal/*`, so a parser there forces every embedder to hand-roll the
+same YAML schema, the same validation, and the same credential rules — three
+copies of a contract whose failure mode is a silently mis-routed family. The
+subpackage IS the containment boundary: `pkg/promql` itself still imports no
+parser and touches no file, so an embedder that builds its table in code inherits
+nothing by importing `pkg/promql` alone.
 
 The file is parsed with `sigs.k8s.io/yaml`, which converts YAML to JSON and then
 uses `encoding/json` — so one struct with json tags accepts **both** forms, which
-is what operators writing a ConfigMap actually want. It is already in the module
-graph as an indirect dependency (via `istio.io/istio`), so promoting it to direct
-adds **no new module** to the build. It is imported from `internal/config` only,
-never from `pkg/`, so an embedder inherits nothing.
+is what operators writing a ConfigMap actually want. It is already a direct
+module dependency, so no module is added; it is imported from
+`pkg/promql/backendsfile` only.
 
 Alternative considered: JSON-only via `encoding/json` for a zero-dependency
 parse. Rejected — a JSON-only routing file inside a YAML ConfigMap is a papercut
 operators would hit on day one, and the dependency is already resolved.
+
+Alternative considered: keep the parser internal and export only in-code
+constructors (a `BackendSpec` struct plus `TableFromSpecs`). Rejected — the
+operator-facing artifact IS the file, so an embedder mounting the same ConfigMap
+would still have to parse it; and two ways to spell one routing table is exactly
+the drift D9's implicit table exists to avoid.
 
 ### D4 — Zone routing is declared per query beside the matcher table; Harvest routes without a matcher
 
@@ -198,6 +219,10 @@ A rejected file is rejected wholesale. Applying the valid subset of a broken fil
 would silently route a family to fewer stores — a partial graph with no error,
 which is D6's failure mode arriving through the config path instead.
 
+The loop itself is a reusable value, not `cmd/` glue: it lives beside the parser
+so an embedder arms the identical behaviour instead of re-deriving the digest
+short-circuit and the keep-the-previous-table rule (D14).
+
 ### D8 — Backends name credential variables; the loader resolves and validates them
 
 The routing file is a ConfigMap and must never hold a secret. A backend therefore
@@ -266,6 +291,35 @@ churn every pool.
 `context.WithTimeout`, so readiness latency is that of the slowest backend rather
 than the sum. The failure body names the backends that did not answer, because
 "upstream unreachable" is not actionable when there are six of them.
+
+### D14 — The embedder's routing surface is the code the binary runs, not a parallel one
+
+`cmd/` composes three things on top of the table: build a `*promql.Router`, arm a
+reload ticker, hand the router to the graph engine. An embedder needs all three
+and today can reach only the first, because the other two live in
+`internal/config` and `cmd/`.
+
+- `backendsfile.Read` / `.Parse` produce the table (D3).
+- `backendsfile.Reloader` is the ticker, the digest short-circuit, the wholesale
+  rejection, and the `Swap` — moved out of `cmd/kube-state-graph/backends.go`,
+  which becomes one of its callers. Its logger and its `RouterMetrics` are
+  OPTIONAL: nil means silent and unrecorded, so an embedder inherits neither
+  kube-state-graph's `kube_state_graph_*` series nor its log format. That mirrors
+  the no-op-tolerant `build.Metrics` / `promql.Metrics` the engine already takes.
+- `kubegraph.NewRouted(*promql.Router, Options)` makes routing visible at the
+  facade. `kubegraph.New(router, …)` already works — `*Router` satisfies
+  `Querier`, and `build.New` type-asserts `QuerierSource` (D1) — but "pass the
+  router as the plain querier and the upgrade is detected for you" is a fact an
+  embedder has to be TOLD. A named constructor states it in the signature
+  instead of in prose, and gives the routed path a place to grow (the `Prober`
+  upgrade for readiness is the obvious next one, deferred here).
+
+`promql.SingleBackendTable(url, user, pass)` and `promql.DefaultBackendName` move
+beside the `Table` they construct: the implicit table needs no parser, and an
+embedder with one store wants exactly it. `internal/config` keeps delegations.
+
+Every addition is additive — no existing exported signature changes, so the
+`graph-api-gateway` compatibility claim in Goals still holds.
 
 ## Risks / Trade-offs
 

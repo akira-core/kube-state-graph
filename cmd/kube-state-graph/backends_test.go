@@ -80,28 +80,10 @@ func (r *recordingMetrics) IncBackendConfigReload(x string) {
 	r.reloads = append(r.reloads, x)
 }
 
-func (r *recordingMetrics) count(result string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := 0
-	for _, x := range r.reloads {
-		if x == result {
-			n++
-		}
-	}
-	return n
-}
-
 func (r *recordingMetrics) reloadCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.reloads)
-}
-
-func (r *recordingMetrics) backendNames() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]string(nil), r.backends...)
 }
 
 // --- initial table -------------------------------------------------------
@@ -177,9 +159,14 @@ func TestBuildRouter_ImplicitBackendRoutesEveryFamily(t *testing.T) {
 	}
 }
 
-// --- reload --------------------------------------------------------------
+// --- reload wiring -------------------------------------------------------
 
-func newTestReloader(t *testing.T, path string, m *recordingMetrics) (*promql.Router, *backendReloader) {
+// The reload BEHAVIOUR — digest short-circuit, wholesale rejection, atomic
+// swap — is pinned in pkg/promql/backendsfile, where the loop lives. What is
+// left to prove here is the wiring: which config values arm it, and that the
+// loop stops with its context.
+
+func newTestRouter(t *testing.T, path string, m *recordingMetrics) *promql.Router {
 	t.Helper()
 	tbl, err := config.ReadBackendsFile(path, noEnv)
 	require.NoError(t, err)
@@ -187,7 +174,7 @@ func newTestReloader(t *testing.T, path string, m *recordingMetrics) (*promql.Ro
 		return promqlNoopQuerier{}, nil
 	})
 	require.NoError(t, err)
-	return r, newBackendReloader(r, path, quietLogger(), m, noEnv)
+	return r
 }
 
 // promqlNoopQuerier stands in for an upstream client: the reload tests care
@@ -198,69 +185,23 @@ func (promqlNoopQuerier) Instant(context.Context, string, string, time.Time) (mo
 	return model.Vector{}, nil
 }
 
-func TestReloader_SwapsWhenTheFileChanges(t *testing.T) {
+// The loop is armed by a file plus a positive interval, and a reload it
+// performs reaches the live router.
+func TestStartBackendReload_SwapsThroughTheLiveRouter(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r, rl := newTestReloader(t, path, m)
-	require.Equal(t, 2, r.Table().Len())
+	r := newTestRouter(t, path, m)
 
-	// An unchanged file costs one read and no swap.
-	rl.once()
-	assert.Equal(t, 2, r.Table().Len())
-	assert.Equal(t, 1, m.count(promql.ReloadResultUnchanged))
-	assert.Zero(t, m.count(promql.ReloadResultOK))
+	cfg := config.Defaults()
+	cfg.BackendsFile = path
+	cfg.BackendsReloadInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startBackendReload(ctx, r, cfg, quietLogger(), m, noEnv)
 
 	require.NoError(t, os.WriteFile(path, []byte(threeBackends), 0o600))
-	rl.once()
-	assert.Equal(t, 3, r.Table().Len(), "the new backend serves without a restart")
-	assert.Equal(t, 1, m.count(promql.ReloadResultOK))
-	assert.Equal(t, []string{"netapp", "zone-a", "zone-b"}, m.backendNames())
-}
-
-// A file that fails to parse or validate is rejected WHOLESALE: the previously
-// live table keeps serving and the failure is counted.
-func TestReloader_InvalidFileKeepsTheLiveTable(t *testing.T) {
-	path := writeTable(t, twoBackends)
-	m := &recordingMetrics{}
-	r, rl := newTestReloader(t, path, m)
-
-	for _, bad := range []string{
-		"::: not yaml :::",
-		"backends:\n  - name: broken\n    url: not-a-url\n    families: [ksm]\n",
-		"backends: []",
-	} {
-		require.NoError(t, os.WriteFile(path, []byte(bad), 0o600))
-		rl.once()
-		assert.Equal(t, 2, r.Table().Len(), "the previous table still serves after %q", bad)
-	}
-	assert.Equal(t, 3, m.count(promql.ReloadResultError))
-	assert.Zero(t, m.count(promql.ReloadResultOK))
-}
-
-// The digest is not advanced on a rejected file, so the same broken content is
-// re-reported every interval rather than failing once and going quiet.
-func TestReloader_BrokenFileIsReReportedEveryTick(t *testing.T) {
-	path := writeTable(t, twoBackends)
-	m := &recordingMetrics{}
-	_, rl := newTestReloader(t, path, m)
-
-	require.NoError(t, os.WriteFile(path, []byte("backends: []"), 0o600))
-	rl.once()
-	rl.once()
-	rl.once()
-	assert.Equal(t, 3, m.count(promql.ReloadResultError))
-	assert.Zero(t, m.count(promql.ReloadResultUnchanged), "a rejected file never counts as unchanged")
-}
-
-func TestReloader_UnreadableFileKeepsTheLiveTable(t *testing.T) {
-	path := writeTable(t, twoBackends)
-	m := &recordingMetrics{}
-	r, rl := newTestReloader(t, path, m)
-
-	require.NoError(t, os.Remove(path))
-	rl.once()
-	assert.Equal(t, 2, r.Table().Len())
-	assert.Equal(t, 1, m.count(promql.ReloadResultError))
+	require.Eventually(t, func() bool { return r.Table().Len() == 3 }, time.Second, 5*time.Millisecond)
 }
 
 // A zero interval starts no goroutine: the table read at startup serves for the
@@ -268,7 +209,7 @@ func TestReloader_UnreadableFileKeepsTheLiveTable(t *testing.T) {
 func TestStartBackendReload_DisabledByZeroInterval(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r, _ := newTestReloader(t, path, m)
+	r := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = path
@@ -289,7 +230,7 @@ func TestStartBackendReload_DisabledByZeroInterval(t *testing.T) {
 func TestStartBackendReload_DisabledWithoutAFile(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r, _ := newTestReloader(t, path, m)
+	r := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = ""
@@ -307,7 +248,7 @@ func TestStartBackendReload_DisabledWithoutAFile(t *testing.T) {
 func TestStartBackendReload_StopsWithContext(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r, _ := newTestReloader(t, path, m)
+	r := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = path
