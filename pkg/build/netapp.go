@@ -560,11 +560,11 @@ func usageByAggr(used, total model.Vector) map[aggrKey]*graph.UsageBytes {
 
 // resolvePVCUsage joins kubelet volume-stats onto (cluster, ns, claim).
 // Per-field independent; smallest numeric value on duplicates.
-func resolvePVCUsage(used, capacity model.Vector, mc missingClusterCounts) map[pvcKey]*graph.UsageBytes {
+func resolvePVCUsage(used, capacity model.Vector, mc *clusterResolver) map[pvcKey]*graph.UsageBytes {
 	usedBy := map[pvcKey]float64{}
 	usedSeen := map[pvcKey]bool{}
 	for _, s := range used {
-		cluster := mc.bucket(promql.QKubeletVolumeUsedBytes, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QKubeletVolumeUsedBytes, s.Metric)
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])
 		if claim == "" {
@@ -580,7 +580,7 @@ func resolvePVCUsage(used, capacity model.Vector, mc missingClusterCounts) map[p
 	capBy := map[pvcKey]float64{}
 	capSeen := map[pvcKey]bool{}
 	for _, s := range capacity {
-		cluster := mc.bucket(promql.QKubeletVolumeCapacityBytes, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QKubeletVolumeCapacityBytes, s.Metric)
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])
 		if claim == "" {

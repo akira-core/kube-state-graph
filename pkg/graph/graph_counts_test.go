@@ -62,3 +62,29 @@ func TestEdgeCountByType_CrossClusterBuckets(t *testing.T) {
 	}
 	assert.Equal(t, 3, cross, "one cross-cluster pod edge + one cross-cluster pod-calls-service + one cross-cluster service-selects-pod")
 }
+
+// TestCounts_ClusterIdentitiesAreDistinctClusters: the self-metric gauges key on
+// labels.cluster, which now carries the composed identity, so two clusters
+// sharing a raw name count separately and an edge between them is cross-cluster.
+// Nothing in the counting code changes — the identity arrives on the labels.
+func TestCounts_ClusterIdentitiesAreDistinctClusters(t *testing.T) {
+	us := &PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "us-dev-c1"}}
+	eu := &PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "eu-prod-c1"}}
+	edge := NewEdge(EdgeTypePodCallsPod, us.IDValue, eu.IDValue, map[string]string{"cluster": "us-dev-c1"})
+
+	g := NewGraph([]GraphNode{us, eu}, []*Edge{edge}, time.Now())
+	g.ClusterIdentities = map[string]ClusterIdentity{
+		"us-dev-c1":  {AZ: "us", Env: "dev", Name: "c1"},
+		"eu-prod-c1": {AZ: "eu", Env: "prod", Name: "c1"},
+	}
+
+	assert.Equal(t, []string{"eu-prod-c1", "us-dev-c1"}, g.ClusterNames())
+
+	nodes := g.NodeCountByKind()
+	assert.Equal(t, 1, nodes[[2]string{"us-dev-c1", string(NodeTypePod)}])
+	assert.Equal(t, 1, nodes[[2]string{"eu-prod-c1", string(NodeTypePod)}])
+	assert.Zero(t, nodes[[2]string{"c1", string(NodeTypePod)}], "the raw name is not a metric dimension")
+
+	assert.Equal(t, 1, g.EdgeCountByType()[[2]string{string(EdgeTypePodCallsPod), "true"}],
+		"two identities behind one raw name make the edge cross-cluster")
+}

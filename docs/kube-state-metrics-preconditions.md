@@ -219,6 +219,33 @@ upstream as **raw** label matchers (`az="…"`, `env="…"`, configurable per ke
   see `upstream-backend-routing.md`), so Harvest series need no such label and
   are never named by that Warn.
 
+**The two labels also define cluster IDENTITY**, not just the filters. A
+Kubernetes cluster is `<az>-<env>-<cluster>`, because the raw name is reused
+across zones and environments and keying on it alone merges two estates into
+one id space. The identity is composed from the four families that mint
+cluster-labelled entities — `kube_pod_info`, `kube_node_info`,
+`kube_service_info`, `kube_pod_spec_volumes_persistentvolumeclaims_info` — and
+every other family (kubelet, owner, annotation, and the service-graph trace
+label) resolves against that table:
+
+- carries both labels → composes its own identity;
+- carries neither, and its raw name maps to exactly one identity → adopts it;
+- otherwise → stands as its own cluster under the raw name and joins nothing,
+  logging one aggregated `cluster_identity_unresolved` per metric.
+
+So an estate that stamps the pair on SOME families and not others still joins
+while each raw name is unambiguous, and breaks visibly (an orphan cluster plus
+that Warn) once one name spans two zones. Stamp both labels on every
+kube-state-metrics and kubelet family. A family whose pair DISAGREES with the
+entity families composes a different identity and joins nothing — the three
+stampers must agree exactly, the same rule the filters already require.
+
+Sanity check — one row per cluster, all three labels populated:
+
+```promql
+count by (cluster, az, env) (kube_pod_info)
+```
+
 ## Pod ArgoCD Application comes from the pod's controller
 
 ArgoCD stamps `argocd.argoproj.io/tracking-id` on the resources it **applies** —

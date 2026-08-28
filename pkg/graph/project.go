@@ -122,6 +122,12 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 
 func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string]GraphNode {
 	out := make(map[string]GraphNode, len(g.NodesByID))
+	// The projection-level `cluster` filter compares the RAW upstream cluster
+	// name, not the composed identity a node's labels carry, so that it admits
+	// exactly what the upstream label matcher admitted (?cluster=c1 selects
+	// every zone's c1; ?az=&env=&cluster= pins one). Resolved through the
+	// graph's identity table, which degrades to identity when absent.
+	rawName := g.ClusterRawName
 	// Infra admission is deferred: K8s nodes, NetApp aggregates, and NetApp
 	// controllers carry no namespace (NetApp types also carry no cluster), so
 	// each is retained iff referenced by an in-scope element (or admitted
@@ -149,7 +155,7 @@ func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string
 		default:
 			// pod / pvc / service / external are admitted directly below.
 		}
-		if !nodePassesFilters(n, scope) {
+		if !nodePassesFilters(n, scope, rawName) {
 			continue
 		}
 		out[id] = n
@@ -171,7 +177,7 @@ func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string
 	}
 
 	for _, n := range deferredK8s {
-		if !infraNodePassesFilters(n, scope, hostNodes) {
+		if !infraNodePassesFilters(n, scope, hostNodes, rawName) {
 			continue
 		}
 		out[n.ID()] = n
@@ -229,7 +235,7 @@ func pullNetAppParents(g *Graph, nodes map[string]GraphNode) {
 	}
 }
 
-func nodePassesFilters(n GraphNode, scope Scope) bool {
+func nodePassesFilters(n GraphNode, scope Scope, rawName func(string) string) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
 		if n.Type() == NodeTypeExternal {
@@ -240,7 +246,7 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 			// NetApp types belong to no Kubernetes cluster; they pass the
 			// cluster check and are gated purely by reference (see
 			// netappInfraPassesFilters).
-		} else if _, ok := scope.Clusters[labels["cluster"]]; !ok {
+		} else if _, ok := scope.Clusters[rawName(labels["cluster"])]; !ok {
 			return false
 		}
 	}
@@ -280,10 +286,10 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 //
 // The cluster filter applies first and exactly as for other node types (the
 // node's own labels carry cluster). See design.md D6.
-func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
+func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}, rawName func(string) string) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
-		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
+		if _, ok := scope.Clusters[rawName(labels["cluster"])]; !ok {
 			return false
 		}
 	}

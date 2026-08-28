@@ -226,6 +226,18 @@ caller pod ──pod-calls-service──► ingress LB Service   labels.role=ing
 不用 `?` bind。`--route-store-unique-rows` 可把 `valid_to` 放回 SQL（僅適用
 update-close 寫入端）。`spec_json` 以 `DiscardUnknown` 解析。
 
+**`cluster` 欄位的命名契約**：寫入 cluster 身分字串 `<az>-<env>-<cluster>`，
+與 kube-state-metrics / kubelet 系列上 `az` + `env` + `cluster` 三個 label 合成的
+值一致。原因是 raw cluster 名稱跨 zone/env 重複，圖上的每個 id、`labels.cluster`
+與索引都以身分為鍵。
+
+寫 raw 名稱仍可運作，但只在該名稱於單次 build 內**唯一**時：`pkg/build` 會把
+`RouteDestination.Cluster` 與 ingress cluster 送進身分階梯的 adopt 步驟。名稱在
+該次 build 對應到兩個身分時無法判定，該解析沿既有的
+`route_engine_dest_cluster_lacks_service` 路徑退化成 external —— 不新增 outcome。
+`RouteRequest.CallerCluster` 送出的一律是呼叫端 pod 的身分（供 family key 與
+ingress 候選 tie-break 使用）。
+
 ---
 
 ## 11. 套件邊界

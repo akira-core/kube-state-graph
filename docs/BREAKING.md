@@ -352,3 +352,101 @@ counted every tick until it is fixed.
 already in the module graph (via `istio.io/istio`), so **no new module enters
 the build**; it is imported from `internal/config` only, never from `pkg/`, so
 an embedder inherits nothing.
+
+# BREAKING changes — cluster identity is `<az>-<env>-<cluster>`
+
+A Kubernetes cluster is now identified by the composite `<az>-<env>-<cluster>`,
+composed from the zone and environment external labels the `?az=` / `?env=`
+filters already match on (under the `--az-label` / `--env-label` keys). The raw
+`cluster` label alone was never unique: `c1` in `us`/`dev` and `c1` in
+`eu`/`prod` collapsed into ONE graph cluster — one `c1/worker-0` node, one
+`cluster/c1` compound group, one service index — silently merging two unrelated
+estates.
+
+**A deployment whose series carry no `az`/`env` pair is completely unaffected:
+every id, label, group and `clusters[]` entry is byte-identical to before.**
+
+## What carries the identity now
+
+- Node ids: pods `<az>-<env>-<cluster>/<uid>`, K8s nodes
+  `<az>-<env>-<cluster>/<node>`, PVCs and services
+  `<az>-<env>-<cluster>/<namespace>/<name>`.
+- `labels.cluster` on pod / node / PVC / service nodes, and the pod's
+  `labels.node` reference.
+- The `type="cluster"` compound group (`id` AND `name`) and every group id
+  nested under it (`<identity>/namespace/<ns>`, …).
+- The top-level `clusters[]` array.
+- The `cluster` label VALUE of `kube_state_graph_graph_node_count` and
+  `..._graph_edge_count` (the label SETS are unchanged).
+
+NetApp `netapp-aggr` / `netapp-node` nodes are untouched: their `ontap_cluster`
+is a filer, not a Kubernetes cluster.
+
+## `?cluster=` still takes the RAW name — `clusters[]` no longer round-trips
+
+`?cluster=` is matched upstream against the raw `cluster` label and is compared
+at projection against the identity's raw component, so it keeps its old
+meaning:
+
+- `?cluster=c1` selects **every** zone's and environment's `c1`.
+- `?az=us&env=dev&cluster=c1` pins exactly one — the three request dimensions
+  ARE the identity's three components.
+- `?cluster=unknown` still addresses the missing-label bucket, whose identities
+  spell `<az>-<env>-unknown`.
+
+**Migration:** a client that fed a value from `clusters[]` back into
+`?cluster=` now gets an empty 200. Send the three components instead, or read
+the raw name from a node id prefix's last segment.
+
+## Edge `labels.cluster` is the client pod's identity
+
+A `pod-calls-pod` / `pod-calls-service` edge whose client side resolves to a
+topology pod now carries that pod's identity rather than the verbatim
+service-graph `cluster` label. The label was frequently missing or disagreed
+with topology, so an edge could name a cluster that appeared on no node of the
+response. A synthesised or non-pod client still falls back to the trace label,
+resolved through the ladder below.
+
+## Same name in two zones is now a cross-cluster edge
+
+Cross-cluster status compares the endpoints' `labels.cluster`, so a call
+between `us-dev-c1` and `eu-prod-c1` is cross-cluster where it previously
+looked intra-cluster. The cluster-family rule (digit runs → `0`) now runs over
+the identity, so a family is scoped to one zone and one environment:
+`us-dev-c1` ~ `us-dev-c2`, but `us-dev-c1` ≁ `eu-prod-c1`. Service-mesh
+`service-selects-pod` fan-out narrows accordingly.
+
+Caveat: the rule normalises digit runs anywhere in the string, so a zone value
+containing digits widens the family (`us-east-1-prod-c1` and
+`us-east-2-prod-c1` share a family key).
+
+## Upstream requirement: stamp both labels on every cluster-keyed family
+
+Every cluster name meets one ladder:
+
+1. **compose** — the series carries both labels → `<az>-<env>-<cluster>`;
+2. **adopt** — it does not, but the raw name maps to exactly ONE identity in
+   the build → that identity;
+3. **verbatim** — otherwise the raw name stands as its own cluster and the
+   build logs one aggregated `cluster_identity_unresolved` per metric.
+
+Step 2 keeps a partially-stamped estate whole. Step 3 is the visible failure: a
+kubelet, owner or annotation family with no pair whose raw name is ambiguous
+becomes an orphan cluster and joins nothing. Stamp `az` and `env` on every
+kube-state-metrics and kubelet family — the same precondition the filters
+already required.
+
+## Route store: write the identity in the `cluster` column
+
+`RouteRequest.CallerCluster` is now the caller pod's identity, and a
+destination's `cluster` is resolved through steps 2–3 before the topology
+lookup. A store writing raw names still resolves while a name is unambiguous in
+the build and otherwise degrades through the existing
+`route_engine_dest_cluster_lacks_service` path — no new outcome. The metadata
+exporter should write the identity string.
+
+## In-process embedder (`pkg/`)
+
+No signature moved. `graph.Graph` gains `ClusterIdentities
+map[string]ClusterIdentity` (nil-safe) and `Graph.ClusterRawName(id)`; a graph
+built without the table compares raw labels exactly as before.

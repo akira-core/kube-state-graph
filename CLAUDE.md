@@ -144,8 +144,12 @@ live under `openspec/specs/`.
   `server_seconds_bucket_label_set_mismatch`). Values are JSON numbers rounded
   to 6 significant digits at serialisation and MAY appear in exponent form.
   `pod-calls-pod` and
-  `pod-calls-service` edges carry a single `labels.cluster` (the trace source /
-  client-side cluster, omitted when the client side is non-pod). Cross-cluster
+  `pod-calls-service` edges carry a single `labels.cluster` — the CLIENT POD's
+  cluster identity when the client side resolved to a topology pod, else the
+  trace `cluster` label put through the identity ladder; omitted when the client
+  side is non-pod. (Revises the original D9, which used the raw trace label: that
+  label is not an identity and could name a cluster present on no node of the
+  response.) Cross-cluster
   status is derived by comparing the resolved source-node and target-node
   `labels.cluster` — D9.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
@@ -154,6 +158,42 @@ live under `openspec/specs/`.
 - **Cluster-scoped IDs everywhere.** Pods: `<cluster>/<uid>`, K8s nodes:
   `<cluster>/<node>`, PVCs: `<cluster>/<namespace>/<claim>`, externals:
   `external/<value>`. Node names are not globally unique without the prefix.
+- **`<cluster>` is the composed cluster IDENTITY `<az>-<env>-<cluster>`, not the
+  raw label.** A raw name is reused across zones and environments, so keying on
+  it merges two estates into one id space. `build.clusterResolver`
+  (`pkg/build/clusteridentity.go`) composes the identity at the ONE point a
+  series' `cluster` label is read — `bucket(query, metric)`, ~20 call sites —
+  so ids, `labels.cluster`, every join key and index, `ClusterFamilyKey`,
+  cross-cluster status, `clusters[]` and the self-metric `cluster` VALUES all
+  inherit it with no downstream code taught about zones. `pkg/cytoscape` and
+  `pkg/route` are unchanged. Every cluster name — topology, kubelet, the
+  service-graph trace label, the route store — walks one ladder: **compose**
+  (both configured labels non-empty), else **adopt** (the raw name maps to
+  exactly one identity in this build), else **verbatim** + one aggregated
+  `cluster_identity_unresolved` Warn per metric. The identity table is built by
+  a FIRST PASS in `parseTopology` over the four entity families only
+  (`kube_pod_info`, `kube_node_info`, `kube_service_info`, the PVC binding); a
+  join input can never invent a cluster that holds no entity. `unknown`
+  composes like any other name (`us-dev-unknown`), keeping its raw component so
+  `?cluster=unknown` still addresses it. Adoption cannot rescue a family under
+  `?az=`/`?env=` — the matcher excludes it upstream before the reader sees it.
+- **`?cluster=` is the RAW name at BOTH layers; `clusters[]` is the identity.**
+  The upstream matcher is unchanged (`cluster="c1"`), and `pkg/graph/project.go`
+  compares `Graph.ClusterRawName(labels["cluster"])`, so `?cluster=c1` admits
+  every zone's `c1` and `?az=&env=&cluster=` pins one — the three request
+  dimensions ARE the identity's components. A value read out of `clusters[]`
+  and sent back as `?cluster=` returns an empty 200; that asymmetry is
+  deliberate and documented in `docs/BREAKING.md`. The table reaches the graph
+  as `Graph.ClusterIdentities`, assigned in `Builder.Build` right after
+  `graph.NewGraph`; nil (an unstamped estate, a hand-built graph, an older
+  embedder) degrades every comparison to the pre-identity behaviour, which is
+  what keeps every existing golden byte-identical.
+- **The cluster-family key runs over the identity string**, with the unchanged
+  digit-run rule, so a family is scoped to one zone AND one environment
+  (`us-dev-c1` ~ `us-dev-c2`, ≁ `eu-prod-c1`). Known widening: digits inside a
+  zone or environment value normalise too (`us-east-1-prod-c1` ~
+  `us-east-2-prod-c1`) — pinned by `TestClusterFamilyKey_OverClusterIdentities`
+  so a future struct-aware key is a deliberate edit.
 #### Service-graph glossary (load-bearing terms)
 
 - **Trace-derived edge**: an edge produced from at least one

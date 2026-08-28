@@ -33,11 +33,27 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"missing-uid-fallback": buildMissingUIDFallback(),
 		"link-relation":        buildLinkRelation(),
 		"with-red-metrics":     buildWithREDMetrics(),
+		"cluster-identity":     buildClusterIdentity(),
+	}
+
+	// Scenarios whose clusters were composed from az/env labels also need the
+	// identity table the builder attaches, since the serialiser reads it via
+	// the graph. Every other scenario models an unstamped estate (nil table),
+	// which is what keeps their goldens byte-identical.
+	identities := map[string]map[string]graph.ClusterIdentity{
+		"cluster-identity": {
+			"us-dev-c1":  {AZ: "us", Env: "dev", Name: "c1"},
+			"eu-prod-c1": {AZ: "eu", Env: "prod", Name: "c1"},
+		},
 	}
 
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
-			g := &graph.Graph{BuiltAt: time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC), NodesByID: map[string]graph.GraphNode{}}
+			g := &graph.Graph{
+				BuiltAt:           time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
+				NodesByID:         map[string]graph.GraphNode{},
+				ClusterIdentities: identities[name],
+			}
 			for _, n := range view.Nodes {
 				g.NodesByID[n.ID()] = n
 			}
@@ -309,6 +325,43 @@ func buildWithREDMetrics() graph.View {
 	}
 	return graph.View{
 		Nodes: []graph.GraphNode{client, server, peer, slow, node},
+		Edges: edges,
+	}
+}
+
+// buildClusterIdentity snapshots the cluster-identity wire shape: two clusters
+// composed from ONE raw name (`c1`) in different zone/environment pairs, plus an
+// unstamped cluster that composed nothing. The identity is what every id prefix,
+// `labels.cluster`, compound-group id and `clusters[]` entry carries; the raw
+// name appears nowhere. The cross-identity edge is cross-cluster even though
+// both sides are "c1".
+func buildClusterIdentity() graph.View {
+	usPod := &graph.PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop", "node": "us-dev-c1/worker-0"}}
+	usNode := &graph.K8sNode{IDValue: "us-dev-c1/worker-0", NameValue: "worker-0",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1"}}
+	usPVC := &graph.PVCNode{IDValue: "us-dev-c1/shop/checkout-data", NameValue: "checkout-data",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	usSvc := &graph.ServiceNode{IDValue: "us-dev-c1/shop/payments", NameValue: "payments",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	euPod := &graph.PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments",
+		LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "shop"}}
+	// Unstamped: no az/env pair upstream, so its cluster stayed the raw name.
+	plainPod := &graph.PodNode{IDValue: "cluster-beta/p3", NameValue: "ledger",
+		LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing"}}
+
+	edges := []*graph.Edge{
+		// Intra-identity call.
+		graph.NewEdge(graph.EdgeTypePodCallsService, usPod.IDValue, usSvc.IDValue,
+			map[string]string{"cluster": "us-dev-c1"}),
+		// Same raw name, different identity → cross-cluster.
+		graph.NewEdge(graph.EdgeTypePodCallsPod, usPod.IDValue, euPod.IDValue,
+			map[string]string{"cluster": "us-dev-c1"}),
+		graph.NewEdge(graph.EdgeTypePodToNode, usPod.IDValue, usNode.IDValue, nil),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, usPod.IDValue, usPVC.IDValue, nil),
+	}
+	return graph.View{
+		Nodes: []graph.GraphNode{usPod, usNode, usPVC, usSvc, euPod, plainPod},
 		Edges: edges,
 	}
 }

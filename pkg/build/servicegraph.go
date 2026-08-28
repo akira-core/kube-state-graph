@@ -185,6 +185,7 @@ type sgResolver struct {
 	ipIndex            map[ipKey]serviceKey          // (cluster, ClusterIP) → Service deployed there (resolve-unknown-server-ip-peer)
 	podIPCandidates    map[famIPKey][]podIPCandidate // family → clusters holding a Pod IP, sorted by cluster (resolve-unknown-server-pod-ip-peer)
 	serviceApps        map[serviceKey]string         // (cluster, namespace, service) → ArgoCD Application
+	clusters           *clusterResolver              // identity ladder shared with the topology parse
 	routes             routeIndex                    // prefetched route-engine answers (nil = engine off; non-nil-but-empty = engine on, nothing collected)
 	externals          map[string]*graph.ExternalNode
 	synthPods          map[string]*graph.PodNode
@@ -511,6 +512,7 @@ func newSGResolver(topology Topology, filtered bool) *sgResolver {
 		ipIndex:            ipIndex,
 		podIPCandidates:    podIPCandidates,
 		serviceApps:        topology.ServiceApplications,
+		clusters:           topologyClusterResolver(topology),
 		externals:          map[string]*graph.ExternalNode{},
 		synthPods:          map[string]*graph.PodNode{},
 		services:           map[string]*graph.ServiceNode{},
@@ -553,9 +555,13 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		return ServiceGraphResult{}
 	}
 
-	// Per-metric tally of samples missing the `cluster` label; surfaced as one
-	// aggregated warn at the end of the parse.
-	mc := missingClusterCounts{}
+	// The TOPOLOGY's cluster resolver, so the trace `cluster` label resolves
+	// through the identity table the topology composed (a fresh resolver would
+	// hold an empty table and every trace label would stand verbatim). Its
+	// per-metric tallies — samples missing the label, and names that map to no
+	// single identity — are surfaced as one aggregated warn per metric at the
+	// end of the parse.
+	mc := res.clusters
 
 	res.routes = routes
 
@@ -600,7 +606,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		clientLabel := string(s.Metric["client"])
 		serverLabel := string(s.Metric["server"])
 		// Single `cluster` label = trace source / client-side cluster.
-		traceCluster := mc.bucket(promql.QServiceGraphTotal, string(s.Metric["cluster"]))
+		traceCluster := mc.bucket(promql.QServiceGraphTotal, s.Metric)
 		clientUID := string(s.Metric["client_k8s_pod_uid"])
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientNS := string(s.Metric["client_k8s_namespace_name"])
@@ -686,6 +692,17 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 				}
 			}
 		}
+		// The edge's own labels.cluster (D9, revised by cluster identities):
+		// the client pod's IDENTITY once the UID resolved one, since the trace
+		// label alone is not an identity and would name a cluster that appears
+		// on no node of the response. Falls back to the ladder-resolved trace
+		// label for a synthesised or non-pod client.
+		srcClusterLabel := traceCluster
+		if clientPod != nil {
+			if c := clientPod.Labels()["cluster"]; c != "" {
+				srcClusterLabel = c
+			}
+		}
 		tgtIDs := res.resolveServer(serverLabel, anchorCluster, serverUID, serverNS, ctServer, clientPod, peer)
 		// Index of the RouteHit ingress-chain ENTRY hop within tgtIDs, or -1.
 		// Its edge is trace-derived and pod/service on both ends, but it is a
@@ -731,8 +748,8 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 				// order (D6). srcIsPod is identical for a given srcID, so only
 				// srcCluster needs the tie-break.
 				key := pairKey{src: srcID, tgt: tgtID}
-				if prev, dup := pairs[key]; !dup || betterSrcCluster(traceCluster, prev.srcCluster) {
-					pairs[key] = aggEdge{srcIsPod: srcIsPod, srcCluster: traceCluster}
+				if prev, dup := pairs[key]; !dup || betterSrcCluster(srcClusterLabel, prev.srcCluster) {
+					pairs[key] = aggEdge{srcIsPod: srcIsPod, srcCluster: srcClusterLabel}
 				}
 				// Record RED join keys for every pair this series produced.
 				//
@@ -966,17 +983,32 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 // "v…", …). Among real names (or two "unknown"s) the lexically-smaller wins.
 // Pure and order-free, so the pick stays a deterministic function of the data
 // (D6) regardless of vector arrival order.
+//
+// Both arguments are cluster IDENTITIES, so the unknown-bucket test compares the
+// RAW component: an identity composed from a cluster-less series spells
+// "us-dev-unknown", and it must lose to "us-dev-c1" exactly as the bare bucket
+// lost to a real name. The tie-break itself is now reachable only when the
+// client side did NOT resolve to a topology pod — every duplicate series of one
+// resolved pod contributes that pod's single identity.
 func betterSrcCluster(next, prev string) bool {
 	if next == prev {
 		return false
 	}
-	if prev == promql.ClusterUnknownValue {
+	if isUnknownCluster(prev) {
 		return true
 	}
-	if next == promql.ClusterUnknownValue {
+	if isUnknownCluster(next) {
 		return false
 	}
 	return next < prev
+}
+
+// isUnknownCluster reports whether a cluster identity's RAW component is the
+// missing-label bucket — either the bare bucket name or any identity composed
+// from it (`<az>-<env>-unknown`).
+func isUnknownCluster(identity string) bool {
+	return identity == promql.ClusterUnknownValue ||
+		strings.HasSuffix(identity, "-"+promql.ClusterUnknownValue)
 }
 
 // isConnString reports whether a client/server label is a "://" connection
@@ -1488,8 +1520,12 @@ func (r *sgResolver) routeNodeID(key routeKey, raw string) string {
 		// apply before materialising: the engine-selected cluster must itself
 		// hold the destination service in topology. Every other outcome (the
 		// route_engine_* miss family) degrades to the external ID below.
-		if r.anchorHolds(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service) {
-			return graph.ServiceID(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service)
+		// Same foreign-name resolution routeIndexResolve applies (design D9):
+		// the store's cluster column carries no labels, so an identity passes
+		// through and an unambiguous raw name is adopted.
+		cluster := r.clusters.resolveForeign(entry.dest.Cluster)
+		if r.anchorHolds(cluster, entry.dest.Namespace, entry.dest.Service) {
+			return graph.ServiceID(cluster, entry.dest.Namespace, entry.dest.Service)
 		}
 	}
 	return ext

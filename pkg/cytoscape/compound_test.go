@@ -237,3 +237,33 @@ func TestSerialiseCytoscape_ClusterNodesSortedFirst(t *testing.T) {
 	assert.Equal(t, "cluster/c-alpha", body.Elements.Nodes[0].Data.ID)
 	assert.Equal(t, "cluster/c-beta", body.Elements.Nodes[1].Data.ID)
 }
+
+// TestSerialiseCytoscape_ClusterIdentityGroups is the serialiser's half of the
+// cluster-identity change: it has NO knowledge of zones — the identity arrives
+// already baked into every id and label by pkg/build — so two clusters that
+// share a raw name simply appear as two clusters, group ids and all.
+func TestSerialiseCytoscape_ClusterIdentityGroups(t *testing.T) {
+	a := &graph.PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	b := &graph.PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments",
+		LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "shop"}}
+
+	body := cy(t, []graph.GraphNode{a, b}, nil)
+
+	byID := map[string]NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	require.Contains(t, byID, "cluster/us-dev-c1")
+	require.Contains(t, byID, "cluster/eu-prod-c1")
+	assert.Equal(t, "us-dev-c1", byID["cluster/us-dev-c1"].Name)
+	assert.Equal(t, "eu-prod-c1", byID["cluster/eu-prod-c1"].Name)
+	assert.NotContains(t, byID, "cluster/c1", "the raw name is not a cluster")
+
+	assert.Equal(t, "us-dev-c1/namespace/shop", byID["us-dev-c1/p1"].Parent)
+	assert.Equal(t, "eu-prod-c1/namespace/shop", byID["eu-prod-c1/p2"].Parent)
+	assert.Equal(t, "cluster/us-dev-c1", byID["us-dev-c1/namespace/shop"].Parent)
+
+	assert.Equal(t, []string{"eu-prod-c1", "us-dev-c1"}, body.Clusters)
+}

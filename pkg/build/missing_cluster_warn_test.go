@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/akira-core/kube-state-graph/pkg/internal/testlog"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // captureLogs is the shared slog-capture helper (pkg/internal/testlog).
@@ -24,7 +26,7 @@ func TestParseTopology_WarnsOnMissingClusterLabel(t *testing.T) {
 			Metric: model.Metric{"node": "worker-0"},
 			Value:  1,
 		}),
-	})
+	}, promql.LabelKeys{})
 	out := buf.String()
 	assert.Contains(t, out, "level=WARN")
 	assert.Contains(t, out, "missing cluster label")
@@ -39,7 +41,7 @@ func TestParseTopology_NoWarnWhenClusterPresent(t *testing.T) {
 			Metric: model.Metric{"cluster": "alpha", "namespace": "shop", "pod": "checkout", "uid": "uid-1", "node": "worker-0"},
 			Value:  1,
 		}),
-	})
+	}, promql.LabelKeys{})
 	assert.NotContains(t, buf.String(), "missing cluster label")
 }
 
@@ -56,7 +58,7 @@ func TestParseTopology_AggregatesMissingClusterSamples(t *testing.T) {
 				Value:  1,
 			},
 		),
-	})
+	}, promql.LabelKeys{})
 	out := buf.String()
 	assert.Equal(t, 1, strings.Count(out, "metric=kube_pod_info"),
 		"one aggregated warn line per metric, not one per sample")
@@ -74,7 +76,7 @@ func TestParseServiceGraph_WarnsOnMissingClusterLabel(t *testing.T) {
 		},
 		Value: 1,
 	})
-	parseServiceGraph(vec, parseTopology(topologyVectors{}))
+	parseServiceGraph(vec, parseTopology(topologyVectors{}, promql.LabelKeys{}))
 	out := buf.String()
 	assert.Contains(t, out, "level=WARN")
 	assert.Contains(t, out, "missing cluster label")

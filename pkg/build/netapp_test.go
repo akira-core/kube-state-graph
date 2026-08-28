@@ -449,7 +449,7 @@ func TestResolvePVCUsage_PerFieldAndSmallest(t *testing.T) {
 	capacity := sampleVec(
 		model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data"}, Value: 200},
 	)
-	out := resolvePVCUsage(used, capacity, missingClusterCounts{})
+	out := resolvePVCUsage(used, capacity, newClusterResolver(promql.LabelKeys{}))
 	u := out[pvcKey{"c", "db", "data"}]
 	require.NotNil(t, u)
 	assert.InDelta(t, 90.0, *u.UsedBytes, 1e-12)
@@ -476,7 +476,7 @@ func TestParseTopology_NetAppJoinAndUsage(t *testing.T) {
 		KubeletVolumeUsed: sampleVec(model.Sample{Metric: model.Metric{
 			"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
 		}, Value: 50}),
-	})
+	}, promql.LabelKeys{})
 	require.Len(t, tp.PVCs, 1)
 	assert.Equal(t, "pvc-9f3a", tp.PVCs[0].Labels()["volumename"])
 	assert.Equal(t, "svm-prod", tp.PVCs[0].Labels()["svm"])

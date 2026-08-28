@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // TestParseTopology_PVCBindingDeduped — a pod mounting one claim through two
@@ -29,7 +31,7 @@ func TestParseTopology_PVCBindingDeduped(t *testing.T) {
 	tp := parseTopology(topologyVectors{
 		Pod: podVec,
 		PVC: sampleVec(binding("data"), binding("data-again")),
-	})
+	}, promql.LabelKeys{})
 	require.Len(t, tp.PVCs, 1, "one PVC node per claim")
 	require.Len(t, tp.PodPVCs, 1,
 		"two samples for the same (pod, claim) must collapse to exactly one binding")
@@ -51,7 +53,7 @@ func TestParseTopology_K8sNodeClusterLabelNotClobbered(t *testing.T) {
 		"label_cluster": "staging", // operator label colliding with the contract key
 		"label_app":     "ingress",
 	}})
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: labelVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: labelVec}, promql.LabelKeys{})
 	require.Len(t, tp.Nodes, 1)
 	labels := tp.Nodes[0].Labels()
 	assert.Equal(t, "prod", labels["cluster"],
@@ -86,7 +88,7 @@ func TestParseTopology_K8sNodeDeduped(t *testing.T) {
 		"cluster": "prod", "node": "worker-0", "condition": "Ready", "status": "true",
 	}, Value: 1})
 
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec}, promql.LabelKeys{})
 
 	require.Len(t, tp.Nodes, 2,
 		"duplicate (cluster,node) series must collapse to one node; distinct nodes survive")
@@ -123,7 +125,7 @@ func TestParseTopology_PodIPNotInheritedFromOldUID(t *testing.T) {
 	tp := parseTopology(topologyVectors{Pod: sampleVec(
 		sample("uid-old", "10.244.0.1", 100), // dead predecessor, has an IP
 		sample("uid-new", "", 200),           // canonical UID, no IP yet
-	)})
+	)}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, "c-a/uid-new", tp.Pods[0].ID())
 	assert.Nil(t, tp.Pods[0].IPAddress(),
@@ -134,7 +136,7 @@ func TestParseTopology_PodIPNotInheritedFromOldUID(t *testing.T) {
 	tp2 := parseTopology(topologyVectors{Pod: sampleVec(
 		sample("uid-new", "10.244.0.9", 150),
 		sample("uid-new", "", 200),
-	)})
+	)}, promql.LabelKeys{})
 	require.Len(t, tp2.Pods, 1)
 	assert.Equal(t, []string{"10.244.0.9"}, tp2.Pods[0].IPAddress(),
 		"same-UID fallback to the most recent non-empty pod_ip must survive")
@@ -151,8 +153,8 @@ func TestParseTopology_PVCVolumeLabelDeterministic(t *testing.T) {
 			"volume":                model.LabelValue(volume),
 		}}
 	}
-	fwd := parseTopology(topologyVectors{PVC: sampleVec(binding("vol-b"), binding("vol-a"))})
-	rev := parseTopology(topologyVectors{PVC: sampleVec(binding("vol-a"), binding("vol-b"))})
+	fwd := parseTopology(topologyVectors{PVC: sampleVec(binding("vol-b"), binding("vol-a"))}, promql.LabelKeys{})
+	rev := parseTopology(topologyVectors{PVC: sampleVec(binding("vol-a"), binding("vol-b"))}, promql.LabelKeys{})
 	require.Len(t, fwd.PVCs, 1)
 	require.Len(t, rev.PVCs, 1)
 	assert.Equal(t, "vol-a", fwd.PVCs[0].Labels()["volume"], "lexically-smallest volume wins")
@@ -170,8 +172,8 @@ func TestParseTopology_ExternalIPDeterministic(t *testing.T) {
 		}}
 	}
 	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}})
-	fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("203.0.113.9"), addr("203.0.113.10"))})
-	rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("203.0.113.10"), addr("203.0.113.9"))})
+	fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("203.0.113.9"), addr("203.0.113.10"))}, promql.LabelKeys{})
+	rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("203.0.113.10"), addr("203.0.113.9"))}, promql.LabelKeys{})
 	require.Len(t, fwd.Nodes, 1)
 	require.Len(t, rev.Nodes, 1)
 	assert.Equal(t, []string{"203.0.113.10"}, fwd.Nodes[0].IPAddress(),
@@ -194,7 +196,7 @@ func TestParseTopology_InternalIPFallback(t *testing.T) {
 	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}})
 
 	t.Run("internal-only falls back", func(t *testing.T) {
-		tp := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.7"))})
+		tp := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.7"))}, promql.LabelKeys{})
 		require.Len(t, tp.Nodes, 1)
 		assert.Equal(t, []string{"10.0.0.7"}, tp.Nodes[0].IPAddress())
 		_, hasInternalIP := tp.Nodes[0].Labels()["internal_ip"]
@@ -202,8 +204,8 @@ func TestParseTopology_InternalIPFallback(t *testing.T) {
 	})
 
 	t.Run("external wins order-independently", func(t *testing.T) {
-		fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.7"), addr("ExternalIP", "203.0.113.10"))})
-		rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("ExternalIP", "203.0.113.10"), addr("InternalIP", "10.0.0.7"))})
+		fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.7"), addr("ExternalIP", "203.0.113.10"))}, promql.LabelKeys{})
+		rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("ExternalIP", "203.0.113.10"), addr("InternalIP", "10.0.0.7"))}, promql.LabelKeys{})
 		require.Len(t, fwd.Nodes, 1)
 		require.Len(t, rev.Nodes, 1)
 		assert.Equal(t, []string{"203.0.113.10"}, fwd.Nodes[0].IPAddress())
@@ -211,8 +213,8 @@ func TestParseTopology_InternalIPFallback(t *testing.T) {
 	})
 
 	t.Run("duplicate internal samples pick lexically-smallest", func(t *testing.T) {
-		fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.9"), addr("InternalIP", "10.0.0.10"))})
-		rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.10"), addr("InternalIP", "10.0.0.9"))})
+		fwd := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.9"), addr("InternalIP", "10.0.0.10"))}, promql.LabelKeys{})
+		rev := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("InternalIP", "10.0.0.10"), addr("InternalIP", "10.0.0.9"))}, promql.LabelKeys{})
 		require.Len(t, fwd.Nodes, 1)
 		assert.Equal(t, []string{"10.0.0.10"}, fwd.Nodes[0].IPAddress(),
 			"lexically-smallest address wins") // "10.0.0.10" < "10.0.0.9" lexically
@@ -220,13 +222,13 @@ func TestParseTopology_InternalIPFallback(t *testing.T) {
 	})
 
 	t.Run("non-IP address types ignored", func(t *testing.T) {
-		tp := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("Hostname", "w0.example.internal"))})
+		tp := parseTopology(topologyVectors{Node: nodeVec, Addr: sampleVec(addr("Hostname", "w0.example.internal"))}, promql.LabelKeys{})
 		require.Len(t, tp.Nodes, 1)
 		assert.Nil(t, tp.Nodes[0].IPAddress(), "Hostname rows must never reach ipaddress")
 	})
 
 	t.Run("no address rows omits IP", func(t *testing.T) {
-		tp := parseTopology(topologyVectors{Node: nodeVec})
+		tp := parseTopology(topologyVectors{Node: nodeVec}, promql.LabelKeys{})
 		require.Len(t, tp.Nodes, 1)
 		assert.Nil(t, tp.Nodes[0].IPAddress())
 	})
@@ -243,8 +245,8 @@ func TestParseTopology_NodeLabelMergeDeterministic(t *testing.T) {
 		}}
 	}
 	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}})
-	fwd := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: sampleVec(series("us-east-1a"), series("us-east-1b"))})
-	rev := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: sampleVec(series("us-east-1b"), series("us-east-1a"))})
+	fwd := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: sampleVec(series("us-east-1a"), series("us-east-1b"))}, promql.LabelKeys{})
+	rev := parseTopology(topologyVectors{Node: nodeVec, NodeLabels: sampleVec(series("us-east-1b"), series("us-east-1a"))}, promql.LabelKeys{})
 	require.Len(t, fwd.Nodes, 1)
 	require.Len(t, rev.Nodes, 1)
 	assert.Equal(t, "us-east-1a", fwd.Nodes[0].Labels()["topology.kubernetes.io/zone"],

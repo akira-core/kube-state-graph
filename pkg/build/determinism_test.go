@@ -6,6 +6,8 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // TestParseTopology_DuplicateUIDAcrossClusters_DeterministicWinner guards N2:
@@ -35,7 +37,7 @@ func TestParseTopology_DuplicateUIDAcrossClusters_DeterministicWinner(t *testing
 	// exercises both insertion orders within a handful of runs.
 	const runs = 64
 	for i := range runs {
-		tp := parseTopology(topologyVectors{Pod: vec})
+		tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 		require.Len(t, tp.Pods, 2, "both colliding pods remain as distinct nodes")
 		winner := tp.PodsByUID["shared-uid"]
 		require.NotNil(t, winner)
@@ -68,7 +70,7 @@ func TestParseTopology_EqualTimestampUIDChurn_DeterministicCanonical(t *testing.
 		{pod("uid-a"), pod("uid-b")},
 		{pod("uid-b"), pod("uid-a")},
 	} {
-		tp := parseTopology(topologyVectors{Pod: sampleVec(order...)})
+		tp := parseTopology(topologyVectors{Pod: sampleVec(order...)}, promql.LabelKeys{})
 		require.Len(t, tp.Pods, 1, "UID churn collapses to one canonical pod")
 		assert.Equal(t, "cluster-alpha/uid-b", tp.Pods[0].ID(),
 			"equal-timestamp tie-break must pick the lexically-larger UID regardless of arrival order")
@@ -102,4 +104,65 @@ func TestParseServiceGraph_SynthPodNamespace_DeterministicOnConflict(t *testing.
 		assert.Equal(t, "apps", res.SynthPods[0].Labels()["namespace"],
 			"conflicting-namespace synth pod must keep the lexically-smaller namespace regardless of arrival order")
 	}
+}
+
+// TestParseTopology_UnstampedIsByteIdentical is the in-package half of the
+// compatibility claim: an estate that stamps no az/env pair must parse to the
+// SAME Topology it did before cluster identities existed. The identity ladder
+// composes nothing, adopts nothing (the table is empty), and every name stands
+// verbatim — so ids, labels, join keys and the observed-cluster list are the
+// raw-name shapes, and no identity table reaches the graph.
+func TestParseTopology_UnstampedIsByteIdentical(t *testing.T) {
+	buf := captureLogs(t)
+
+	v := topologyVectors{
+		Pod: sampleVec(
+			sample(map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "uid-1", "node": "worker-0"}),
+			sample(map[string]string{"cluster": "cluster-beta", "namespace": "billing", "pod": "payments", "uid": "uid-2", "node": "worker-1"}),
+		),
+		Node: sampleVec(
+			sample(map[string]string{"cluster": "cluster-alpha", "node": "worker-0"}),
+			sample(map[string]string{"cluster": "cluster-beta", "node": "worker-1"}),
+		),
+		Service: sampleVec(sample(map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "service": "checkout", "cluster_ip": "10.0.0.1"})),
+		PVC: sampleVec(sample(map[string]string{
+			"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "volume": "data", "claim_name": "checkout-data",
+		})),
+		PodOwner: sampleVec(sample(map[string]string{
+			"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout",
+			"owner_kind": "Deployment", "owner_name": "checkout", "owner_is_controller": "true",
+		})),
+		KubeletVolumeUsed: sampleVec(sample(map[string]string{
+			"cluster": "cluster-alpha", "namespace": "shop", "persistentvolumeclaim": "checkout-data",
+		})),
+	}
+
+	tp := parseTopology(v, promql.LabelKeys{})
+
+	assert.Nil(t, tp.ClusterIdentities, "an unstamped estate composes no identity table")
+	assert.Equal(t, []string{"cluster-alpha", "cluster-beta"}, tp.ClustersObserved)
+
+	ids := map[string]bool{}
+	for _, p := range tp.Pods {
+		ids[p.ID()] = true
+		assert.NotContains(t, p.Labels()["cluster"], "-unknown")
+	}
+	assert.True(t, ids["cluster-alpha/uid-1"])
+	assert.True(t, ids["cluster-beta/uid-2"])
+
+	require.Len(t, tp.Nodes, 2)
+	require.Len(t, tp.PVCs, 1)
+	assert.Equal(t, "cluster-alpha/shop/checkout-data", tp.PVCs[0].ID())
+	assert.NotNil(t, tp.PVCs[0].Usage(), "the kubelet join is unaffected")
+	assert.Contains(t, tp.ServicesByNameNS, serviceKey{"cluster-alpha", "shop", "checkout"})
+
+	// Every join input resolved against the raw name, so the owner is attached
+	// and nothing was reported as unplaceable.
+	for _, p := range tp.Pods {
+		if p.ID() == "cluster-alpha/uid-1" {
+			require.NotNil(t, p.Owner())
+			assert.Equal(t, "Deployment", p.Owner().Kind)
+		}
+	}
+	assert.NotContains(t, buf.String(), "cluster_identity_unresolved")
 }

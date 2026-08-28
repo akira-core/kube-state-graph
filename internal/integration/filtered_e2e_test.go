@@ -130,10 +130,10 @@ func (s *FilterSuite) TestAZFilterNarrowsEstate() {
 	body := s.fetch(srv.URL, func(q url.Values) { q.Set("az", "zone-a") })
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "cluster-alpha/alpha-1", "zone-a caller present")
-	s.Contains(ids, "cluster-alpha/alpha-2", "zone-a callee present")
-	s.NotContains(ids, "cluster-beta/beta-1", "zone-b pod is not loaded")
-	s.Equal([]string{"cluster-alpha"}, body.Clusters)
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-1", "zone-a caller present")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-2", "zone-a callee present")
+	s.NotContains(ids, "zone-b-prod-cluster-beta/beta-1", "zone-b pod is not loaded")
+	s.Equal([]string{"zone-a-prod-cluster-alpha"}, body.Clusters)
 
 	ext, ok := ids["external/payments"]
 	s.Require().True(ok, "the out-of-zone peer renders as an external node")
@@ -159,12 +159,12 @@ func (s *FilterSuite) TestNamespacePushDownNarrowsTopology() {
 	body := s.fetch(srv.URL, func(q url.Values) { q.Set("namespace", "shop") })
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "cluster-alpha/alpha-1")
-	s.Contains(ids, "cluster-alpha/alpha-2")
-	s.NotContains(ids, "cluster-alpha/alpha-3", "the finance pod is not loaded")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-1")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-2")
+	s.NotContains(ids, "zone-a-prod-cluster-alpha/alpha-3", "the finance pod is not loaded")
 	s.Contains(ids, "external/ledger", "the out-of-namespace peer renders as an external")
-	s.Contains(ids, "cluster-alpha/worker-0", "the host node follows the in-scope pods by reference")
-	s.NotContains(ids, "cluster-alpha/worker-9", "a node hosting no in-scope pod is not admitted")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/worker-0", "the host node follows the in-scope pods by reference")
+	s.NotContains(ids, "zone-a-prod-cluster-alpha/worker-9", "a node hosting no in-scope pod is not admitted")
 
 	for id, n := range ids {
 		if n.Type == "pod" {
@@ -180,17 +180,17 @@ func (s *FilterSuite) TestClusterFilterRendersExternalPartner() {
 	body := s.fetch(srv.URL, func(q url.Values) { q.Set("cluster", "cluster-alpha") })
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "cluster-alpha/alpha-1")
-	s.NotContains(ids, "cluster-beta/beta-1")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-1")
+	s.NotContains(ids, "zone-b-prod-cluster-beta/beta-1")
 	s.Contains(ids, "external/payments")
-	s.Equal([]string{"cluster-alpha"}, body.Clusters)
+	s.Equal([]string{"zone-a-prod-cluster-alpha"}, body.Clusters)
 
 	var found bool
 	for _, e := range body.Elements.Edges {
-		if e.Data.Source == "cluster-alpha/alpha-1" && e.Data.Target == "external/payments" {
+		if e.Data.Source == "zone-a-prod-cluster-alpha/alpha-1" && e.Data.Target == "external/payments" {
 			found = true
 			s.Equal("pod-calls-pod", e.Data.Type)
-			s.Equal("cluster-alpha", e.Data.Labels["cluster"], "the client side is still a loaded pod")
+			s.Equal("zone-a-prod-cluster-alpha", e.Data.Labels["cluster"], "the client side is still a loaded pod")
 		}
 	}
 	s.True(found, "the edge to the externalised partner is emitted")
@@ -206,13 +206,13 @@ func (s *FilterSuite) TestClusterUnknownMatchesUnlabelledSeries() {
 	})
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "unknown/nocluster-1", "the unlabelled pod is addressable as cluster=unknown")
+	s.Contains(ids, "zone-a-prod-unknown/nocluster-1", "the unlabelled pod is addressable as cluster=unknown")
 	// Both spellings of the bucket must come back: bucketCluster maps an absent
 	// label to "unknown", so a series LABELLED "unknown" is indistinguishable
 	// from it downstream and the rendered matcher must accept both.
-	s.Contains(ids, "unknown/nocluster-2", "a literal cluster=\"unknown\" series is in the same bucket")
-	s.NotContains(ids, "cluster-alpha/alpha-1", "labelled series are excluded")
-	s.Equal([]string{"unknown"}, body.Clusters)
+	s.Contains(ids, "zone-a-prod-unknown/nocluster-2", "a literal cluster=\"unknown\" series is in the same bucket")
+	s.NotContains(ids, "zone-a-prod-cluster-alpha/alpha-1", "labelled series are excluded")
+	s.Equal([]string{"zone-a-prod-unknown"}, body.Clusters)
 }
 
 // A mixed `cluster` set including `unknown` renders one anchored alternation
@@ -226,10 +226,10 @@ func (s *FilterSuite) TestClusterUnknownMixedWithRealCluster() {
 	})
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "unknown/nocluster-1")
-	s.Contains(ids, "unknown/nocluster-2")
-	s.Contains(ids, "cluster-alpha/alpha-1")
-	s.NotContains(ids, "cluster-beta/beta-1")
+	s.Contains(ids, "zone-a-prod-unknown/nocluster-1")
+	s.Contains(ids, "zone-a-prod-unknown/nocluster-2")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-1")
+	s.NotContains(ids, "zone-b-prod-cluster-beta/beta-1")
 }
 
 // prune=false surfaces the connectivity-disconnected pod with its whole
@@ -238,15 +238,15 @@ func (s *FilterSuite) TestPruneFalseSurfacesIdleWorkloadAndPodlessNode() {
 	srv := s.StartAPIServer(nil)
 
 	pruned := nodeIDs(s.fetch(srv.URL, nil))
-	s.NotContains(pruned, "cluster-alpha/alpha-4", "the idle pod is pruned by default")
-	s.NotContains(pruned, "cluster-alpha/worker-9")
+	s.NotContains(pruned, "zone-a-prod-cluster-alpha/alpha-4", "the idle pod is pruned by default")
+	s.NotContains(pruned, "zone-a-prod-cluster-alpha/worker-9")
 
 	all := nodeIDs(s.fetch(srv.URL, func(q url.Values) { q.Set("prune", "false") }))
-	s.Contains(all, "cluster-alpha/alpha-4", "prune=false surfaces the idle pod")
-	s.Contains(all, "cluster-alpha/shop/idle-data", "with its claim")
+	s.Contains(all, "zone-a-prod-cluster-alpha/alpha-4", "prune=false surfaces the idle pod")
+	s.Contains(all, "zone-a-prod-cluster-alpha/shop/idle-data", "with its claim")
 	s.Contains(all, "netapp/ontap-prod/aggr/aggr1", "and the aggregate behind it")
 	s.Contains(all, "netapp/ontap-prod/ontap-prod-01", "and the owning controller")
-	s.Contains(all, "cluster-alpha/worker-9", "and the podless node")
+	s.Contains(all, "zone-a-prod-cluster-alpha/worker-9", "and the podless node")
 }
 
 // Under a namespace filter, prune=false stays reference-driven for
@@ -259,9 +259,9 @@ func (s *FilterSuite) TestPruneFalseUnderNamespaceFilterStaysScoped() {
 		q.Set("prune", "false")
 	}))
 
-	s.Contains(ids, "cluster-alpha/alpha-4", "the namespace's idle pod is surfaced")
-	s.Contains(ids, "cluster-alpha/worker-9", "its host node follows by reference")
-	s.NotContains(ids, "cluster-alpha/alpha-3", "the finance pod is still out of scope")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-4", "the namespace's idle pod is surfaced")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/worker-9", "its host node follows by reference")
+	s.NotContains(ids, "zone-a-prod-cluster-alpha/alpha-3", "the finance pod is still out of scope")
 }
 
 // The unfiltered request is unaffected by any of this: every pod of every
@@ -271,10 +271,10 @@ func (s *FilterSuite) TestUnfilteredRequestKeepsRealCrossClusterPartner() {
 	srv := s.StartAPIServer(nil)
 	ids := nodeIDs(s.fetch(srv.URL, nil))
 
-	s.Contains(ids, "cluster-alpha/alpha-1")
-	s.Contains(ids, "cluster-beta/beta-1", "both clusters are loaded, so the partner is real")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/alpha-1")
+	s.Contains(ids, "zone-b-prod-cluster-beta/beta-1", "both clusters are loaded, so the partner is real")
 	s.NotContains(ids, "external/payments")
-	s.ElementsMatch([]string{"cluster-alpha", "cluster-beta"}, s.fetch(srv.URL, nil).Clusters)
+	s.ElementsMatch([]string{"zone-a-prod-cluster-alpha", "zone-b-prod-cluster-beta"}, s.fetch(srv.URL, nil).Clusters)
 }
 
 // Harvest is zone-ROUTED, never zone- or env-MATCHED: the env value on a
@@ -305,13 +305,13 @@ volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-pr
 	})
 	ids := nodeIDs(body)
 
-	s.Contains(ids, "cluster-alpha/shop/lonely-data", "the claim itself is still loaded")
+	s.Contains(ids, "zone-a-prod-cluster-alpha/shop/lonely-data", "the claim itself is still loaded")
 	s.Contains(ids, "netapp/ontap-prod/aggr/aggr9", "the differently-labelled aggregate still joins: env never reaches Harvest")
 	s.Contains(ids, "netapp/ontap-prod/ontap-prod-02", "and pulls its controller with it")
 
 	var joined bool
 	for _, e := range body.Elements.Edges {
-		if e.Data.Source == "cluster-alpha/shop/lonely-data" && e.Data.Target == "netapp/ontap-prod/aggr/aggr9" {
+		if e.Data.Source == "zone-a-prod-cluster-alpha/shop/lonely-data" && e.Data.Target == "netapp/ontap-prod/aggr/aggr9" {
 			joined = true
 		}
 	}
@@ -336,6 +336,6 @@ kube_node_info{cluster="cluster-gamma",node="worker-0",topology_zone="zone-x",te
 		q.Set("prune", "false")
 	}))
 
-	s.Contains(ids, "cluster-gamma/gamma-1", "matched through the rebound key")
-	s.NotContains(ids, "cluster-alpha/alpha-1", "series carrying only the default key do not match")
+	s.Contains(ids, "zone-x-prod-cluster-gamma/gamma-1", "matched through the rebound key, and the identity composes from it too")
+	s.NotContains(ids, "zone-a-prod-cluster-alpha/alpha-1", "series carrying only the default key do not match")
 }

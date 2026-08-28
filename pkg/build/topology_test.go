@@ -31,7 +31,7 @@ func TestParseTopology_PodRestartCollapsesToLatestUID(t *testing.T) {
 		}
 	}
 	vec := sampleVec(pod("uid-1", 100), pod("uid-2", 200))
-	tp := parseTopology(topologyVectors{Pod: vec})
+	tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1, "older UID must be discarded; only newest survives")
 	assert.Equal(t, "cluster-alpha/uid-2", tp.Pods[0].ID(), "newest UID must be canonical pod")
 }
@@ -45,7 +45,7 @@ func TestParseTopology_MissingClusterBucketed(t *testing.T) {
 			"node":      "worker-0",
 		},
 	})
-	tp := parseTopology(topologyVectors{Pod: vec})
+	tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, "unknown", tp.Pods[0].Labels()["cluster"])
 	assert.Contains(t, tp.ClustersObserved, "unknown")
@@ -64,7 +64,7 @@ func TestParseTopology_PodIPAttribute(t *testing.T) {
 		},
 		Value: 1,
 	})
-	tp := parseTopology(topologyVectors{Pod: vec})
+	tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	pod := tp.Pods[0]
 	assert.Equal(t, []string{"10.244.0.42"}, pod.IPAddress(),
@@ -108,7 +108,7 @@ func TestParseTopology_MergesSameUIDPartialLabels(t *testing.T) {
 			Value: 1, Timestamp: 100,
 		},
 	)
-	tp := parseTopology(topologyVectors{Pod: vec})
+	tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	pod := tp.Pods[0]
 	assert.Equal(t, []string{"10.244.0.42"}, pod.IPAddress(),
@@ -128,7 +128,7 @@ func TestParseTopology_PodIPAbsentWhenMetricMissing(t *testing.T) {
 		},
 		Value: 1,
 	})
-	tp := parseTopology(topologyVectors{Pod: vec})
+	tp := parseTopology(topologyVectors{Pod: vec}, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	assert.Nil(t, tp.Pods[0].IPAddress(), "IPAddress should be nil when pod_ip is absent")
 }
@@ -144,7 +144,7 @@ func TestParseTopology_K8sNodeLabelsFlattened(t *testing.T) {
 			"label_kubernetes_io_arch":          "amd64",
 		},
 	})
-	tp := parseTopology(topologyVectors{Node: nodeVec, Addr: addrVec, NodeLabels: labelVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, Addr: addrVec, NodeLabels: labelVec}, promql.LabelKeys{})
 	require.Len(t, tp.Nodes, 1)
 	n := tp.Nodes[0]
 	assert.Equal(t, []string{"203.0.113.10"}, n.IPAddress(),
@@ -209,7 +209,7 @@ func TestParseTopology_ServiceAndEndpointSliceIndexes(t *testing.T) {
 		model.Sample{Metric: model.Metric{"cluster": "c-a", "namespace": "pay", "endpointslice": "payments-x1", "targetref_kind": "Pod", "targetref_name": "payments-1", "targetref_namespace": "pay"}},
 	)
 
-	tp := parseTopology(topologyVectors{Pod: podVec, Service: svcVec, EpEndpoints: epEndpointsVec, EpLabels: epLabelsVec})
+	tp := parseTopology(topologyVectors{Pod: podVec, Service: svcVec, EpEndpoints: epEndpointsVec, EpLabels: epLabelsVec}, promql.LabelKeys{})
 
 	require.Contains(t, tp.ServicesByNameNS, serviceKey{"c-a", "pay", "payments"})
 	assert.Equal(t, "10.96.0.5", tp.ServicesByNameNS[serviceKey{"c-a", "pay", "payments"}].ClusterIP)
@@ -262,7 +262,7 @@ func TestParseTopology_PodOwnerAttribute(t *testing.T) {
 	)
 	rsOwnerVec := sampleVec(rsOwner("c", "shop", "checkout-7f9c", "checkout"))
 
-	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, ReplicaSetOwner: rsOwnerVec})
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, ReplicaSetOwner: rsOwnerVec}, promql.LabelKeys{})
 	byName := map[string]*graph.Owner{}
 	for _, p := range tp.Pods {
 		byName[p.Name()] = p.Owner()
@@ -290,7 +290,7 @@ func TestParseTopology_PodOwnerAttribute(t *testing.T) {
 	}
 
 	// Owner series absent entirely → valid topology, no owner.
-	tp2 := parseTopology(topologyVectors{Pod: podVec})
+	tp2 := parseTopology(topologyVectors{Pod: podVec}, promql.LabelKeys{})
 	for _, p := range tp2.Pods {
 		assert.Nilf(t, p.Owner(), "no owner series → pod %q must carry no owner", p.Name())
 	}
@@ -304,8 +304,8 @@ func TestParseTopology_PodOwnerDeterministic(t *testing.T) {
 	ctrlA := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "owner_kind": "DaemonSet", "owner_name": "a", "owner_is_controller": "true"}}
 	ctrlB := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "owner_kind": "StatefulSet", "owner_name": "b", "owner_is_controller": "true"}}
 
-	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(ctrlA, ctrlB)})
-	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(ctrlB, ctrlA)})
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(ctrlA, ctrlB)}, promql.LabelKeys{})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodOwner: sampleVec(ctrlB, ctrlA)}, promql.LabelKeys{})
 
 	require.Len(t, forward.Pods, 1)
 	require.Len(t, reverse.Pods, 1)
@@ -344,7 +344,7 @@ func TestParseTopology_PodContainersAttribute(t *testing.T) {
 		ctr("shop", "checkout-1", "app", "reg/app:1.2"),
 	)
 
-	tp := parseTopology(topologyVectors{Pod: podVec, PodContainerInfo: ctrVec})
+	tp := parseTopology(topologyVectors{Pod: podVec, PodContainerInfo: ctrVec}, promql.LabelKeys{})
 	byName := map[string]*graph.PodNode{}
 	for _, p := range tp.Pods {
 		byName[p.Name()] = p
@@ -366,7 +366,7 @@ func TestParseTopology_PodContainersAttribute(t *testing.T) {
 	}
 
 	// Container metric absent entirely → valid topology, no containers.
-	tp2 := parseTopology(topologyVectors{Pod: podVec})
+	tp2 := parseTopology(topologyVectors{Pod: podVec}, promql.LabelKeys{})
 	for _, p := range tp2.Pods {
 		assert.Nilf(t, p.Containers(), "no container series → pod %q carries nil containers", p.Name())
 	}
@@ -393,8 +393,8 @@ func TestParseTopology_PodContainersLatestImageWins(t *testing.T) {
 	newer := ctr("app", "reg/app:2.0", 200) // seen later AND lexically larger
 	z := ctr("zzz", "reg/z:1.0", 150)
 
-	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(older, newer, z)})
-	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(z, newer, older)})
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(older, newer, z)}, promql.LabelKeys{})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(z, newer, older)}, promql.LabelKeys{})
 
 	require.Len(t, forward.Pods, 1)
 	want := []graph.Container{{Name: "app", Image: "reg/app:2.0"}, {Name: "zzz", Image: "reg/z:1.0"}}
@@ -416,8 +416,8 @@ func TestParseTopology_PodContainersTieIsDeterministic(t *testing.T) {
 	a := ctr("reg/app:1.0")
 	b := ctr("reg/app:2.0")
 
-	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(a, b)})
-	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(b, a)})
+	forward := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(a, b)}, promql.LabelKeys{})
+	reverse := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: sampleVec(b, a)}, promql.LabelKeys{})
 
 	require.Len(t, forward.Pods, 1)
 	assert.Equal(t, []graph.Container{{Name: "app", Image: "reg/app:1.0"}}, forward.Pods[0].Containers(),
@@ -444,7 +444,7 @@ func TestParseTopology_PodContainersSkipsEmptyImage(t *testing.T) {
 	// "app" has an empty-image series seen LATER (200) than its populated one (100);
 	// the empty must still not win. "side" has only an empty-image series.
 	vec := sampleVec(ctr("app", "", 200), ctr("app", "reg/app:1.4", 100), ctr("side", "", 150))
-	tp := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: vec})
+	tp := parseTopology(topologyVectors{Pod: sampleVec(pod), PodContainerInfo: vec}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, []graph.Container{{Name: "app", Image: "reg/app:1.4"}}, tp.Pods[0].Containers(),
@@ -507,7 +507,7 @@ func TestParseTopology_PodApplicationAttribute(t *testing.T) {
 		ctrlAnn("deployment", "shop", "colon", ":apps/Deployment:shop/x"),
 	)
 
-	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, DeploymentAnnotations: deployVec})
+	tp := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec, DeploymentAnnotations: deployVec}, promql.LabelKeys{})
 	byName := map[string]*graph.PodNode{}
 	for _, p := range tp.Pods {
 		byName[p.Name()] = p
@@ -527,7 +527,7 @@ func TestParseTopology_PodApplicationAttribute(t *testing.T) {
 	}
 
 	// Annotation families absent entirely → valid topology, no application.
-	tp2 := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec})
+	tp2 := parseTopology(topologyVectors{Pod: podVec, PodOwner: ownerVec}, promql.LabelKeys{})
 	for _, p := range tp2.Pods {
 		assert.Emptyf(t, p.Application(), "no annotation series → pod %q carries no application", p.Name())
 		assert.NotNilf(t, p.Owner(), "pod %q keeps its controller owner", p.Name())
@@ -563,7 +563,7 @@ func TestParseTopology_PodApplicationPerOwnerKind(t *testing.T) {
 		ReplicaSetAnnotations:  sampleVec(ctrlAnn("replicaset", "shop", "adhoc-rs", "adhoc:apps/ReplicaSet:shop/adhoc-rs")),
 	}
 
-	tp := parseTopology(v)
+	tp := parseTopology(v, promql.LabelKeys{})
 	got := map[string]string{}
 	for _, p := range tp.Pods {
 		got[p.Name()] = p.Application()
@@ -591,7 +591,7 @@ func TestParseTopology_PodApplicationCronJobHop(t *testing.T) {
 			"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
 		}}),
 		CronJobAnnotations: sampleVec(ctrlAnn("cronjob", "batch", "nightly", "reports:batch/CronJob:batch/nightly")),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, "reports", tp.Pods[0].Application(), "Application resolves through the CronJob hop")
@@ -613,7 +613,7 @@ func TestParseTopology_PodApplicationJobOwnAnnotationWins(t *testing.T) {
 		}}),
 		JobAnnotations:     sampleVec(ctrlAnn("job_name", "shop", "migrate-1", "migrations:batch/Job:shop/migrate-1")),
 		CronJobAnnotations: sampleVec(ctrlAnn("cronjob", "shop", "nightly", "reports:batch/CronJob:shop/nightly")),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, "migrations", tp.Pods[0].Application(), "the Job's own annotation wins over the CronJob's")
@@ -645,7 +645,7 @@ func TestParseTopology_PodApplicationJobOwnerNonController(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := base
 			v.JobOwner = sampleVec(tc.row)
-			tp := parseTopology(v)
+			tp := parseTopology(v, promql.LabelKeys{})
 			require.Len(t, tp.Pods, 1)
 			assert.Empty(t, tp.Pods[0].Application(), "the hop must not be followed")
 		})
@@ -658,7 +658,7 @@ func TestParseTopology_PodApplicationJobOwnerNonController(t *testing.T) {
 		ctrlAnn("cronjob", "batch", "zeta", "zed:batch/CronJob:batch/zeta"),
 		ctrlAnn("cronjob", "batch", "alpha", "aye:batch/CronJob:batch/alpha"),
 	)
-	tp := parseTopology(v)
+	tp := parseTopology(v, promql.LabelKeys{})
 	require.Len(t, tp.Pods, 1)
 	assert.Equal(t, "aye", tp.Pods[0].Application(), "lexically-smallest CronJob name wins")
 }
@@ -674,10 +674,10 @@ func TestParseTopology_PodApplicationDeterministic(t *testing.T) {
 
 	forward := parseTopology(topologyVectors{
 		Pod: sampleVec(pod), PodOwner: sampleVec(owner), DeploymentAnnotations: sampleVec(a, b),
-	})
+	}, promql.LabelKeys{})
 	reverse := parseTopology(topologyVectors{
 		Pod: sampleVec(pod), PodOwner: sampleVec(owner), DeploymentAnnotations: sampleVec(b, a),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, forward.Pods, 1)
 	assert.Equal(t, "alpha", forward.Pods[0].Application(), "lexically-smallest tracking-id wins")
@@ -697,7 +697,7 @@ func TestParseTopology_PodApplicationNoControllerOwner(t *testing.T) {
 			"owner_kind": "Node", "owner_name": "w0", "owner_is_controller": "false",
 		}}),
 		DeploymentAnnotations: sampleVec(ctrlAnn("deployment", "shop", "checkout", "storefront:apps/Deployment:shop/checkout")),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 1)
 	assert.Nil(t, tp.Pods[0].Owner(), "non-controller row must not set an owner")
@@ -715,7 +715,7 @@ func TestParseTopology_PodApplicationUnsupportedOwnerKind(t *testing.T) {
 			appOwner("shop", "legacy-1", "ReplicationController", "legacy"),
 		),
 		DeploymentAnnotations: sampleVec(ctrlAnn("deployment", "shop", "canary", "nope:apps/Deployment:shop/canary")),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 2)
 	for _, p := range tp.Pods {
@@ -734,7 +734,7 @@ func TestParseTopology_PodLevelTrackingIDIgnored(t *testing.T) {
 	tp := parseTopology(topologyVectors{
 		Pod:      sampleVec(appPod("shop", "checkout-1", "u1")),
 		PodOwner: sampleVec(owner),
-	})
+	}, promql.LabelKeys{})
 
 	require.Len(t, tp.Pods, 1)
 	assert.Empty(t, tp.Pods[0].Application(),
@@ -748,7 +748,7 @@ func TestParseTopology_PodLevelTrackingIDIgnored(t *testing.T) {
 // indexes and never errors.
 func TestParseTopology_NoServiceSeriesYieldsEmptyIndexes(t *testing.T) {
 	podVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "pod": "p", "uid": "u", "node": "w"}})
-	tp := parseTopology(topologyVectors{Pod: podVec})
+	tp := parseTopology(topologyVectors{Pod: podVec}, promql.LabelKeys{})
 	assert.Empty(t, tp.ServicesByNameNS)
 	assert.Empty(t, tp.EndpointsByService)
 }
@@ -778,7 +778,7 @@ func TestParseTopology_PVCStorageClass(t *testing.T) {
 	)
 	infoVec := sampleVec(info("c-a", "db", "data-mongo-0", "gp3"))
 
-	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCInfo: infoVec})
+	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCInfo: infoVec}, promql.LabelKeys{})
 	byID := map[string]*graph.PVCNode{}
 	for _, p := range tp.PVCs {
 		byID[p.ID()] = p
@@ -795,7 +795,7 @@ func TestParseTopology_PVCStorageClass(t *testing.T) {
 	assert.Empty(t, redis.StorageClass(), "PVC with no matching info series carries empty StorageClass")
 
 	// Info metric absent entirely → every PVC empty, build still succeeds.
-	tp2 := parseTopology(topologyVectors{PVC: pvcVec})
+	tp2 := parseTopology(topologyVectors{PVC: pvcVec}, promql.LabelKeys{})
 	require.Len(t, tp2.PVCs, 2)
 	for _, p := range tp2.PVCs {
 		assert.Emptyf(t, p.StorageClass(), "no info series → PVC %q must be empty", p.ID())
@@ -810,8 +810,8 @@ func TestParseTopology_PVCStorageClassDeterministic(t *testing.T) {
 	scGP3 := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "persistentvolumeclaim": "claim", "storageclass": "gp3"}}
 	scGP2 := model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "n", "persistentvolumeclaim": "claim", "storageclass": "gp2"}}
 
-	fwd := parseTopology(topologyVectors{PVC: sampleVec(binding), PVCInfo: sampleVec(scGP3, scGP2)})
-	rev := parseTopology(topologyVectors{PVC: sampleVec(binding), PVCInfo: sampleVec(scGP2, scGP3)})
+	fwd := parseTopology(topologyVectors{PVC: sampleVec(binding), PVCInfo: sampleVec(scGP3, scGP2)}, promql.LabelKeys{})
+	rev := parseTopology(topologyVectors{PVC: sampleVec(binding), PVCInfo: sampleVec(scGP2, scGP3)}, promql.LabelKeys{})
 	require.Len(t, fwd.PVCs, 1)
 	require.Len(t, rev.PVCs, 1)
 	assert.Equal(t, "gp2", fwd.PVCs[0].StorageClass(), "lexically-smallest storageclass wins")
@@ -851,7 +851,7 @@ func TestParseTopology_PVCApplicationAttribute(t *testing.T) {
 		ann("db", "data-colon", ":apps/Deployment:db/x"),
 	)
 
-	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCAnnotations: annVec})
+	tp := parseTopology(topologyVectors{PVC: pvcVec, PVCAnnotations: annVec}, promql.LabelKeys{})
 	byID := map[string]*graph.PVCNode{}
 	for _, p := range tp.PVCs {
 		byID[p.ID()] = p
@@ -869,7 +869,7 @@ func TestParseTopology_PVCApplicationAttribute(t *testing.T) {
 	}
 
 	// Annotation metric absent entirely → valid topology, no application.
-	tp2 := parseTopology(topologyVectors{PVC: pvcVec})
+	tp2 := parseTopology(topologyVectors{PVC: pvcVec}, promql.LabelKeys{})
 	for _, p := range tp2.PVCs {
 		assert.Emptyf(t, p.Application(), "no annotation series → PVC %q carries no application", p.ID())
 	}
@@ -957,7 +957,7 @@ func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
 	tp := parseTopology(topologyVectors{
 		Pod: podVec, PodOwner: ownerVec, DeploymentAnnotations: deployVec,
 		PVC: pvcVec, PVCAnnotations: annVec,
-	})
+	}, promql.LabelKeys{})
 	byID := map[string]*graph.PVCNode{}
 	for _, p := range tp.PVCs {
 		byID[p.ID()] = p
@@ -997,7 +997,7 @@ func TestResolveServiceApplications(t *testing.T) {
 		ann("c", "shop", "noapp", ""),              // no annotation → absent
 		ann("c", "shop", "colon", ":apps/x"),       // empty leading segment → dropped
 		ann("", "shop", "orphan", "orphan:apps/x"), // missing cluster → "unknown"
-	), missingClusterCounts{})
+	), newClusterResolver(promql.LabelKeys{}))
 
 	assert.Equal(t, "checkout", got[serviceKey{"c", "shop", "checkout"}])
 	assert.Equal(t, "web", got[serviceKey{"c", "shop", "web"}])
@@ -1010,17 +1010,17 @@ func TestResolveServiceApplications(t *testing.T) {
 	// Collision: lexically-smallest raw tracking-id wins, order-independent.
 	fwd := resolveServiceApplications(sampleVec(
 		ann("c", "n", "s", "beta:apps/x"), ann("c", "n", "s", "alpha:apps/x"),
-	), missingClusterCounts{})
+	), newClusterResolver(promql.LabelKeys{}))
 	rev := resolveServiceApplications(sampleVec(
 		ann("c", "n", "s", "alpha:apps/x"), ann("c", "n", "s", "beta:apps/x"),
-	), missingClusterCounts{})
+	), newClusterResolver(promql.LabelKeys{}))
 	assert.Equal(t, "alpha", fwd[serviceKey{"c", "n", "s"}], "lexically-smallest tracking-id wins")
 	assert.Equal(t, fwd[serviceKey{"c", "n", "s"}], rev[serviceKey{"c", "n", "s"}], "order-independent")
 
 	// parseTopology surfaces the index on Topology.ServiceApplications.
 	tp := parseTopology(topologyVectors{ServiceAnnotations: sampleVec(
 		ann("c", "shop", "checkout", "checkout:apps/Deployment:shop/checkout"),
-	)})
+	)}, promql.LabelKeys{})
 	assert.Equal(t, "checkout", tp.ServiceApplications[serviceKey{"c", "shop", "checkout"}])
 }
 
@@ -1039,11 +1039,11 @@ func TestResolveApplications_MalformedSiblingDoesNotSuppressValid(t *testing.T) 
 	fwd := resolveServiceApplications(sampleVec(
 		ann("checkout", ":apps/Deployment:shop/x"),                // malformed: empty leading segment
 		ann("checkout", "checkout:apps/Deployment:shop/checkout"), // valid
-	), missingClusterCounts{})
+	), newClusterResolver(promql.LabelKeys{}))
 	rev := resolveServiceApplications(sampleVec(
 		ann("checkout", "checkout:apps/Deployment:shop/checkout"),
 		ann("checkout", ":apps/Deployment:shop/x"),
-	), missingClusterCounts{})
+	), newClusterResolver(promql.LabelKeys{}))
 	assert.Equal(t, "checkout", fwd[serviceKey{"c", "shop", "checkout"}], "valid Application survives a malformed sibling")
 	assert.Equal(t, fwd[serviceKey{"c", "shop", "checkout"}], rev[serviceKey{"c", "shop", "checkout"}], "order-independent")
 }
@@ -1081,7 +1081,7 @@ func TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving(t *testing.T) {
 		row("", "ghost-1", "Job", "x", "true", true),               // excluded + missing cluster → must not tally
 	}
 
-	mcFull, mcKept := missingClusterCounts{}, missingClusterCounts{}
+	mcFull, mcKept := newClusterResolver(promql.LabelKeys{}), newClusterResolver(promql.LabelKeys{})
 	gotFull := resolveJobCronJobOwners(sampleVec(slices.Concat(admitted, excluded)...), mcFull)
 	gotKept := resolveJobCronJobOwners(sampleVec(admitted...), mcKept)
 
@@ -1144,7 +1144,7 @@ func TestResolveApplications_TrackingIDPresenceIsOutputPreserving(t *testing.T) 
 			set(&full, sampleVec(slices.Concat(admitted, excluded)...))
 			set(&kept, sampleVec(admitted...))
 
-			mcFull, mcKept := missingClusterCounts{}, missingClusterCounts{}
+			mcFull, mcKept := newClusterResolver(promql.LabelKeys{}), newClusterResolver(promql.LabelKeys{})
 			gotFull := resolveControllerApplications(full, mcFull)
 			gotKept := resolveControllerApplications(kept, mcKept)
 
@@ -1183,7 +1183,7 @@ func TestParseTopology_NodeReadyStatusAttribute(t *testing.T) {
 		model.Sample{Metric: model.Metric{"cluster": "c", "node": "nocond-0", "condition": "MemoryPressure", "status": "true"}, Value: 1},
 	)
 
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec}, promql.LabelKeys{})
 	byName := map[string]*graph.K8sNode{}
 	for _, n := range tp.Nodes {
 		byName[n.Name()] = n
@@ -1203,7 +1203,7 @@ func TestParseTopology_NodeReadyStatusAttribute(t *testing.T) {
 	}
 
 	// Metric absent entirely → valid topology, no ready_status.
-	tp2 := parseTopology(topologyVectors{Node: nodeVec})
+	tp2 := parseTopology(topologyVectors{Node: nodeVec}, promql.LabelKeys{})
 	for _, n := range tp2.Nodes {
 		assert.Emptyf(t, n.ReadyStatus(), "no status series → node %q omits ready_status", n.Name())
 	}
@@ -1218,7 +1218,7 @@ func TestParseTopology_NodeReadyStatusNoActiveRowOmitted(t *testing.T) {
 		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "true"}, Value: 0},
 		model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": "false"}, Value: 0},
 	)
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec}, promql.LabelKeys{})
 	require.Len(t, tp.Nodes, 1)
 	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "no active (value==1) row → ready_status omitted")
 }
@@ -1247,7 +1247,7 @@ func TestParseTopology_NodeReadyStatusCaseInsensitive(t *testing.T) {
 		cond("notready-0", "True", 0), cond("notready-0", "False", 1), cond("notready-0", "Unknown", 0),
 		cond("unknown-0", "True", 0), cond("unknown-0", "False", 0), cond("unknown-0", "Unknown", 1),
 	)
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec}, promql.LabelKeys{})
 	byName := map[string]*graph.K8sNode{}
 	for _, n := range tp.Nodes {
 		byName[n.Name()] = n
@@ -1266,8 +1266,8 @@ func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
 		return model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0", "condition": "Ready", "status": model.LabelValue(status)}, Value: v}
 	}
 
-	fwd := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 0), r("unknown", 1), r("false", 0))})
-	rev := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 0), r("unknown", 1), r("true", 0))})
+	fwd := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 0), r("unknown", 1), r("false", 0))}, promql.LabelKeys{})
+	rev := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 0), r("unknown", 1), r("true", 0))}, promql.LabelKeys{})
 	require.Len(t, fwd.Nodes, 1)
 	require.Len(t, rev.Nodes, 1)
 	assert.Equal(t, graph.ReadyStatusUnknown, fwd.Nodes[0].ReadyStatus())
@@ -1275,8 +1275,8 @@ func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
 
 	// Defensive multi-active tie (correct KSM never emits this): lexically-
 	// smallest status label wins → "false" → NotReady, regardless of order.
-	tieF := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 1), r("false", 1))})
-	tieR := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 1), r("true", 1))})
+	tieF := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("true", 1), r("false", 1))}, promql.LabelKeys{})
+	tieR := parseTopology(topologyVectors{Node: sampleVec(node), NodeStatus: sampleVec(r("false", 1), r("true", 1))}, promql.LabelKeys{})
 	require.Len(t, tieF.Nodes, 1)
 	require.Len(t, tieR.Nodes, 1)
 	assert.Equal(t, graph.ReadyStatusNotReady, tieF.Nodes[0].ReadyStatus(), "multi-active tie → lexically-smallest status (false) wins")
@@ -1289,7 +1289,7 @@ func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
 func TestParseTopology_NodeReadyStatusMissingClusterDoesNotJoin(t *testing.T) {
 	nodeVec := sampleVec(model.Sample{Metric: model.Metric{"cluster": "prod", "node": "w0"}})
 	condVec := sampleVec(model.Sample{Metric: model.Metric{"node": "w0", "condition": "Ready", "status": "true"}, Value: 1})
-	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec})
+	tp := parseTopology(topologyVectors{Node: nodeVec, NodeStatus: condVec}, promql.LabelKeys{})
 	require.Len(t, tp.Nodes, 1)
 	assert.Equal(t, "prod/w0", tp.Nodes[0].ID())
 	assert.Empty(t, tp.Nodes[0].ReadyStatus(), "status row missing cluster label buckets to unknown; does not join the prod node")

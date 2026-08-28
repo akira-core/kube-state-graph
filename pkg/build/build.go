@@ -168,6 +168,13 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 
 	nodes, edges := assemble(topology, sg)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
+	// The identity table the reader composed. Every cluster-scoped id and label
+	// already carries the identity; the graph needs the table so the
+	// projection-level `cluster` filter can recover each identity's RAW
+	// component — the value the request actually carries and the upstream
+	// matcher selected on. Nil for an unstamped estate, which degrades the
+	// lookup to the pre-identity comparison.
+	g.ClusterIdentities = topology.ClusterIdentities
 
 	// Cross-cluster status is derived from the resolved endpoint nodes'
 	// `cluster` labels, since edges only carry the trace-source cluster

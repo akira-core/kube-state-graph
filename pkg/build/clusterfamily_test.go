@@ -1,6 +1,10 @@
 package build
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestClusterFamilyKey(t *testing.T) {
 	cases := []struct {
@@ -38,4 +42,24 @@ func TestClusterFamilyKey(t *testing.T) {
 	if ClusterFamilyKey("a#1") == ClusterFamilyKey("a1#") {
 		t.Error("digit-run position must stay significant around non-digit bytes")
 	}
+}
+
+// TestClusterFamilyKey_OverClusterIdentities pins the family rule as it applies
+// to composed cluster identities (design D4): the unchanged digit-run rule,
+// evaluated over `<az>-<env>-<cluster>`, scopes a family to one zone AND one
+// environment.
+func TestClusterFamilyKey_OverClusterIdentities(t *testing.T) {
+	same := func(a, b string) bool { return ClusterFamilyKey(a) == ClusterFamilyKey(b) }
+
+	assert.True(t, same("us-dev-c1", "us-dev-c2"), "same zone and environment: one family")
+	assert.False(t, same("us-dev-c1", "eu-prod-c1"), "a different zone and environment is a different family")
+	assert.False(t, same("us-dev-c1", "us-prod-c1"), "the environment alone separates families")
+	assert.False(t, same("us-dev-c1", "eu-dev-c1"), "the zone alone separates families")
+
+	// Documented caveat (design D4): the rule normalises digit runs ANYWHERE in
+	// the string, so digits inside a zone value widen the family. Pinned so a
+	// future struct-aware key is a deliberate change to this expectation, not a
+	// silent one.
+	assert.True(t, same("us-east-1-prod-c1", "us-east-2-prod-c1"),
+		"digits inside the zone value normalise too — the known widening")
 }

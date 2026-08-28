@@ -14,6 +14,48 @@ type Graph struct {
 
 	NodesByID map[string]GraphNode
 	Edges     []*Edge
+
+	// ClusterIdentities maps each cluster IDENTITY present in the graph to the
+	// three components it was composed from. A Kubernetes cluster is identified
+	// by `<az>-<env>-<cluster>` — the raw `cluster` label alone is not unique
+	// across zones and environments — so every cluster-scoped id prefix, every
+	// `labels["cluster"]`, and every cluster-keyed index is keyed on the
+	// identity (see pkg/build's cluster resolver, which owns the composition
+	// rule; this package only stores what the reader decided).
+	//
+	// Set by the builder after NewGraph; nil for a graph built by hand or by an
+	// embedder predating cluster identities, in which case ClusterRawName
+	// degrades every value to itself and the request-scoped `cluster` filter
+	// compares raw labels exactly as it did before.
+	ClusterIdentities map[string]ClusterIdentity
+}
+
+// ClusterIdentity holds the three components of a composed cluster identity.
+// Name is the RAW upstream `cluster` label value, which is what the
+// request-scoped `?cluster=` filter matches on at both the query and the
+// projection layer (the composed identity is a response-side value and is
+// deliberately NOT a valid filter value).
+type ClusterIdentity struct {
+	AZ   string
+	Env  string
+	Name string
+}
+
+// ClusterRawName returns the raw `cluster` label component of a cluster
+// identity, or the argument verbatim when it names no known identity (an
+// unresolved raw name, or any value on a graph with no identity table).
+//
+// This is the one lookup the projection-level `cluster` filter uses, so that a
+// request narrowing on the raw upstream value admits exactly the elements the
+// upstream label matcher admitted.
+func (g *Graph) ClusterRawName(id string) string {
+	if g == nil {
+		return id
+	}
+	if ci, ok := g.ClusterIdentities[id]; ok {
+		return ci.Name
+	}
+	return id
 }
 
 // NewGraph builds a Graph from the supplied nodes + edges.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func sampleGraph() *Graph {
@@ -253,4 +254,63 @@ func TestProject_Inventory_NamespaceFilterKeepsK8sNodeReferenceDriven(t *testing
 	}
 	assert.True(t, ids["c/worker-0"], "host of the in-scope pod kept")
 	assert.False(t, ids["c/worker-1"], "podless node NOT lifted under a namespace filter")
+}
+
+// identityGraph holds three clusters whose identities compose from two raw
+// names: c1 exists in two zone/environment pairs, c2 in one. The
+// projection-level cluster filter must compare the RAW component so it admits
+// what the upstream `cluster="c1"` matcher admitted.
+func identityGraph() *Graph {
+	pods := []GraphNode{
+		&PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop", "node": "us-dev-c1/w0"}},
+		&PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "shop"}},
+		&PodNode{IDValue: "us-dev-c2/p3", NameValue: "cart", LabelsValue: map[string]string{"cluster": "us-dev-c2", "namespace": "shop"}},
+	}
+	all := append([]GraphNode{}, pods...)
+	all = append(all, &K8sNode{IDValue: "us-dev-c1/w0", NameValue: "w0", LabelsValue: map[string]string{"cluster": "us-dev-c1"}})
+
+	g := NewGraph(all, nil, time.Now())
+	g.ClusterIdentities = map[string]ClusterIdentity{
+		"us-dev-c1":  {AZ: "us", Env: "dev", Name: "c1"},
+		"eu-prod-c1": {AZ: "eu", Env: "prod", Name: "c1"},
+		"us-dev-c2":  {AZ: "us", Env: "dev", Name: "c2"},
+	}
+	return g
+}
+
+func TestProject_ClusterFilterMatchesRawComponent(t *testing.T) {
+	g := identityGraph()
+
+	t.Run("raw name admits every identity sharing it", func(t *testing.T) {
+		scope, err := NewScope([]string{"c1"}, nil, nil, true)
+		require.NoError(t, err)
+		got := map[string]bool{}
+		for _, n := range Project(g, scope).Nodes {
+			got[n.ID()] = true
+		}
+		assert.True(t, got["us-dev-c1/p1"], "us-dev-c1 pod must pass ?cluster=c1")
+		assert.True(t, got["eu-prod-c1/p2"], "eu-prod-c1 pod must pass ?cluster=c1")
+		assert.False(t, got["us-dev-c2/p3"], "us-dev-c2 pod must not pass ?cluster=c1")
+	})
+
+	t.Run("an identity is not a filter value", func(t *testing.T) {
+		scope, err := NewScope([]string{"us-dev-c1"}, nil, nil, true)
+		require.NoError(t, err)
+		assert.Empty(t, Project(g, scope).Nodes)
+	})
+
+	t.Run("infra node admitted through the raw component", func(t *testing.T) {
+		scope, err := NewScope([]string{"c1"}, nil, nil, false)
+		require.NoError(t, err)
+		// prune=true keeps only connectivity-connected workload, so assert the
+		// predicate directly: the host node passes the cluster check and is
+		// referenced by p1.
+		host := g.NodesByID["us-dev-c1/w0"]
+		referenced := map[string]struct{}{"us-dev-c1/w0": {}}
+		assert.True(t, infraNodePassesFilters(host, scope, referenced, g.ClusterRawName))
+
+		identityScope, err := NewScope([]string{"us-dev-c1"}, nil, nil, false)
+		require.NoError(t, err)
+		assert.False(t, infraNodePassesFilters(host, identityScope, referenced, g.ClusterRawName))
+	})
 }

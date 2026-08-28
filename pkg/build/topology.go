@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"maps"
 	"runtime/debug"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -124,6 +123,17 @@ type Topology struct {
 	// the accompanying `optional topology query failed` Warn is the only thing
 	// that separates the two.
 	RawSeriesCount map[string]int
+
+	// ClusterIdentities is the identity table the reader composed, handed to
+	// the built graph so the projection-level `cluster` filter can recover each
+	// identity's RAW component. Nil for an estate that stamps no az/env pair.
+	ClusterIdentities map[string]graph.ClusterIdentity
+
+	// clusters is the resolver that composed those identities. Carried so the
+	// service-graph reader resolves the trace `cluster` label and the route
+	// store's cluster names through the SAME table — a second resolver could
+	// hold a different one and the two would silently disagree.
+	clusters *clusterResolver
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It
@@ -349,7 +359,7 @@ func ReadTopology(
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
 
-	t := parseTopology(v)
+	t := parseTopology(v, keys)
 	t.RawSeriesCount = map[string]int{
 		string(promql.QPodInfo):                    len(v.Pod),
 		string(promql.QNodeInfo):                   len(v.Node),
@@ -448,12 +458,25 @@ func (a nodeAddrs) pick() string {
 	return a.internal
 }
 
-func parseTopology(v topologyVectors) Topology {
+func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	clusters := map[string]struct{}{}
 
-	// Per-metric tally of samples missing the `cluster` label; surfaced as one
-	// aggregated warn per metric at the end of the parse.
-	mc := missingClusterCounts{}
+	// Resolver for the cluster identity every structure below is keyed on, and
+	// the per-metric tallies of samples missing the `cluster` label or naming
+	// no single identity; both surfaced as one aggregated warn per metric at
+	// the end of the parse.
+	mc := newClusterResolver(keys)
+
+	// FIRST PASS: build the identity table from the four families that mint
+	// cluster-labelled entities. It must complete before ANY bucket call —
+	// including the resolve* helpers below — because step 2 of the ladder
+	// (adopt) reads it. The other families resolve THROUGH the table and never
+	// add to it, so a join input cannot invent a cluster that holds no entity.
+	for _, vec := range []model.Vector{v.Pod, v.Node, v.Service, v.PVC} {
+		for _, s := range vec {
+			mc.observe(s.Metric)
+		}
+	}
 
 	// Pod controller-owner resolution (D34), with the ReplicaSet skipped to its
 	// owning Deployment. Built up-front so the per-pod assembly below can set
@@ -502,7 +525,7 @@ func parseTopology(v topologyVectors) Topology {
 	// never reach `ipaddress`.
 	nodeIPs := map[[2]string]nodeAddrs{}
 	for _, s := range v.Addr {
-		cluster := mc.bucket(promql.QNodeAddresses, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeAddresses, s.Metric)
 		nodeName := string(s.Metric["node"])
 		typ := string(s.Metric["type"])
 		addr := string(s.Metric["address"])
@@ -532,7 +555,7 @@ func parseTopology(v topologyVectors) Topology {
 	// K8s node label map: (cluster, node-name) -> labels (with `label_` prefix removed).
 	nodeLabels := map[[2]string]map[string]string{}
 	for _, s := range v.NodeLabels {
-		cluster := mc.bucket(promql.QNodeLabels, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeLabels, s.Metric)
 		nodeName := string(s.Metric["node"])
 		key := [2]string{cluster, nodeName}
 		if _, ok := nodeLabels[key]; !ok {
@@ -567,7 +590,7 @@ func parseTopology(v topologyVectors) Topology {
 	nodes := make([]*graph.K8sNode, 0, len(v.Node))
 	seenNodes := make(map[[2]string]struct{}, len(v.Node))
 	for _, s := range v.Node {
-		cluster := mc.bucket(promql.QNodeInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeInfo, s.Metric)
 		nodeName := string(s.Metric["node"])
 		if nodeName == "" {
 			continue
@@ -604,7 +627,7 @@ func parseTopology(v topologyVectors) Topology {
 	// Pods (group by (cluster, namespace, pod) for restart handling).
 	podGroups := map[podKey][]podObs{}
 	for _, s := range v.Pod {
-		cluster := mc.bucket(promql.QPodInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		name := string(s.Metric["pod"])
 		uid := string(s.Metric["uid"])
@@ -726,7 +749,7 @@ func parseTopology(v topologyVectors) Topology {
 		canonicalPodUID[[3]string{k.cluster, k.namespace, k.pod}] = group[0].uid
 	}
 	for _, s := range v.PVC {
-		cluster := mc.bucket(promql.QPVCBindings, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPVCBindings, s.Metric)
 		ns := string(s.Metric["namespace"])
 		podName := string(s.Metric["pod"])
 		claim := string(s.Metric["persistentvolumeclaim"])
@@ -835,7 +858,7 @@ func parseTopology(v topologyVectors) Topology {
 	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.
 	servicesByNameNS := map[serviceKey]ServiceObs{}
 	for _, s := range v.Service {
-		cluster := mc.bucket(promql.QServiceInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QServiceInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		svc := string(s.Metric["service"])
 		if svc == "" {
@@ -854,7 +877,7 @@ func parseTopology(v topologyVectors) Topology {
 	type sliceKey struct{ cluster, namespace, slice string }
 	sliceToService := map[sliceKey]string{}
 	for _, s := range v.EpLabels {
-		cluster := mc.bucket(promql.QEndpointSliceLabels, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QEndpointSliceLabels, s.Metric)
 		ns := string(s.Metric["namespace"])
 		slice := string(s.Metric["endpointslice"])
 		svc := string(s.Metric["label_kubernetes_io_service_name"])
@@ -871,7 +894,7 @@ func parseTopology(v topologyVectors) Topology {
 	// the source of the Service → backing-pod fan-out (service-selects-pod edges).
 	endpointsByService := map[serviceKey][]EndpointObs{}
 	for _, s := range v.EpEndpoints {
-		cluster := mc.bucket(promql.QEndpointSliceEndpoints, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QEndpointSliceEndpoints, s.Metric)
 		ns := string(s.Metric["namespace"])
 		slice := string(s.Metric["endpointslice"])
 		svc, ok := sliceToService[sliceKey{cluster, ns, slice}]
@@ -919,6 +942,8 @@ func parseTopology(v topologyVectors) Topology {
 		EndpointsByService:  endpointsByService,
 		ServiceApplications: serviceApplications,
 		ClustersObserved:    clusterList,
+		ClusterIdentities:   mc.snapshot(),
+		clusters:            mc,
 	}
 }
 
@@ -938,7 +963,7 @@ type ownerRef struct{ kind, name string }
 // lexically-smallest (kind, name) wins so the emitted entity is stable across
 // rebuilds (D6 determinism). The only side effect is tallying missing-cluster
 // samples into the caller's mc accumulator.
-func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts) map[podNameKey]ownerRef {
+func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc *clusterResolver) map[podNameKey]ownerRef {
 	// ReplicaSet → owning Deployment, keyed by (cluster, namespace, replicaset).
 	// Only Deployment owners are retained; a ReplicaSet owned by anything else
 	// (or nothing) is left unresolved so the pod keeps the ReplicaSet.
@@ -947,7 +972,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 		if string(s.Metric["owner_kind"]) != "Deployment" {
 			continue
 		}
-		cluster := mc.bucket(promql.QReplicaSetOwner, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QReplicaSetOwner, s.Metric)
 		ns := string(s.Metric["namespace"])
 		rs := string(s.Metric["replicaset"])
 		dep := string(s.Metric["owner_name"])
@@ -962,7 +987,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 		if string(s.Metric["owner_is_controller"]) != "true" {
 			continue
 		}
-		cluster := mc.bucket(promql.QPodOwner, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodOwner, s.Metric)
 		ns := string(s.Metric["namespace"])
 		pod := string(s.Metric["pod"])
 		kind := string(s.Metric["owner_kind"])
@@ -1013,7 +1038,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 // containers (graceful degradation). The returned map is a deterministic
 // function of the input vector. The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podNameKey][]graph.Container {
+func resolvePodContainers(vec model.Vector, mc *clusterResolver) map[podNameKey][]graph.Container {
 	type containerKey struct {
 		pod  podNameKey
 		name string
@@ -1026,7 +1051,7 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 	// value), lexically-smallest image breaking exact-timestamp ties.
 	best := make(map[containerKey]pick, len(vec))
 	for _, s := range vec {
-		cluster := mc.bucket(promql.QPodContainerInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodContainerInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		pod := string(s.Metric["pod"])
 		name := string(s.Metric["container"])
@@ -1104,7 +1129,7 @@ var controllerAnnotationFamilies = []controllerAnnotationFamily{
 // OPTIONAL: every family is empty unless the operator allowlisted the
 // annotation, which is the stock kube-state-metrics state. An empty input
 // yields an empty index and no pod resolves an Application.
-func resolveControllerApplications(v topologyVectors, mc missingClusterCounts) map[controllerKey]string {
+func resolveControllerApplications(v topologyVectors, mc *clusterResolver) map[controllerKey]string {
 	out := map[controllerKey]string{}
 	for _, f := range controllerAnnotationFamilies {
 		apps := resolveApplications(f.vec(v), "annotation_argocd_argoproj_io_tracking_id",
@@ -1114,7 +1139,7 @@ func resolveControllerApplications(v topologyVectors, mc missingClusterCounts) m
 					return controllerKey{}, false
 				}
 				return controllerKey{
-					cluster:   mc.bucket(f.query, string(m["cluster"])),
+					cluster:   mc.bucket(f.query, m),
 					namespace: string(m["namespace"]),
 					kind:      f.kind,
 					name:      name,
@@ -1147,7 +1172,7 @@ type jobKey struct{ cluster, namespace, job string }
 //
 // This index is NEVER read by resolvePodOwners, which is what makes "the hop
 // cannot change data.owner" a structural property rather than a convention.
-func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[jobKey]string {
+func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]string {
 	out := make(map[jobKey]string, len(vec))
 	for _, s := range vec {
 		if string(s.Metric["owner_kind"]) != "CronJob" || string(s.Metric["owner_is_controller"]) != "true" {
@@ -1158,7 +1183,7 @@ func resolveJobCronJobOwners(vec model.Vector, mc missingClusterCounts) map[jobK
 		if job == "" || cronJob == "" {
 			continue
 		}
-		key := jobKey{mc.bucket(promql.QJobOwner, string(s.Metric["cluster"])), string(s.Metric["namespace"]), job}
+		key := jobKey{mc.bucket(promql.QJobOwner, s.Metric), string(s.Metric["namespace"]), job}
 		if cur, ok := out[key]; ok && cur <= cronJob {
 			continue
 		}
@@ -1230,13 +1255,13 @@ func resolvePodApplications(
 // argocd.argoproj.io/tracking-id annotation). OPTIONAL: an absent/empty vector
 // yields an empty map (services carry no Application). Deterministic per
 // "absent when empty" (lexically-smallest raw tracking-id wins on collision).
-func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[serviceKey]string {
+func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[serviceKey]string {
 	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
 		svc := string(m["service"])
 		if svc == "" {
 			return serviceKey{}, false
 		}
-		return serviceKey{mc.bucket(promql.QServiceAnnotations, string(m["cluster"])), string(m["namespace"]), svc}, true
+		return serviceKey{mc.bucket(promql.QServiceAnnotations, m), string(m["namespace"]), svc}, true
 	})
 }
 
@@ -1244,13 +1269,13 @@ func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[s
 // Application index from kube_persistentvolumeclaim_annotations' tracking-id
 // label, keyed identically to resolvePVCInfo so the per-PVC assembly
 // can join it. OPTIONAL/graceful and deterministic like the service variant.
-func resolvePVCApplications(vec model.Vector, mc missingClusterCounts) map[pvcKey]string {
+func resolvePVCApplications(vec model.Vector, mc *clusterResolver) map[pvcKey]string {
 	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
 		claim := string(m["persistentvolumeclaim"])
 		if claim == "" {
 			return pvcKey{}, false
 		}
-		return pvcKey{mc.bucket(promql.QPVCAnnotations, string(m["cluster"])), string(m["namespace"]), claim}, true
+		return pvcKey{mc.bucket(promql.QPVCAnnotations, m), string(m["namespace"]), claim}, true
 	})
 }
 
@@ -1353,7 +1378,7 @@ type pvcInfoAttrs struct {
 // non-empty value wins PER FIELD, so the emitted grouping and labels are
 // stable across rebuilds (D6 determinism). The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInfoAttrs {
+func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAttrs {
 	pick := func(cur *string, val string) {
 		if val == "" {
 			return
@@ -1364,7 +1389,7 @@ func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInf
 	}
 	out := make(map[pvcKey]pvcInfoAttrs, len(vec))
 	for _, s := range vec {
-		cluster := mc.bucket(promql.QPVCInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPVCInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])
 		if claim == "" {
@@ -1415,7 +1440,7 @@ func readyStatusFromLabel(status string) string {
 // from ReadyStatusUnknown (kubelet lost contact). The returned map is a
 // deterministic function of the input vector; the only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
+func resolveNodeReadyStatus(vec model.Vector, mc *clusterResolver) map[[2]string]string {
 	// (cluster, node) → lexically-smallest active, recognised `status` label.
 	raw := make(map[[2]string]string, len(vec))
 	for _, s := range vec {
@@ -1435,7 +1460,7 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 		if readyStatusFromLabel(status) == "" {
 			continue
 		}
-		cluster := mc.bucket(promql.QNodeStatusCondition, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeStatusCondition, s.Metric)
 		node := string(s.Metric["node"])
 		if node == "" {
 			continue
@@ -1452,44 +1477,6 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 		out[key] = readyStatusFromLabel(status)
 	}
 	return out
-}
-
-// bucketCluster returns the missing-cluster bucket name when the upstream
-// cluster label is absent. The name is promql.ClusterUnknownValue rather than a
-// local literal because the query layer renders the SAME value as a request
-// matcher: rename it on one side only and `?cluster=<bucket>` silently stops
-// addressing the bucket it names.
-func bucketCluster(c string) string {
-	if c == "" {
-		return promql.ClusterUnknownValue
-	}
-	return c
-}
-
-// missingClusterCounts tallies, per upstream metric, samples whose `cluster`
-// label is absent and were therefore bucketed into the "unknown" cluster.
-type missingClusterCounts map[promql.Query]int
-
-// bucket records a missing cluster label against metric and returns the
-// bucketed cluster name (see bucketCluster).
-func (m missingClusterCounts) bucket(metric promql.Query, c string) string {
-	if c == "" {
-		m[metric]++
-	}
-	return bucketCluster(c)
-}
-
-// warn emits one aggregated warning per affected metric — not one per sample,
-// so a whole cluster missing the label cannot flood the log — letting
-// operators spot which exporter feeds the "unknown" cluster. Sorted iteration
-// keeps the log order deterministic.
-func (m missingClusterCounts) warn() {
-	for _, q := range slices.Sorted(maps.Keys(m)) {
-		slog.Warn(`samples missing cluster label; bucketed into "unknown" cluster`,
-			"metric", string(q),
-			"samples", m[q],
-		)
-	}
 }
 
 // unflattenLabel inverts kube-state-metrics' `label_*` flattening.
