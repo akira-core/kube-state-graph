@@ -98,10 +98,10 @@ var EdgeTypes = []EdgeTypeDefinition{
 		Labels:          nil,
 	},
 	{
-		Type:            EdgeTypePVCToStorageClass,
-		Description:     "PVC is provisioned by a StorageClass, derived from the PVC's resolved `storageclass` (kube_persistentvolumeclaim_info) joined to the StorageClass node (kube_storageclass_info, bare-synthesised when absent). Emitted for every PVC with a resolved StorageClass. Always intra-cluster.",
+		Type:            EdgeTypePVCToNetAppAggr,
+		Description:     "PVC is served by an ONTAP aggregate, derived by joining the PVC's bound PV name (kube_persistentvolumeclaim_info.volumename) to the Harvest volume series' volume_name label. The target aggregate belongs to no Kubernetes cluster, so the Kubernetes cross-cluster notion does not apply. Carries typed data.metrics I/O fields (read_ops / write_ops / read_latency_us / write_latency_us / read_bytes_per_sec / write_bytes_per_sec) when the matching Harvest families are present.",
 		SourceType:      []NodeType{NodeTypePVC},
-		TargetType:      []NodeType{NodeTypeStorageClass},
+		TargetType:      []NodeType{NodeTypeNetAppAggr},
 		Directed:        true,
 		MayCrossCluster: false,
 		Labels:          nil,

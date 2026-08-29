@@ -98,12 +98,35 @@ func TestWithMetrics_ImmutableCopy(t *testing.T) {
 	assert.NotSame(t, orig, with)
 }
 
+func TestWithIO_ImmutableCopy(t *testing.T) {
+	orig := NewEdge(EdgeTypePVCToNetAppAggr, "c/ns/claim", "netapp/oc/aggr/a1", nil)
+	readOps, writeOps, readBps, writeBps := 10.0, 4.0, 5242880.0, 1048576.0
+	maxIOPS, maxBps := 5000.0, 262144000.0
+	with := orig.WithIO(IOMetrics{
+		ReadOps: &readOps, WriteOps: &writeOps,
+		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+		MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps,
+	})
+	assert.Nil(t, orig.IO)
+	assert.Equal(t, orig.ID, with.ID)
+	require.NotNil(t, with.IO)
+	assert.InDelta(t, 10.0, *with.IO.ReadOps, 1e-12)
+	assert.InDelta(t, 4.0, *with.IO.WriteOps, 1e-12)
+	assert.InDelta(t, 5242880.0, *with.IO.ReadBytesPerSec, 1e-12)
+	assert.InDelta(t, 1048576.0, *with.IO.WriteBytesPerSec, 1e-12)
+	assert.InDelta(t, 5000.0, *with.IO.MaxIOPS, 1e-12)
+	assert.InDelta(t, 262144000.0, *with.IO.MaxBytesPerSec, 1e-12)
+	assert.Nil(t, with.IO.ReadLatencyUs)
+	assert.NotSame(t, orig, with)
+}
+
 // TestEdgeTypes_TopologyRelationshipEntries — the two new topology edge types
 // are registered (so /v1/edge-types advertises them and ?edge_type= accepts
 // them) with the expected directed/intra-cluster source/target contract.
 func TestEdgeTypes_TopologyRelationshipEntries(t *testing.T) {
 	assert.True(t, ValidEdgeType(EdgeTypePodToNode))
-	assert.True(t, ValidEdgeType(EdgeTypePVCToStorageClass))
+	assert.True(t, ValidEdgeType(EdgeTypePVCToNetAppAggr))
+	assert.False(t, ValidEdgeType("pvc-to-storageclass"))
 
 	byType := map[EdgeType]EdgeTypeDefinition{}
 	for _, d := range EdgeTypes {
@@ -116,9 +139,10 @@ func TestEdgeTypes_TopologyRelationshipEntries(t *testing.T) {
 	assert.Equal(t, []NodeType{NodeTypePod}, p2n.SourceType)
 	assert.Equal(t, []NodeType{NodeTypeK8sNode}, p2n.TargetType)
 
-	p2s := byType[EdgeTypePVCToStorageClass]
-	assert.True(t, p2s.Directed)
-	assert.False(t, p2s.MayCrossCluster)
-	assert.Equal(t, []NodeType{NodeTypePVC}, p2s.SourceType)
-	assert.Equal(t, []NodeType{NodeTypeStorageClass}, p2s.TargetType)
+	p2a := byType[EdgeTypePVCToNetAppAggr]
+	assert.True(t, p2a.Directed)
+	assert.False(t, p2a.MayCrossCluster)
+	assert.Equal(t, []NodeType{NodeTypePVC}, p2a.SourceType)
+	assert.Equal(t, []NodeType{NodeTypeNetAppAggr}, p2a.TargetType)
+	assert.Empty(t, p2a.Labels)
 }

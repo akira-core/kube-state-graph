@@ -2,15 +2,24 @@
 
 ## Purpose
 TBD - created by archiving change add-k8s-pod-graph-api. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Centralised VictoriaMetrics as the only topology source
 
-The topology reader SHALL fetch all pod, node, and PVC topology by issuing PromQL queries against a single configurable Prometheus-compatible endpoint (`--prom-url`), pointing at centralised VictoriaMetrics. The reader SHALL NOT call the Kubernetes API server, SHALL NOT scrape `kube-state-metrics` directly, and SHALL NOT use Kubernetes informers.
+The topology reader SHALL fetch all pod, node, and PVC topology by issuing PromQL queries against one or more configured Prometheus-compatible endpoints, pointing at VictoriaMetrics. Which endpoint a given query is issued to is decided by the routing table defined by the `upstream-backend-routing` capability; when no routing table is configured, the single `--prom-url` endpoint serves every query. The reader SHALL NOT call the Kubernetes API server, SHALL NOT scrape `kube-state-metrics` directly, and SHALL NOT use Kubernetes informers.
+
+Regardless of how many endpoints are configured, the endpoints are the reader's **only** source of cluster facts: no Kubernetes client, no informer, no kubeconfig, and no per-cluster RBAC is involved at any point.
 
 #### Scenario: Single configured upstream
 
-- **WHEN** the server starts with `--prom-url=http://vm.example:8428`
+- **WHEN** the server starts with `--prom-url=http://vm.example:8428` and no routing table
 - **THEN** every topology query is sent to `http://vm.example:8428` and no other HTTP destinations
+
+#### Scenario: Routed upstreams
+
+- **WHEN** the server starts with a routing table declaring `http://vm-a.example:8428` and `http://vm-b.example:8428`
+- **THEN** every topology query is sent to one or both of those two endpoints as the routing table dictates, and to no other HTTP destinations
 
 #### Scenario: No Kubernetes API access
 
@@ -19,45 +28,60 @@ The topology reader SHALL fetch all pod, node, and PVC topology by issuing PromQ
 
 ### Requirement: Topology series consumed
 
-The topology reader SHALL consume at minimum the following `kube-state-metrics` series, each carrying a `cluster` external label:
+The topology reader SHALL consume at minimum the following `kube-state-metrics` series, each carrying a `cluster` external label. The bracketed tag after each series names the request-scoped matchers it receives (see "Request-scoped upstream selectors"): **[AECN]** = `az`, `env`, `cluster`, `namespace`; **[AEC]** = `az`, `env`, `cluster`.
 
-- `kube_pod_info{cluster, namespace, pod, uid, node, pod_ip, host_ip, ...}` (`pod_ip` and `host_ip` are surfaced when present)
-- `kube_node_info{cluster, node, ...}`
-- `kube_node_status_addresses{cluster, node, type=~"ExternalIP|InternalIP", address, ...}` (the anchored alternation selects exactly the two address types; ExternalIP is preferred and InternalIP is the fallback for the node `ipaddress` attribute)
-- `kube_pod_spec_volumes_persistentvolumeclaims_info{cluster, namespace, pod, volume, claim_name, ...}`
-- `kube_node_labels{cluster, node, label_*, ...}`
-- `kube_service_info{cluster, namespace, service, cluster_ip, ...}` (OPTIONAL — feeds the service/endpoint indexes)
-- `kube_endpointslice_endpoints{cluster, namespace, endpointslice, address, targetref_kind, targetref_name, targetref_namespace, ...}` (OPTIONAL — feeds the service/endpoint indexes)
-- `kube_endpointslice_labels{cluster, namespace, endpointslice, label_kubernetes_io_service_name, ...}` (OPTIONAL — joins each slice back to its owning service)
-- `kube_pod_owner{cluster, namespace, pod, owner_kind, owner_name, owner_is_controller, argocd_tracking_id, ...}` (OPTIONAL — feeds the pod controller-owner labels and, via the `argocd_tracking_id` label, the pod ArgoCD Application attribute)
-- `kube_replicaset_owner{cluster, namespace, replicaset, owner_kind, owner_name, ...}` (OPTIONAL — resolves a ReplicaSet pod owner up to its owning Deployment)
-- `kube_persistentvolumeclaim_info{cluster, namespace, persistentvolumeclaim, storageclass, volumename, ...}` (OPTIONAL — feeds PVC StorageClass resolution and the `pvc-to-storageclass` edge, and — via the `volumename` label — the PVC `volumename` label that roots the NetApp Trident SVM join)
-- `kube_storageclass_info{cluster, storageclass, provisioner, storagePools, pool, fsType, fsName, ClusterID, selector, ...}` (OPTIONAL — feeds the real `type="storageclass"` node, its `provisioner` attribute, and its `parameters` object of NetApp/Ceph backing-storage values; the parameter labels are the operator's `--metric-labels-allowlist` responsibility)
-- `kube_pod_container_info{cluster, namespace, pod, uid, container, image, ...}` (OPTIONAL — feeds the per-pod container list attribute; one series per container)
-- `kube_node_status_condition{cluster, node, condition="Ready", status, ...}` (OPTIONAL — feeds the K8s node `ready_status` attribute; the `condition="Ready"` selector is a fixed, request-invariant metric-selection contract, and the `status` label carries `true`/`false`/`unknown` **matched case-insensitively** — stock kube-state-metrics lowercases the value, but an exporter re-publishing the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown` — with the active row's sample value being `1`)
-- `kube_persistentvolumeclaim_annotations{cluster, namespace, persistentvolumeclaim, annotation_argocd_argoproj_io_tracking_id, ...}` (OPTIONAL — feeds the PVC ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label is kube-state-metrics' sanitised form of the `argocd.argoproj.io/tracking-id` annotation and requires the operator's `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`)
-- `kube_service_annotations{cluster, namespace, service, annotation_argocd_argoproj_io_tracking_id, ...}` (OPTIONAL — feeds the service ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label requires the operator's `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]`)
-- `kube_tridentvolume_info{cluster, name, backendUUID, ...}` (OPTIONAL — NetApp Trident custom-resource series, from a kube-state-metrics custom-resource-state config or compatible exporter, NOT a stock KSM default; `name` is the TridentVolume CR name, equal to the bound PV name; feeds the PVC `svm` label chain)
-- `kube_tridentbackend_info{cluster, backendUUID, svm, ...}` (OPTIONAL — NetApp Trident custom-resource series, same provenance; maps a Trident `backendUUID` to its ONTAP `svm`; feeds the PVC `svm` label chain)
+- `kube_pod_info{cluster, namespace, pod, uid, node, pod_ip, host_ip, ...}` **[AECN]** (`pod_ip` and `host_ip` are surfaced when present)
+- `kube_node_info{cluster, node, ...}` **[AEC]**
+- `kube_node_status_addresses{cluster, node, type=~"ExternalIP|InternalIP", address, ...}` **[AEC]** (the anchored alternation selects exactly the two address types; ExternalIP is preferred and InternalIP is the fallback for the node `ipaddress` attribute)
+- `kube_pod_spec_volumes_persistentvolumeclaims_info{cluster, namespace, pod, volume, claim_name, ...}` **[AECN]**
+- `kube_node_labels{cluster, node, label_*, ...}` **[AEC]**
+- `kube_service_info{cluster, namespace, service, cluster_ip, ...}` **[AECN]** (OPTIONAL — feeds the service/endpoint indexes)
+- `kube_endpointslice_endpoints{cluster, namespace, endpointslice, address, targetref_kind, targetref_name, targetref_namespace, ...}` **[AECN]** (OPTIONAL — feeds the service/endpoint indexes)
+- `kube_endpointslice_labels{cluster, namespace, endpointslice, label_kubernetes_io_service_name, ...}` **[AECN]** (OPTIONAL — joins each slice back to its owning service)
+- `kube_pod_owner{cluster, namespace, pod, owner_kind, owner_name, owner_is_controller, ...}` **[AECN]** (OPTIONAL — feeds the pod controller-owner attribute and, through the resolved owner, the pod ArgoCD Application attribute)
+- `kube_replicaset_owner{cluster, namespace, replicaset, owner_kind, owner_name, ...}` **[AECN]** (OPTIONAL — resolves a ReplicaSet pod owner up to its owning Deployment)
+- `kube_job_owner{cluster, namespace, job_name, owner_kind="CronJob", owner_name, owner_is_controller="true", ...}` **[AECN]** (OPTIONAL — resolves a Job up to its owning CronJob **for ArgoCD Application resolution only**; it SHALL NOT alter the pod `owner` attribute. The `owner_kind="CronJob"` and `owner_is_controller="true"` matchers are a fixed, request-invariant metric-selection contract — the reader keeps exactly those rows and no other, so selecting them upstream is output-preserving)
+- `kube_persistentvolumeclaim_info{cluster, namespace, persistentvolumeclaim, storageclass, volumename, ...}` **[AECN]** (OPTIONAL — feeds the PVC `storageclass` attribute and — via the `volumename` label — the PVC `volumename` label that roots the NetApp Harvest join defined by the `netapp-storage-graph` capability)
+- `kube_pod_container_info{cluster, namespace, pod, uid, container, image, ...}` **[AECN]** (OPTIONAL — feeds the per-pod container list attribute; one series per container)
+- `kube_node_status_condition{cluster, node, condition="Ready", status, ...}` **[AEC]** (OPTIONAL — feeds the K8s node `ready_status` attribute; the `condition="Ready"` selector is a fixed, request-invariant metric-selection contract, and the `status` label carries `true`/`false`/`unknown` **matched case-insensitively** — stock kube-state-metrics lowercases the value, but an exporter re-publishing the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown` — with the active row's sample value being `1`)
+- `kube_persistentvolumeclaim_annotations{cluster, namespace, persistentvolumeclaim, annotation_argocd_argoproj_io_tracking_id, ...}` **[AECN]** (OPTIONAL — feeds the PVC ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label is kube-state-metrics' sanitised form of the `argocd.argoproj.io/tracking-id` annotation and requires the operator's `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`)
+- `kube_service_annotations{cluster, namespace, service, annotation_argocd_argoproj_io_tracking_id, ...}` **[AECN]** (OPTIONAL — feeds the service ArgoCD Application attribute; the `annotation_argocd_argoproj_io_tracking_id` label requires the operator's `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]`)
 
-The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes.
+The following six **controller-annotation** families feed the pod ArgoCD Application attribute (see "Pod ArgoCD Application attribute"). Each is OPTIONAL and **[AECN]**, each carries the `annotation_argocd_argoproj_io_tracking_id` label under the operator's `--metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id]`, and each is keyed by its own resource-identity label — note that the Job family's identity label is `job_name`, not `job`.
 
-`kube_persistentvolumeclaim_info` is likewise OPTIONAL: when absent — or when no series matches a given PVC — the reader SHALL still build a valid topology, the affected PVC entities carry no resolved StorageClass, no `pvc-to-storageclass` edge is emitted for them, and the Cytoscape serialiser nests those PVCs under their namespace group (`cluster > namespace > pvc`) like any other PVC. The same absence also yields no `volumename` (and hence no `svm`) label on the affected PVC entities (see "PVC PersistentVolume name and NetApp SVM labels").
+Each of the six SHALL be queried with the fixed, request-invariant matcher `annotation_argocd_argoproj_io_tracking_id!=""`. kube-state-metrics emits one series per workload object of that kind whether or not the annotation is allowlisted or present, and the reader discards every series whose tracking-id is empty before it is counted or keyed, so restricting the query to annotated objects is **output-preserving** — the same set of pods resolves the same Applications, and the missing-`cluster` diagnostic tally is unchanged. PromQL treats an absent label as the empty string, so a build against a kube-state-metrics with no annotation allowlist receives an empty vector rather than one series per workload object.
 
-`kube_storageclass_info` is likewise OPTIONAL: when absent — or when a PVC's resolved StorageClass name has no matching `kube_storageclass_info` series — the reader SHALL still build a valid topology and SHALL NOT fail the build. A StorageClass node referenced by a PVC but absent from `kube_storageclass_info` SHALL be synthesised **bare** (`labels={cluster}`, no backing-storage attributes) so the `pvc-to-storageclass` edge has a real target (see "StorageClass entity from kube_storageclass_info").
+- `kube_deployment_annotations{cluster, namespace, deployment, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
+- `kube_statefulset_annotations{cluster, namespace, statefulset, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
+- `kube_daemonset_annotations{cluster, namespace, daemonset, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
+- `kube_replicaset_annotations{cluster, namespace, replicaset, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
+- `kube_job_annotations{cluster, namespace, job_name, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
+- `kube_cronjob_annotations{cluster, namespace, cronjob, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
 
-`kube_pod_container_info` is likewise OPTIONAL: when absent — or when no series matches a given pod — the reader SHALL still build a valid topology, the affected pod entities carry no `containers` attribute, and the build does not fail. The `argocd_tracking_id` label on `kube_pod_owner` is likewise OPTIONAL: when absent, the affected pod entities carry no `application` attribute and the build does not fail.
+The kubelet volume-stats series of the "PVC usage from kubelet volume stats" requirement are **[AECN]**. The NetApp Harvest series of the `netapp-storage-graph` capability receive **no** request-scoped matcher — the `az` dimension reaches them through backend selection only (the `upstream-backend-routing` capability's zone rule) and `env` does not reach them at all.
+
+Every series above SHALL be queried at its bare (unprefixed) name — there is no configurable metric-name prefix. A request with no selector-level filter SHALL issue each query exactly as listed, with no request-scoped matcher.
+
+The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes. Under a selector-level filter the indexes hold only the in-scope services and the in-scope backing pods.
+
+`kube_persistentvolumeclaim_info` is likewise OPTIONAL: when absent — or when no series matches a given PVC — the reader SHALL still build a valid topology, the affected PVC entities carry no `storageclass` attribute, no `volumename` label (and hence no `svm` label and no `pvc-to-netapp-aggr` edge — see the `netapp-storage-graph` capability), and the Cytoscape serialiser nests those PVCs under their namespace group (`cluster > namespace > pvc`) like any other PVC.
+
+`kube_pod_container_info` is likewise OPTIONAL: when absent — or when no series matches a given pod — the reader SHALL still build a valid topology, the affected pod entities carry no `containers` attribute, and the build does not fail.
+
+The six controller-annotation families and `kube_job_owner` are likewise OPTIONAL: when absent — or when no series matches a given pod's resolved controller owner, or the matched series' `annotation_argocd_argoproj_io_tracking_id` label is empty — the reader SHALL still build a valid topology, the affected pod entities carry no `application` attribute and nest directly under their `controller` group (or their namespace group when they also have no controller owner), and the build does not fail. The reader SHALL NOT read any `argocd_tracking_id` label from `kube_pod_owner`; that label is no longer part of the series contract.
+
+**Query error is a separate axis from an empty vector**, and the seven split on it. `kube_replicaset_annotations` and `kube_job_annotations` SHALL degrade on a query error: the failure is logged, the family is treated as an empty vector, and the build completes without the Applications that family would have supplied. The other five — the Deployment, StatefulSet, DaemonSet and CronJob annotation families and `kube_job_owner` — SHALL fail the build on a query error, as every other kube-state-metrics leg does. The two that degrade are the two whose cardinality **accumulates with history** rather than tracking the live object count (one series per ReplicaSet retained by a Deployment's `revisionHistoryLimit`, one per Job retained by a CronJob's history limits), so they are the two that can exceed an upstream series or sample limit in an estate whose live object count is unremarkable — and losing an `application` string is never worth failing the whole graph. Caller-originated cancellation — a build timeout or a disconnected client — SHALL still fail the request for these two, since the caller is no longer waiting for any result.
+
+A degrade SHALL be **subtractive**: it removes Applications the failed family would have supplied and never substitutes a different one. This requires one gate. The Job → CronJob hop is taken only when the Job carries no annotation of its own, a fact a family that was never read cannot establish — so when the `kube_job_annotations` query fails, the reader SHALL suppress the hop for that build rather than let every Job miss fall through to its owning CronJob's Application. A Job that genuinely carries no annotation of its own therefore also resolves no Application while that leg is degraded. `kube_replicaset_annotations` needs no equivalent gate: a bare ReplicaSet has no further ancestor to consult, so its miss resolves nothing either way.
 
 `kube_node_status_condition` is likewise OPTIONAL: when absent — or when no `condition="Ready"` series matches a given node — the reader SHALL still build a valid topology, the affected K8s node entities carry no `ready_status` attribute, and the build does not fail.
 
 `kube_persistentvolumeclaim_annotations` and `kube_service_annotations` are likewise OPTIONAL: when absent — or when no series matches a given `(cluster, namespace, claim)` / `(cluster, namespace, service)`, or its `annotation_argocd_argoproj_io_tracking_id` label is empty — the reader SHALL still build a valid topology, the affected PVC / service entities carry no `application` attribute and nest under their namespace group, and the build does not fail.
 
-`kube_tridentvolume_info` and `kube_tridentbackend_info` are likewise OPTIONAL: when absent — the normal case on clusters without NetApp Trident or without the custom-resource-state config — or when no series matches a given join key, the reader SHALL still build a valid topology, the affected PVC entities carry no `svm` label (their `volumename` label is unaffected), and the build does not fail.
-
 #### Scenario: All families queried
 
 - **WHEN** a graph build runs against an upstream containing all families above
-- **THEN** the reader emits exactly one PromQL query per family for the build, each evaluated at the bucketed `end` over the bucketed window
+- **THEN** the reader emits exactly one PromQL query per family for the build, each evaluated at the caller-supplied `end` over `end - start`
 
 #### Scenario: Missing optional family
 
@@ -72,12 +96,17 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 #### Scenario: PVC info metric absent
 
 - **WHEN** the upstream contains `kube_pod_spec_volumes_persistentvolumeclaims_info` but no `kube_persistentvolumeclaim_info` series for the window
-- **THEN** the reader produces a valid topology in which every PVC entity has an empty StorageClass and emits no `pvc-to-storageclass` edge, carries no `volumename` or `svm` label, the build does not fail, and the serialiser nests every PVC under its namespace group
+- **THEN** the reader produces a valid topology in which every PVC entity has no `storageclass` attribute, carries no `volumename` or `svm` label, emits no `pvc-to-netapp-aggr` edge, the build does not fail, and the serialiser nests every PVC under its namespace group
 
 #### Scenario: StorageClass info metric absent
 
-- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` (so PVCs resolve a StorageClass name) but no `kube_storageclass_info` series for the window
-- **THEN** the reader produces a valid topology in which each referenced StorageClass is materialised as a bare node (`labels={cluster}`, no `provisioner`, no `parameters`), the `pvc-to-storageclass` edges are still emitted, and the build does not fail
+- **WHEN** the upstream contains `kube_storageclass_info` series for the window
+- **THEN** the reader never queries the metric (it is removed from the topology fan-out), no `storageclass` entity is materialised, and PVC entities still resolve their `storageclass` attribute from `kube_persistentvolumeclaim_info`
+
+#### Scenario: Trident custom-resource metrics absent
+
+- **WHEN** the upstream contains (or lacks) `kube_tridentvolume_info` / `kube_tridentbackend_info` series for the window
+- **THEN** the reader never queries either metric (the Trident chain is removed from the topology fan-out) and the PVC `svm` label resolves solely via the `netapp-storage-graph` capability's `volume_labels` join
 
 #### Scenario: Container info metric absent
 
@@ -94,10 +123,50 @@ The three service/endpointslice families are OPTIONAL: when absent (kube-state-m
 - **WHEN** the upstream contains `kube_persistentvolumeclaim_info` and `kube_service_info` but no `kube_persistentvolumeclaim_annotations` or `kube_service_annotations` series for the window
 - **THEN** the reader produces a valid topology in which every PVC and service entity carries no `application` attribute and nests under its namespace group, and the build does not fail
 
-#### Scenario: Trident custom-resource metrics absent
+#### Scenario: Controller annotation metrics absent
 
-- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` but no `kube_tridentvolume_info` or `kube_tridentbackend_info` series for the window
-- **THEN** the reader produces a valid topology in which PVC entities carry no `svm` label (while `volumename` still resolves from `kube_persistentvolumeclaim_info`), and the build does not fail
+- **WHEN** the upstream contains `kube_pod_owner` and `kube_replicaset_owner` but none of the six controller-annotation families and no `kube_job_owner` series for the window
+- **THEN** the reader produces a valid topology in which every pod entity keeps its `owner` attribute and carries no `application` attribute, no PVC inherits an Application from a mounting pod, and the build does not fail
+
+#### Scenario: Annotation allowlist not configured yields an empty vector
+
+- **WHEN** kube-state-metrics runs the `deployments` collector but no `--metric-annotations-allowlist` entry for it, so every `kube_deployment_annotations` series lacks the `annotation_argocd_argoproj_io_tracking_id` label
+- **THEN** the query returns no series at all (the fixed matcher excludes a series whose label is absent), no pod resolves an Application from that family, the build does not fail, and the outcome is indistinguishable from the family being absent
+
+#### Scenario: Accumulating-cardinality family degrades on a query error
+
+- **WHEN** the `kube_replicaset_annotations` or `kube_job_annotations` query fails upstream — a timeout, a 5xx, or a series/sample limit exceeded — while the caller's own deadline has not expired
+- **THEN** the failure is logged, that family is treated as an empty vector, every other family still resolves, pods owned by a bare ReplicaSet (or a Job) carry no `application` attribute, and the request returns a valid `200` graph
+
+#### Scenario: A degraded Job annotation family suppresses the CronJob hop
+
+- **WHEN** the `kube_job_annotations` query fails upstream while `kube_job_owner` and `kube_cronjob_annotations` both resolve, and a pod is owned by a Job that carries its own tracking-id under a CronJob that carries a different one
+- **THEN** the pod carries no `application` attribute — the hop is suppressed for the build, so the pod is never attributed to the CronJob's Application — while the same fixture with the Job family read but genuinely empty still resolves the CronJob's Application through the hop
+
+#### Scenario: A required annotation family still fails the build
+
+- **WHEN** the `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_cronjob_annotations`, or `kube_job_owner` query fails upstream
+- **THEN** the build fails and the request returns an error, as it does for every other kube-state-metrics topology leg
+
+#### Scenario: Caller cancellation still fails a degrading family
+
+- **WHEN** the `kube_job_annotations` query fails because the caller's own context is already done — the build timeout elapsed or the client disconnected
+- **THEN** the request fails rather than degrading, since the failure is the caller's deadline rather than an upstream fault
+
+#### Scenario: Job-owner rows the reader discards are never fetched
+
+- **WHEN** the upstream holds `kube_job_owner` series for Jobs owned by a CronJob and for Jobs with no controller owner or a non-CronJob owner
+- **THEN** only the `owner_kind="CronJob"` AND `owner_is_controller="true"` series are fetched, and the resolved Job → CronJob index is identical to the one built by fetching every series and filtering in the reader
+
+#### Scenario: Pod-level tracking-id label is not read
+
+- **WHEN** the upstream contains `kube_pod_owner` series carrying a non-empty `argocd_tracking_id` label
+- **THEN** the reader ignores that label entirely and resolves each pod's Application solely from its controller's `annotation_argocd_argoproj_io_tracking_id` — a pod whose controller carries no such annotation has no `application` attribute even though the pod-level label is populated
+
+#### Scenario: Namespace-scoped series narrowed at the source
+
+- **WHEN** a build runs with the namespace filter `shop` against an upstream holding pods in `shop` and `payments`
+- **THEN** every **[AECN]** series is issued with `namespace="shop"`, every **[AEC]** series is issued without a namespace matcher, the topology holds only `shop` pods, claims, services, and endpoints, and every node of the loaded clusters
 
 ### Requirement: Service and endpoint indexes
 
@@ -112,37 +181,6 @@ The two indexes are:
 
 - **WHEN** the upstream provides `kube_service_info{cluster="cluster-alpha", namespace="db", service="mongo", cluster_ip="10.96.0.5"}`, a `kube_endpointslice_labels{cluster="cluster-alpha", namespace="db", endpointslice="mongo-abc", label_kubernetes_io_service_name="mongo"}` series, and `kube_endpointslice_endpoints{cluster="cluster-alpha", namespace="db", endpointslice="mongo-abc", targetref_kind="Pod", targetref_name="mongo-0", targetref_namespace="db"}` whose `(namespace, targetref_name)` matches a `kube_pod_info` pod
 - **THEN** `ServicesByNameNS[(cluster-alpha, db, mongo)]` carries `cluster_ip="10.96.0.5"` and `EndpointsByService[(cluster-alpha, db, mongo)]` lists the resolved backing pod, while no `service` node or `service-selects-pod` edge is emitted into the graph by the topology reader
-
-### Requirement: Configurable upstream metric-name prefix
-
-The topology reader SHALL prepend a single configurable prefix to every `kube_*` series name it queries, so deployments using a fork of kube-state-metrics or a custom exporter that re-publishes the same series under an organisational prefix (e.g. `o11y_kube_pod_info`) can be supported without forking the API server. The prefix SHALL be sourced from the `KSG_METRIC_PREFIX` environment variable or the `--metric-prefix` flag (flag wins over env when both are set). The default value SHALL be the empty string, preserving stock kube-state-metrics behaviour. The prefix SHALL be additive — appended verbatim before the existing series name; the existing `kube_*` suffix and the upstream label-name contract (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `label_*`, etc.) are unchanged. The prefix SHALL be validated against the Prometheus metric-name charset `^[a-zA-Z_:][a-zA-Z0-9_:]*$` when non-empty; an invalid value SHALL fail server startup. The trailing underscore (if any) is the operator's responsibility — the server does not inject one.
-
-The same prefix SHALL apply to every kube-state-metrics-shaped series the reader consumes: `kube_pod_info`, `kube_node_info`, `kube_node_status_addresses`, `kube_pod_spec_volumes_persistentvolumeclaims_info`, `kube_node_labels`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_pod_owner`, `kube_replicaset_owner`, `kube_persistentvolumeclaim_info`, `kube_storageclass_info`, `kube_pod_container_info`, `kube_node_status_condition`, `kube_persistentvolumeclaim_annotations`, `kube_service_annotations`, `kube_tridentvolume_info`, `kube_tridentbackend_info`, and the `kube_node_info`-backed cluster discovery query. The upstream label-name contract those series carry is unchanged (`cluster`, `namespace`, `pod`, `uid`, `node`, `persistentvolumeclaim`, `storageclass`, `provisioner`, `storagePools`, `pool`, `fsType`, `fsName`, `ClusterID`, `selector`, `container`, `image`, `argocd_tracking_id`, `annotation_argocd_argoproj_io_tracking_id`, `condition`, `status`, `label_*`, `service`, `cluster_ip`, `endpointslice`, `address`, `hostname`, `targetref_kind`, `targetref_name`, `targetref_namespace`, `label_kubernetes_io_service_name`, `volumename`, `name`, `backendUUID`, `svm`, etc.). The prefix SHALL NOT be applied to `traces_service_graph_request_total` (which is produced by a different exporter family) nor to the Prometheus-native `up{}` readiness probe.
-
-#### Scenario: Default empty prefix preserves stock series names
-
-- **WHEN** the server starts without `KSG_METRIC_PREFIX` or `--metric-prefix`
-- **THEN** every topology query string contains the bare `kube_*` series name (e.g. `last_over_time(kube_pod_info[<window>])`) and no prefix is added
-
-#### Scenario: Custom prefix from environment
-
-- **WHEN** the server starts with `KSG_METRIC_PREFIX=o11y_`
-- **THEN** the issued topology PromQL contains `last_over_time(o11y_kube_pod_info[<window>])`, `last_over_time(o11y_kube_node_info[<window>])`, `last_over_time(o11y_kube_node_status_addresses{type=~"ExternalIP|InternalIP"}[<window>])`, `last_over_time(o11y_kube_pod_spec_volumes_persistentvolumeclaims_info[<window>])`, `last_over_time(o11y_kube_node_labels[<window>])`, `last_over_time(o11y_kube_service_info[<window>])`, `last_over_time(o11y_kube_endpointslice_endpoints[<window>])`, `last_over_time(o11y_kube_endpointslice_labels[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_info[<window>])`, `last_over_time(o11y_kube_storageclass_info[<window>])`, `tlast_over_time(o11y_kube_pod_container_info[<window>])` (the container query uses `tlast_over_time` so each image-variant series' value is its last-sample timestamp — see the "Pod container list attribute" requirement and design.md D-A4), `last_over_time(o11y_kube_node_status_condition{condition="Ready"}[<window>])`, `last_over_time(o11y_kube_persistentvolumeclaim_annotations[<window>])`, `last_over_time(o11y_kube_service_annotations[<window>])`, `last_over_time(o11y_kube_tridentvolume_info[<window>])`, `last_over_time(o11y_kube_tridentbackend_info[<window>])`, AND the cluster-discovery query becomes `group by (cluster) (last_over_time(o11y_kube_node_info[<lookback>]))`
-
-#### Scenario: Prefix does not affect service-graph or probe queries
-
-- **WHEN** the server starts with `KSG_METRIC_PREFIX=o11y_`
-- **THEN** the service-graph reader still queries `rate(traces_service_graph_request_total[<window>])` (no prefix) and the `/readyz` probe still issues `up` (no prefix)
-
-#### Scenario: Flag overrides environment variable
-
-- **WHEN** the server starts with `KSG_METRIC_PREFIX=acme_` in the environment and `--metric-prefix=beta_` on the command line
-- **THEN** the resulting topology queries reference `beta_kube_pod_info` and not `acme_kube_pod_info`
-
-#### Scenario: Invalid prefix charset rejected at startup
-
-- **WHEN** the server starts with `KSG_METRIC_PREFIX="o11y-bad!"`
-- **THEN** `config.Validate` returns an error containing `metric-prefix` and the process exits non-zero before binding the listener
 
 ### Requirement: Time-window evaluation
 
@@ -160,10 +198,10 @@ Each topology query SHALL be evaluated at the caller-supplied `end` timestamp us
 
 ### Requirement: Cluster-scoped IDs
 
-The reader SHALL produce topology entities whose stable identifiers are cluster-scoped:
+The reader SHALL produce topology entities whose stable identifiers are cluster-scoped, where `<cluster>` is the cluster **identity** of "Cluster identity composed from zone and environment labels" — `<az>-<env>-<cluster>` when the series composed one, the raw `cluster` label otherwise:
 
-- Pod ID = `<cluster>/<pod-uid>` (composite of `cluster` and `uid` labels).
-- K8s node ID = `<cluster>/<node>` (composite of `cluster` and `node` labels).
+- Pod ID = `<cluster>/<pod-uid>` (composite of the cluster identity and the `uid` label).
+- K8s node ID = `<cluster>/<node>` (composite of the cluster identity and the `node` label).
 - PVC ID = `<cluster>/<namespace>/<claim_name>`.
 - StorageClass ID = `<cluster>/storageclass/<storageclass>` (composite of `cluster` and the `storageclass` name label; StorageClass is a cluster-scoped Kubernetes object whose name is not globally unique across clusters).
 
@@ -172,10 +210,20 @@ The reader SHALL produce topology entities whose stable identifiers are cluster-
 - **WHEN** `kube_node_info{cluster="cluster-alpha", node="worker-0"}` and `kube_node_info{cluster="cluster-beta", node="worker-0"}` both exist in the window
 - **THEN** the reader emits two distinct K8s node entities with IDs `cluster-alpha/worker-0` and `cluster-beta/worker-0`
 
+#### Scenario: Two clusters with the same raw name in different zones
+
+- **WHEN** `kube_node_info{cluster="c1", node="worker-0", az="us", env="dev"}` and `kube_node_info{cluster="c1", node="worker-0", az="eu", env="prod"}` both exist in the window
+- **THEN** the reader emits two distinct K8s node entities with IDs `us-dev-c1/worker-0` and `eu-prod-c1/worker-0`
+
 #### Scenario: Pod ID derives from uid label
 
 - **WHEN** `kube_pod_info{cluster="cluster-alpha", uid="abc-123", ...}` is present
 - **THEN** the reader emits a pod entity with ID `cluster-alpha/abc-123`
+
+#### Scenario: Pod ID carries the composed identity
+
+- **WHEN** `kube_pod_info{cluster="c1", uid="abc-123", az="us", env="dev", ...}` is present
+- **THEN** the reader emits a pod entity with ID `us-dev-c1/abc-123` and `labels.cluster: "us-dev-c1"`
 
 #### Scenario: Two clusters with same StorageClass name
 
@@ -275,23 +323,24 @@ When `last_over_time(kube_pod_info[...])` returns multiple `uid` values for the 
 - **WHEN** the window includes a pod restart producing two distinct UIDs for the same `(cluster, namespace, pod)` tuple
 - **THEN** the resulting topology contains exactly one pod entity, identified by the newest UID; the prior UID does not appear as a node and no synthetic edge is emitted
 
-### Requirement: Cluster discovery query
-
-The topology reader SHALL provide a discovery query, used by the cluster discovery endpoint, that returns the set of distinct `cluster` label values observed in `kube_node_info` over a configurable lookback (default 1 hour) via PromQL `group by (cluster) (last_over_time(kube_node_info[<lookback>]))`.
-
-#### Scenario: Two clusters discovered
-
-- **WHEN** centralised VictoriaMetrics holds `kube_node_info` series for `cluster=cluster-alpha` and `cluster=cluster-beta` within the discovery lookback
-- **THEN** the discovery query returns exactly the set `{ "cluster-alpha", "cluster-beta" }`
-
 ### Requirement: Series missing the cluster label
 
-A topology series that is missing the `cluster` label SHALL be bucketed under `cluster="unknown"`. The reader SHALL surface the count of such series via the `kube_state_graph_clusters_observed` gauge (the value `unknown` will appear in the gauge's label set when present).
+A topology series that is missing the `cluster` label SHALL be bucketed under the raw name `unknown`, which then resolves through the identity ladder like any other raw name: a series carrying both zone and environment labels composes to `<az>-<env>-unknown`, one carrying neither resolves to the verbatim `unknown`. The reader SHALL surface the count of such series via the `kube_state_graph_clusters_observed` gauge (an identity with the raw component `unknown` will appear in the gauge's label set when present). A request-scoped `cluster` filter whose value is `unknown` SHALL be rendered as an anchored alternation carrying BOTH spellings of the bucket — the literal `unknown` and the empty string, i.e. `cluster=~"unknown|"` — because a series whose `cluster` label is literally `unknown` and one carrying no `cluster` label are indistinguishable after bucketing and both belong to the bucket. (PromQL's empty alternative matches a series that carries no such label.) The alternation form SHALL be used even when `unknown` is the only requested value. Any other value renders as the literal value. At projection the same filter matches every identity whose raw component is `unknown`.
 
 #### Scenario: Legacy series without cluster label
 
 - **WHEN** a `kube_pod_info` series has no `cluster` label
 - **THEN** the resulting pod entity has `cluster: "unknown"` and contributes to the `unknown` value in the observed-clusters set
+
+#### Scenario: Cluster-less series with zone and environment composes
+
+- **WHEN** a `kube_pod_info` series has no `cluster` label but carries `az="us"` and `env="dev"`
+- **THEN** the resulting pod entity has id `us-dev-unknown/<uid>` and `cluster: "us-dev-unknown"`, and a request with `?cluster=unknown` still loads it upstream and admits it at projection
+
+#### Scenario: Filtering on the unknown bucket
+
+- **WHEN** a build runs with the cluster filter `unknown` against an upstream where some `kube_pod_info` series carry no `cluster` label, one carries `cluster="unknown"`, and others carry `cluster="cluster-alpha"`
+- **THEN** the query is issued with `cluster=~"unknown|"`, the unlabelled series AND the literally-`unknown` series are loaded, `cluster-alpha` is not, and the resulting pod entities all have `cluster: "unknown"`
 
 ### Requirement: Per-call upstream timeout
 
@@ -304,43 +353,50 @@ Each topology query SHALL be issued with a per-call context timeout (default 10 
 
 ### Requirement: PVC StorageClass resolution
 
-The topology reader SHALL resolve each PVC's StorageClass **name** from `kube_persistentvolumeclaim_info`, joining on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity (which derives from `kube_pod_spec_volumes_persistentvolumeclaims_info`, where the claim name comes from the `claim_name` label). The resolved StorageClass name SHALL drive a directed `pvc-to-storageclass` edge from the PVC node to the StorageClass node `<cluster>/storageclass/<name>` (see "Topology relationship edges"). The name SHALL NOT be added to the PVC `labels` map and SHALL NOT be serialised as a standalone PVC attribute — there SHALL be no `data.storageclass` field on the `type="pvc"` node. The StorageClass surfaces in the wire output as the real `type="storageclass"` node and the `pvc-to-storageclass` edge, NOT as compound nesting of the PVC.
+The topology reader SHALL resolve each PVC's StorageClass **name** from `kube_persistentvolumeclaim_info`, joining on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity (which derives from `kube_pod_spec_volumes_persistentvolumeclaims_info`, where the claim name comes from the `claim_name` label). The resolved name SHALL be surfaced as the PVC's own typed `storageclass` attribute (serialised `data.storageclass`, `omitempty` — graph-api "PVC `storageclass` and `usage` attributes"). It SHALL NOT be added to the PVC `labels` map, SHALL NOT drive any edge, and SHALL NOT materialise any node — the StorageClass entity and the `pvc-to-storageclass` edge are removed. The name is retained because it is the operator's discriminator for the `netapp-storage-graph` join-coverage signal: it distinguishes "this claim was never meant to have a NetApp backend" from "this claim should have joined and did not".
 
-`kube_persistentvolumeclaim_info` is OPTIONAL: when the series is absent, or when no series matches a given `(cluster, namespace, claim)`, that PVC's StorageClass name SHALL be empty, no `pvc-to-storageclass` edge SHALL be emitted for it, and the build SHALL NOT fail. When the upstream reports more than one StorageClass value for a single `(cluster, namespace, claim)` the reader SHALL pick deterministically (the lexically smallest StorageClass name) so the emitted edge target is byte-stable across rebuilds.
+`kube_persistentvolumeclaim_info` is OPTIONAL: when the series is absent, or when no series matches a given `(cluster, namespace, claim)`, that PVC's StorageClass name SHALL be empty (the attribute absent), and the build SHALL NOT fail. When the upstream reports more than one StorageClass value for a single `(cluster, namespace, claim)` the reader SHALL pick deterministically (the lexically smallest StorageClass name) so the emitted attribute is byte-stable across rebuilds.
 
 #### Scenario: StorageClass resolved for a PVC drives an edge
 
-- **WHEN** the upstream provides `kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha", namespace="db", claim_name="data-mongo-0"}` and `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", storageclass="gp3"}`
-- **THEN** the reader emits a directed `pvc-to-storageclass` edge from `cluster-alpha/db/data-mongo-0` to `cluster-alpha/storageclass/gp3`, no `storageclass` key appears in the PVC's `labels`, and no `data.storageclass` field is emitted on the PVC node
+- **WHEN** the upstream provides `kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha", namespace="db", claim_name="data-mongo-0"}` and `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", storageclass="netapp-nas"}`
+- **THEN** the `cluster-alpha/db/data-mongo-0` PVC entity carries `data.storageclass="netapp-nas"`, no `storageclass` key appears in its `labels`, and no edge or node is emitted for the StorageClass (the former drives-an-edge behaviour is removed)
 
 #### Scenario: PVC with no matching StorageClass series
 
 - **WHEN** a PVC derived from `kube_pod_spec_volumes_persistentvolumeclaims_info` has no matching `kube_persistentvolumeclaim_info{persistentvolumeclaim=...}` series for its `(cluster, namespace, claim)`
-- **THEN** that PVC entity carries an empty StorageClass name, no `pvc-to-storageclass` edge is emitted for it, and the build does not fail
+- **THEN** that PVC entity carries no `storageclass` attribute and the build does not fail
 
 #### Scenario: Deterministic pick on duplicate StorageClass series
 
 - **WHEN** the upstream reports two `kube_persistentvolumeclaim_info` series for the same `(cluster, namespace, claim)` with `storageclass="gp3"` and `storageclass="gp2"`
-- **THEN** the reader resolves the PVC's StorageClass to `gp2` (the lexically smallest) deterministically across rebuilds, and the `pvc-to-storageclass` edge targets `<cluster>/storageclass/gp2`
+- **THEN** the reader resolves the PVC's `data.storageclass` to `gp2` (the lexically smallest) deterministically across rebuilds
 
 ### Requirement: Optional basic-auth credentials for the upstream endpoint
 
-The server SHALL support optional HTTP Basic Auth credentials for the single upstream Prometheus-compatible endpoint, sourced **exclusively** from the environment variables `KSG_PROM_USERNAME` and `KSG_PROM_PASSWORD`. No CLI flag SHALL exist for either value — credential-carrying flags leak through process listings and container specs; this is a deliberate exception to the env+flag dual-track configuration convention.
+The server SHALL support optional HTTP Basic Auth credentials for each upstream Prometheus-compatible endpoint, sourced **exclusively** from environment variables. No CLI flag SHALL exist for any credential value — credential-carrying flags leak through process listings and container specs; this is a deliberate exception to the env+flag dual-track configuration convention.
 
-When both variables are set (non-empty), every outbound HTTP request to the upstream — topology queries, the service-graph query, the cluster-discovery query, and the `/readyz` `up` probe — SHALL carry an `Authorization: Basic` header for those credentials. When both are unset, requests SHALL carry no `Authorization` header and behaviour is unchanged from an unauthenticated deployment.
+`KSG_PROM_USERNAME` and `KSG_PROM_PASSWORD` are the **global** pair. When both are set (non-empty), every outbound HTTP request to an upstream that declares no credentials of its own — topology queries, the service-graph queries, the Harvest queries, and the `/readyz` `up` probe — SHALL carry an `Authorization: Basic` header for those credentials. When both are unset, such requests SHALL carry no `Authorization` header and behaviour is unchanged from an unauthenticated deployment.
 
-Setting exactly one of the two variables (non-empty) SHALL fail server startup with a validation error that names both environment variables but does NOT echo either value.
+A routed deployment MAY additionally give an individual backend its own pair by naming the environment variables holding it, as specified by the `upstream-backend-routing` capability's per-backend credential requirement; that pair takes precedence over the global one for requests to that backend.
 
-The credential values SHALL NOT appear in any log line, trace span attribute, metric label, error message, or HTTP response body. Rotation requires a process restart — there is no hot reload for upstream credentials.
+Setting exactly one of the two global variables (non-empty) SHALL fail server startup with a validation error that names both environment variables but does NOT echo either value.
+
+Credential values SHALL NOT appear in any log line, trace span attribute, metric label, error message, or HTTP response body. Rotation of a credential **value** requires a process restart — there is no hot reload for upstream credential values.
 
 #### Scenario: Credentials applied to all upstream queries
 
 - **WHEN** the server starts with `KSG_PROM_USERNAME=ksg` and `KSG_PROM_PASSWORD=s3cret` and serves a `/v1/graph` request
-- **THEN** every upstream HTTP request issued for the build (topology fan-out, service-graph, and any cluster-discovery or readiness query) carries `Authorization: Basic` for `ksg:s3cret`
+- **THEN** every upstream HTTP request issued for the build (topology fan-out, service-graph, Harvest, and any readiness query) carries `Authorization: Basic` for `ksg:s3cret`
+
+#### Scenario: Per-backend pair overrides the global pair
+
+- **WHEN** the global pair is set and one backend declares its own credential variables
+- **THEN** requests to that backend carry the backend's credentials and requests to every other backend carry the global pair
 
 #### Scenario: No credentials configured
 
-- **WHEN** the server starts with neither `KSG_PROM_USERNAME` nor `KSG_PROM_PASSWORD` set
+- **WHEN** the server starts with neither `KSG_PROM_USERNAME` nor `KSG_PROM_PASSWORD` set and no backend declares its own
 - **THEN** upstream requests carry no `Authorization` header and startup validation passes
 
 #### Scenario: Half-configured credentials rejected at startup
@@ -356,7 +412,7 @@ The credential values SHALL NOT appear in any log line, trace span attribute, me
 #### Scenario: Credentials never logged
 
 - **WHEN** the server runs with credentials configured at any log level, including `debug`, and upstream queries succeed or fail
-- **THEN** no emitted log line, span attribute, or error string contains the configured username or password
+- **THEN** no emitted log line, span attribute, or error string contains any configured username or password
 
 ### Requirement: Pod container list attribute
 
@@ -398,28 +454,98 @@ Note (design.md D-A4): the latest-image pick is reliable only for query windows 
 
 ### Requirement: Pod ArgoCD Application attribute
 
-The topology reader SHALL resolve each pod's **ArgoCD Application** from the `argocd_tracking_id` label carried on its `kube_pod_owner` series and surface it on the pod entity as a typed, nullable `application` attribute (a string), serialised as `data.application` (`omitempty`) and **never inside `labels`**. The reader SHALL read the `argocd_tracking_id` label value independently of which `kube_pod_owner` row wins the controller-owner pick (the Application is a pod-level fact that must survive even when no row is a controller).
+The topology reader SHALL resolve each pod's **ArgoCD Application** from the `annotation_argocd_argoproj_io_tracking_id` label carried on the annotation series of the pod's **controller**, and surface it on the pod entity as a typed, nullable `application` attribute (a string), serialised as `data.application` (`omitempty`) and **never inside `labels`**. ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on the pods a controller spawns, so the controller is the only place the value exists; the reader SHALL NOT read any `argocd_tracking_id` label from `kube_pod_owner`.
 
-The Application name SHALL be the substring of the `argocd_tracking_id` value **before the first `:`** (ArgoCD annotation-based tracking-id form `<app>:<group>/<kind>:<namespace>/<name>`); when the value contains no `:`, the **entire value** SHALL be surfaced verbatim. When more than one distinct non-empty `argocd_tracking_id` value is observed across a pod's `kube_pod_owner` rows, the reader SHALL pick the **lexically-smallest non-empty** value so the emitted entity is deterministic and order-free. When the label is absent or empty for a pod, the reader SHALL emit a nil `application` so `data.application` is omitted entirely — it SHALL NOT emit an empty string or any application key in `labels`. The `argocd_tracking_id` label is OPTIONAL: when no `kube_pod_owner` series carries it, the reader SHALL build a valid topology with no `application` on any pod and SHALL NOT fail the build. This requirement introduces NO new node or edge type — the Application is a typed attribute on the existing `type="pod"` node (the same precedent as the `owner` attribute), keeping `labels` a strict `map[string]string` of typological metadata.
+**Controller key.** The lookup key SHALL be the pod's own resolved controller owner from "Pod controller-owner attribute with ReplicaSet skip" — `(cluster, namespace, owner_kind, owner_name)` — so a pod owned through a ReplicaSet is looked up against its already-resolved **Deployment**, and no additional owner hop is needed for that case. A pod with no controller owner SHALL resolve no Application.
+
+**Controller-annotation index.** The reader SHALL build one index keyed `(cluster, namespace, kind, name)` from the six controller-annotation families, each contributing its own owner kind and identity label:
+
+| Owner kind | Series | Identity label |
+|---|---|---|
+| `Deployment` | `kube_deployment_annotations` | `deployment` |
+| `StatefulSet` | `kube_statefulset_annotations` | `statefulset` |
+| `DaemonSet` | `kube_daemonset_annotations` | `daemonset` |
+| `ReplicaSet` | `kube_replicaset_annotations` | `replicaset` |
+| `Job` | `kube_job_annotations` | `job_name` |
+| `CronJob` | `kube_cronjob_annotations` | `cronjob` |
+
+A series whose identity label is empty SHALL be skipped. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
+
+**Job → CronJob hop.** When the resolved owner kind is `Job` and the index holds no entry for that Job, the reader SHALL resolve the Job's owning CronJob via `kube_job_owner` keyed `(cluster, namespace, job_name=<owner_name>)` selecting the series with `owner_is_controller="true"` and `owner_kind="CronJob"`, and SHALL then look the index up again at `(cluster, namespace, "CronJob", <owner_name of the job_owner series>)`. This hop exists because the Kubernetes CronJob controller propagates only `spec.jobTemplate.metadata` annotations onto the Jobs it creates — never the CronJob object's own annotations — so ArgoCD's tracking-id never reaches the Job. A directly ArgoCD-managed Job is resolved by its own annotation before the hop is attempted. The hop is **resolution-only**: it SHALL NOT change the pod's `owner` attribute, which stays `{kind:"Job", name:<job>}`, nor its `controller` compound group. On a defensive collision (more than one controller CronJob owner for a Job) the lexically-smallest `owner_name` SHALL win.
+
+**Application name.** The Application name SHALL be the substring of the tracking-id value **before the first `:`** (ArgoCD annotation-based tracking-id form `<app>:<group>/<kind>:<namespace>/<name>`); when the value contains no `:`, the **entire value** SHALL be surfaced verbatim; when the leading segment is empty (e.g. `:apps/Deployment:ns/x`) the controller SHALL resolve to **no** Application rather than to an empty string. This is byte-for-byte the parse the service and PVC resolvers use, so a workload, its Service and its PVC derive their Application from one grammar.
+
+**Determinism.** When more than one distinct non-empty tracking-id is observed for a single `(cluster, namespace, kind, name)`, the reader SHALL pick the **lexically-smallest** raw value whose derived Application is non-empty, so the emitted entity is stable and order-free across rebuilds (D6), mirroring the service and PVC resolvers.
+
+**Unsupported owner kinds.** A pod whose resolved controller owner is of a kind with no kube-state-metrics annotation family — `ReplicationController` (no `kube_replicationcontroller_annotations` exists), `Node` (static / mirror pods), and any third-party CRD controller such as argo-rollouts `Rollout` or OpenKruise `CloneSet` — SHALL resolve no Application. The reader SHALL NOT fail the build, SHALL keep the pod's `owner` attribute, and SHALL NOT emit an empty string.
+
+**Optionality.** The six controller-annotation families and `kube_job_owner` are OPTIONAL: when the annotation allowlist is not configured (their common state under stock kube-state-metrics) the vectors are empty, no pod resolves an Application, and the build SHALL NOT fail. When the label is absent, empty, or unmatched for a pod, the reader SHALL emit a nil `application` so `data.application` is omitted entirely — it SHALL NOT emit an empty string or any application key in `labels`.
+
+This requirement introduces NO new node or edge type — the Application is a typed attribute on the existing `type="pod"` node (the same precedent as the `owner` attribute), keeping `labels` a strict `map[string]string` of typological metadata.
 
 #### Scenario: Pod with a full ArgoCD tracking-id
 
-- **WHEN** `kube_pod_owner{cluster="cluster-alpha", namespace="shop", pod="checkout-1", owner_kind="ReplicaSet", owner_name="checkout-7f9c", owner_is_controller="true", argocd_tracking_id="checkout:apps/Deployment:shop/checkout"}` is present
-- **THEN** the emitted pod entity has `application="checkout"` (the segment before the first `:`) and no `argocd_tracking_id` key in `labels`
+- **WHEN** `kube_pod_owner{cluster="cluster-alpha", namespace="shop", pod="checkout-1", owner_kind="ReplicaSet", owner_name="checkout-7f9c", owner_is_controller="true"}`, `kube_replicaset_owner{cluster="cluster-alpha", namespace="shop", replicaset="checkout-7f9c", owner_kind="Deployment", owner_name="checkout"}` and `kube_deployment_annotations{cluster="cluster-alpha", namespace="shop", deployment="checkout", annotation_argocd_argoproj_io_tracking_id="storefront:apps/Deployment:shop/checkout"}` are present
+- **THEN** the emitted pod entity has `application="storefront"` (the segment before the first `:`), `owner={kind:"Deployment", name:"checkout"}`, and no tracking-id key in `labels`
+
+#### Scenario: Pod owned directly by a StatefulSet
+
+- **WHEN** a pod's resolved owner is `{kind:"StatefulSet", name:"mongo"}` and `kube_statefulset_annotations{cluster="cluster-alpha", namespace="db", statefulset="mongo", annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:db/mongo"}` is present
+- **THEN** the emitted pod entity has `application="mongo"`
+
+#### Scenario: Pod owned directly by a DaemonSet
+
+- **WHEN** a pod's resolved owner is `{kind:"DaemonSet", name:"fluentd"}` and `kube_daemonset_annotations{cluster="cluster-alpha", namespace="platform", daemonset="fluentd", annotation_argocd_argoproj_io_tracking_id="logging:apps/DaemonSet:platform/fluentd"}` is present
+- **THEN** the emitted pod entity has `application="logging"`
+
+#### Scenario: Pod owned by a bare ReplicaSet
+
+- **WHEN** a pod's resolved owner is `{kind:"ReplicaSet", name:"adhoc-rs"}` (no owning Deployment) and `kube_replicaset_annotations{cluster="cluster-alpha", namespace="shop", replicaset="adhoc-rs", annotation_argocd_argoproj_io_tracking_id="adhoc:apps/ReplicaSet:shop/adhoc-rs"}` is present
+- **THEN** the emitted pod entity has `application="adhoc"`
+
+#### Scenario: Pod owned by a CronJob-created Job
+
+- **WHEN** a pod's resolved owner is `{kind:"Job", name:"nightly-28901"}`, no `kube_job_annotations` series matches that Job, `kube_job_owner{cluster="cluster-alpha", namespace="batch", job_name="nightly-28901", owner_kind="CronJob", owner_name="nightly", owner_is_controller="true"}` is present, and `kube_cronjob_annotations{cluster="cluster-alpha", namespace="batch", cronjob="nightly", annotation_argocd_argoproj_io_tracking_id="reports:batch/CronJob:batch/nightly"}` is present
+- **THEN** the emitted pod entity has `application="reports"` and its `owner` attribute remains `{kind:"Job", name:"nightly-28901"}` — the hop does not rewrite the owner
+
+#### Scenario: Directly managed Job resolves before the hop
+
+- **WHEN** a pod's resolved owner is `{kind:"Job", name:"migrate-1"}` and `kube_job_annotations{cluster="cluster-alpha", namespace="shop", job_name="migrate-1", annotation_argocd_argoproj_io_tracking_id="migrations:batch/Job:shop/migrate-1"}` is present alongside a `kube_job_owner` series naming a CronJob with a different tracking-id
+- **THEN** the emitted pod entity has `application="migrations"` (the Job's own annotation wins; the CronJob hop is not attempted)
 
 #### Scenario: Pod with a bare Application name (no colon)
 
-- **WHEN** a pod's `kube_pod_owner` series carries `argocd_tracking_id="checkout"` (no `:`)
-- **THEN** the emitted pod entity has `application="checkout"` (the verbatim value)
+- **WHEN** a pod's controller annotation value is `checkout` (no `:`)
+- **THEN** the emitted pod entity has `application="checkout"`
+
+#### Scenario: Empty leading segment yields no Application
+
+- **WHEN** a pod's controller annotation value is `:apps/Deployment:shop/checkout`
+- **THEN** the emitted pod entity has a nil `application` (`data.application` omitted entirely)
+
+#### Scenario: Deterministic pick on duplicate controller annotation series
+
+- **WHEN** two `kube_deployment_annotations` series for the same `(cluster, namespace, deployment)` report tracking-ids `zeta:apps/Deployment:shop/x` and `alpha:apps/Deployment:shop/x`
+- **THEN** every pod owned by that Deployment resolves `application="alpha"` (the lexically-smallest raw value) and the choice is identical across rebuilds
 
 #### Scenario: Pod with no ArgoCD label
 
-- **WHEN** no `kube_pod_owner` series for a pod carries a non-empty `argocd_tracking_id` label
+- **WHEN** a pod's resolved owner is `{kind:"Deployment", name:"checkout"}` and the matching `kube_deployment_annotations` series carries an empty `annotation_argocd_argoproj_io_tracking_id` (or no series matches)
 - **THEN** the emitted pod entity has a nil `application` (`data.application` omitted entirely) and carries no application key in `labels`
+
+#### Scenario: Pod with no controller owner
+
+- **WHEN** no `kube_pod_owner` series with `owner_is_controller="true"` exists for a pod
+- **THEN** the emitted pod entity has a nil `application` and no controller-annotation lookup is attempted
+
+#### Scenario: Owner kind with no annotation family
+
+- **WHEN** a pod's resolved owner is `{kind:"Rollout", name:"canary"}` or `{kind:"ReplicationController", name:"legacy"}`
+- **THEN** the emitted pod entity keeps that `owner`, has a nil `application`, and the build does not fail
 
 #### Scenario: ArgoCD label absent entirely
 
-- **WHEN** the upstream contains `kube_pod_owner` series but none carry an `argocd_tracking_id` label for the window
+- **WHEN** the upstream contains `kube_pod_owner` series but none of the six controller-annotation families for the window
 - **THEN** the reader produces a valid topology with no `application` on any pod and does not fail the build
 
 ### Requirement: K8s node Ready-status attribute
@@ -460,56 +586,13 @@ For each `(cluster, node)`, the reader SHALL read the `status` label of the **ac
 - **WHEN** the active `condition="Ready"` series for `(cluster="cluster-alpha", node="worker-0")` carries `status="True"` (value `1`) — the raw Kubernetes `v1.ConditionStatus` casing an exporter may emit instead of the lowercase form stock kube-state-metrics produces
 - **THEN** the emitted K8s node entity has `ready_status="Ready"` (the reader matches the `status` label case-insensitively), and likewise `status="False"` → `"NotReady"` and `status="Unknown"` → `"Unknown"`
 
-### Requirement: StorageClass entity from kube_storageclass_info
-
-The topology reader SHALL materialise each StorageClass observed in `kube_storageclass_info` as a real `type="storageclass"` graph node, keyed by `(cluster, storageclass)` with ID `<cluster>/storageclass/<storageclass>` and `name=<storageclass>`. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series). The node's `labels` SHALL be a strict `map[string]string` containing exactly `cluster`.
-
-The reader SHALL surface the StorageClass's provisioner and backing-storage parameters as **typed attributes, NOT inside `labels`** (the `owner` / `ipaddress` precedent):
-
-- `provisioner` (serialised `data.provisioner`, `omitempty`) ← the native `provisioner` label of `kube_storageclass_info`.
-- `parameters` (serialised `data.parameters`, an object `map[string]string`, `omitempty`) — the NetApp/Ceph backing-storage values, each key resolved as **first non-empty source label wins** and **omitted when its resolved value is empty**:
-  - `pool` ← the `storagePools` label, else the `pool` label
-  - `fs` ← the `fsType` label, else the `fsName` label
-  - `cluster_id` ← the `ClusterID` label
-  - `selector` ← the `selector` label
-
-The native kube-state-metrics `reclaim_policy` and `volume_binding_mode` fields are OUT OF SCOPE and SHALL NOT be surfaced. When more than one `kube_storageclass_info` series is observed for a single `(cluster, storageclass)`, the `provisioner` and each `parameters` key SHALL be resolved deterministically (the lexically-smallest non-empty value) so the emitted node is byte-stable across rebuilds. The StorageClass node SHALL NOT carry `ipaddress`, `owner`, `application`, `containers`, or `ready_status`, and SHALL NOT place the provisioner or any parameter inside `labels`.
-
-A StorageClass referenced by a PVC (via "PVC StorageClass resolution") but absent from `kube_storageclass_info` SHALL be materialised as a **bare** node (`labels={cluster}`, no `provisioner`, no `parameters`) so the `pvc-to-storageclass` edge has a real target; when both an attributed and a bare candidate exist for the same `(cluster, storageclass)`, the attributed node SHALL win. `kube_storageclass_info` is OPTIONAL: when absent the reader SHALL build a valid topology (all referenced StorageClass nodes bare) and SHALL NOT fail the build.
-
-#### Scenario: StorageClass node with provisioner and parameters
-
-- **WHEN** `kube_storageclass_info{cluster="cluster-alpha", storageclass="netapp-nas", provisioner="csi.trident.netapp.io", storagePools="aggr1", fsType="nfs", ClusterID="ceph-uuid", selector="region=eu"}` is present
-- **THEN** the reader emits a StorageClass entity with `id="cluster-alpha/storageclass/netapp-nas"`, `name="netapp-nas"`, `type="storageclass"`, `labels={cluster:"cluster-alpha"}`, `data.provisioner="csi.trident.netapp.io"`, and `data.parameters={pool:"aggr1", fs:"nfs", cluster_id:"ceph-uuid", selector:"region=eu"}`
-
-#### Scenario: Source-label fallback order
-
-- **WHEN** a series carries `pool="ceph-pool"` (and no `storagePools`) and `fsName="cephfs"` (and no `fsType`)
-- **THEN** the StorageClass node's `data.parameters` carries `pool="ceph-pool"` and `fs="cephfs"`
-
-#### Scenario: Unset attributes omitted
-
-- **WHEN** a `kube_storageclass_info` series carries `storageclass="gp3"` and none of `provisioner`/`storagePools`/`pool`/`fsType`/`fsName`/`ClusterID`/`selector`
-- **THEN** the StorageClass node's `labels` is `{cluster}`, its `data` has no `provisioner` field, and its `data` has no `parameters` field
-
-#### Scenario: Deterministic attribute pick on duplicate series
-
-- **WHEN** two `kube_storageclass_info` series for `(cluster-alpha, gp3)` carry `pool="b-pool"` and `pool="a-pool"`
-- **THEN** the StorageClass node's `data.parameters.pool` is `a-pool` (the lexically smallest) deterministically across rebuilds
-
-#### Scenario: Bare node for a referenced-but-absent StorageClass
-
-- **WHEN** a PVC resolves StorageClass `gp3` but no `kube_storageclass_info` series exists for `(cluster-alpha, gp3)`
-- **THEN** the reader materialises `cluster-alpha/storageclass/gp3` as a bare node with `labels={cluster:"cluster-alpha"}`, no `provisioner`/`parameters`, and emits the `pvc-to-storageclass` edge to it
-
 ### Requirement: Topology relationship edges
 
-The topology reader SHALL emit two directed topology relationship edges, in addition to `pod-mounts-pvc`, using deterministic UUIDv5 edge IDs (canonical input `<type>|<source>|<target>`) and de-duplicating by `(type, source, target)` so the emitted set is byte-stable across rebuilds:
+The topology reader SHALL emit one directed topology relationship edge, in addition to `pod-mounts-pvc`, using deterministic UUIDv5 edge IDs (canonical input `<type>|<source>|<target>`) and de-duplicating by `(type, source, target)` so the emitted set is byte-stable across rebuilds:
 
 - **`pod-to-node`** — for every pod whose `labels.node` (the cluster-scoped node ID) is non-empty (i.e. the pod is scheduled), one edge from the pod node ID to that node ID. The edge SHALL carry no `labels`. It is always intra-cluster (the node is in the pod's own cluster); `may_cross_cluster` is `false`.
-- **`pvc-to-storageclass`** — for every PVC with a non-empty resolved StorageClass name, one edge from the PVC node ID to the StorageClass node ID `<cluster>/storageclass/<name>` (which is materialised, bare if necessary, per "StorageClass entity from kube_storageclass_info"). The edge SHALL carry no `labels`. It is always intra-cluster; `may_cross_cluster` is `false`.
 
-These two edges replace the previous compound-nesting representation of the pod→node and pvc→storageclass relationships (graph-api "Cytoscape compound node grouping" supersedes D31). An unscheduled pod (no `node` label) emits no `pod-to-node` edge; a PVC with no resolved StorageClass emits no `pvc-to-storageclass` edge.
+The former `pvc-to-storageclass` edge is removed. The `pvc-to-netapp-aggr` edge is NOT a topology relationship edge — it is derived from the Harvest volume join and defined by the `netapp-storage-graph` capability. An unscheduled pod (no `node` label) emits no `pod-to-node` edge.
 
 #### Scenario: Scheduled pod emits a pod-to-node edge
 
@@ -523,12 +606,12 @@ These two edges replace the previous compound-nesting representation of the pod�
 
 #### Scenario: PVC with a StorageClass emits a pvc-to-storageclass edge
 
-- **WHEN** the reader resolves PVC `cluster-alpha/db/data-mongo-0` to StorageClass `gp3`
-- **THEN** the graph contains a directed `pvc-to-storageclass` edge from `cluster-alpha/db/data-mongo-0` to `cluster-alpha/storageclass/gp3` with empty `labels`
+- **WHEN** the reader resolves PVC `cluster-alpha/db/data-mongo-0` to StorageClass name `gp3`
+- **THEN** the graph contains no `pvc-to-storageclass` edge and no `storageclass` node — the former edge behaviour this scenario named is removed; the name surfaces only as the PVC's `data.storageclass` attribute
 
 #### Scenario: Relationship edge IDs are stable across rebuilds
 
-- **WHEN** the same `pod-to-node` or `pvc-to-storageclass` relationship is produced by two consecutive builds for the same window
+- **WHEN** the same `pod-to-node` relationship is produced by two consecutive builds for the same window
 - **THEN** the edge `id` (UUIDv5 over `<type>|<source>|<target>`) is byte-identical between the two builds
 
 ### Requirement: Service and PVC ArgoCD Application resolution
@@ -575,7 +658,7 @@ For **PVC** entities specifically, when this annotation path resolves no Applica
 
 ### Requirement: PVC ArgoCD Application inheritance from mounting pod
 
-When a PVC entity has **no** ArgoCD Application resolved from its own annotation (the "Service and PVC ArgoCD Application resolution" path produced none — the `kube_persistentvolumeclaim_annotations` series is absent, unmatched, has an empty `annotation_argocd_argoproj_io_tracking_id` label, or that label's leading segment is empty), the topology reader SHALL attempt to **inherit** an Application from the pods that mount the PVC. For every `pod-mounts-pvc` edge incident to the PVC (source = a pod entity, target = the PVC entity), the mounting pod's own resolved Application (the pod ArgoCD Application from the `argocd_tracking_id` label on `kube_pod_owner`) is a candidate. The PVC SHALL inherit the **lexically-smallest non-empty** candidate Application; a mounting pod with no resolved Application contributes no candidate.
+When a PVC entity has **no** ArgoCD Application resolved from its own annotation (the "Service and PVC ArgoCD Application resolution" path produced none — the `kube_persistentvolumeclaim_annotations` series is absent, unmatched, has an empty `annotation_argocd_argoproj_io_tracking_id` label, or that label's leading segment is empty), the topology reader SHALL attempt to **inherit** an Application from the pods that mount the PVC. For every `pod-mounts-pvc` edge incident to the PVC (source = a pod entity, target = the PVC entity), the mounting pod's own resolved Application (the pod ArgoCD Application resolved from the pod's controller — see "Pod ArgoCD Application attribute") is a candidate. The PVC SHALL inherit the **lexically-smallest non-empty** candidate Application; a mounting pod with no resolved Application contributes no candidate.
 
 Inheritance is a strictly-ordered **fallback**: a PVC's own annotation-resolved Application ALWAYS wins and SHALL NEVER be overridden by inheritance. Inheritance fires **only** for a PVC that would otherwise carry no Application.
 
@@ -612,51 +695,46 @@ Inheritance SHALL be resolved at build time over the fully-assembled graph (all 
 
 ### Requirement: PVC PersistentVolume name and NetApp SVM labels
 
-The topology reader SHALL resolve each PVC's bound **PersistentVolume name** and, when the NetApp Trident custom-resource metrics are present, the **ONTAP SVM** serving it, and surface both as additive entries in the PVC entity's `labels` map (strict `map[string]string`):
+The topology reader SHALL resolve each PVC's bound **PersistentVolume name** and surface it, together with the **ONTAP SVM** serving it when the NetApp Harvest join resolves, as additive entries in the PVC entity's `labels` map (strict `map[string]string`):
 
 - `volumename` — the bound PV name, read from the `volumename` label of `kube_persistentvolumeclaim_info`, joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity (the same join as PVC StorageClass resolution; the two label reads are per-field independent — a series may carry `volumename` without `storageclass` and vice versa). The key SHALL be set only when the resolved value is non-empty.
-- `svm` — the NetApp SVM, resolved by chaining two joins rooted at the resolved PV name, both within the same cluster:
-  1. `kube_tridentvolume_info`: the series whose `name` label equals the PV name yields its `backendUUID` label.
-  2. `kube_tridentbackend_info`: the series whose `backendUUID` label equals that value yields its `svm` label.
-  The key SHALL be set only when every link resolves to a non-empty value. By construction `svm` SHALL never be present without `volumename`.
+- `svm` — the NetApp SVM, resolved by the `netapp-storage-graph` capability's Harvest join rooted at the resolved PV name (the Trident custom-resource chain is removed; the `svm` label rides on the same `volume_labels` series that provides the serving aggregate and controller, and never on the QoS families that carry the edge's I/O). The key SHALL be set only when the join resolves a non-empty `svm` value. By construction `svm` SHALL never be present without `volumename`.
 
 The `volumename` key is DISTINCT from the existing `volume` key (the pod-spec volume name from `kube_pod_spec_volumes_persistentvolumeclaims_info`); both MAY coexist on one PVC entity and neither replaces the other.
 
-`kube_tridentvolume_info` and `kube_tridentbackend_info` are NOT stock kube-state-metrics defaults — they come from a kube-state-metrics custom-resource-state configuration over the Trident `tridentvolumes` / `tridentbackends` CRDs (or a compatible exporter). The fixed label contract any exporter MUST honour, case-sensitive and verbatim: `kube_tridentvolume_info` carries `name` (the TridentVolume CR name, which equals the PV name under Trident's naming) and `backendUUID`; `kube_tridentbackend_info` carries `backendUUID` and `svm`. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
+Every link degrades gracefully: when `kube_persistentvolumeclaim_info` is absent, a join finds no match, or a required label is empty, the affected key(s) are simply omitted — the reader SHALL still build a valid topology, SHALL NOT fail the build, and SHALL NOT emit an empty-string label value. The join ENRICHES PVC entities that exist via the pod→PVC binding metric; it SHALL NOT materialise a PVC on its own.
 
-Both Trident metrics are OPTIONAL, and every link of the chain degrades gracefully: when a metric is absent, a join finds no match, or a required label is empty, the affected key(s) are simply omitted — the reader SHALL still build a valid topology, SHALL NOT fail the build, and SHALL NOT emit an empty-string label value. The chain ENRICHES PVC entities that exist via the pod→PVC binding metric; it SHALL NOT materialise a PVC on its own.
-
-Resolution SHALL be deterministic: on duplicate series the reader SHALL pick the lexically-smallest non-empty value at each stage (`volumename` per `(cluster, namespace, claim)`, `backendUUID` per `(cluster, name)`, `svm` per `(cluster, backendUUID)`), so the emitted labels are a pure function of the upstream data, independent of vector order. Labels are baked at build time before any projection; no new node or edge type is introduced.
+Resolution SHALL be deterministic: on duplicate series the reader SHALL pick the lexically-smallest non-empty value per stage (`volumename` per `(cluster, namespace, claim)`; `svm` per join key, per the `netapp-storage-graph` capability), so the emitted labels are a pure function of the upstream data, independent of vector order. Labels are baked at build time before any projection.
 
 #### Scenario: Full chain resolves volumename and svm
 
-- **WHEN** the upstream provides a PVC entity `cluster-alpha/db/data-mongo-0` with `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", volumename="pvc-9f3a"}`, `kube_tridentvolume_info{cluster="cluster-alpha", name="pvc-9f3a", backendUUID="be-1234"}`, and `kube_tridentbackend_info{cluster="cluster-alpha", backendUUID="be-1234", svm="svm-prod"}`
+- **WHEN** the upstream provides a PVC entity `cluster-alpha/db/data-mongo-0` with `kube_persistentvolumeclaim_info{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0", volumename="pvc-9f3a"}` and a Harvest `volume_labels` series with `volume_name="pvc-9f3a", svm="svm-prod"`
 - **THEN** the emitted PVC entity's `labels` contains `volumename="pvc-9f3a"` and `svm="svm-prod"`
 
 #### Scenario: PV without a TridentVolume row yields volumename only
 
-- **WHEN** a PVC resolves `volumename="pvc-9f3a"` but no `kube_tridentvolume_info` series with `name="pvc-9f3a"` exists in its cluster
+- **WHEN** a PVC resolves `volumename="pvc-9f3a"` but no Harvest `volume_labels` series carries `volume_name="pvc-9f3a"` (the former Trident chain no longer exists; the Harvest join is the only `svm` source)
 - **THEN** the emitted PVC entity's `labels` contains `volumename="pvc-9f3a"` and no `svm` key, and the build does not fail
 
 #### Scenario: TridentVolume without a matching backend yields no svm
 
-- **WHEN** a PVC's chain reaches `backendUUID="be-1234"` but no `kube_tridentbackend_info` series with `backendUUID="be-1234"` exists in its cluster (or the matching series has an empty `svm` label)
-- **THEN** the emitted PVC entity carries `volumename` but no `svm` key, and the build does not fail
+- **WHEN** the Harvest `volume_labels` series matched by a PVC's PV name carries an empty `svm` label (the former TridentVolume→backend hop no longer exists)
+- **THEN** the emitted PVC entity carries `volumename` but no `svm` key — never an empty-string value — and the build does not fail
+
+#### Scenario: Trident metrics absent entirely
+
+- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` (with `volumename` labels) and no Harvest `volume_labels` series for the window (the Trident custom-resource metrics are no longer read at all)
+- **THEN** the reader produces a valid topology in which PVC entities carry `volumename` but no `svm` key, and the build does not fail
 
 #### Scenario: PVC info without volumename yields neither label
 
 - **WHEN** a PVC's `kube_persistentvolumeclaim_info` series carries no (or an empty) `volumename` label, or no info series matches the PVC at all
 - **THEN** the emitted PVC entity carries neither a `volumename` nor an `svm` key — no empty-string value is emitted — and the build does not fail
 
-#### Scenario: Trident metrics absent entirely
-
-- **WHEN** the upstream contains `kube_persistentvolumeclaim_info` (with `volumename` labels) but no `kube_tridentvolume_info` or `kube_tridentbackend_info` series for the window
-- **THEN** the reader produces a valid topology in which PVC entities carry `volumename` but no `svm` key, and the build does not fail
-
 #### Scenario: volumename is independent of storageclass on the same series
 
 - **WHEN** a `kube_persistentvolumeclaim_info` series carries `volumename="pvc-9f3a"` but an empty `storageclass` label
-- **THEN** the emitted PVC entity carries `labels.volumename="pvc-9f3a"` while no `pvc-to-storageclass` edge is emitted for it (and vice versa: a series with `storageclass` but no `volumename` drives the edge without the label)
+- **THEN** the emitted PVC entity carries `labels.volumename="pvc-9f3a"` while no `storageclass` attribute is emitted for it (and vice versa: a series with `storageclass` but no `volumename` drives the attribute without the label)
 
 #### Scenario: volume and volumename coexist
 
@@ -665,6 +743,199 @@ Resolution SHALL be deterministic: on duplicate series the reader SHALL pick the
 
 #### Scenario: Deterministic pick on duplicate series at every stage
 
-- **WHEN** the upstream reports two `kube_tridentvolume_info` series for `(cluster-alpha, name="pvc-9f3a")` with `backendUUID="be-b"` and `backendUUID="be-a"`, and two `kube_tridentbackend_info` series for `(cluster-alpha, backendUUID="be-a")` with `svm="svm-b"` and `svm="svm-a"`
-- **THEN** the chain resolves via `be-a` to `svm="svm-a"` (the lexically-smallest non-empty value at each stage) deterministically across rebuilds, independent of upstream vector order
+- **WHEN** the upstream reports two `kube_persistentvolumeclaim_info` series for `(cluster-alpha, db, data-mongo-0)` with `volumename="pvc-b"` and `volumename="pvc-a"`, and two Harvest `volume_labels` series for `volume_name="pvc-a"` with `svm="svm-b"` and `svm="svm-a"`
+- **THEN** the reader resolves `volumename="pvc-a"` and `svm="svm-a"` (the lexically-smallest non-empty value at each stage) deterministically across rebuilds, independent of upstream vector order
 
+### Requirement: PVC usage from kubelet volume stats
+
+The topology reader SHALL resolve each PVC's storage usage from the kubelet volume-stats series `kubelet_volume_stats_used_bytes{cluster, namespace, persistentvolumeclaim, ...}` and `kubelet_volume_stats_capacity_bytes{cluster, namespace, persistentvolumeclaim, ...}`, joined on `(cluster, namespace, persistentvolumeclaim)` to the PVC entity. This introduces **kubelet** as a further upstream metric family alongside kube-state-metrics and NetApp Harvest (whose volume-label, QoS workload, QoS fixed-policy, aggregate, and node objects are read by the `netapp-storage-graph` capability); the label contract above is fixed and case-sensitive. A series missing the `cluster` label SHALL be bucketed under `cluster="unknown"` (the same rule as every other topology series).
+
+Both series are OPTIONAL and per-field independent: `used_bytes` resolves from the first, `capacity_bytes` from the second; the PVC's `usage` attribute (graph-api "PVC `storageclass` and `usage` attributes") SHALL be present iff at least one field resolved, with an unresolved field omitted from the object. When a metric is absent, or no series matches a given PVC, the affected field(s) are simply omitted — the reader SHALL still build a valid topology and SHALL NOT fail the build. On duplicate series for one `(cluster, namespace, claim)` the reader SHALL pick deterministically (the smallest numeric value) so the emitted attribute is byte-stable across rebuilds. The values SHALL never appear inside `labels`.
+
+#### Scenario: Both usage fields resolved
+
+- **WHEN** the upstream provides `kubelet_volume_stats_used_bytes{cluster="cluster-alpha", namespace="db", persistentvolumeclaim="data-mongo-0"} = 5368709120` and `kubelet_volume_stats_capacity_bytes{...} = 10737418240` for a PVC entity
+- **THEN** the `cluster-alpha/db/data-mongo-0` PVC entity carries `usage = {used_bytes: 5368709120, capacity_bytes: 10737418240}` and its `labels` gains no new key
+
+#### Scenario: Capacity only
+
+- **WHEN** a PVC matches a `kubelet_volume_stats_capacity_bytes` series but no `kubelet_volume_stats_used_bytes` series
+- **THEN** the PVC's `usage` object contains `capacity_bytes` and no `used_bytes` key, and the build does not fail
+
+#### Scenario: Kubelet metrics absent entirely
+
+- **WHEN** the upstream contains no `kubelet_volume_stats_*` series for the window
+- **THEN** the reader produces a valid topology in which no PVC entity carries a `usage` attribute, and the build does not fail
+
+#### Scenario: Deterministic pick on duplicate usage series
+
+- **WHEN** two `kubelet_volume_stats_used_bytes` series for one `(cluster, namespace, claim)` report `100` and `90`
+- **THEN** the PVC resolves `used_bytes: 90` (the smallest value) deterministically across rebuilds
+
+### Requirement: Request-scoped upstream selectors
+
+The build SHALL accept four request-scoped selector dimensions — `az`, `env`, `cluster`, `namespace` — each a set of values, and SHALL render them into the upstream PromQL queries as label matchers composed **with** (never replacing) each query's fixed, request-invariant selectors (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on each of the six controller-annotation families, the service-graph sentinel and `edge_relation!="link"` matchers). Which dimensions reach which series is a hardcoded contract with no configuration surface:
+
+- `az` and `env`: every kube-state-metrics and kubelet series. **Never** a NetApp Harvest series — the `az` dimension reaches Harvest through backend selection only (the `upstream-backend-routing` capability's zone rule), and `env` does not reach Harvest at all.
+- `cluster`: every kube-state-metrics and kubelet series. **Never** a Harvest series — Harvest's `cluster` label names the ONTAP cluster, not a Kubernetes cluster — and never a service-graph series.
+- `namespace`: every kube-state-metrics and kubelet series that carries a `namespace` label — the pod-, claim-, Service-, EndpointSlice-, and **controller**-scoped series (the six controller-annotation families and `kube_job_owner` are namespaced like every other workload family). Never a node series, never a Harvest series, never a service-graph series.
+- Every NetApp Harvest series, the three `traces_service_graph_*` series, and the `up{}` probe SHALL carry **no** request-scoped matcher under any request. The `qos_*` families keep their fixed `lun=""` selector.
+
+Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=~"unknown|"` (see "Series missing the cluster label"), the one value that is not rendered as a plain literal. Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
+
+A build with every dimension empty SHALL add **no** request-scoped matcher to any query, so each query renders exactly its fixed form. Zero rows under a non-empty dimension is a valid, empty topology — not a failure and not a retention miss.
+
+#### Scenario: Fixed selector composed with request matchers
+
+- **WHEN** a build runs with `az={zone-a}` and `cluster={cluster-alpha}`
+- **THEN** the node-address query is issued as `last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",cluster="cluster-alpha"}[<window>])` and the node-condition query keeps `condition="Ready"` ahead of the request matchers
+
+#### Scenario: Controller-annotation families receive all four dimensions
+
+- **WHEN** a build runs with `az={zone-a}`, `env={prod}`, `cluster={cluster-alpha}` and `namespace={shop}`
+- **THEN** each of the six controller-annotation queries and the `kube_job_owner` query is issued with exactly `az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"` added, in that fixed order, following that query's own fixed selector
+
+#### Scenario: Controller-annotation fixed selectors precede the request matchers
+
+- **WHEN** a build runs with `namespace={shop}`
+- **THEN** the Deployment annotation query is issued as `last_over_time(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!="",namespace="shop"}[<window>])` and the Job-owner query as `last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",namespace="shop"}[<window>])` — the fixed selector first, the request matcher composed after it and never replacing it
+
+#### Scenario: Harvest receives no request-scoped matcher
+
+- **WHEN** a build runs with `az={zone-a}`, `env={prod}`, `cluster={cluster-alpha}`, `namespace={shop}`
+- **THEN** every Harvest query (`volume_labels`, the `qos_*` families, `qos_policy_fixed_max_throughput_*`, `aggr_*`, `node_new_status`) is issued exactly as in an unfiltered build — the `qos_*` families with `lun=""` only — with no `az`, `env`, `cluster`, or `namespace` matcher; the `az` value reaches Harvest only as backend selection (which `harvest` backends the query is issued to) and the `env` value does not reach it at all
+
+#### Scenario: Service-graph series are never narrowed
+
+- **WHEN** a build runs with any non-empty combination of the four dimensions
+- **THEN** the three `traces_service_graph_*` queries are issued exactly as for an unfiltered build (sentinel and link matchers only), and the `up{}` probe query is the bare `up`
+
+#### Scenario: Multi-value rendering is order-free
+
+- **WHEN** one build runs with `namespace={b, a}` and another with `namespace={a, b, a}`
+- **THEN** both issue `namespace=~"a|b"` on every namespace-scoped series
+
+#### Scenario: Regex metacharacters in a value are quoted
+
+- **WHEN** a build runs with `env={prod.eu, prod-us}`
+- **THEN** the rendered alternation is `env=~"prod-us|prod\\.eu"` — the metacharacter is regex-quoted AND the resulting backslash is escaped for the PromQL string literal, which rejects an unknown escape sequence — so a series with `env="prodXeu"` does not match
+
+#### Scenario: Empty dimensions render nothing
+
+- **WHEN** a build runs with all four dimensions empty
+- **THEN** every issued query string carries only its own fixed selector — byte-identical to the recorded unfiltered rendering, with no request-scoped matcher appended
+
+### Requirement: Configurable `az` / `env` label keys
+
+The upstream label names that the `az` and `env` dimensions bind to SHALL default to `az` and `env` and SHALL be overridable per deployment via the environment variables `KSG_AZ_LABEL` / `KSG_ENV_LABEL` and the flags `--az-label` / `--env-label` (flag overrides environment, following the existing precedence). Each configured key SHALL be validated at startup as a PromQL label name (`[a-zA-Z_][a-zA-Z0-9_]*`); an invalid key SHALL fail startup with an error naming the setting. The two keys SHALL be distinct. The request parameter names (`az`, `env`) SHALL NOT change with the configured keys. The engine's embeddable options SHALL expose the same two keys so an in-process consumer configures them identically.
+
+The same two keys SHALL name the labels the reader composes a cluster's identity from ("Cluster identity composed from zone and environment labels"): the matcher a request renders and the identity a series composes are bound to one pair of labels, so rebinding a key moves both together and a deployment can never filter on one label while identifying by another.
+
+#### Scenario: Defaults apply when unset
+
+- **WHEN** the server starts with neither variable nor flag set and a request carries `az=zone-a`
+- **THEN** the rendered matcher is `az="zone-a"`
+
+#### Scenario: Environment variable rebinds the key
+
+- **WHEN** the server starts with `KSG_ENV_LABEL=deployment_tier` and a request carries `env=prod`
+- **THEN** the rendered matcher is `deployment_tier="prod"`
+
+#### Scenario: Rebound key drives the identity read
+
+- **WHEN** the server starts with `KSG_ENV_LABEL=deployment_tier` and `c1`'s series carry `az="us"` and `deployment_tier="dev"` but also an unrelated `env="ignored"` label
+- **THEN** the composed identity is `us-dev-c1`
+
+#### Scenario: Invalid key fails startup
+
+- **WHEN** the server starts with `KSG_AZ_LABEL=topology.kubernetes.io/zone`
+- **THEN** startup fails with an error naming `KSG_AZ_LABEL` and stating that the value is not a valid PromQL label name
+
+#### Scenario: Identical keys are rejected
+
+- **WHEN** the server starts with `--az-label=scope --env-label=scope`
+- **THEN** startup fails with an error stating that the two keys must differ
+
+### Requirement: Backend routing composes with request-scoped selectors
+
+Backend selection and PromQL matcher rendering SHALL be independent, composed mechanisms. The `az` dimension SHALL continue to be rendered as a label matcher on every query that accepts it — exactly as specified by "Request-scoped upstream selectors" — **in addition to** selecting which backends the query is issued to. Neither mechanism SHALL substitute for the other: routing narrows which store is asked, the matcher narrows what that store returns. The `harvest` family is the one family where the two diverge: it is zone-routed yet accepts no `az` matcher, so backend selection is the only effect `az` has on it (see the `netapp-storage-graph` capability).
+
+The rendered query string for a given query SHALL be identical across every backend the query is fanned out to. A per-backend query variant SHALL NOT exist.
+
+The `env`, `cluster`, and `namespace` dimensions SHALL play no part in backend selection.
+
+#### Scenario: Zone matcher still rendered under routing
+
+- **WHEN** a request carries `az=zone-a` and the routing table sends `ksm` queries for that zone only to backend `zone-a`
+- **THEN** the query issued to `zone-a` still carries the `az="zone-a"` matcher
+
+#### Scenario: Identical query string across backends
+
+- **WHEN** a request with no `az` fans `kube_pod_info` out to three backends
+- **THEN** all three receive byte-identical query strings
+
+#### Scenario: Namespace filter does not route
+
+- **WHEN** a request carries `namespace=shop` and no `az`
+- **THEN** every backend serving the family is selected, exactly as for a request carrying neither parameter
+
+### Requirement: Cluster identity composed from zone and environment labels
+
+The topology reader SHALL identify a Kubernetes cluster by the composite `<az>-<env>-<cluster>`, composed at the moment a series' `cluster` label is read from that series' own zone and environment labels under the operator-configured label keys ("Configurable `az` / `env` label keys"). The identity is the value every cluster-scoped structure is keyed on — entity ids, entity `cluster` labels, every join key and index, the cluster-family key, the observed-clusters set, and the `cluster` label of the self-metric gauges — so two clusters sharing a raw name under different zones or environments SHALL be distinct in every one of them.
+
+Every cluster name the reader encounters — on a topology or kubelet series, on a service-graph series' `cluster` label, or arriving from the route store — SHALL be resolved through one ladder, in order:
+
+1. **Compose**: the series carries non-empty values for both configured keys → `<az>-<env>-<raw>`.
+2. **Adopt**: otherwise, when the raw name maps to exactly one identity in the build's identity table, that identity.
+3. **Verbatim**: otherwise the raw name itself (the `unknown` bucket when the `cluster` label is absent). The reader SHALL count such series per metric and log one aggregated `cluster_identity_unresolved` warning per affected metric per build.
+
+The identity table SHALL be built once per build from the four families that mint cluster-labelled entities — `kube_pod_info`, `kube_node_info`, `kube_service_info`, `kube_pod_spec_volumes_persistentvolumeclaims_info` — as the set of step-1 compositions keyed by raw name. Every other family resolves through the table and SHALL NOT add to it. The outcome SHALL NOT depend on series order.
+
+The built graph SHALL expose the identity table (identity → `{az, env, name}`), and the raw-name component SHALL be recoverable from any identity in it. The cluster-family key of the `pod-service-graph` capability SHALL be computed over the identity string with its existing rule, so a family is scoped to one zone and one environment.
+
+A build whose series carry no zone/environment pair SHALL produce every identity, id, label and index exactly as it does today.
+
+#### Scenario: Same raw name in two zones yields two clusters
+
+- **WHEN** `kube_node_info{cluster="c1",node="worker-0",az="us",env="dev"}` and `kube_node_info{cluster="c1",node="worker-0",az="eu",env="prod"}` both exist in the window
+- **THEN** the reader emits two distinct K8s node entities with ids `us-dev-c1/worker-0` and `eu-prod-c1/worker-0`, each with `labels.cluster` equal to its own identity, and the observed-clusters set holds both `us-dev-c1` and `eu-prod-c1`
+
+#### Scenario: Every cluster-scoped structure carries the identity
+
+- **WHEN** `cluster-alpha`'s pod, node, service and claim series all carry `az="zone-a"` and `env="prod"`
+- **THEN** pod ids are `zone-a-prod-cluster-alpha/<uid>`, PVC ids `zone-a-prod-cluster-alpha/<ns>/<claim>`, the service index is keyed `(zone-a-prod-cluster-alpha, <ns>, <svc>)`, a pod's `labels.node` is `zone-a-prod-cluster-alpha/<node>`, and the observed-clusters set holds `zone-a-prod-cluster-alpha` and not `cluster-alpha`
+
+#### Scenario: Unambiguous raw name adopts the identity
+
+- **WHEN** the only cluster identity composed from a raw `cluster="c1"` in the build is `us-dev-c1`, and a `kubelet_volume_stats_used_bytes{cluster="c1",...}` series carries neither zone nor environment label
+- **THEN** the kubelet series resolves to `us-dev-c1`, its usage joins the `us-dev-c1/<ns>/<claim>` PVC, and no `cluster_identity_unresolved` warning is logged
+
+#### Scenario: Ambiguous raw name stays verbatim and is warned
+
+- **WHEN** the build composed both `us-dev-c1` and `eu-prod-c1` from raw `c1`, and a `kube_pod_owner{cluster="c1",...}` series carries neither zone nor environment label
+- **THEN** that series resolves to the verbatim `c1`, joins neither identity (the affected pods keep no `owner` from it), and the build logs one `cluster_identity_unresolved` warning naming `kube_pod_owner` with the count of such series
+
+#### Scenario: Partially-stamped series never composes
+
+- **WHEN** a `kube_pod_info{cluster="c1",az="us"}` series carries a zone but no environment label and no identity for raw `c1` exists in the build
+- **THEN** the pod's cluster is the verbatim `c1` (never `us--c1` or `us-c1`), and the series is counted as unresolved
+
+#### Scenario: Identity table is built only from entity families
+
+- **WHEN** every `kube_pod_info` series of `c1` carries `az="us",env="dev"` while a `kube_pod_owner` series of `c1` carries `az="eu",env="prod"`
+- **THEN** the identity table maps `c1` to `us-dev-c1` only, the owner series composes to `eu-prod-c1` by step 1 and joins nothing, and no second `c1` cluster is created by it
+
+#### Scenario: Cluster family is scoped to zone and environment
+
+- **WHEN** the build holds identities `us-dev-c1`, `us-dev-c2`, `eu-prod-c1` and `eu-prod-c2`
+- **THEN** `us-dev-c1` and `us-dev-c2` share a family key (`us-dev-c0`), `eu-prod-c1` and `eu-prod-c2` share another (`eu-prod-c0`), and no cross-family fan-out or ingress-cluster candidacy exists between the two families
+
+#### Scenario: Foreign cluster names resolve through the same ladder
+
+- **WHEN** a service-graph series carries `cluster="c1"` with no zone/environment labels and the build's only identity for `c1` is `us-dev-c1`, and a route-store destination names cluster `c1`
+- **THEN** both resolve to `us-dev-c1`, the trace-cluster anchor and the route destination look up topology under `us-dev-c1`, and neither is counted as unresolved
+
+#### Scenario: Unstamped estate is unchanged
+
+- **WHEN** no series in the build carries a zone or environment label
+- **THEN** every identity equals the raw `cluster` label, the identity table is empty, no warning is logged, and every id, label and index is byte-identical to the pre-change reader

@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestBuild_UpProbeError_WarnsAndProceeds(t *testing.T) {
 	buf := captureLogs(t)
 	q := newEmptyTopologyQuerier(t, nil, errors.New("probe exploded"))
 
-	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd)
+	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, promql.Selector{})
 
 	require.NoError(t, err, "a failed probe must not fail the build")
 	require.NotNil(t, g)
@@ -69,7 +70,7 @@ func TestBuild_UpProbeEmpty_NoWarnProceeds(t *testing.T) {
 	buf := captureLogs(t)
 	q := newEmptyTopologyQuerier(t, model.Vector{}, nil)
 
-	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd)
+	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, promql.Selector{})
 
 	require.NoError(t, err)
 	require.NotNil(t, g)
@@ -88,9 +89,98 @@ func TestBuild_UpProbeHealthy_OutsideRetentionUnchanged(t *testing.T) {
 	})
 	q := newEmptyTopologyQuerier(t, up, nil)
 
-	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd)
+	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, promql.Selector{})
 
 	require.Error(t, err)
 	assert.Nil(t, g)
 	assert.Equal(t, ReasonOutsideRetention, AsReason(err))
+}
+
+// TestBuild_FilteredEmptyResultSkipsRetentionClassification pins design D7:
+// with any selector-level dimension active, "zero pods and zero nodes" means
+// "nothing in scope", not a retention miss. The build returns an empty graph,
+// and the up{} probe is never issued — asserted structurally, by registering
+// NO up-probe expectation on the mock (an unexpected call fails the test).
+func TestBuild_FilteredEmptyResultSkipsRetentionClassification(t *testing.T) {
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().
+		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, name, _ string, _ time.Time) (model.Vector, error) {
+			require.NotEqual(t, string(promql.QUpProbe), name,
+				"a filtered build must not issue the retention probe")
+			return model.Vector{}, nil
+		}).
+		Maybe()
+
+	sel := promql.Selector{Namespace: []string{"shop"}}
+	g, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, sel)
+
+	require.NoError(t, err, "an empty filtered result is a valid empty graph, not an error")
+	require.NotNil(t, g)
+	assert.Empty(t, g.NodesByID)
+	assert.Empty(t, g.Edges)
+}
+
+// The unfiltered counterpart still classifies: healthy upstream + zero rows is
+// outside_retention, exactly as before.
+func TestBuild_UnfilteredEmptyResultStillClassifiesRetention(t *testing.T) {
+	q := newEmptyTopologyQuerier(t, model.Vector{{Value: 1}}, nil)
+
+	_, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, promql.Selector{})
+
+	require.Error(t, err)
+	var be *Error
+	require.ErrorAs(t, err, &be)
+	assert.Equal(t, ReasonOutsideRetention, be.Reason)
+}
+
+// The filtered build passes its selector to every topology query and to none of
+// the service-graph queries — the push-down contract, asserted on the exact
+// query strings the build issues.
+func TestBuild_SelectorReachesTopologyQueriesOnly(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]string{}
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().
+		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, name, query string, _ time.Time) (model.Vector, error) {
+			mu.Lock()
+			seen[name] = query
+			mu.Unlock()
+			// One pod keeps the topology non-empty. A filtered build that
+			// loads NOTHING skips the service-graph read entirely (no series
+			// could survive admission), and this test is about what the
+			// service-graph queries look like when they ARE issued.
+			if name == string(promql.QPodInfo) {
+				return model.Vector{{Metric: model.Metric{
+					"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
+				}, Value: 1}}, nil
+			}
+			return model.Vector{}, nil
+		}).
+		Maybe()
+
+	sel := promql.Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"},
+		Cluster: []string{"cluster-alpha"}, Namespace: []string{"shop"},
+	}
+	_, err := New(q, Options{}, nil, nil).Build(context.Background(), 5*time.Minute, probeTestEnd, sel)
+	require.NoError(t, err)
+
+	assert.Equal(t,
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[5m])`,
+		seen[string(promql.QPodInfo)], "namespaced KSM series carry all four dimensions")
+	assert.Equal(t,
+		`last_over_time(kube_node_info{az="zone-a",env="prod",cluster="cluster-alpha"}[5m])`,
+		seen[string(promql.QNodeInfo)], "node series carry no namespace")
+	assert.Equal(t,
+		`last_over_time(volume_labels[5m])`,
+		seen[string(promql.QVolumeLabels)], "Harvest carries no request matcher — az only routes it, env is inert")
+	assert.Equal(t,
+		`last_over_time(kubelet_volume_stats_used_bytes{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[5m])`,
+		seen[string(promql.QKubeletVolumeUsedBytes)], "kubelet is namespaced")
+	assert.Equal(t,
+		`rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[5m])`,
+		seen[string(promql.QServiceGraphTotal)], "service-graph series are never narrowed")
+	assert.NotContains(t, seen, string(promql.QUpProbe), "no retention probe on a filtered build")
 }

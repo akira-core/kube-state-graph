@@ -46,6 +46,12 @@ type VMSuite struct {
 	HTTPAuthUsername string
 	HTTPAuthPassword string
 
+	// ExtraLabels is stamped onto every series ingested through IngestExpFmt
+	// that does not already carry the key — the scrape-time external labels a
+	// real deployment applies. Set it in SetupSuite/SetupTest; leave empty for
+	// suites whose fixtures spell every label out.
+	ExtraLabels string
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	container testcontainers.Container
@@ -156,10 +162,99 @@ func (s *VMSuite) WaitForReady(budget time.Duration) {
 	s.Require().FailNowf("vm_not_ready", "VictoriaMetrics did not become ready within %s", budget)
 }
 
+// StampLabels injects extra label pairs into every series line of an
+// exposition block, skipping any key the line already carries. It models the
+// scrape-time external labels a real deployment adds (`az`, `env`, `cluster`),
+// so a fixture written for topology shape does not have to repeat them on
+// every line — and a test that wants a DIFFERENT value (or none) simply
+// spells that key out itself.
+func StampLabels(exposition, extra string) string {
+	if extra == "" {
+		return exposition
+	}
+	// Key and rendered text are carried together: deriving one from a second
+	// Split of `extra` by index silently stamps the WRONG pair as soon as one
+	// entry lacks an "=" and the two slices stop lining up.
+	type labelPair struct{ key, text string }
+	var pairs []labelPair
+	for _, p := range strings.Split(extra, ",") {
+		if k, _, ok := strings.Cut(p, "="); ok {
+			pairs = append(pairs, labelPair{key: strings.TrimSpace(k), text: strings.TrimSpace(p)})
+		}
+	}
+	if len(pairs) == 0 {
+		return exposition
+	}
+	lines := strings.Split(exposition, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		open := strings.Index(line, "{")
+		if open < 0 {
+			// `metric value ts` — give it a label set.
+			name, rest, ok := strings.Cut(line, " ")
+			if !ok {
+				continue
+			}
+			lines[i] = name + "{" + extra + "} " + rest
+			continue
+		}
+		closeIdx := strings.LastIndex(line, "}")
+		if closeIdx < open {
+			continue
+		}
+		labels := line[open+1 : closeIdx]
+		var missing []string
+		for _, p := range pairs {
+			if !hasLabelKey(labels, p.key) {
+				missing = append(missing, p.text)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		sep := ","
+		if strings.TrimSpace(labels) == "" {
+			sep = ""
+		}
+		lines[i] = line[:closeIdx] + sep + strings.Join(missing, ",") + line[closeIdx:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// hasLabelKey reports whether a label-set body already declares label `key`.
+// A bare strings.Contains(labels, key+"=") is wrong: `cluster=` is a suffix of
+// `ontap_cluster=`, so the Harvest series would silently keep the fixture's
+// ONTAP cluster and never receive the Kubernetes one. Require the match to
+// start a label name — at the beginning of the set or right after a separator.
+func hasLabelKey(labels, key string) bool {
+	needle := key + "="
+	for i := 0; i < len(labels); {
+		j := strings.Index(labels[i:], needle)
+		if j < 0 {
+			return false
+		}
+		at := i + j
+		if at == 0 {
+			return true
+		}
+		switch labels[at-1] {
+		case ',', ' ', '\t':
+			return true
+		}
+		i = at + len(needle)
+	}
+	return false
+}
+
 // IngestExpFmt POSTs Prometheus exposition-format text to VM's
-// /api/v1/import/prometheus endpoint. Each line is one sample.
+// /api/v1/import/prometheus endpoint. Each line is one sample. When
+// ExtraLabels is set it is stamped onto every series first (see StampLabels).
 func (s *VMSuite) IngestExpFmt(exposition string) {
 	s.T().Helper()
+	exposition = StampLabels(exposition, s.ExtraLabels)
 	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost,
 		s.vmURL+"/api/v1/import/prometheus", strings.NewReader(exposition))
 	s.Require().NoError(err)
@@ -172,6 +267,33 @@ func (s *VMSuite) IngestExpFmt(exposition string) {
 	body, _ := io.ReadAll(resp.Body)
 	s.Require().Truef(resp.StatusCode >= 200 && resp.StatusCode < 300,
 		"VM ingest returned %d: %s", resp.StatusCode, body)
+	s.ForceFlush()
+}
+
+// ForceFlush makes everything ingested so far immediately queryable.
+//
+// This is the single reason the suites are not dominated by waiting.
+// VictoriaMetrics registers a brand-NEW series into the searchable index on a
+// periodic tick, so a fixture's first sample is invisible for ~10s (measured
+// on the pinned image: 10.59s for a fresh label set, versus 0.017s for a new
+// sample on a series that already exists). Every test seeds its own label sets,
+// so every test paid it. /internal/force_flush is VM's test-oriented endpoint
+// for exactly this and collapses the wait to ~30ms.
+//
+// A non-2xx is NOT fatal: the endpoint is an internal convenience, and the
+// WaitForSeries polls that follow every ingest remain the actual correctness
+// gate — losing the flush costs latency, never a wrong result.
+func (s *VMSuite) ForceFlush() {
+	s.T().Helper()
+	resp, err := s.vmGet(s.vmURL + "/internal/force_flush")
+	if err != nil {
+		s.T().Logf("force_flush failed (falling back to the ingest-visibility wait): %v", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.T().Logf("force_flush returned %d (falling back to the ingest-visibility wait)", resp.StatusCode)
+	}
 }
 
 // WaitForSeries polls VM until the supplied PromQL returns a non-empty
@@ -278,10 +400,10 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 		s.Require().NoError(ks.LoadFile(cfg.APIKeysFile))
 	}
 	builder := build.New(prom, build.Options{
-		MetricPrefix:        cfg.MetricPrefix,
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       o.routeResolver,
 		RouteResolveTimeout: o.routeResolveTimeout,
+		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
 	}, metrics, o.clk)
 	srv := api.New(cfg, builder, prom, metrics, logger, ks, o.clk)
 

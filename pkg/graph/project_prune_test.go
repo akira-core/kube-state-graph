@@ -26,8 +26,10 @@ func prunableGraph() *Graph {
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}},
 		&PVCNode{IDValue: "c/ns/pvc-bound", NameValue: "pvc-bound", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}, StorageClassValue: "sc-fast"},
 		&PVCNode{IDValue: "c/ns/pvc-orphan", NameValue: "pvc-orphan", LabelsValue: map[string]string{"cluster": "c", "namespace": "ns"}, StorageClassValue: "sc-slow"},
-		&StorageClassNode{IDValue: StorageClassID("c", "sc-fast"), NameValue: "sc-fast", LabelsValue: map[string]string{"cluster": "c"}},
-		&StorageClassNode{IDValue: StorageClassID("c", "sc-slow"), NameValue: "sc-slow", LabelsValue: map[string]string{"cluster": "c"}},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "fast"), NameValue: "fast", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "slow"), NameValue: "slow", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n2"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1"), NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n2"), NameValue: "n2", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
 	}
 	edges := []*Edge{
 		NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"}),
@@ -36,8 +38,8 @@ func prunableGraph() *Graph {
 		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
 		NewEdge(EdgeTypePodToNode, "c/p2", "c/worker-0", nil),
 		NewEdge(EdgeTypePodToNode, "c/p9", "c/worker-1", nil),
-		NewEdge(EdgeTypePVCToStorageClass, "c/ns/pvc-bound", StorageClassID("c", "sc-fast"), nil),
-		NewEdge(EdgeTypePVCToStorageClass, "c/ns/pvc-orphan", StorageClassID("c", "sc-slow"), nil),
+		NewEdge(EdgeTypePVCToNetAppAggr, "c/ns/pvc-bound", NetAppAggrID("oc", "fast"), nil),
+		NewEdge(EdgeTypePVCToNetAppAggr, "c/ns/pvc-orphan", NetAppAggrID("oc", "slow"), nil),
 	}
 	return NewGraph(nodes, edges, time.Now())
 }
@@ -53,13 +55,15 @@ func TestProject_DefaultPrunesEdgelessSubgraph(t *testing.T) {
 	assert.True(t, ids["c/p2"], "connected pod p2 kept")
 	assert.True(t, ids["c/worker-0"], "node hosting connected pods kept")
 	assert.True(t, ids["c/ns/pvc-bound"], "pvc mounted by connected pod kept")
-	assert.True(t, ids[StorageClassID("c", "sc-fast")], "storageclass backing kept pvc kept")
+	assert.True(t, ids[NetAppAggrID("oc", "fast")], "aggregate serving kept pvc kept")
+	assert.True(t, ids[NetAppNodeID("oc", "n1")], "controller of kept aggregate kept")
 
 	// Edgeless subgraph pruned.
 	assert.False(t, ids["c/p9"], "edgeless pod must be pruned")
 	assert.False(t, ids["c/worker-1"], "node hosting only edgeless pod must be pruned")
 	assert.False(t, ids["c/ns/pvc-orphan"], "pvc mounted only by edgeless pod must be pruned")
-	assert.False(t, ids[StorageClassID("c", "sc-slow")], "storageclass backing only orphan pvc must be pruned")
+	assert.False(t, ids[NetAppAggrID("oc", "slow")], "aggregate serving only orphan pvc must be pruned")
+	assert.False(t, ids[NetAppNodeID("oc", "n2")], "controller of only-orphan aggregate must be pruned")
 }
 
 // The pod-to-node edge from the pruned pod must NOT resurrect that pod via the
@@ -104,27 +108,17 @@ func TestProject_ServiceSelectsPodBackingPodKept(t *testing.T) {
 	assert.True(t, ids["c/worker-0"], "node hosting backing pod kept")
 }
 
-// Escape hatch: an explicit ?name= surfaces an otherwise-pruned edgeless pod
-// (symmetric with the D6 infra-node name exception).
-func TestProject_NameFilterSurfacesEdgelessPod(t *testing.T) {
-	v := Project(prunableGraph(), Scope{Names: map[string]struct{}{"p9": {}}})
+// Escape hatch: `prune=false` surfaces an otherwise-pruned edgeless pod. It is
+// the ONLY hatch — the former ?name= / ?root= exceptions are withdrawn.
+func TestProject_InventorySurfacesEdgelessPod(t *testing.T) {
+	v := Project(prunableGraph(), Scope{Inventory: true})
 	ids := idSet(v)
-	assert.True(t, ids["c/p9"], "explicit name filter must surface the edgeless pod on demand")
+	assert.True(t, ids["c/p9"], "prune=false must surface the edgeless pod")
+	assert.True(t, ids["c/worker-1"], "and the node hosting only that pod")
 }
 
-// Escape hatch: a root-anchored traversal still includes reachable nodes even if
-// they have no connectivity edge (the prune is off under traversal).
-func TestProject_TraversalSurfacesEdgelessNeighbour(t *testing.T) {
-	// Root on worker-1 (the otherwise-pruned node), depth 1 over pod-to-node
-	// reaches the edgeless pod p9.
-	v := Project(prunableGraph(), Scope{Root: "c/worker-1", Depth: 1, Direction: DirectionBoth})
-	ids := idSet(v)
-	assert.True(t, ids["c/worker-1"], "traversal root kept")
-	assert.True(t, ids["c/p9"], "edgeless pod reachable from root kept under traversal")
-}
-
-// Namespace filter still prunes edgeless pods (prune is active for cluster/ns
-// filters, only name/traversal disable it).
+// Namespace filter still prunes edgeless pods by default (only prune=false
+// disables the prune).
 func TestProject_NamespaceFilterStillPrunes(t *testing.T) {
 	v := Project(prunableGraph(), Scope{Namespaces: map[string]struct{}{"ns": {}}})
 	ids := idSet(v)

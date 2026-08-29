@@ -8,10 +8,10 @@ import (
 // Query identifies one of the PromQL templates the build pipeline issues.
 // The name is also used as the `query` label on self-metrics.
 //
-// The constant values are the bare upstream metric names (kube-state-metrics
-// naming). At render time a configurable prefix may be prepended via
-// Renderer; the Query string itself is not rewritten so that self-metric and
-// span dimensions stay stable across deployments that differ only by prefix.
+// The constant values are the bare upstream metric names. The Query string
+// itself is never rewritten so that self-metric and span dimensions stay
+// stable. There is no configurable metric-name prefix — every series is
+// queried at its bare name.
 type Query string
 
 const (
@@ -23,82 +23,88 @@ const (
 	QServiceGraphTotal Query = "traces_service_graph_request_total"
 	// QServiceGraphFailedTotal is the Errors counter of the service-graph RED
 	// triple. OPTIONAL — a missing metric, empty result, or query error degrades
-	// to "no error_rate on the edge" and never fails the build. The configurable
-	// metric-name prefix is NOT applied (Alloy/Tempo exporter family, same as
-	// QServiceGraphTotal). See design D3 / D6 of add-service-graph-red-metrics.
+	// to "no error_rate on the edge" and never fails the build. Alloy/Tempo
+	// exporter family, same as QServiceGraphTotal. See design D3 / D6 of
+	// add-service-graph-red-metrics.
 	QServiceGraphFailedTotal Query = "traces_service_graph_request_failed_total"
 	// QServiceGraphServerSecondsBucket is the Duration classic histogram of the
 	// service-graph RED triple (server-observed). OPTIONAL — absence degrades to
-	// "no p90_server_ms". Prefix NOT applied. The rendered PromQL is RAW: no
-	// upstream aggregation, so each bucket series keeps the full dimension set of
-	// its request-total series plus `le` and joins by exact identity, exactly like
-	// the failure counter (design D4 / D5).
+	// "no p90_server_ms". The rendered PromQL is RAW: no upstream aggregation, so
+	// each bucket series keeps the full dimension set of its request-total
+	// series plus `le` and joins by exact identity, exactly like the failure
+	// counter (design D4 / D5).
 	QServiceGraphServerSecondsBucket Query = "traces_service_graph_request_server_seconds_bucket"
-	QClusterDiscovery                Query = "cluster_discovery"
 	QUpProbe                         Query = "up"
 
 	// Service / endpointslice topology (D29 connection-string resolution).
-	// KSM-shaped, so prefix-aware via Renderer.
 	QServiceInfo            Query = "kube_service_info"
 	QEndpointSliceEndpoints Query = "kube_endpointslice_endpoints"
 	QEndpointSliceLabels    Query = "kube_endpointslice_labels"
 
-	// Pod controller-owner resolution (D34). KSM-shaped, so prefix-aware via
-	// Renderer. kube_pod_owner gives a pod's owner refs; kube_replicaset_owner
-	// resolves a ReplicaSet owner up to its owning Deployment (the ReplicaSet is
-	// skipped). The owner_kind/owner_name/owner_is_controller labels are KSM
-	// defaults (no --metric-labels-allowlist required). NOTE: the optional
-	// `argocd_tracking_id` label the application resolver reads off kube_pod_owner
-	// (resolvePodApplications) is NOT a KSM default — it is operator-provided
-	// (e.g. via --metric-labels-allowlist or a relabel); absence degrades
-	// gracefully to no `application` attribute. See design.md D-A4.
+	// Pod controller-owner resolution (D34). kube_pod_owner gives a pod's
+	// owner refs; kube_replicaset_owner resolves a ReplicaSet owner up to
+	// its owning Deployment (the ReplicaSet is skipped). The
+	// owner_kind/owner_name/owner_is_controller labels are KSM defaults
+	// (no --metric-labels-allowlist required). kube_pod_owner carries NO
+	// application information: ArgoCD stamps its tracking-id on the managed
+	// controller, never on the pods a controller spawns, so the pod's
+	// Application is resolved from the controller-annotation families below.
 	QPodOwner        Query = "kube_pod_owner"
 	QReplicaSetOwner Query = "kube_replicaset_owner"
 
-	// PVC StorageClass resolution. KSM-shaped, so prefix-aware via Renderer.
-	// kube_persistentvolumeclaim_info carries the `storageclass` label that the
-	// pod→PVC binding metric (QPVCBindings) lacks; it is joined on
-	// (cluster, namespace, persistentvolumeclaim) to enrich existing PVC nodes
-	// (never to materialise new ones). OPTIONAL — a KSM default, no
-	// --metric-labels-allowlist required.
+	// Job → CronJob resolution, for ArgoCD Application resolution ONLY.
+	// The Kubernetes CronJob controller copies only spec.jobTemplate.metadata
+	// annotations onto the Jobs it creates — never the CronJob object's own
+	// annotations — so ArgoCD's tracking-id never reaches a Job and a
+	// CronJob-managed pod can only resolve its Application one level up.
+	// Keyed (cluster, namespace, job_name); the identity label is `job_name`,
+	// NOT `job` (kube-state-metrics avoids Prometheus' reserved target label).
+	// This leg NEVER alters the pod `owner` attribute — resolvePodOwners does
+	// not read it. Queried at the fixed selector
+	// `owner_kind="CronJob",owner_is_controller="true"`
+	// (jobOwnerCronJobSelector) — a request-invariant metric-selection
+	// contract mirroring resolveJobCronJobOwners, NOT a caller filter — so
+	// Topology.RawSeriesCount counts CronJob-controlled Jobs, not all Jobs.
+	// OPTIONAL on the EMPTY-VECTOR axis (a KSM default, absence degrades
+	// gracefully to no Application for CronJob-managed pods); on the
+	// QUERY-ERROR axis it is abort-on-error (`fetch`).
+	QJobOwner Query = "kube_job_owner"
+
+	// PVC StorageClass name + bound PV name. kube_persistentvolumeclaim_info
+	// carries the `storageclass` and `volumename` labels that the pod→PVC
+	// binding metric (QPVCBindings) lacks; joined on
+	// (cluster, namespace, persistentvolumeclaim) to enrich existing PVC
+	// nodes (never to materialise new ones). OPTIONAL — a KSM default, no
+	// --metric-labels-allowlist required. The StorageClass name is the PVC's
+	// own typed attribute (never a node); `volumename` roots the Harvest
+	// volume join (see QVolumeLabels).
 	QPVCInfo Query = "kube_persistentvolumeclaim_info"
 
-	// StorageClass node resolution. KSM-shaped, so prefix-aware via Renderer.
-	// kube_storageclass_info carries the native `provisioner` label plus the
-	// operator-allowlisted NetApp/Ceph parameter labels (storagePools/pool,
-	// fsType/fsName, ClusterID, selector) that materialise the real
-	// type="storageclass" node and its typed provisioner/parameters attributes.
-	// OPTIONAL — absence degrades gracefully to bare StorageClass nodes
-	// (referenced by a PVC but carrying no provisioner/parameters).
-	QStorageClassInfo Query = "kube_storageclass_info"
-
-	// Pod container list resolution. KSM-shaped, so prefix-aware via Renderer.
-	// kube_pod_container_info emits one series per container carrying the
-	// `container` (name) and `image` labels; joined on (cluster, namespace, pod)
-	// to enrich existing pod nodes with their typed `containers` attribute
-	// (never new nodes). OPTIONAL — a KSM default, no --metric-labels-allowlist
-	// required.
+	// Pod container list resolution. kube_pod_container_info emits one series
+	// per container carrying the `container` (name) and `image` labels; joined
+	// on (cluster, namespace, pod) to enrich existing pod nodes with their
+	// typed `containers` attribute (never new nodes). OPTIONAL — a KSM
+	// default, no --metric-labels-allowlist required.
 	QPodContainerInfo Query = "kube_pod_container_info"
 
-	// K8s node Ready-status resolution. KSM-shaped, so prefix-aware via Renderer.
-	// kube_node_status_condition emits one series per (condition, status) with
-	// value 1 for the active combination; the topology reader reads the active
-	// condition="Ready" row's `status` label (true/false/unknown, matched
-	// case-insensitively — a raw-enum exporter emits True/False/Unknown) to
-	// enrich the node's typed `ready_status` attribute (never a label, never a
-	// new node).
+	// K8s node Ready-status resolution. kube_node_status_condition emits one
+	// series per (condition, status) with value 1 for the active combination;
+	// the topology reader reads the active condition="Ready" row's `status`
+	// label (true/false/unknown, matched case-insensitively — a raw-enum
+	// exporter emits True/False/Unknown) to enrich the node's typed
+	// `ready_status` attribute (never a label, never a new node).
 	// The condition="Ready" selector is a fixed, request-invariant metric-
 	// selection contract (same class as the QNodeAddresses type selector and the
 	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
 	// absence degrades gracefully to no `ready_status`.
 	QNodeStatusCondition Query = "kube_node_status_condition"
 
-	// Service / PVC ArgoCD Application resolution. KSM-shaped, so prefix-aware via
-	// Renderer. kube_service_annotations / kube_persistentvolumeclaim_annotations
+	// Service / PVC ArgoCD Application resolution.
+	// kube_service_annotations / kube_persistentvolumeclaim_annotations
 	// carry the `annotation_argocd_argoproj_io_tracking_id` label — KSM's sanitised
 	// form of the argocd.argoproj.io/tracking-id annotation — whose value uses the
-	// same <app>:<group>/<kind>:<ns>/<name> grammar as the pod's argocd_tracking_id,
-	// so the Application is the segment before the first ":". Joined on
+	// <app>:<group>/<kind>:<ns>/<name> grammar, so the Application is the segment
+	// before the first ":". Joined on
 	// (cluster, namespace, service) / (cluster, namespace, persistentvolumeclaim) to
 	// enrich existing service / PVC nodes (never new nodes). OPTIONAL — the
 	// annotation label requires the operator's --metric-annotations-allowlist;
@@ -106,26 +112,368 @@ const (
 	QServiceAnnotations Query = "kube_service_annotations"
 	QPVCAnnotations     Query = "kube_persistentvolumeclaim_annotations"
 
-	// NetApp Trident PVC SVM resolution. KSM-shaped, so prefix-aware via
-	// Renderer — but NOT stock kube-state-metrics: both series come from a KSM
-	// custom-resource-state config over the Trident `tridentvolumes` /
-	// `tridentbackends` CRDs (or a compatible exporter). Fixed label contract,
-	// case-sensitive and verbatim: kube_tridentvolume_info carries `name` (the
-	// TridentVolume CR name, which equals the bound PV name under Trident's
-	// naming) and `backendUUID`; kube_tridentbackend_info carries `backendUUID`
-	// and `svm`. Chained from kube_persistentvolumeclaim_info's `volumename`
-	// label to enrich existing PVC nodes with `volumename` / `svm` labels
-	// (never new nodes, never new edges). OPTIONAL — absent on clusters without
-	// Trident or without the custom-resource-state config; every broken link of
-	// the chain degrades to omitting the affected label(s), never a build
-	// failure.
-	QTridentVolumeInfo  Query = "kube_tridentvolume_info"
-	QTridentBackendInfo Query = "kube_tridentbackend_info"
+	// Pod ArgoCD Application resolution — the controller-annotation families.
+	// ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it
+	// applies, never on the pods a controller spawns, so a pod's Application is
+	// read from its CONTROLLER's annotation series. Each family carries the same
+	// sanitised `annotation_argocd_argoproj_io_tracking_id` label and the same
+	// <app>:<group>/<kind>:<ns>/<name> grammar as the service / PVC families
+	// above, and each is keyed by its own resource-identity label:
+	//
+	//	Deployment   kube_deployment_annotations   `deployment`
+	//	StatefulSet  kube_statefulset_annotations  `statefulset`
+	//	DaemonSet    kube_daemonset_annotations    `daemonset`
+	//	ReplicaSet   kube_replicaset_annotations   `replicaset`
+	//	Job          kube_job_annotations          `job_name`   (NOT `job`)
+	//	CronJob      kube_cronjob_annotations      `cronjob`
+	//
+	// The Job family's identity label is `job_name` — kube-state-metrics avoids
+	// Prometheus' reserved `job` target label. Joined on
+	// (cluster, namespace, kind, name) against the pod's already-resolved
+	// controller owner, so the Deployment case needs no extra owner hop (the
+	// D34 ReplicaSet skip has already collapsed it). ALL are OPTIONAL on the
+	// EMPTY-VECTOR axis — each annotation label requires the operator's
+	// --metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id],
+	// and because that flag is per-resource the degradation is per-family: an
+	// operator may enable `deployments` alone. Absence degrades gracefully to no
+	// `application` attribute.
+	//
+	// All six are queried at the fixed selector
+	// `annotation_argocd_argoproj_io_tracking_id!=""`
+	// (argoTrackingIDPresentSelector) — a request-invariant metric-selection
+	// contract mirroring resolveApplications' skip, NOT a caller filter — so an
+	// ALLOWLISTED family returns only its annotated objects rather than one
+	// series per workload object, and Topology.RawSeriesCount counts ANNOTATED
+	// objects. An UN-allowlisted family was already empty at the KSM end.
+	//
+	// On the QUERY-ERROR axis they split: kube_replicaset_annotations and
+	// kube_job_annotations are `fetchOptional` (log-and-continue — their
+	// cardinality accumulates with revisionHistoryLimit / Job history limits);
+	// the other four are abort-on-error `fetch`. See ReadTopology.
+	QDeploymentAnnotations  Query = "kube_deployment_annotations"
+	QStatefulSetAnnotations Query = "kube_statefulset_annotations"
+	QDaemonSetAnnotations   Query = "kube_daemonset_annotations"
+	QReplicaSetAnnotations  Query = "kube_replicaset_annotations"
+	QJobAnnotations         Query = "kube_job_annotations"
+	QCronJobAnnotations     Query = "kube_cronjob_annotations"
+
+	// NetApp Harvest volume label series — the SOLE source of the storage
+	// topology (hop A of design.md D3): the pvc-to-netapp-aggr edge, the
+	// netapp-aggr / netapp-node entities and the PVC `svm` label all derive
+	// from this one series and nothing else. It is an info series: its sample
+	// value is discarded, only its label set is consumed. The `volume_name`
+	// label is a deployment relabel (not stock Harvest) mapping each FlexVol
+	// to the Kubernetes PV it backs. OPTIONAL: a query error or empty vector
+	// degrades to no storage topology, never a build failure.
+	QVolumeLabels Query = "volume_labels"
+
+	// NetApp Harvest QoS workload I/O (hop B of design.md D3). Harvest has
+	// already resolved ONTAP base counters — ops are per-second, latency is an
+	// average in microseconds, data is bytes per second — so these are read
+	// verbatim via last_over_time, NEVER wrapped in rate(). Read at volume
+	// granularity only (see qosVolumeGranularitySelector). OPTIONAL and
+	// independent of the topology source: a miss leaves the claim's edge in
+	// place carrying no metrics at all.
+	QQoSReadOps      Query = "qos_read_ops"
+	QQoSWriteOps     Query = "qos_write_ops"
+	QQoSReadLatency  Query = "qos_read_latency"
+	QQoSWriteLatency Query = "qos_write_latency"
+	QQoSReadData     Query = "qos_read_data"
+	QQoSWriteData    Query = "qos_write_data"
+
+	// NetApp Harvest QoS fixed-policy ceilings (hop C of design.md D3),
+	// joined on the (ontap_cluster, svm, policy_group) triple recovered from
+	// the matched QoS workload series. Rendered bare — a policy object has no
+	// LUN dimension. OPTIONAL: absence means "no declared ceiling", which is
+	// never rendered as a number.
+	QQoSPolicyFixedMaxIOPS Query = "qos_policy_fixed_max_throughput_iops"
+	QQoSPolicyFixedMaxMBps Query = "qos_policy_fixed_max_throughput_mbps"
+
+	// NetApp Harvest aggregate + controller gauges. Same last_over_time
+	// verbatim read; OPTIONAL; log-and-continue on query error.
+	QAggrStatus       Query = "aggr_new_status"
+	QAggrSpaceUsed    Query = "aggr_space_used"
+	QAggrSpaceTotal   Query = "aggr_space_total"
+	QNetAppNodeStatus Query = "node_new_status"
+
+	// Kubelet PVC usage (bytes). OPTIONAL; per-field independent; joined on
+	// (cluster, namespace, persistentvolumeclaim). Introduces kubelet as a
+	// fourth upstream family.
+	QKubeletVolumeUsedBytes     Query = "kubelet_volume_stats_used_bytes"
+	QKubeletVolumeCapacityBytes Query = "kubelet_volume_stats_capacity_bytes"
 )
 
-// ClusterDiscoveryLookback is the fixed lookback used by /v1/clusters
-// discovery. Sized to absorb transient KSM scrape gaps; not configurable.
-const ClusterDiscoveryLookback = time.Hour
+// queryDims is the hardcoded "which request dimension reaches which series"
+// contract. It is a TABLE, not per-case logic, so the contract is greppable in
+// one place and a new Query constant cannot silently default into accepting
+// (or refusing) a caller filter: TestQueryDims_EveryQueryListed parses this
+// file's Query constants and fails on a missing entry.
+//
+// The three groupings and their reasons:
+//
+//   - dimsNamespaced — pod-, claim-, Service- and EndpointSlice-scoped
+//     kube-state-metrics series plus the kubelet volume-stats family. These
+//     carry every label, so every dimension applies.
+//   - dimsClusterScoped — the kube_node_* family: cluster-keyed, no namespace.
+//     A namespace filter reaches K8s nodes by REFERENCE (a node is emitted when
+//     an in-scope pod is scheduled on it), never by matcher.
+//   - dimsHarvest — every NetApp Harvest series. Their `cluster` label is the
+//     ONTAP cluster name, NOT a Kubernetes cluster, so pushing a Kubernetes
+//     cluster value into it would match nothing; they carry no namespace
+//     either; and they take no az/env matcher — the family is zone-ROUTED
+//     (dimAZRoute: the request's az picks the Harvest backend) while the query
+//     string stays unfiltered. Narrowed by reference through the loaded
+//     claims' volumename join.
+//   - dimsNone — the three traces_service_graph_* series (read in full for
+//     every request: their `cluster` label is the unreliable trace-source
+//     cluster and their namespace labels describe only the caller's own view,
+//     so narrowing here would drop edges the loaded topology still needs) and
+//     the up{} probe (it measures the store, not the data).
+var queryDims = map[Query]dims{
+	// kube-state-metrics — namespaced.
+	QPodInfo:                dimsNamespaced,
+	QPVCBindings:            dimsNamespaced,
+	QServiceInfo:            dimsNamespaced,
+	QEndpointSliceEndpoints: dimsNamespaced,
+	QEndpointSliceLabels:    dimsNamespaced,
+	QPodOwner:               dimsNamespaced,
+	QReplicaSetOwner:        dimsNamespaced,
+	QJobOwner:               dimsNamespaced,
+	QPVCInfo:                dimsNamespaced,
+	QPodContainerInfo:       dimsNamespaced,
+	QServiceAnnotations:     dimsNamespaced,
+	QPVCAnnotations:         dimsNamespaced,
+
+	// kube-state-metrics — the controller-annotation families feeding the pod
+	// ArgoCD Application. Namespaced like every other workload family, which is
+	// not merely permissible but REQUIRED for correctness under a filter: a
+	// pod's controller always lives in the pod's own (cluster, namespace), so
+	// narrowing both sides by the same matcher keeps every join intact.
+	QDeploymentAnnotations:  dimsNamespaced,
+	QStatefulSetAnnotations: dimsNamespaced,
+	QDaemonSetAnnotations:   dimsNamespaced,
+	QReplicaSetAnnotations:  dimsNamespaced,
+	QJobAnnotations:         dimsNamespaced,
+	QCronJobAnnotations:     dimsNamespaced,
+
+	// kubelet — namespaced.
+	QKubeletVolumeUsedBytes:     dimsNamespaced,
+	QKubeletVolumeCapacityBytes: dimsNamespaced,
+
+	// kube-state-metrics — cluster-scoped (node objects have no namespace).
+	QNodeInfo:            dimsClusterScoped,
+	QNodeAddresses:       dimsClusterScoped,
+	QNodeLabels:          dimsClusterScoped,
+	QNodeStatusCondition: dimsClusterScoped,
+
+	// NetApp Harvest — zone-routed, no request matcher.
+	QVolumeLabels:          dimsHarvest,
+	QQoSReadOps:            dimsHarvest,
+	QQoSWriteOps:           dimsHarvest,
+	QQoSReadLatency:        dimsHarvest,
+	QQoSWriteLatency:       dimsHarvest,
+	QQoSReadData:           dimsHarvest,
+	QQoSWriteData:          dimsHarvest,
+	QQoSPolicyFixedMaxIOPS: dimsHarvest,
+	QQoSPolicyFixedMaxMBps: dimsHarvest,
+	QAggrStatus:            dimsHarvest,
+	QAggrSpaceUsed:         dimsHarvest,
+	QAggrSpaceTotal:        dimsHarvest,
+	QNetAppNodeStatus:      dimsHarvest,
+
+	// Read unfiltered for every request.
+	QServiceGraphTotal:               dimsNone,
+	QServiceGraphFailedTotal:         dimsNone,
+	QServiceGraphServerSecondsBucket: dimsNone,
+	QUpProbe:                         dimsNone,
+}
+
+// Family classifies a Query by the upstream metric family it belongs to. It is
+// the routing counterpart of queryDims: queryDims decides which request
+// dimension narrows a query, Family decides which upstream installation is
+// asked to answer it (see the upstream-backend-routing capability).
+//
+// The two are deliberately separate contracts. A deployment may ingest the
+// NetApp Harvest series into a different VictoriaMetrics installation from the
+// kube-state-metrics series without that changing one character of either
+// query string.
+type Family string
+
+const (
+	// FamilyKSM is every kube-state-metrics `kube_*` series — pod, node,
+	// claim, Service, EndpointSlice, owner and controller-annotation.
+	FamilyKSM Family = "ksm"
+	// FamilyKubelet is the kubelet volume-stats pair. Separate from KSM
+	// because it is a different exporter with its own scrape job, which a
+	// deployment may route elsewhere.
+	FamilyKubelet Family = "kubelet"
+	// FamilyHarvest is every NetApp Harvest series. This is the split the
+	// routing capability exists for: ONTAP metrics commonly land in their own
+	// installation.
+	FamilyHarvest Family = "harvest"
+	// FamilyServiceGraph is the three traces_service_graph_* series.
+	FamilyServiceGraph Family = "servicegraph"
+	// FamilyProbe is the up{} store-health probe.
+	FamilyProbe Family = "probe"
+)
+
+// Families lists every declared family in a fixed order. It is the set a
+// routing table validates against and the set it must cover — a family served
+// by no backend is a configuration error, because the queries in it would have
+// nowhere to go.
+var Families = []Family{
+	FamilyKSM,
+	FamilyKubelet,
+	FamilyHarvest,
+	FamilyServiceGraph,
+	FamilyProbe,
+}
+
+// ParseFamily resolves a configured family name. The bool reports whether the
+// name is one of Families; an unknown name is a validation error at the
+// configuration boundary, never a silent no-op.
+func ParseFamily(s string) (Family, bool) {
+	for _, f := range Families {
+		if Family(s) == f {
+			return f, true
+		}
+	}
+	return "", false
+}
+
+// queryFamily is the hardcoded "which series belongs to which upstream family"
+// contract. It is a TABLE, not per-case logic, for the same reason queryDims
+// is: the contract stays greppable in one place and a new Query constant
+// cannot silently default into a family.
+// TestQueryFamily_EveryQueryListed parses this file's Query constants and
+// fails on a missing entry.
+var queryFamily = map[Query]Family{
+	// kube-state-metrics.
+	QPodInfo:                FamilyKSM,
+	QNodeInfo:               FamilyKSM,
+	QNodeAddresses:          FamilyKSM,
+	QNodeLabels:             FamilyKSM,
+	QNodeStatusCondition:    FamilyKSM,
+	QPVCBindings:            FamilyKSM,
+	QPVCInfo:                FamilyKSM,
+	QPVCAnnotations:         FamilyKSM,
+	QServiceInfo:            FamilyKSM,
+	QServiceAnnotations:     FamilyKSM,
+	QEndpointSliceEndpoints: FamilyKSM,
+	QEndpointSliceLabels:    FamilyKSM,
+	QPodOwner:               FamilyKSM,
+	QReplicaSetOwner:        FamilyKSM,
+	QJobOwner:               FamilyKSM,
+	QPodContainerInfo:       FamilyKSM,
+	QDeploymentAnnotations:  FamilyKSM,
+	QStatefulSetAnnotations: FamilyKSM,
+	QDaemonSetAnnotations:   FamilyKSM,
+	QReplicaSetAnnotations:  FamilyKSM,
+	QJobAnnotations:         FamilyKSM,
+	QCronJobAnnotations:     FamilyKSM,
+
+	// kubelet.
+	QKubeletVolumeUsedBytes:     FamilyKubelet,
+	QKubeletVolumeCapacityBytes: FamilyKubelet,
+
+	// NetApp Harvest.
+	QVolumeLabels:          FamilyHarvest,
+	QQoSReadOps:            FamilyHarvest,
+	QQoSWriteOps:           FamilyHarvest,
+	QQoSReadLatency:        FamilyHarvest,
+	QQoSWriteLatency:       FamilyHarvest,
+	QQoSReadData:           FamilyHarvest,
+	QQoSWriteData:          FamilyHarvest,
+	QQoSPolicyFixedMaxIOPS: FamilyHarvest,
+	QQoSPolicyFixedMaxMBps: FamilyHarvest,
+	QAggrStatus:            FamilyHarvest,
+	QAggrSpaceUsed:         FamilyHarvest,
+	QAggrSpaceTotal:        FamilyHarvest,
+	QNetAppNodeStatus:      FamilyHarvest,
+
+	// Service graph.
+	QServiceGraphTotal:               FamilyServiceGraph,
+	QServiceGraphFailedTotal:         FamilyServiceGraph,
+	QServiceGraphServerSecondsBucket: FamilyServiceGraph,
+
+	// Store health.
+	QUpProbe: FamilyProbe,
+}
+
+// FamilyOf returns the family query q belongs to. The bool reports whether q
+// is a known Query; a caller reaching an unknown query has bypassed the
+// constant set, which the completeness test makes impossible for code in this
+// repository.
+func FamilyOf(q Query) (Family, bool) {
+	f, ok := queryFamily[q]
+	return f, ok
+}
+
+// familyAcceptsAZ is derived from queryDims once, at package initialisation:
+// a family is zone-routable iff EVERY query in it carries dimAZ (az rendered
+// as a matcher AND routed) or dimAZRoute (routed only — the Harvest family).
+//
+// Deriving it (rather than restating it) is what keeps backend selection and
+// matcher rendering reading the same table. The service-graph and probe
+// families carry neither bit, so narrowing them by zone at the routing layer
+// would drop exactly the series the matcher layer deliberately keeps — see the
+// design's D4.
+//
+// A family whose queries disagreed would resolve to false (not zone-routable,
+// so fanned out to every backend serving it), which is the safe direction.
+// TestFamilyAcceptsAZ_HomogeneousWithinFamily fails on such a disagreement.
+var familyAcceptsAZ = buildFamilyAcceptsAZ()
+
+func buildFamilyAcceptsAZ() map[Family]bool {
+	out := make(map[Family]bool, len(Families))
+	seen := make(map[Family]bool, len(Families))
+	for q, f := range queryFamily {
+		az := queryDims[q]&(dimAZ|dimAZRoute) != 0
+		if !seen[f] {
+			seen[f] = true
+			out[f] = az
+			continue
+		}
+		out[f] = out[f] && az
+	}
+	return out
+}
+
+// AcceptsAZ reports whether the queries in family f carry the `az` request
+// dimension, and therefore whether backend selection may narrow this family by
+// the requested zones. A family that accepts no dimension is always fanned out
+// to every backend serving it.
+func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
+
+// qosVolumeGranularitySelector keeps the Harvest QoS workload reads at volume
+// granularity. A PromQL empty-string matcher also matches series carrying no
+// such label at all, so the contract stays correct against a Harvest template
+// that omits `lun` entirely.
+const qosVolumeGranularitySelector = `lun=""`
+
+// jobOwnerCronJobSelector keeps kube_job_owner at the rows
+// resolveJobCronJobOwners retains: CronJob controller owners. It is a
+// request-invariant metric-selection contract, NOT a caller filter — the
+// reader already drops every other row before it is keyed or counted, so
+// selecting them upstream is output-preserving
+// (harden-controller-annotation-legs D1).
+const jobOwnerCronJobSelector = `owner_kind="CronJob",owner_is_controller="true"`
+
+// argoTrackingIDPresentSelector keeps each controller-annotation family at
+// series that actually carry a tracking-id. It is a request-invariant
+// metric-selection contract, NOT a caller filter — resolveApplications
+// skips an empty or absent tracking-id before keyOf, so selecting them
+// upstream is output-preserving (harden-controller-annotation-legs D1).
+//
+// What it actually saves is the ALLOWLISTED-BUT-UNANNOTATED majority: once
+// --metric-annotations-allowlist names the resource, kube-state-metrics emits
+// one series per object of that kind and attaches the annotation label only to
+// the objects that hold the annotation. PromQL treats the missing label as "",
+// so this matcher drops the rest. It saves NOTHING on the un-allowlisted case —
+// KSM short-circuits an un-allowlisted resource to an EMPTY family (no series
+// at all), as docs/kube-state-metrics-preconditions.md records; there is
+// nothing there to drop.
+const argoTrackingIDPresentSelector = `annotation_argocd_argoproj_io_tracking_id!=""`
 
 // serviceGraphSentinelSelector excludes the servicegraph connector's virtual
 // peers from the service-graph series at the query layer (design.md D30): an
@@ -182,93 +530,142 @@ const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 // failure/bucket series filtered away upstream and then read as error_rate=0.
 const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 
-// Renderer renders Query templates to PromQL strings, optionally prepending
-// Prefix to every kube-state-metrics-shaped metric name. The prefix is
-// additive — it is not applied to the service-graph metric
-// (`traces_service_graph_request_total`, produced by a different exporter
-// family) or to the Prometheus-native readiness probe (`up`).
-//
-// Zero value (`Renderer{}`) preserves stock kube-state-metrics behaviour.
-type Renderer struct {
-	Prefix string
-}
-
 // Render returns the PromQL string for the named query, parameterised by
-// `window` (the bucketed end-start) and prefixed per r.Prefix where
-// applicable.
-func (r Renderer) Render(q Query, window time.Duration) string {
+// `window` (the bucketed end-start) and by the request-scoped `sel` selector.
+// Every series is queried at its bare name — there is no configurable
+// metric-name prefix.
+//
+// Two selector layers meet here and MUST NOT be conflated. A query's FIXED
+// selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`,
+// `owner_kind="CronJob",owner_is_controller="true"`,
+// `annotation_argocd_argoproj_io_tracking_id!=""`, the service-graph
+// sentinel and link matchers) is a request-invariant metric-selection
+// contract, identical for every request. `sel` carries the
+// caller's `az` / `env` / `cluster` / `namespace` values and reaches only the
+// dimensions queryDims grants this query. The fixed part is always rendered
+// FIRST, so composing the two never reorders an existing matcher.
+//
+// A zero Selector renders every query exactly as it was rendered before
+// request-scoped selectors existed (pinned by
+// TestRender_EmptySelectorMatchesBaseline).
+func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string {
 	w := FormatDuration(window)
+	req := sel.render(queryDims[q], keys)
+
+	// braces joins a query's fixed selector with the request matchers, omitting
+	// the braces entirely when neither is present.
+	braces := func(fixed string) string {
+		switch {
+		case fixed == "" && req == "":
+			return ""
+		case req == "":
+			return "{" + fixed + "}"
+		case fixed == "":
+			return "{" + req + "}"
+		default:
+			return "{" + fixed + "," + req + "}"
+		}
+	}
 
 	switch q {
 	case QPodInfo:
-		return fmt.Sprintf(`last_over_time(%skube_pod_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_pod_info%s[%s])`, braces(""), w)
 	case QNodeInfo:
-		return fmt.Sprintf(`last_over_time(%skube_node_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_node_info%s[%s])`, braces(""), w)
 	case QNodeAddresses:
 		// ExternalIP preferred, InternalIP fallback; anchored alternation
 		// selects exactly the two types — the topology reader applies the
 		// preference at parse time.
-		return fmt.Sprintf(`last_over_time(%skube_node_status_addresses{type=~"ExternalIP|InternalIP"}[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_node_status_addresses%s[%s])`, braces(`type=~"ExternalIP|InternalIP"`), w)
 	case QPVCBindings:
-		return fmt.Sprintf(`last_over_time(%skube_pod_spec_volumes_persistentvolumeclaims_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info%s[%s])`, braces(""), w)
 	case QNodeLabels:
-		return fmt.Sprintf(`last_over_time(%skube_node_labels[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_node_labels%s[%s])`, braces(""), w)
 	case QServiceInfo:
-		return fmt.Sprintf(`last_over_time(%skube_service_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_service_info%s[%s])`, braces(""), w)
 	case QEndpointSliceEndpoints:
-		return fmt.Sprintf(`last_over_time(%skube_endpointslice_endpoints[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_endpointslice_endpoints%s[%s])`, braces(""), w)
 	case QEndpointSliceLabels:
-		return fmt.Sprintf(`last_over_time(%skube_endpointslice_labels[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_endpointslice_labels%s[%s])`, braces(""), w)
 	case QPodOwner:
-		return fmt.Sprintf(`last_over_time(%skube_pod_owner[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_pod_owner%s[%s])`, braces(""), w)
 	case QReplicaSetOwner:
-		return fmt.Sprintf(`last_over_time(%skube_replicaset_owner[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_replicaset_owner%s[%s])`, braces(""), w)
+	case QJobOwner:
+		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, braces(jobOwnerCronJobSelector), w)
 	case QPVCInfo:
-		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_info[%s])`, r.Prefix, w)
-	case QStorageClassInfo:
-		return fmt.Sprintf(`last_over_time(%skube_storageclass_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_info%s[%s])`, braces(""), w)
 	case QPodContainerInfo:
 		// tlast_over_time (MetricsQL) — value is each series' last-sample timestamp
 		// (unix seconds). A container that changed image in the window has one
 		// series per image (image is a label); the resolver picks the image with
 		// the greatest last-sample timestamp (the current one). last_over_time
 		// would stamp every series at the eval instant, flattening recency.
-		return fmt.Sprintf(`tlast_over_time(%skube_pod_container_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`tlast_over_time(kube_pod_container_info%s[%s])`, braces(""), w)
 	case QNodeStatusCondition:
 		// condition="Ready" is a fixed, request-invariant metric-selection
 		// contract (anchored equality), not a caller filter — the reader reads
 		// the active row's `status` label at parse time. The four other node
 		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
 		// are never surfaced, so they are excluded here.
-		return fmt.Sprintf(`last_over_time(%skube_node_status_condition{condition="Ready"}[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_node_status_condition%s[%s])`, braces(`condition="Ready"`), w)
 	case QServiceAnnotations:
-		return fmt.Sprintf(`last_over_time(%skube_service_annotations[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_service_annotations%s[%s])`, braces(""), w)
 	case QPVCAnnotations:
-		return fmt.Sprintf(`last_over_time(%skube_persistentvolumeclaim_annotations[%s])`, r.Prefix, w)
-	case QTridentVolumeInfo:
-		return fmt.Sprintf(`last_over_time(%skube_tridentvolume_info[%s])`, r.Prefix, w)
-	case QTridentBackendInfo:
-		return fmt.Sprintf(`last_over_time(%skube_tridentbackend_info[%s])`, r.Prefix, w)
+		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations%s[%s])`, braces(""), w)
+	case QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
+		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations:
+		// One grouped arm for the six controller-annotation families (same
+		// shape as the QQoS* arm below): each Query constant IS its bare
+		// metric name, so `q` renders it and a seventh family costs one
+		// constant in the case list rather than a copy-pasted Sprintf whose
+		// hand-typed metric name only render-baseline.txt would catch.
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(argoTrackingIDPresentSelector), w)
+	case QVolumeLabels:
+		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, braces(""), w)
+	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
+		// Volume-granularity restriction (design.md D2): ONTAP collects a
+		// workload per LUN as well as per volume, and a LUN workload carries
+		// the volume_name of its containing FlexVol once the deployment
+		// relabel rule has run — an unrestricted read would sum LUN traffic on
+		// top of volume traffic for the same claim. This is a fixed,
+		// request-invariant metric-selection contract (same class as the D30
+		// sentinel matcher and condition="Ready"), NOT a caller filter.
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(qosVolumeGranularitySelector), w)
+	case QQoSPolicyFixedMaxIOPS:
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, braces(""), w)
+	case QQoSPolicyFixedMaxMBps:
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_mbps%s[%s])`, braces(""), w)
+	case QAggrStatus:
+		return fmt.Sprintf(`last_over_time(aggr_new_status%s[%s])`, braces(""), w)
+	case QAggrSpaceUsed:
+		return fmt.Sprintf(`last_over_time(aggr_space_used%s[%s])`, braces(""), w)
+	case QAggrSpaceTotal:
+		return fmt.Sprintf(`last_over_time(aggr_space_total%s[%s])`, braces(""), w)
+	case QNetAppNodeStatus:
+		return fmt.Sprintf(`last_over_time(node_new_status%s[%s])`, braces(""), w)
+	case QKubeletVolumeUsedBytes:
+		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_used_bytes%s[%s])`, braces(""), w)
+	case QKubeletVolumeCapacityBytes:
+		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_capacity_bytes%s[%s])`, braces(""), w)
 	case QServiceGraphTotal:
-		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics;
-		// the configurable prefix deliberately does NOT apply here. The metric
-		// carries a single `cluster` label representing the trace source
-		// (client-side) cluster; server-side cluster is recovered at build time
-		// via the topology pod-UID index, not via PromQL.
+		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics.
+		// The metric carries a single `cluster` label representing the trace
+		// source (client-side) cluster; server-side cluster is recovered at
+		// build time via the topology pod-UID index, not via PromQL.
 		//
 		// The fixed sentinel matcher (D30) drops the connector's virtual
 		// `user` / `unknown` peers upstream. It is a metric-selection contract,
 		// identical for every request — NOT a caller-supplied filter — so it
 		// does not violate the "no filters pushed to PromQL" rule (D2 / D7).
-		return fmt.Sprintf(`rate(traces_service_graph_request_total{%s}[%s])`, serviceGraphSentinelSelector, w)
+		return fmt.Sprintf(`rate(traces_service_graph_request_total%s[%s])`, braces(serviceGraphSentinelSelector), w)
 	case QServiceGraphFailedTotal:
-		// OPTIONAL Errors counter. Prefix NOT applied (Alloy/Tempo family).
-		// Raw label granularity so failures join the total series by exact
-		// identity (design D4).
-		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total{%s,%s}[%s])`,
-			serviceGraphSentinelSelector, serviceGraphLinkExclusionSelector, w)
+		// OPTIONAL Errors counter. Raw label granularity so failures join the
+		// total series by exact identity (design D4).
+		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total%s[%s])`,
+			braces(serviceGraphSentinelSelector+","+serviceGraphLinkExclusionSelector), w)
 	case QServiceGraphServerSecondsBucket:
-		// OPTIONAL Duration classic histogram. Prefix NOT applied.
+		// OPTIONAL Duration classic histogram.
 		//
 		// Read RAW — deliberately no upstream `sum by` (design D4). Once an
 		// endpoint may be resolved from a peer address or a connection string,
@@ -280,21 +677,10 @@ func (r Renderer) Render(q Query, window time.Duration) string {
 		// multiplied cardinality on the wire; the metric is OPTIONAL, so a store
 		// that refuses the query degrades exactly as an absent one.
 		return fmt.Sprintf(
-			`rate(traces_service_graph_request_server_seconds_bucket{%s,%s}[%s])`,
-			serviceGraphSentinelSelector, serviceGraphLinkExclusionSelector, w)
-	case QClusterDiscovery:
-		return fmt.Sprintf(`group by (cluster) (last_over_time(%skube_node_info[%s]))`, r.Prefix, w)
+			`rate(traces_service_graph_request_server_seconds_bucket%s[%s])`,
+			braces(serviceGraphSentinelSelector+","+serviceGraphLinkExclusionSelector), w)
 	case QUpProbe:
-		// Prometheus-native; the configurable prefix does not apply.
 		return `up`
 	}
 	return ""
-}
-
-// Render returns the PromQL string for the named query using a zero-prefix
-// Renderer. Retained for tests and existing callers that do not need a
-// configurable prefix; production code paths go through a Renderer held by
-// build.Builder / api.Server.
-func Render(q Query, window time.Duration) string {
-	return Renderer{}.Render(q, window)
 }

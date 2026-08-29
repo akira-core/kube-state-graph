@@ -15,7 +15,7 @@ const (
 	EdgeTypePodCallsService   EdgeType = "pod-calls-service"
 	EdgeTypeServiceSelectsPod EdgeType = "service-selects-pod"
 	EdgeTypePodToNode         EdgeType = "pod-to-node"
-	EdgeTypePVCToStorageClass EdgeType = "pvc-to-storageclass"
+	EdgeTypePVCToNetAppAggr   EdgeType = "pvc-to-netapp-aggr"
 )
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are
@@ -48,6 +48,33 @@ type Edge struct {
 	Target  string
 	Labels  map[string]string
 	Metrics *EdgeMetrics // nil = no RED measurements for this edge
+	IO      *IOMetrics   // nil = no I/O measurements for this edge
+}
+
+// IOMetrics holds the Harvest storage measurements attached to a
+// pvc-to-netapp-aggr edge: six measured I/O figures from the QoS workload
+// families plus the volume's declared throughput ceiling from its QoS fixed
+// policy. Numeric values NEVER enter Labels. Each field is a pointer so a
+// missing family is omitted (distinct from 0) — for the ceiling, absence means
+// "no declared ceiling" and must never surface as a number. The RED
+// EdgeMetrics invariant is untouched; a single edge carries at most one
+// family (the builder never sets both).
+//
+// MaxIOPS / MaxBytesPerSec can only be set for an edge that already carries at
+// least one measurement: the policy join key is recovered from the matched QoS
+// workload series (design.md D3 hop C), so no workload means no ceiling.
+// MaxBytesPerSec is the one converted value in the struct — the policy's
+// megabytes-per-second figure scaled to bytes per second so it shares the unit
+// of ReadBytesPerSec / WriteBytesPerSec.
+type IOMetrics struct {
+	ReadOps          *float64
+	WriteOps         *float64
+	ReadLatencyUs    *float64
+	WriteLatencyUs   *float64
+	ReadBytesPerSec  *float64
+	WriteBytesPerSec *float64
+	MaxIOPS          *float64
+	MaxBytesPerSec   *float64
 }
 
 // NewEdge constructs an Edge with a deterministic UUIDv5 id derived from
@@ -77,6 +104,18 @@ func (e *Edge) WithMetrics(m EdgeMetrics) *Edge {
 	cp := *e
 	mm := m
 	cp.Metrics = &mm
+	return &cp
+}
+
+// WithIO returns a shallow copy of e carrying the given I/O measurements.
+// Identity fields are unchanged; the original *Edge is left untouched.
+func (e *Edge) WithIO(m IOMetrics) *Edge {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	mm := m
+	cp.IO = &mm
 	return &cp
 }
 

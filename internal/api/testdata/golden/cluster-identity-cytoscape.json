@@ -1,0 +1,177 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-beta",
+    "eu-prod-c1",
+    "us-dev-c1"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-beta",
+          "name": "cluster-beta",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster/eu-prod-c1",
+          "name": "eu-prod-c1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster/us-dev-c1",
+          "name": "us-dev-c1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-beta/namespace/billing",
+          "name": "billing",
+          "type": "namespace",
+          "parent": "cluster/cluster-beta",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "eu-prod-c1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/eu-prod-c1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/us-dev-c1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/p1",
+          "name": "checkout",
+          "type": "pod",
+          "parent": "us-dev-c1/namespace/shop",
+          "labels": {
+            "cluster": "us-dev-c1",
+            "namespace": "shop",
+            "node": "us-dev-c1/worker-0"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/worker-0",
+          "name": "worker-0",
+          "type": "node",
+          "parent": "cluster/us-dev-c1",
+          "labels": {
+            "cluster": "us-dev-c1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/shop/checkout-data",
+          "name": "checkout-data",
+          "type": "pvc",
+          "parent": "us-dev-c1/namespace/shop",
+          "labels": {
+            "cluster": "us-dev-c1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/shop/payments",
+          "name": "payments",
+          "type": "service",
+          "parent": "us-dev-c1/namespace/shop",
+          "labels": {
+            "cluster": "us-dev-c1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "eu-prod-c1/p2",
+          "name": "payments",
+          "type": "pod",
+          "parent": "eu-prod-c1/namespace/shop",
+          "labels": {
+            "cluster": "eu-prod-c1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-beta/p3",
+          "name": "ledger",
+          "type": "pod",
+          "parent": "cluster-beta/namespace/billing",
+          "labels": {
+            "cluster": "cluster-beta",
+            "namespace": "billing"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "b103fec8-622d-593b-b38c-2d1f3f2454e3",
+          "type": "pod-calls-service",
+          "source": "us-dev-c1/p1",
+          "target": "us-dev-c1/shop/payments",
+          "labels": {
+            "cluster": "us-dev-c1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "94d8ac3b-b2a1-5dde-bc5d-5ad745ab0ce1",
+          "type": "pod-calls-pod",
+          "source": "us-dev-c1/p1",
+          "target": "eu-prod-c1/p2",
+          "labels": {
+            "cluster": "us-dev-c1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "16578a4b-f79f-5e43-9d8c-93abd2bca0a9",
+          "type": "pod-to-node",
+          "source": "us-dev-c1/p1",
+          "target": "us-dev-c1/worker-0",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "d116a817-0820-55f4-a7ee-5fd515fc1fdc",
+          "type": "pod-mounts-pvc",
+          "source": "us-dev-c1/p1",
+          "target": "us-dev-c1/shop/checkout-data",
+          "labels": {}
+        }
+      }
+    ]
+  }
+}

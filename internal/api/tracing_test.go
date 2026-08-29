@@ -227,7 +227,7 @@ func TestAuth_NoAPIKeyInLogs(t *testing.T) {
 	metrics := observability.NewMetrics()
 	ks := auth.NewKeySet()
 	ks.LoadCSV("real-key-1,real-key-2")
-	builder := build.New(q, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, clock.System{})
+	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clock.System{})
 	server := New(cfg, builder, q, metrics, logger, ks, clock.System{})
 
 	srv := httptest.NewServer(server.Handler())

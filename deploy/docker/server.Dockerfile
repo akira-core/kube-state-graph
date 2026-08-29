@@ -13,10 +13,10 @@
 ARG ENVOY_TOOLS_IMAGE=envoyproxy/envoy:tools-v1.34-latest@sha256:74a4aebd5cc9ca03889189f96f0164015bcd1e087953528ad557cb389816d0d6
 
 # ---- build stage ---------------------------------------------------------
-# Base image Go must match go.mod's `toolchain` directive (go1.26.4); a lower
+# Base image Go must match go.mod's `toolchain` directive (go1.26.6); a lower
 # base would trigger a silent mid-build toolchain download from dl.google.com
 # (GOTOOLCHAIN is not pinned to local), breaking reproducibility.
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH

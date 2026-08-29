@@ -26,48 +26,80 @@ var tracer = otel.Tracer("kube-state-graph")
 // multi-cluster Graph for one bucketed time window.
 type Builder struct {
 	q       promql.Querier
-	r       promql.Renderer
+	src     promql.QuerierSource
 	opts    Options
 	metrics Metrics
 	clk     clock.Clock
 }
 
 // New constructs a Builder. clk may be nil (falls back to clock.System); m may
-// be nil (no-op metrics). The Renderer is derived from opts.MetricPrefix and
-// held on the Builder so every PromQL query the build pipeline issues picks up
-// the configured upstream metric-name prefix (see design.md D26).
+// be nil (no-op metrics).
+//
+// When q ALSO satisfies promql.QuerierSource — a *promql.Router does — the
+// builder resolves a per-build Querier from it, so the request's `az`
+// dimension can select which upstream installations answer. This is an
+// OPTIONAL upgrade, deliberately shaped like BuildScopedRouteResolver: a plain
+// Querier (a *promql.Client, a mock) leaves src nil and every query is issued
+// exactly as it was before backend routing existed.
 func New(q promql.Querier, opts Options, m Metrics, clk clock.Clock) *Builder {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	return &Builder{
+	b := &Builder{
 		q:       q,
-		r:       promql.Renderer{Prefix: opts.MetricPrefix},
 		opts:    opts,
 		metrics: m,
 		clk:     clk,
 	}
+	if src, ok := q.(promql.QuerierSource); ok && src != nil {
+		b.src = src
+	}
+	return b
+}
+
+// querierFor resolves the Querier this build dispatches through. The routing
+// snapshot is taken ONCE per build and threaded through every leg — topology,
+// service graph, and the retention probe — so a routing-table reload cannot
+// change which backends a build in flight reaches, and the build cannot end up
+// probing a different set of stores than it read from.
+func (b *Builder) querierFor(sel promql.Selector) promql.Querier {
+	if b.src == nil {
+		return b.q
+	}
+	return b.src.QuerierFor(sel)
 }
 
 // Build runs all upstream queries for [end - window, end] and returns the
 // joined multi-cluster Graph.
-func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time) (*graph.Graph, error) {
+//
+// sel carries the request-scoped selector dimensions (`az`, `env`, `cluster`,
+// `namespace`). A zero Selector is the unfiltered build: every query is issued
+// exactly as it was before request-scoped selectors existed, and every
+// filtered-build rule below stays inert.
+func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	filtered := sel.Active()
+	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
+			attribute.Bool("kube_state_graph.selector_active", filtered),
 		),
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, b.q, b.r, window, end)
+	topology, err := ReadTopology(ctx, q, window, end, b.opts.LabelKeys, sel)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
 
 	// Outside-retention check: zero pods + healthy upstream ⇒ retention miss.
-	if len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
-		up, probeErr := b.upProbe(ctx)
+	// Only meaningful for an UNFILTERED build. With any selector-level filter
+	// active, zero rows means "nothing in scope" — a legitimate empty result,
+	// not a client-classifiable retention error — so the classification (and
+	// its up{} probe) is skipped entirely.
+	if !filtered && len(topology.Pods) == 0 && len(topology.Nodes) == 0 {
+		up, probeErr := b.upProbe(ctx, q)
 		if probeErr != nil {
 			// A failed probe must not fail the build (control flow / status
 			// mapping unchanged — that is a spec-level decision), but it must
@@ -99,23 +131,50 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 				"start", startStr,
 				"end", endStr,
 				"window", window.String(),
-				"metric_prefix", b.opts.MetricPrefix,
 				"raw_series_counts", topology.RawSeriesCount,
-				"pod_info_query", b.r.Render(promql.QPodInfo, window),
-				"node_info_query", b.r.Render(promql.QNodeInfo, window),
+				"pod_info_query", promql.Render(promql.QPodInfo, window, b.opts.LabelKeys, sel),
+				"node_info_query", promql.Render(promql.QNodeInfo, window, b.opts.LabelKeys, sel),
 			)
 			return nil, err
 		}
 	}
 
-	sg, err := ReadServiceGraph(ctx, b.q, b.r, window, end, topology,
-		b.opts.RouteResolver, b.opts.RouteResolveTimeout)
-	if err != nil {
-		return nil, classifyReadError(span, "service-graph read failed", err)
+	// A filtered build that loaded NO topology cannot admit a single
+	// service-graph series, so the three traces_service_graph_* queries are
+	// skipped entirely. They are the most expensive leg of the fan-out and the
+	// one leg no selector narrows (queryDims gives them no dimension), so a
+	// mistyped `?namespace=` would otherwise scan the whole estate to build an
+	// empty response, on every request, with no cache in front.
+	//
+	// Provably wasted, not heuristically: admission (design D6) keeps a series
+	// only when a resolved endpoint names loaded topology — podByID, built from
+	// Pods, or an already-materialised service, which can only come from
+	// ServicesByNameNS via anchorHolds. Both empty ⇒ every series is rejected
+	// and every side effect rolled back.
+	//
+	// Gated on `filtered` so the unfiltered empty-topology case stays exactly
+	// the outside-retention path above.
+	var sg ServiceGraphResult
+	if filtered && len(topology.Pods) == 0 && len(topology.ServicesByNameNS) == 0 {
+		slog.DebugContext(ctx, "service-graph read skipped: selector matched no topology",
+			"reason", "filtered_empty_topology")
+	} else {
+		sg, err = ReadServiceGraph(ctx, q, window, end, topology,
+			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
+		if err != nil {
+			return nil, classifyReadError(span, "service-graph read failed", err)
+		}
 	}
 
 	nodes, edges := assemble(topology, sg)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
+	// The identity table the reader composed. Every cluster-scoped id and label
+	// already carries the identity; the graph needs the table so the
+	// projection-level `cluster` filter can recover each identity's RAW
+	// component — the value the request actually carries and the upstream
+	// matcher selected on. Nil for an unstamped estate, which degrades the
+	// lookup to the pre-identity comparison.
+	g.ClusterIdentities = topology.ClusterIdentities
 
 	// Cross-cluster status is derived from the resolved endpoint nodes'
 	// `cluster` labels, since edges only carry the trace-source cluster
@@ -132,6 +191,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		}
 	}
 	slog.InfoContext(ctx, "graph built",
+		"selector_active", filtered,
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
@@ -184,7 +244,7 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	// service-graph nodes. Reordering these appends silently flips the
 	// collision winner — see TestAssemble_TopologyWinsIDCollision.
 	total := len(topology.Pods) + len(topology.Nodes) + len(topology.PVCs) +
-		len(topology.StorageClasses) +
+		len(topology.NetAppAggrs) + len(topology.NetAppNodes) +
 		len(sg.SynthPods) + len(sg.ServiceNodes) + len(sg.ExternalNodes)
 	nodes := make([]graph.GraphNode, 0, total)
 	for _, p := range topology.Pods {
@@ -196,8 +256,11 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	for _, pv := range topology.PVCs {
 		nodes = append(nodes, pv)
 	}
-	for _, sc := range topology.StorageClasses {
-		nodes = append(nodes, sc)
+	for _, a := range topology.NetAppAggrs {
+		nodes = append(nodes, a)
+	}
+	for _, n := range topology.NetAppNodes {
+		nodes = append(nodes, n)
 	}
 	for _, p := range sg.SynthPods {
 		nodes = append(nodes, p)
@@ -212,11 +275,17 @@ func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*g
 	edges := make([]*graph.Edge, 0,
 		len(sg.Edges)+len(topology.Pods)+len(topology.PodPVCs))
 	edges = append(edges, TopologyEdges(topology)...)
+	edges = append(edges, topology.StorageEdges...)
 	edges = append(edges, sg.Edges...)
 	return nodes, edges
 }
 
-func (b *Builder) upProbe(ctx context.Context) (bool, error) {
+// upProbe measures store health through the SAME per-build querier the
+// topology read used. Routing it any other way would let the classification
+// consult a different set of backends than the build read from — and the probe
+// family accepts no request dimension, so it still reaches every backend
+// serving it regardless of the request's zones.
+func (b *Builder) upProbe(ctx context.Context, q promql.Querier) (bool, error) {
 	// Honour the documented contract (Options.APITimeout): zero means inherit
 	// the caller's context deadline. context.WithTimeout(ctx, 0) would otherwise
 	// produce an immediately-expired context, silently failing the probe (and
@@ -226,8 +295,8 @@ func (b *Builder) upProbe(ctx context.Context) (bool, error) {
 		ctx, cancel = context.WithTimeout(ctx, b.opts.APITimeout)
 		defer cancel()
 	}
-	vec, err := b.q.Instant(ctx, string(promql.QUpProbe),
-		b.r.Render(promql.QUpProbe, 0), b.clk.Now().UTC())
+	vec, err := q.Instant(ctx, string(promql.QUpProbe),
+		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), b.clk.Now().UTC())
 	if err != nil {
 		return false, err
 	}

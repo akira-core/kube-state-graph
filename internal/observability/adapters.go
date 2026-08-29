@@ -40,3 +40,33 @@ func (m *Metrics) SetGraphEdgeCounts(counts map[[2]string]int) {
 func (m *Metrics) SetClustersObserved(n int) {
 	m.ClustersObserved.Set(float64(n))
 }
+
+// SetBackends records the live routing table's backends. It sets the backend
+// gauge and pre-creates each backend's failure counter at zero, so a healthy
+// backend is a visible zero series rather than an absent one — a counter that
+// materialises only on the first failure is a dashboard trap.
+//
+// Satisfies pkg/promql.RouterMetrics — the OPTIONAL upgrade over
+// pkg/promql.Metrics, so an embedder supplying only the two required methods
+// keeps working unchanged.
+func (m *Metrics) SetBackends(names []string) {
+	m.UpstreamBackends.Set(float64(len(names)))
+	m.BackendQueryFailed.Reset()
+	for _, n := range names {
+		m.BackendQueryFailed.WithLabelValues(n)
+	}
+}
+
+// IncBackendQueryFailure increments the per-backend upstream failure counter.
+// It is deliberately a SEPARATE metric from IncQueryFailure's: the established
+// kube_state_graph_upstream_query_failures_total keeps its `query`-only label
+// set. Satisfies pkg/promql.RouterMetrics.
+func (m *Metrics) IncBackendQueryFailure(backend string) {
+	m.BackendQueryFailed.WithLabelValues(backend).Inc()
+}
+
+// IncBackendConfigReload increments the routing-table reload counter, labelled
+// by result. Satisfies pkg/promql.RouterMetrics.
+func (m *Metrics) IncBackendConfigReload(result string) {
+	m.BackendReload.WithLabelValues(result).Inc()
+}

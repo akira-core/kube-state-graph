@@ -1,14 +1,15 @@
 package build
 
-import "time"
+import (
+	"time"
+
+	"github.com/akira-core/kube-state-graph/pkg/promql"
+)
 
 // Options configures a Builder. It carries only the build-relevant settings,
 // decoupled from any server-side configuration struct, so the package is
 // importable by other modules without dragging in internal/config.
 type Options struct {
-	// MetricPrefix is prepended to kube-state-metrics-shaped metric names
-	// (see design.md D26). Empty means no prefix.
-	MetricPrefix string
 	// APITimeout bounds the cheap up{} probe used for the outside-retention
 	// check. Zero means the probe inherits the caller's context deadline.
 	APITimeout time.Duration
@@ -21,4 +22,8 @@ type Options struct {
 	// during the pre-parse resolution pass. Zero means each call inherits
 	// only the build context's deadline.
 	RouteResolveTimeout time.Duration
+	// LabelKeys names the upstream labels the request's `az` / `env` filter
+	// dimensions are matched against. The zero value means the defaults
+	// (`az`, `env`); validation lives where the keys are configured.
+	LabelKeys promql.LabelKeys
 }

@@ -31,7 +31,7 @@ When `OTEL_EXPORTER_OTLP_ENDPOINT` (or its per-signal `OTEL_EXPORTER_OTLP_TRACES
 
 ### Requirement: HTTP request tracing via otelgin
 
-The server SHALL install the `otelgin` middleware on every `/v1/*` and `/debug/*` route group so that each authenticated request produces an inbound server span whose name is the matched Gin route template (e.g. `GET /v1/graph`, `GET /v1/clusters`).
+The server SHALL install the `otelgin` middleware on every `/v1/*` and `/debug/*` route group so that each authenticated request produces an inbound server span whose name is the matched Gin route template (e.g. `GET /v1/graph`, `GET /v1/edge-types`).
 
 The middleware SHALL extract the W3C `traceparent` and `tracestate` headers from inbound requests using the global propagator (`propagation.TraceContext{}` + `propagation.Baggage{}`) so that callers' trace context becomes the parent of the server span.
 
@@ -65,6 +65,11 @@ When a handler returns a non-2xx status, the middleware SHALL set the span statu
 
 - **WHEN** a `/v1/graph` request fails with `build.Reason = "upstream_unavailable"` mapping to HTTP 502
 - **THEN** the server span's status is set to `Error` with description `"upstream_unavailable"` and `http.response.status_code=502`
+
+#### Scenario: Removed route is not a traced route template
+
+- **WHEN** a client sends `GET /v1/clusters`
+- **THEN** Gin matches no route, the request receives `404`, and no span named `GET /v1/clusters` is exported
 
 ### Requirement: Build pipeline span instrumentation
 

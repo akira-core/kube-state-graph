@@ -1,0 +1,26 @@
+# Worked two-backend-family example from docs/upstream-backend-routing.md.
+#
+# Tracked as testdata so TestParseBackendsFile_DocumentedExampleParses keeps
+# the documentation honest: a schema change that invalidates this file fails
+# the build instead of silently leaving the docs wrong.
+backends:
+  # Zone-scoped kube-state-metrics / kubelet stores. Each also serves the
+  # service-graph and probe families, which are NOT zone-routed — a request
+  # scoped to one zone still reaches both for those two families.
+  - name: zone-a
+    url: http://vmselect-zone-a.monitoring.svc:8481/select/0/prometheus
+    families: [ksm, kubelet, servicegraph, probe]
+    zones: [zone-a]
+    usernameEnv: KSG_PROM_USERNAME_ZONE_A
+    passwordEnv: KSG_PROM_PASSWORD_ZONE_A
+
+  - name: zone-b
+    url: http://vmselect-zone-b.monitoring.svc:8481/select/0/prometheus
+    families: [ksm, kubelet, servicegraph, probe]
+    zones: [zone-b]
+
+  # NetApp Harvest lands in its own installation. No `zones`, so it is a
+  # catch-all: every request reaches it whatever `?az=` says.
+  - name: netapp
+    url: http://vmselect-netapp.monitoring.svc:8481/select/0/prometheus
+    families: [harvest]

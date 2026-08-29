@@ -11,35 +11,41 @@ type View struct {
 // Project returns a View of g constrained by scope. It does not mutate g.
 //
 // Order of operations:
-//  1. If scope.Root is set, run a bounded BFS to determine the reachable
-//     node set; otherwise consider all nodes.
-//  2. Apply edge-type filter to edges among the reachable set.
-//  3. Apply cluster / namespace / name filters to nodes.
-//  4. Drop edges whose endpoints are no longer present.
+//  1. Unless scope.Inventory is set, compute the connectivity prune set.
+//  2. Apply cluster / namespace filters to nodes; admit infrastructure nodes
+//     by reference (or unconditionally under Inventory).
+//  3. Apply the edge-type filter and drop edges whose endpoints are absent,
+//     re-adding a single missing partner where the filters allow it.
 func Project(g *Graph, scope Scope) View {
 	if g == nil {
 		return View{}
 	}
 
-	reachable := traverse(g, scope)
-
 	// Default-projection connectivity prune: every response carries only pods
 	// that sit on a connectivity edge (pod-calls-pod / pod-calls-service /
 	// service-selects-pod) and the infra that hangs off them — an edgeless pod,
 	// the node hosting only edgeless pods, a PVC mounted only by edgeless pods,
-	// and a StorageClass backing only such PVCs are dropped. The exclusion set
-	// is a pure function of the graph (scope-independent), so it is computed once
-	// and consulted in both filterNodes (skip) and filterEdges (no partner
-	// re-add). It is suppressed under an explicit name filter or a root-anchored
-	// traversal: those are the on-demand escape hatches that surface a specific
-	// edgeless element (symmetric with the D6 infra-node name/root exception).
+	// and the NetApp aggregate (then controller) serving only such PVCs are
+	// dropped. The exclusion set is a pure function of the graph
+	// (scope-independent), so it is computed once and consulted in both
+	// filterNodes (skip) and filterEdges (no partner re-add).
+	//
+	// `prune=false` (scope.Inventory) is the single escape hatch that surfaces
+	// connectivity-disconnected elements; the former ?name= / ?root= hatches
+	// are withdrawn with those parameters.
 	var excluded map[string]struct{}
-	if reachable == nil && !scope.NameFilterActive() {
+	if !scope.Inventory {
 		excluded = connectivityExcluded(g)
 	}
 
-	nodes := filterNodes(g, scope, reachable, excluded)
-	edges := filterEdges(g, scope, nodes, reachable, excluded)
+	nodes := filterNodes(g, scope, excluded)
+	edges := filterEdges(g, scope, nodes, excluded)
+	// The single parent sweep, deliberately after filterEdges: an aggregate
+	// admitted as an edge partner (via a pvc-to-netapp-aggr edge) still needs
+	// its owning controller, because the compound parent must exist. No edge
+	// type has a netapp-node endpoint, so running it here rather than inside
+	// filterNodes cannot change which edges survive.
+	pullNetAppParents(g, nodes)
 
 	out := View{
 		Nodes: make([]GraphNode, 0, len(nodes)),
@@ -53,58 +59,6 @@ func Project(g *Graph, scope Scope) View {
 	return out
 }
 
-func traverse(g *Graph, scope Scope) map[string]struct{} {
-	if scope.Root == "" {
-		return nil // sentinel: no traversal restriction
-	}
-	if _, ok := g.NodesByID[scope.Root]; !ok {
-		return map[string]struct{}{} // empty: unknown root
-	}
-
-	// A Scope built directly (not via NewScope) may leave Direction unset; a
-	// Root-anchored traversal then matched none of the branches below and
-	// silently collapsed to the root alone. Default an empty Direction to
-	// "both", matching the HTTP path's NewScope behaviour (D32 reusable engine).
-	dir := scope.Direction
-	if dir == "" {
-		dir = DirectionBoth
-	}
-
-	visited := map[string]struct{}{scope.Root: {}}
-	frontier := []string{scope.Root}
-	for depth := 0; depth < scope.Depth && len(frontier) > 0; depth++ {
-		next := make([]string, 0, len(frontier))
-		for _, id := range frontier {
-			if dir == DirectionOut || dir == DirectionBoth {
-				for _, e := range g.Forward[id] {
-					// Only cross in-scope edge types so a node reachable solely
-					// via a filtered-out edge never enters the view as an orphan.
-					if !scope.edgeTypeAllowed(e.Type) {
-						continue
-					}
-					if _, seen := visited[e.Target]; !seen {
-						visited[e.Target] = struct{}{}
-						next = append(next, e.Target)
-					}
-				}
-			}
-			if dir == DirectionIn || dir == DirectionBoth {
-				for _, e := range g.Reverse[id] {
-					if !scope.edgeTypeAllowed(e.Type) {
-						continue
-					}
-					if _, seen := visited[e.Source]; !seen {
-						visited[e.Source] = struct{}{}
-						next = append(next, e.Source)
-					}
-				}
-			}
-		}
-		frontier = next
-	}
-	return visited
-}
-
 // connectivityExcluded returns the set of pod and PVC node IDs that the
 // default projection drops because they sit on no connectivity edge:
 //   - a pod is excluded iff it is not an endpoint of any pod-calls-pod /
@@ -113,10 +67,11 @@ func traverse(g *Graph, scope Scope) map[string]struct{} {
 //     itself connectivity-connected.
 //
 // It is a pure function of g (independent of any Scope), so the result is stable
-// across requests and reusable by a future cache. K8s nodes and StorageClasses
-// are NOT listed here — they are already reference-gated by infraNodePassesFilters
-// (a node hosting only excluded pods, or a StorageClass backing only excluded
-// PVCs, falls out for free once those pods/PVCs are gone).
+// across requests and reusable by a future cache. K8s nodes and the NetApp types
+// are NOT listed here — they are already reference-gated by
+// infraNodePassesFilters / netappInfraPassesFilters (a node hosting only excluded
+// pods, or an aggregate serving only excluded PVCs — and then its controller —
+// falls out for free once those pods/PVCs are gone).
 func connectivityExcluded(g *Graph) map[string]struct{} {
 	connectedPods := make(map[string]struct{})
 	pvcMounters := make(map[string][]string)
@@ -130,10 +85,10 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 			connectedPods[e.Target] = struct{}{}
 		case EdgeTypePodMountsPVC:
 			pvcMounters[e.Target] = append(pvcMounters[e.Target], e.Source)
-		case EdgeTypePodToNode, EdgeTypePVCToStorageClass:
-			// Infra edges (pod→node, pvc→storageclass) are NOT connectivity edges:
+		case EdgeTypePodToNode, EdgeTypePVCToNetAppAggr:
+			// Infra edges (pod→node, pvc→netapp-aggr) are NOT connectivity edges:
 			// they never make a pod or PVC connectivity-connected. Their endpoints
-			// (K8s nodes / StorageClasses) are reference-gated by
+			// (K8s nodes / NetApp aggregates) are reference-gated by
 			// infraNodePassesFilters, not by this set. Listed explicitly to keep
 			// the switch exhaustive over graph.EdgeType.
 		}
@@ -158,104 +113,150 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 				excluded[id] = struct{}{}
 			}
 		default:
-			// node / storageclass / service / external are not connectivity-pruned.
+			// node / netapp-aggr / netapp-node / service / external are not
+			// connectivity-pruned (NetApp types are reference-gated).
 		}
 	}
 	return excluded
 }
 
-func filterNodes(g *Graph, scope Scope, reachable, excluded map[string]struct{}) map[string]GraphNode {
+func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string]GraphNode {
 	out := make(map[string]GraphNode, len(g.NodesByID))
-	// K8sNode and StorageClassNode admission is deferred: neither carries a
-	// namespace label, so each is retained iff referenced by an in-scope element
-	// — a K8s node hosts an in-scope pod (labels.node), a StorageClass backs an
-	// in-scope PVC (its StorageClass()) — or it is explicitly matched by a name
-	// filter. We first resolve every other node — recording the referenced ids —
-	// then admit the deferred infra nodes per infraNodePassesFilters. The
-	// reference sets are built for EVERY request shape (no filter, cluster,
-	// namespace) so the response only ever carries infra nodes connected to
-	// in-scope workload; an explicit ?name=<infra-node> is the one exception.
-	// See design.md D6 (generalises the namespace-only rule to all requests).
-	var deferred []GraphNode
+	// The projection-level `cluster` filter compares the RAW upstream cluster
+	// name, not the composed identity a node's labels carry, so that it admits
+	// exactly what the upstream label matcher admitted (?cluster=c1 selects
+	// every zone's c1; ?az=&env=&cluster= pins one). Resolved through the
+	// graph's identity table, which degrades to identity when absent.
+	rawName := g.ClusterRawName
+	// Infra admission is deferred: K8s nodes, NetApp aggregates, and NetApp
+	// controllers carry no namespace (NetApp types also carry no cluster), so
+	// each is retained iff referenced by an in-scope element (or admitted
+	// unconditionally under Inventory). Wave 1: netapp-aggr iff an admitted PVC has a
+	// pvc-to-netapp-aggr edge to it. Wave 2: netapp-node iff an admitted
+	// aggregate names it in labels.node. See design.md D6.
+	var deferredK8s, deferredAggr, deferredNetAppNode []GraphNode
 	hostNodes := map[string]struct{}{}
-	referencedSC := map[string]struct{}{}
 	for id, n := range g.NodesByID {
-		if reachable != nil {
-			if _, ok := reachable[id]; !ok {
-				continue
-			}
-		}
-		// Connectivity prune (default projection only; nil under name/traversal).
-		// An excluded pod/PVC is dropped before any other admission so it never
-		// feeds the deferred infra reference sets — its host node / backing
-		// StorageClass then prunes for free via infraNodePassesFilters.
 		if excluded != nil {
 			if _, ex := excluded[id]; ex {
 				continue
 			}
 		}
 		switch n.Type() {
-		case NodeTypeK8sNode, NodeTypeStorageClass:
-			deferred = append(deferred, n)
+		case NodeTypeK8sNode:
+			deferredK8s = append(deferredK8s, n)
+			continue
+		case NodeTypeNetAppAggr:
+			deferredAggr = append(deferredAggr, n)
+			continue
+		case NodeTypeNetAppNode:
+			deferredNetAppNode = append(deferredNetAppNode, n)
 			continue
 		default:
 			// pod / pvc / service / external are admitted directly below.
 		}
-		if !nodePassesFilters(n, scope) {
+		if !nodePassesFilters(n, scope, rawName) {
 			continue
 		}
 		out[id] = n
-		// The reference sets feed only the default infra-admission path; under a
-		// name filter infraNodePassesFilters returns on the name branch and never
-		// consults them, so skip the population work entirely.
-		if scope.NameFilterActive() {
-			continue
-		}
-		switch n.Type() {
-		case NodeTypePod:
+		if n.Type() == NodeTypePod {
 			if hn := n.Labels()["node"]; hn != "" {
 				hostNodes[hn] = struct{}{}
 			}
-		case NodeTypePVC:
-			if sc := n.StorageClass(); sc != "" {
-				referencedSC[StorageClassID(n.Labels()["cluster"], sc)] = struct{}{}
-			}
-		default:
-			// other in-scope types reference no deferred infra node.
 		}
 	}
-	for _, n := range deferred {
-		referenced := hostNodes
-		if n.Type() == NodeTypeStorageClass {
-			referenced = referencedSC
+
+	referencedAggr := map[string]struct{}{}
+	for _, e := range g.Edges {
+		if e.Type != EdgeTypePVCToNetAppAggr {
+			continue
 		}
-		if !infraNodePassesFilters(n, scope, referenced) {
+		if _, ok := out[e.Source]; ok {
+			referencedAggr[e.Target] = struct{}{}
+		}
+	}
+
+	for _, n := range deferredK8s {
+		if !infraNodePassesFilters(n, scope, hostNodes, rawName) {
 			continue
 		}
 		out[n.ID()] = n
 	}
+	for _, n := range deferredAggr {
+		if !netappInfraPassesFilters(n, scope, referencedAggr) {
+			continue
+		}
+		out[n.ID()] = n
+	}
+	referencedCtrl := map[string]struct{}{}
+	for _, n := range out {
+		if n.Type() != NodeTypeNetAppAggr {
+			continue
+		}
+		oc, node := n.Labels()["ontap_cluster"], n.Labels()["node"]
+		if oc != "" && node != "" {
+			referencedCtrl[NetAppNodeID(oc, node)] = struct{}{}
+		}
+	}
+	for _, n := range deferredNetAppNode {
+		if !netappInfraPassesFilters(n, scope, referencedCtrl) {
+			continue
+		}
+		out[n.ID()] = n
+	}
+	// No pullNetAppParents here: referencedCtrl above already names the owning
+	// netapp-node of every aggregate admitted by this pass, so the sweep would
+	// find nothing. Project runs it once AFTER filterEdges, which is the only
+	// remaining way an aggregate can enter the view without having passed this
+	// loop.
 	return out
 }
 
-func nodePassesFilters(n GraphNode, scope Scope) bool {
+// pullNetAppParents admits the owning netapp-node of every admitted
+// netapp-aggr so the real-node compound parent cannot dangle. Called exactly
+// once per projection, from Project, after both filter passes.
+func pullNetAppParents(g *Graph, nodes map[string]GraphNode) {
+	for _, n := range nodes {
+		if n.Type() != NodeTypeNetAppAggr {
+			continue
+		}
+		oc, node := n.Labels()["ontap_cluster"], n.Labels()["node"]
+		if oc == "" || node == "" {
+			continue
+		}
+		id := NetAppNodeID(oc, node)
+		if _, ok := nodes[id]; ok {
+			continue
+		}
+		parent, ok := g.NodesByID[id]
+		if ok {
+			nodes[id] = parent
+		}
+	}
+}
+
+func nodePassesFilters(n GraphNode, scope Scope, rawName func(string) string) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
 		if n.Type() == NodeTypeExternal {
 			// External nodes have no cluster; exclude when caller scoped to clusters.
 			return false
 		}
-		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
+		if n.Type() == NodeTypeNetAppAggr || n.Type() == NodeTypeNetAppNode {
+			// NetApp types belong to no Kubernetes cluster; they pass the
+			// cluster check and are gated purely by reference (see
+			// netappInfraPassesFilters).
+		} else if _, ok := scope.Clusters[rawName(labels["cluster"])]; !ok {
 			return false
 		}
 	}
 	if len(scope.Namespaces) > 0 {
 		// ExternalNode is cluster-unscoped (no namespace label) and only ever
 		// enters a view as the re-added partner of a pod-calls-pod edge, so it
-		// is exempt from the namespace match. K8sNode and StorageClassNode are
-		// also namespace-less but are admitted separately by
-		// infraNodePassesFilters (referenced-by-in-scope rule), so they never
-		// reach this predicate. Every other node type must match the requested
-		// namespace.
+		// is exempt from the namespace match. K8sNode and NetApp types are
+		// also namespace-less but are admitted separately by the infra
+		// predicates (referenced-by-in-scope rule), so they never reach this
+		// predicate. Every other node type must match the requested namespace.
 		switch n.Type() {
 		case NodeTypeExternal:
 			// pass-through
@@ -265,58 +266,38 @@ func nodePassesFilters(n GraphNode, scope Scope) bool {
 			}
 		}
 	}
-	if scope.NameFilterActive() {
-		if _, ok := scope.Names[n.Name()]; !ok {
-			return false
-		}
-	}
 	return true
 }
 
 // infraNodePassesFilters decides whether a cluster-scoped infrastructure node
-// (a K8sNode or a StorageClassNode) is admitted to a view. Neither carries a
-// namespace label, so admission is reference-driven: the node is kept iff
-// `referenced` contains its id — i.e. some in-scope element references it (a pod
-// scheduled on a K8s node via labels.node, or a PVC backed by a StorageClass via
-// its StorageClass()). This holds for EVERY request shape (no filter, cluster
-// filter, namespace filter), so the response only ever carries infra nodes
-// connected to in-scope workload — a node hosting no in-scope pod (and a
-// StorageClass backing no in-scope PVC) is dropped, not surfaced as an orphan.
+// (today: a K8sNode) is admitted to a view. It carries no namespace label, so
+// admission is reference-driven: the node is kept iff `referenced` contains its
+// id — i.e. some in-scope element references it (a pod scheduled on it via
+// labels.node). This holds for EVERY request shape (no filter, cluster filter,
+// namespace filter), so the response only ever carries infra nodes connected to
+// in-scope workload — a node hosting no in-scope pod is dropped, not surfaced as
+// an orphan. The cluster-less NetApp types use netappInfraPassesFilters instead.
 //
-// Two exceptions admit an infra node that is referenced by nothing, applied in
-// this order so ?root= and ?name= compose consistently across node kinds:
-//   - a name filter narrows FIRST: a ?name= request admits the node iff its
-//     Name() is named — so ?root=<infra>&name=<other> drops the infra root just
-//     as it drops a pod root, not leaking the anchor past the name filter; then
-//   - the explicit traversal anchor (scope.Root) is admitted when no name filter
-//     narrows it — a ?root=<infra-node> request focuses on that exact node, and
-//     traverse() already selected it as reachable, so it must not be pruned as
-//     an "orphan" (a podless K8s node or PVC-less StorageClass used as the root
-//     would otherwise yield an EMPTY view).
-//
-// A name filter that does not name this node drops it here; if it is instead the
-// host of a named pod (or backs a named PVC), it re-enters the view as that
-// edge's re-added partner in filterEdges, not via this predicate.
+// The one exception is `prune=false` (scope.Inventory), which admits an
+// unreferenced infra node — but only when no ACTIVE filter could have excluded
+// it by its own labels (see the guard below). That is what makes `?prune=false`
+// alone the full inventory while `?namespace=x&prune=false` stays the
+// namespace's storage topology.
 //
 // The cluster filter applies first and exactly as for other node types (the
 // node's own labels carry cluster). See design.md D6.
-func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
+func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}, rawName func(string) string) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {
-		if _, ok := scope.Clusters[labels["cluster"]]; !ok {
+		if _, ok := scope.Clusters[rawName(labels["cluster"])]; !ok {
 			return false
 		}
 	}
-	// Name filter narrows FIRST — a non-matching name drops even the traversal
-	// anchor, symmetric with a pod root (which nodePassesFilters drops on a
-	// non-matching name), so ?root= and ?name= compose consistently.
-	if scope.NameFilterActive() {
-		_, named := scope.Names[n.Name()]
-		return named
-	}
-	// The explicit traversal anchor is admitted when no name filter narrows it
-	// (it is the focus of the query and is already in the reachable set).
-	if scope.Root != "" && n.ID() == scope.Root {
+	// A K8s node carries `cluster` (applied above) but no `namespace`, so under
+	// a namespace filter its only meaningful admission stays "some in-scope pod
+	// is scheduled on it" — lifting there would emit every node of the loaded
+	// clusters into a namespace view.
+	if scope.Inventory && len(scope.Namespaces) == 0 {
 		return true
 	}
 	// Default: admit iff referenced by an in-scope element.
@@ -324,20 +305,32 @@ func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]stru
 	return ok
 }
 
-func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable, excluded map[string]struct{}) []*Edge {
+// netappInfraPassesFilters is the NetApp-type twin of infraNodePassesFilters.
+// The cluster filter is skipped (the NetApp types carry no Kubernetes cluster
+// label, and their Harvest series receive neither a cluster nor a namespace
+// matcher), so admission is reference-driven. The Inventory lift requires that
+// NEITHER a cluster NOR a namespace filter is active, since both reach these
+// nodes only through the claims that join them.
+func netappInfraPassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}) bool {
+	if scope.Inventory && len(scope.Clusters) == 0 && len(scope.Namespaces) == 0 {
+		return true
+	}
+	_, ok := referenced[n.ID()]
+	return ok
+}
+
+func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, excluded map[string]struct{}) []*Edge {
 	out := make([]*Edge, 0, len(g.Edges))
 	// Snapshot the in-scope set at entry. Re-adds during this pass MUST NOT
-	// promote a re-added partner into a new in-scope anchor, otherwise name
-	// or cluster anchors would cascade through the graph indefinitely.
+	// promote a re-added partner into a new in-scope anchor, otherwise a
+	// cluster anchor would cascade through the graph indefinitely.
 	primary := make(map[string]struct{}, len(nodes))
 	for id := range nodes {
 		primary[id] = struct{}{}
 	}
 	for _, e := range g.Edges {
-		if len(scope.EdgeTypes) > 0 {
-			if _, ok := scope.EdgeTypes[e.Type]; !ok {
-				continue
-			}
+		if !scope.edgeTypeAllowed(e.Type) {
+			continue
 		}
 		_, srcOK := primary[e.Source]
 		_, tgtOK := primary[e.Target]
@@ -350,20 +343,13 @@ func filterEdges(g *Graph, scope Scope, nodes map[string]GraphNode, reachable, e
 		}
 		// Unified partner re-add: exactly one endpoint is in scope, re-add the
 		// other from g.NodesByID provided it passes the non-cluster filters.
-		// This single rule covers (a) cross-cluster pod-calls-pod partner
-		// preservation, (b) non-pod endpoints incident on in-scope pods, and
-		// (c) name-anchored views that need to render incident edges with
-		// their partner endpoints. When traversal is active, the partner must
-		// also lie within the reachable set so the depth bound is respected.
-		if reachable != nil {
-			missing := e.Target
-			if !srcOK {
-				missing = e.Source
-			}
-			if _, ok := reachable[missing]; !ok {
-				continue
-			}
-		}
+		// This single rule covers (a) non-pod endpoints incident on in-scope
+		// pods — the pod-to-node host, the pvc-to-netapp-aggr aggregate, and
+		// the `external` partner a filtered build materialises for an
+		// out-of-scope peer — and (b) in an UNFILTERED build, a cross-cluster
+		// pod-calls-pod partner outside a projection-level cluster filter.
+		// (Under a selector-level cluster filter that partner's topology was
+		// never loaded, so the edge already points at an external node.)
 		if !readdEdgePartners(g, e, nodes, srcOK, tgtOK, scope, excluded, nodePassesNonClusterFilters) {
 			continue
 		}
@@ -416,8 +402,8 @@ func nodePassesNonClusterFilters(n GraphNode, scope Scope) bool {
 	labels := n.Labels()
 	if len(scope.Namespaces) > 0 {
 		switch n.Type() {
-		case NodeTypeExternal:
-			// pass-through; external endpoints carry no namespace.
+		case NodeTypeExternal, NodeTypeK8sNode, NodeTypeNetAppAggr, NodeTypeNetAppNode:
+			// pass-through; these types carry no namespace.
 		default:
 			if _, ok := scope.Namespaces[labels["namespace"]]; !ok {
 				return false

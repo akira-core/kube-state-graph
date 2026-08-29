@@ -29,6 +29,10 @@ type UpstreamAuthSuite struct {
 }
 
 func TestUpstreamAuthSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(UpstreamAuthSuite))
 }
 

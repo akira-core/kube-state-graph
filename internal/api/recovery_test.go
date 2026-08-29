@@ -26,7 +26,7 @@ import (
 )
 
 // newPanicQuerier returns a Querier mock whose every Instant call panics with
-// the given value. /v1/clusters calls Instant on the handler goroutine, so the
+// the given value. /readyz calls Instant on the handler goroutine, so the
 // panic propagates straight up the gin middleware chain (unlike /v1/graph,
 // whose fan-out runs Instant on errgroup goroutines).
 func newPanicQuerier(t *testing.T, v any) *promqlmocks.MockQuerier {
@@ -77,7 +77,7 @@ func newServerWithLogBuffer(t *testing.T, q *promqlmocks.MockQuerier) (*Server, 
 	buf := &syncLogBuffer{}
 	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	metrics := observability.NewMetrics()
-	builder := build.New(q, build.Options{MetricPrefix: cfg.MetricPrefix, APITimeout: cfg.APITimeout}, metrics, clock.System{})
+	builder := build.New(q, build.Options{APITimeout: cfg.APITimeout}, metrics, clock.System{})
 	return New(cfg, builder, q, metrics, logger, auth.NewKeySet(), clock.System{}), buf
 }
 
@@ -91,7 +91,7 @@ func TestPanicRecovery_Returns500Envelope(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// Without recovery middleware this Get fails with a connection reset (EOF).
-	resp, err := http.Get(srv.URL + "/v1/clusters")
+	resp, err := http.Get(srv.URL + "/readyz")
 	require.NoError(t, err, "a handler panic must not reset the connection")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
@@ -118,18 +118,26 @@ func TestPanicRecovery_ErrAbortHandlerPassesThrough(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/clusters") //nolint:bodyclose // the request must fail without a response
+	resp, err := http.Get(srv.URL + "/readyz") //nolint:bodyclose // the request must fail without a response
 	if err == nil {
 		resp.Body.Close()
 		t.Fatalf("expected an aborted connection, got HTTP %d", resp.StatusCode)
 	}
 
 	// The client error can return while the server goroutine is still
-	// unwinding; the deferred access log is the last write of that unwind, so
-	// once it appears the recovery log (which would precede it) is settled.
+	// unwinding. /readyz is a quiet path (no access log below 400, and an
+	// aborted handler never sets a status), so settle on the request METRIC
+	// instead — it is incremented in the same deferred block, after any
+	// recovery log would have been written.
 	require.Eventually(t, func() bool {
-		return bytes.Contains(logs.Bytes(), []byte(`"msg":"http"`))
-	}, 2*time.Second, 10*time.Millisecond, "access log line never appeared")
+		mresp, err := http.Get(srv.URL + "/metrics") //nolint:noctx,gosec // test server URL
+		if err != nil {
+			return false
+		}
+		defer mresp.Body.Close()
+		body, err := io.ReadAll(mresp.Body)
+		return err == nil && bytes.Contains(body, []byte(`kube_state_graph_http_requests_total{path="/readyz"`))
+	}, 2*time.Second, 10*time.Millisecond, "request metric for the aborted /readyz never appeared")
 	assert.NotContains(t, logs.String(), "panic recovered",
 		"a deliberate silent abort must not be logged as a recovered panic")
 }
@@ -143,7 +151,7 @@ func TestPanicRecovery_AccessLogAndMetricStillRecorded(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/clusters")
+	resp, err := http.Get(srv.URL + "/readyz")
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
@@ -163,7 +171,7 @@ func TestPanicRecovery_AccessLogAndMetricStillRecorded(t *testing.T) {
 		if json.Unmarshal(raw, &line) != nil {
 			continue
 		}
-		if line.Msg == "http" && line.Path == "/v1/clusters" && line.Status == http.StatusInternalServerError {
+		if line.Msg == "http" && line.Path == "/readyz" && line.Status == http.StatusInternalServerError {
 			sawAccessLog = true
 		}
 	}
@@ -175,6 +183,6 @@ func TestPanicRecovery_AccessLogAndMetricStillRecorded(t *testing.T) {
 	defer mresp.Body.Close()
 	mbody, _ := io.ReadAll(mresp.Body)
 	assert.Contains(t, string(mbody),
-		`kube_state_graph_http_requests_total{path="/v1/clusters",status="5xx"}`,
+		`kube_state_graph_http_requests_total{path="/readyz",status="5xx"}`,
 		"HTTP metric must record the 500 despite the panic")
 }

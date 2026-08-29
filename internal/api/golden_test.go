@@ -27,16 +27,33 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"with-service":         buildWithService(),
 		"family-fanout":        buildFamilyFanout(),
 		"with-storageclass":    buildWithStorageClass(),
-		"with-netapp-trident":  buildWithNetAppTrident(),
-		"name-filter":          buildNameFilter(),
+		"with-netapp-storage":  buildWithNetAppStorage(),
+		"prune-false":          buildPruneFalse(),
+		"filtered-external":    buildFilteredExternalPartner(),
 		"missing-uid-fallback": buildMissingUIDFallback(),
 		"link-relation":        buildLinkRelation(),
 		"with-red-metrics":     buildWithREDMetrics(),
+		"cluster-identity":     buildClusterIdentity(),
+	}
+
+	// Scenarios whose clusters were composed from az/env labels also need the
+	// identity table the builder attaches, since the serialiser reads it via
+	// the graph. Every other scenario models an unstamped estate (nil table),
+	// which is what keeps their goldens byte-identical.
+	identities := map[string]map[string]graph.ClusterIdentity{
+		"cluster-identity": {
+			"us-dev-c1":  {AZ: "us", Env: "dev", Name: "c1"},
+			"eu-prod-c1": {AZ: "eu", Env: "prod", Name: "c1"},
+		},
 	}
 
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
-			g := &graph.Graph{BuiltAt: time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC), NodesByID: map[string]graph.GraphNode{}}
+			g := &graph.Graph{
+				BuiltAt:           time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
+				NodesByID:         map[string]graph.GraphNode{},
+				ClusterIdentities: identities[name],
+			}
 			for _, n := range view.Nodes {
 				g.NodesByID[n.ID()] = n
 			}
@@ -129,15 +146,10 @@ func buildFamilyFanout() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{pod, svc1, svc2, nats1, nats2}, Edges: edges}
 }
 
-// buildWithStorageClass snapshots the new StorageClass design (supersedes D31):
-// a real `type="storageclass"` node carrying its provisioner + parameters as
-// typed data attributes (labels stay {cluster}), nested under its cluster group;
-// the PVC nests under its namespace group with a `pvc-to-storageclass` edge to
-// the StorageClass node (a class-less PVC also nests under the namespace group,
-// with no such edge). The pod nests under its controller > application >
-// namespace hierarchy and links to its host node via a `pod-to-node` edge (the
-// node itself nests under the cluster group). The StorageClass surfaces as a
-// real node + edge — never as a PVC attribute or label.
+// buildWithStorageClass snapshots a PVC that still carries its StorageClass
+// *name* as data.storageclass (the StorageClass node and pvc-to-storageclass
+// edge are gone). The pod nests under its controller > application >
+// namespace hierarchy and links to its host node via a `pod-to-node` edge.
 func buildWithStorageClass() graph.View {
 	pod := &graph.PodNode{
 		IDValue:          "cluster-alpha/p1",
@@ -147,33 +159,31 @@ func buildWithStorageClass() graph.View {
 		OwnerValue:       &graph.Owner{Kind: "StatefulSet", Name: "mongo"},
 	}
 	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
-	pvcGP3 := &graph.PVCNode{IDValue: "cluster-alpha/db/data-mongo-0", NameValue: "data-mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db", "volume": "data"}, StorageClassValue: "gp3"}
-	pvcNone := &graph.PVCNode{IDValue: "cluster-alpha/db/legacy", NameValue: "legacy", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	sc := &graph.StorageClassNode{
-		IDValue:     graph.StorageClassID("cluster-alpha", "gp3"),
-		NameValue:   "gp3",
-		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		InfoValue:   &graph.StorageClassInfo{Provisioner: "ebs.csi.aws.com", Parameters: map[string]string{"pool": "aggr1", "fs": "ext4"}},
+	used, cap := 5368709120.0, 10737418240.0
+	pvcGP3 := &graph.PVCNode{
+		IDValue: "cluster-alpha/db/data-mongo-0", NameValue: "data-mongo-0",
+		LabelsValue:       map[string]string{"cluster": "cluster-alpha", "namespace": "db", "volume": "data"},
+		StorageClassValue: "gp3",
+		UsageValue:        &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
 	}
+	pvcNone := &graph.PVCNode{IDValue: "cluster-alpha/db/legacy", NameValue: "legacy", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	edges := []*graph.Edge{
 		graph.NewEdge(graph.EdgeTypePodToNode, pod.IDValue, node.IDValue, nil),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcGP3.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcNone.IDValue, map[string]string{"claim_name": "legacy"}),
-		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcGP3.IDValue, sc.IDValue, nil),
 	}
-	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone, sc}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{node, pod, pvcGP3, pvcNone}, Edges: edges}
 }
 
-// buildWithNetAppTrident snapshots the NetApp Trident PVC label chain: a PVC
-// whose bound PV name (`labels.volumename`, from kube_persistentvolumeclaim_info)
-// and serving SVM (`labels.svm`, via kube_tridentvolume_info →
-// kube_tridentbackend_info) surface as plain additive labels — no
-// data.volumename / data.svm typed fields — coexisting with the pod-spec
-// `volume` key. A second PVC with an unresolved chain carries neither key
-// (absent, never empty-string).
-func buildWithNetAppTrident() graph.View {
+// buildWithNetAppStorage snapshots the Harvest-joined storage graph: a PVC
+// with volumename+svm labels, a pvc-to-netapp-aggr edge carrying I/O metrics,
+// an aggregate with health+usage nested under its real owning controller,
+// which nests under a storage-cluster group.
+func buildWithNetAppStorage() graph.View {
 	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	pvcTrident := &graph.PVCNode{
+	used, cap := 700000000000.0, 1000000000000.0
+	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
+	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
 		LabelsValue: map[string]string{
@@ -183,18 +193,31 @@ func buildWithNetAppTrident() graph.View {
 		StorageClassValue: "netapp-nas",
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
-	sc := &graph.StorageClassNode{
-		IDValue:     graph.StorageClassID("cluster-alpha", "netapp-nas"),
-		NameValue:   "netapp-nas",
-		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		InfoValue:   &graph.StorageClassInfo{Provisioner: "csi.trident.netapp.io", Parameters: map[string]string{"pool": "aggr1", "fs": "nfs"}},
+	aggr := &graph.NetAppAggrNode{
+		IDValue:     graph.NetAppAggrID("ontap-prod", "aggr1"),
+		NameValue:   "aggr1",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-01"},
+		HealthValue: graph.HealthOnline,
+		UsageValue:  &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
 	}
+	ctrl := &graph.NetAppNode{
+		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
+		NameValue:   "ontap-prod-01",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+		HealthValue: graph.HealthOnline,
+	}
+	maxIOPS, maxBps := 5000.0, 262144000.0
+	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
+		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
+		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
+		MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps,
+	})
 	edges := []*graph.Edge{
-		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcTrident.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvc.IDValue, map[string]string{"claim_name": "data-mongo-0"}),
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcPlain.IDValue, map[string]string{"claim_name": "scratch"}),
-		graph.NewEdge(graph.EdgeTypePVCToStorageClass, pvcTrident.IDValue, sc.IDValue, nil),
+		ioEdge,
 	}
-	return graph.View{Nodes: []graph.GraphNode{pod, pvcTrident, pvcPlain, sc}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{pod, pvc, pvcPlain, aggr, ctrl}, Edges: edges}
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph
@@ -228,25 +251,44 @@ func buildLinkRelation() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{producer, consumer, broker, brokerPod}, Edges: edges}
 }
 
-// buildNameFilter snapshots the projection of a two-cluster graph through
-// `?name=checkout`. The matching pod (cluster-alpha/p1) is the anchor; the
-// cross-cluster partner pod (cluster-beta/p2) is re-added via the unified
-// edge-endpoint partner rule on the pod-calls-pod edge. This fixture's graph
-// carries no pod-to-node edges, so the name-filtered view does not pull in the
-// host K8s nodes (a graph that did include them would, via the pod-to-node edge
-// re-add — see the projection unit tests).
-func buildNameFilter() graph.View {
-	a := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}}
-	b := &graph.PodNode{IDValue: "cluster-beta/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing", "node": "cluster-beta/worker-0"}}
-	nodeA := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
-	nodeB := &graph.K8sNode{IDValue: "cluster-beta/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-beta"}}
-	er := 0.0
+// buildPruneFalse snapshots `?prune=false`: the inventory view. A
+// connectivity-disconnected pod keeps its whole storage chain (host node,
+// claim, NetApp aggregate, owning controller) and an unreferenced podless node
+// is admitted too — the shape that replaces the withdrawn ?name= / ?root=
+// escape hatches.
+func buildPruneFalse() graph.View {
+	idle := &graph.PodNode{IDValue: "cluster-alpha/p9", NameValue: "idle", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-1"}}
+	worker1 := &graph.K8sNode{IDValue: "cluster-alpha/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
+	worker9 := &graph.K8sNode{IDValue: "cluster-alpha/worker-9", NameValue: "worker-9", LabelsValue: map[string]string{"cluster": "cluster-alpha"}, ReadyStatusValue: "NotReady"}
+	pvc := &graph.PVCNode{IDValue: "cluster-alpha/shop/idle-data", NameValue: "idle-data", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "volume": "data"}}
+	aggr := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID("ontap-prod", "aggr2"), NameValue: "aggr2", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-02"}}
+	ctrl := &graph.NetAppNode{IDValue: graph.NetAppNodeID("ontap-prod", "ontap-prod-02"), NameValue: "ontap-prod-02", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"}}
 	edges := []*graph.Edge{
-		graph.NewEdge(graph.EdgeTypePodCallsPod, a.IDValue, b.IDValue, map[string]string{"cluster": "cluster-alpha"}).
-			WithMetrics(graph.EdgeMetrics{Rate: 2, ErrorRate: &er}),
+		graph.NewEdge(graph.EdgeTypePodToNode, idle.IDValue, worker1.IDValue, nil),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, idle.IDValue, pvc.IDValue, map[string]string{"claim_name": "idle-data"}),
+		graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil),
 	}
-	g := graph.NewGraph([]graph.GraphNode{a, b, nodeA, nodeB}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
-	return graph.Project(g, graph.Scope{Names: map[string]struct{}{"checkout": {}}})
+	g := graph.NewGraph([]graph.GraphNode{idle, worker1, worker9, pvc, aggr, ctrl}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
+	return graph.Project(g, graph.Scope{Inventory: true})
+}
+
+// buildFilteredExternalPartner snapshots the filtered-build wire shape: a
+// caller loaded by the request talks to a peer the request's selector did NOT
+// load, so the peer renders as `external/<label>` with empty labels rather
+// than as a synthesised pod. The edge keeps labels.cluster (the client side is
+// a real pod) and carries no metrics (an external endpoint is never measured).
+func buildFilteredExternalPartner() graph.View {
+	caller := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}}
+	node := &graph.K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}}
+	outbound := &graph.ExternalNode{IDValue: graph.ExternalID("cart"), NameValue: "cart", LabelsValue: map[string]string{}}
+	inbound := &graph.ExternalNode{IDValue: graph.ExternalID("frontend"), NameValue: "frontend", LabelsValue: map[string]string{}}
+	edges := []*graph.Edge{
+		graph.NewEdge(graph.EdgeTypePodCallsPod, caller.IDValue, outbound.IDValue, map[string]string{"cluster": "cluster-alpha"}),
+		graph.NewEdge(graph.EdgeTypePodCallsPod, inbound.IDValue, caller.IDValue, map[string]string{}),
+		graph.NewEdge(graph.EdgeTypePodToNode, caller.IDValue, node.IDValue, nil),
+	}
+	g := graph.NewGraph([]graph.GraphNode{caller, node, outbound, inbound}, edges, time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC))
+	return graph.Project(g, graph.Scope{Namespaces: map[string]struct{}{"shop": {}}})
 }
 
 // buildWithREDMetrics exercises every wire shape of data.metrics in one body:
@@ -283,6 +325,43 @@ func buildWithREDMetrics() graph.View {
 	}
 	return graph.View{
 		Nodes: []graph.GraphNode{client, server, peer, slow, node},
+		Edges: edges,
+	}
+}
+
+// buildClusterIdentity snapshots the cluster-identity wire shape: two clusters
+// composed from ONE raw name (`c1`) in different zone/environment pairs, plus an
+// unstamped cluster that composed nothing. The identity is what every id prefix,
+// `labels.cluster`, compound-group id and `clusters[]` entry carries; the raw
+// name appears nowhere. The cross-identity edge is cross-cluster even though
+// both sides are "c1".
+func buildClusterIdentity() graph.View {
+	usPod := &graph.PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop", "node": "us-dev-c1/worker-0"}}
+	usNode := &graph.K8sNode{IDValue: "us-dev-c1/worker-0", NameValue: "worker-0",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1"}}
+	usPVC := &graph.PVCNode{IDValue: "us-dev-c1/shop/checkout-data", NameValue: "checkout-data",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	usSvc := &graph.ServiceNode{IDValue: "us-dev-c1/shop/payments", NameValue: "payments",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	euPod := &graph.PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments",
+		LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "shop"}}
+	// Unstamped: no az/env pair upstream, so its cluster stayed the raw name.
+	plainPod := &graph.PodNode{IDValue: "cluster-beta/p3", NameValue: "ledger",
+		LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing"}}
+
+	edges := []*graph.Edge{
+		// Intra-identity call.
+		graph.NewEdge(graph.EdgeTypePodCallsService, usPod.IDValue, usSvc.IDValue,
+			map[string]string{"cluster": "us-dev-c1"}),
+		// Same raw name, different identity → cross-cluster.
+		graph.NewEdge(graph.EdgeTypePodCallsPod, usPod.IDValue, euPod.IDValue,
+			map[string]string{"cluster": "us-dev-c1"}),
+		graph.NewEdge(graph.EdgeTypePodToNode, usPod.IDValue, usNode.IDValue, nil),
+		graph.NewEdge(graph.EdgeTypePodMountsPVC, usPod.IDValue, usPVC.IDValue, nil),
+	}
+	return graph.View{
+		Nodes: []graph.GraphNode{usPod, usNode, usPVC, usSvc, euPod, plainPod},
 		Edges: edges,
 	}
 }

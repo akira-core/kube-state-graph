@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"maps"
 	"runtime/debug"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -63,11 +62,13 @@ type EndpointObs struct {
 // Topology is the typed result of reading kube-state-metrics-style series for
 // a single time window across all clusters in scope.
 type Topology struct {
-	Pods           []*graph.PodNode
-	Nodes          []*graph.K8sNode
-	PVCs           []*graph.PVCNode
-	StorageClasses []*graph.StorageClassNode
-	PodPVCs        []PodPVCBinding
+	Pods         []*graph.PodNode
+	Nodes        []*graph.K8sNode
+	PVCs         []*graph.PVCNode
+	NetAppAggrs  []*graph.NetAppAggrNode
+	NetAppNodes  []*graph.NetAppNode
+	StorageEdges []*graph.Edge
+	PodPVCs      []PodPVCBinding
 
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
@@ -103,13 +104,36 @@ type Topology struct {
 
 	ClustersObserved []string // sorted unique cluster values
 
-	// RawSeriesCount records how many raw upstream series each topology query
-	// returned BEFORE parsing/filtering, keyed by query name. Diagnostic only:
-	// the build pipeline uses it to enrich the outside-retention error so an
-	// operator can tell which upstream metric came back empty (0 raw series)
-	// versus returned rows that were all filtered out (raw > 0 but parsed 0,
-	// e.g. kube_pod_info samples with an empty uid).
+	// RawSeriesCount records how many series each topology query returned,
+	// keyed by query name. Diagnostic only: the build pipeline uses it to
+	// enrich the outside-retention error so an operator can tell which
+	// upstream metric came back empty (0 series) versus returned rows that
+	// were all discarded in Go (count > 0 but parsed 0, e.g. kube_pod_info
+	// samples with an empty uid).
+	//
+	// It is a POST-selector count, not a raw object count. Seven legs carry a
+	// fixed selector that pre-filters what the reader would have discarded
+	// anyway — kube_job_owner (CronJob controllers only) and the six
+	// controller-annotation families (annotated objects only) — so for those a
+	// 0 means "nothing matched the fixed selector", never "the collector is
+	// off". Every leg is also narrowed by the request's own az/env/cluster/
+	// namespace matchers per promql.queryDims. And because
+	// kube_replicaset_annotations / kube_job_annotations are fetchOptional, a
+	// 0 for those two ALSO covers "the query errored and the leg degraded" —
+	// the accompanying `optional topology query failed` Warn is the only thing
+	// that separates the two.
 	RawSeriesCount map[string]int
+
+	// ClusterIdentities is the identity table the reader composed, handed to
+	// the built graph so the projection-level `cluster` filter can recover each
+	// identity's RAW component. Nil for an estate that stamps no az/env pair.
+	ClusterIdentities map[string]graph.ClusterIdentity
+
+	// clusters is the resolver that composed those identities. Carried so the
+	// service-graph reader resolves the trace `cluster` label and the route
+	// store's cluster names through the SAME table — a second resolver could
+	// hold a different one and the two would silently disagree.
+	clusters *clusterResolver
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It
@@ -127,10 +151,11 @@ type topologyVectors struct {
 	// Pod controller-owner resolution (D34).
 	PodOwner        model.Vector
 	ReplicaSetOwner model.Vector
-	// PVC StorageClass resolution.
+	// Job → CronJob resolution, for pod ArgoCD Application resolution ONLY:
+	// resolvePodOwners never reads it, so the pod `owner` attribute cannot move.
+	JobOwner model.Vector
+	// PVC StorageClass name + bound PV name.
 	PVCInfo model.Vector
-	// StorageClass node resolution (provisioner + NetApp/Ceph parameters).
-	StorageClassInfo model.Vector
 	// Pod container list resolution (name/image per container).
 	PodContainerInfo model.Vector
 	// K8s node Ready-status resolution (kube_node_status_condition).
@@ -138,25 +163,80 @@ type topologyVectors struct {
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id).
 	ServiceAnnotations model.Vector
 	PVCAnnotations     model.Vector
-	// NetApp Trident PVC SVM resolution (volumename → backendUUID → svm).
-	TridentVolume  model.Vector
-	TridentBackend model.Vector
+	// Pod ArgoCD Application resolution — one annotation family per controller
+	// kind kube-state-metrics can describe. ArgoCD stamps its tracking-id on the
+	// managed controller, never on the pods it spawns.
+	DeploymentAnnotations  model.Vector
+	StatefulSetAnnotations model.Vector
+	DaemonSetAnnotations   model.Vector
+	ReplicaSetAnnotations  model.Vector
+	JobAnnotations         model.Vector
+	CronJobAnnotations     model.Vector
+	// JobAnnotationsDegraded records that the kube_job_annotations leg came back
+	// empty BECAUSE THE QUERY FAILED, as opposed to genuinely matching nothing.
+	// resolvePodApplications needs the two told apart: its Job → CronJob hop is
+	// gated on "this Job carries no annotation of its own", which only a leg that
+	// was actually read can establish.
+	//
+	// kube_replicaset_annotations — the other degrading family — needs no such
+	// flag: a bare ReplicaSet has no further ancestor to consult, so a miss
+	// resolves no Application either way and the degrade stays subtractive on
+	// its own.
+	JobAnnotationsDegraded bool
+	// NetApp Harvest storage series, in join order (design.md D3):
+	// hop A the volume label series (topology), hop B the QoS workload
+	// families (I/O), hop C the QoS fixed-policy ceilings.
+	VolumeLabels     model.Vector
+	QoSReadOps       model.Vector
+	QoSWriteOps      model.Vector
+	QoSReadLatency   model.Vector
+	QoSWriteLatency  model.Vector
+	QoSReadData      model.Vector
+	QoSWriteData     model.Vector
+	QoSPolicyMaxIOPS model.Vector
+	QoSPolicyMaxMBps model.Vector
+	AggrStatus       model.Vector
+	AggrSpaceUsed    model.Vector
+	AggrSpaceTotal   model.Vector
+	NetAppNodeStatus model.Vector
+	// Kubelet PVC usage.
+	KubeletVolumeUsed     model.Vector
+	KubeletVolumeCapacity model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
-// result. The Renderer carries the configurable upstream metric-name prefix
-// (see design.md D26) so deployments using a fork of kube-state-metrics or a
-// custom exporter that re-publishes KSM-shaped series can be supported.
+// result.
 //
 // The service / endpointslice queries (D29) are best-effort: an upstream that
 // does not export them (older KSM, or KSM started without
 // --resources=services,endpointslices) yields empty indexes, and "://"
 // connection-string endpoints simply fall back to `external/<label>`.
-func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, window time.Duration, end time.Time) (Topology, error) {
+// Harvest and kubelet legs are OPTIONAL with log-and-continue error
+// semantics (a non-NetApp deployment must build cleanly). Existing KSM
+// legs keep abort-on-error semantics, except kube_replicaset_annotations
+// and kube_job_annotations whose cardinality accumulates with history
+// and which degrade like Harvest (harden-controller-annotation-legs D3).
+func ReadTopology(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	keys promql.LabelKeys,
+	sel promql.Selector,
+) (Topology, error) {
 	// Each goroutine writes a distinct field, so concurrent writes to v are
 	// race-free (no overlapping memory); g.Wait() establishes the happens-before
 	// edge to the read below.
 	var v topologyVectors
+
+	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
+	// fetchOptional must distinguish "the caller went away (build timeout /
+	// client disconnect)" from "a sibling leg failed and cancelled gctx" — only
+	// the former may fail an OPTIONAL leg. Passing the errgroup ctx would make
+	// every optional leg fatal whenever any required leg fails, masking the
+	// real error. Mirrors ReadServiceGraph, which keeps ctx and gctx apart for
+	// exactly this reason.
+	callerCtx := ctx
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -179,10 +259,54 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, err := q.Instant(ctx, string(name), r.Render(name, window), end)
+			out, err := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
 			*dst = out
 			return err
 		}
+	}
+	// fetchOptionalTracking is the OPTIONAL-leg twin of fetch: a query error logs
+	// and yields an empty vector instead of failing the build. Caller
+	// cancellation still fails the group. Used for Harvest, kubelet, and
+	// the two accumulating-cardinality annotation families.
+	//
+	// A non-nil degraded is set when — and only when — an error was swallowed,
+	// so a reader that infers something from the family's ABSENCE can tell
+	// "read, matched nothing" from "never read". Only kube_job_annotations
+	// needs that today; every other optional leg passes nil via fetchOptional.
+	fetchOptionalTracking := func(name promql.Query, dst *model.Vector, degraded *bool) func() error {
+		return func() (err error) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.ErrorContext(ctx, "panic in optional topology query",
+						"query", string(name),
+						"panic", fmt.Sprint(rec),
+						"stack", string(debug.Stack()),
+					)
+					err = fmt.Errorf("panic in %s query: %v", name, rec)
+				}
+			}()
+			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
+			if qerr != nil {
+				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
+					return cerr
+				}
+				slog.WarnContext(ctx, "optional topology query failed; continuing with empty vector",
+					"query", string(name),
+					"error", qerr)
+				*dst = nil
+				if degraded != nil {
+					*degraded = true
+				}
+				return nil
+			}
+			*dst = out
+			return nil
+		}
+	}
+	// fetchOptional is fetchOptionalTracking for the legs whose degrade needs no
+	// downstream signal.
+	fetchOptional := func(name promql.Query, dst *model.Vector) func() error {
+		return fetchOptionalTracking(name, dst, nil)
 	}
 
 	g.Go(fetch(promql.QPodInfo, &v.Pod))
@@ -196,39 +320,128 @@ func ReadTopology(ctx context.Context, q promql.Querier, r promql.Renderer, wind
 	g.Go(fetch(promql.QPodOwner, &v.PodOwner))
 	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
 	g.Go(fetch(promql.QPVCInfo, &v.PVCInfo))
-	g.Go(fetch(promql.QStorageClassInfo, &v.StorageClassInfo))
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
 	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
-	g.Go(fetch(promql.QTridentVolumeInfo, &v.TridentVolume))
-	g.Go(fetch(promql.QTridentBackendInfo, &v.TridentBackend))
+	// The four live-object-count controller-annotation families and
+	// kube_job_owner use `fetch`: an upstream fault is rare and fail-fast
+	// is the right response. kube_replicaset_annotations and
+	// kube_job_annotations use `fetchOptional` — their cardinality
+	// accumulates with history (revisionHistoryLimit / Job history limits)
+	// and can exceed an upstream series limit in an otherwise ordinary
+	// estate; losing an `application` string is never worth failing the
+	// whole graph (harden-controller-annotation-legs D3). Caller cancellation
+	// still fails the request.
+	g.Go(fetch(promql.QJobOwner, &v.JobOwner))
+	g.Go(fetch(promql.QDeploymentAnnotations, &v.DeploymentAnnotations))
+	g.Go(fetch(promql.QStatefulSetAnnotations, &v.StatefulSetAnnotations))
+	g.Go(fetch(promql.QDaemonSetAnnotations, &v.DaemonSetAnnotations))
+	g.Go(fetchOptional(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
+	g.Go(fetchOptionalTracking(promql.QJobAnnotations, &v.JobAnnotations, &v.JobAnnotationsDegraded))
+	g.Go(fetch(promql.QCronJobAnnotations, &v.CronJobAnnotations))
+	g.Go(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels))
+	g.Go(fetchOptional(promql.QQoSReadOps, &v.QoSReadOps))
+	g.Go(fetchOptional(promql.QQoSWriteOps, &v.QoSWriteOps))
+	g.Go(fetchOptional(promql.QQoSReadLatency, &v.QoSReadLatency))
+	g.Go(fetchOptional(promql.QQoSWriteLatency, &v.QoSWriteLatency))
+	g.Go(fetchOptional(promql.QQoSReadData, &v.QoSReadData))
+	g.Go(fetchOptional(promql.QQoSWriteData, &v.QoSWriteData))
+	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxIOPS, &v.QoSPolicyMaxIOPS))
+	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxMBps, &v.QoSPolicyMaxMBps))
+	g.Go(fetchOptional(promql.QAggrStatus, &v.AggrStatus))
+	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
+	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
+	g.Go(fetchOptional(promql.QNetAppNodeStatus, &v.NetAppNodeStatus))
+	g.Go(fetchOptional(promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed))
+	g.Go(fetchOptional(promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity))
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
 
-	t := parseTopology(v)
+	t := parseTopology(v, keys)
 	t.RawSeriesCount = map[string]int{
-		string(promql.QPodInfo):                len(v.Pod),
-		string(promql.QNodeInfo):               len(v.Node),
-		string(promql.QNodeAddresses):          len(v.Addr),
-		string(promql.QPVCBindings):            len(v.PVC),
-		string(promql.QNodeLabels):             len(v.NodeLabels),
-		string(promql.QServiceInfo):            len(v.Service),
-		string(promql.QEndpointSliceEndpoints): len(v.EpEndpoints),
-		string(promql.QEndpointSliceLabels):    len(v.EpLabels),
-		string(promql.QPodOwner):               len(v.PodOwner),
-		string(promql.QReplicaSetOwner):        len(v.ReplicaSetOwner),
-		string(promql.QPVCInfo):                len(v.PVCInfo),
-		string(promql.QStorageClassInfo):       len(v.StorageClassInfo),
-		string(promql.QPodContainerInfo):       len(v.PodContainerInfo),
-		string(promql.QNodeStatusCondition):    len(v.NodeStatus),
-		string(promql.QServiceAnnotations):     len(v.ServiceAnnotations),
-		string(promql.QPVCAnnotations):         len(v.PVCAnnotations),
-		string(promql.QTridentVolumeInfo):      len(v.TridentVolume),
-		string(promql.QTridentBackendInfo):     len(v.TridentBackend),
+		string(promql.QPodInfo):                    len(v.Pod),
+		string(promql.QNodeInfo):                   len(v.Node),
+		string(promql.QNodeAddresses):              len(v.Addr),
+		string(promql.QPVCBindings):                len(v.PVC),
+		string(promql.QNodeLabels):                 len(v.NodeLabels),
+		string(promql.QServiceInfo):                len(v.Service),
+		string(promql.QEndpointSliceEndpoints):     len(v.EpEndpoints),
+		string(promql.QEndpointSliceLabels):        len(v.EpLabels),
+		string(promql.QPodOwner):                   len(v.PodOwner),
+		string(promql.QReplicaSetOwner):            len(v.ReplicaSetOwner),
+		string(promql.QPVCInfo):                    len(v.PVCInfo),
+		string(promql.QPodContainerInfo):           len(v.PodContainerInfo),
+		string(promql.QNodeStatusCondition):        len(v.NodeStatus),
+		string(promql.QServiceAnnotations):         len(v.ServiceAnnotations),
+		string(promql.QPVCAnnotations):             len(v.PVCAnnotations),
+		string(promql.QJobOwner):                   len(v.JobOwner),
+		string(promql.QDeploymentAnnotations):      len(v.DeploymentAnnotations),
+		string(promql.QStatefulSetAnnotations):     len(v.StatefulSetAnnotations),
+		string(promql.QDaemonSetAnnotations):       len(v.DaemonSetAnnotations),
+		string(promql.QReplicaSetAnnotations):      len(v.ReplicaSetAnnotations),
+		string(promql.QJobAnnotations):             len(v.JobAnnotations),
+		string(promql.QCronJobAnnotations):         len(v.CronJobAnnotations),
+		string(promql.QVolumeLabels):               len(v.VolumeLabels),
+		string(promql.QQoSReadOps):                 len(v.QoSReadOps),
+		string(promql.QQoSWriteOps):                len(v.QoSWriteOps),
+		string(promql.QQoSReadLatency):             len(v.QoSReadLatency),
+		string(promql.QQoSWriteLatency):            len(v.QoSWriteLatency),
+		string(promql.QQoSReadData):                len(v.QoSReadData),
+		string(promql.QQoSWriteData):               len(v.QoSWriteData),
+		string(promql.QQoSPolicyFixedMaxIOPS):      len(v.QoSPolicyMaxIOPS),
+		string(promql.QQoSPolicyFixedMaxMBps):      len(v.QoSPolicyMaxMBps),
+		string(promql.QAggrStatus):                 len(v.AggrStatus),
+		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
+		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
+		string(promql.QNetAppNodeStatus):           len(v.NetAppNodeStatus),
+		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
+		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
 	}
+	warnSelectorFamilyEmpty(ctx, sel, keys, t.RawSeriesCount)
 	return t, nil
+}
+
+// warnSelectorFamilyEmpty surfaces the one operator mistake this change makes
+// silent: a metric family that does NOT carry the labels the request filters on
+// simply matches nothing, and because the default projection keeps only
+// connectivity-connected workload, the result can be an empty graph rather than
+// a partial one.
+//
+// The signature is narrow on purpose — kube-state-metrics returned rows, so the
+// selector demonstrably matches the deployment's labelling, yet a kubelet
+// family came back empty. A family is reported ONLY when a dimension the
+// request actually carries reaches it (promql.Selector.Reaches). In practice
+// that is the kubelet pair alone: the Harvest families render NO request
+// matcher (az only routes them to a backend, env is inert), so Reaches is
+// false for every dimension and an empty volume_labels can never be the
+// request's doing — reporting it would fire this Warn on every filtered
+// request of every non-NetApp deployment. QVolumeLabels stays in the list so
+// the contract is enforced by the table rather than by omission. It is a
+// Warn, not an error, and stays quiet for every unfiltered build.
+func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
+	if !sel.Active() || raw[string(promql.QPodInfo)] == 0 {
+		return
+	}
+	var empty []string
+	for _, q := range []promql.Query{
+		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
+	} {
+		if raw[string(q)] == 0 && sel.Reaches(q) {
+			empty = append(empty, string(q))
+		}
+	}
+	if len(empty) == 0 {
+		return
+	}
+	keys = keys.OrDefault()
+	slog.WarnContext(ctx, "selector-filtered build: kube-state-metrics matched but another family returned nothing; check that it carries the labels this request filters on",
+		"reason", "selector_family_empty",
+		"empty_families", empty,
+		"az_label", keys.AZ,
+		"env_label", keys.Env,
+	)
 }
 
 // nodeAddrs holds the best (lexically-smallest) address seen per type for one
@@ -245,43 +458,53 @@ func (a nodeAddrs) pick() string {
 	return a.internal
 }
 
-func parseTopology(v topologyVectors) Topology {
+func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	clusters := map[string]struct{}{}
 
-	// Per-metric tally of samples missing the `cluster` label; surfaced as one
-	// aggregated warn per metric at the end of the parse.
-	mc := missingClusterCounts{}
+	// Resolver for the cluster identity every structure below is keyed on, and
+	// the per-metric tallies of samples missing the `cluster` label or naming
+	// no single identity; both surfaced as one aggregated warn per metric at
+	// the end of the parse.
+	mc := newClusterResolver(keys)
+
+	// FIRST PASS: build the identity table from the four families that mint
+	// cluster-labelled entities. It must complete before ANY bucket call —
+	// including the resolve* helpers below — because step 2 of the ladder
+	// (adopt) reads it. The other families resolve THROUGH the table and never
+	// add to it, so a join input cannot invent a cluster that holds no entity.
+	for _, vec := range []model.Vector{v.Pod, v.Node, v.Service, v.PVC} {
+		for _, s := range vec {
+			mc.observe(s.Metric)
+		}
+	}
 
 	// Pod controller-owner resolution (D34), with the ReplicaSet skipped to its
 	// owning Deployment. Built up-front so the per-pod assembly below can set
 	// each pod's typed Owner attribute (never a label).
 	podOwners := resolvePodOwners(v.PodOwner, v.ReplicaSetOwner, mc)
 
-	// PVC info resolution (StorageClass + bound PV name). Built up-front so the
-	// per-PVC assembly below can set each PVC's StorageClass (drives the
-	// pvc-to-storageclass edge — never a label) and its `volumename` label (the
-	// bound PV name, rooting the Trident svm chain below).
+	// PVC info resolution (StorageClass name + bound PV name). Built up-front
+	// so the per-PVC assembly below can set each PVC's StorageClass (typed
+	// data.storageclass, never a label or node) and its `volumename` label
+	// (the bound PV name, rooting the Harvest volume join below).
 	pvcInfo := resolvePVCInfo(v.PVCInfo, mc)
 
-	// NetApp Trident svm chain: (cluster, PV name) → backendUUID → svm. Both
-	// indexes are built up-front; the per-PVC assembly joins them off the
-	// resolved volumename to set the PVC's `svm` label. OPTIONAL — absent
-	// Trident metrics leave both maps empty and the labels off.
-	tridentBackendByPV := resolveTridentVolumeBackends(v.TridentVolume, mc)
-	tridentSVMByBackend := resolveTridentBackendSVMs(v.TridentBackend, mc)
-
-	// StorageClass node attributes (provisioner + NetApp/Ceph parameters) from
-	// kube_storageclass_info, keyed (cluster, storageclass). Built up-front; the
-	// StorageClass nodes are materialised after the PVC slice exists (so a
-	// PVC-referenced-but-absent class can be back-filled bare).
-	scInfo := resolveStorageClassInfo(v.StorageClassInfo, mc)
+	// Kubelet PVC usage (used/capacity bytes). Built up-front so assembly
+	// can set PVCNode.UsageValue. OPTIONAL — absent series leave usage nil.
+	pvcUsage := resolvePVCUsage(v.KubeletVolumeUsed, v.KubeletVolumeCapacity, mc)
 
 	// Pod container list + ArgoCD Application resolution. Both feed typed pod
 	// attributes (never labels) set during the per-pod assembly below. The
-	// Application is read from the SAME kube_pod_owner vector as the controller
-	// owner but independently of the controller pick (it is a pod-level fact).
+	// Application is joined from the pod's controller — ArgoCD annotates the
+	// managed workload object, never the pods it spawns — reusing the controller
+	// owner resolved above, so the Deployment case needs no extra owner hop.
 	podContainers := resolvePodContainers(v.PodContainerInfo, mc)
-	podApplications := resolvePodApplications(v.PodOwner)
+	podApplications := resolvePodApplications(
+		podOwners,
+		resolveControllerApplications(v, mc),
+		resolveJobCronJobOwners(v.JobOwner, mc),
+		v.JobAnnotationsDegraded,
+	)
 
 	// Service / PVC ArgoCD Application resolution (annotation tracking-id). Built
 	// up-front: the PVC index enriches each PVC at the per-PVC assembly below; the
@@ -302,7 +525,7 @@ func parseTopology(v topologyVectors) Topology {
 	// never reach `ipaddress`.
 	nodeIPs := map[[2]string]nodeAddrs{}
 	for _, s := range v.Addr {
-		cluster := mc.bucket(promql.QNodeAddresses, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeAddresses, s.Metric)
 		nodeName := string(s.Metric["node"])
 		typ := string(s.Metric["type"])
 		addr := string(s.Metric["address"])
@@ -332,7 +555,7 @@ func parseTopology(v topologyVectors) Topology {
 	// K8s node label map: (cluster, node-name) -> labels (with `label_` prefix removed).
 	nodeLabels := map[[2]string]map[string]string{}
 	for _, s := range v.NodeLabels {
-		cluster := mc.bucket(promql.QNodeLabels, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeLabels, s.Metric)
 		nodeName := string(s.Metric["node"])
 		key := [2]string{cluster, nodeName}
 		if _, ok := nodeLabels[key]; !ok {
@@ -367,7 +590,7 @@ func parseTopology(v topologyVectors) Topology {
 	nodes := make([]*graph.K8sNode, 0, len(v.Node))
 	seenNodes := make(map[[2]string]struct{}, len(v.Node))
 	for _, s := range v.Node {
-		cluster := mc.bucket(promql.QNodeInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeInfo, s.Metric)
 		nodeName := string(s.Metric["node"])
 		if nodeName == "" {
 			continue
@@ -404,7 +627,7 @@ func parseTopology(v topologyVectors) Topology {
 	// Pods (group by (cluster, namespace, pod) for restart handling).
 	podGroups := map[podKey][]podObs{}
 	for _, s := range v.Pod {
-		cluster := mc.bucket(promql.QPodInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		name := string(s.Metric["pod"])
 		uid := string(s.Metric["uid"])
@@ -526,7 +749,7 @@ func parseTopology(v topologyVectors) Topology {
 		canonicalPodUID[[3]string{k.cluster, k.namespace, k.pod}] = group[0].uid
 	}
 	for _, s := range v.PVC {
-		cluster := mc.bucket(promql.QPVCBindings, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPVCBindings, s.Metric)
 		ns := string(s.Metric["namespace"])
 		podName := string(s.Metric["pod"])
 		claim := string(s.Metric["persistentvolumeclaim"])
@@ -549,11 +772,6 @@ func parseTopology(v topologyVectors) Topology {
 			// name); both may coexist on one PVC.
 			if attrs.volumeName != "" {
 				labels["volumename"] = attrs.volumeName
-				if uuid := tridentBackendByPV[[2]string{cluster, attrs.volumeName}]; uuid != "" {
-					if svm := tridentSVMByBackend[[2]string{cluster, uuid}]; svm != "" {
-						labels["svm"] = svm
-					}
-				}
 			}
 			node = &graph.PVCNode{
 				IDValue:           id,
@@ -561,6 +779,7 @@ func parseTopology(v topologyVectors) Topology {
 				LabelsValue:       labels,
 				StorageClassValue: attrs.storageClass,
 				ApplicationValue:  pvcApplications[pvcKey{cluster, ns, claim}],
+				UsageValue:        pvcUsage[pvcKey{cluster, ns, claim}],
 			}
 			pvcByID[id] = node
 			pvcs = append(pvcs, node)
@@ -616,51 +835,30 @@ func parseTopology(v topologyVectors) Topology {
 		}
 	}
 
-	// StorageClass nodes (real, from kube_storageclass_info). Every observed
-	// StorageClass becomes a node; a StorageClass referenced by an emitted PVC
-	// but absent from the info metric is materialised bare (nil InfoValue, no
-	// provisioner/parameters) so its pvc-to-storageclass edge has a target.
-	// Attributed nodes win over bare on the same (cluster, name) via scSeen.
-	// Sorted by ID so the slice — and hence NewGraph keep-first dedup — is a pure
-	// function of the data (D6 determinism).
-	storageClasses := make([]*graph.StorageClassNode, 0, len(scInfo))
-	scSeen := make(map[storageClassKey]bool, len(scInfo))
-	for key, info := range scInfo {
-		storageClasses = append(storageClasses, &graph.StorageClassNode{
-			IDValue:     graph.StorageClassID(key.cluster, key.name),
-			NameValue:   key.name,
-			LabelsValue: map[string]string{"cluster": key.cluster},
-			InfoValue:   info,
-		})
-		scSeen[key] = true
-		clusters[key.cluster] = struct{}{}
-	}
+	// Harvest volume join: SVM label, pvc-to-netapp-aggr edges, demand-driven
+	// NetApp aggregate + controller nodes. Rooted at each PVC's volumename.
+	claims := make([]pvcVolume, 0, len(pvcs))
 	for _, pv := range pvcs {
-		sc := pv.StorageClassValue
-		if sc == "" {
-			continue
+		if vn := pv.LabelsValue["volumename"]; vn != "" {
+			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn})
 		}
-		key := storageClassKey{pv.LabelsValue["cluster"], sc}
-		if scSeen[key] {
-			continue
-		}
-		scSeen[key] = true
-		storageClasses = append(storageClasses, &graph.StorageClassNode{
-			IDValue:     graph.StorageClassID(key.cluster, key.name),
-			NameValue:   key.name,
-			LabelsValue: map[string]string{"cluster": key.cluster},
-			InfoValue:   nil,
-		})
-		clusters[key.cluster] = struct{}{}
 	}
-	sort.SliceStable(storageClasses, func(i, j int) bool {
-		return storageClasses[i].ID() < storageClasses[j].ID()
-	})
+	netapp := resolveNetAppStorage(claims,
+		v.VolumeLabels,
+		v.QoSReadOps, v.QoSWriteOps, v.QoSReadLatency, v.QoSWriteLatency,
+		v.QoSReadData, v.QoSWriteData,
+		v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps,
+		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal, v.NetAppNodeStatus)
+	for _, pv := range pvcs {
+		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {
+			pv.LabelsValue["svm"] = svm
+		}
+	}
 
 	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.
 	servicesByNameNS := map[serviceKey]ServiceObs{}
 	for _, s := range v.Service {
-		cluster := mc.bucket(promql.QServiceInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QServiceInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		svc := string(s.Metric["service"])
 		if svc == "" {
@@ -679,7 +877,7 @@ func parseTopology(v topologyVectors) Topology {
 	type sliceKey struct{ cluster, namespace, slice string }
 	sliceToService := map[sliceKey]string{}
 	for _, s := range v.EpLabels {
-		cluster := mc.bucket(promql.QEndpointSliceLabels, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QEndpointSliceLabels, s.Metric)
 		ns := string(s.Metric["namespace"])
 		slice := string(s.Metric["endpointslice"])
 		svc := string(s.Metric["label_kubernetes_io_service_name"])
@@ -696,7 +894,7 @@ func parseTopology(v topologyVectors) Topology {
 	// the source of the Service → backing-pod fan-out (service-selects-pod edges).
 	endpointsByService := map[serviceKey][]EndpointObs{}
 	for _, s := range v.EpEndpoints {
-		cluster := mc.bucket(promql.QEndpointSliceEndpoints, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QEndpointSliceEndpoints, s.Metric)
 		ns := string(s.Metric["namespace"])
 		slice := string(s.Metric["endpointslice"])
 		svc, ok := sliceToService[sliceKey{cluster, ns, slice}]
@@ -735,13 +933,17 @@ func parseTopology(v topologyVectors) Topology {
 		Pods:                pods,
 		Nodes:               nodes,
 		PVCs:                pvcs,
-		StorageClasses:      storageClasses,
+		NetAppAggrs:         netapp.aggrs,
+		NetAppNodes:         netapp.nodes,
+		StorageEdges:        netapp.edges,
 		PodPVCs:             bindings,
 		PodsByUID:           podsByUID,
 		ServicesByNameNS:    servicesByNameNS,
 		EndpointsByService:  endpointsByService,
 		ServiceApplications: serviceApplications,
 		ClustersObserved:    clusterList,
+		ClusterIdentities:   mc.snapshot(),
+		clusters:            mc,
 	}
 }
 
@@ -761,7 +963,7 @@ type ownerRef struct{ kind, name string }
 // lexically-smallest (kind, name) wins so the emitted entity is stable across
 // rebuilds (D6 determinism). The only side effect is tallying missing-cluster
 // samples into the caller's mc accumulator.
-func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts) map[podNameKey]ownerRef {
+func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc *clusterResolver) map[podNameKey]ownerRef {
 	// ReplicaSet → owning Deployment, keyed by (cluster, namespace, replicaset).
 	// Only Deployment owners are retained; a ReplicaSet owned by anything else
 	// (or nothing) is left unresolved so the pod keeps the ReplicaSet.
@@ -770,7 +972,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 		if string(s.Metric["owner_kind"]) != "Deployment" {
 			continue
 		}
-		cluster := mc.bucket(promql.QReplicaSetOwner, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QReplicaSetOwner, s.Metric)
 		ns := string(s.Metric["namespace"])
 		rs := string(s.Metric["replicaset"])
 		dep := string(s.Metric["owner_name"])
@@ -785,7 +987,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 		if string(s.Metric["owner_is_controller"]) != "true" {
 			continue
 		}
-		cluster := mc.bucket(promql.QPodOwner, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodOwner, s.Metric)
 		ns := string(s.Metric["namespace"])
 		pod := string(s.Metric["pod"])
 		kind := string(s.Metric["owner_kind"])
@@ -836,7 +1038,7 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc missingClusterCounts
 // containers (graceful degradation). The returned map is a deterministic
 // function of the input vector. The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podNameKey][]graph.Container {
+func resolvePodContainers(vec model.Vector, mc *clusterResolver) map[podNameKey][]graph.Container {
 	type containerKey struct {
 		pod  podNameKey
 		name string
@@ -849,7 +1051,7 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 	// value), lexically-smallest image breaking exact-timestamp ties.
 	best := make(map[containerKey]pick, len(vec))
 	for _, s := range vec {
-		cluster := mc.bucket(promql.QPodContainerInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPodContainerInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		pod := string(s.Metric["pod"])
 		name := string(s.Metric["container"])
@@ -882,34 +1084,169 @@ func resolvePodContainers(vec model.Vector, mc missingClusterCounts) map[podName
 	return out
 }
 
-// resolvePodApplications builds the (cluster, namespace, pod) → ArgoCD
-// Application index from the argocd_tracking_id label on kube_pod_owner. The
-// Application is the segment of the tracking-id value before the first ":"
-// (ArgoCD annotation-based form <app>:<group>/<kind>:<ns>/<name>); a value with
-// no ":" is surfaced verbatim. The label is read independently of the
-// controller-owner pick — it is a pod-level fact that must survive even when no
-// kube_pod_owner row is a controller.
+// controllerKey identifies one workload controller by its cluster-scoped
+// namespace, its owner kind and its name — exactly the tuple resolvePodOwners
+// already produces per pod, so the pod → Application join is a single lookup.
+type controllerKey struct{ cluster, namespace, kind, name string }
+
+// controllerAnnotationFamily binds one owner kind to the kube-state-metrics
+// annotation family that describes it and to that family's resource-identity
+// label. The Job family's identity label is `job_name`, NOT `job` —
+// kube-state-metrics avoids Prometheus' reserved `job` target label.
+type controllerAnnotationFamily struct {
+	kind      string
+	query     promql.Query
+	nameLabel model.LabelName
+	vec       func(topologyVectors) model.Vector
+}
+
+// controllerAnnotationFamilies is the complete set of pod controller kinds a
+// stock kube-state-metrics can describe. A resolved owner kind absent from this
+// table — ReplicationController (KSM exposes no annotations family for it),
+// Node (static / mirror pods), or any CRD controller such as argo-rollouts
+// Rollout or OpenKruise CloneSet — resolves no Application, keeps the pod's
+// owner attribute, and never fails the build.
+var controllerAnnotationFamilies = []controllerAnnotationFamily{
+	{"Deployment", promql.QDeploymentAnnotations, "deployment", func(v topologyVectors) model.Vector { return v.DeploymentAnnotations }},
+	{"StatefulSet", promql.QStatefulSetAnnotations, "statefulset", func(v topologyVectors) model.Vector { return v.StatefulSetAnnotations }},
+	{"DaemonSet", promql.QDaemonSetAnnotations, "daemonset", func(v topologyVectors) model.Vector { return v.DaemonSetAnnotations }},
+	{"ReplicaSet", promql.QReplicaSetAnnotations, "replicaset", func(v topologyVectors) model.Vector { return v.ReplicaSetAnnotations }},
+	{"Job", promql.QJobAnnotations, "job_name", func(v topologyVectors) model.Vector { return v.JobAnnotations }},
+	{"CronJob", promql.QCronJobAnnotations, "cronjob", func(v topologyVectors) model.Vector { return v.CronJobAnnotations }},
+}
+
+// resolveControllerApplications builds the (cluster, namespace, kind, name) →
+// ArgoCD Application index from the six controller-annotation families. Each
+// family goes through the SAME generic resolveApplications the service and PVC
+// resolvers use — same tracking-id label, same segment-before-":" parse, same
+// lexically-smallest-raw tie-break, same drop-when-the-Application-would-be-
+// empty rule — with a keyOf that stamps the family's constant owner kind.
 //
-// OPTIONAL: pods with no non-empty argocd_tracking_id label are absent from the
-// returned map (the caller omits the attribute rather than emitting ""). The
-// returned map is a deterministic function of the input vector — on a per-pod
-// collision the lexically-smallest non-empty tracking-id wins. It uses the pure
-// bucketCluster helper (NOT mc.bucket): resolvePodOwners already tallies this
-// vector's missing-cluster samples for its controller rows, so using mc.bucket
-// here would double-count those. (A tracking-id carried only on a non-controller
-// row with a missing cluster label is therefore bucketed silently — an
-// acceptable diagnostic gap, not a wrong-output one.)
-func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
-	// kube_pod_owner's missing-cluster tally is owned by resolvePodOwners (the
-	// controller pick reads the SAME vector), so this pass buckets without
-	// re-tallying — hence bucketCluster, not mc.bucket.
-	return resolveApplications(ownerVec, "argocd_tracking_id", func(m model.Metric) (podNameKey, bool) {
-		pod := string(m["pod"])
-		if pod == "" {
-			return podNameKey{}, false
+// The six results are merged into one map. Their key spaces are disjoint by
+// construction (the kind component differs), so the merge needs no cross-family
+// tie-break and is independent of iteration order (D6 determinism).
+//
+// OPTIONAL: every family is empty unless the operator allowlisted the
+// annotation, which is the stock kube-state-metrics state. An empty input
+// yields an empty index and no pod resolves an Application.
+func resolveControllerApplications(v topologyVectors, mc *clusterResolver) map[controllerKey]string {
+	out := map[controllerKey]string{}
+	for _, f := range controllerAnnotationFamilies {
+		apps := resolveApplications(f.vec(v), "annotation_argocd_argoproj_io_tracking_id",
+			func(m model.Metric) (controllerKey, bool) {
+				name := string(m[f.nameLabel])
+				if name == "" {
+					return controllerKey{}, false
+				}
+				return controllerKey{
+					cluster:   mc.bucket(f.query, m),
+					namespace: string(m["namespace"]),
+					kind:      f.kind,
+					name:      name,
+				}, true
+			})
+		// Key spaces are disjoint by kind, so a plain copy is order-free.
+		maps.Copy(out, apps)
+	}
+	return out
+}
+
+// jobKey identifies a Job by its cluster-scoped namespace/name. It is
+// deliberately NOT podNameKey: the two are structurally identical, so sharing
+// one type would let a Job key silently satisfy a pod-keyed lookup (and vice
+// versa) with no compiler complaint.
+type jobKey struct{ cluster, namespace, job string }
+
+// resolveJobCronJobOwners builds the (cluster, namespace, job) → owning CronJob
+// name index from kube_job_owner. It exists only for ArgoCD Application
+// resolution: the Kubernetes CronJob controller copies only
+// spec.jobTemplate.metadata annotations onto the Jobs it creates — never the
+// CronJob object's own annotations — so ArgoCD's tracking-id never reaches a
+// Job and a CronJob-managed pod can only resolve its Application one level up.
+//
+// Only controller rows naming a CronJob are retained. Unlike the pre-existing
+// rsToDeployment pass in resolvePodOwners, this one DOES filter
+// owner_is_controller: new code honours the authoritative label, while
+// tightening rsToDeployment would move the pod `owner` attribute and is out of
+// scope. On a defensive collision the lexically-smallest CronJob name wins (D6).
+//
+// This index is NEVER read by resolvePodOwners, which is what makes "the hop
+// cannot change data.owner" a structural property rather than a convention.
+func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]string {
+	out := make(map[jobKey]string, len(vec))
+	for _, s := range vec {
+		if string(s.Metric["owner_kind"]) != "CronJob" || string(s.Metric["owner_is_controller"]) != "true" {
+			continue
 		}
-		return podNameKey{bucketCluster(string(m["cluster"])), string(m["namespace"]), pod}, true
-	})
+		job := string(s.Metric["job_name"])
+		cronJob := string(s.Metric["owner_name"])
+		if job == "" || cronJob == "" {
+			continue
+		}
+		key := jobKey{mc.bucket(promql.QJobOwner, s.Metric), string(s.Metric["namespace"]), job}
+		if cur, ok := out[key]; ok && cur <= cronJob {
+			continue
+		}
+		out[key] = cronJob
+	}
+	return out
+}
+
+// resolvePodApplications builds the (cluster, namespace, pod) → ArgoCD
+// Application index by joining each pod's already-resolved controller owner to
+// the controller-annotation index. ArgoCD stamps
+// `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on
+// the pods a controller spawns, so the controller is the only place the value
+// exists — no pod-level label is read.
+//
+// Because the D34 ReplicaSet skip has already collapsed a ReplicaSet owner to
+// its Deployment, the Deployment case needs no extra hop. The ONE fallback is
+// Job → CronJob: when the owner is a Job that carries no annotation of its own,
+// the owning CronJob is consulted. The Job's own annotation is tried FIRST, so
+// a Job that ArgoCD manages directly keeps its own Application — the same
+// "nearest managed ancestor wins" rule the ReplicaSet collapse implies.
+//
+// A pod with no controller owner, or an owner of a kind outside
+// controllerAnnotationFamilies, is absent from the returned map so the caller
+// omits data.application entirely rather than emitting "".
+//
+// jobAnnotationsDegraded suppresses the hop wholesale. The hop's precondition
+// is "the Job carries no annotation of its OWN", and a degraded
+// kube_job_annotations cannot establish it: every Job misses, the annotated
+// ones included. Taking the hop then would attribute a directly-managed Job's
+// pod to its CronJob's Application — the one degrade that SUBSTITUTES a wrong
+// value instead of omitting a right one, which no other optional leg does. The
+// cost of suppressing is that a genuinely annotation-less Job under an
+// annotated CronJob also loses its Application for that build; losing a string
+// is strictly better than reporting the wrong one, and it keeps every degrade
+// in this package subtractive (harden-controller-annotation-legs D3).
+func resolvePodApplications(
+	owners map[podNameKey]ownerRef,
+	ctrlApps map[controllerKey]string,
+	jobCronJobs map[jobKey]string,
+	jobAnnotationsDegraded bool,
+) map[podNameKey]string {
+	out := make(map[podNameKey]string, len(owners))
+	for pod, owner := range owners {
+		key := controllerKey{pod.cluster, pod.namespace, owner.kind, owner.name}
+		if app, ok := ctrlApps[key]; ok {
+			out[pod] = app
+			continue
+		}
+		// Job → CronJob: the only hop, and only on a miss the Job family was
+		// actually read to establish.
+		if owner.kind != "Job" || jobAnnotationsDegraded {
+			continue
+		}
+		cronJob, ok := jobCronJobs[jobKey{pod.cluster, pod.namespace, owner.name}]
+		if !ok {
+			continue
+		}
+		if app, ok := ctrlApps[controllerKey{pod.cluster, pod.namespace, "CronJob", cronJob}]; ok {
+			out[pod] = app
+		}
+	}
+	return out
 }
 
 // resolveServiceApplications builds the (cluster, namespace, service) → ArgoCD
@@ -918,13 +1255,13 @@ func resolvePodApplications(ownerVec model.Vector) map[podNameKey]string {
 // argocd.argoproj.io/tracking-id annotation). OPTIONAL: an absent/empty vector
 // yields an empty map (services carry no Application). Deterministic per
 // "absent when empty" (lexically-smallest raw tracking-id wins on collision).
-func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[serviceKey]string {
+func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[serviceKey]string {
 	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
 		svc := string(m["service"])
 		if svc == "" {
 			return serviceKey{}, false
 		}
-		return serviceKey{mc.bucket(promql.QServiceAnnotations, string(m["cluster"])), string(m["namespace"]), svc}, true
+		return serviceKey{mc.bucket(promql.QServiceAnnotations, m), string(m["namespace"]), svc}, true
 	})
 }
 
@@ -932,13 +1269,13 @@ func resolveServiceApplications(vec model.Vector, mc missingClusterCounts) map[s
 // Application index from kube_persistentvolumeclaim_annotations' tracking-id
 // label, keyed identically to resolvePVCInfo so the per-PVC assembly
 // can join it. OPTIONAL/graceful and deterministic like the service variant.
-func resolvePVCApplications(vec model.Vector, mc missingClusterCounts) map[pvcKey]string {
+func resolvePVCApplications(vec model.Vector, mc *clusterResolver) map[pvcKey]string {
 	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
 		claim := string(m["persistentvolumeclaim"])
 		if claim == "" {
 			return pvcKey{}, false
 		}
-		return pvcKey{mc.bucket(promql.QPVCAnnotations, string(m["cluster"])), string(m["namespace"]), claim}, true
+		return pvcKey{mc.bucket(promql.QPVCAnnotations, m), string(m["namespace"]), claim}, true
 	})
 }
 
@@ -1041,7 +1378,7 @@ type pvcInfoAttrs struct {
 // non-empty value wins PER FIELD, so the emitted grouping and labels are
 // stable across rebuilds (D6 determinism). The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInfoAttrs {
+func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAttrs {
 	pick := func(cur *string, val string) {
 		if val == "" {
 			return
@@ -1052,7 +1389,7 @@ func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInf
 	}
 	out := make(map[pvcKey]pvcInfoAttrs, len(vec))
 	for _, s := range vec {
-		cluster := mc.bucket(promql.QPVCInfo, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QPVCInfo, s.Metric)
 		ns := string(s.Metric["namespace"])
 		claim := string(s.Metric["persistentvolumeclaim"])
 		if claim == "" {
@@ -1063,143 +1400,6 @@ func resolvePVCInfo(vec model.Vector, mc missingClusterCounts) map[pvcKey]pvcInf
 		pick(&attrs.storageClass, string(s.Metric["storageclass"]))
 		pick(&attrs.volumeName, string(s.Metric["volumename"]))
 		out[key] = attrs
-	}
-	return out
-}
-
-// resolveTridentVolumeBackends builds the (cluster, name) → backendUUID index
-// from kube_tridentvolume_info, the NetApp Trident custom-resource series
-// whose `name` label is the TridentVolume CR name — equal to the bound PV name
-// under Trident's naming — so the per-PVC assembly can chain a resolved
-// `volumename` to its backend. OPTIONAL and not stock KSM (custom-resource-
-// state config over the tridentvolumes CRD, or a compatible exporter): an
-// absent or empty vector yields an empty map and PVCs carry no svm label.
-// Series with an empty `name` or `backendUUID` are skipped; on a duplicate
-// (cluster, name) the lexically-smallest backendUUID wins (D6 determinism).
-// The only side effect is tallying missing-cluster samples into mc.
-func resolveTridentVolumeBackends(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
-	out := make(map[[2]string]string, len(vec))
-	for _, s := range vec {
-		cluster := mc.bucket(promql.QTridentVolumeInfo, string(s.Metric["cluster"]))
-		name := string(s.Metric["name"])
-		uuid := string(s.Metric["backendUUID"])
-		if name == "" || uuid == "" {
-			continue
-		}
-		key := [2]string{cluster, name}
-		if cur, ok := out[key]; ok && cur <= uuid {
-			continue
-		}
-		out[key] = uuid
-	}
-	return out
-}
-
-// resolveTridentBackendSVMs builds the (cluster, backendUUID) → svm index from
-// kube_tridentbackend_info, the NetApp Trident custom-resource series mapping
-// a backend UUID to the ONTAP SVM serving it — the final link of the PVC
-// volumename → backendUUID → svm label chain. OPTIONAL and not stock KSM (same
-// provenance as kube_tridentvolume_info): an absent or empty vector yields an
-// empty map and PVCs carry no svm label. Series with an empty `backendUUID` or
-// `svm` are skipped; on a duplicate (cluster, backendUUID) the
-// lexically-smallest svm wins (D6 determinism). The only side effect is
-// tallying missing-cluster samples into mc.
-func resolveTridentBackendSVMs(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
-	out := make(map[[2]string]string, len(vec))
-	for _, s := range vec {
-		cluster := mc.bucket(promql.QTridentBackendInfo, string(s.Metric["cluster"]))
-		uuid := string(s.Metric["backendUUID"])
-		svm := string(s.Metric["svm"])
-		if uuid == "" || svm == "" {
-			continue
-		}
-		key := [2]string{cluster, uuid}
-		if cur, ok := out[key]; ok && cur <= svm {
-			continue
-		}
-		out[key] = svm
-	}
-	return out
-}
-
-// storageClassKey identifies a StorageClass by its cluster-scoped name. The
-// name is cluster-scoped (StorageClass names are not globally unique).
-type storageClassKey struct{ cluster, name string }
-
-// resolveStorageClassInfo builds the (cluster, storageclass) → typed
-// provisioner/parameters index from kube_storageclass_info. The result
-// materialises real StorageClass nodes; it does not enrich any existing node.
-//
-// The `provisioner` parameter comes from the native KSM `provisioner` label.
-// The `parameters` object carries the operator-allowlisted NetApp/Ceph values,
-// each resolved "first non-empty source label wins" PER SERIES
-// (storagePools→pool, fsType→fsName, ClusterID, selector), then the
-// lexically-smallest non-empty value ACROSS series so the emitted node is a
-// pure function of the data (D6 determinism). The native reclaim_policy /
-// volume_binding_mode fields are out of scope and never read.
-//
-// OPTIONAL: an absent or empty vector yields an empty map (all referenced
-// StorageClass nodes are then materialised bare by the caller). The only side
-// effect is tallying missing-cluster samples into the caller's mc accumulator.
-func resolveStorageClassInfo(vec model.Vector, mc missingClusterCounts) map[storageClassKey]*graph.StorageClassInfo {
-	type acc struct {
-		provisioner, pool, fs, clusterID, selector string
-	}
-	pick := func(cur *string, val string) {
-		if val == "" {
-			return
-		}
-		if *cur == "" || val < *cur {
-			*cur = val
-		}
-	}
-	firstNonEmpty := func(primary, fallback string) string {
-		if primary != "" {
-			return primary
-		}
-		return fallback
-	}
-
-	raw := make(map[storageClassKey]*acc, len(vec))
-	for _, s := range vec {
-		name := string(s.Metric["storageclass"])
-		if name == "" {
-			continue
-		}
-		cluster := mc.bucket(promql.QStorageClassInfo, string(s.Metric["cluster"]))
-		key := storageClassKey{cluster, name}
-		a := raw[key]
-		if a == nil {
-			a = &acc{}
-			raw[key] = a
-		}
-		pick(&a.provisioner, string(s.Metric["provisioner"]))
-		pick(&a.pool, firstNonEmpty(string(s.Metric["storagePools"]), string(s.Metric["pool"])))
-		pick(&a.fs, firstNonEmpty(string(s.Metric["fsType"]), string(s.Metric["fsName"])))
-		pick(&a.clusterID, string(s.Metric["ClusterID"]))
-		pick(&a.selector, string(s.Metric["selector"]))
-	}
-
-	out := make(map[storageClassKey]*graph.StorageClassInfo, len(raw))
-	for key, a := range raw {
-		params := map[string]string{}
-		if a.pool != "" {
-			params["pool"] = a.pool
-		}
-		if a.fs != "" {
-			params["fs"] = a.fs
-		}
-		if a.clusterID != "" {
-			params["cluster_id"] = a.clusterID
-		}
-		if a.selector != "" {
-			params["selector"] = a.selector
-		}
-		info := &graph.StorageClassInfo{Provisioner: a.provisioner}
-		if len(params) > 0 {
-			info.Parameters = params
-		}
-		out[key] = info
 	}
 	return out
 }
@@ -1240,7 +1440,7 @@ func readyStatusFromLabel(status string) string {
 // from ReadyStatusUnknown (kubelet lost contact). The returned map is a
 // deterministic function of the input vector; the only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
-func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]string]string {
+func resolveNodeReadyStatus(vec model.Vector, mc *clusterResolver) map[[2]string]string {
 	// (cluster, node) → lexically-smallest active, recognised `status` label.
 	raw := make(map[[2]string]string, len(vec))
 	for _, s := range vec {
@@ -1260,7 +1460,7 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 		if readyStatusFromLabel(status) == "" {
 			continue
 		}
-		cluster := mc.bucket(promql.QNodeStatusCondition, string(s.Metric["cluster"]))
+		cluster := mc.bucket(promql.QNodeStatusCondition, s.Metric)
 		node := string(s.Metric["node"])
 		if node == "" {
 			continue
@@ -1277,40 +1477,6 @@ func resolveNodeReadyStatus(vec model.Vector, mc missingClusterCounts) map[[2]st
 		out[key] = readyStatusFromLabel(status)
 	}
 	return out
-}
-
-// bucketCluster returns "unknown" when the upstream cluster label is missing.
-func bucketCluster(c string) string {
-	if c == "" {
-		return "unknown"
-	}
-	return c
-}
-
-// missingClusterCounts tallies, per upstream metric, samples whose `cluster`
-// label is absent and were therefore bucketed into the "unknown" cluster.
-type missingClusterCounts map[promql.Query]int
-
-// bucket records a missing cluster label against metric and returns the
-// bucketed cluster name (see bucketCluster).
-func (m missingClusterCounts) bucket(metric promql.Query, c string) string {
-	if c == "" {
-		m[metric]++
-	}
-	return bucketCluster(c)
-}
-
-// warn emits one aggregated warning per affected metric — not one per sample,
-// so a whole cluster missing the label cannot flood the log — letting
-// operators spot which exporter feeds the "unknown" cluster. Sorted iteration
-// keeps the log order deterministic.
-func (m missingClusterCounts) warn() {
-	for _, q := range slices.Sorted(maps.Keys(m)) {
-		slog.Warn(`samples missing cluster label; bucketed into "unknown" cluster`,
-			"metric", string(q),
-			"samples", m[q],
-		)
-	}
 }
 
 // unflattenLabel inverts kube-state-metrics' `label_*` flattening.

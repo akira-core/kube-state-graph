@@ -152,6 +152,10 @@ type RouteSuite struct {
 }
 
 func TestRouteSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(RouteSuite))
 }
 
@@ -175,6 +179,7 @@ func (s *RouteSuite) SetupSuite() {
 	s.VMSuite.SetupSuite()
 	s.startClickHouse()
 	s.seedRouteStore()
+	s.seedTopology()
 }
 
 func (s *RouteSuite) TearDownSuite() {
@@ -531,9 +536,15 @@ func (s *RouteSuite) seedRouteStore() {
 // backing pod (the cross-cluster ingress fixture — a route hit anchored on
 // beta must resolve against beta's topology; beta's igw is deliberately
 // ABSENT from VM topology, so the beta hit doubles as the e2e
-// chain-degrade-to-direct-edge proof), all discriminated by test name.
-func (s *RouteSuite) SetupTest() {
-	disc := s.T().Name()
+// chain-degrade-to-direct-edge proof).
+//
+// Seeded once, not per test — see GraphSuite.SetupSuite: VM charges ~10s to
+// make a brand-new series queryable, so a per-test discriminator label made
+// every test re-register the whole set and wait again.
+func (s *RouteSuite) seedTopology() {
+	s.T().Helper()
+
+	const disc = "base"
 	t1 := fixedNow.Unix() * 1000
 	exposition := fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="checkout",uid="alpha-1",node="worker-0",test=%q} 1 %d
@@ -832,6 +843,10 @@ type RouteStoreSuite struct {
 }
 
 func TestRouteStoreSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(RouteStoreSuite))
 }
 

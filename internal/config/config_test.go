@@ -83,68 +83,6 @@ func TestSplitAndTrim(t *testing.T) {
 	assert.Equal(t, []string{"a", "b", "c"}, splitAndTrim(" a, b ,, c "))
 }
 
-func TestParse_MetricPrefix_DefaultEmpty(t *testing.T) {
-	cfg, err := Parse(nil, func(string) (string, bool) { return "", false })
-	require.NoError(t, err)
-	assert.Empty(t, cfg.MetricPrefix, "metric-prefix default should be empty")
-}
-
-func TestParse_MetricPrefix_EnvAndFlag(t *testing.T) {
-	t.Run("env wins over default", func(t *testing.T) {
-		cfg, err := Parse(nil, func(k string) (string, bool) {
-			if k == "KSG_METRIC_PREFIX" {
-				return "o11y_", true
-			}
-			return "", false
-		})
-		require.NoError(t, err)
-		assert.Equal(t, "o11y_", cfg.MetricPrefix)
-	})
-	t.Run("flag wins over env", func(t *testing.T) {
-		cfg, err := Parse(
-			[]string{"--metric-prefix=beta_"},
-			func(k string) (string, bool) {
-				if k == "KSG_METRIC_PREFIX" {
-					return "acme_", true
-				}
-				return "", false
-			},
-		)
-		require.NoError(t, err)
-		assert.Equal(t, "beta_", cfg.MetricPrefix)
-	})
-}
-
-func TestValidate_MetricPrefix(t *testing.T) {
-	cases := map[string]struct {
-		prefix  string
-		wantErr bool
-	}{
-		"empty":             {prefix: "", wantErr: false},
-		"underscore suffix": {prefix: "o11y_", wantErr: false},
-		"colon allowed":     {prefix: "acme:tenant_", wantErr: false},
-		"alpha only":        {prefix: "acme", wantErr: false},
-		"hyphen rejected":   {prefix: "o11y-bad!", wantErr: true},
-		"leading digit":     {prefix: "1starts_with_digit", wantErr: true},
-		"trailing space":    {prefix: "o11y_ ", wantErr: true},
-		"embedded space":    {prefix: "o 11y_", wantErr: true},
-		"unicode rejected":  {prefix: "o11y✓_", wantErr: true},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			cfg := Defaults()
-			cfg.MetricPrefix = tc.prefix
-			err := cfg.Validate()
-			if tc.wantErr {
-				require.Error(t, err, "expected error for prefix %q", tc.prefix)
-				assert.Contains(t, err.Error(), "metric-prefix", "error should mention metric-prefix")
-			} else {
-				require.NoError(t, err, "did not expect error for prefix %q", tc.prefix)
-			}
-		})
-	}
-}
-
 // Upstream basic-auth credentials are env-only (D-A1) and must be configured
 // as a pair (D-A2); validation errors must never echo the configured values
 // (D-A5).
@@ -255,4 +193,100 @@ func TestParse_RouteStoreAuth_NoFlagsRegistered(t *testing.T) {
 			require.Error(t, err, "credential flags must not exist")
 		})
 	}
+}
+
+// The az / env label keys default to the built-in binding, are overridable by
+// env and then by flag, and are validated as PromQL label names at startup —
+// an invalid key would otherwise break every topology query at request time.
+func TestParse_LabelKeys(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+
+	cfg, err := Parse(nil, noEnv)
+	require.NoError(t, err)
+	assert.Equal(t, "az", cfg.AZLabel)
+	assert.Equal(t, "env", cfg.EnvLabel)
+
+	env := map[string]string{"KSG_AZ_LABEL": "topology_zone", "KSG_ENV_LABEL": "deployment_tier"}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	cfg, err = Parse(nil, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "topology_zone", cfg.AZLabel)
+	assert.Equal(t, "deployment_tier", cfg.EnvLabel)
+
+	cfg, err = Parse([]string{"--az-label=zone"}, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "zone", cfg.AZLabel, "flag overrides env")
+	assert.Equal(t, "deployment_tier", cfg.EnvLabel)
+}
+
+func TestParse_LabelKeysRejected(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"dotted az key", []string{"--az-label=topology.kubernetes.io/zone"}, "KSG_AZ_LABEL"},
+		{"empty env key", []string{"--env-label="}, "KSG_ENV_LABEL"},
+		{"identical keys", []string{"--az-label=scope", "--env-label=scope"}, "must differ"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.args, noEnv)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// --- backend routing configuration ---------------------------------------
+
+func TestParse_BackendsDefaults(t *testing.T) {
+	cfg := Defaults()
+	assert.Empty(t, cfg.BackendsFile, "no routing file by default — the implicit single backend serves")
+	assert.Equal(t, 30*time.Second, cfg.BackendsReloadInterval,
+		"the routing table reloads on the same cadence as the API-key file")
+	require.NoError(t, cfg.Validate())
+}
+
+func TestParse_BackendsFlagOverridesEnv(t *testing.T) {
+	env := map[string]string{
+		"KSG_BACKENDS_FILE":            "/from/env.yaml",
+		"KSG_BACKENDS_RELOAD_INTERVAL": "45s",
+	}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+
+	// Env alone.
+	cfg, err := Parse(nil, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "/from/env.yaml", cfg.BackendsFile)
+	assert.Equal(t, 45*time.Second, cfg.BackendsReloadInterval)
+
+	// Flags win.
+	cfg, err = Parse([]string{"--backends-file=/from/flag.yaml", "--backends-reload-interval=10s"}, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "/from/flag.yaml", cfg.BackendsFile)
+	assert.Equal(t, 10*time.Second, cfg.BackendsReloadInterval)
+}
+
+func TestParse_RejectsInvalidBackendsReloadIntervalEnv(t *testing.T) {
+	_, err := Parse(nil, func(k string) (string, bool) {
+		if k == "KSG_BACKENDS_RELOAD_INTERVAL" {
+			return "45", true // missing unit
+		}
+		return "", false
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "KSG_BACKENDS_RELOAD_INTERVAL")
+}
+
+// Zero stays the documented disable sentinel; a negative value is rejected
+// rather than silently disabling reloads.
+func TestValidate_RejectsNegativeBackendsReloadInterval(t *testing.T) {
+	cfg := Defaults()
+	cfg.BackendsReloadInterval = -time.Second
+	require.Error(t, cfg.Validate())
+
+	cfg.BackendsReloadInterval = 0
+	assert.NoError(t, cfg.Validate())
 }

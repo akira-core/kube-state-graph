@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/akira-core/kube-state-graph/internal/config"
-	"github.com/akira-core/kube-state-graph/pkg/clock"
 	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
@@ -29,18 +28,31 @@ type GraphSuite struct {
 }
 
 func TestGraphSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(GraphSuite))
 }
 
-// SetupTest seeds the standard multi-cluster fixture set before each test
-// using the per-test name as a discriminator label.
+// SetupSuite seeds the standard multi-cluster fixture set ONCE.
+//
+// It is deliberately not SetupTest. VictoriaMetrics makes a brand-new series
+// queryable only after ~10s (measured: an existing series takes ~17ms for a new
+// sample), and stamping the per-test name into a `test` label made every test
+// re-register the whole fixture and pay that latency again — ~10s x 32 tests of
+// pure waiting. The discriminator bought nothing: the API's queries carry no
+// `test` matcher, so every test always saw every other test's series anyway; it
+// was only ever the WaitForSeries probe key.
 //
 // Service-graph series are ingested as TWO monotonic counter samples (t0 and
 // t1 = t0 + 60s) so that `rate(traces_service_graph_request_total[w])` over
 // the test window can recover a non-zero per-second rate. Without two samples
 // the rate() result is empty and every pod-call edge silently disappears.
-func (s *GraphSuite) SetupTest() {
-	disc := s.T().Name()
+func (s *GraphSuite) SetupSuite() {
+	s.VMSuite.SetupSuite()
+
+	const disc = "base"
 	t1 := fixedNow.Unix() * 1000 // ms timestamps for /api/v1/import/prometheus
 	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
 	const counterStep = 60.0 // seconds between t0 and t1 (matches rate denominator)
@@ -200,15 +212,13 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 	s.Require().True(s.WaitForSeries(`kube_node_status_condition{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_node_status_condition")
 
-	// These probe nodes host no pod, so the default view hides them (generalised
-	// D6: a no-filter response only carries nodes referenced by an in-scope pod).
-	// `ready_status` still surfaces — fetch each node directly via ?name= (the
-	// name-filter exception admits a podless infra node by name).
+	// These probe nodes host no pod, so the default view hides them (a no-filter
+	// response only carries nodes referenced by an in-scope pod). `ready_status`
+	// still surfaces — `prune=false` is the escape hatch that admits an
+	// unreferenced infra node (the withdrawn ?name= exception's replacement).
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
-		q.Add("name", "ready-probe-ready")
-		q.Add("name", "ready-probe-unknown")
-		q.Add("name", "ready-probe-nocond")
+		q.Set("prune", "false")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
@@ -248,32 +258,6 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 		"node with no Ready series is still present")
 	s.Empty(status["cluster-alpha/ready-probe-nocond"],
 		"no Ready series → ready_status omitted, DISTINCT from Unknown")
-}
-
-func (s *GraphSuite) TestNameFilter_PodAnchor() {
-	srv := s.StartAPIServer(func(cfg *config.Config) {})
-	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("name", "checkout") }))
-	defer func() { _ = resp.Body.Close() }()
-	s.Require().Equal(http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	s.Contains(bodyStr, `"id":"cluster-alpha/alpha-1"`, "checkout pod present")
-	// Cross-cluster partner pod IS re-added by the unified edge-endpoint
-	// rule on pod-calls-pod, so the cross-cluster edge can render with
-	// both endpoints visible.
-	s.Contains(bodyStr, `"id":"cluster-beta/beta-1"`,
-		"cross-cluster partner pod re-added as edge endpoint of named anchor")
-}
-
-func (s *GraphSuite) TestNameFilter_UnknownReturnsEmpty() {
-	srv := s.StartAPIServer(func(cfg *config.Config) {})
-	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("name", "does-not-exist") }))
-	defer func() { _ = resp.Body.Close() }()
-	s.Require().Equal(http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	s.Contains(bodyStr, `"nodes":[]`)
-	s.Contains(bodyStr, `"edges":[]`)
 }
 
 // TestPodOwnerAttributeSkipReplicaSet — D34. Ingest kube_pod_owner for the
@@ -338,10 +322,13 @@ kube_replicaset_owner{cluster="cluster-alpha",namespace="shop",replicaset="check
 }
 
 // TestPodApplicationAndContainersAttributes — ingest kube_pod_container_info
-// (two containers) and a kube_pod_owner carrying an argocd_tracking_id for a
-// dedicated pod; assert /v1/graph sets the pod node's typed data.application
-// (segment before the first ":") and ordered data.containers, neither leaking
-// into labels, while a sibling pod with no such series omits both. The pods
+// (two containers), a kube_pod_owner naming a DaemonSet, and a
+// kube_daemonset_annotations series carrying that DaemonSet's
+// annotation_argocd_argoproj_io_tracking_id; assert /v1/graph sets the pod
+// node's typed data.application (segment before the first ":") and ordered
+// data.containers, neither leaking into labels, while a sibling pod with no such
+// series omits both. The Application is joined from the CONTROLLER — ArgoCD
+// annotates the managed workload object, never the pods it spawns. The pods
 // live in a dedicated namespace ("appcat") so the owner/container series cannot
 // collide with the shared `checkout`/`cart` fixtures other tests assert on.
 //
@@ -363,12 +350,13 @@ func (s *GraphSuite) TestPodApplicationAndContainersAttributes() {
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",uid="alpha-app-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-bare",uid="alpha-app-2",node="worker-0",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",argocd_tracking_id="storefront:apps/Deployment:appcat/ksg",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",owner_kind="DaemonSet",owner_name="ksg-ds",owner_is_controller="true",test=%q} 1 %d
+kube_daemonset_annotations{cluster="cluster-alpha",namespace="appcat",daemonset="ksg-ds",annotation_argocd_argoproj_io_tracking_id="storefront:apps/DaemonSet:appcat/ksg-ds",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="app",image="reg/ksg:1.4",test=%q} 1 %d
 kube_pod_container_info{cluster="cluster-alpha",namespace="appcat",pod="ksg-enriched",container="istio-proxy",image="reg/proxy:0.9",test=%q} 1 %d
 traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 0 %d
 traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",cluster="cluster-alpha",client_k8s_pod_uid="alpha-app-1",server_k8s_pod_uid="alpha-app-2",client_k8s_namespace_name="appcat",server_k8s_namespace_name="appcat",connection_type="virtual_node",test=%q} 60 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_container_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_container_info")
 	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="ksg-enriched",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
@@ -416,12 +404,12 @@ traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",clust
 		{Name: "istio-proxy", Image: "reg/proxy:0.9"},
 	}, enriched.Containers, "data.containers ordered by (name, image)")
 	_, appInLabels := enriched.Labels["application"]
-	_, trackInLabels := enriched.Labels["argocd_tracking_id"]
+	_, trackInLabels := enriched.Labels["annotation_argocd_argoproj_io_tracking_id"]
 	s.False(appInLabels || trackInLabels, "application must NOT appear inside labels")
 
 	bare, ok := podByName("ksg-bare")
 	s.Require().True(ok, "bare pod node must be present")
-	s.Empty(bare.Application, "pod with no argocd label omits data.application")
+	s.Empty(bare.Application, "pod with no controller annotation omits data.application")
 	s.Nil(bare.Containers, "pod with no container series omits data.containers")
 }
 
@@ -499,7 +487,9 @@ traces_service_graph_request_total{client="argo-pod",server="https://argo-svc.ar
 // it (via the pod-mounts-pvc binding), surfacing data.application and nesting
 // under the inherited application group — indistinguishable from an
 // annotation-sourced value. A PVC carrying its OWN annotation keeps it (own
-// wins over inheritance). Objects live in a dedicated namespace ("argoinh") so
+// wins over inheritance). Each mounting pod's own Application comes from its
+// Deployment's annotation, so this also exercises the controller join feeding
+// the inheritance pass. Objects live in a dedicated namespace ("argoinh") so
 // they cannot collide with the shared fixtures.
 func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
 	disc := s.T().Name()
@@ -511,14 +501,16 @@ func (s *GraphSuite) TestPVCInheritsApplicationFromMountingPod() {
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",uid="inh-1",node="worker-0",test=%q} 1 %d
 kube_pod_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",uid="own-1",node="worker-0",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",owner_kind="Deployment",owner_name="inh",owner_is_controller="true",argocd_tracking_id="checkout:apps/Deployment:argoinh/checkout",test=%q} 1 %d
-kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_kind="Deployment",owner_name="own",owner_is_controller="true",argocd_tracking_id="web:apps/Deployment:argoinh/web",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",owner_kind="Deployment",owner_name="inh",owner_is_controller="true",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",owner_kind="Deployment",owner_name="own",owner_is_controller="true",test=%q} 1 %d
+kube_deployment_annotations{cluster="cluster-alpha",namespace="argoinh",deployment="inh",annotation_argocd_argoproj_io_tracking_id="checkout:apps/Deployment:argoinh/inh",test=%q} 1 %d
+kube_deployment_annotations{cluster="cluster-alpha",namespace="argoinh",deployment="own",annotation_argocd_argoproj_io_tracking_id="web:apps/Deployment:argoinh/own",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="inh-pod",claim_name="inh-data",test=%q} 1 %d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="argoinh",pod="own-pod",claim_name="own-data",test=%q} 1 %d
 kube_persistentvolumeclaim_annotations{cluster="cluster-alpha",namespace="argoinh",persistentvolumeclaim="own-data",annotation_argocd_argoproj_io_tracking_id="mongo:apps/StatefulSet:argoinh/mongo",test=%q} 1 %d
 traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 0 %d
 traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cluster-alpha",client_k8s_pod_uid="inh-1",server_k8s_pod_uid="own-1",client_k8s_namespace_name="argoinh",server_k8s_namespace_name="argoinh",connection_type="virtual_node",test=%q} 60 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
 	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe ingested kube_pod_spec_volumes_persistentvolumeclaims_info")
 	s.Require().True(s.WaitForSeries(`kube_pod_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
@@ -553,6 +545,67 @@ traces_service_graph_request_total{client="inh-pod",server="own-pod",cluster="cl
 	s.Equal("mongo", own.Application, "PVC's own annotation wins over inheritance")
 	s.Equal("cluster-alpha/namespace/argoinh/application/mongo", own.Parent,
 		"own-annotation PVC nests under its own application group")
+}
+
+// TestPodApplicationFromCronJobHop — a CronJob-created Job carries no ArgoCD
+// tracking-id of its own (the Kubernetes CronJob controller copies only
+// spec.jobTemplate.metadata annotations onto the Jobs it creates, never the
+// CronJob object's own annotations), so the pod's Application resolves one level
+// up through kube_job_owner to kube_cronjob_annotations. The hop is
+// resolution-only: data.owner must STILL name the Job, and the pod must nest
+// under its Job controller group inside the CronJob's application group. Objects
+// live in a dedicated namespace ("argocj") so they cannot collide with the
+// shared fixtures.
+func (s *GraphSuite) TestPodApplicationFromCronJobHop() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
+	// The two pods are wired by a pod-calls-pod edge so both survive the default
+	// connectivity prune; peer-pod carries no owner at all, so it must report no
+	// application even though the CronJob annotation is in the same namespace.
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="argocj",pod="nightly-28901-abc",uid="cj-1",node="worker-0",test=%q} 1 %d
+kube_pod_info{cluster="cluster-alpha",namespace="argocj",pod="peer-pod",uid="cj-2",node="worker-0",test=%q} 1 %d
+kube_pod_owner{cluster="cluster-alpha",namespace="argocj",pod="nightly-28901-abc",owner_kind="Job",owner_name="nightly-28901",owner_is_controller="true",test=%q} 1 %d
+kube_job_owner{cluster="cluster-alpha",namespace="argocj",job_name="nightly-28901",owner_kind="CronJob",owner_name="nightly",owner_is_controller="true",test=%q} 1 %d
+kube_cronjob_annotations{cluster="cluster-alpha",namespace="argocj",cronjob="nightly",annotation_argocd_argoproj_io_tracking_id="reports:batch/CronJob:argocj/nightly",test=%q} 1 %d
+traces_service_graph_request_total{client="nightly-28901-abc",server="peer-pod",cluster="cluster-alpha",client_k8s_pod_uid="cj-1",server_k8s_pod_uid="cj-2",client_k8s_namespace_name="argocj",server_k8s_namespace_name="argocj",connection_type="virtual_node",test=%q} 0 %d
+traces_service_graph_request_total{client="nightly-28901-abc",server="peer-pod",cluster="cluster-alpha",client_k8s_pod_uid="cj-1",server_k8s_pod_uid="cj-2",client_k8s_namespace_name="argocj",server_k8s_namespace_name="argocj",connection_type="virtual_node",test=%q} 60 %d
+`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t0, disc, t1))
+	s.Require().True(s.WaitForSeries(`kube_cronjob_annotations{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_cronjob_annotations")
+	s.Require().True(s.WaitForSeries(`kube_job_owner{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_job_owner")
+	s.Require().True(s.WaitForSeries(`rate(traces_service_graph_request_total{client="nightly-28901-abc",test=`+strconv.Quote(disc)+`}[5m]) > 0`, fixedNow, 30*time.Second),
+		"VM did not observe non-zero nightly→peer service-graph rate")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+	}
+
+	pod, ok := byID["cluster-alpha/cj-1"]
+	s.Require().True(ok, "CronJob-managed pod node must be present")
+	s.Equal("reports", pod.Application, "Application resolves through the Job → CronJob hop")
+	s.Require().NotNil(pod.Owner, "the pod keeps its controller owner")
+	s.Equal("Job", pod.Owner.Kind, "the hop must NOT rewrite the owner kind to CronJob")
+	s.Equal("nightly-28901", pod.Owner.Name, "the hop must NOT rewrite the owner name")
+	s.Equal("cluster-alpha/namespace/argocj/application/reports/controller/Job/nightly-28901", pod.Parent,
+		"the pod nests under its Job controller group inside the CronJob's application group")
+	_, appInLabels := pod.Labels["application"]
+	_, trackInLabels := pod.Labels["annotation_argocd_argoproj_io_tracking_id"]
+	s.False(appInLabels || trackInLabels, "application must NOT appear inside labels")
+
+	peer, ok := byID["cluster-alpha/cj-2"]
+	s.Require().True(ok, "peer pod node must be present")
+	s.Empty(peer.Application, "a pod with no controller owner resolves no Application")
 }
 
 func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {
@@ -1195,16 +1248,21 @@ traces_service_graph_request_total{client="xfam-client",server="unknown",cluster
 	s.NotContains(bodyStr, `external/10.244.9.9`, "the Pod IP literal must not leak as an external node")
 }
 
-func (s *GraphSuite) TestClustersDiscovery() {
-	// Discovery handler evaluates "now" via the injected Clock. Pin it to
-	// fixedNow so the 1h discovery lookback covers the statically-timestamped
-	// fixtures.
-	srv := s.StartAPIServer(nil, WithClock(clock.Fake{T: fixedNow}))
+// /v1/clusters is removed (BREAKING): the cluster list lives in the graph
+// body instead, derived from the built graph's node labels and sorted.
+func (s *GraphSuite) TestClustersEndpointRemoved() {
+	srv := s.StartAPIServer(nil)
 	resp := s.httpGet(srv.URL + "/v1/clusters")
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	s.Contains(string(body), "cluster-alpha")
-	s.Contains(string(body), "cluster-beta")
+	s.Equal(http.StatusNotFound, resp.StatusCode)
+
+	graphResp := s.httpGet(s.graphURL(srv.URL, nil))
+	defer func() { _ = graphResp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, graphResp.StatusCode)
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(graphResp.Body).Decode(&body))
+	s.Contains(body.Clusters, "cluster-alpha")
+	s.Contains(body.Clusters, "cluster-beta")
 }
 
 func (s *GraphSuite) TestEdgeTypesCatalogue() {
@@ -1283,27 +1341,21 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 	s.True(found, "pod-mounts-pvc edge checkout→checkout-data must be present")
 }
 
-// TestPVCStorageClassNodeAndEdge — ingest a PVC binding, its matching
-// kube_persistentvolumeclaim_info storageclass, and a kube_storageclass_info
-// series (provisioner + NetApp/Ceph parameter labels) against a real
-// VictoriaMetrics, then assert the response carries a REAL type="storageclass"
-// node (with typed provisioner/parameters, labels {cluster}, nested under its
-// cluster group), the PVC nests under its NAMESPACE group, and a
-// pvc-to-storageclass edge links them. End-to-end coverage of the new
-// StorageClass design (supersedes the old cluster > storageclass > pvc grouping).
-func (s *GraphSuite) TestPVCStorageClassNodeAndEdge() {
+// TestPVCStorageClassAttribute — ingest a PVC binding and its matching
+// kube_persistentvolumeclaim_info storageclass; the StorageClass name
+// surfaces as the PVC's own data.storageclass. No storageclass node or
+// pvc-to-storageclass edge exists.
+func (s *GraphSuite) TestPVCStorageClassAttribute() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="mongo-data",volume="data",test=%q} 1 %d
 # HELP kube_persistentvolumeclaim_info dummy
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="mongo-data",storageclass="gp3-ssd",test=%q} 1 %d
-# HELP kube_storageclass_info dummy
-kube_storageclass_info{cluster="cluster-alpha",storageclass="gp3-ssd",provisioner="ebs.csi.aws.com",storagePools="aggr1",fsType="ext4",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1))
+`, disc, t1, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`kube_storageclass_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
-		"VM did not observe ingested kube_storageclass_info")
+		s.WaitForSeries(`kube_persistentvolumeclaim_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_persistentvolumeclaim_info")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -1316,34 +1368,15 @@ kube_storageclass_info{cluster="cluster-alpha",storageclass="gp3-ssd",provisione
 	byID := map[string]cytoscape.NodeData{}
 	for _, n := range body.Elements.Nodes {
 		byID[n.Data.ID] = n.Data
+		s.NotEqual("storageclass", n.Data.Type, "storageclass node type is removed")
 	}
-
-	sc, ok := byID["cluster-alpha/storageclass/gp3-ssd"]
-	s.Require().True(ok, "real storageclass node must be present")
-	s.Equal("storageclass", sc.Type)
-	s.Equal("gp3-ssd", sc.Name)
-	s.Equal("cluster/cluster-alpha", sc.Parent, "storageclass node nests under its cluster group")
-	s.Equal(map[string]string{"cluster": "cluster-alpha"}, sc.Labels, "labels stay {cluster}")
-	s.Equal("ebs.csi.aws.com", sc.Provisioner)
-	s.Equal("aggr1", sc.Parameters["pool"])
-	s.Equal("ext4", sc.Parameters["fs"])
 
 	pvc, ok := byID["cluster-alpha/shop/mongo-data"]
 	s.Require().True(ok, "pvc node must be present")
-	s.Equal("cluster-alpha/namespace/shop", pvc.Parent,
-		"pvc nests under its namespace group (pvc→storageclass is an edge now)")
+	s.Equal("gp3-ssd", pvc.StorageClass)
+	s.Equal("cluster-alpha/namespace/shop", pvc.Parent)
 	_, hasLabel := pvc.Labels["storageclass"]
 	s.False(hasLabel, "storageclass must not leak into pvc labels")
-
-	var found bool
-	for _, e := range body.Elements.Edges {
-		if e.Data.Type == "pvc-to-storageclass" &&
-			e.Data.Source == "cluster-alpha/shop/mongo-data" &&
-			e.Data.Target == "cluster-alpha/storageclass/gp3-ssd" {
-			found = true
-		}
-	}
-	s.True(found, "expected a pvc-to-storageclass edge from the PVC to the StorageClass node")
 }
 
 // TestPVCWithoutStorageClassNestsUnderNamespace — a PVC binding with NO matching
@@ -1378,42 +1411,56 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 	s.Require().NotNil(pvc, "pvc node must be present")
 	s.Equal("cluster-alpha/namespace/shop", pvc.Parent,
 		"a PVC with no resolved StorageClass nests under its namespace group")
-	// This class-less PVC emits no pvc-to-storageclass edge of its own (other
-	// PVCs in the shared suite topology may have StorageClasses, so the check is
-	// scoped to this PVC's id).
+	s.Empty(pvc.StorageClass)
 	for _, e := range body.Elements.Edges {
 		if e.Data.Source == "cluster-alpha/shop/legacy-data" {
-			s.NotEqual("pvc-to-storageclass", e.Data.Type, "no pvc-to-storageclass edge for a class-less PVC")
+			s.NotEqual("pvc-to-netapp-aggr", e.Data.Type, "no pvc-to-netapp-aggr edge for a class-less PVC")
 		}
 	}
 }
 
-// TestPVCNetAppTridentLabels — ingest a PVC binding, its
-// kube_persistentvolumeclaim_info series carrying `volumename` (the bound PV
-// name), and the two NetApp Trident custom-resource series
-// (kube_tridentvolume_info: name → backendUUID; kube_tridentbackend_info:
-// backendUUID → svm) against a real VictoriaMetrics, then assert the PVC node
-// carries BOTH additive labels (`volumename`, `svm`) while a second PVC whose
-// PV has no Trident rows carries `volumename` only — the svm key absent, never
-// empty. End-to-end coverage of the Trident label chain including graceful
-// partial-chain degradation.
-func (s *GraphSuite) TestPVCNetAppTridentLabels() {
+// TestPVCNetAppHarvestJoin — ingest a PVC binding, kube_persistentvolumeclaim_info
+// with volumename, Harvest volume/aggr/node series, and kubelet usage against
+// VictoriaMetrics; assert svm, pvc-to-netapp-aggr, health, usage, and nesting.
+func (s *GraphSuite) TestPVCNetAppHarvestJoin() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
-kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="trident-data",volume="data",test=%q} 1 %d
-kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="plain-nas-data",volume="scratch",test=%q} 1 %d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="netapp-data",volume="data",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="qosless-data",volume="archive",test=%[1]q} 1 %[2]d
 # HELP kube_persistentvolumeclaim_info dummy
-kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="trident-data",storageclass="netapp-nas",volumename="pvc-9f3a-trident",test=%q} 1 %d
-kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="plain-nas-data",storageclass="netapp-nas",volumename="pvc-0000-plain",test=%q} 1 %d
-# HELP kube_tridentvolume_info dummy
-kube_tridentvolume_info{cluster="cluster-alpha",name="pvc-9f3a-trident",backendUUID="be-1234",test=%q} 1 %d
-# HELP kube_tridentbackend_info dummy
-kube_tridentbackend_info{cluster="cluster-alpha",backendUUID="be-1234",svm="svm-prod",test=%q} 1 %d
-`, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1, disc, t1))
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="qosless-data",storageclass="netapp-nas",volumename="pvc-noqos",test=%[1]q} 1 %[2]d
+# HELP volume_labels dummy
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-noqos",test=%[1]q} 1 %[2]d
+# HELP qos_read_ops dummy
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 150 %[2]d
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",lun="/vol/pvc_9f3a/lun0",test=%[1]q} 90 %[2]d
+# HELP qos_read_data dummy
+qos_read_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 5242880 %[2]d
+# HELP qos_write_data dummy
+qos_write_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 1000000 %[2]d
+# HELP qos_policy_fixed_max_throughput_iops dummy
+qos_policy_fixed_max_throughput_iops{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 5000 %[2]d
+# HELP qos_policy_fixed_max_throughput_mbps dummy
+qos_policy_fixed_max_throughput_mbps{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 250 %[2]d
+# HELP aggr_new_status dummy
+aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1 %[2]d
+# HELP aggr_space_used dummy
+aggr_space_used{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 700 %[2]d
+# HELP aggr_space_total dummy
+aggr_space_total{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1000 %[2]d
+# HELP node_new_status dummy
+node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 1 %[2]d
+# HELP kubelet_volume_stats_used_bytes dummy
+kubelet_volume_stats_used_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%[1]q} 50 %[2]d
+# HELP kubelet_volume_stats_capacity_bytes dummy
+kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%[1]q} 100 %[2]d
+`, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`kube_tridentbackend_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
-		"VM did not observe ingested kube_tridentbackend_info")
+		s.WaitForSeries(`volume_labels{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested volume_labels")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, nil))
@@ -1428,67 +1475,98 @@ kube_tridentbackend_info{cluster="cluster-alpha",backendUUID="be-1234",svm="svm-
 		byID[n.Data.ID] = n.Data
 	}
 
-	trident, ok := byID["cluster-alpha/shop/trident-data"]
-	s.Require().True(ok, "trident-backed pvc node must be present")
-	s.Equal("pvc-9f3a-trident", trident.Labels["volumename"], "bound PV name surfaces as labels.volumename")
-	s.Equal("svm-prod", trident.Labels["svm"], "Trident chain resolves labels.svm")
-	s.Equal("data", trident.Labels["volume"], "pod-spec volume key coexists with volumename")
+	pvc, ok := byID["cluster-alpha/shop/netapp-data"]
+	s.Require().True(ok, "pvc node must be present")
+	s.Equal("pvc-9f3a", pvc.Labels["volumename"])
+	s.Equal("svm-prod", pvc.Labels["svm"])
+	s.Equal("netapp-nas", pvc.StorageClass)
+	s.Require().NotNil(pvc.Usage)
+	s.InDelta(50.0, *pvc.Usage.UsedBytes, 1e-9)
 
-	plain, ok := byID["cluster-alpha/shop/plain-nas-data"]
-	s.Require().True(ok, "plain pvc node must be present")
-	s.Equal("pvc-0000-plain", plain.Labels["volumename"], "volumename resolves without Trident rows")
-	_, hasSVM := plain.Labels["svm"]
-	s.False(hasSVM, "a PV with no Trident rows must omit the svm key entirely")
+	// The QoS-less claim keeps its whole storage topology — svm included.
+	// Only its measurements are missing (design.md D3: the hops degrade
+	// independently).
+	qosless, ok := byID["cluster-alpha/shop/qosless-data"]
+	s.Require().True(ok, "qos-less pvc node must be present")
+	s.Equal("pvc-noqos", qosless.Labels["volumename"])
+	s.Equal("svm-prod", qosless.Labels["svm"])
+
+	aggr, ok := byID["netapp/ontap-prod/aggr/aggr1"]
+	s.Require().True(ok, "netapp-aggr node must be present")
+	s.Equal("online", aggr.Health)
+	s.Equal("netapp/ontap-prod/ontap-prod-01", aggr.Parent)
+	ctrl, ok := byID["netapp/ontap-prod/ontap-prod-01"]
+	s.Require().True(ok, "netapp-node must be present")
+	s.Equal("storage-cluster/ontap-prod", ctrl.Parent)
+	s.Equal("online", ctrl.Health)
+	for _, c := range body.Clusters {
+		s.NotEqual("ontap-prod", c)
+	}
+
+	var found, foundQoSless bool
+	for _, e := range body.Elements.Edges {
+		if e.Data.Type != "pvc-to-netapp-aggr" || e.Data.Target != "netapp/ontap-prod/aggr/aggr1" {
+			continue
+		}
+		switch e.Data.Source {
+		case "cluster-alpha/shop/netapp-data":
+			found = true
+			s.Require().NotNil(e.Data.Metrics)
+			s.Require().NotNil(e.Data.Metrics.ReadOps)
+			// 150, NOT 240: the LUN-level workload carries the same
+			// relabelled volume_name and is excluded upstream by lun="".
+			s.InDelta(150.0, *e.Data.Metrics.ReadOps, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.ReadBytesPerSec)
+			s.InDelta(5242880.0, *e.Data.Metrics.ReadBytesPerSec, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.WriteBytesPerSec)
+			s.InDelta(1000000.0, *e.Data.Metrics.WriteBytesPerSec, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.MaxIOPS)
+			s.InDelta(5000.0, *e.Data.Metrics.MaxIOPS, 1e-9)
+			s.Require().NotNil(e.Data.Metrics.MaxBytesPerSec)
+			s.InDelta(262144000.0, *e.Data.Metrics.MaxBytesPerSec, 1e-9)
+			s.Nil(e.Data.Metrics.Rate)
+		case "cluster-alpha/shop/qosless-data":
+			foundQoSless = true
+			s.Nil(e.Data.Metrics, "no QoS workload ⇒ no metrics key, ceiling included")
+		}
+	}
+	s.True(found, "expected a pvc-to-netapp-aggr edge")
+	s.True(foundQoSless, "expected the qos-less claim to keep its aggregate edge")
 }
 
-// TestMetricPrefix_ResolvesPrefixedSeries covers design.md D26 end-to-end
-// against a real VictoriaMetrics container: ingest a topology under an
-// `o11y_`-prefixed metric-name family, start the API with
-// `cfg.MetricPrefix="o11y_"`, and assert the resulting graph contains the
-// pod node. Without the prefix knob the build would issue queries for stock
-// `kube_pod_info` / `kube_node_info` which the fixture deliberately does NOT
-// publish, so an empty graph would result.
-func (s *GraphSuite) TestMetricPrefix_ResolvesPrefixedSeries() {
+// TestPVCNetAppHarvestAbsent — a PVC with volumename but no Harvest series
+// degrades gracefully: volumename stays, no svm, no netapp nodes, no miss
+// warning (absence of Harvest is not a coverage failure).
+func (s *GraphSuite) TestPVCNetAppHarvestAbsent() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
-	t0 := fixedNow.Add(-time.Minute).Unix() * 1000
-
-	// The service-graph metric is never metric-prefixed (D26), so this
-	// (unprefixed) edge keeps prefixed-pod connectivity-connected — without it
-	// the default prune would drop the only pod and the assertion would see an
-	// empty graph. server="ext" (no UID, non-"://") resolves to an external node.
-	exposition := fmt.Sprintf(`# HELP o11y_kube_pod_info dummy
-o11y_kube_pod_info{cluster="cluster-prefix",namespace="ops",pod="prefixed-pod",uid="prefix-uid-1",node="worker-x",test=%q} 1 %d
-o11y_kube_node_info{cluster="cluster-prefix",node="worker-x",test=%q} 1 %d
-traces_service_graph_request_total{cluster="cluster-prefix",client="prefixed-pod",server="ext",client_k8s_pod_uid="prefix-uid-1",server_k8s_pod_uid="",test=%q} 0 %d
-traces_service_graph_request_total{cluster="cluster-prefix",client="prefixed-pod",server="ext",client_k8s_pod_uid="prefix-uid-1",server_k8s_pod_uid="",test=%q} 60 %d
-`,
-		disc, t1,
-		disc, t1,
-		disc, t0,
-		disc, t1,
-	)
-	s.IngestExpFmt(exposition)
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="plain-nas-data",volume="scratch",test=%q} 1 %d
+# HELP kube_persistentvolumeclaim_info dummy
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="plain-nas-data",storageclass="netapp-nas",volumename="pvc-0000-plain",test=%q} 1 %d
+`, disc, t1, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`o11y_kube_pod_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
-		"VM did not observe ingested o11y_kube_pod_info",
-	)
-	s.Require().True(
-		s.WaitForSeries(`rate(traces_service_graph_request_total{cluster="cluster-prefix"}[5m]) > 0`, fixedNow, 30*time.Second),
-		"VM did not observe non-zero prefixed-pod service-graph rate",
-	)
+		s.WaitForSeries(`kube_persistentvolumeclaim_info{test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe ingested kube_persistentvolumeclaim_info")
 
-	srv := s.StartAPIServer(func(cfg *config.Config) {
-		cfg.MetricPrefix = "o11y_"
-	})
-	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("cluster", "cluster-prefix") }))
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	resp := s.httpGet(s.graphURL(srv.URL, nil))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	s.Contains(bodyStr, `"id":"cluster-prefix/prefix-uid-1"`,
-		"pod resolved from o11y_-prefixed topology series")
-	s.Contains(bodyStr, `"name":"prefixed-pod"`)
+
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	byID := map[string]cytoscape.NodeData{}
+	for _, n := range body.Elements.Nodes {
+		byID[n.Data.ID] = n.Data
+		s.NotEqual("netapp-aggr", n.Data.Type)
+		s.NotEqual("netapp-node", n.Data.Type)
+	}
+	plain, ok := byID["cluster-alpha/shop/plain-nas-data"]
+	s.Require().True(ok)
+	s.Equal("pvc-0000-plain", plain.Labels["volumename"])
+	_, hasSVM := plain.Labels["svm"]
+	s.False(hasSVM)
 }
 
 func (s *GraphSuite) TestAPIKey_FileBacked_Enforced() {

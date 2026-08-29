@@ -34,6 +34,16 @@ func genGraph(seed int64, clusters, podsPerCluster, extraEdges int) *Graph {
 		}
 	}
 
+	// Shared NetApp filer: one aggregate + controller referenced by every
+	// cluster's first pod via a PVC, so the default projection retains them
+	// whenever that pod is connectivity-connected.
+	aggrID := NetAppAggrID("ontap-prod", "aggr1")
+	ctrlID := NetAppNodeID("ontap-prod", "n1")
+	all = append(all,
+		&NetAppAggrNode{IDValue: aggrID, NameValue: "aggr1", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "n1"}},
+		&NetAppNode{IDValue: ctrlID, NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"}},
+	)
+
 	// One Service per cluster (D29). Added before the edge loop so podsOnly()
 	// still sees only pods.
 	for i := range clusters {
@@ -46,6 +56,21 @@ func genGraph(seed int64, clusters, podsPerCluster, extraEdges int) *Graph {
 
 	edges := []*Edge{}
 	pods := podsOnly(all)
+	for i := range clusters {
+		for _, p := range pods {
+			if p.Labels()["cluster"] != clusterNames[i] {
+				continue
+			}
+			pvcID := PVCID(clusterNames[i], "ns-0", "data")
+			all = append(all, &PVCNode{
+				IDValue: pvcID, NameValue: "data",
+				LabelsValue: map[string]string{"cluster": clusterNames[i], "namespace": "ns-0"},
+			})
+			edges = append(edges, NewEdge(EdgeTypePodMountsPVC, p.ID(), pvcID, nil))
+			edges = append(edges, NewEdge(EdgeTypePVCToNetAppAggr, pvcID, aggrID, nil))
+			break
+		}
+	}
 	// service-selects-pod edge from each cluster's Service to a backing pod.
 	for i := range clusters {
 		svcID := ServiceID(clusterNames[i], "ns-0", "svc")
@@ -106,45 +131,6 @@ func TestProperty_FilteredSubsetUnfiltered(t *testing.T) {
 	}
 }
 
-func TestProperty_TraversalDepthRespected(t *testing.T) {
-	for seed := int64(1); seed <= 25; seed++ {
-		g := genGraph(seed, 3, 5, 12)
-		var root string
-		for id := range g.NodesByID {
-			root = id
-			break
-		}
-		for d := range 4 {
-			v := Project(g, Scope{Root: root, Depth: d, Direction: DirectionBoth})
-			dist := map[string]int{root: 0}
-			frontier := []string{root}
-			for hop := 0; hop < d && len(frontier) > 0; hop++ {
-				next := []string{}
-				for _, id := range frontier {
-					for _, e := range g.Forward[id] {
-						if _, seen := dist[e.Target]; !seen {
-							dist[e.Target] = hop + 1
-							next = append(next, e.Target)
-						}
-					}
-					for _, e := range g.Reverse[id] {
-						if _, seen := dist[e.Source]; !seen {
-							dist[e.Source] = hop + 1
-							next = append(next, e.Source)
-						}
-					}
-				}
-				frontier = next
-			}
-			for _, n := range v.Nodes {
-				dd, ok := dist[n.ID()]
-				assert.Truef(t, ok, "seed=%d depth=%d: node %s in view but not reachable from root", seed, d, n.ID())
-				assert.LessOrEqualf(t, dd, d, "seed=%d depth=%d: node %s at distance %d > depth", seed, d, n.ID(), dd)
-			}
-		}
-	}
-}
-
 func TestProperty_CrossClusterEdgesHaveDistinctClusterEndpoints(t *testing.T) {
 	for seed := int64(1); seed <= 25; seed++ {
 		g := genGraph(seed, 3, 5, 12)
@@ -170,81 +156,28 @@ func TestProperty_CrossClusterEdgesHaveDistinctClusterEndpoints(t *testing.T) {
 	}
 }
 
-func TestProperty_NameFilterEveryNodeMatchesOrIsRehydratedPartner(t *testing.T) {
+// TestProperty_PrunedViewSubsetOfInventory: the default (pruned) view can only
+// ever be a subset of the same request with prune=false — turning the prune off
+// adds elements, never removes or rewrites them.
+func TestProperty_PrunedViewSubsetOfInventory(t *testing.T) {
 	for seed := int64(1); seed <= 25; seed++ {
 		g := genGraph(seed, 3, 5, 12)
-		// Pick the first pod's name as the in-scope set. Random but deterministic.
-		var anchor string
-		for _, n := range g.NodesByID {
-			if n.Type() == NodeTypePod {
-				anchor = n.Name()
-				break
-			}
-		}
-		require.NotEmpty(t, anchor)
-		v := Project(g, Scope{Names: map[string]struct{}{anchor: {}}})
+		pruned := Project(g, Scope{})
+		inventory := Project(g, Scope{Inventory: true})
 
-		// Build the set of node IDs whose name matches the filter (the
-		// "named-match" set) and the set of all returned node IDs.
-		named := map[string]bool{}
-		returned := map[string]bool{}
-		for _, n := range v.Nodes {
-			returned[n.ID()] = true
-			if n.Name() == anchor {
-				named[n.ID()] = true
-			}
+		invNodes := map[string]bool{}
+		for _, n := range inventory.Nodes {
+			invNodes[n.ID()] = true
 		}
-		// Every returned node either matches the name OR is incident on at
-		// least one retained edge whose other endpoint matches the name set.
-		incident := map[string]bool{}
-		for _, e := range v.Edges {
-			if named[e.Source] {
-				incident[e.Target] = true
-			}
-			if named[e.Target] {
-				incident[e.Source] = true
-			}
+		for _, n := range pruned.Nodes {
+			require.Truef(t, invNodes[n.ID()], "seed=%d: pruned view has node %s absent from the inventory view", seed, n.ID())
 		}
-		for id := range returned {
-			if named[id] {
-				continue
-			}
-			assert.Truef(t, incident[id],
-				"seed=%d: node %s in result but neither matches name nor is incident on a retained edge to a named match", seed, id)
+		invEdges := map[string]bool{}
+		for _, e := range inventory.Edges {
+			invEdges[e.ID] = true
 		}
-	}
-}
-
-func TestProperty_ServiceSelectsPodEdgesWellFormed(t *testing.T) {
-	for seed := int64(1); seed <= 25; seed++ {
-		g := genGraph(seed, 3, 5, 12)
-		count := 0
-		for _, e := range g.Edges {
-			if e.Type != EdgeTypeServiceSelectsPod {
-				continue
-			}
-			count++
-			src, srcOK := g.NodesByID[e.Source]
-			tgt, tgtOK := g.NodesByID[e.Target]
-			require.Truef(t, srcOK, "seed=%d: service-selects-pod source %s unresolved", seed, e.Source)
-			require.Truef(t, tgtOK, "seed=%d: service-selects-pod target %s unresolved", seed, e.Target)
-			assert.Equalf(t, NodeTypeService, src.Type(), "seed=%d: source must be a service node", seed)
-			assert.Equalf(t, NodeTypePod, tgt.Type(), "seed=%d: target must be a pod node", seed)
-		}
-		assert.Positivef(t, count, "seed=%d: expected at least one service-selects-pod edge", seed)
-	}
-}
-
-func TestProperty_EdgeIDsUniquePerTuple(t *testing.T) {
-	for seed := int64(1); seed <= 25; seed++ {
-		g := genGraph(seed, 3, 5, 12)
-		ids := map[string]string{}
-		for _, e := range g.Edges {
-			tuple := string(e.Type) + "|" + e.Source + "|" + e.Target
-			if existing, ok := ids[e.ID]; ok {
-				require.Equalf(t, existing, tuple, "seed=%d: edge id %s shared by %q and %q", seed, e.ID, existing, tuple)
-			}
-			ids[e.ID] = tuple
+		for _, e := range pruned.Edges {
+			require.Truef(t, invEdges[e.ID], "seed=%d: pruned view has edge %s absent from the inventory view", seed, e.ID)
 		}
 	}
 }

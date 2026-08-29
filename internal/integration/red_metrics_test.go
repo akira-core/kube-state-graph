@@ -22,6 +22,10 @@ type REDMetricsSuite struct {
 }
 
 func TestREDMetricsSuite(t *testing.T) {
+	// Each suite owns its own container, so the suites are independent; go
+	// test otherwise runs them one after another and the wall clock is their
+	// sum. Tests INSIDE a suite stay sequential (testify shares suite state).
+	t.Parallel()
 	suite.Run(t, new(REDMetricsSuite))
 }
 
@@ -63,7 +67,6 @@ traces_service_graph_request_server_seconds_bucket{client="checkout",server="car
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
 		q.Set("edge_type", "pod-calls-pod")
-		q.Set("name", "checkout")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
@@ -126,7 +129,6 @@ traces_service_graph_request_total{client="a",server="b",cluster="cluster-alpha"
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
 		q.Set("edge_type", "pod-calls-pod")
-		q.Set("name", "a")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
@@ -198,7 +200,6 @@ traces_service_graph_request_total{client="client",server="unknown",cluster="clu
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
 		q.Set("edge_type", "pod-calls-pod")
-		q.Set("name", "client")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)
@@ -336,7 +337,6 @@ traces_service_graph_request_failed_total{client="producer",server="consumer",cl
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	resp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) {
 		q.Set("edge_type", "pod-calls-pod")
-		q.Set("name", "producer")
 	}))
 	defer func() { _ = resp.Body.Close() }()
 	s.Require().Equal(http.StatusOK, resp.StatusCode)

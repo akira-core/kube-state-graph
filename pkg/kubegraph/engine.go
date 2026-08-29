@@ -22,10 +22,8 @@ import (
 // Options configures an Engine. Clock and Metrics are optional: a nil Clock
 // falls back to the system clock, and a nil Metrics disables build self-metrics
 // (an embedder that does not want kube-state-graph's Prometheus series leaves it
-// nil). MetricPrefix and APITimeout mirror the build-layer settings.
+// nil). APITimeout mirrors the build-layer setting.
 type Options struct {
-	// MetricPrefix is prepended to kube-state-metrics-shaped metric names (D26).
-	MetricPrefix string
 	// APITimeout bounds the cheap up{} retention probe inside the build.
 	APITimeout time.Duration
 	// Clock is the time source for "now"; nil means the system clock.
@@ -40,6 +38,9 @@ type Options struct {
 	RouteResolver build.RouteResolver
 	// RouteResolveTimeout mirrors build.Options.RouteResolveTimeout.
 	RouteResolveTimeout time.Duration
+	// LabelKeys names the upstream labels the request's `az` / `env` filter
+	// dimensions are matched against. Zero value ⇒ the defaults (`az`, `env`).
+	LabelKeys promql.LabelKeys
 }
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
@@ -58,12 +59,29 @@ func New(q promql.Querier, opts Options) *Engine {
 		clk = clock.System{}
 	}
 	b := build.New(q, build.Options{
-		MetricPrefix:        opts.MetricPrefix,
 		APITimeout:          opts.APITimeout,
 		RouteResolver:       opts.RouteResolver,
 		RouteResolveTimeout: opts.RouteResolveTimeout,
+		LabelKeys:           opts.LabelKeys,
 	}, opts.Metrics, clk)
 	return &Engine{builder: b, q: q, clk: clk}
+}
+
+// NewRouted constructs an Engine dispatching through a routing table, so a
+// build's `az` values select which upstream installation answers each query
+// family.
+//
+// It is New plus the routing seam made visible in the signature. Passing the
+// router to New works identically — *promql.Router satisfies promql.Querier,
+// and the builder type-asserts the promql.QuerierSource upgrade — but that is a
+// fact an embedder would have to be told in prose; a named constructor states
+// it instead (design D1 / D14).
+//
+// Build the table with promql.SingleBackendTable for a single upstream, with
+// promql.NewTable for one assembled in code, or with backendsfile.Read for the
+// file an operator mounts.
+func NewRouted(r *promql.Router, opts Options) *Engine {
+	return New(r, opts)
 }
 
 // Probe reports upstream reachability via a cheap up{} instant query — the same
@@ -74,9 +92,11 @@ func (e *Engine) Probe(ctx context.Context) error {
 }
 
 // Build runs the multi-cluster build for [end-window, end] and returns the
-// immutable graph. The caller supplies any build deadline via ctx.
-func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time) (*graph.Graph, error) {
-	return e.builder.Build(ctx, window, end)
+// immutable graph. sel carries the request-scoped selector dimensions pushed
+// into the upstream queries; a zero Selector is the unfiltered build. The
+// caller supplies any build deadline via ctx.
+func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	return e.builder.Build(ctx, window, end, sel)
 }
 
 // BuildFromValues parses the /v1/graph query parameters, builds the graph,
@@ -85,13 +105,13 @@ func (e *Engine) Build(ctx context.Context, window time.Duration, end time.Time)
 // in kube-state-graph's API); build failures propagate the build layer's typed
 // errors. The caller supplies any build deadline via ctx.
 func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
-	start, end, scope, err := ParseValues(v)
+	req, err := ParseValues(v)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	g, err := e.builder.Build(ctx, end.Sub(start), end)
+	g, err := e.builder.Build(ctx, req.End.Sub(req.Start), req.End, req.Selector)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	return cytoscape.Serialise(g, graph.Project(g, scope)), nil
+	return cytoscape.Serialise(g, graph.Project(g, req.Scope)), nil
 }

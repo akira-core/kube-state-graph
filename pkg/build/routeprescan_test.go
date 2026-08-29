@@ -614,8 +614,8 @@ func TestReadServiceGraph_ResolverErrorDegradesToExternal(t *testing.T) {
 		return RouteDestination{}, RouteNoGateway, errors.New("store unreachable")
 	}}
 
-	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
-		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
+	res, err := ReadServiceGraph(context.Background(), q,
+		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err, "a resolver error must never fail the read")
 	require.Len(t, resolver.requests(), 1, "the prescan collected the endpoint")
 
@@ -635,8 +635,8 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "payments", Port: 8080}, RouteHit, nil
 	}}
 
-	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
-		window, end, sampleTopologyWithServices(), resolver, time.Second)
+	res, err := ReadServiceGraph(context.Background(), q,
+		window, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err)
 	require.Len(t, resolver.requests(), 1)
 	assert.Equal(t, RouteRequest{
@@ -669,8 +669,8 @@ func TestReadServiceGraph_NoDNSAnswersNeverConsultsResolver(t *testing.T) {
 		return RouteDestination{}, RouteNoGateway, nil
 	}}
 
-	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
-		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second)
+	res, err := ReadServiceGraph(context.Background(), q,
+		5*time.Minute, end, sampleTopologyWithServices(), resolver, time.Second, false)
 	require.NoError(t, err)
 	assert.Empty(t, resolver.requests(), "no engine call for an IP-less endpoint")
 
@@ -686,8 +686,8 @@ func TestReadServiceGraph_NilResolverNeverPrescans(t *testing.T) {
 	q := promqlmocks.NewMockQuerier(t)
 	expectServiceGraphQueries(q, end, vec)
 
-	res, err := ReadServiceGraph(context.Background(), q, promql.Renderer{},
-		5*time.Minute, end, sampleTopologyWithServices(), nil, 0)
+	res, err := ReadServiceGraph(context.Background(), q,
+		5*time.Minute, end, sampleTopologyWithServices(), nil, 0, false)
 	require.NoError(t, err)
 	require.Len(t, res.ExternalNodes, 1, "feature off: pre-change external fallback")
 }
@@ -1027,4 +1027,94 @@ func TestParseServiceGraphRoutes_BothPathsMarkIngressGatewayEitherOrder(t *testi
 				"ingress-gateway wins regardless of resolution order")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Route-store cluster names under cluster identities (design D9).
+// ---------------------------------------------------------------------------
+
+// identityRouteTopology is sampleTopologyWithServices in composed-identity form:
+// the estate lives in us-dev-cluster-alpha, built from the raw name
+// "cluster-alpha". `ambiguous` adds a second identity behind that same raw name
+// so the adopt step can no longer place it.
+func identityRouteTopology(ambiguous bool) Topology {
+	client := &graph.PodNode{IDValue: "us-dev-cluster-alpha/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "us-dev-cluster-alpha", "namespace": "shop"}}
+	pay0 := &graph.PodNode{IDValue: "us-dev-cluster-alpha/pay0", NameValue: "payments-0", LabelsValue: map[string]string{"cluster": "us-dev-cluster-alpha", "namespace": "shop"}}
+
+	mc := newClusterResolver(promql.LabelKeys{})
+	mc.observe(model.Metric{"cluster": "cluster-alpha", "az": "us", "env": "dev"})
+	if ambiguous {
+		mc.observe(model.Metric{"cluster": "cluster-alpha", "az": "eu", "env": "prod"})
+	}
+
+	return Topology{
+		Pods:      []*graph.PodNode{client, pay0},
+		PodsByUID: map[string]*graph.PodNode{"abc": client, "pay0": pay0},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"us-dev-cluster-alpha", "shop", "payments"}: {ClusterIP: "10.0.0.5"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"us-dev-cluster-alpha", "shop", "payments"}: {{Pod: pay0}},
+		},
+		ClusterIdentities: mc.snapshot(),
+		clusters:          mc,
+	}
+}
+
+// identityPeerSample is unknownPeerSample with the trace label carrying the RAW
+// cluster name — what a collector that knows nothing of identities emits.
+func identityPeerSample(peer string) model.Sample {
+	s := unknownPeerSample(peer, nil)
+	s.Metric["cluster"] = "cluster-alpha"
+	return s
+}
+
+// TestRoutePrescan_DestClusterResolvesThroughIdentity: the route store's cluster
+// column carries no az/env labels, so its names go through the ladder's adopt
+// step before the topology lookup. Unambiguous → resolved; ambiguous → the
+// EXISTING dest_cluster_lacks_service degrade, no new outcome.
+func TestRoutePrescan_DestClusterResolvesThroughIdentity(t *testing.T) {
+	routes := func(cluster string) routeIndex {
+		return routeIndex{
+			{callerCluster: "us-dev-cluster-alpha", host: "api.example.com", path: "/", port: 443, ips: testDNSAnswer}: {
+				dest:    RouteDestination{Cluster: cluster, Namespace: "shop", Service: "payments", Port: 8080},
+				outcome: RouteHit,
+			},
+		}
+	}
+	vec := sampleVec(identityPeerSample("api.example.com"))
+
+	t.Run("raw store name is adopted while unambiguous", func(t *testing.T) {
+		res := parseServiceGraphRoutes(vec, identityRouteTopology(false), routes("cluster-alpha"))
+
+		require.Len(t, res.ServiceNodes, 1)
+		assert.Equal(t, "us-dev-cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+		assert.Empty(t, res.ExternalNodes)
+	})
+
+	t.Run("store name already an identity passes through", func(t *testing.T) {
+		res := parseServiceGraphRoutes(vec, identityRouteTopology(false), routes("us-dev-cluster-alpha"))
+
+		require.Len(t, res.ServiceNodes, 1)
+		assert.Equal(t, "us-dev-cluster-alpha/shop/payments", res.ServiceNodes[0].IDValue)
+		assert.Empty(t, res.ExternalNodes)
+	})
+
+	t.Run("ambiguous raw store name degrades through the existing reason", func(t *testing.T) {
+		res := parseServiceGraphRoutes(vec, identityRouteTopology(true), routes("cluster-alpha"))
+
+		assert.Empty(t, res.ServiceNodes, "an unplaceable destination materialises no service")
+		require.Len(t, res.ExternalNodes, 1)
+		assert.Equal(t, "external/api.example.com", res.ExternalNodes[0].IDValue)
+	})
+}
+
+// TestRoutePrescan_CallerClusterIsTheIdentity: RouteRequest.CallerCluster feeds
+// the family key and the ingress tie-break, so it must be the caller pod's
+// composed identity, not the raw trace label.
+func TestRoutePrescan_CallerClusterIsTheIdentity(t *testing.T) {
+	keys := collectRouteQueries(sampleVec(identityPeerSample("api.example.com")), identityRouteTopology(false))
+
+	require.Len(t, keys, 1)
+	assert.Equal(t, "us-dev-cluster-alpha", keys[0].callerCluster)
 }

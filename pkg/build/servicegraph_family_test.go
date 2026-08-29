@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // familyTopology models the cluster-family environment for the localised
@@ -193,8 +194,10 @@ func TestParseServiceGraph_MissingClusterLabelRecoversAnchorFromClientPod(t *tes
 	// The series is missing its cluster label (bucketed to "unknown"), but the
 	// client UID resolves to the prod-1 pod via the global UID index — the
 	// server-side "://" anchor is recovered as prod-1, so resolution localises
-	// there and fans out across the prod-0 family. The edge's labels.cluster
-	// stays the raw trace label ("unknown", per D9).
+	// there and fans out across the prod-0 family. The edge's labels.cluster is
+	// the CLIENT POD's cluster identity (D9 as revised by cluster identities):
+	// the trace label alone is not an identity, and naming "unknown" here would
+	// put a cluster on the edge that appears on no node of the response.
 	vec := sampleVec(famSample("checkout", "nats://nats.messaging.svc:4222", "", "abc", ""))
 	res := parseServiceGraph(vec, familyTopology())
 
@@ -203,7 +206,8 @@ func TestParseServiceGraph_MissingClusterLabelRecoversAnchorFromClientPod(t *tes
 	pcs := edgesByType(res, graph.EdgeTypePodCallsService)
 	require.Len(t, pcs, 1)
 	assert.Equal(t, "prod-1/abc", pcs[0].Source)
-	assert.Equal(t, "unknown", pcs[0].Labels["cluster"], "edge cluster label stays the raw trace label (D9)")
+	assert.Equal(t, "prod-1", pcs[0].Labels["cluster"],
+		"edge cluster label is the UID-resolved client pod's cluster, not the missing trace label")
 	assert.ElementsMatch(t, []string{"prod-1/n1", "prod-2/n2"},
 		[]string{edgesByType(res, graph.EdgeTypeServiceSelectsPod)[0].Target, edgesByType(res, graph.EdgeTypeServiceSelectsPod)[1].Target})
 	assert.Empty(t, res.ExternalNodes)
@@ -435,4 +439,101 @@ func TestParseServiceGraph_LocalisedResolution_Deterministic(t *testing.T) {
 	n2, e2 := summarise(parseServiceGraph(mkVec(99), familyTopology()))
 	assert.ElementsMatch(t, n1, n2, "node set must be arrival-order independent")
 	assert.ElementsMatch(t, e1, e2, "edge set (incl. UUIDv5 IDs) must be arrival-order independent")
+}
+
+// identityTopology is familyTopology's cluster-identity sibling: the same
+// estate, but its pods live in the composed identities us-dev-c1 / us-dev-c2 /
+// eu-prod-c1, all built from the raw names c1 and c2. `ambiguous` decides
+// whether raw `c1` maps to one identity (adoptable) or two (unresolvable).
+func identityTopology(ambiguous bool) Topology {
+	client := &graph.PodNode{IDValue: "us-dev-c1/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"}}
+	natsA := &graph.PodNode{IDValue: "us-dev-c1/n1", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "messaging"}}
+	natsB := &graph.PodNode{IDValue: "us-dev-c2/n2", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "us-dev-c2", "namespace": "messaging"}}
+	natsFar := &graph.PodNode{IDValue: "eu-prod-c1/n3", NameValue: "nats-0", LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "messaging"}}
+
+	mc := newClusterResolver(promql.LabelKeys{})
+	mc.observe(model.Metric{"cluster": "c1", "az": "us", "env": "dev"})
+	mc.observe(model.Metric{"cluster": "c2", "az": "us", "env": "dev"})
+	if ambiguous {
+		mc.observe(model.Metric{"cluster": "c1", "az": "eu", "env": "prod"})
+	}
+
+	return Topology{
+		Pods:      []*graph.PodNode{client, natsA, natsB, natsFar},
+		PodsByUID: map[string]*graph.PodNode{"abc": client, "n1": natsA, "n2": natsB, "n3": natsFar},
+		ServicesByNameNS: map[serviceKey]ServiceObs{
+			{"us-dev-c1", "messaging", "nats"}:  {ClusterIP: "10.1.0.5"},
+			{"us-dev-c2", "messaging", "nats"}:  {ClusterIP: "10.2.0.5"},
+			{"eu-prod-c1", "messaging", "nats"}: {ClusterIP: "10.9.0.5"},
+		},
+		EndpointsByService: map[serviceKey][]EndpointObs{
+			{"us-dev-c1", "messaging", "nats"}:  {{Pod: natsA}},
+			{"us-dev-c2", "messaging", "nats"}:  {{Pod: natsB}},
+			{"eu-prod-c1", "messaging", "nats"}: {{Pod: natsFar}},
+		},
+		ClustersObserved:  []string{"eu-prod-c1", "us-dev-c1", "us-dev-c2"},
+		ClusterIdentities: mc.snapshot(),
+		clusters:          mc,
+	}
+}
+
+// TestParseServiceGraph_EdgeClusterIsClientPodIdentity pins the pod-service-graph
+// scenarios "Edge label carries the client pod's identity" and "Synthesised
+// client resolves the trace label through the ladder".
+func TestParseServiceGraph_EdgeClusterIsClientPodIdentity(t *testing.T) {
+	t.Run("resolved client pod supplies the identity", func(t *testing.T) {
+		// The trace carries the RAW name c1, which is not an identity. The UID
+		// resolves to the us-dev-c1 pod, so that is what the edge names.
+		vec := sampleVec(famSample("checkout", "nats://nats.messaging.svc:4222", "c1", "abc", ""))
+		res := parseServiceGraph(vec, identityTopology(false))
+
+		pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+		require.Len(t, pcs, 1)
+		assert.Equal(t, "us-dev-c1/abc", pcs[0].Source)
+		assert.Equal(t, "us-dev-c1", pcs[0].Labels["cluster"])
+		require.Len(t, res.ServiceNodes, 1)
+		assert.Equal(t, "us-dev-c1/messaging/nats", res.ServiceNodes[0].IDValue)
+	})
+
+	t.Run("synthesised client adopts the sole identity of its raw name", func(t *testing.T) {
+		// An unknown UID cannot resolve a topology pod, so the trace label goes
+		// through the ladder: raw c2 maps to exactly one identity.
+		vec := sampleVec(famSample("ghost", "nats://nats.messaging.svc:4222", "c2", "zzz", ""))
+		res := parseServiceGraph(vec, identityTopology(false))
+
+		pcs := edgesByType(res, graph.EdgeTypePodCallsService)
+		require.Len(t, pcs, 1)
+		assert.Equal(t, "us-dev-c2/zzz", pcs[0].Source, "the synthesised pod adopts the identity too")
+		assert.Equal(t, "us-dev-c2", pcs[0].Labels["cluster"])
+	})
+
+	t.Run("synthesised client keeps an ambiguous raw name verbatim", func(t *testing.T) {
+		// Raw c1 now maps to two identities: nothing is guessed, so the ghost
+		// pod and the edge stand under the raw name and resolve no service.
+		vec := sampleVec(famSample("ghost", "nats://nats.messaging.svc:4222", "c1", "zzz", ""))
+		res := parseServiceGraph(vec, identityTopology(true))
+
+		require.Empty(t, res.ServiceNodes, "the verbatim c1 holds no service")
+		edges := edgesByType(res, graph.EdgeTypePodCallsPod)
+		require.Len(t, edges, 1)
+		assert.Equal(t, "c1/zzz", edges[0].Source)
+		assert.Equal(t, "c1", edges[0].Labels["cluster"])
+	})
+}
+
+// TestParseServiceGraph_FanOutStaysWithinZoneFamily pins that the family key,
+// computed over the IDENTITY, scopes the service-selects-pod fan-out to one
+// zone and one environment.
+func TestParseServiceGraph_FanOutStaysWithinZoneFamily(t *testing.T) {
+	vec := sampleVec(famSample("checkout", "nats://nats.messaging.svc:4222", "c1", "abc", ""))
+	res := parseServiceGraph(vec, identityTopology(false))
+
+	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
+	targets := make([]string, 0, len(ssp))
+	for _, e := range ssp {
+		targets = append(targets, e.Target)
+	}
+	assert.ElementsMatch(t, []string{"us-dev-c1/n1", "us-dev-c2/n2"}, targets,
+		"us-dev-c0 is the family; eu-prod-c1 is a different zone and environment")
+	assert.NotContains(t, targets, "eu-prod-c1/n3")
 }

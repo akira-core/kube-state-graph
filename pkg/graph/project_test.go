@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func sampleGraph() *Graph {
@@ -118,30 +119,6 @@ func TestProject_EdgeTypeFilter(t *testing.T) {
 	assert.Len(t, v.Edges, 2)
 }
 
-func TestProject_TraversalBoundedByDepth(t *testing.T) {
-	v := Project(sampleGraph(), Scope{Root: "cluster-alpha/p1", Depth: 1, Direction: DirectionOut})
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	for _, want := range []string{"cluster-alpha/p1", "cluster-alpha/p2", "cluster-beta/p3"} {
-		assert.Truef(t, ids[want], "expected %s in traversal result", want)
-	}
-	assert.False(t, ids["cluster-alpha/worker-0"], "host node unreachable without a pod-runs-on-node edge")
-}
-
-func TestProject_UnknownRootEmpty(t *testing.T) {
-	v := Project(sampleGraph(), Scope{Root: "does-not-exist", Depth: 2, Direction: DirectionBoth})
-	assert.Empty(t, v.Nodes)
-	assert.Empty(t, v.Edges)
-}
-
-func TestProject_DepthZero(t *testing.T) {
-	v := Project(sampleGraph(), Scope{Root: "cluster-alpha/p1", Depth: 0, Direction: DirectionBoth})
-	assert.Len(t, v.Nodes, 1)
-	assert.Equal(t, "cluster-alpha/p1", v.Nodes[0].ID())
-}
-
 // Namespace filter retains a K8sNode iff an in-scope pod is scheduled on it
 // (design.md D31). K8s nodes carry no namespace label of their own, so rather
 // than dropping every node under a namespace filter, a node is kept when some
@@ -208,15 +185,17 @@ func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}}, // hosts p1+p2
 		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // hosts nothing
 		&PVCNode{IDValue: "c/shop/data", NameValue: "data", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop"}, StorageClassValue: "gp3"},
-		&StorageClassNode{IDValue: StorageClassID("c", "gp3"), NameValue: "gp3", LabelsValue: map[string]string{"cluster": "c"}},       // backs data
-		&StorageClassNode{IDValue: StorageClassID("c", "unused"), NameValue: "unused", LabelsValue: map[string]string{"cluster": "c"}}, // backs nothing
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "used"), NameValue: "used", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n1"}},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "unused"), NameValue: "unused", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n2"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1"), NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n2"), NameValue: "n2", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
 	}
 	edges := []*Edge{
 		NewEdge(EdgeTypePodCallsPod, "c/p1", "c/p2", map[string]string{"cluster": "c"}),
 		NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil),
 		NewEdge(EdgeTypePodToNode, "c/p2", "c/worker-0", nil),
 		NewEdge(EdgeTypePodMountsPVC, "c/p1", "c/shop/data", nil),
-		NewEdge(EdgeTypePVCToStorageClass, "c/shop/data", StorageClassID("c", "gp3"), nil),
+		NewEdge(EdgeTypePVCToNetAppAggr, "c/shop/data", NetAppAggrID("oc", "used"), nil),
 	}
 	g := NewGraph(all, edges, time.Now())
 
@@ -226,14 +205,17 @@ func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
 		ids[n.ID()] = true
 	}
 	assert.True(t, ids["c/worker-0"], "node hosting an in-graph pod is retained")
-	assert.True(t, ids[StorageClassID("c", "gp3")], "StorageClass backing an in-graph PVC is retained")
+	assert.True(t, ids[NetAppAggrID("oc", "used")], "aggregate serving an in-graph PVC is retained")
+	assert.True(t, ids[NetAppNodeID("oc", "n1")], "controller of the kept aggregate is retained")
 	assert.False(t, ids["c/worker-1"], "podless node dropped from the no-filter view")
-	assert.False(t, ids[StorageClassID("c", "unused")], "PVC-less StorageClass dropped from the no-filter view")
+	assert.False(t, ids[NetAppAggrID("oc", "unused")], "unreferenced aggregate dropped from the no-filter view")
+	assert.False(t, ids[NetAppNodeID("oc", "n2")], "controller of an unreferenced aggregate dropped")
 }
 
-// The name-filter exception: ?name=<infra-node> surfaces a referenced-by-nothing
-// node directly, even though the default view hides it.
-func TestProject_NameFilter_MatchesUnreferencedInfraNode(t *testing.T) {
+// prune=false with no namespace filter admits a podless K8s node — the
+// `?prune=false` inventory view, which replaces the withdrawn `?name=` and
+// `?root=` escape hatches.
+func TestProject_Inventory_AdmitsPodlessK8sNode(t *testing.T) {
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
@@ -241,20 +223,24 @@ func TestProject_NameFilter_MatchesUnreferencedInfraNode(t *testing.T) {
 	}
 	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
 
-	v := Project(g, Scope{Names: map[string]struct{}{"worker-1": {}}})
 	ids := map[string]bool{}
-	for _, n := range v.Nodes {
+	for _, n := range Project(g, Scope{Inventory: true}).Nodes {
 		ids[n.ID()] = true
 	}
-	assert.True(t, ids["c/worker-1"], "explicit ?name=<podless-node> still returns the node")
-	assert.False(t, ids["c/worker-0"], "non-named node not pulled in")
+	assert.True(t, ids["c/worker-1"], "prune=false admits the podless node")
+	assert.True(t, ids["c/worker-0"], "and keeps the referenced one")
+
+	// A cluster filter still applies to a K8s node's own labels.
+	scoped := map[string]bool{}
+	for _, n := range Project(g, Scope{Inventory: true, Clusters: map[string]struct{}{"other": {}}}).Nodes {
+		scoped[n.ID()] = true
+	}
+	assert.False(t, scoped["c/worker-1"], "cluster filter excludes the node by its own label")
 }
 
-// A traversal anchored on a podless infra node (?root=<node>) must still return
-// that node — it is the explicit focus and is in the reachable set, so the
-// reference-pruning must not drop it (else the view would be empty, while a pod
-// root returns at least itself).
-func TestProject_RootAnchorOnPodlessInfraNode(t *testing.T) {
+// Under a namespace filter the K8s-node lift is suppressed: the node carries no
+// namespace, so its only meaningful admission stays "an in-scope pod runs here".
+func TestProject_Inventory_NamespaceFilterKeepsK8sNodeReferenceDriven(t *testing.T) {
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
 		&K8sNode{IDValue: "c/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "c"}},
@@ -262,210 +248,69 @@ func TestProject_RootAnchorOnPodlessInfraNode(t *testing.T) {
 	}
 	g := NewGraph(all, []*Edge{NewEdge(EdgeTypePodToNode, "c/p1", "c/worker-0", nil)}, time.Now())
 
-	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth})
 	ids := map[string]bool{}
-	for _, n := range v.Nodes {
+	for _, n := range Project(g, Scope{Inventory: true, Namespaces: map[string]struct{}{"shop": {}}}).Nodes {
 		ids[n.ID()] = true
 	}
-	assert.True(t, ids["c/worker-1"], "podless node used as ?root= anchor must be returned, not pruned to empty")
-
-	// Sanity: rooting at the host node reaches its pod via the pod-to-node reverse edge.
-	v2 := Project(g, Scope{Root: "c/worker-0", Depth: 2, Direction: DirectionBoth})
-	ids2 := map[string]bool{}
-	for _, n := range v2.Nodes {
-		ids2[n.ID()] = true
-	}
-	assert.True(t, ids2["c/worker-0"], "host node root present")
-	assert.True(t, ids2["c/p1"], "pod reached from the node root via pod-to-node")
+	assert.True(t, ids["c/worker-0"], "host of the in-scope pod kept")
+	assert.False(t, ids["c/worker-1"], "podless node NOT lifted under a namespace filter")
 }
 
-// The traversal-anchor exception must NOT leak past an active name filter: a
-// ?root=<infra>&name=<other> request drops the infra root (symmetric with a pod
-// root, which the name filter also drops), while ?name=<that-node> admits it.
-func TestProject_RootAnchorRespectsNameFilter(t *testing.T) {
-	all := []GraphNode{
-		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
-		&K8sNode{IDValue: "c/worker-1", NameValue: "worker-1", LabelsValue: map[string]string{"cluster": "c"}}, // podless
-	}
-	g := NewGraph(all, nil, time.Now())
-
-	v := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"other": {}}})
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.False(t, ids["c/worker-1"], "infra root excluded by a non-matching name filter (no leak past ?name=)")
-
-	v2 := Project(g, Scope{Root: "c/worker-1", Depth: 2, Direction: DirectionBoth, Names: map[string]struct{}{"worker-1": {}}})
-	ids2 := map[string]bool{}
-	for _, n := range v2.Nodes {
-		ids2[n.ID()] = true
-	}
-	assert.True(t, ids2["c/worker-1"], "infra root admitted when the name filter names it")
-}
-
-// multiClusterPodSampleGraph extends sampleGraph with a `payments` pod in
-// cluster-alpha so the `pod=payments` filter can match across clusters
-// (cluster-alpha and cluster-beta) and we can assert AND/OR semantics with
-// the cluster filter.
-func multiClusterPodSampleGraph() *Graph {
+// identityGraph holds three clusters whose identities compose from two raw
+// names: c1 exists in two zone/environment pairs, c2 in one. The
+// projection-level cluster filter must compare the RAW component so it admits
+// what the upstream `cluster="c1"` matcher admitted.
+func identityGraph() *Graph {
 	pods := []GraphNode{
-		&PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}},
-		&PodNode{IDValue: "cluster-alpha/p2", NameValue: "cart", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}},
-		&PodNode{IDValue: "cluster-alpha/p4", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "billing", "node": "cluster-alpha/worker-0"}},
-		&PodNode{IDValue: "cluster-beta/p3", NameValue: "payments", LabelsValue: map[string]string{"cluster": "cluster-beta", "namespace": "billing", "node": "cluster-beta/worker-0"}},
-	}
-	nodes := []GraphNode{
-		&K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}},
-		&K8sNode{IDValue: "cluster-beta/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-beta"}},
+		&PodNode{IDValue: "us-dev-c1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop", "node": "us-dev-c1/w0"}},
+		&PodNode{IDValue: "eu-prod-c1/p2", NameValue: "payments", LabelsValue: map[string]string{"cluster": "eu-prod-c1", "namespace": "shop"}},
+		&PodNode{IDValue: "us-dev-c2/p3", NameValue: "cart", LabelsValue: map[string]string{"cluster": "us-dev-c2", "namespace": "shop"}},
 	}
 	all := append([]GraphNode{}, pods...)
-	all = append(all, nodes...)
+	all = append(all, &K8sNode{IDValue: "us-dev-c1/w0", NameValue: "w0", LabelsValue: map[string]string{"cluster": "us-dev-c1"}})
 
-	edges := []*Edge{
-		NewEdge(EdgeTypePodCallsPod, "cluster-alpha/p1", "cluster-alpha/p2", map[string]string{"cluster": "cluster-alpha"}),
-		NewEdge(EdgeTypePodCallsPod, "cluster-alpha/p1", "cluster-beta/p3", map[string]string{"cluster": "cluster-alpha"}),
+	g := NewGraph(all, nil, time.Now())
+	g.ClusterIdentities = map[string]ClusterIdentity{
+		"us-dev-c1":  {AZ: "us", Env: "dev", Name: "c1"},
+		"eu-prod-c1": {AZ: "eu", Env: "prod", Name: "c1"},
+		"us-dev-c2":  {AZ: "us", Env: "dev", Name: "c2"},
 	}
-	return NewGraph(all, edges, time.Now())
+	return g
 }
 
-// crossTypeSampleGraph contains:
-//   - a pod named "worker-0" in cluster-alpha (collision with K8s node name)
-//   - a K8s node named "worker-0" in cluster-alpha and cluster-beta
-//   - a PVC named "checkout-data" in cluster-alpha
-//   - a single pod-mounts-pvc edge (K8s nodes are edgeless; they are present
-//     only to exercise the pod/node name collision)
-func crossTypeSampleGraph() *Graph {
-	all := []GraphNode{
-		&PodNode{IDValue: "cluster-alpha/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}},
-		&PodNode{IDValue: "cluster-alpha/p2", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop", "node": "cluster-alpha/worker-0"}},
-		&K8sNode{IDValue: "cluster-alpha/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-alpha"}},
-		&K8sNode{IDValue: "cluster-beta/worker-0", NameValue: "worker-0", LabelsValue: map[string]string{"cluster": "cluster-beta"}},
-		&PVCNode{IDValue: "cluster-alpha/shop/checkout-data", NameValue: "checkout-data", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "shop"}},
-	}
-	edges := []*Edge{
-		NewEdge(EdgeTypePodMountsPVC, "cluster-alpha/p1", "cluster-alpha/shop/checkout-data", nil),
-	}
-	return NewGraph(all, edges, time.Now())
-}
+func TestProject_ClusterFilterMatchesRawComponent(t *testing.T) {
+	g := identityGraph()
 
-func TestProject_NameFilter_MatchesPod(t *testing.T) {
-	g := sampleGraph()
-	v := Project(g, Scope{Names: map[string]struct{}{"checkout": {}}})
-
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/p1"], "checkout pod must match name")
-	// Endpoints of checkout's incident edges are re-added by the unified rule:
-	// pod-calls-pod → cart (p2); pod-calls-pod → cross-cluster payments (p3).
-	assert.True(t, ids["cluster-alpha/p2"], "cart re-added via pod-calls-pod")
-	assert.True(t, ids["cluster-beta/p3"], "cross-cluster payments re-added via pod-calls-pod")
-	// Host K8s nodes carry no edge to the pod, so they are not pulled in.
-	assert.False(t, ids["cluster-alpha/worker-0"], "host node not re-added (no pod-runs-on-node edge)")
-	assert.False(t, ids["cluster-beta/worker-0"], "unrelated K8s node must drop")
-}
-
-func TestProject_NameFilter_MatchesK8sNode(t *testing.T) {
-	g := sampleGraph()
-	v := Project(g, Scope{Names: map[string]struct{}{"worker-0": {}}})
-
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	// Both worker-0 K8s nodes match by name (cluster-alpha and cluster-beta).
-	assert.True(t, ids["cluster-alpha/worker-0"])
-	assert.True(t, ids["cluster-beta/worker-0"])
-	// K8s nodes carry no edges, so a name match pulls in no pods.
-	assert.False(t, ids["cluster-alpha/p1"], "no edge re-adds a pod onto a name-matched K8s node")
-	assert.False(t, ids["cluster-beta/p3"], "no edge re-adds a pod onto a name-matched K8s node")
-}
-
-func TestProject_NameFilter_MatchesPVC(t *testing.T) {
-	g := crossTypeSampleGraph()
-	v := Project(g, Scope{Names: map[string]struct{}{"checkout-data": {}}})
-
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/shop/checkout-data"], "matching PVC must be present")
-	// Pod that mounts the PVC re-added via pod-mounts-pvc edge.
-	assert.True(t, ids["cluster-alpha/p1"], "pod mounting checkout-data must be re-added")
-	assert.False(t, ids["cluster-alpha/p2"], "unrelated pod must NOT be re-added")
-}
-
-func TestProject_NameFilter_AcrossTypes(t *testing.T) {
-	g := crossTypeSampleGraph()
-	// "worker-0" is both a pod name (cluster-alpha/p2) and a K8s node name
-	// (in both clusters). All three matches must surface in the result.
-	v := Project(g, Scope{Names: map[string]struct{}{"worker-0": {}}})
-
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/p2"], "pod named worker-0 must match")
-	assert.True(t, ids["cluster-alpha/worker-0"], "K8s node named worker-0 in alpha must match")
-	assert.True(t, ids["cluster-beta/worker-0"], "K8s node named worker-0 in beta must match")
-}
-
-func TestProject_NameFilter_DuplicatesAcrossClusters(t *testing.T) {
-	g := multiClusterPodSampleGraph()
-	v := Project(g, Scope{Names: map[string]struct{}{"payments": {}}})
-
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/p4"], "alpha payments must match")
-	assert.True(t, ids["cluster-beta/p3"], "beta payments must match")
-	// p2 (cart) has no incident edge to either payments pod, so it must drop.
-	assert.False(t, ids["cluster-alpha/p2"], "cart not incident on payments must drop")
-}
-
-func TestProject_NameFilter_AndedWithCluster(t *testing.T) {
-	g := multiClusterPodSampleGraph()
-	v := Project(g, Scope{
-		Names:    map[string]struct{}{"payments": {}},
-		Clusters: map[string]struct{}{"cluster-alpha": {}},
+	t.Run("raw name admits every identity sharing it", func(t *testing.T) {
+		scope, err := NewScope([]string{"c1"}, nil, nil, true)
+		require.NoError(t, err)
+		got := map[string]bool{}
+		for _, n := range Project(g, scope).Nodes {
+			got[n.ID()] = true
+		}
+		assert.True(t, got["us-dev-c1/p1"], "us-dev-c1 pod must pass ?cluster=c1")
+		assert.True(t, got["eu-prod-c1/p2"], "eu-prod-c1 pod must pass ?cluster=c1")
+		assert.False(t, got["us-dev-c2/p3"], "us-dev-c2 pod must not pass ?cluster=c1")
 	})
 
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/p4"], "alpha payments matches")
-	assert.False(t, ids["cluster-beta/p3"], "beta payments excluded by cluster filter")
-}
+	t.Run("an identity is not a filter value", func(t *testing.T) {
+		scope, err := NewScope([]string{"us-dev-c1"}, nil, nil, true)
+		require.NoError(t, err)
+		assert.Empty(t, Project(g, scope).Nodes)
+	})
 
-func TestProject_NameFilter_RetainsCrossClusterEdgeWithRehydratedPartner(t *testing.T) {
-	g := sampleGraph()
-	// Anchor on cluster-alpha/p1 (pod name "checkout"); its outgoing
-	// pod-calls-pod to cluster-beta/p3 must retain the edge AND re-add p3
-	// via the unified edge-endpoint partner rule.
-	v := Project(g, Scope{Names: map[string]struct{}{"checkout": {}}})
+	t.Run("infra node admitted through the raw component", func(t *testing.T) {
+		scope, err := NewScope([]string{"c1"}, nil, nil, false)
+		require.NoError(t, err)
+		// prune=true keeps only connectivity-connected workload, so assert the
+		// predicate directly: the host node passes the cluster check and is
+		// referenced by p1.
+		host := g.NodesByID["us-dev-c1/w0"]
+		referenced := map[string]struct{}{"us-dev-c1/w0": {}}
+		assert.True(t, infraNodePassesFilters(host, scope, referenced, g.ClusterRawName))
 
-	ids := map[string]bool{}
-	for _, n := range v.Nodes {
-		ids[n.ID()] = true
-	}
-	assert.True(t, ids["cluster-alpha/p1"])
-	assert.True(t, ids["cluster-beta/p3"], "cross-cluster partner pod must be re-added as edge endpoint")
-	var crossEdges int
-	for _, e := range v.Edges {
-		if e.Type == EdgeTypePodCallsPod && e.Source == "cluster-alpha/p1" && e.Target == "cluster-beta/p3" {
-			crossEdges++
-		}
-	}
-	assert.Equal(t, 1, crossEdges, "cross-cluster pod-calls-pod edge must survive name anchor")
-}
-
-func TestProject_NameFilter_UnknownReturnsEmpty(t *testing.T) {
-	g := sampleGraph()
-	v := Project(g, Scope{Names: map[string]struct{}{"does-not-exist": {}}})
-	assert.Empty(t, v.Nodes)
-	assert.Empty(t, v.Edges)
+		identityScope, err := NewScope([]string{"us-dev-c1"}, nil, nil, false)
+		require.NoError(t, err)
+		assert.False(t, infraNodePassesFilters(host, identityScope, referenced, g.ClusterRawName))
+	})
 }

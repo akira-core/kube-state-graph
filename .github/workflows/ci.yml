@@ -67,9 +67,11 @@ jobs:
       - name: Export router_check_tool path
         run: echo "KSG_ROUTER_CHECK_BIN=$PWD/bin/router_check_tool" >> "$GITHUB_ENV"
 
-      # Single source of truth: `make test` carries the -timeout 30m the three
-      # container-backed suites need under -race (Go's 10m default aborts them
-      # with a panic dump instead of a clean failure).
+      # Runs under Go's default 10m per-package timeout: the container-backed
+      # suites in internal/integration seed their fixtures once per suite and
+      # run in parallel, which keeps the package well inside it. Restore an
+      # explicit -timeout only if that stops being true — the default aborts
+      # with a goroutine dump rather than a clean failure.
       - name: Run unit + integration tests
         run: make test
 
@@ -113,6 +115,9 @@ jobs:
 
       - name: Verify route-engine containment
         run: make check-route-containment
+
+      - name: Verify routing-file parser containment
+        run: make check-parser-containment
 
   mocks-drift:
     runs-on: ubuntu-latest

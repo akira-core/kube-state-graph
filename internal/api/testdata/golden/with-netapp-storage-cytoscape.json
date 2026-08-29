@@ -1,0 +1,147 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "storage-cluster/ontap-prod",
+          "name": "ontap-prod",
+          "type": "storage-cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/db",
+          "name": "db",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/p1",
+          "name": "mongo-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/db/data-mongo-0",
+          "name": "data-mongo-0",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/db",
+          "storageclass": "netapp-nas",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db",
+            "svm": "svm-prod",
+            "volume": "data",
+            "volumename": "pvc-9f3a"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/db/scratch",
+          "name": "scratch",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/db",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "db"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/aggr/aggr1",
+          "name": "aggr1",
+          "type": "netapp-aggr",
+          "parent": "netapp/ontap-prod/ontap-prod-01",
+          "health": "online",
+          "usage": {
+            "used_bytes": 700000000000,
+            "capacity_bytes": 1000000000000
+          },
+          "labels": {
+            "node": "ontap-prod-01",
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/ontap-prod-01",
+          "name": "ontap-prod-01",
+          "type": "netapp-node",
+          "parent": "storage-cluster/ontap-prod",
+          "health": "online",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "64198393-9529-53f1-b4fe-d6ffad8bd939",
+          "type": "pod-mounts-pvc",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/db/data-mongo-0",
+          "labels": {
+            "claim_name": "data-mongo-0"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "016fc590-790c-5ebc-a67a-dcd54002029b",
+          "type": "pod-mounts-pvc",
+          "source": "cluster-alpha/p1",
+          "target": "cluster-alpha/db/scratch",
+          "labels": {
+            "claim_name": "scratch"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "bb57a3b0-75f1-5215-be11-e2570c9aa6df",
+          "type": "pvc-to-netapp-aggr",
+          "source": "cluster-alpha/db/data-mongo-0",
+          "target": "netapp/ontap-prod/aggr/aggr1",
+          "labels": {},
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 40,
+            "read_latency_us": 830,
+            "write_latency_us": 1200,
+            "read_bytes_per_sec": 5242880,
+            "write_bytes_per_sec": 1000000,
+            "max_iops": 5000,
+            "max_bytes_per_sec": 262144000
+          }
+        }
+      }
+    ]
+  }
+}

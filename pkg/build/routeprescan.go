@@ -271,7 +271,9 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 	if len(vec) == 0 {
 		return nil
 	}
-	return collectRouteQueriesWith(vec, newSGResolver(topology))
+	// The prescan is pure lookup — it materialises nothing — so the filtered
+	// flag is irrelevant here; ReadServiceGraph shares its own resolver anyway.
+	return collectRouteQueriesWith(vec, newSGResolver(topology, false))
 }
 
 // viaRouteKey derives the route key for one endpoint anchored on its OWN
@@ -330,10 +332,11 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 		}
 		clientLabel := string(s.Metric["client"])
 		serverLabel := string(s.Metric["server"])
-		traceCluster := string(s.Metric["cluster"])
-		if traceCluster == "" {
-			traceCluster = "unknown" // mirrors missingClusterCounts.bucket
-		}
+		// Through the SAME ladder the parse uses, tally-free: the prescan
+		// re-reads this vector, and lookupClientPod's cluster-scoped fast path
+		// must key on the identity or the prescan would decide a different
+		// client pod than the parse does.
+		traceCluster := r.clusters.identify(s.Metric)
 		clientUID := string(s.Metric["client_k8s_pod_uid"])
 		serverUID := string(s.Metric["server_k8s_pod_uid"])
 		clientUID, serverUID = normalizeSelfLoopUIDs(clientUID, serverUID, clientLabel, serverLabel)
@@ -521,6 +524,15 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 	if !ok {
 		return nil, false // uncollected (build deadline hit): pre-change behaviour
 	}
+	// The route store's cluster column carries no az/env labels, so its names
+	// resolve through the ladder's steps 2-3 only: an identity passes straight
+	// through, a raw name is adopted while unambiguous, and anything else
+	// stands verbatim and simply misses the topology lookups below — degrading
+	// through the existing route_engine_dest_cluster_lacks_service path rather
+	// than a new outcome (design D9).
+	dest := entry.dest
+	dest.Cluster = r.clusters.resolveForeign(dest.Cluster)
+
 	switch {
 	case entry.failed:
 		r.noteExternal("route_engine_error", t, "host", key.host, "port", key.port,
@@ -532,7 +544,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// (family-wide, unchanged): a backend topology miss keeps the
 		// existing external path with the ingress never materialised
 		// (route-hit-ingress-chain D3).
-		if ids := r.resolveServiceLevel(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
+		if ids := r.resolveServiceLevel(dest.Cluster, dest.Namespace, dest.Service); len(ids) > 0 {
 			chain := false
 			// When the destination carries the ingress LB Service identity
 			// and every chain precondition holds, the endpoint resolves to
@@ -542,7 +554,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 			// locked-cluster ingress pods fan in between
 			// (route-hit-ingress-chain D5). Any precondition failure keeps
 			// ids = the backend alone — today's direct shape.
-			if chainIDs, ok := r.resolveRouteChain(entry.dest, ids[0], t); ok {
+			if chainIDs, ok := r.resolveRouteChain(dest, ids[0], t); ok {
 				chainIDs = append(chainIDs, ids[0]) // [ingress, backend]
 				ids, chain = chainIDs, true
 			}
@@ -550,8 +562,8 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
 				"outcome", string(entry.outcome), "chain", chain,
 				"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-				"ingress_namespace", entry.dest.IngressNamespace, "ingress_service", entry.dest.IngressService,
-				"ingress_cluster", entry.dest.Cluster, "caller_cluster", key.callerCluster,
+				"ingress_namespace", dest.IngressNamespace, "ingress_service", dest.IngressService,
+				"ingress_cluster", dest.Cluster, "caller_cluster", key.callerCluster,
 				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
 			return ids, true
 		}
@@ -560,7 +572,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// disagree) — external.
 		r.noteExternal("route_engine_dest_cluster_lacks_service", t,
 			"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-			"host", key.host, "port", key.port, "ingress_cluster", entry.dest.Cluster,
+			"host", key.host, "port", key.port, "ingress_cluster", dest.Cluster,
 			"caller_cluster", key.callerCluster)
 	case entry.outcome == RouteIngressLBService:
 		// The ingress-lb-service-fallback destination is the LB entry point
@@ -571,19 +583,19 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		// synthesized edges: there is no routed backend behind the entry
 		// point. The outcome dimension in the log keeps the coarser
 		// semantics distinguishable from a routed hit.
-		if ids := r.resolveServiceLevelInCluster(entry.dest.Cluster, entry.dest.Namespace, entry.dest.Service); len(ids) > 0 {
+		if ids := r.resolveServiceLevelInCluster(dest.Cluster, dest.Namespace, dest.Service); len(ids) > 0 {
 			r.markIngressService(ids[0], roleIngressLB)
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
 				"side", t.side, "peer_address", value, "host", key.host, "port", key.port,
 				"outcome", string(entry.outcome),
 				"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-				"ingress_cluster", entry.dest.Cluster, "caller_cluster", key.callerCluster,
+				"ingress_cluster", dest.Cluster, "caller_cluster", key.callerCluster,
 				"service_id", ids[0], "client", t.clientLabel, "server", t.serverLabel)
 			return ids, true
 		}
 		r.noteExternal("route_engine_dest_cluster_lacks_service", t,
 			"service", entry.dest.Service, "namespace", entry.dest.Namespace,
-			"host", key.host, "port", key.port, "ingress_cluster", entry.dest.Cluster,
+			"host", key.host, "port", key.port, "ingress_cluster", dest.Cluster,
 			"caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoListenerOnPort:
 		// The design-D5 mis-derived-port signature, kept distinct from an
