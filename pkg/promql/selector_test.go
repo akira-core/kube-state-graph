@@ -240,9 +240,10 @@ func TestQueryDims_HarvestNeverCarriesClusterOrNamespace(t *testing.T) {
 	}
 	got := Render(QVolumeLabels, time.Minute, LabelKeys{}, sel)
 	assert.Equal(t, `last_over_time(volume_labels[1m])`, got)
-	assert.Equal(t, `last_over_time(qos_read_ops{lun=""}[1m])`,
+	assert.Equal(t, `last_over_time(qos_read_ops[1m])`,
 		Render(QQoSReadOps, time.Minute, LabelKeys{}, sel),
-		"the fixed lun selector is the only selector a Harvest query carries")
+		"a Harvest query carries no matcher at all — not a request one, and "+
+			"since D11 not a lun one either")
 }
 
 // TestQueryDims_ControllerAnnotationFamiliesAreNamespaced pins the third
@@ -294,8 +295,8 @@ func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
 			`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",cluster="cluster-alpha"}[1m])`},
 		"node condition": {QNodeStatusCondition,
 			`last_over_time(kube_node_status_condition{condition="Ready",az="zone-a",cluster="cluster-alpha"}[1m])`},
-		"qos volume granularity (Harvest routes, never matches)": {QQoSReadOps,
-			`last_over_time(qos_read_ops{lun=""}[1m])`},
+		"qos workload (Harvest routes, never matches)": {QQoSReadOps,
+			`last_over_time(qos_read_ops[1m])`},
 		"job owner cronjob": {QJobOwner,
 			`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
 		"deployment annotations": {QDeploymentAnnotations,

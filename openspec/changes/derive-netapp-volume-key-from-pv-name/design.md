@@ -6,6 +6,8 @@ See `proposal.md` — Why. The constraints that shape the approach:
   `fetchOptional` (log-and-continue); the KSM legs are `fetch` (abort). All are
   issued together, and `parseTopology` — a pure function of the collected
   vectors — runs after the group completes.
+- Hop B's `{lun=""}` selector was a query-layer contract; D11 moves it into
+  `sumQoSIO`.
 - `resolveNetAppStorage` reads `volume_name` at exactly two sites: the
   `volume_labels` index (`pkg/build/netapp.go:89`) and `indexQoSFamily`
   (`:259`). Hop C keyed on the `(cluster, svm, policy_group)` triple recovered
@@ -282,6 +284,49 @@ unscoped. Rejected — it fixes hop C and leaves the (pre-existing) hop-B I/O
 loss in place, and it would emit a PVC `svm` label naming a filer the claim's
 own edge does not point at.
 
+### D11 — Volume granularity becomes a reader rule so the SAN policy stays reachable
+
+The six workload queries drop their `lun=""` selector; `sumQoSIO` skips
+candidates with a non-empty `lun` instead, and `pickPolicy` reads every
+candidate.
+
+The matcher was introduced to stop a LUN workload — which carries its
+FlexVol's `volume` — being summed on top of the volume workload for one claim.
+That reason is untouched; only its enforcement point moves. What the matcher
+also did, unintentionally, was hide the one series that names the QoS policy on
+a SAN backend: with `ontap-san`, the policy is attached to the LUN, so the
+FlexVol's own workload sits in ONTAP's built-in `User-Best_effort` class, which
+declares no ceiling and appears in no `qos_policy_fixed_max_throughput_*`
+series. Every SAN claim therefore resolved a policy group that could never
+match, and no ceiling was reachable — silently, since this capability emits no
+signal for a missing ceiling.
+
+Moving the discard into `sumQoSIO` is strictly stronger than the matcher was.
+A `lun=""` selector also matches series carrying no `lun` label at all, which
+the previous design relied on for templates that omit it on VOLUME workloads —
+but the same property means a template omitting `lun` on a LUN workload slipped
+straight through. The Go guard reads the label it actually has.
+
+Cardinality is bounded: the six legs are issued ONLY through
+`RenderQoSVolumeScoped`, so every query already carries the `volume`
+alternation and the extra rows are the LUNs of the matched FlexVols — one per
+claim under `ontap-san`. No filer-wide LUN scan is reachable.
+
+**Picking among the two policy groups** is data-driven, not a name list. The
+pick prefers a `policy_group` the fixed-policy index holds for the claim's
+`(ontap-cluster, svm)`, falling back to the lexically-smallest non-empty value
+when none resolves. A hardcoded set of built-in class names would need
+maintaining per ONTAP release and would still be wrong for a user-defined
+policy that happens to declare no ceiling. The preference is load-bearing
+rather than cosmetic: `User-Best_effort` sorts BEFORE `gold-tier`, so a plain
+lexical pick would take the built-in class and resolve nothing.
+
+*Alternative considered:* keep `lun=""` on the six legs and add a seventh,
+label-only read at `lun!=""` purely to recover the policy. Rejected — it makes
+the ceiling depend on whichever single family that read names (breaking the
+per-family degradation every other Harvest leg has), and it buys back a
+query-layer invariant that was never airtight.
+
 ## Risks / Trade-offs
 
 - **A deployment whose FlexVol names encode no PV name at all loses its storage
@@ -312,6 +357,14 @@ own edge does not point at.
   non-empty `svm` now emits no `svm` label at all. → Correct: that value named a
   filer the claim's own edge does not point at, and emitting it cost the edge
   its I/O. `netapp_qos_join_miss` already covers the resulting measurement gap.
+- **The six workload legs now return LUN rows as well as volume rows.** Roughly
+  double the series for a SAN estate. → Bounded by the `volume` scope already in
+  place (one LUN per FlexVol under `ontap-san`), and the rows are what make the
+  ceiling reachable at all.
+- **A FlexVol holding several LUNs with different policies** resolves the
+  lexically-smallest of those that declare a ceiling. → Inherited coarseness:
+  such an estate (`ontap-san-economy`) already maps many claims onto one
+  FlexVol, which hop A cannot separate either — documented as blind spot 2.
 - **A volume in no QoS policy group still gets no ceiling.** D9 does not widen
   the key's reachability; it only re-anchors two of its three components. →
   Accepted: that is the pre-existing behaviour, no signal is emitted for it (a

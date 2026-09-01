@@ -171,7 +171,7 @@ read. The six QoS workload legs are therefore issued in a **second wave**,
 after hop A, restricted to exactly the FlexVol names the loaded claims matched:
 
 ```
-last_over_time(qos_read_ops{lun="",volume=~"trident_pvc_a|trident_pvc_b"}[5m])
+last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 ```
 
 Consequences worth knowing:
@@ -191,12 +191,30 @@ Consequences worth knowing:
   that produced it were themselves loaded under the request's selectors, so this
   is the capability's "narrowed by reference" rule reaching the query layer.
 
-**Volume granularity is a query-layer contract.** Every QoS leg carries `lun=""`
-alongside the scope. ONTAP collects a workload per LUN as well as per volume, and
-a LUN workload carries the `volume` of its containing FlexVol — without the
-matcher, LUN traffic would be summed on top of volume traffic for the same
-claim. A PromQL empty-string matcher also matches series carrying no `lun`
-label, so the contract holds against a template that omits it.
+**Volume granularity is a READER rule, not a matcher.** The QoS legs carry the
+`volume` scope and nothing else; the reader sums only candidates whose `lun`
+label is empty. ONTAP collects a workload per LUN as well as per volume and a
+LUN workload carries the `volume` of its containing FlexVol, so the two must
+never be summed for one claim — but the discard has to live in the reader,
+because on a SAN backend that LUN row is the ONLY series naming the QoS policy.
+
+**On `ontap-san`, the ceiling is reachable only through the LUN workload.** The
+QoS policy is attached to the LUN, so the FlexVol's own workload falls into
+ONTAP's built-in `User-Best_effort` class, which declares no ceiling and appears
+in no `qos_policy_fixed_max_throughput_*` series. The policy pick therefore
+reads both granularities and prefers a `policy_group` the fixed-policy families
+actually hold — data-driven, never a hardcoded list of built-in class names.
+If a SAN claim shows I/O but no `max_iops`, check that its LUN workload carries
+a `policy_group` that `qos_policy_fixed_max_throughput_iops` also names:
+
+```promql
+count by (cluster, svm, policy_group) (qos_read_ops)   # both granularities
+count by (cluster, svm, name) (qos_policy_fixed_max_throughput_iops)
+```
+
+A reader-side discard is also strictly stronger than the `lun=""` matcher it
+replaces: an empty-string matcher admits series carrying no `lun` label at all,
+so a template omitting `lun` on a LUN workload slipped straight through it.
 
 **Unit conversion.** `qos_policy_fixed_max_throughput_mbps` is the ONE value not
 read verbatim: `max_bytes_per_sec = mbps × 1048576`, so the ceiling shares the

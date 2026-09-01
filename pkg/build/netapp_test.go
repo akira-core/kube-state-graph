@@ -77,10 +77,10 @@ func volLabelSample(pvName, oc, node, aggr, svm string) model.Sample {
 	}
 }
 
-// qosSample is a hop-B QoS workload series. It carries no aggr/node dimension —
-// that is exactly why hop A exists. LUN-level workloads never reach the
-// resolver: they are excluded at the query layer by the `lun=""` matcher,
-// pinned by promql.TestRender_QoSVolumeGranularity.
+// qosSample is a hop-B QoS workload series at VOLUME granularity (no `lun`
+// label). It carries no aggr/node dimension — that is exactly why hop A exists.
+// LUN-level workloads DO reach the resolver since D11 (see lunQosSample); it is
+// sumQoSIO that discards them, so their policy group stays readable.
 func qosSample(pvName, oc, svm, policy string, val float64) model.Sample {
 	return model.Sample{
 		Metric: model.Metric{
@@ -91,6 +91,16 @@ func qosSample(pvName, oc, svm, policy string, val float64) model.Sample {
 		},
 		Value: model.SampleValue(val),
 	}
+}
+
+// lunQosSample is a LUN-level hop-B workload series. ONTAP collects one per
+// LUN as well as per volume and it carries its FlexVol's `volume`, so it must
+// never be summed onto the claim — but on a SAN backend it is the ONLY series
+// naming the real QoS policy group.
+func lunQosSample(pvName, oc, svm, policy, lun string, val float64) model.Sample {
+	sm := qosSample(pvName, oc, svm, policy, val)
+	sm.Metric["lun"] = model.LabelValue(lun)
+	return sm
 }
 
 // policySample is a hop-C qos_policy_fixed_max_throughput_* series.
@@ -584,6 +594,68 @@ func TestResolveNetAppStorage_SVMScopedToPickedCluster(t *testing.T) {
 	require.NotNil(t, res.edges[0].IO.MaxIOPS)
 	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12,
 		"the ceiling must key on (oc-a, zulu, gold), not on the other filer's svm")
+}
+
+// The ontap-san shape, one LUN per FlexVol: the QoS policy is attached to the
+// LUN, so the FlexVol's own workload falls into ONTAP's built-in
+// "User-Best_effort" class, which declares no ceiling and has no fixed-policy
+// series. The ceiling must come from the LUN row's policy — while the LUN
+// row's I/O must still be excluded from the sum.
+func TestResolveNetAppStorage_SANPolicyOnLUN(t *testing.T) {
+	res := netappFixture{
+		claims: claim1(),
+		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(
+			qosSample("pvc-x", "oc", "svm", "User-Best_effort", 150),
+			lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90),
+		),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+		maxMBps: sampleVec(policySample("oc", "svm", "gold-tier", 250)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	require.NotNil(t, io.ReadOps)
+	assert.InDelta(t, 150.0, *io.ReadOps, 1e-12,
+		"the LUN workload must not be summed on top of the volume workload")
+	require.NotNil(t, io.MaxIOPS, "the ceiling must come from the LUN row's policy")
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+	require.NotNil(t, io.MaxBytesPerSec)
+	assert.InDelta(t, 250.0*1048576, *io.MaxBytesPerSec, 1e-12)
+}
+
+// The preference is data-driven, not a hardcoded list of ONTAP built-in class
+// names: "User-Best_effort" sorts BEFORE "gold-tier", so a plain lexical pick
+// would take it. The policy that the fixed-policy index actually holds wins.
+func TestResolveNetAppStorage_PolicyPickPrefersAResolvingOne(t *testing.T) {
+	assert.Less(t, "User-Best_effort", "gold-tier",
+		"the built-in class must sort first, or this test proves nothing")
+	res := netappFixture{
+		claims: claim1(),
+		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(
+			lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90),
+			qosSample("pvc-x", "oc", "svm", "User-Best_effort", 150),
+		),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+	}.run()
+	require.NotNil(t, res.edges[0].IO.MaxIOPS)
+	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12)
+}
+
+// A LUN-only volume has no volume-level row to measure: the edge is still
+// drawn (hop A resolved it) but carries no metrics at all, so no ceiling can
+// ride along either — the attachment invariant holds under the widened read.
+func TestResolveNetAppStorage_LUNOnlyWorkloadMeasuresNothing(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90)),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	assert.Nil(t, res.edges[0].IO,
+		"a LUN row alone is not a volume measurement, and a ceiling never rides alone")
 }
 
 // volume_labels rows without a `node` label leave the aggregate owner-less: the

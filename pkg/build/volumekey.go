@@ -134,7 +134,7 @@ func defaultVolumeKeyRewriter() *VolumeKeyRewriter {
 // DefaultQoSScopeBatchBytes bounds one scoped QoS query's rendered `volume`
 // alternation when the operator configures no budget. It sits comfortably under
 // the common VictoriaMetrics `-search.maxQueryLen` default, leaving room for the
-// metric name, the `lun=""` matcher and the surrounding function call.
+// metric name and the surrounding function call.
 const DefaultQoSScopeBatchBytes = 8192
 
 // volumeKey resolves the rewriter this build uses, adopting the defaults for a

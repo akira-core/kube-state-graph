@@ -23,10 +23,12 @@ func isQoSWorkloadQuery(q Query) bool {
 }
 
 // RenderQoSVolumeScoped renders one QoS workload query restricted to a known
-// set of ONTAP FlexVol names, composed with — never replacing — the family's
-// fixed `lun=""` volume-granularity contract:
+// set of ONTAP FlexVol names. That scope is the query's ONLY matcher — volume
+// granularity is enforced by the reader, not here, because the LUN rows a
+// `lun=""` matcher would drop are the only ones naming the QoS policy on a SAN
+// backend (design.md D11):
 //
-//	last_over_time(qos_read_ops{lun="",volume=~"trident_pvc_a|trident_pvc_b"}[5m])
+//	last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //
 // The values are FlexVol names the volume-object family already returned, so
 // the restriction is EXACT: pkg/build's derive-then-match runs once, in Go,
@@ -52,7 +54,7 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, volumes []string) (str
 	if len(vals) == 0 {
 		return "", false
 	}
-	matchers := appendMatcher([]string{qosVolumeGranularitySelector}, HarvestVolumeLabel, vals)
+	matchers := appendMatcher(nil, HarvestVolumeLabel, vals)
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }

@@ -130,7 +130,7 @@ They are **not** caller filters and are always rendered **before** any
 |---|---|---|
 | `kube_node_status_addresses` | `type=~"ExternalIP\|InternalIP"` | ExternalIP wins; InternalIP is the fallback when the node has no ExternalIP |
 | `kube_node_status_condition` | `condition="Ready"` | Only the Ready condition is surfaced as `data.ready_status` |
-| six `qos_{read,write}_{ops,latency,data}` | `lun=""` plus a data-derived `volume=~"…"` scope | ONTAP also collects a per-LUN workload that carries its FlexVol's `volume`; without the `lun` matcher LUN traffic is double-counted. An empty-string matcher also matches series that omit `lun`. The `volume` alternation names the FlexVols the loaded claims matched — derived from upstream data, not from the request |
+| six `qos_{read,write}_{ops,latency,data}` | a data-derived `volume=~"…"` scope, nothing else | ONTAP also collects a per-LUN workload that carries its FlexVol's `volume`. It IS fetched — on a SAN backend it is the only series naming the QoS policy — and the reader discards non-empty-`lun` rows from every I/O sum, which is stricter than a `lun=""` matcher (that also admits rows omitting the label). The `volume` alternation names the FlexVols the loaded claims matched — derived from upstream data, not from the request |
 | `traces_service_graph_request_total` | `client!~"user\|unknown",server!~"user"` | Drops the connector's virtual peers (`client="user"` / `"unknown"`, `server="user"`). Exact, case-sensitive. `server="unknown"` **is** admitted so the unknown-server peer-address ladder can run |
 | two RED series | same sentinel **plus** `edge_relation!="link"` | Span-link series still produce an edge from `_total`, but they do not contribute rate / error / latency. An absent `edge_relation` label is retained (`!=` treats missing as `""`) |
 | `kube_job_owner` | `owner_kind="CronJob",owner_is_controller="true"` | The reader (`resolveJobCronJobOwners`) keeps exactly those rows — Jobs owned by a CronJob controller. Every other owner kind, a non-controller row, or a missing `owner_is_controller` is discarded before it is keyed or counted |
@@ -322,7 +322,7 @@ count(kube_endpointslice_labels{label_kubernetes_io_service_name!=""})
 # Harvest join key present on both hops. Compare a `volume` value here with a
 # claim's `volumename` to check the configured derivation fits the estate.
 count by (volume) (volume_labels)
-count(qos_read_ops{lun=""})
+count(qos_read_ops)
 ```
 
 The code-side pins: `TestQueryDims_EveryQueryListed` fails if a `Query`

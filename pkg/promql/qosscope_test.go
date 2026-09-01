@@ -1,7 +1,6 @@
 package promql
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +15,7 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, []string{"trident_pvc_a"})
 		require.True(t, ok)
 		assert.Equal(t,
-			`last_over_time(qos_read_ops{lun="",volume="trident_pvc_a"}[1m])`, got)
+			`last_over_time(qos_read_ops{volume="trident_pvc_a"}[1m])`, got)
 	})
 
 	t.Run("several names render one anchored alternation", func(t *testing.T) {
@@ -24,7 +23,7 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 			[]string{"trident_pvc_b", "trident_pvc_a"})
 		require.True(t, ok)
 		assert.Equal(t,
-			`last_over_time(qos_write_data{lun="",volume=~"trident_pvc_a|trident_pvc_b"}[5m])`, got,
+			`last_over_time(qos_write_data{volume=~"trident_pvc_a|trident_pvc_b"}[5m])`, got,
 			"values are sorted, so the rendered string is a pure function of the set")
 	})
 
@@ -32,7 +31,7 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute,
 			[]string{"v_a", "", "v_a"})
 		require.True(t, ok)
-		assert.Equal(t, `last_over_time(qos_read_ops{lun="",volume="v_a"}[1m])`, got)
+		assert.Equal(t, `last_over_time(qos_read_ops{volume="v_a"}[1m])`, got)
 	})
 
 	t.Run("a metacharacter in a name matches itself literally", func(t *testing.T) {
@@ -62,13 +61,13 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 		}
 	})
 
-	t.Run("the fixed lun contract is composed, never replaced", func(t *testing.T) {
+	t.Run("the volume scope is the only matcher", func(t *testing.T) {
 		for _, q := range QoSWorkloadQueries {
 			got, ok := RenderQoSVolumeScoped(q, time.Minute, []string{"v"})
 			require.True(t, ok)
-			assert.Contains(t, got, `lun=""`)
-			assert.Less(t, strings.Index(got, `lun=""`), strings.Index(got, "volume"),
-				"the request-invariant selector is rendered first")
+			assert.NotContains(t, got, "lun",
+				"volume granularity is the reader's rule, never a matcher (D11)")
+			assert.Contains(t, got, `volume="v"`)
 		}
 	})
 }
@@ -120,7 +119,7 @@ func TestRenderQoSVolumeScoped_DoesNotDisturbRender(t *testing.T) {
 	t.Parallel()
 	for _, q := range QoSWorkloadQueries {
 		assert.Equal(t,
-			`last_over_time(`+string(q)+`{lun=""}[1m])`,
+			`last_over_time(`+string(q)+`[1m])`,
 			Render(q, time.Minute, LabelKeys{}, Selector{}))
 	}
 }

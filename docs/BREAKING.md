@@ -58,9 +58,10 @@ labels — see "The Harvest `volume_name` relabel is no longer read" below:
 | `qos_policy_fixed_max_throughput_{iops,mbps}` | C — ceiling | No `max_iops` / `max_bytes_per_sec` |
 
 Required Harvest templates: volume instance labels, QoS workload, QoS fixed
-policy. The QoS legs are issued at `{lun=""}` — without that matcher a LUN
-workload, which carries its FlexVol's `volume`, would be summed on top of the
-volume's own traffic.
+policy. The QoS legs carry the `volume` scope and no `lun` matcher: a LUN
+workload, which carries its FlexVol's `volume`, is fetched (on a SAN backend it
+is the only series naming the QoS policy) and discarded by the reader before any
+I/O sum, so it is never added to the volume's own traffic.
 
 Two aggregated coverage warnings replace the single one:
 `netapp_volume_join_miss` (hop A) and `netapp_qos_join_miss` (hop B), each gated

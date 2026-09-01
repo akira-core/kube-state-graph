@@ -104,9 +104,31 @@ about is known, and the QoS read can be scoped to it.
   rides on a matched workload series, so a ceiling cannot exist without a
   measurement.
 
+### Volume granularity moves from the selector into the reader
+
+- **The six workload queries drop their `lun=""` selector.** `sumQoSIO` skips
+  candidates carrying a non-empty `lun` instead, so the no-double-count rule is
+  unchanged in effect and strictly stronger in enforcement — a `lun=""` matcher
+  also admits series with no `lun` label at all, so a Harvest template omitting
+  it on a LUN workload slipped through, which the Go guard cannot.
+- **Why it has to move:** on an `ontap-san` backend the QoS policy is attached
+  to the LUN, so the FlexVol's own workload sits in ONTAP's built-in
+  `User-Best_effort` class — which declares no ceiling and appears in no
+  `qos_policy_fixed_max_throughput_*` series. The selector hid the only series
+  naming the real policy, so every SAN claim resolved a ceiling-less class and
+  silently got no `max_iops` / `max_bytes_per_sec`.
+- The policy pick therefore reads candidates at **both granularities** and
+  **prefers a policy group the fixed-policy families actually hold**, falling
+  back to the lexically-smallest non-empty value. The preference is data-driven,
+  never a hardcoded list of built-in class names — and it is load-bearing:
+  `User-Best_effort` sorts before `gold-tier`.
+- Cardinality is bounded by the `volume` scope already in place: the six legs
+  are issued only through the scoped renderer, so the extra rows are the LUNs of
+  the matched FlexVols, one per claim under `ontap-san`.
+
 ### Unchanged
 
-- The `{lun=""}` volume-granularity contract, the three-hop result structure
+- The three-hop result structure
   (topology / measurement / ceiling), the two coverage warnings
   (`netapp_volume_join_miss`, `netapp_qos_join_miss`) and their per-family
   gating, backend routing of the Harvest family, and the response body.

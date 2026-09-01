@@ -447,12 +447,6 @@ func buildFamilyAcceptsAZ() map[Family]bool {
 // to every backend serving it.
 func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
 
-// qosVolumeGranularitySelector keeps the Harvest QoS workload reads at volume
-// granularity. A PromQL empty-string matcher also matches series carrying no
-// such label at all, so the contract stays correct against a Harvest template
-// that omits `lun` entirely.
-const qosVolumeGranularitySelector = `lun=""`
-
 // HarvestVolumeLabel is the STOCK Harvest label naming the ONTAP FlexVol, on
 // both the volume-object family (QVolumeLabels) and the six QoS workload
 // families. It is the storage join's key on the Harvest side; the Kubernetes
@@ -546,7 +540,7 @@ const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 // metric-name prefix.
 //
 // Two selector layers meet here and MUST NOT be conflated. A query's FIXED
-// selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`,
+// selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`,
 // `owner_kind="CronJob",owner_is_controller="true"`,
 // `annotation_argocd_argoproj_io_tracking_id!=""`, the service-graph
 // sentinel and link matchers) is a request-invariant metric-selection
@@ -641,7 +635,7 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// a fixed,
 		// request-invariant metric-selection contract (same class as the D30
 		// sentinel matcher and condition="Ready"), NOT a caller filter.
-		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(qosVolumeGranularitySelector), w)
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(""), w)
 	case QQoSPolicyFixedMaxIOPS:
 		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, braces(""), w)
 	case QQoSPolicyFixedMaxMBps:

@@ -130,7 +130,7 @@ The family is OPTIONAL. When it is absent from the window — the normal case fo
 
 The builder SHALL consume the NetApp Harvest QoS workload series `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, and `qos_write_data`. The fixed, case-sensitive label contract each series MUST carry: `cluster` (the ONTAP cluster name), `svm` (the serving Storage Virtual Machine), `policy_group` (the QoS policy group governing the workload — empty when the volume is in none), `lun` (empty for a volume-level workload), and `volume` (the ONTAP FlexVol name, the same stock label the volume-object family carries). No non-stock label is read from these families.
 
-Every issued QoS query SHALL restrict the selector to **volume granularity** with the exact matcher `lun=""`. ONTAP collects a workload per LUN as well as per volume, and a LUN workload carries the `volume` of its containing FlexVol, so an unrestricted read would sum LUN traffic on top of volume traffic for the same claim. This matcher is a fixed, **request-invariant metric-selection contract** — not a caller filter — of the same class as the service-graph sentinel matcher and `kube_node_status_condition{condition="Ready"}`. Because a PromQL empty-string matcher also matches series carrying no such label at all, the contract stays correct against a Harvest template that omits `lun` entirely. It is composed with, never replaced by, the `volume` scope restriction of the scoped-read requirement.
+Issued QoS queries SHALL carry **no `lun` matcher**. ONTAP collects a workload per LUN as well as per volume and a LUN workload carries the `volume` of its containing FlexVol, so the two SHALL NOT be summed together — but that discard is a **reader** rule, not a selector one: the builder SHALL sum only candidates whose `lun` label is empty, and SHALL read every candidate, LUN rows included, when resolving the policy group (see "QoS fixed-policy throughput ceilings"). Keeping the discard in the reader is strictly stronger than a `lun=""` selector, which a Harvest template omitting `lun` on a LUN workload would slip past, and it is what makes the SAN policy reachable at all. The `volume` scope restriction of the scoped-read requirement is therefore the ONLY matcher these queries carry.
 
 Values SHALL be read **verbatim**: Harvest already resolves ONTAP's base counters, so the ops series are per-second rates, the latency series are averages in microseconds, and the data series are throughput in bytes per second. The issued queries SHALL NOT wrap these series in `rate()` — the opposite of the service-graph RED counters, where the upstream series are raw counters.
 
@@ -141,12 +141,17 @@ All six families are OPTIONAL and independent of the topology source. When none 
 #### Scenario: QoS queries restricted to volume granularity
 
 - **WHEN** the builder issues the six Harvest QoS queries for a window
-- **THEN** every query string carries the exact `lun=""` matcher, references the bare series evaluated at the window end, and none wraps the series in `rate()`
+- **THEN** volume granularity is enforced by the reader, not the selector: no query string carries a `lun` matcher, each references the bare series evaluated at the window end restricted only by the `volume` scope, and none wraps the series in `rate()`
 
 #### Scenario: LUN workloads never contribute
 
-- **WHEN** a claim's matched FlexVol is carried both by a volume-level QoS series (`lun=""`, `qos_read_ops` = `150`) and by a LUN-level QoS series (`lun="/vol/trident_pvc_9f3a/lun0"`, `qos_read_ops` = `90`)
-- **THEN** the edge reports `read_ops: 150` — the LUN series is excluded at the query layer and never summed in
+- **WHEN** a claim's matched FlexVol is carried both by a volume-level QoS series (no `lun` label, `qos_read_ops` = `150`) and by a LUN-level QoS series (`lun="/vol/trident_pvc_9f3a/lun0"`, `qos_read_ops` = `90`)
+- **THEN** the edge reports `read_ops: 150` — the LUN series reaches the reader, which discards it from every I/O sum
+
+#### Scenario: A LUN-only FlexVol measures nothing
+
+- **WHEN** a claim's matched FlexVol is carried by LUN-level QoS series only, with no volume-level row in the window
+- **THEN** the edge is still emitted with no `metrics` key at all, and the claim is counted by the I/O-coverage signal — a LUN row is not a volume measurement
 
 #### Scenario: A colliding PV name on another filer does not contribute
 
@@ -165,7 +170,9 @@ The builder SHALL resolve each joined volume's declared throughput ceiling from 
 The join key is the `(ontap-cluster, svm, policy-group)` triple, assembled from BOTH topology hops:
 
 - `ontap-cluster` and `svm` come from **hop A** — the ONTAP cluster of the claim's picked aggregate and the SVM the `volume_labels` match resolved (see "PVC svm label re-sourced from the Harvest join"), so the ceiling is anchored on the same filer and SVM the edge itself points at.
-- `policy-group` comes from **hop B** — the `policy_group` label of the claim's in-scope QoS workload candidates, which is the ONLY upstream statement of which policy group governs THIS FlexVol; `volume_labels` carries no policy identity. When in-scope candidates disagree (a volume moved between policy groups inside the window) the builder SHALL pick the lexically-smallest non-empty value deterministically.
+- `policy-group` comes from **hop B** — the `policy_group` label of the claim's in-scope QoS workload candidates, which is the ONLY upstream statement of which policy group governs THIS FlexVol; `volume_labels` carries no policy identity. Candidates SHALL be read at **both granularities**, LUN-level rows included: on a SAN backend the QoS policy is attached to the LUN, and the FlexVol's own workload then falls into the provisioner-independent built-in class the storage system assigns to unmanaged workloads (`User-Best_effort` on ONTAP), which by definition declares no ceiling and therefore has no fixed-policy series. Admitting LUN rows here cannot affect a measurement, since the I/O sum reads volume-level rows only.
+
+  The pick SHALL **prefer a policy group the fixed-policy families actually hold** for the claim's `(ontap-cluster, svm)`, taking the lexically-smallest such value; when none resolves it SHALL fall back to the lexically-smallest non-empty value overall, which leaves the ceiling absent exactly as an unmatched key does. Both passes are order-free. The preference SHALL be data-driven — the builder SHALL NOT carry a hardcoded list of built-in class names, whose spelling varies by storage-system release — and it is what stops a built-in class that sorts ahead of the real policy from winning the pick.
 
 Sourcing the cluster and SVM from hop A rather than from the workload series is what lets a workload series carrying a `policy_group` but NO `svm` label still resolve a ceiling, and what keeps the key on the picked filer under a cross-filer FlexVol-name collision.
 
@@ -179,6 +186,16 @@ Because the policy group is recovered from a matched workload series, a ceiling 
 
 - **WHEN** a claim's picked aggregate is on `cluster="ontap-prod"`, its `volume_labels` match resolved `svm="svm-prod"`, its in-scope QoS workload series carry `policy_group="gold-tier"`, and the fixed-policy series `qos_policy_fixed_max_throughput_iops{cluster="ontap-prod", svm="svm-prod", name="gold-tier"} = 5000` and `qos_policy_fixed_max_throughput_mbps{...} = 250` exist
 - **THEN** the edge's `data.metrics` contains `max_iops: 5000` and `max_bytes_per_sec: 262144000`
+
+#### Scenario: SAN claim resolves its ceiling through the LUN workload
+
+- **WHEN** a claim's FlexVol carries a volume-level workload in the built-in `User-Best_effort` class (`qos_read_ops` = `150`, no fixed-policy series for that class) and a LUN-level workload in `gold-tier` (`qos_read_ops` = `90`), and `gold-tier` holds fixed-policy series for the claim's `(ontap-cluster, svm)`
+- **THEN** the edge reports `read_ops: 150` (the LUN row is not summed) AND resolves `gold-tier`'s ceiling — the policy group is recovered from the LUN row, the only series naming it
+
+#### Scenario: A built-in class sorting first does not win the pick
+
+- **WHEN** a claim's candidates offer both `User-Best_effort` (no fixed-policy series) and `gold-tier` (fixed-policy series present), and `User-Best_effort` sorts lexically before `gold-tier`
+- **THEN** the ceiling resolves from `gold-tier` — the pick prefers a policy the fixed-policy families hold over a lexically-smaller one they do not
 
 #### Scenario: Another policy group in the same SVM is never borrowed
 

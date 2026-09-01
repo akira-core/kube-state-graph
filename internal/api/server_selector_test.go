@@ -108,7 +108,7 @@ func TestGraph_SelectorQueriesCaptured(t *testing.T) {
 		`last_over_time(volume_labels[1h])`,
 		seen["volume_labels"], "Harvest takes no request matcher — az only routes it, env is inert")
 	assert.Equal(t,
-		`last_over_time(qos_read_ops{lun="",volume="trident_pvc_9f3a"}[1h])`,
+		`last_over_time(qos_read_ops{volume="trident_pvc_9f3a"}[1h])`,
 		seen["qos_read_ops"],
 		"the QoS scope is derived from the matched FlexVol names, never from the request: still no az / env / cluster / namespace matcher")
 	assert.Equal(t,
