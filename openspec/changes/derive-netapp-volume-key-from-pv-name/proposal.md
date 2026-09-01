@@ -81,6 +81,29 @@ about is known, and the QoS read can be scoped to it.
   consults the QoS index only for claims that resolved an aggregate, but the
   "three hops degrade independently" wording in the spec is restated.
 
+### Ceiling key re-anchored on hop A
+
+- **The hop-C ceiling key stays the `(ontap-cluster, svm, policy-group)`
+  triple, but stops being recovered wholesale from the workload series.** Its
+  `ontap-cluster` and `svm` now come from **hop A** — the ONTAP cluster of the
+  claim's picked aggregate and the SVM the `volume_labels` match resolved — and
+  hop B is read only for `policy_group`, which is the sole upstream statement of
+  which policy governs this FlexVol (`volume_labels` carries no policy
+  identity).
+- This is **additive** for the resolved value: a workload series carrying a
+  `policy_group` but no `svm` label of its own now resolves a ceiling where it
+  previously could not, and under a cross-filer FlexVol-name collision the key
+  follows the filer the edge actually points at.
+- **An incomplete or unmatched key is ignored, never widened.** No hop-A `svm`,
+  no non-empty `policy_group` on any in-scope candidate, or a triple matching no
+  fixed-policy series leaves both fields absent. There is deliberately no
+  SVM-wide or cluster-wide fallback: an SVM commonly holds one policy group per
+  storage class, so any other group's figure would name a limit this volume does
+  not have.
+- The attachment invariant is unchanged, and structurally so: the policy group
+  rides on a matched workload series, so a ceiling cannot exist without a
+  measurement.
+
 ### Unchanged
 
 - The `{lun=""}` volume-granularity contract, the three-hop result structure
@@ -108,7 +131,10 @@ introduces no new node type, edge type, metric family, or observable attribute.
   requirement; the PVC-to-aggregate join requirement is restated as
   derive-then-match; a new requirement covers the scoped, batched QoS read and
   its per-batch degradation; the QoS volume-granularity rationale and the
-  join-coverage scenarios are restated against the new key.
+  join-coverage scenarios are restated against the new key; the
+  fixed-policy ceiling requirement re-anchors its triple's `cluster` and `svm`
+  components on hop A, keeps `policy-group` on hop B, and states that an
+  incomplete or unmatched key is ignored rather than widened.
 - `cluster-topology-source`: the PVC `svm` label requirement and its scenarios
   reference the Harvest join by `volume_name`; they are restated against the
   derived token and stock `volume` label. The `volumename` label's own
@@ -117,7 +143,9 @@ introduces no new node type, edge type, metric family, or observable attribute.
 ## Impact
 
 - `pkg/build/netapp.go` — the two label read sites (`volume_labels` indexing and
-  `indexQoSFamily`), plus the new token derivation and matcher.
+  `indexQoSFamily`), plus the new token derivation and matcher; the ceiling
+  ceiling key re-anchor (`applyCeiling` fed hop A's cluster and svm, `pickPolicy`
+  reduced to the `policy_group` pick alone, and the incomplete-key guard).
 - `pkg/build/topology.go` — the `pvcVolume` claim list gains the derived token;
   `ReadTopology`'s flat errgroup gains a two-wave Harvest sub-pipeline.
 - `pkg/build/build.go` — `build.Options` carries the rewrite rules and match

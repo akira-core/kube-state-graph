@@ -816,7 +816,7 @@ live under `openspec/specs/`.
     the PVC `svm` label. An **info series**: its sample value is discarded, only
     its labels (`cluster` = ONTAP cluster, `node`, `aggr`, `svm`) are read.
   - **hop B `qos_{read,write}_{ops,latency,data}`** — the six measured I/O
-    figures plus the volume's `policy_group`. Queried at **`{lun=""}`**: ONTAP
+    figures. Queried at **`{lun=""}`**: ONTAP
     collects a workload per LUN as well as per volume, and a LUN workload
     carries its FlexVol's `volume`, so an unfiltered read would
     double-count the claim. That matcher is a fixed **request-invariant
@@ -847,27 +847,44 @@ live under `openspec/specs/`.
     matcher — but the claims that produced it were loaded under the request's
     selectors, which is "narrowed by reference" reaching the query layer.
   - **hop C `qos_policy_fixed_max_throughput_{iops,mbps}`** — the declared
-    ceiling, joined on the `(ontap_cluster, svm, policy_group)` triple recovered
-    from hop B. The policy's identity label is read as `name` with a
+    ceiling, joined on the `(ontap_cluster, svm, policy_group)` triple assembled
+    from BOTH topology hops: **hop A** owns the ONTAP cluster of the picked
+    aggregate and the SVM the `volume_labels` match resolved, **hop B** owns the
+    `policy_group` (`volume_labels` carries no policy identity, so hop B is the
+    only upstream statement of which policy governs this FlexVol). Anchoring the
+    first two on hop A is what lets a workload series carrying a `policy_group`
+    but NO `svm` still resolve a ceiling, and keeps the key on the filer the
+    edge points at. The policy's identity label is read as `name` with a
     `policy_group` fallback (Harvest spells it differently across templates).
-    `max_bytes_per_sec` is the **one** value not read verbatim: `mbps × 1048576`
-    (`bytesPerMB`), so the ceiling shares the unit of `read_bytes_per_sec`.
+    An incomplete or unmatched key is **ignored, never widened** — no hop-A
+    `svm`, no non-empty `policy_group`, or no matching series leaves both fields
+    absent rather than borrowing another policy group's figure from the same
+    SVM. `max_bytes_per_sec` is the **one** value not read verbatim:
+    `mbps × 1048576` (`bytesPerMB`), so the ceiling shares the unit of
+    `read_bytes_per_sec`.
   The hop split is load-bearing: a hop-B miss leaves a valid **measurement-less
   edge**, it never costs the claim its topology. A ceiling can NEVER appear
-  without a measurement — structurally, because the policy key rides on a
-  matched workload series (the ceiling is attached inside the `io != nil`
-  branch, and `metricsDTO` deliberately does not let a ceiling set `filled`).
+  without a measurement — structurally, because the policy group is recovered
+  FROM a matched workload series (and the attachment sits inside the `io != nil`
+  branch, with `metricsDTO` deliberately not letting a ceiling set `filled`).
+  A volume in no policy group carries no ceiling.
   Both `volumename` and `svm` are **plain labels**, set only when non-empty;
   `svm` is impossible without `volumename` and comes from hop A ONLY (hop B's
-  own `svm` is a join key, never a fallback). **`volumename` ≠ `volume`**.
+  own `svm` only SCOPES a workload candidate to the claim's volume in
+  `qosInScope` — it is neither a join key nor a fallback since D9 re-keyed the
+  ceiling's `svm` component onto hop A). The hop-A pick runs `pickAggr` FIRST and scopes
+  `pickSVM` to the ONTAP cluster it landed on, so a cross-filer FlexVol-name
+  collision cannot pair one filer's aggregate with another's SVM — which would
+  reject every in-scope workload and key the ceiling on a foreign tenant (D10);
+  with no aggregate resolved (FlexGroup) the pick is unscoped and the claim
+  still gains its `svm`. **`volumename` ≠ `volume`**.
   All 15 Harvest/kubelet legs are OPTIONAL (log-and-continue). **Two** coverage
   warnings, each gated on its OWN family having been read:
   `slog.Warn("netapp_volume_join_miss", "count", n)` (hop-A miss or
   empty-`aggr`) and `slog.Warn("netapp_qos_join_miss", "count", n)` (edge drawn,
   no QoS match — under the scoped read its gate means "at least one issued chunk
   returned series", so a build that issued none is silent). No signal for a
-  missing ceiling — a volume in no policy group
-  is normal. Tests: `pkg/build/volumekey_test.go`, `pkg/build/qosscope_test.go`,
+  missing ceiling — an SVM with no fixed-policy series is normal. Tests: `pkg/build/volumekey_test.go`, `pkg/build/qosscope_test.go`,
   `pkg/build/netapp_test.go` (incl. the fan-out pin: 31 legs with no matched
   volume, 37 with one),
   `pkg/promql/qosscope_test.go`,

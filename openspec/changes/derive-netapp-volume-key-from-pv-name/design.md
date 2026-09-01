@@ -8,8 +8,9 @@ See `proposal.md` — Why. The constraints that shape the approach:
   vectors — runs after the group completes.
 - `resolveNetAppStorage` reads `volume_name` at exactly two sites: the
   `volume_labels` index (`pkg/build/netapp.go:89`) and `indexQoSFamily`
-  (`:259`). Hop C keys on `(cluster, svm, policy_group)` and never sees the
-  volume key.
+  (`:259`). Hop C keyed on the `(cluster, svm, policy_group)` triple recovered
+  from hop B and never saw the volume key; D9 re-keys it onto hop A's
+  `(cluster, svm)`.
 - `promql.Render(q, window, keys, sel)` is a pure function; the empty-selector
   form of every query is pinned byte-for-byte by
   `pkg/promql/testdata/render-baseline.txt`. The Harvest family renders no
@@ -201,6 +202,86 @@ for claims that resolved an aggregate), so no observable behaviour changes, but
 the spec wording "three hops degrade independently" is restated to describe the
 read as well as the parse.
 
+### D9 — The ceiling triple is anchored on hop A for cluster and SVM; hop B supplies only the policy group
+
+The `(ontap-cluster, svm, policy-group)` key stays a triple, but stops being
+recovered wholesale from the workload series. Its cluster and SVM components
+come from **hop A** — the picked aggregate's ONTAP cluster and the SVM the
+`volume_labels` match resolved — and hop B is read for the `policy_group` label
+alone.
+
+Hop B has to stay in the key because it is the ONLY upstream statement of which
+policy group governs a given FlexVol: `volume_labels` carries no policy identity
+(confirmed against the Harvest volume template and the demo faker's rendering),
+so the mapping exists nowhere else. Hop A has to own the other two because they
+are properties of the volume the edge points at, not of whichever workload
+series happened to match — which is what makes the following two cases resolve:
+
+- A workload series carrying a `policy_group` but **no `svm` label** now
+  contributes its policy. `qosInScope` already keeps such a candidate for
+  measurement; keying the SVM off hop A lets the same candidate reach hop C.
+- Under a cross-filer FlexVol-name collision the key follows the picked filer
+  (D10), so it can never name another filer's SVM.
+
+**An incomplete or unmatched key is ignored, never widened.** No `svm` from hop
+A, no non-empty `policy_group` among the in-scope candidates, or a triple that
+matches no fixed-policy series all leave both ceiling fields absent. There is
+deliberately no SVM-wide or cluster-wide fallback: an SVM commonly holds several
+policy groups (one per storage class is the ordinary Trident shape), so a
+figure resolved from any other group would name a limit this volume does not
+have. Reporting a `bronze` ceiling against a `gold` volume's measured
+throughput is worse than reporting no ceiling — a consumer computing a
+saturation ratio would read a healthy volume as many times over its limit,
+while an absent field is already specified as "no declared ceiling" and renders
+as nothing at all.
+
+The attachment invariant is structural again, not merely positional: the policy
+group rides on a matched workload series, so a ceiling cannot exist without a
+measurement even before `applyCeiling`'s placement inside the `io != nil`
+branch is considered.
+
+*Alternatives considered:* key on `(ontap-cluster, svm)` alone with a per-figure
+minimum across the SVM's policy groups — it makes a ceiling reachable for a
+volume in no policy group, but at the cost of misattributing every volume in a
+multi-policy SVM, which is the common shape. Fall back to that minimum only
+when `policy_group` is empty — it keeps the precise value where one exists, but
+gives `data.metrics` two incomparable meanings with nothing on the wire to
+distinguish them; a consumer cannot tell a volume's own ceiling from its SVM's
+most restrictive one.
+
+### D10 — The SVM pick is scoped to the picked aggregate's ONTAP cluster
+
+`pickSVM` ran over every matched `volume_labels` candidate and ran *before*
+`pickAggr`. D9 makes that unsafe: the resolved `svm` is now paired with the
+picked aggregate's ONTAP cluster twice — `qosInScope` rejects a workload whose
+`svm` differs, and `applyCeiling` keys on the `(ontap-cluster, svm)` pair.
+
+On a cross-filer token collision (blind spot 5: same-named FlexVols on two
+filers sharing one VictoriaMetrics) the two picks could land on different
+filers — `pickAggr` takes the lexically-smallest `(cluster, aggr)` pair while
+`pickSVM` took the lexically-smallest `svm` from anywhere — so the edge lost
+every in-scope workload, and, whenever the picked filer happened to host a
+same-named SVM, the ceiling of an unrelated tenant was attached.
+
+`pickAggr` therefore runs first and `pickSVM(cands, oc)` considers only
+candidates on `oc`. The order also makes the file's two candidate picks
+consistent: `pickNode` already scoped itself to `(oc, aggr)`.
+
+Scoping to `oc` alone, not to `(oc, aggr)`: an SVM is a property of the volume,
+not of the aggregate it sits on, so a volume observed on two aggregates of one
+filer inside the window must still resolve it.
+
+An empty `oc` — the FlexGroup shape, or no candidate carrying both a `cluster`
+and an `aggr` — means there is neither an edge nor a ceiling, so there is no
+filer to scope to and the pick stays unscoped. That preserves the existing
+FlexGroup behaviour: a claim that draws no aggregate edge still gains its `svm`
+label.
+
+*Alternative considered:* scope the ceiling key instead, leaving `pickSVM`
+unscoped. Rejected — it fixes hop C and leaves the (pre-existing) hop-B I/O
+loss in place, and it would emit a PVC `svm` label naming a filer the claim's
+own edge does not point at.
+
 ## Risks / Trade-offs
 
 - **A deployment whose FlexVol names encode no PV name at all loses its storage
@@ -226,6 +307,17 @@ read as well as the parse.
   (lexically-smallest `(ontap_cluster, aggr)`) is unchanged and deterministic.
 - **The scope is a superset of the entity claim list** (unbound PVCs contribute
   names). → Harmless: it widens what is fetched, never what joins.
+- **D10 narrows which series can supply a claim's `svm`.** A claim whose
+  aggregate resolves on one filer while only the OTHER filer's series carries a
+  non-empty `svm` now emits no `svm` label at all. → Correct: that value named a
+  filer the claim's own edge does not point at, and emitting it cost the edge
+  its I/O. `netapp_qos_join_miss` already covers the resulting measurement gap.
+- **A volume in no QoS policy group still gets no ceiling.** D9 does not widen
+  the key's reachability; it only re-anchors two of its three components. →
+  Accepted: that is the pre-existing behaviour, no signal is emitted for it (a
+  volume in no policy group is normal, not a defect), and the alternative —
+  borrowing another policy group's figure — is a wrong value rather than a
+  missing one.
 
 ## Migration Plan
 

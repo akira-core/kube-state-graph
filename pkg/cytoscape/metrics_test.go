@@ -154,8 +154,9 @@ func TestSerialise_IOMetricsOnly(t *testing.T) {
 }
 
 // A ceiling never makes a metrics object exist on its own. The builder cannot
-// produce this shape (the policy key rides on a matched workload series), and
-// the serialiser must not invent one if it ever could.
+// produce this shape (the ceiling's policy group is recovered FROM a matched
+// workload series, and it is attached only inside that branch), and the serialiser must not invent one if it ever
+// could.
 func TestMetricsDTO_CeilingAloneOmitsMetrics(t *testing.T) {
 	maxIOPS := 5000.0
 	assert.Nil(t, metricsDTO(nil, &graph.IOMetrics{MaxIOPS: &maxIOPS}))

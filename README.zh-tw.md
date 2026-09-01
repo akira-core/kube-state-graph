@@ -118,15 +118,15 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 
 | 指標 | 用途 | 會讀的標籤 | 必填？ |
 |---|---|---|---|
-| `volume_labels` | **Hop A — 整個儲存拓樸。** PVC→aggregate join（`volume_name` = PV 名）、`netapp-aggr`／`netapp-node` 實體、PVC `svm` 標籤。info series：只讀 labels、丟棄 sample 值 | `cluster`（ONTAP 叢集）、`node`、`aggr`、`svm`、`volume_name` | 選填（缺則無 NetApp 節點／邊／`svm`） |
-| `qos_read_ops`／`qos_write_ops`／`qos_read_latency`／`qos_write_latency`／`qos_read_data`／`qos_write_data` | **Hop B — I/O**，掛在 `pvc-to-netapp-aggr`（`read_ops`、`write_ops`、`read_latency_us`、`write_latency_us`、`read_bytes_per_sec`、`write_bytes_per_sec`）。**原樣讀取**——Harvest 已把 ONTAP counter 解成 ops/s、平均 µs、bytes/s；絕不包 `rate()`。以 `{lun=""}` 查詢，避免 LUN workload（帶著所屬 FlexVol 的 `volume_name`）被加總進去 | `cluster`、`svm`、`policy_group`、`lun`、`volume_name` | 選填（缺則邊仍在、沒有 `metrics`） |
-| `qos_policy_fixed_max_throughput_iops`／`qos_policy_fixed_max_throughput_mbps` | **Hop C — 宣告上限** `max_iops`／`max_bytes_per_sec`，join 鍵為 `(cluster, svm, policy_group)`。`mbps` 是唯一換算值（× 1048576 → bytes/s），與 `read_bytes_per_sec` 同單位 | `cluster`、`svm`、`name`（或 `policy_group`） | 選填（缺則無上限欄位；永不為 `0`） |
+| `volume_labels` | **Hop A — 整個儲存拓樸。** PVC→aggregate join（由 PV 名推導出的 token 比對 `volume`）、`netapp-aggr`／`netapp-node` 實體、PVC `svm` 標籤。info series：只讀 labels、丟棄 sample 值。不帶任何 request matcher | `cluster`（ONTAP 叢集）、`node`、`aggr`、`svm`、`volume` | 選填（缺則無 NetApp 節點／邊／`svm`，且完全不發出 QoS 查詢） |
+| `qos_read_ops`／`qos_write_ops`／`qos_read_latency`／`qos_write_latency`／`qos_read_data`／`qos_write_data` | **Hop B — I/O**，掛在 `pvc-to-netapp-aggr`（`read_ops`、`write_ops`、`read_latency_us`、`write_latency_us`、`read_bytes_per_sec`、`write_bytes_per_sec`）。**原樣讀取**——Harvest 已把 ONTAP counter 解成 ops/s、平均 µs、bytes/s；絕不包 `rate()`。以 `{lun=""}` 查詢，避免 LUN workload（帶著所屬 FlexVol 的 `volume`）被加總進去；並**收斂**到 hop A 對到的 FlexVol 名稱 | `cluster`、`svm`、`policy_group`、`lun`、`volume` | 選填（缺則邊仍在、沒有 `metrics`） |
+| `qos_policy_fixed_max_throughput_iops`／`qos_policy_fixed_max_throughput_mbps` | **Hop C — 宣告上限** `max_iops`／`max_bytes_per_sec`，join 鍵為 `(cluster, svm, policy_group)` 三元組——cluster 與 svm 來自 hop A，policy group 來自 hop B。鍵不完整或查無對應即忽略，絕不退回同 SVM 其他 policy group 的數值。`mbps` 是唯一換算值（× 1048576 → bytes/s），與 `read_bytes_per_sec` 同單位 | `cluster`、`svm`、`name`（或 `policy_group`） | 選填（缺則無上限欄位；永不為 `0`） |
 | `aggr_new_status` | Aggregate `data.health`（sample 為 `1` 則 `online`，否則 `degraded`；無 series 則省略） | `cluster`、`node`、`aggr` | 選填 |
 | `aggr_space_used`／`aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`、`node`、`aggr` | 選填 |
 | `node_new_status` | Controller `data.health`（對應方式同 aggregate） | `cluster`、`node` | 選填 |
 | `kubelet_volume_stats_used_bytes`／`kubelet_volume_stats_capacity_bytes` | PVC `data.usage` `{used_bytes, capacity_bytes}` | `cluster`、`namespace`、`persistentvolumeclaim` | 選填 |
 
-`volume_name` **不是** stock Harvest 標籤——由部署自己的 relabel 規則產生，必須同時蓋到 volume-object 與 QoS workload 系列。見 `docs/netapp-harvest-preconditions.md`。
+上述標籤全部是 **stock Harvest 輸出**——不需要、也不會讀取任何 relabel 規則。ONTAP volume 名稱不允許 `-`，因此接往 Kubernetes 的橋樑由 backend 自行搭建：把 PVC 綁定的 PV 名改寫成 match token（預設把 `-` 換成 `_`），再與 `volume` 比對（預設以 suffix 比對，因此不必宣告 provisioner 的 `storagePrefix`）。兩者皆可設定。見 `docs/netapp-harvest-preconditions.md`。
 
 各拓樸／Harvest／kubelet 指標以 `last_over_time(<metric>[<window>]) @ <end>` 包裝，反映請求視窗 `[start, end]` 內最後觀測值——惟 `kube_pod_container_info` 改用 `tlast_over_time(...)`，使每條 per-image series 帶其最後 sample 時間戳，供解析器挑出每容器最新的 image（近期視窗準確；遠期視窗的限制見 `design.md` D-A4）。
 
@@ -159,7 +159,7 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 |---|---|
 | `pod-mounts-pvc` | `kube_pod_spec_volumes_persistentvolumeclaims_info` |
 | `pod-to-node` | `kube_pod_info`（`node` 標籤；每個已排程 pod 一條，叢集內） |
-| `pvc-to-netapp-aggr` | Harvest `volume_labels`，join 鍵 `volume_name` = PVC `volumename`（PV 名） |
+| `pvc-to-netapp-aggr` | Harvest `volume_labels`，以 PVC `volumename`（PV 名）推導出的 token 比對 stock `volume` 標籤 |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
 | `pod-calls-service` | `traces_service_graph_request_total`（目標透過連線字串／peer-address／route engine 解析為 service 節點時） |
 | `service-selects-pod` | `traces_service_graph_request_total`（連線字串解析 + `kube_endpointslice_*` join，隨需產生） |

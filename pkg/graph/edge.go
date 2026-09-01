@@ -53,16 +53,19 @@ type Edge struct {
 
 // IOMetrics holds the Harvest storage measurements attached to a
 // pvc-to-netapp-aggr edge: six measured I/O figures from the QoS workload
-// families plus the volume's declared throughput ceiling from its QoS fixed
-// policy. Numeric values NEVER enter Labels. Each field is a pointer so a
-// missing family is omitted (distinct from 0) — for the ceiling, absence means
-// "no declared ceiling" and must never surface as a number. The RED
-// EdgeMetrics invariant is untouched; a single edge carries at most one
-// family (the builder never sets both).
+// families plus the volume's declared throughput ceiling, from the QoS
+// fixed-policy families (its own QoS policy group's figures — never another
+// group's from the same SVM). Numeric values NEVER enter Labels. Each
+// field is a pointer so a missing family is omitted (distinct from 0) — for the
+// ceiling, absence means "no declared ceiling" and must never surface as a
+// number. The RED EdgeMetrics invariant is untouched; a single edge carries at
+// most one family (the builder never sets both).
 //
 // MaxIOPS / MaxBytesPerSec can only be set for an edge that already carries at
-// least one measurement: the policy join key is recovered from the matched QoS
-// workload series (design.md D3 hop C), so no workload means no ceiling.
+// least one measurement. The ceiling is keyed on hop A's (ontap cluster, svm)
+// pair, so it does NOT ride on a workload series any more (design.md D9); the
+// invariant is upheld structurally instead — the builder attaches the ceiling
+// only inside its matched-workload branch (design.md D3 hop C).
 // MaxBytesPerSec is the one converted value in the struct — the policy's
 // megabytes-per-second figure scaled to bytes per second so it shares the unit
 // of ReadBytesPerSec / WriteBytesPerSec.

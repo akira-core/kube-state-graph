@@ -126,6 +126,16 @@ resolves no storage chain at all.
 - The `/v1/edge-types` **description** of `pvc-to-netapp-aggr` now says
   derive-then-match. The edge `id`, `type`, endpoints and `data.metrics` fields
   are unchanged.
+- **The hop-C ceiling triple is anchored on hop A.** Its `ontap_cluster` and
+  `svm` components now come from the topology hop — the picked aggregate's
+  ONTAP cluster and the SVM the `volume_labels` match resolved — instead of
+  from the workload series; only `policy_group` is still read from hop B. This
+  is **additive** for the resolved value: a workload series carrying a
+  `policy_group` but no `svm` label of its own now resolves a ceiling where it
+  previously could not, and under a cross-filer FlexVol-name collision the key
+  follows the filer the edge points at. A volume in no QoS policy group still
+  carries no ceiling — an incomplete key is ignored, never widened to an
+  SVM-wide figure.
 
 ---
 

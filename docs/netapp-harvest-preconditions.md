@@ -113,7 +113,10 @@ build where hop A matched nothing issues no hop-B query at all.
    both match one claim's token are both candidates, and the claim joins the
    lexically-smallest `(ontap_cluster, aggr)` with no warning. FlexVol names
    derived from Kubernetes PV names (`pvc-<uuid>`) do not collide; a
-   hand-chosen naming scheme that does is the operator's risk.
+   hand-chosen naming scheme that does is the operator's risk. Everything the
+   claim resolves stays on the filer that pick landed on: the `svm` label, the
+   QoS workloads that measure the edge, and the `(ontap_cluster, svm)` pair the
+   throughput ceiling is keyed on all come from that filer's series alone.
 
 ## Zone and environment labels are NOT required on Harvest
 
@@ -139,8 +142,8 @@ Two coverage signals, each gated on its OWN family being present:
 
 So a deployment running the volume template without the QoS template gets its
 topology graph and no spurious I/O warning, and a non-NetApp deployment (neither
-family) stays silent on both. No signal is emitted for a missing ceiling — a
-volume in no QoS policy group is the normal case, not a defect.
+family) stays silent on both. No signal is emitted for a missing ceiling — an
+SVM with no fixed-policy series is the normal case, not a defect.
 
 The PVC's retained `data.storageclass` is the operator's discriminator between
 "this claim was never meant to have a NetApp backend" and "this claim should
@@ -151,8 +154,8 @@ have joined and did not". The builder does not interpret StorageClass names.
 | Series | Hop | Role |
 |---|---|---|
 | `volume_labels` | A | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED |
-| `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | I/O (verbatim; no `rate()`; data families are already bytes/s) + the volume's `policy_group`. Read SCOPED |
-| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | Declared ceiling `max_iops` / `max_bytes_per_sec` |
+| `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
+| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | Aggregate health / usage |
 | `node_new_status` | — | Controller health |
 
@@ -197,9 +200,20 @@ label, so the contract holds against a template that omits it.
 
 **Unit conversion.** `qos_policy_fixed_max_throughput_mbps` is the ONE value not
 read verbatim: `max_bytes_per_sec = mbps × 1048576`, so the ceiling shares the
-unit of the measured `read_bytes_per_sec` / `write_bytes_per_sec`. The policy's
-identity label is read as `name` with a `policy_group` fallback — Harvest names
-it differently across templates.
+unit of the measured `read_bytes_per_sec` / `write_bytes_per_sec`. The ceiling
+is the volume's OWN policy group's figure, keyed on the
+`(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy
+group from the workload series, and the fixed-policy series addressed by its
+`name` (with a `policy_group` fallback for template variance). An incomplete or
+unmatched key is ignored, never widened: a volume in no policy group carries no
+ceiling rather than borrowing another group's figure from the same SVM.
+
+**`svm` is required on the fixed-policy families.** A `qos_policy_fixed_max_*`
+series carrying no `cluster` or no `svm` label is not indexed at all, so a
+Harvest template that omits `svm` there loses EVERY ceiling in the estate
+silently: no coverage signal fires, because hop B still matched and a missing
+ceiling is a legitimate reading. The same holds for the policy's identity label
+— a series carrying neither `name` nor `policy_group` cannot be keyed.
 
 All fifteen Harvest/kubelet legs are OPTIONAL: a query error logs and continues
 with an empty vector and never fails the build.

@@ -183,9 +183,10 @@ const (
 	QQoSWriteData    Query = "qos_write_data"
 
 	// NetApp Harvest QoS fixed-policy ceilings (hop C of design.md D3),
-	// joined on the (ontap_cluster, svm, policy_group) triple recovered from
-	// the matched QoS workload series. Rendered bare — a policy object has no
-	// LUN dimension. OPTIONAL: absence means "no declared ceiling", which is
+	// joined on the (ontap_cluster, svm, policy_group) triple: cluster and svm
+	// from hop A's matched volume_labels series, policy group from the matched
+	// QoS workload series. Rendered bare — a policy object has no LUN
+	// dimension. OPTIONAL: absence means "no declared ceiling", which is
 	// never rendered as a number.
 	QQoSPolicyFixedMaxIOPS Query = "qos_policy_fixed_max_throughput_iops"
 	QQoSPolicyFixedMaxMBps Query = "qos_policy_fixed_max_throughput_mbps"

@@ -338,7 +338,10 @@ func TestResolveNetAppStorage_CeilingPerField(t *testing.T) {
 	assert.Nil(t, io.MaxBytesPerSec)
 }
 
-func TestResolveNetAppStorage_NoPolicyGroupNoCeiling(t *testing.T) {
+// Spec: "Volume in no policy group carries no ceiling" — an incomplete key is
+// IGNORED, never widened. The SVM holds a gold policy, but this volume is in
+// none, so borrowing gold's figure would name a limit it does not have.
+func TestResolveNetAppStorage_EmptyPolicyGroupIgnoresSVMCeiling(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
 		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
@@ -348,12 +351,27 @@ func TestResolveNetAppStorage_NoPolicyGroupNoCeiling(t *testing.T) {
 	io := res.edges[0].IO
 	require.NotNil(t, io)
 	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
-	assert.Nil(t, io.MaxIOPS, "a volume in no policy group has no declared ceiling")
+	assert.Nil(t, io.MaxIOPS, "no policy group ⇒ no ceiling, not the SVM's")
 	assert.Nil(t, io.MaxBytesPerSec)
 }
 
-// The ceiling rides on the workload series' policy_group, so an edge with no
-// measurement can never acquire one. Structural, not defensive.
+// Spec: "Volume in no policy group carries no ceiling" — empty policy_group
+// on the workload AND no fixed-policy series for the pair.
+func TestResolveNetAppStorage_NoPolicySeriesNoCeiling(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "", 10)),
+	}.run()
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	assert.Nil(t, io.MaxIOPS)
+	assert.Nil(t, io.MaxBytesPerSec)
+}
+
+// The ceiling is attached only inside the matched-workload branch, so an
+// edge with no measurement can never acquire one. Structural, not defensive.
 func TestResolveNetAppStorage_NoCeilingWithoutMeasurement(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
@@ -365,38 +383,128 @@ func TestResolveNetAppStorage_NoCeilingWithoutMeasurement(t *testing.T) {
 	assert.Nil(t, res.edges[0].IO, "no workload ⇒ no metrics at all, ceiling included")
 }
 
-func TestResolveNetAppStorage_PolicyTriplePickIsLexical(t *testing.T) {
-	res := netappFixture{
-		claims: claim1(),
-		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
-		readOps: sampleVec(
-			qosSample("pvc-x", "oc", "svm", "silver", 10),
-			qosSample("pvc-x", "oc", "svm", "gold", 10),
-		),
-		maxIOPS: sampleVec(
-			policySample("oc", "svm", "gold", 5000),
-			policySample("oc", "svm", "silver", 1000),
-		),
-	}.run()
-	require.NotNil(t, res.edges[0].IO.MaxIOPS)
-	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12, "lexically-smallest policy wins")
-}
-
-// Harvest names the fixed policy's identity label differently across templates.
-// The join key's SHAPE is the contract, not the label's spelling.
-func TestResolveNetAppStorage_PolicyLabelSpellingFallback(t *testing.T) {
-	pg := model.Sample{
-		Metric: model.Metric{"cluster": "oc", "svm": "svm", "policy_group": "gold"},
-		Value:  5000,
-	}
+// Spec: "Another policy group in the same SVM is never borrowed". A gold
+// volume in an SVM that also holds bronze must report gold's own figures —
+// not bronze's, and not a per-figure minimum across the two, either of which
+// would read as a healthy volume many times over its limit.
+func TestResolveNetAppStorage_CeilingIsTheVolumesOwnPolicy(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
 		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
-		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 10)),
-		maxIOPS: sampleVec(pg),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 1200)),
+		maxIOPS: sampleVec(
+			policySample("oc", "svm", "gold", 5000),
+			policySample("oc", "svm", "bronze", 100),
+		),
+		maxMBps: sampleVec(
+			policySample("oc", "svm", "gold", 250),
+			policySample("oc", "svm", "bronze", 400),
+		),
 	}.run()
-	require.NotNil(t, res.edges[0].IO.MaxIOPS)
-	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	require.NotNil(t, io.MaxIOPS)
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12, "gold's ceiling, not bronze's")
+	require.NotNil(t, io.MaxBytesPerSec)
+	assert.InDelta(t, 250.0*1048576, *io.MaxBytesPerSec, 1e-12,
+		"each figure comes from the same policy — never a cross-policy minimum")
+}
+
+// A volume observed under two policy groups inside the window resolves
+// deterministically to the lexically-smallest, independent of vector order.
+func TestResolveNetAppStorage_CeilingPolicyPickDeterministic(t *testing.T) {
+	for _, order := range [][]model.Sample{
+		{qosSample("pvc-x", "oc", "svm", "gold", 10), qosSample("pvc-x", "oc", "svm", "bronze", 5)},
+		{qosSample("pvc-x", "oc", "svm", "bronze", 5), qosSample("pvc-x", "oc", "svm", "gold", 10)},
+	} {
+		res := netappFixture{
+			claims:  claim1(),
+			vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+			readOps: sampleVec(order...),
+			maxIOPS: sampleVec(
+				policySample("oc", "svm", "gold", 5000),
+				policySample("oc", "svm", "bronze", 100),
+			),
+		}.run()
+		require.NotNil(t, res.edges[0].IO.MaxIOPS)
+		assert.InDelta(t, 100.0, *res.edges[0].IO.MaxIOPS, 1e-12,
+			"lexically-smallest policy group wins regardless of series order")
+	}
+}
+
+// The ceiling key takes its svm from hop A, so a workload series carrying a
+// policy_group but NO svm label of its own still reaches hop C — it measures
+// the edge under qosInScope and contributes its policy.
+func TestResolveNetAppStorage_CeilingFromSVMLessWorkload(t *testing.T) {
+	noSVM := model.Sample{
+		Metric: model.Metric{
+			"volume":       model.LabelValue(tridentVol("pvc-x")),
+			"cluster":      "oc",
+			"policy_group": "gold",
+		},
+		Value: 10,
+	}
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm-prod")),
+		readOps: sampleVec(noSVM),
+		maxIOPS: sampleVec(policySample("oc", "svm-prod", "gold", 5000)),
+	}.run()
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	require.NotNil(t, io.MaxIOPS, "hop A supplies the svm the workload lacks")
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+}
+
+// Spec: "Claim without an SVM carries no ceiling". Hop A's empty svm is the
+// gate — hop B carrying a policy_group, and hop C holding series for that
+// cluster, must not leak a ceiling onto an SVM-less claim.
+func TestResolveNetAppStorage_EmptySVMNoCeiling(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "")),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm-prod", "gold", 10)),
+		maxIOPS: sampleVec(policySample("oc", "svm-prod", "gold", 5000)),
+		maxMBps: sampleVec(policySample("oc", "svm-prod", "gold", 250)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	assert.Nil(t, io.MaxIOPS)
+	assert.Nil(t, io.MaxBytesPerSec)
+}
+
+// Harvest spells the policy's identity label differently across templates, so
+// the reader takes `name` with a `policy_group` fallback. A series carrying
+// neither cannot be keyed and is dropped.
+func TestResolveNetAppStorage_CeilingPolicyIdentitySpellings(t *testing.T) {
+	policyNamed := func(label, policy string) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster":              "oc",
+				"svm":                  "svm",
+				model.LabelName(label): model.LabelValue(policy),
+			},
+			Value: 5000,
+		}
+	}
+	fixture := func(ceiling model.Sample) *graph.IOMetrics {
+		return netappFixture{
+			claims:  claim1(),
+			vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+			readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 10)),
+			maxIOPS: sampleVec(ceiling),
+		}.run().edges[0].IO
+	}
+	for _, label := range []string{"name", "policy_group"} {
+		io := fixture(policyNamed(label, "gold"))
+		require.NotNil(t, io.MaxIOPS, "identity label %q must resolve", label)
+		assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+	}
+	bare := model.Sample{Metric: model.Metric{"cluster": "oc", "svm": "svm"}, Value: 5000}
+	assert.Nil(t, fixture(bare).MaxIOPS, "a policy with no identity label cannot be keyed")
 }
 
 func TestResolveNetAppStorage_CeilingSmallestOnDuplicate(t *testing.T) {
@@ -446,6 +554,36 @@ func TestResolveNetAppStorage_QoSScopedToPickedCluster(t *testing.T) {
 	assert.Equal(t, graph.NetAppAggrID("oc-a", "aggr1"), res.edges[0].Target)
 	assert.InDelta(t, 10.0, *res.edges[0].IO.ReadOps, 1e-12,
 		"oc-b's workload must not be summed onto the oc-a edge")
+}
+
+// A cross-filer token collision must not let the SVM pick and the aggregate
+// pick land on different filers: the resolved svm is paired with the picked
+// aggregate's ONTAP cluster by both qosInScope and the hop-C ceiling key, so an
+// unscoped lexically-smallest pick would take oc-b's "alpha" against oc-a's
+// aggregate — dropping every in-scope workload and attaching oc-a's unrelated
+// "alpha" tenant ceiling.
+func TestResolveNetAppStorage_SVMScopedToPickedCluster(t *testing.T) {
+	res := netappFixture{
+		claims: claim1(),
+		vol: sampleVec(
+			volLabelSample("pvc-x", "oc-a", "n1", "aggr1", "zulu"),
+			volLabelSample("pvc-x", "oc-b", "n9", "aggr9", "alpha"),
+		),
+		readOps: sampleVec(qosSample("pvc-x", "oc-a", "zulu", "gold", 10)),
+		maxIOPS: sampleVec(
+			policySample("oc-a", "zulu", "gold", 5000),
+			policySample("oc-a", "alpha", "gold", 100),
+		),
+	}.run()
+	assert.Equal(t, "zulu", res.svmByPVC["c/db/data"],
+		"svm must come from the filer the aggregate pick landed on")
+	require.Len(t, res.edges, 1)
+	assert.Equal(t, graph.NetAppAggrID("oc-a", "aggr1"), res.edges[0].Target)
+	require.NotNil(t, res.edges[0].IO, "the oc-a workload must stay in scope")
+	assert.InDelta(t, 10.0, *res.edges[0].IO.ReadOps, 1e-12)
+	require.NotNil(t, res.edges[0].IO.MaxIOPS)
+	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12,
+		"the ceiling must key on (oc-a, zulu, gold), not on the other filer's svm")
 }
 
 // volume_labels rows without a `node` label leave the aggregate owner-less: the
