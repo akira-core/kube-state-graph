@@ -29,6 +29,19 @@ import (
 // look like has to keep the topology non-empty.
 func recordingQuerier(t *testing.T, podInfo ...*model.Sample) (*promqlmocks.MockQuerier, func() map[string]string) {
 	t.Helper()
+	fixtures := map[string]model.Vector{}
+	if len(podInfo) > 0 {
+		fixtures["kube_pod_info"] = model.Vector(podInfo)
+	}
+	return recordingQuerierWith(t, fixtures)
+}
+
+// recordingQuerierWith is recordingQuerier with a per-leg fixture table. The
+// six QoS workload legs are issued only for FlexVol names a loaded claim
+// already matched, so a test asserting what THOSE queries look like must answer
+// kube_persistentvolumeclaim_info and volume_labels too.
+func recordingQuerierWith(t *testing.T, fixtures map[string]model.Vector) (*promqlmocks.MockQuerier, func() map[string]string) {
+	t.Helper()
 	var mu sync.Mutex
 	seen := map[string]string{}
 	q := promqlmocks.NewMockQuerier(t)
@@ -36,9 +49,10 @@ func recordingQuerier(t *testing.T, podInfo ...*model.Sample) (*promqlmocks.Mock
 		RunAndReturn(func(_ context.Context, name, query string, _ time.Time) (model.Vector, error) {
 			mu.Lock()
 			seen[name] = query
+			out := fixtures[name]
 			mu.Unlock()
-			if name == "kube_pod_info" && len(podInfo) > 0 {
-				return model.Vector(podInfo), nil
+			if out != nil {
+				return out, nil
 			}
 			return model.Vector{}, nil
 		}).Maybe()
@@ -58,9 +72,21 @@ func recordingQuerier(t *testing.T, podInfo ...*model.Sample) (*promqlmocks.Mock
 // handler, each series receiving exactly the dimensions its labels support,
 // and the service-graph family receiving none.
 func TestGraph_SelectorQueriesCaptured(t *testing.T) {
-	q, captured := recordingQuerier(t, &model.Sample{Metric: model.Metric{
-		"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
-	}, Value: 1})
+	q, captured := recordingQuerierWith(t, map[string]model.Vector{
+		"kube_pod_info": {&model.Sample{Metric: model.Metric{
+			"cluster": "cluster-alpha", "namespace": "shop", "pod": "checkout", "uid": "alpha-1",
+		}, Value: 1}},
+		// A claim that matches a FlexVol, so the scoped QoS leg is issued and
+		// its query string can be asserted below.
+		"kube_persistentvolumeclaim_info": {&model.Sample{Metric: model.Metric{
+			"cluster": "cluster-alpha", "namespace": "shop",
+			"persistentvolumeclaim": "netapp-data", "volumename": "pvc-9f3a",
+		}, Value: 1}},
+		"volume_labels": {&model.Sample{Metric: model.Metric{
+			"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
+			"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm-prod",
+		}, Value: 1}},
+	})
 	s := newServerWithMocks(t, q, nil)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -79,8 +105,12 @@ func TestGraph_SelectorQueriesCaptured(t *testing.T) {
 		`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",env="prod",cluster="cluster-alpha"}[1h])`,
 		seen["kube_node_status_addresses"], "the fixed selector stays ahead of the request matchers")
 	assert.Equal(t,
-		`last_over_time(qos_read_ops{lun=""}[1h])`,
-		seen["qos_read_ops"], "Harvest takes no request matcher — az only routes it, env is inert")
+		`last_over_time(volume_labels[1h])`,
+		seen["volume_labels"], "Harvest takes no request matcher — az only routes it, env is inert")
+	assert.Equal(t,
+		`last_over_time(qos_read_ops{lun="",volume="trident_pvc_9f3a"}[1h])`,
+		seen["qos_read_ops"],
+		"the QoS scope is derived from the matched FlexVol names, never from the request: still no az / env / cluster / namespace matcher")
 	assert.Equal(t,
 		`last_over_time(kubelet_volume_stats_used_bytes{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[1h])`,
 		seen["kubelet_volume_stats_used_bytes"])

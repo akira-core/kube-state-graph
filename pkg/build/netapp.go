@@ -77,6 +77,7 @@ type policyKey struct{ oc, svm, policy string }
 // two aggregated coverage warnings (D8).
 func resolveNetAppStorage(
 	claims []pvcVolume,
+	rw *VolumeKeyRewriter,
 	volumeLabels model.Vector,
 	readOps, writeOps, readLat, writeLat, readData, writeData model.Vector,
 	policyMaxIOPS, policyMaxMBps model.Vector,
@@ -84,20 +85,51 @@ func resolveNetAppStorage(
 ) netappResult {
 	out := netappResult{svmByPVC: map[string]string{}}
 
+	// One pass over the Harvest vector resolves every claim. The join is
+	// derive-then-match, not equality: ONTAP volume names admit no `-`, so a
+	// `volume` value can never equal a `pvc-<uuid>` PV name. matcher answers
+	// which claims a given FlexVol name matches (hash-indexed for the default
+	// suffix mode — see volumeMatcher).
+	matcher := newVolumeMatcher(rw, claims)
 	volIndex := map[string][]volumeLabelCandidate{}
+	candsByClaim := make([][]volumeLabelCandidate, len(claims))
+	volsByClaim := make([][]string, len(claims))
+	volSeenByClaim := make([]map[string]bool, len(claims))
+	var matched []int
 	for _, s := range volumeLabels {
-		vn, oc := string(s.Metric["volume_name"]), string(s.Metric["cluster"])
-		if vn == "" || oc == "" {
+		vol, oc := string(s.Metric[promql.HarvestVolumeLabel]), string(s.Metric["cluster"])
+		if vol == "" || oc == "" {
 			continue
 		}
-		volIndex[vn] = append(volIndex[vn], volumeLabelCandidate{
+		cand := volumeLabelCandidate{
 			ontapCluster: oc,
 			node:         string(s.Metric["node"]),
 			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
-		})
+		}
+		volIndex[vol] = append(volIndex[vol], cand)
+		matched = matcher.match(vol, matched)
+		for _, ci := range matched {
+			candsByClaim[ci] = append(candsByClaim[ci], cand)
+			if volSeenByClaim[ci] == nil {
+				volSeenByClaim[ci] = map[string]bool{}
+			}
+			if !volSeenByClaim[ci][vol] {
+				volSeenByClaim[ci][vol] = true
+				volsByClaim[ci] = append(volsByClaim[ci], vol)
+			}
+		}
+	}
+	// A claim matching several FlexVol names gathers its QoS candidates in
+	// sorted name order, so the float summation order — and therefore the last
+	// bits of every I/O figure — is a pure function of the matched set rather
+	// than of upstream vector order (D6).
+	for i := range volsByClaim {
+		sort.Strings(volsByClaim[i])
 	}
 
+	// Keyed by the same stock `volume` label the topology family carries, so a
+	// claim looks its QoS candidates up through the FlexVol names it matched.
 	qosIndex := map[string][]qosCandidate{}
 	indexQoSFamily(qosIndex, readOps, ioReadOps)
 	indexQoSFamily(qosIndex, writeOps, ioWriteOps)
@@ -111,10 +143,16 @@ func resolveNetAppStorage(
 	// Each coverage signal is gated on ITS OWN family having been read, so a
 	// deployment running the volume template without the QoS template gets its
 	// topology graph and no spurious I/O warning. Gating on the raw vectors
-	// rather than the built indexes is deliberate: a vector whose series carry
-	// no volume_name WAS read, and a broken relabel rule is exactly the
-	// coverage failure these signals exist to surface.
+	// rather than the built indexes is deliberate: a vector whose series match
+	// no claim WAS read, and a derivation that does not fit the estate's
+	// FlexVol naming is exactly the coverage failure these signals exist to
+	// surface.
 	topoPresent := len(volumeLabels) > 0
+	// Under the scoped read this is exactly "at least one issued chunk of at
+	// least one QoS family returned series": a build whose scope was empty
+	// issued no QoS query at all, so every vector is empty and no I/O-coverage
+	// warning fires — which is right, since an empty scope means hop A drew no
+	// edge for hop B to measure.
 	qosPresent := len(readOps)+len(writeOps)+len(readLat)+len(writeLat)+len(readData)+len(writeData) > 0
 
 	type joinHit struct {
@@ -124,8 +162,8 @@ func resolveNetAppStorage(
 	hits := map[string]joinHit{} // pvcID → pick
 	topoMisses, qosMisses := 0, 0
 
-	for _, c := range claims {
-		cands := volIndex[c.volumeName]
+	for i, c := range claims {
+		cands := candsByClaim[i]
 		svm := pickSVM(cands)
 		if svm != "" {
 			out.svmByPVC[c.id] = svm
@@ -137,7 +175,8 @@ func resolveNetAppStorage(
 			}
 			continue
 		}
-		io := sumQoSIO(qosIndex[c.volumeName], oc, svm)
+		qcands := qosCandidatesFor(volsByClaim[i], qosIndex)
+		io := sumQoSIO(qcands, oc, svm)
 		if io == nil {
 			if qosPresent {
 				qosMisses++
@@ -146,7 +185,7 @@ func resolveNetAppStorage(
 			// Structural, not defensive: the ceiling is attached ONLY inside
 			// this branch, so a ceiling field can never appear on an edge that
 			// carries no measurement (design.md D3 hop C).
-			applyCeiling(io, policyIndex, pickPolicy(qosIndex[c.volumeName], oc, svm))
+			applyCeiling(io, policyIndex, pickPolicy(qcands, oc, svm))
 		}
 		hits[c.id] = joinHit{oc: oc, aggr: aggr, io: io}
 	}
@@ -254,14 +293,28 @@ func resolveNetAppStorage(
 	return out
 }
 
+// qosCandidatesFor gathers the QoS candidates of every FlexVol name a claim
+// matched, concatenated in the caller's (sorted) name order so the summation
+// downstream is order-free.
+func qosCandidatesFor(volumes []string, index map[string][]qosCandidate) []qosCandidate {
+	if len(volumes) == 1 {
+		return index[volumes[0]]
+	}
+	var out []qosCandidate
+	for _, v := range volumes {
+		out = append(out, index[v]...)
+	}
+	return out
+}
+
 func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily) {
 	for _, s := range vec {
-		vn := string(s.Metric["volume_name"])
+		vol := string(s.Metric[promql.HarvestVolumeLabel])
 		oc := string(s.Metric["cluster"])
-		if vn == "" || oc == "" {
+		if vol == "" || oc == "" {
 			continue
 		}
-		dst[vn] = append(dst[vn], qosCandidate{
+		dst[vol] = append(dst[vol], qosCandidate{
 			ontapCluster: oc,
 			svm:          string(s.Metric["svm"]),
 			policyGroup:  string(s.Metric["policy_group"]),
@@ -378,7 +431,7 @@ func pickSVM(cands []volumeLabelCandidate) string {
 }
 
 // qosInScope keeps a QoS candidate that belongs to the volume the edge was
-// drawn for. The ONTAP cluster must match the aggregate's — a volume_name
+// drawn for. The ONTAP cluster must match the aggregate's — a FlexVol name
 // colliding across two filers sharing one VictoriaMetrics would otherwise be
 // double-counted onto this edge. The svm must match too when BOTH sides
 // resolved one; a candidate with no svm label still measures the volume and is

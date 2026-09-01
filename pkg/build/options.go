@@ -26,4 +26,20 @@ type Options struct {
 	// dimensions are matched against. The zero value means the defaults
 	// (`az`, `env`); validation lives where the keys are configured.
 	LabelKeys promql.LabelKeys
+	// VolumeKey derives a claim's bound PersistentVolume name into the token
+	// matched against the STOCK Harvest `volume` label (the ONTAP FlexVol
+	// name), and decides how that token is compared. Nil (the zero value)
+	// means the defaults: replace `-` with `_`, match as a suffix.
+	//
+	// It is a pre-compiled value rather than raw rules so an invalid regular
+	// expression surfaces at NewVolumeKeyRewriter — the caller's own call site,
+	// where it can be reported as a configuration error — and never inside a
+	// build, where the only honest options would be a silent fallback to a
+	// different estate's naming or a panic.
+	VolumeKey *VolumeKeyRewriter
+	// QoSScopeBatchBytes bounds the rendered `volume` alternation of one
+	// scoped QoS workload query, so a large estate is split across several
+	// queries rather than exceeding the upstream's query-length limit. Zero
+	// (the default) means DefaultQoSScopeBatchBytes.
+	QoSScopeBatchBytes int
 }

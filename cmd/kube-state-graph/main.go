@@ -149,11 +149,21 @@ func run() error {
 	// promRouter satisfies promql.QuerierSource as well as promql.Querier, so
 	// build.New upgrades it and resolves a per-request querier from the live
 	// routing table.
+	// Already proven to compile by cfg.Validate(); the error is re-checked
+	// rather than discarded so a future validation change cannot silently
+	// hand build.Options a nil rewriter and fall back to a different estate's
+	// naming.
+	volumeKey, err := cfg.VolumeKeyRewriter()
+	if err != nil {
+		return fmt.Errorf("netapp volume key derivation: %w", err)
+	}
 	builder := build.New(promRouter, build.Options{
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       routeResolver,
 		RouteResolveTimeout: cfg.RouteResolveTimeout,
 		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
+		VolumeKey:           volumeKey,
+		QoSScopeBatchBytes:  cfg.NetAppQoSScopeBatchBytes,
 	}, metrics, nil)
 	server := api.New(cfg, builder, promRouter, metrics, logger, keys, nil)
 

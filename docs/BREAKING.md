@@ -48,9 +48,8 @@ re-sourced from the Harvest `volume_labels` series (see
 
 ## New upstream requirements — NetApp Harvest
 
-The storage join reads three Harvest families, and the deployment's
-`volume_name` relabel rule must now stamp **both** the volume-object and the
-QoS workload series:
+The storage join reads three Harvest families. It reads them at their **stock**
+labels — see "The Harvest `volume_name` relabel is no longer read" below:
 
 | Series | Hop | Effect if missing |
 |---|---|---|
@@ -60,12 +59,73 @@ QoS workload series:
 
 Required Harvest templates: volume instance labels, QoS workload, QoS fixed
 policy. The QoS legs are issued at `{lun=""}` — without that matcher a LUN
-workload, which carries its FlexVol's relabelled `volume_name`, would be summed
-on top of the volume's own traffic.
+workload, which carries its FlexVol's `volume`, would be summed on top of the
+volume's own traffic.
 
 Two aggregated coverage warnings replace the single one:
 `netapp_volume_join_miss` (hop A) and `netapp_qos_join_miss` (hop B), each gated
 on its own family having been read.
+
+---
+
+# BREAKING — the Harvest `volume_name` relabel is no longer read
+
+The PVC → ONTAP aggregate join no longer reads `volume_name`, a label stock
+Harvest does not emit and that every deployment had to synthesise with a
+Prometheus relabel rule. Both the volume-object family and the six QoS workload
+families are now read at their **stock `volume` label** (the ONTAP FlexVol
+name), and the bridge to Kubernetes is built in the backend: the PVC's bound PV
+name is rewritten into a match token and matched against `volume`.
+
+## What to do
+
+1. Upgrade with **no configuration change**. The defaults — replace `-` with
+   `_`, match as a suffix — resolve a stock Trident estate without the
+   deployment declaring its `storagePrefix`.
+2. Read `netapp_volume_join_miss` from the build logs. Zero means the derivation
+   covers the estate.
+3. If non-zero, compare `count by (volume) (volume_labels)` with a claim's
+   `volumename` and set `--netapp-volume-key-rewrite` /
+   `--netapp-volume-match-mode` accordingly.
+   [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md) has the
+   full table.
+4. Once step 2 reports zero, the `volume_name` relabel rule may be deleted.
+   Leaving it installed is harmless — the label is simply not read.
+
+## Who this breaks
+
+A deployment whose relabel rule encoded an **arbitrary** mapping — a
+hand-maintained table for pre-existing volumes, say — rather than a
+transformation of the PV name. Regular expressions can express a
+transformation, not a lookup table. Such a deployment loses its storage chain
+and must either express the mapping through the rewrite rules or accept the
+miss. The loss is reported by `netapp_volume_join_miss`, never silent.
+
+## Rollback is asymmetric
+
+The previous version reads `volume_name`. A deployment that already deleted its
+relabel rule must **restore the rule before rolling back**, or the older binary
+resolves no storage chain at all.
+
+## Other changes in the same release
+
+- **The six `qos_*` workload families are read scoped.** They are issued after
+  the volume-object family, restricted to the FlexVol names the loaded claims
+  actually matched, and split across several queries when that set exceeds
+  `--netapp-qos-scope-batch-bytes` (default 8192). A build whose claims matched
+  nothing issues **no QoS query at all**. Each chunk degrades on its own.
+- **`build.ReadTopology`'s signature changed** (embedders only): its
+  `keys promql.LabelKeys` parameter is now `opts build.Options`, which carries
+  `LabelKeys` alongside the new `VolumeKey` and `QoSScopeBatchBytes` fields. A
+  zero `Options` behaves exactly as `promql.LabelKeys{}` did.
+- **New configuration**: `--netapp-volume-key-rewrite` /
+  `KSG_NETAPP_VOLUME_KEY_REWRITE`, `--netapp-volume-match-mode` /
+  `KSG_NETAPP_VOLUME_MATCH_MODE`, `--netapp-qos-scope-batch-bytes` /
+  `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES`. An uncompilable rewrite pattern or an
+  unknown match mode is a startup failure, never a silent fallback.
+- The `/v1/edge-types` **description** of `pvc-to-netapp-aggr` now says
+  derive-then-match. The edge `id`, `type`, endpoints and `data.metrics` fields
+  are unchanged.
 
 ---
 

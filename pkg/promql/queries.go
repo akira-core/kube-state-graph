@@ -161,10 +161,11 @@ const (
 	// topology (hop A of design.md D3): the pvc-to-netapp-aggr edge, the
 	// netapp-aggr / netapp-node entities and the PVC `svm` label all derive
 	// from this one series and nothing else. It is an info series: its sample
-	// value is discarded, only its label set is consumed. The `volume_name`
-	// label is a deployment relabel (not stock Harvest) mapping each FlexVol
-	// to the Kubernetes PV it backs. OPTIONAL: a query error or empty vector
-	// degrades to no storage topology, never a build failure.
+	// value is discarded, only its label set is consumed. The join key is the
+	// STOCK `volume` label (the ONTAP FlexVol name); no deployment relabel is
+	// required, because pkg/build derives a match token from each claim's PV
+	// name and matches it against `volume`. OPTIONAL: a query error or empty
+	// vector degrades to no storage topology, never a build failure.
 	QVolumeLabels Query = "volume_labels"
 
 	// NetApp Harvest QoS workload I/O (hop B of design.md D3). Harvest has
@@ -451,6 +452,14 @@ func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
 // that omits `lun` entirely.
 const qosVolumeGranularitySelector = `lun=""`
 
+// HarvestVolumeLabel is the STOCK Harvest label naming the ONTAP FlexVol, on
+// both the volume-object family (QVolumeLabels) and the six QoS workload
+// families. It is the storage join's key on the Harvest side; the Kubernetes
+// side is the PVC's bound PV name put through pkg/build's rewrite. Exported so
+// the reader, the scope computation and RenderQoSVolumeScoped share one
+// spelling.
+const HarvestVolumeLabel = "volume"
+
 // jobOwnerCronJobSelector keeps kube_job_owner at the rows
 // resolveJobCronJobOwners retains: CronJob controller owners. It is a
 // request-invariant metric-selection contract, NOT a caller filter — the
@@ -626,9 +635,9 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
 		// Volume-granularity restriction (design.md D2): ONTAP collects a
 		// workload per LUN as well as per volume, and a LUN workload carries
-		// the volume_name of its containing FlexVol once the deployment
-		// relabel rule has run — an unrestricted read would sum LUN traffic on
-		// top of volume traffic for the same claim. This is a fixed,
+		// the `volume` of its containing FlexVol — an unrestricted read would
+		// sum LUN traffic on top of volume traffic for the same claim. This is
+		// a fixed,
 		// request-invariant metric-selection contract (same class as the D30
 		// sentinel matcher and condition="Ready"), NOT a caller filter.
 		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(qosVolumeGranularitySelector), w)

@@ -193,8 +193,8 @@ func TestFormatDuration(t *testing.T) {
 }
 
 // The `lun=""` matcher is a load-bearing metric-selection contract: without it
-// a LUN workload, which carries the volume_name of its containing FlexVol once
-// the deployment relabel rule has run, would be summed on top of the volume
+// a LUN workload, which carries the `volume` of its containing FlexVol, would
+// be summed on top of the volume
 // workload for the same claim (design.md D2). Pin it on every QoS I/O leg, and
 // pin its ABSENCE on the policy legs, which have no LUN dimension.
 func TestRender_QoSVolumeGranularity(t *testing.T) {

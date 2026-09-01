@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
@@ -71,6 +72,27 @@ type Config struct {
 	// and required to differ.
 	AZLabel  string
 	EnvLabel string
+	// NetAppVolumeKeyRewrite is the ordered list of `<pattern>=<replacement>`
+	// rewrite rules deriving the Harvest match token from a PVC's bound
+	// PersistentVolume name (--netapp-volume-key-rewrite, repeatable;
+	// KSG_NETAPP_VOLUME_KEY_REWRITE, semicolon-separated). Each entry splits on
+	// its FIRST `=`; a pattern needing a literal `=` writes `\x3d`. Nil (the
+	// default) adopts build.DefaultVolumeKeyRules — replace `-` with `_`, the
+	// transformation a CSI provisioner performs to make a `pvc-<uuid>` PV name
+	// a legal ONTAP volume name. An explicitly empty value is an identity
+	// rewrite.
+	NetAppVolumeKeyRewrite []string
+	// NetAppVolumeMatchMode decides how that token is compared against the
+	// stock Harvest `volume` label: exact, suffix, contains or regex
+	// (--netapp-volume-match-mode / KSG_NETAPP_VOLUME_MATCH_MODE). Defaults to
+	// suffix, which resolves a FlexVol without the deployment declaring the
+	// provisioner's storage prefix.
+	NetAppVolumeMatchMode string
+	// NetAppQoSScopeBatchBytes bounds the rendered `volume` alternation of one
+	// scoped QoS workload query (--netapp-qos-scope-batch-bytes /
+	// KSG_NETAPP_QOS_SCOPE_BATCH_BYTES), so a large estate is split across
+	// several queries instead of exceeding the upstream's query-length limit.
+	NetAppQoSScopeBatchBytes int
 	// BackendsFile is the path to the mounted routing table declaring the
 	// upstream backends queries are dispatched across (--backends-file /
 	// KSG_BACKENDS_FILE). Empty (the default) synthesises a single implicit
@@ -111,7 +133,13 @@ func Defaults() Config {
 		PromPassword:          "",
 		AZLabel:               promql.DefaultAZLabel,
 		EnvLabel:              promql.DefaultEnvLabel,
-		BackendsFile:          "",
+		// Nil, not an empty slice: nil means "the operator configured none"
+		// and adopts build.DefaultVolumeKeyRules, while an explicitly empty
+		// list is an identity rewrite.
+		NetAppVolumeKeyRewrite:   nil,
+		NetAppVolumeMatchMode:    string(build.DefaultVolumeMatchMode),
+		NetAppQoSScopeBatchBytes: build.DefaultQoSScopeBatchBytes,
+		BackendsFile:             "",
 		// Matches APIKeysReloadInterval: the same mounted-file cadence, so an
 		// operator reasons about one reload period, not two.
 		BackendsReloadInterval: 30 * time.Second,
@@ -139,6 +167,9 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.DurationVar(&cfg.BackendsReloadInterval, "backends-reload-interval", cfg.BackendsReloadInterval, "How often to re-read --backends-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
+	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
+	fs.StringVar(&cfg.NetAppVolumeMatchMode, "netapp-volume-match-mode", cfg.NetAppVolumeMatchMode, "How the derived token is matched against the stock Harvest `volume` label: exact, suffix, contains or regex.")
+	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one scoped QoS query's `volume` alternation. A larger matched set is split across several queries.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
@@ -172,6 +203,18 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		}
 		return nil
 	}
+	// getInt mirrors getDur: a non-numeric value fails at startup rather than
+	// silently keeping the default.
+	getInt := func(env string, dst *int) error {
+		if v, ok := lookup(env); ok {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: must be an integer", env, v)
+			}
+			*dst = n
+		}
+		return nil
+	}
 
 	getStr("KSG_PROM_URL", &cfg.PromURL)
 	// Env-only by design — no matching flags are registered in Parse (D-A1).
@@ -196,6 +239,16 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
 	getStr("KSG_AZ_LABEL", &cfg.AZLabel)
 	getStr("KSG_ENV_LABEL", &cfg.EnvLabel)
+	// Semicolon-separated, not comma-separated: a regular expression may
+	// legitimately contain a comma (`a{2,3}`) but a semicolon is far rarer, and
+	// the flag form exists for anything the separator cannot express.
+	if v, ok := lookup("KSG_NETAPP_VOLUME_KEY_REWRITE"); ok {
+		cfg.NetAppVolumeKeyRewrite = splitAndTrimOn(v, ";")
+	}
+	getStr("KSG_NETAPP_VOLUME_MATCH_MODE", &cfg.NetAppVolumeMatchMode)
+	if err := getInt("KSG_NETAPP_QOS_SCOPE_BATCH_BYTES", &cfg.NetAppQoSScopeBatchBytes); err != nil {
+		return err
+	}
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
 	// Env-only by design — no matching flags are registered in Parse
 	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
@@ -282,11 +335,104 @@ func (c Config) Validate() error {
 	if c.AZLabel == c.EnvLabel {
 		return fmt.Errorf("az-label and env-label must differ (both %q): one matcher would overwrite the other", c.AZLabel)
 	}
+	// The derivation decides which FlexVol every claim joins, so an
+	// uncompilable pattern or an unknown mode fails HERE rather than resolving
+	// a different estate than the operator declared. Compiling it also proves
+	// the value handed to build.Options is usable.
+	if _, err := c.VolumeKeyRewriter(); err != nil {
+		return fmt.Errorf("netapp volume key derivation is invalid: %w", err)
+	}
+	if c.NetAppQoSScopeBatchBytes <= 0 {
+		return fmt.Errorf(
+			"netapp-qos-scope-batch-bytes (KSG_NETAPP_QOS_SCOPE_BATCH_BYTES) must be > 0, got %d",
+			c.NetAppQoSScopeBatchBytes)
+	}
 	return nil
 }
 
 // labelNameRE is the PromQL label-name grammar.
 var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// volumeKeyRewriteFlag collects repeated --netapp-volume-key-rewrite values in
+// declaration order. The FIRST occurrence discards the default (nil) rather
+// than appending to it, so a deployment that configures any rule configures the
+// whole ordered list — a half-inherited default would apply a rewrite the
+// operator never wrote.
+type volumeKeyRewriteFlag struct {
+	dst  *[]string
+	seen bool
+}
+
+func (f *volumeKeyRewriteFlag) String() string {
+	if f == nil || f.dst == nil {
+		return ""
+	}
+	return strings.Join(*f.dst, ";")
+}
+
+func (f *volumeKeyRewriteFlag) Set(v string) error {
+	if !f.seen {
+		// Discard whatever the default or the environment supplied: the first
+		// flag occurrence starts the list. Appending instead would apply an
+		// inherited rule the operator never wrote, in a position they never
+		// chose — and order is load-bearing here.
+		*f.dst = nil
+		f.seen = true
+	}
+	*f.dst = append(*f.dst, v)
+	return nil
+}
+
+// ParseVolumeKeyRules turns the configured `<pattern>=<replacement>` entries
+// into build rules. Splitting on the FIRST `=` keeps a replacement free to
+// contain one; a PATTERN needing a literal `=` writes the escape `\x3d`, which
+// Go's regexp accepts.
+//
+// A nil input stays nil — "the operator configured none", which
+// build.NewVolumeKeyRewriter resolves to the defaults. A non-nil empty input
+// stays a non-nil empty slice: an explicit identity rewrite.
+func ParseVolumeKeyRules(entries []string) ([]build.VolumeKeyRule, error) {
+	if entries == nil {
+		return nil, nil
+	}
+	out := make([]build.VolumeKeyRule, 0, len(entries))
+	for i, e := range entries {
+		pattern, replacement, ok := strings.Cut(e, "=")
+		if !ok {
+			return nil, fmt.Errorf(
+				"netapp-volume-key-rewrite rule %d (%q) has no %q separator: write <regex>=<replacement>",
+				i+1, e, "=")
+		}
+		if pattern == "" {
+			return nil, fmt.Errorf(
+				"netapp-volume-key-rewrite rule %d (%q) has an empty pattern", i+1, e)
+		}
+		out = append(out, build.VolumeKeyRule{Pattern: pattern, Replacement: replacement})
+	}
+	return out, nil
+}
+
+// VolumeKeyRewriter compiles the configured derivation. Callers construct it
+// once at startup and hand the result to build.Options, so an invalid pattern is
+// a startup failure rather than a per-build one.
+func (c Config) VolumeKeyRewriter() (*build.VolumeKeyRewriter, error) {
+	rules, err := ParseVolumeKeyRules(c.NetAppVolumeKeyRewrite)
+	if err != nil {
+		return nil, err
+	}
+	return build.NewVolumeKeyRewriter(rules, build.VolumeMatchMode(c.NetAppVolumeMatchMode))
+}
+
+func splitAndTrimOn(v, sep string) []string {
+	parts := strings.Split(v, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func splitAndTrim(v string) []string {
 	if v == "" {

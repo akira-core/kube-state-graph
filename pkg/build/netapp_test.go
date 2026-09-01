@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,10 +31,20 @@ type netappFixture struct {
 	maxIOPS, maxMBps model.Vector
 	// aggregate / controller gauges.
 	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector
+	// rw overrides the derivation; nil exercises the shipped defaults
+	// (`-` → `_`, suffix match), which is what almost every case wants.
+	rw *VolumeKeyRewriter
+}
+
+func (f netappFixture) rewriter() *VolumeKeyRewriter {
+	if f.rw != nil {
+		return f.rw
+	}
+	return defaultVolumeKeyRewriter()
 }
 
 func (f netappFixture) run() netappResult {
-	return resolveNetAppStorage(f.claims, f.vol,
+	return resolveNetAppStorage(f.claims, f.rewriter(), f.vol,
 		f.readOps, f.writeOps, f.readLat, f.writeLat, f.readData, f.writeData,
 		f.maxIOPS, f.maxMBps,
 		f.aggrStatus, f.aggrUsed, f.aggrTotal, f.nodeStatus)
@@ -41,16 +52,26 @@ func (f netappFixture) run() netappResult {
 
 func claim1() []pvcVolume { return []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}} }
 
+// tridentVol renders the ONTAP FlexVol name a CSI provisioner derives from a
+// PersistentVolume name: the prefix it is configured with, plus the PV name with
+// every `-` replaced by `_` (ONTAP volume names admit no dashes). Fixtures state
+// PV names and the series carry stock Harvest `volume` values, so every case
+// below exercises the shipped derivation end to end rather than a pre-joined
+// key.
+func tridentVol(pvName string) string {
+	return "trident_" + strings.ReplaceAll(pvName, "-", "_")
+}
+
 // volLabelSample is a hop-A volume_labels series. Its value is deliberately a
 // constant: the resolver must never read it.
-func volLabelSample(vn, oc, node, aggr, svm string) model.Sample {
+func volLabelSample(pvName, oc, node, aggr, svm string) model.Sample {
 	return model.Sample{
 		Metric: model.Metric{
-			"volume_name": model.LabelValue(vn),
-			"cluster":     model.LabelValue(oc),
-			"node":        model.LabelValue(node),
-			"aggr":        model.LabelValue(aggr),
-			"svm":         model.LabelValue(svm),
+			"volume":  model.LabelValue(tridentVol(pvName)),
+			"cluster": model.LabelValue(oc),
+			"node":    model.LabelValue(node),
+			"aggr":    model.LabelValue(aggr),
+			"svm":     model.LabelValue(svm),
 		},
 		Value: 1,
 	}
@@ -60,10 +81,10 @@ func volLabelSample(vn, oc, node, aggr, svm string) model.Sample {
 // that is exactly why hop A exists. LUN-level workloads never reach the
 // resolver: they are excluded at the query layer by the `lun=""` matcher,
 // pinned by promql.TestRender_QoSVolumeGranularity.
-func qosSample(vn, oc, svm, policy string, val float64) model.Sample {
+func qosSample(pvName, oc, svm, policy string, val float64) model.Sample {
 	return model.Sample{
 		Metric: model.Metric{
-			"volume_name":  model.LabelValue(vn),
+			"volume":       model.LabelValue(tridentVol(pvName)),
 			"cluster":      model.LabelValue(oc),
 			"svm":          model.LabelValue(svm),
 			"policy_group": model.LabelValue(policy),
@@ -406,7 +427,7 @@ func TestResolveNetAppStorage_SVMComesFromTopologyOnly(t *testing.T) {
 	assert.True(t, hasMsg(recs, "netapp_qos_join_miss"))
 }
 
-// A volume_name colliding across two ONTAP clusters sharing one
+// A FlexVol name colliding across two ONTAP clusters sharing one
 // VictoriaMetrics must not have the other filer's throughput summed onto this
 // edge.
 func TestResolveNetAppStorage_QoSScopedToPickedCluster(t *testing.T) {
@@ -500,7 +521,7 @@ func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err, "a failing Harvest leg must not fail the build")
 	assert.Empty(t, tp.NetAppAggrs)
 }
@@ -516,7 +537,7 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
@@ -525,31 +546,72 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 // Application from its controller).
 // Pinning the count catches a leg silently dropped or double-registered.
 func TestReadTopology_FanOutLegCount(t *testing.T) {
-	var mu sync.Mutex
-	seen := map[string]int{}
+	// The six QoS workload legs are no longer unconditional: they are issued
+	// only for FlexVol names a loaded claim already matched, so the fan-out has
+	// two shapes and both are pinned here.
+	fanOut := func(t *testing.T, fixtures map[promql.Query]model.Vector) map[string]int {
+		t.Helper()
+		var mu sync.Mutex
+		seen := map[string]int{}
 
-	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Run(func(_ context.Context, name string, _ string, _ time.Time) {
-			mu.Lock()
-			seen[name]++
-			mu.Unlock()
-		}).
-		Return(model.Vector{}, nil).
-		Maybe()
+		q := promqlmocks.NewMockQuerier(t)
+		q.EXPECT().
+			Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			RunAndReturn(func(_ context.Context, name string, _ string, _ time.Time) (model.Vector, error) {
+				mu.Lock()
+				seen[name]++
+				mu.Unlock()
+				return fixtures[promql.Query(name)], nil
+			}).
+			Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
-	require.NoError(t, err)
+		_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(),
+			Options{}, promql.Selector{})
+		require.NoError(t, err)
 
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Len(t, seen, 37, "one query per leg, no duplicates")
-	total := 0
-	for _, n := range seen {
-		total += n
+		mu.Lock()
+		defer mu.Unlock()
+		out := map[string]int{}
+		for k, n := range seen {
+			out[k] = n
+		}
+		return out
 	}
-	assert.Equal(t, 37, total, "each leg issued exactly once")
+
+	assertOncePerLeg := func(t *testing.T, seen map[string]int, want int, msg string) {
+		t.Helper()
+		assert.Len(t, seen, want, msg)
+		total := 0
+		for _, n := range seen {
+			total += n
+		}
+		assert.Equal(t, want, total, "each leg issued exactly once")
+	}
+
+	t.Run("no matched volume issues no QoS workload query", func(t *testing.T) {
+		seen := fanOut(t, nil)
+		assertOncePerLeg(t, seen, 31, "31 legs, the six QoS workload families withheld")
+		for _, q := range promql.QoSWorkloadQueries {
+			assert.Zero(t, seen[string(q)], string(q))
+		}
+	})
+
+	t.Run("a matched volume adds the six QoS workload legs", func(t *testing.T) {
+		seen := fanOut(t, map[promql.Query]model.Vector{
+			promql.QPVCInfo: {&model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
+				"volumename": "pvc-9f3a",
+			}, Value: 1}},
+			promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
+				"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
+				"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
+			}, Value: 1}},
+		})
+		assertOncePerLeg(t, seen, 37, "one query per leg, no duplicates")
+		for _, q := range promql.QoSWorkloadQueries {
+			assert.Equal(t, 1, seen[string(q)], string(q))
+		}
+	})
 }
 
 // legFixture is one topology leg's canned answer.
@@ -596,7 +658,7 @@ func failingLegs(vec model.Vector, err error, names ...promql.Query) map[promql.
 // readTopologyDefaults runs ReadTopology with the zero LabelKeys / Selector —
 // the shape every leg-failure test wants.
 func readTopologyDefaults(ctx context.Context, q promql.Querier) (Topology, error) {
-	return ReadTopology(ctx, q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	return ReadTopology(ctx, q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 }
 
 func TestReadTopology_AccumulatingAnnotationLegDegrades(t *testing.T) {
@@ -724,4 +786,94 @@ func TestReadTopology_DegradingLegHonoursCallerCancellation(t *testing.T) {
 	live := legQuerier(t, failingLegs(nil, errors.New("upstream 5xx"), promql.QJobAnnotations))
 	_, err = readTopologyDefaults(context.Background(), live)
 	require.NoError(t, err, "the same leg and error must degrade when the caller is still alive")
+}
+
+// A claim can match more than one FlexVol name — two filers each carrying a
+// volume whose name ends with the same derived token. The aggregate pick stays
+// the lexically-smallest (ontap_cluster, aggr) pair and the result is
+// independent of upstream vector order.
+func TestResolveNetAppStorage_TwoVolumesMatchOneClaim(t *testing.T) {
+	a := model.Sample{Metric: model.Metric{
+		"volume": "trident_pvc_x", "cluster": "ontap-b", "node": "n-b", "aggr": "aggr-b", "svm": "svm0",
+	}, Value: 1}
+	b := model.Sample{Metric: model.Metric{
+		"volume": "other_pvc_x", "cluster": "ontap-a", "node": "n-a", "aggr": "aggr-a", "svm": "svm0",
+	}, Value: 1}
+
+	fwd := netappFixture{claims: claim1(), vol: model.Vector{&a, &b}}.run()
+	rev := netappFixture{claims: claim1(), vol: model.Vector{&b, &a}}.run()
+
+	require.Len(t, fwd.edges, 1)
+	assert.Equal(t, graph.NetAppAggrID("ontap-a", "aggr-a"), fwd.edges[0].Target,
+		"the lexically-smallest (ontap_cluster, aggr) pair wins across matched volumes")
+	assert.Equal(t, fwd.edges[0].Target, rev.edges[0].Target, "independent of vector order")
+	assert.Equal(t, fwd.edges[0].ID, rev.edges[0].ID)
+}
+
+// QoS candidates are gathered across every FlexVol name a claim matched, in
+// sorted name order, so the summed I/O is a pure function of the matched set.
+func TestResolveNetAppStorage_QoSSummedAcrossMatchedVolumes(t *testing.T) {
+	vol := func(v, oc, aggr string) *model.Sample {
+		return &model.Sample{Metric: model.Metric{
+			"volume": model.LabelValue(v), "cluster": model.LabelValue(oc),
+			"node": "n", "aggr": model.LabelValue(aggr), "svm": "svm0",
+		}, Value: 1}
+	}
+	qos := func(v, oc string, val float64) *model.Sample {
+		return &model.Sample{Metric: model.Metric{
+			"volume": model.LabelValue(v), "cluster": model.LabelValue(oc), "svm": "svm0",
+		}, Value: model.SampleValue(val)}
+	}
+
+	f := netappFixture{
+		claims:  claim1(),
+		vol:     model.Vector{vol("trident_pvc_x", "ontap-a", "aggr1"), vol("other_pvc_x", "ontap-a", "aggr1")},
+		readOps: model.Vector{qos("trident_pvc_x", "ontap-a", 10), qos("other_pvc_x", "ontap-a", 5)},
+	}
+	got := f.run()
+
+	require.Len(t, got.edges, 1)
+	require.NotNil(t, got.edges[0].IO)
+	require.NotNil(t, got.edges[0].IO.ReadOps)
+	assert.InDelta(t, 15.0, *got.edges[0].IO.ReadOps, 1e-12,
+		"both matched volumes' workloads measure this claim")
+}
+
+// A derivation that does not fit the estate's FlexVol naming is REPORTED, not
+// silent: every claim misses and the aggregated warning carries the full count.
+// This is the operator's signal to tune the rewrite rules or the match mode.
+func TestResolveNetAppStorage_DerivationMisfitIsCounted(t *testing.T) {
+	claims := []pvcVolume{
+		{id: "c/db/a", volumeName: "pvc-a"},
+		{id: "c/db/b", volumeName: "pvc-b"},
+		{id: "c/db/c", volumeName: "pvc-c"},
+	}
+	// A filer whose volume names embed no PV name at all.
+	vol := model.Vector{
+		&model.Sample{Metric: model.Metric{
+			"volume": "vol0", "cluster": "ontap-prod", "node": "n", "aggr": "aggr1",
+		}, Value: 1},
+		&model.Sample{Metric: model.Metric{
+			"volume": "root_vol", "cluster": "ontap-prod", "node": "n", "aggr": "aggr1",
+		}, Value: 1},
+	}
+
+	var got netappResult
+	recs := captureDebugRecords(t, func() {
+		got = netappFixture{claims: claims, vol: vol}.run()
+	})
+
+	assert.Empty(t, got.edges, "nothing joined")
+	assert.Empty(t, got.aggrs)
+	require.True(t, hasMsg(recs, "netapp_volume_join_miss"))
+	var count float64
+	for _, r := range recs {
+		if r["msg"] == "netapp_volume_join_miss" {
+			count, _ = r["count"].(float64)
+		}
+	}
+	assert.InDelta(t, float64(len(claims)), count, 1e-12,
+		"every claim is counted, so the misfit is visible rather than silent")
+	assert.False(t, hasMsg(recs, "netapp_qos_join_miss"),
+		"no edge was drawn, so there is nothing for the I/O signal to report")
 }

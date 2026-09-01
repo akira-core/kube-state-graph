@@ -183,6 +183,13 @@ type topologyVectors struct {
 	// resolves no Application either way and the degrade stays subtractive on
 	// its own.
 	JobAnnotationsDegraded bool
+
+	// VolumeKey derives each claim's Harvest match token from its bound PV
+	// name and decides how that token is compared against the stock `volume`
+	// label. Like JobAnnotationsDegraded it is a build-scoped FACT rather than
+	// a vector, carried here so parseTopology keeps its two-argument shape.
+	// Nil means the defaults (`-` → `_`, suffix match).
+	VolumeKey *VolumeKeyRewriter
 	// NetApp Harvest storage series, in join order (design.md D3):
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
@@ -221,13 +228,17 @@ func ReadTopology(
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
-	keys promql.LabelKeys,
+	opts Options,
 	sel promql.Selector,
 ) (Topology, error) {
+	keys := opts.LabelKeys
 	// Each goroutine writes a distinct field, so concurrent writes to v are
 	// race-free (no overlapping memory); g.Wait() establishes the happens-before
 	// edge to the read below.
 	var v topologyVectors
+	// The parse must derive claim tokens exactly as the scope computation below
+	// did, or a claim could be fetched for and then not joined.
+	v.VolumeKey = opts.volumeKey()
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -319,7 +330,16 @@ func ReadTopology(
 	g.Go(fetch(promql.QEndpointSliceLabels, &v.EpLabels))
 	g.Go(fetch(promql.QPodOwner, &v.PodOwner))
 	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
-	g.Go(fetch(promql.QPVCInfo, &v.PVCInfo))
+	// Signalled, not awaited by a barrier: the scoped QoS read depends on these
+	// two legs alone, so it starts as soon as they land instead of behind the
+	// slowest kube-state-metrics leg (design D5).
+	pvcInfoDone, volumeLabelsDone := make(chan struct{}), make(chan struct{})
+	g.Go(signalWhenDone(fetch(promql.QPVCInfo, &v.PVCInfo), pvcInfoDone))
+	g.Go(signalWhenDone(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels), volumeLabelsDone))
+	g.Go(func() error {
+		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v,
+			pvcInfoDone, volumeLabelsDone)
+	})
 	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
 	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
 	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
@@ -340,13 +360,13 @@ func ReadTopology(
 	g.Go(fetchOptional(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
 	g.Go(fetchOptionalTracking(promql.QJobAnnotations, &v.JobAnnotations, &v.JobAnnotationsDegraded))
 	g.Go(fetch(promql.QCronJobAnnotations, &v.CronJobAnnotations))
-	g.Go(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels))
-	g.Go(fetchOptional(promql.QQoSReadOps, &v.QoSReadOps))
-	g.Go(fetchOptional(promql.QQoSWriteOps, &v.QoSWriteOps))
-	g.Go(fetchOptional(promql.QQoSReadLatency, &v.QoSReadLatency))
-	g.Go(fetchOptional(promql.QQoSWriteLatency, &v.QoSWriteLatency))
-	g.Go(fetchOptional(promql.QQoSReadData, &v.QoSReadData))
-	g.Go(fetchOptional(promql.QQoSWriteData, &v.QoSWriteData))
+	// The six QoS workload families are NOT issued here. They are the one leg
+	// whose useful population is not known until another leg has been read:
+	// ONTAP collects a workload per volume on the filer, and the resolver
+	// consults them only for claims that already matched a volume_labels
+	// series. readScopedQoS below waits on exactly the two families its scope
+	// is computed from and then issues each workload query restricted to the
+	// FlexVol names those claims actually matched.
 	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxIOPS, &v.QoSPolicyMaxIOPS))
 	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxMBps, &v.QoSPolicyMaxMBps))
 	g.Go(fetchOptional(promql.QAggrStatus, &v.AggrStatus))
@@ -456,6 +476,16 @@ func (a nodeAddrs) pick() string {
 		return a.external
 	}
 	return a.internal
+}
+
+// volumeKey resolves the derivation this parse uses, adopting the defaults for
+// a zero topologyVectors — which is what every hand-built test fixture and
+// every embedder that configures nothing passes.
+func (v topologyVectors) volumeKey() *VolumeKeyRewriter {
+	if v.VolumeKey != nil {
+		return v.VolumeKey
+	}
+	return defaultVolumeKeyRewriter()
 }
 
 func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
@@ -843,7 +873,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn})
 		}
 	}
-	netapp := resolveNetAppStorage(claims,
+	netapp := resolveNetAppStorage(claims, v.volumeKey(),
 		v.VolumeLabels,
 		v.QoSReadOps, v.QoSWriteOps, v.QoSReadLatency, v.QoSWriteLatency,
 		v.QoSReadData, v.QoSWriteData,
