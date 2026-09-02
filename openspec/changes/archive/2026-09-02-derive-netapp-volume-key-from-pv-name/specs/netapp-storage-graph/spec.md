@@ -55,7 +55,7 @@ The derivation SHALL be a pure function of the PV name and the configuration, so
 
 The six QoS workload queries SHALL be issued **only for FlexVol names the volume-label family has already matched**, never as an unfiltered read of every workload on the filer. ONTAP collects a QoS workload for every volume, the overwhelming majority of which back no claim, and the builder consults the QoS families only for claims that already resolved an aggregate — so an unfiltered read fetches series that are provably discarded before they are read.
 
-The scope SHALL be the sorted, de-duplicated set of `volume` values matched by the loaded claims' derived tokens, and each issued query SHALL restrict `volume` to that set with an anchored alternation composed with — never replacing — the family's fixed `lun=""` selector. Because the scope holds FlexVol names that already matched, the query-layer restriction is **exact**: the match modes of the derivation requirement are applied once, in the builder, and SHALL NOT reach the query layer.
+The scope SHALL be the sorted, de-duplicated set of `volume` values matched by the loaded claims' derived tokens, and each issued query SHALL restrict `volume` to that set with an anchored alternation. That restriction SHALL be the query's ONLY matcher — volume granularity is a reader rule, not a selector one (see "Harvest QoS workload series as the I/O source"). Because the scope holds FlexVol names that already matched, the query-layer restriction is **exact**: the match modes of the derivation requirement are applied once, in the builder, and SHALL NOT reach the query layer.
 
 The scope SHALL be computed from the claim-info family and the volume-label family alone; the QoS read SHALL wait on those two families only, and SHALL NOT wait on families it does not read.
 
@@ -68,7 +68,7 @@ Each chunk SHALL degrade independently and SHALL NOT fail the build: a failed ch
 #### Scenario: QoS read is restricted to matched volumes
 
 - **WHEN** a build loads 3 claims that match `volume` values `v_a`, `v_b` and `v_c` while the filer carries 40000 other QoS workloads
-- **THEN** every issued QoS query restricts `volume` to exactly `{v_a, v_b, v_c}` alongside its `lun=""` matcher, and no series for any other workload is fetched
+- **THEN** every issued QoS query restricts `volume` to exactly `{v_a, v_b, v_c}` and carries no other matcher, and no series for any other workload is fetched
 
 #### Scenario: No matched volumes issues no QoS query
 
