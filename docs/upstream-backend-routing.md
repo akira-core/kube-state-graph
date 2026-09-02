@@ -92,7 +92,7 @@ pods on both ends.
 
 `harvest` is the opposite special case: it **is** routed by zone, but the query
 string sent to the selected backend is the unfiltered one — no `az` and no
-`env` matcher (the `qos_*` families keep their fixed `lun=""`). A per-zone
+`env` matcher (the `qos_*` families carry only their data-derived `volume` scope). A per-zone
 Harvest store already holds only its own zone's series, so the store boundary is
 the zone filter, and the Harvest series therefore need **not** carry the
 configured `az` / `env` labels at all. Two consequences: `?env=` has no effect

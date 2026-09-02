@@ -99,7 +99,7 @@ var EdgeTypes = []EdgeTypeDefinition{
 	},
 	{
 		Type:            EdgeTypePVCToNetAppAggr,
-		Description:     "PVC is served by an ONTAP aggregate, derived by joining the PVC's bound PV name (kube_persistentvolumeclaim_info.volumename) to the Harvest volume series' volume_name label. The target aggregate belongs to no Kubernetes cluster, so the Kubernetes cross-cluster notion does not apply. Carries typed data.metrics I/O fields (read_ops / write_ops / read_latency_us / write_latency_us / read_bytes_per_sec / write_bytes_per_sec) when the matching Harvest families are present.",
+		Description:     "PVC is served by an ONTAP aggregate, derived by rewriting the PVC's bound PV name (kube_persistentvolumeclaim_info.volumename) into a match token and matching it against the stock `volume` label (the ONTAP FlexVol name) of the Harvest volume series. The target aggregate belongs to no Kubernetes cluster, so the Kubernetes cross-cluster notion does not apply. Carries typed data.metrics I/O fields (read_ops / write_ops / read_latency_us / write_latency_us / read_bytes_per_sec / write_bytes_per_sec) when the matching Harvest families are present.",
 		SourceType:      []NodeType{NodeTypePVC},
 		TargetType:      []NodeType{NodeTypeNetAppAggr},
 		Directed:        true,

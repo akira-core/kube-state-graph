@@ -1,8 +1,5 @@
-# netapp-storage-graph Specification
+## ADDED Requirements
 
-## Purpose
-Surfaces the physical NetApp ONTAP storage behind Kubernetes claims: one graph node per ONTAP aggregate and per ONTAP controller, a PVC-to-aggregate edge derived from a single Harvest label series, per-edge I/O measurements and the volume's declared throughput ceiling from the Harvest QoS families, per-aggregate health and usage, controller health, and coverage signals for claims that should have joined but did not.
-## Requirements
 ### Requirement: PV-name-to-FlexVol-name derivation
 
 The builder SHALL bridge the Kubernetes PersistentVolume name and the ONTAP FlexVol name by deriving a **match token** from each claim's resolved PV name and comparing that token against the stock `volume` label of the Harvest series. ONTAP volume names admit only letters, digits and `_`, so a `volume` value can never equal a `pvc-<uuid>` PV name and the two SHALL NOT be compared for equality directly.
@@ -53,6 +50,47 @@ The derivation SHALL be a pure function of the PV name and the configuration, so
 
 - **WHEN** two consecutive builds run over the same estate with the same configuration
 - **THEN** every claim derives the same token and the emitted node, edge and label sets are byte-identical
+
+### Requirement: Scoped and batched QoS workload read
+
+The six QoS workload queries SHALL be issued **only for FlexVol names the volume-label family has already matched**, never as an unfiltered read of every workload on the filer. ONTAP collects a QoS workload for every volume, the overwhelming majority of which back no claim, and the builder consults the QoS families only for claims that already resolved an aggregate — so an unfiltered read fetches series that are provably discarded before they are read.
+
+The scope SHALL be the sorted, de-duplicated set of `volume` values matched by the loaded claims' derived tokens, and each issued query SHALL restrict `volume` to that set with an anchored alternation. That restriction SHALL be the query's ONLY matcher — volume granularity is a reader rule, not a selector one (see "Harvest QoS workload series as the I/O source"). Because the scope holds FlexVol names that already matched, the query-layer restriction is **exact**: the match modes of the derivation requirement are applied once, in the builder, and SHALL NOT reach the query layer.
+
+The scope SHALL be computed from the claim-info family and the volume-label family alone; the QoS read SHALL wait on those two families only, and SHALL NOT wait on families it does not read.
+
+When the scope is **empty** — no claim matched any volume-label series, or the volume-label family was absent or degraded — the builder SHALL issue **no QoS workload query at all**, mirroring the rule that a selector loading no pods or services issues no service-graph queries.
+
+Because the alternation grows with the number of matched volumes and upstream installations cap query length, the scope SHALL be **chunked deterministically** and one query issued per chunk per family. A single volume name SHALL always be issued even when it alone exceeds the chunk budget: dropping it would remove a claim's measurements silently. Chunk results SHALL be merged in **chunk order**, not completion order, so that the summed I/O values are a pure function of the scope and independent of upstream timing.
+
+Each chunk SHALL degrade independently and SHALL NOT fail the build: a failed chunk costs I/O measurements only for the claims whose volumes it carried, and the deterministic chunking makes which claims those are a pure function of the scope. The `pvc-to-netapp-aggr` edges, the aggregate and controller entities, and the PVC `svm` labels are unaffected by any QoS chunk outcome.
+
+#### Scenario: QoS read is restricted to matched volumes
+
+- **WHEN** a build loads 3 claims that match `volume` values `v_a`, `v_b` and `v_c` while the filer carries 40000 other QoS workloads
+- **THEN** every issued QoS query restricts `volume` to exactly `{v_a, v_b, v_c}` and carries no other matcher, and no series for any other workload is fetched
+
+#### Scenario: No matched volumes issues no QoS query
+
+- **WHEN** a build reads a `volume_labels` vector in which no series matches any loaded claim's derived token
+- **THEN** no QoS workload query is issued at all, every claim's outcome is unchanged, and the build succeeds
+
+#### Scenario: Volume-label family absent issues no QoS query
+
+- **WHEN** the volume-label family is absent from the window or its read degraded
+- **THEN** no QoS workload query is issued, no `pvc-to-netapp-aggr` edge is emitted, and the build succeeds
+
+#### Scenario: Large scope is chunked and merged deterministically
+
+- **WHEN** the matched scope is large enough to exceed the chunk budget and is split across several queries per family
+- **THEN** the merged result is identical to a single unchunked read of the same scope, and two consecutive builds over the same estate produce byte-identical I/O values
+
+#### Scenario: One failed chunk costs only its own claims
+
+- **WHEN** one chunk of one QoS family fails while every other chunk succeeds
+- **THEN** the build succeeds, claims carried by the successful chunks keep their `metrics`, claims carried by the failed chunk emit their edge with no `metrics` key and are counted by the I/O-coverage signal, and no claim loses its aggregate, controller or `svm`
+
+## MODIFIED Requirements
 
 ### Requirement: Harvest volume-label series as the storage topology source
 
@@ -125,45 +163,6 @@ All six families are OPTIONAL and independent of the topology source. When none 
 - **WHEN** a claim resolves its aggregate from `volume_labels` but no QoS workload series carries its matched FlexVol name
 - **THEN** the graph still contains the `pvc-to-netapp-aggr` edge and its `netapp-aggr` / `netapp-node` nodes, the edge has no `metrics` key, and the claim is counted by the I/O-coverage signal
 
-### Requirement: Scoped and batched QoS workload read
-
-The six QoS workload queries SHALL be issued **only for FlexVol names the volume-label family has already matched**, never as an unfiltered read of every workload on the filer. ONTAP collects a QoS workload for every volume, the overwhelming majority of which back no claim, and the builder consults the QoS families only for claims that already resolved an aggregate — so an unfiltered read fetches series that are provably discarded before they are read.
-
-The scope SHALL be the sorted, de-duplicated set of `volume` values matched by the loaded claims' derived tokens, and each issued query SHALL restrict `volume` to that set with an anchored alternation. That restriction SHALL be the query's ONLY matcher — volume granularity is a reader rule, not a selector one (see "Harvest QoS workload series as the I/O source"). Because the scope holds FlexVol names that already matched, the query-layer restriction is **exact**: the match modes of the derivation requirement are applied once, in the builder, and SHALL NOT reach the query layer.
-
-The scope SHALL be computed from the claim-info family and the volume-label family alone; the QoS read SHALL wait on those two families only, and SHALL NOT wait on families it does not read.
-
-When the scope is **empty** — no claim matched any volume-label series, or the volume-label family was absent or degraded — the builder SHALL issue **no QoS workload query at all**, mirroring the rule that a selector loading no pods or services issues no service-graph queries.
-
-Because the alternation grows with the number of matched volumes and upstream installations cap query length, the scope SHALL be **chunked deterministically** and one query issued per chunk per family. A single volume name SHALL always be issued even when it alone exceeds the chunk budget: dropping it would remove a claim's measurements silently. Chunk results SHALL be merged in **chunk order**, not completion order, so that the summed I/O values are a pure function of the scope and independent of upstream timing.
-
-Each chunk SHALL degrade independently and SHALL NOT fail the build: a failed chunk costs I/O measurements only for the claims whose volumes it carried, and the deterministic chunking makes which claims those are a pure function of the scope. The `pvc-to-netapp-aggr` edges, the aggregate and controller entities, and the PVC `svm` labels are unaffected by any QoS chunk outcome.
-
-#### Scenario: QoS read is restricted to matched volumes
-
-- **WHEN** a build loads 3 claims that match `volume` values `v_a`, `v_b` and `v_c` while the filer carries 40000 other QoS workloads
-- **THEN** every issued QoS query restricts `volume` to exactly `{v_a, v_b, v_c}` and carries no other matcher, and no series for any other workload is fetched
-
-#### Scenario: No matched volumes issues no QoS query
-
-- **WHEN** a build reads a `volume_labels` vector in which no series matches any loaded claim's derived token
-- **THEN** no QoS workload query is issued at all, every claim's outcome is unchanged, and the build succeeds
-
-#### Scenario: Volume-label family absent issues no QoS query
-
-- **WHEN** the volume-label family is absent from the window or its read degraded
-- **THEN** no QoS workload query is issued, no `pvc-to-netapp-aggr` edge is emitted, and the build succeeds
-
-#### Scenario: Large scope is chunked and merged deterministically
-
-- **WHEN** the matched scope is large enough to exceed the chunk budget and is split across several queries per family
-- **THEN** the merged result is identical to a single unchunked read of the same scope, and two consecutive builds over the same estate produce byte-identical I/O values
-
-#### Scenario: One failed chunk costs only its own claims
-
-- **WHEN** one chunk of one QoS family fails while every other chunk succeeds
-- **THEN** the build succeeds, claims carried by the successful chunks keep their `metrics`, claims carried by the failed chunk emit their edge with no `metrics` key and are counted by the I/O-coverage signal, and no claim loses its aggregate, controller or `svm`
-
 ### Requirement: QoS fixed-policy throughput ceilings
 
 The builder SHALL resolve each joined volume's declared throughput ceiling from the OPTIONAL Harvest QoS fixed-policy series `qos_policy_fixed_max_throughput_iops` and `qos_policy_fixed_max_throughput_mbps`. The fixed, case-sensitive label contract: `cluster` (the ONTAP cluster), `svm`, and the policy's own identity label naming the policy group, read as `name` with a `policy_group` fallback (Harvest spells it differently across templates; the contract pins the key's SHAPE, not the label's spelling).
@@ -227,136 +226,6 @@ Because the policy group is recovered from a matched workload series, a ceiling 
 
 - **WHEN** a claim draws its edge from `volume_labels` but matches no QoS workload series
 - **THEN** the edge has no `metrics` key at all — neither a measurement nor a ceiling field is emitted; with no workload series there is no policy group to key on
-
-### Requirement: NetApp aggregate entity
-
-The builder SHALL materialise each ONTAP aggregate referenced by at least one joined claim as a `type="netapp-aggr"` graph node:
-
-- `id` SHALL be `netapp/<ontap-cluster>/aggr/<aggr>` (aggregate names are cluster-wide unique in ONTAP; the id deliberately **excludes the owning node**, so an HA takeover moves ownership without changing the aggregate's identity).
-- `name` SHALL be `<aggr>` (the aggregate name).
-- `labels` SHALL be exactly `{ontap_cluster: "<ontap-cluster>", node: "<node>"}` — the `node` value is the controller **currently owning** the aggregate (from the matched `volume_labels` series' `node` label) and drives the compound nesting under the real `netapp-node` (graph-api "Cytoscape compound node grouping"). Deliberately **no `cluster` key** — the aggregate belongs to no Kubernetes cluster.
-
-When matched `volume_labels` series disagree on the owning `node` for one aggregate (e.g. a takeover inside the window), the builder SHALL pick deterministically — the lexically-smallest non-empty `node` value — so the emitted labels are byte-stable across rebuilds. Because the aggregate carries no `cluster` label, its ONTAP cluster name SHALL NEVER appear in the response's top-level `clusters[]` array, and a `?cluster=` filter SHALL never match it directly. A filer shared by several Kubernetes clusters SHALL yield **one** aggregate node per aggregate — the same id — with `pvc-to-netapp-aggr` edges arriving from every Kubernetes cluster that uses it.
-
-A NetApp aggregate SHALL be materialised ONLY via the PVC join — never wholesale from Harvest series presence. It SHALL NOT carry `ipaddress`, `owner`, `application`, `containers`, or `ready_status`.
-
-#### Scenario: Aggregate identity and labels
-
-- **WHEN** a claim joins a `volume_labels` series with `cluster="ontap-prod"`, `node="ontap-prod-01"`, `aggr="aggr1"`
-- **THEN** the graph contains a node with `id="netapp/ontap-prod/aggr/aggr1"`, `name="aggr1"`, `type="netapp-aggr"`, and `labels={ontap_cluster:"ontap-prod", node:"ontap-prod-01"}` with no `cluster` key
-
-#### Scenario: HA takeover moves ownership, not identity
-
-- **WHEN** the same aggregate `aggr1` is observed owned by `ontap-prod-02` in a later window after a takeover
-- **THEN** the node keeps `id="netapp/ontap-prod/aggr/aggr1"` while its `labels.node` (and hence its compound parent) becomes `ontap-prod-02`
-
-#### Scenario: Unreferenced aggregate not materialised
-
-- **WHEN** Harvest reports `volume_labels` series for an aggregate whose `volume_name` values match no PVC's resolved PV name
-- **THEN** no `netapp-aggr` node is materialised for that aggregate
-
-#### Scenario: Shared filer is one node set across Kubernetes clusters
-
-- **WHEN** a PVC in Kubernetes cluster `cluster-alpha` and a PVC in `cluster-beta` both join `volume_labels` series on aggregate `(ontap-prod, aggr1)`
-- **THEN** the graph contains exactly one `netapp/ontap-prod/aggr/aggr1` node with one `pvc-to-netapp-aggr` edge from each PVC, and no ONTAP cluster name appears in `clusters[]`
-
-### Requirement: NetApp node entity and health
-
-The builder SHALL materialise each ONTAP controller referenced by at least one emitted `netapp-aggr` node (its `labels.node`) as a `type="netapp-node"` graph node:
-
-- `id` SHALL be `netapp/<ontap-cluster>/<node>`.
-- `name` SHALL be `<node>` (the controller name).
-- `labels` SHALL be exactly `{ontap_cluster: "<ontap-cluster>"}` — no `cluster` key; the same `clusters[]` / `?cluster=` exclusion as the aggregate.
-
-The node's health SHALL derive from the OPTIONAL Harvest series `node_new_status` (fixed, case-sensitive labels: `cluster` — the ONTAP cluster, `node`; sample value `1` = the controller is healthy, any other value = not healthy), matched on `(ontap-cluster, node)`:
-
-- the matched sample is `1` → `data.health = "online"`
-- the matched sample is not `1` → `data.health = "degraded"`
-- no matched series (or the metric absent entirely) → the `health` attribute is **omitted**.
-
-Absence of data SHALL stay distinct from a reported unhealthy state — the builder SHALL NOT default a missing metric to `"degraded"` (the `ready_status` absent-vs-Unknown precedent). On duplicate series for one `(ontap-cluster, node)` the builder SHALL derive deterministically (any non-`1` sample → `"degraded"`, order-free). Failure of the `node_new_status` query SHALL degrade gracefully (health omitted on every node) and SHALL NOT fail the build.
-
-A NetApp node SHALL be materialised ONLY via aggregate reference — never wholesale from Harvest series presence — and SHALL NOT carry `ipaddress`, `owner`, `application`, `containers`, or `ready_status`. It acts as the **compound parent** of its aggregates (graph-api "Cytoscape compound node grouping") and is the target of no edge.
-
-#### Scenario: Node identity, labels, and health
-
-- **WHEN** an emitted aggregate carries `labels.node="ontap-prod-01"` in ONTAP cluster `ontap-prod` and `node_new_status{cluster="ontap-prod", node="ontap-prod-01"}` has value `1`
-- **THEN** the graph contains a node with `id="netapp/ontap-prod/ontap-prod-01"`, `name="ontap-prod-01"`, `type="netapp-node"`, `labels={ontap_cluster:"ontap-prod"}`, and `data.health="online"`
-
-#### Scenario: Unhealthy controller
-
-- **WHEN** `node_new_status` for a materialised controller has value `0`
-- **THEN** that node carries `data.health="degraded"`
-
-#### Scenario: Absent node-status metric omits the attribute
-
-- **WHEN** no `node_new_status` series matches a materialised NetApp node (or the metric is absent from the window)
-- **THEN** that node's `data` has no `health` key — absence is never conflated with `"degraded"`
-
-#### Scenario: Controller not referenced by any aggregate is not materialised
-
-- **WHEN** `node_new_status` reports a controller that owns no emitted aggregate
-- **THEN** no `netapp-node` node is materialised for it
-
-### Requirement: NetApp aggregate health and usage
-
-Each materialised `netapp-aggr` node SHALL be able to carry two typed attributes, both `omitempty`, both outside `labels`:
-
-- `health` — from the OPTIONAL Harvest series `aggr_new_status` (fixed, case-sensitive labels: `cluster`, `node`, `aggr`; sample value `1` = the aggregate is online, any other value = not online), matched on `(ontap-cluster, aggr)` — a 1:1 per-aggregate read, with NO cross-aggregate derivation: the sample is `1` → `"online"`; not `1` → `"degraded"`; no matched series → the attribute is **omitted** (absence is distinct from a reported unhealthy state, never conflated). On duplicate series the derivation is deterministic (any non-`1` sample → `"degraded"`, order-free).
-- `usage` — an object `{used_bytes, capacity_bytes}` from the OPTIONAL Harvest series `aggr_space_used` / `aggr_space_total` (same label contract as `aggr_new_status`), matched on `(ontap-cluster, aggr)` — the **same shape** the PVC gains from kubelet volume stats. Per-field independent: each field present iff its own series matched; the object present iff at least one field resolved; values are JSON numbers (bytes), never strings. On duplicate series the builder SHALL pick deterministically (the smallest numeric value).
-
-All three metrics are OPTIONAL; their absence degrades gracefully (attributes omitted) and SHALL NOT fail the build.
-
-#### Scenario: Online aggregate with usage
-
-- **WHEN** `aggr_new_status{cluster="ontap-prod", node="ontap-prod-01", aggr="aggr1"}` has value `1`, `aggr_space_used{...aggr="aggr1"}` is `700000000000`, and `aggr_space_total{...aggr="aggr1"}` is `1000000000000`
-- **THEN** the `netapp/ontap-prod/aggr/aggr1` node carries `data.health: "online"` and `data.usage: {"used_bytes": 700000000000, "capacity_bytes": 1000000000000}`
-
-#### Scenario: Offline aggregate marks health degraded
-
-- **WHEN** `aggr_new_status` for a materialised aggregate has value `0`
-- **THEN** that aggregate node carries `data.health: "degraded"`
-
-#### Scenario: Absent status metric omits health
-
-- **WHEN** no `aggr_new_status` series matches a materialised aggregate
-- **THEN** that node's `data` has no `health` key — absence is never conflated with `"degraded"`
-
-#### Scenario: Partial usage keeps only the resolved field
-
-- **WHEN** an aggregate matches `aggr_space_total` but no `aggr_space_used` series
-- **THEN** its `data.usage` equals `{"capacity_bytes": <value>}` with no `used_bytes` key
-
-### Requirement: PVC-to-NetApp-aggregate edge join
-
-For every PVC entity whose resolved PV name (`volumename`) is non-empty, the builder SHALL derive that PV name into a match token and match it against the `volume` label of the Harvest `volume_labels` series under the configured match mode. On a match with a **non-empty `aggr` label** it SHALL emit one directed `pvc-to-netapp-aggr` edge from the PVC node to the NetApp aggregate node `netapp/<ontap-cluster>/aggr/<aggr>` derived from the same matched series' `cluster` and `aggr` labels — no separate topology query is issued. The edge is a pure function of this one family: whether it is drawn SHALL NOT depend on the QoS families, which only decide what it carries. The join is rooted at the PV name alone (CSI-provisioned PV names are UUID-derived, so cross-cluster collisions are not a practical concern).
-
-The edge SHALL carry empty `labels` (`{}`), a deterministic UUIDv5 `id` (canonical input `<type>|<source>|<target>`), and SHALL de-duplicate by `(pvc, netapp-aggr)`. When matched series disagree on the containing aggregate for one claim — including when the match mode admits several distinct FlexVol names — the builder SHALL pick deterministically the lexically-smallest `(ontap-cluster, aggr)` pair, so the emitted edge set is byte-stable across rebuilds, independent of vector order. A PVC with no resolved `volumename` SHALL emit no `pvc-to-netapp-aggr` edge. A matched series whose `aggr` label is **empty** (the FlexGroup shape) SHALL emit no edge and SHALL be counted by the join-coverage signal.
-
-#### Scenario: Joined claim emits the edge
-
-- **WHEN** PVC `cluster-alpha/db/data-mongo-0` resolves `volumename="pvc-9f3a"` and a `volume_labels` series carries `volume="trident_pvc_9f3a"`, `cluster="ontap-prod"`, `node="ontap-prod-01"`, `aggr="aggr1"`
-- **THEN** the graph contains a directed `pvc-to-netapp-aggr` edge from `cluster-alpha/db/data-mongo-0` to `netapp/ontap-prod/aggr/aggr1` with empty `labels`
-
-#### Scenario: PVC without a PV name emits no edge
-
-- **WHEN** a PVC entity has no resolved `volumename`
-- **THEN** no `pvc-to-netapp-aggr` edge originates from it and the build does not fail
-
-#### Scenario: Matched series with an empty aggr label emits no edge
-
-- **WHEN** a claim's derived token matches a `volume_labels` series whose `aggr` label is empty (a FlexGroup volume spanning aggregates)
-- **THEN** no `pvc-to-netapp-aggr` edge is emitted for that claim, the claim is counted by the join-coverage signal, and the build does not fail
-
-#### Scenario: Deterministic pick on conflicting aggregates
-
-- **WHEN** two series matched by one claim's token report `(ontap-prod, aggr-b)` and `(ontap-prod, aggr-a)`
-- **THEN** the edge targets `netapp/ontap-prod/aggr/aggr-a` (the lexically-smallest pair) deterministically across rebuilds
-
-#### Scenario: Edge id stable across rebuilds
-
-- **WHEN** the same `(pvc, netapp-aggr)` join is produced by two consecutive builds for the same window
-- **THEN** the edge `id` (UUIDv5 over `<type>|<source>|<target>`) is byte-identical between the two builds
 
 ### Requirement: I/O measurements on the storage edge
 
@@ -426,6 +295,37 @@ When the PVC join resolves, the builder SHALL set the PVC entity's `svm` label f
 
 - **WHEN** the joined `volume_labels` series carries an empty `svm` label
 - **THEN** the PVC entity carries no `svm` key — never an empty-string value
+
+### Requirement: PVC-to-NetApp-aggregate edge join
+
+For every PVC entity whose resolved PV name (`volumename`) is non-empty, the builder SHALL derive that PV name into a match token and match it against the `volume` label of the Harvest `volume_labels` series under the configured match mode. On a match with a **non-empty `aggr` label** it SHALL emit one directed `pvc-to-netapp-aggr` edge from the PVC node to the NetApp aggregate node `netapp/<ontap-cluster>/aggr/<aggr>` derived from the same matched series' `cluster` and `aggr` labels — no separate topology query is issued. The edge is a pure function of this one family: whether it is drawn SHALL NOT depend on the QoS families, which only decide what it carries. The join is rooted at the PV name alone (CSI-provisioned PV names are UUID-derived, so cross-cluster collisions are not a practical concern).
+
+The edge SHALL carry empty `labels` (`{}`), a deterministic UUIDv5 `id` (canonical input `<type>|<source>|<target>`), and SHALL de-duplicate by `(pvc, netapp-aggr)`. When matched series disagree on the containing aggregate for one claim — including when the match mode admits several distinct FlexVol names — the builder SHALL pick deterministically the lexically-smallest `(ontap-cluster, aggr)` pair, so the emitted edge set is byte-stable across rebuilds, independent of vector order. A PVC with no resolved `volumename` SHALL emit no `pvc-to-netapp-aggr` edge. A matched series whose `aggr` label is **empty** (the FlexGroup shape) SHALL emit no edge and SHALL be counted by the join-coverage signal.
+
+#### Scenario: Joined claim emits the edge
+
+- **WHEN** PVC `cluster-alpha/db/data-mongo-0` resolves `volumename="pvc-9f3a"` and a `volume_labels` series carries `volume="trident_pvc_9f3a"`, `cluster="ontap-prod"`, `node="ontap-prod-01"`, `aggr="aggr1"`
+- **THEN** the graph contains a directed `pvc-to-netapp-aggr` edge from `cluster-alpha/db/data-mongo-0` to `netapp/ontap-prod/aggr/aggr1` with empty `labels`
+
+#### Scenario: PVC without a PV name emits no edge
+
+- **WHEN** a PVC entity has no resolved `volumename`
+- **THEN** no `pvc-to-netapp-aggr` edge originates from it and the build does not fail
+
+#### Scenario: Matched series with an empty aggr label emits no edge
+
+- **WHEN** a claim's derived token matches a `volume_labels` series whose `aggr` label is empty (a FlexGroup volume spanning aggregates)
+- **THEN** no `pvc-to-netapp-aggr` edge is emitted for that claim, the claim is counted by the join-coverage signal, and the build does not fail
+
+#### Scenario: Deterministic pick on conflicting aggregates
+
+- **WHEN** two series matched by one claim's token report `(ontap-prod, aggr-b)` and `(ontap-prod, aggr-a)`
+- **THEN** the edge targets `netapp/ontap-prod/aggr/aggr-a` (the lexically-smallest pair) deterministically across rebuilds
+
+#### Scenario: Edge id stable across rebuilds
+
+- **WHEN** the same `(pvc, netapp-aggr)` join is produced by two consecutive builds for the same window
+- **THEN** the edge `id` (UUIDv5 over `<type>|<source>|<target>`) is byte-identical between the two builds
 
 ### Requirement: Join-coverage observability
 
@@ -522,4 +422,3 @@ Within a filtered build the storage chain is therefore narrowed **by reference**
 
 - **WHEN** claims in `cluster-alpha` and `cluster-beta` both match `netapp/ontap-prod/aggr/aggr1` and a build runs with `cluster={cluster-alpha}`
 - **THEN** `netapp/ontap-prod/aggr/aggr1` and its owning `netapp-node` are materialised with a `pvc-to-netapp-aggr` edge from the `cluster-alpha` claim only; a `cluster={cluster-beta}` build materialises the same two nodes from the `cluster-beta` claim
-

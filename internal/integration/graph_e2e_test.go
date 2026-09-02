@@ -1432,19 +1432,35 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="qosless-data",storageclass="netapp-nas",volumename="pvc-noqos",test=%[1]q} 1 %[2]d
 # HELP volume_labels dummy
-volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-9f3a",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-noqos",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_9f3a",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_noqos",test=%[1]q} 1 %[2]d
 # HELP qos_read_ops dummy
-qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 150 %[2]d
-qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",lun="/vol/pvc_9f3a/lun0",test=%[1]q} 90 %[2]d
+# The ontap-san shape. Hop C keys on (cluster, svm, policy_group): cluster and
+# svm come from the volume_labels match above, policy_group from the workload
+# series below, and the fixed-policy series is addressed by its name label.
+# The QoS policy is attached to the LUN, so the FlexVol's own workload sits in
+# ONTAP's built-in User-Best_effort class, which declares no ceiling and has no
+# fixed-policy series: the ceiling is reachable ONLY through the LUN row, while
+# the LUN row's 90 must stay out of the sum. The qos_*_data series further down
+# carry no policy_group at all. The bronze policy in the SAME svm must never be
+# borrowed.
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="User-Best_effort",volume="trident_pvc_9f3a",test=%[1]q} 150 %[2]d
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume="trident_pvc_9f3a",lun="/vol/pvc_9f3a/lun0",test=%[1]q} 90 %[2]d
+# A workload on a FlexVol no claim matches. The scoped read never asks for it
+# (its name is absent from the rendered volume alternation, pinned by
+# pkg/build TestReadScopedQoS_RestrictedToMatchedVolumes), and it must not
+# reach any edge even if it were fetched.
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume="root_vol",test=%[1]q} 9999 %[2]d
 # HELP qos_read_data dummy
-qos_read_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 5242880 %[2]d
+qos_read_data{cluster="ontap-prod",svm="svm-prod",volume="trident_pvc_9f3a",test=%[1]q} 5242880 %[2]d
 # HELP qos_write_data dummy
-qos_write_data{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume_name="pvc-9f3a",test=%[1]q} 1000000 %[2]d
+qos_write_data{cluster="ontap-prod",svm="svm-prod",volume="trident_pvc_9f3a",test=%[1]q} 1000000 %[2]d
 # HELP qos_policy_fixed_max_throughput_iops dummy
 qos_policy_fixed_max_throughput_iops{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 5000 %[2]d
+qos_policy_fixed_max_throughput_iops{cluster="ontap-prod",svm="svm-prod",name="bronze-tier",test=%[1]q} 100 %[2]d
 # HELP qos_policy_fixed_max_throughput_mbps dummy
 qos_policy_fixed_max_throughput_mbps{cluster="ontap-prod",svm="svm-prod",name="gold-tier",test=%[1]q} 250 %[2]d
+qos_policy_fixed_max_throughput_mbps{cluster="ontap-prod",svm="svm-prod",name="bronze-tier",test=%[1]q} 400 %[2]d
 # HELP aggr_new_status dummy
 aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1 %[2]d
 # HELP aggr_space_used dummy
@@ -1513,15 +1529,21 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 			found = true
 			s.Require().NotNil(e.Data.Metrics)
 			s.Require().NotNil(e.Data.Metrics.ReadOps)
-			// 150, NOT 240: the LUN-level workload carries the same
-			// relabelled volume_name and is excluded upstream by lun="".
+			// 150, NOT 240: the LUN-level workload carries the same stock
+			// `volume` label. It IS fetched (its policy_group is the only
+			// route to the ceiling on a SAN backend) and sumQoSIO discards it.
 			s.InDelta(150.0, *e.Data.Metrics.ReadOps, 1e-9)
 			s.Require().NotNil(e.Data.Metrics.ReadBytesPerSec)
 			s.InDelta(5242880.0, *e.Data.Metrics.ReadBytesPerSec, 1e-9)
 			s.Require().NotNil(e.Data.Metrics.WriteBytesPerSec)
 			s.InDelta(1000000.0, *e.Data.Metrics.WriteBytesPerSec, 1e-9)
 			s.Require().NotNil(e.Data.Metrics.MaxIOPS)
-			s.InDelta(5000.0, *e.Data.Metrics.MaxIOPS, 1e-9)
+			s.InDelta(5000.0, *e.Data.Metrics.MaxIOPS, 1e-9,
+				"gold-tier, recovered from the LUN row — never bronze-tier's "+
+					"100 from the same svm, and never a cross-policy minimum")
+			s.Require().NotNil(e.Data.Metrics.MaxBytesPerSec)
+			s.InDelta(250.0*1048576, *e.Data.Metrics.MaxBytesPerSec, 1e-9,
+				"each figure comes from gold-tier, not bronze-tier's larger mbps")
 			s.Require().NotNil(e.Data.Metrics.MaxBytesPerSec)
 			s.InDelta(262144000.0, *e.Data.Metrics.MaxBytesPerSec, 1e-9)
 			s.Nil(e.Data.Metrics.Rate)

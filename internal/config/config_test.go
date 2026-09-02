@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/akira-core/kube-state-graph/pkg/build"
 )
 
 func TestParse_DefaultsValid(t *testing.T) {
@@ -289,4 +291,92 @@ func TestValidate_RejectsNegativeBackendsReloadInterval(t *testing.T) {
 
 	cfg.BackendsReloadInterval = 0
 	assert.NoError(t, cfg.Validate())
+}
+
+// The NetApp volume-key derivation defaults to the provisioner-agnostic
+// `-` → `_` rewrite matched as a suffix, is overridable by env and then by
+// flag, and is compiled at startup so an invalid pattern never reaches a build.
+func TestParse_NetAppVolumeKey(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+
+	cfg, err := Parse(nil, noEnv)
+	require.NoError(t, err)
+	assert.Nil(t, cfg.NetAppVolumeKeyRewrite,
+		"nil means the operator configured none, which adopts the build defaults")
+	assert.Equal(t, string(build.DefaultVolumeMatchMode), cfg.NetAppVolumeMatchMode)
+	assert.Equal(t, build.DefaultQoSScopeBatchBytes, cfg.NetAppQoSScopeBatchBytes)
+
+	env := map[string]string{
+		"KSG_NETAPP_VOLUME_KEY_REWRITE":    `-=_ ; ^=vol_`,
+		"KSG_NETAPP_VOLUME_MATCH_MODE":     "contains",
+		"KSG_NETAPP_QOS_SCOPE_BATCH_BYTES": "4096",
+	}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	cfg, err = Parse(nil, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"-=_", "^=vol_"}, cfg.NetAppVolumeKeyRewrite,
+		"the env form splits on semicolons and trims")
+	assert.Equal(t, "contains", cfg.NetAppVolumeMatchMode)
+	assert.Equal(t, 4096, cfg.NetAppQoSScopeBatchBytes)
+
+	cfg, err = Parse([]string{
+		"--netapp-volume-key-rewrite=-=_",
+		"--netapp-volume-match-mode=exact",
+	}, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"-=_"}, cfg.NetAppVolumeKeyRewrite,
+		"the flag replaces the env list wholesale rather than appending to it")
+	assert.Equal(t, "exact", cfg.NetAppVolumeMatchMode, "flag overrides env")
+	assert.Equal(t, 4096, cfg.NetAppQoSScopeBatchBytes, "untouched dimensions keep the env value")
+
+	cfg, err = Parse([]string{
+		"--netapp-volume-key-rewrite=-=_",
+		"--netapp-volume-key-rewrite=^=trident_",
+	}, noEnv)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"-=_", "^=trident_"}, cfg.NetAppVolumeKeyRewrite,
+		"repeated flags accumulate in declaration order")
+}
+
+func TestParse_NetAppVolumeKeyRejected(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"uncompilable pattern", []string{"--netapp-volume-key-rewrite=([=x"}, `"(["`},
+		{"missing separator", []string{"--netapp-volume-key-rewrite=nosep"}, "no \"=\" separator"},
+		{"empty pattern", []string{"--netapp-volume-key-rewrite==x"}, "empty pattern"},
+		{"unknown match mode", []string{"--netapp-volume-match-mode=prefix"}, "prefix"},
+		{"non-positive batch budget", []string{"--netapp-qos-scope-batch-bytes=0"}, "must be > 0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Parse(c.args, noEnv)
+			require.Error(t, err, "an invalid derivation must not start with a default substituted")
+			assert.Contains(t, err.Error(), c.want)
+		})
+	}
+}
+
+// The parse layer owns the `<pattern>=<replacement>` grammar; a replacement is
+// free to contain `=` because only the FIRST one separates.
+func TestParseVolumeKeyRules(t *testing.T) {
+	rules, err := ParseVolumeKeyRules([]string{"-=_", `\x3d=EQ`, "a=b=c"})
+	require.NoError(t, err)
+	assert.Equal(t, []build.VolumeKeyRule{
+		{Pattern: "-", Replacement: "_"},
+		{Pattern: `\x3d`, Replacement: "EQ"},
+		{Pattern: "a", Replacement: "b=c"},
+	}, rules)
+
+	nilRules, err := ParseVolumeKeyRules(nil)
+	require.NoError(t, err)
+	assert.Nil(t, nilRules, "nil stays nil so the build layer applies its defaults")
+
+	empty, err := ParseVolumeKeyRules([]string{})
+	require.NoError(t, err)
+	assert.NotNil(t, empty, "an explicitly empty list is an identity rewrite, not the default")
+	assert.Empty(t, empty)
 }

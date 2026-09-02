@@ -141,12 +141,12 @@ func TestRender_HarvestAndKubeletLastOverTime(t *testing.T) {
 		want string
 	}{
 		{QVolumeLabels, "last_over_time(volume_labels[1m])"},
-		{QQoSReadOps, `last_over_time(qos_read_ops{lun=""}[1m])`},
-		{QQoSWriteOps, `last_over_time(qos_write_ops{lun=""}[1m])`},
-		{QQoSReadLatency, `last_over_time(qos_read_latency{lun=""}[1m])`},
-		{QQoSWriteLatency, `last_over_time(qos_write_latency{lun=""}[1m])`},
-		{QQoSReadData, `last_over_time(qos_read_data{lun=""}[1m])`},
-		{QQoSWriteData, `last_over_time(qos_write_data{lun=""}[1m])`},
+		{QQoSReadOps, "last_over_time(qos_read_ops[1m])"},
+		{QQoSWriteOps, "last_over_time(qos_write_ops[1m])"},
+		{QQoSReadLatency, "last_over_time(qos_read_latency[1m])"},
+		{QQoSWriteLatency, "last_over_time(qos_write_latency[1m])"},
+		{QQoSReadData, "last_over_time(qos_read_data[1m])"},
+		{QQoSWriteData, "last_over_time(qos_write_data[1m])"},
 		{QQoSPolicyFixedMaxIOPS, "last_over_time(qos_policy_fixed_max_throughput_iops[1m])"},
 		{QQoSPolicyFixedMaxMBps, "last_over_time(qos_policy_fixed_max_throughput_mbps[1m])"},
 		{QAggrStatus, "last_over_time(aggr_new_status[1m])"},
@@ -192,18 +192,17 @@ func TestFormatDuration(t *testing.T) {
 	}
 }
 
-// The `lun=""` matcher is a load-bearing metric-selection contract: without it
-// a LUN workload, which carries the volume_name of its containing FlexVol once
-// the deployment relabel rule has run, would be summed on top of the volume
-// workload for the same claim (design.md D2). Pin it on every QoS I/O leg, and
-// pin its ABSENCE on the policy legs, which have no LUN dimension.
+// No Harvest QoS leg carries a `lun` matcher any more: volume granularity is a
+// READER rule now (sumQoSIO skips LUN rows), because the LUN workload is the
+// only series carrying the QoS policy on a SAN backend — see design.md D11.
+// Pin the matcher's absence on every leg, and pin that no leg is rate()-wrapped.
 func TestRender_QoSVolumeGranularity(t *testing.T) {
 	t.Parallel()
 
 	for _, q := range []Query{QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData} {
 		got := Render(q, time.Minute, LabelKeys{}, Selector{})
-		if !strings.Contains(got, `{lun=""}`) {
-			t.Errorf("Render(%s) = %q, want the lun=\"\" volume-granularity matcher", q, got)
+		if strings.Contains(got, "lun") {
+			t.Errorf("Render(%s) = %q, want no lun matcher — the discard is the reader's", q, got)
 		}
 		if strings.Contains(got, "rate(") {
 			t.Errorf("Render(%s) = %q, must not wrap a Harvest series in rate()", q, got)

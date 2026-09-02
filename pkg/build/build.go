@@ -88,7 +88,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, q, window, end, b.opts.LabelKeys, sel)
+	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}

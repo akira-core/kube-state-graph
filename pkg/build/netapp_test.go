@@ -3,6 +3,7 @@ package build
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,10 +31,20 @@ type netappFixture struct {
 	maxIOPS, maxMBps model.Vector
 	// aggregate / controller gauges.
 	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector
+	// rw overrides the derivation; nil exercises the shipped defaults
+	// (`-` → `_`, suffix match), which is what almost every case wants.
+	rw *VolumeKeyRewriter
+}
+
+func (f netappFixture) rewriter() *VolumeKeyRewriter {
+	if f.rw != nil {
+		return f.rw
+	}
+	return defaultVolumeKeyRewriter()
 }
 
 func (f netappFixture) run() netappResult {
-	return resolveNetAppStorage(f.claims, f.vol,
+	return resolveNetAppStorage(f.claims, f.rewriter(), f.vol,
 		f.readOps, f.writeOps, f.readLat, f.writeLat, f.readData, f.writeData,
 		f.maxIOPS, f.maxMBps,
 		f.aggrStatus, f.aggrUsed, f.aggrTotal, f.nodeStatus)
@@ -41,35 +52,55 @@ func (f netappFixture) run() netappResult {
 
 func claim1() []pvcVolume { return []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}} }
 
+// tridentVol renders the ONTAP FlexVol name a CSI provisioner derives from a
+// PersistentVolume name: the prefix it is configured with, plus the PV name with
+// every `-` replaced by `_` (ONTAP volume names admit no dashes). Fixtures state
+// PV names and the series carry stock Harvest `volume` values, so every case
+// below exercises the shipped derivation end to end rather than a pre-joined
+// key.
+func tridentVol(pvName string) string {
+	return "trident_" + strings.ReplaceAll(pvName, "-", "_")
+}
+
 // volLabelSample is a hop-A volume_labels series. Its value is deliberately a
 // constant: the resolver must never read it.
-func volLabelSample(vn, oc, node, aggr, svm string) model.Sample {
+func volLabelSample(pvName, oc, node, aggr, svm string) model.Sample {
 	return model.Sample{
 		Metric: model.Metric{
-			"volume_name": model.LabelValue(vn),
-			"cluster":     model.LabelValue(oc),
-			"node":        model.LabelValue(node),
-			"aggr":        model.LabelValue(aggr),
-			"svm":         model.LabelValue(svm),
+			"volume":  model.LabelValue(tridentVol(pvName)),
+			"cluster": model.LabelValue(oc),
+			"node":    model.LabelValue(node),
+			"aggr":    model.LabelValue(aggr),
+			"svm":     model.LabelValue(svm),
 		},
 		Value: 1,
 	}
 }
 
-// qosSample is a hop-B QoS workload series. It carries no aggr/node dimension —
-// that is exactly why hop A exists. LUN-level workloads never reach the
-// resolver: they are excluded at the query layer by the `lun=""` matcher,
-// pinned by promql.TestRender_QoSVolumeGranularity.
-func qosSample(vn, oc, svm, policy string, val float64) model.Sample {
+// qosSample is a hop-B QoS workload series at VOLUME granularity (no `lun`
+// label). It carries no aggr/node dimension — that is exactly why hop A exists.
+// LUN-level workloads DO reach the resolver since D11 (see lunQosSample); it is
+// sumQoSIO that discards them, so their policy group stays readable.
+func qosSample(pvName, oc, svm, policy string, val float64) model.Sample {
 	return model.Sample{
 		Metric: model.Metric{
-			"volume_name":  model.LabelValue(vn),
+			"volume":       model.LabelValue(tridentVol(pvName)),
 			"cluster":      model.LabelValue(oc),
 			"svm":          model.LabelValue(svm),
 			"policy_group": model.LabelValue(policy),
 		},
 		Value: model.SampleValue(val),
 	}
+}
+
+// lunQosSample is a LUN-level hop-B workload series. ONTAP collects one per
+// LUN as well as per volume and it carries its FlexVol's `volume`, so it must
+// never be summed onto the claim — but on a SAN backend it is the ONLY series
+// naming the real QoS policy group.
+func lunQosSample(pvName, oc, svm, policy, lun string, val float64) model.Sample {
+	sm := qosSample(pvName, oc, svm, policy, val)
+	sm.Metric["lun"] = model.LabelValue(lun)
+	return sm
 }
 
 // policySample is a hop-C qos_policy_fixed_max_throughput_* series.
@@ -317,7 +348,10 @@ func TestResolveNetAppStorage_CeilingPerField(t *testing.T) {
 	assert.Nil(t, io.MaxBytesPerSec)
 }
 
-func TestResolveNetAppStorage_NoPolicyGroupNoCeiling(t *testing.T) {
+// Spec: "Volume in no policy group carries no ceiling" — an incomplete key is
+// IGNORED, never widened. The SVM holds a gold policy, but this volume is in
+// none, so borrowing gold's figure would name a limit it does not have.
+func TestResolveNetAppStorage_EmptyPolicyGroupIgnoresSVMCeiling(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
 		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
@@ -327,12 +361,27 @@ func TestResolveNetAppStorage_NoPolicyGroupNoCeiling(t *testing.T) {
 	io := res.edges[0].IO
 	require.NotNil(t, io)
 	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
-	assert.Nil(t, io.MaxIOPS, "a volume in no policy group has no declared ceiling")
+	assert.Nil(t, io.MaxIOPS, "no policy group ⇒ no ceiling, not the SVM's")
 	assert.Nil(t, io.MaxBytesPerSec)
 }
 
-// The ceiling rides on the workload series' policy_group, so an edge with no
-// measurement can never acquire one. Structural, not defensive.
+// Spec: "Volume in no policy group carries no ceiling" — empty policy_group
+// on the workload AND no fixed-policy series for the pair.
+func TestResolveNetAppStorage_NoPolicySeriesNoCeiling(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "", 10)),
+	}.run()
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	assert.Nil(t, io.MaxIOPS)
+	assert.Nil(t, io.MaxBytesPerSec)
+}
+
+// The ceiling is attached only inside the matched-workload branch, so an
+// edge with no measurement can never acquire one. Structural, not defensive.
 func TestResolveNetAppStorage_NoCeilingWithoutMeasurement(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
@@ -344,38 +393,128 @@ func TestResolveNetAppStorage_NoCeilingWithoutMeasurement(t *testing.T) {
 	assert.Nil(t, res.edges[0].IO, "no workload ⇒ no metrics at all, ceiling included")
 }
 
-func TestResolveNetAppStorage_PolicyTriplePickIsLexical(t *testing.T) {
-	res := netappFixture{
-		claims: claim1(),
-		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
-		readOps: sampleVec(
-			qosSample("pvc-x", "oc", "svm", "silver", 10),
-			qosSample("pvc-x", "oc", "svm", "gold", 10),
-		),
-		maxIOPS: sampleVec(
-			policySample("oc", "svm", "gold", 5000),
-			policySample("oc", "svm", "silver", 1000),
-		),
-	}.run()
-	require.NotNil(t, res.edges[0].IO.MaxIOPS)
-	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12, "lexically-smallest policy wins")
-}
-
-// Harvest names the fixed policy's identity label differently across templates.
-// The join key's SHAPE is the contract, not the label's spelling.
-func TestResolveNetAppStorage_PolicyLabelSpellingFallback(t *testing.T) {
-	pg := model.Sample{
-		Metric: model.Metric{"cluster": "oc", "svm": "svm", "policy_group": "gold"},
-		Value:  5000,
-	}
+// Spec: "Another policy group in the same SVM is never borrowed". A gold
+// volume in an SVM that also holds bronze must report gold's own figures —
+// not bronze's, and not a per-figure minimum across the two, either of which
+// would read as a healthy volume many times over its limit.
+func TestResolveNetAppStorage_CeilingIsTheVolumesOwnPolicy(t *testing.T) {
 	res := netappFixture{
 		claims:  claim1(),
 		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
-		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 10)),
-		maxIOPS: sampleVec(pg),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 1200)),
+		maxIOPS: sampleVec(
+			policySample("oc", "svm", "gold", 5000),
+			policySample("oc", "svm", "bronze", 100),
+		),
+		maxMBps: sampleVec(
+			policySample("oc", "svm", "gold", 250),
+			policySample("oc", "svm", "bronze", 400),
+		),
 	}.run()
-	require.NotNil(t, res.edges[0].IO.MaxIOPS)
-	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	require.NotNil(t, io.MaxIOPS)
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12, "gold's ceiling, not bronze's")
+	require.NotNil(t, io.MaxBytesPerSec)
+	assert.InDelta(t, 250.0*1048576, *io.MaxBytesPerSec, 1e-12,
+		"each figure comes from the same policy — never a cross-policy minimum")
+}
+
+// A volume observed under two policy groups inside the window resolves
+// deterministically to the lexically-smallest, independent of vector order.
+func TestResolveNetAppStorage_CeilingPolicyPickDeterministic(t *testing.T) {
+	for _, order := range [][]model.Sample{
+		{qosSample("pvc-x", "oc", "svm", "gold", 10), qosSample("pvc-x", "oc", "svm", "bronze", 5)},
+		{qosSample("pvc-x", "oc", "svm", "bronze", 5), qosSample("pvc-x", "oc", "svm", "gold", 10)},
+	} {
+		res := netappFixture{
+			claims:  claim1(),
+			vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+			readOps: sampleVec(order...),
+			maxIOPS: sampleVec(
+				policySample("oc", "svm", "gold", 5000),
+				policySample("oc", "svm", "bronze", 100),
+			),
+		}.run()
+		require.NotNil(t, res.edges[0].IO.MaxIOPS)
+		assert.InDelta(t, 100.0, *res.edges[0].IO.MaxIOPS, 1e-12,
+			"lexically-smallest policy group wins regardless of series order")
+	}
+}
+
+// The ceiling key takes its svm from hop A, so a workload series carrying a
+// policy_group but NO svm label of its own still reaches hop C — it measures
+// the edge under qosInScope and contributes its policy.
+func TestResolveNetAppStorage_CeilingFromSVMLessWorkload(t *testing.T) {
+	noSVM := model.Sample{
+		Metric: model.Metric{
+			"volume":       model.LabelValue(tridentVol("pvc-x")),
+			"cluster":      "oc",
+			"policy_group": "gold",
+		},
+		Value: 10,
+	}
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm-prod")),
+		readOps: sampleVec(noSVM),
+		maxIOPS: sampleVec(policySample("oc", "svm-prod", "gold", 5000)),
+	}.run()
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	require.NotNil(t, io.MaxIOPS, "hop A supplies the svm the workload lacks")
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+}
+
+// Spec: "Claim without an SVM carries no ceiling". Hop A's empty svm is the
+// gate — hop B carrying a policy_group, and hop C holding series for that
+// cluster, must not leak a ceiling onto an SVM-less claim.
+func TestResolveNetAppStorage_EmptySVMNoCeiling(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "")),
+		readOps: sampleVec(qosSample("pvc-x", "oc", "svm-prod", "gold", 10)),
+		maxIOPS: sampleVec(policySample("oc", "svm-prod", "gold", 5000)),
+		maxMBps: sampleVec(policySample("oc", "svm-prod", "gold", 250)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	assert.InDelta(t, 10.0, *io.ReadOps, 1e-12)
+	assert.Nil(t, io.MaxIOPS)
+	assert.Nil(t, io.MaxBytesPerSec)
+}
+
+// Harvest spells the policy's identity label differently across templates, so
+// the reader takes `name` with a `policy_group` fallback. A series carrying
+// neither cannot be keyed and is dropped.
+func TestResolveNetAppStorage_CeilingPolicyIdentitySpellings(t *testing.T) {
+	policyNamed := func(label, policy string) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster":              "oc",
+				"svm":                  "svm",
+				model.LabelName(label): model.LabelValue(policy),
+			},
+			Value: 5000,
+		}
+	}
+	fixture := func(ceiling model.Sample) *graph.IOMetrics {
+		return netappFixture{
+			claims:  claim1(),
+			vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+			readOps: sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 10)),
+			maxIOPS: sampleVec(ceiling),
+		}.run().edges[0].IO
+	}
+	for _, label := range []string{"name", "policy_group"} {
+		io := fixture(policyNamed(label, "gold"))
+		require.NotNil(t, io.MaxIOPS, "identity label %q must resolve", label)
+		assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+	}
+	bare := model.Sample{Metric: model.Metric{"cluster": "oc", "svm": "svm"}, Value: 5000}
+	assert.Nil(t, fixture(bare).MaxIOPS, "a policy with no identity label cannot be keyed")
 }
 
 func TestResolveNetAppStorage_CeilingSmallestOnDuplicate(t *testing.T) {
@@ -406,7 +545,7 @@ func TestResolveNetAppStorage_SVMComesFromTopologyOnly(t *testing.T) {
 	assert.True(t, hasMsg(recs, "netapp_qos_join_miss"))
 }
 
-// A volume_name colliding across two ONTAP clusters sharing one
+// A FlexVol name colliding across two ONTAP clusters sharing one
 // VictoriaMetrics must not have the other filer's throughput summed onto this
 // edge.
 func TestResolveNetAppStorage_QoSScopedToPickedCluster(t *testing.T) {
@@ -425,6 +564,98 @@ func TestResolveNetAppStorage_QoSScopedToPickedCluster(t *testing.T) {
 	assert.Equal(t, graph.NetAppAggrID("oc-a", "aggr1"), res.edges[0].Target)
 	assert.InDelta(t, 10.0, *res.edges[0].IO.ReadOps, 1e-12,
 		"oc-b's workload must not be summed onto the oc-a edge")
+}
+
+// A cross-filer token collision must not let the SVM pick and the aggregate
+// pick land on different filers: the resolved svm is paired with the picked
+// aggregate's ONTAP cluster by both qosInScope and the hop-C ceiling key, so an
+// unscoped lexically-smallest pick would take oc-b's "alpha" against oc-a's
+// aggregate — dropping every in-scope workload and attaching oc-a's unrelated
+// "alpha" tenant ceiling.
+func TestResolveNetAppStorage_SVMScopedToPickedCluster(t *testing.T) {
+	res := netappFixture{
+		claims: claim1(),
+		vol: sampleVec(
+			volLabelSample("pvc-x", "oc-a", "n1", "aggr1", "zulu"),
+			volLabelSample("pvc-x", "oc-b", "n9", "aggr9", "alpha"),
+		),
+		readOps: sampleVec(qosSample("pvc-x", "oc-a", "zulu", "gold", 10)),
+		maxIOPS: sampleVec(
+			policySample("oc-a", "zulu", "gold", 5000),
+			policySample("oc-a", "alpha", "gold", 100),
+		),
+	}.run()
+	assert.Equal(t, "zulu", res.svmByPVC["c/db/data"],
+		"svm must come from the filer the aggregate pick landed on")
+	require.Len(t, res.edges, 1)
+	assert.Equal(t, graph.NetAppAggrID("oc-a", "aggr1"), res.edges[0].Target)
+	require.NotNil(t, res.edges[0].IO, "the oc-a workload must stay in scope")
+	assert.InDelta(t, 10.0, *res.edges[0].IO.ReadOps, 1e-12)
+	require.NotNil(t, res.edges[0].IO.MaxIOPS)
+	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12,
+		"the ceiling must key on (oc-a, zulu, gold), not on the other filer's svm")
+}
+
+// The ontap-san shape, one LUN per FlexVol: the QoS policy is attached to the
+// LUN, so the FlexVol's own workload falls into ONTAP's built-in
+// "User-Best_effort" class, which declares no ceiling and has no fixed-policy
+// series. The ceiling must come from the LUN row's policy — while the LUN
+// row's I/O must still be excluded from the sum.
+func TestResolveNetAppStorage_SANPolicyOnLUN(t *testing.T) {
+	res := netappFixture{
+		claims: claim1(),
+		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(
+			qosSample("pvc-x", "oc", "svm", "User-Best_effort", 150),
+			lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90),
+		),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+		maxMBps: sampleVec(policySample("oc", "svm", "gold-tier", 250)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	io := res.edges[0].IO
+	require.NotNil(t, io)
+	require.NotNil(t, io.ReadOps)
+	assert.InDelta(t, 150.0, *io.ReadOps, 1e-12,
+		"the LUN workload must not be summed on top of the volume workload")
+	require.NotNil(t, io.MaxIOPS, "the ceiling must come from the LUN row's policy")
+	assert.InDelta(t, 5000.0, *io.MaxIOPS, 1e-12)
+	require.NotNil(t, io.MaxBytesPerSec)
+	assert.InDelta(t, 250.0*1048576, *io.MaxBytesPerSec, 1e-12)
+}
+
+// The preference is data-driven, not a hardcoded list of ONTAP built-in class
+// names: "User-Best_effort" sorts BEFORE "gold-tier", so a plain lexical pick
+// would take it. The policy that the fixed-policy index actually holds wins.
+func TestResolveNetAppStorage_PolicyPickPrefersAResolvingOne(t *testing.T) {
+	assert.Less(t, "User-Best_effort", "gold-tier",
+		"the built-in class must sort first, or this test proves nothing")
+	res := netappFixture{
+		claims: claim1(),
+		vol:    sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(
+			lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90),
+			qosSample("pvc-x", "oc", "svm", "User-Best_effort", 150),
+		),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+	}.run()
+	require.NotNil(t, res.edges[0].IO.MaxIOPS)
+	assert.InDelta(t, 5000.0, *res.edges[0].IO.MaxIOPS, 1e-12)
+}
+
+// A LUN-only volume has no volume-level row to measure: the edge is still
+// drawn (hop A resolved it) but carries no metrics at all, so no ceiling can
+// ride along either — the attachment invariant holds under the widened read.
+func TestResolveNetAppStorage_LUNOnlyWorkloadMeasuresNothing(t *testing.T) {
+	res := netappFixture{
+		claims:  claim1(),
+		vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm")),
+		readOps: sampleVec(lunQosSample("pvc-x", "oc", "svm", "gold-tier", "/vol/trident_pvc_x/lun0", 90)),
+		maxIOPS: sampleVec(policySample("oc", "svm", "gold-tier", 5000)),
+	}.run()
+	require.Len(t, res.edges, 1)
+	assert.Nil(t, res.edges[0].IO,
+		"a LUN row alone is not a volume measurement, and a ceiling never rides alone")
 }
 
 // volume_labels rows without a `node` label leave the aggregate owner-less: the
@@ -500,7 +731,7 @@ func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	tp, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err, "a failing Harvest leg must not fail the build")
 	assert.Empty(t, tp.NetAppAggrs)
 }
@@ -516,7 +747,7 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
@@ -525,31 +756,72 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 // Application from its controller).
 // Pinning the count catches a leg silently dropped or double-registered.
 func TestReadTopology_FanOutLegCount(t *testing.T) {
-	var mu sync.Mutex
-	seen := map[string]int{}
+	// The six QoS workload legs are no longer unconditional: they are issued
+	// only for FlexVol names a loaded claim already matched, so the fan-out has
+	// two shapes and both are pinned here.
+	fanOut := func(t *testing.T, fixtures map[promql.Query]model.Vector) map[string]int {
+		t.Helper()
+		var mu sync.Mutex
+		seen := map[string]int{}
 
-	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Run(func(_ context.Context, name string, _ string, _ time.Time) {
-			mu.Lock()
-			seen[name]++
-			mu.Unlock()
-		}).
-		Return(model.Vector{}, nil).
-		Maybe()
+		q := promqlmocks.NewMockQuerier(t)
+		q.EXPECT().
+			Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			RunAndReturn(func(_ context.Context, name string, _ string, _ time.Time) (model.Vector, error) {
+				mu.Lock()
+				seen[name]++
+				mu.Unlock()
+				return fixtures[promql.Query(name)], nil
+			}).
+			Maybe()
 
-	_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
-	require.NoError(t, err)
+		_, err := ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(),
+			Options{}, promql.Selector{})
+		require.NoError(t, err)
 
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Len(t, seen, 37, "one query per leg, no duplicates")
-	total := 0
-	for _, n := range seen {
-		total += n
+		mu.Lock()
+		defer mu.Unlock()
+		out := map[string]int{}
+		for k, n := range seen {
+			out[k] = n
+		}
+		return out
 	}
-	assert.Equal(t, 37, total, "each leg issued exactly once")
+
+	assertOncePerLeg := func(t *testing.T, seen map[string]int, want int, msg string) {
+		t.Helper()
+		assert.Len(t, seen, want, msg)
+		total := 0
+		for _, n := range seen {
+			total += n
+		}
+		assert.Equal(t, want, total, "each leg issued exactly once")
+	}
+
+	t.Run("no matched volume issues no QoS workload query", func(t *testing.T) {
+		seen := fanOut(t, nil)
+		assertOncePerLeg(t, seen, 31, "31 legs, the six QoS workload families withheld")
+		for _, q := range promql.QoSWorkloadQueries {
+			assert.Zero(t, seen[string(q)], string(q))
+		}
+	})
+
+	t.Run("a matched volume adds the six QoS workload legs", func(t *testing.T) {
+		seen := fanOut(t, map[promql.Query]model.Vector{
+			promql.QPVCInfo: {&model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
+				"volumename": "pvc-9f3a",
+			}, Value: 1}},
+			promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
+				"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
+				"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
+			}, Value: 1}},
+		})
+		assertOncePerLeg(t, seen, 37, "one query per leg, no duplicates")
+		for _, q := range promql.QoSWorkloadQueries {
+			assert.Equal(t, 1, seen[string(q)], string(q))
+		}
+	})
 }
 
 // legFixture is one topology leg's canned answer.
@@ -596,7 +868,7 @@ func failingLegs(vec model.Vector, err error, names ...promql.Query) map[promql.
 // readTopologyDefaults runs ReadTopology with the zero LabelKeys / Selector —
 // the shape every leg-failure test wants.
 func readTopologyDefaults(ctx context.Context, q promql.Querier) (Topology, error) {
-	return ReadTopology(ctx, q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+	return ReadTopology(ctx, q, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 }
 
 func TestReadTopology_AccumulatingAnnotationLegDegrades(t *testing.T) {
@@ -724,4 +996,94 @@ func TestReadTopology_DegradingLegHonoursCallerCancellation(t *testing.T) {
 	live := legQuerier(t, failingLegs(nil, errors.New("upstream 5xx"), promql.QJobAnnotations))
 	_, err = readTopologyDefaults(context.Background(), live)
 	require.NoError(t, err, "the same leg and error must degrade when the caller is still alive")
+}
+
+// A claim can match more than one FlexVol name — two filers each carrying a
+// volume whose name ends with the same derived token. The aggregate pick stays
+// the lexically-smallest (ontap_cluster, aggr) pair and the result is
+// independent of upstream vector order.
+func TestResolveNetAppStorage_TwoVolumesMatchOneClaim(t *testing.T) {
+	a := model.Sample{Metric: model.Metric{
+		"volume": "trident_pvc_x", "cluster": "ontap-b", "node": "n-b", "aggr": "aggr-b", "svm": "svm0",
+	}, Value: 1}
+	b := model.Sample{Metric: model.Metric{
+		"volume": "other_pvc_x", "cluster": "ontap-a", "node": "n-a", "aggr": "aggr-a", "svm": "svm0",
+	}, Value: 1}
+
+	fwd := netappFixture{claims: claim1(), vol: model.Vector{&a, &b}}.run()
+	rev := netappFixture{claims: claim1(), vol: model.Vector{&b, &a}}.run()
+
+	require.Len(t, fwd.edges, 1)
+	assert.Equal(t, graph.NetAppAggrID("ontap-a", "aggr-a"), fwd.edges[0].Target,
+		"the lexically-smallest (ontap_cluster, aggr) pair wins across matched volumes")
+	assert.Equal(t, fwd.edges[0].Target, rev.edges[0].Target, "independent of vector order")
+	assert.Equal(t, fwd.edges[0].ID, rev.edges[0].ID)
+}
+
+// QoS candidates are gathered across every FlexVol name a claim matched, in
+// sorted name order, so the summed I/O is a pure function of the matched set.
+func TestResolveNetAppStorage_QoSSummedAcrossMatchedVolumes(t *testing.T) {
+	vol := func(v, oc, aggr string) *model.Sample {
+		return &model.Sample{Metric: model.Metric{
+			"volume": model.LabelValue(v), "cluster": model.LabelValue(oc),
+			"node": "n", "aggr": model.LabelValue(aggr), "svm": "svm0",
+		}, Value: 1}
+	}
+	qos := func(v, oc string, val float64) *model.Sample {
+		return &model.Sample{Metric: model.Metric{
+			"volume": model.LabelValue(v), "cluster": model.LabelValue(oc), "svm": "svm0",
+		}, Value: model.SampleValue(val)}
+	}
+
+	f := netappFixture{
+		claims:  claim1(),
+		vol:     model.Vector{vol("trident_pvc_x", "ontap-a", "aggr1"), vol("other_pvc_x", "ontap-a", "aggr1")},
+		readOps: model.Vector{qos("trident_pvc_x", "ontap-a", 10), qos("other_pvc_x", "ontap-a", 5)},
+	}
+	got := f.run()
+
+	require.Len(t, got.edges, 1)
+	require.NotNil(t, got.edges[0].IO)
+	require.NotNil(t, got.edges[0].IO.ReadOps)
+	assert.InDelta(t, 15.0, *got.edges[0].IO.ReadOps, 1e-12,
+		"both matched volumes' workloads measure this claim")
+}
+
+// A derivation that does not fit the estate's FlexVol naming is REPORTED, not
+// silent: every claim misses and the aggregated warning carries the full count.
+// This is the operator's signal to tune the rewrite rules or the match mode.
+func TestResolveNetAppStorage_DerivationMisfitIsCounted(t *testing.T) {
+	claims := []pvcVolume{
+		{id: "c/db/a", volumeName: "pvc-a"},
+		{id: "c/db/b", volumeName: "pvc-b"},
+		{id: "c/db/c", volumeName: "pvc-c"},
+	}
+	// A filer whose volume names embed no PV name at all.
+	vol := model.Vector{
+		&model.Sample{Metric: model.Metric{
+			"volume": "vol0", "cluster": "ontap-prod", "node": "n", "aggr": "aggr1",
+		}, Value: 1},
+		&model.Sample{Metric: model.Metric{
+			"volume": "root_vol", "cluster": "ontap-prod", "node": "n", "aggr": "aggr1",
+		}, Value: 1},
+	}
+
+	var got netappResult
+	recs := captureDebugRecords(t, func() {
+		got = netappFixture{claims: claims, vol: vol}.run()
+	})
+
+	assert.Empty(t, got.edges, "nothing joined")
+	assert.Empty(t, got.aggrs)
+	require.True(t, hasMsg(recs, "netapp_volume_join_miss"))
+	var count float64
+	for _, r := range recs {
+		if r["msg"] == "netapp_volume_join_miss" {
+			count, _ = r["count"].(float64)
+		}
+	}
+	assert.InDelta(t, float64(len(claims)), count, 1e-12,
+		"every claim is counted, so the misfit is visible rather than silent")
+	assert.False(t, hasMsg(recs, "netapp_qos_join_miss"),
+		"no edge was drawn, so there is nothing for the I/O signal to report")
 }

@@ -32,7 +32,7 @@ func TestReadTopology_QueryPanicBecomesError(t *testing.T) {
 		Return(model.Vector{}, nil).
 		Maybe()
 
-	_, err := ReadTopology(context.Background(), q, 5*time.Minute, probeTestEnd, promql.LabelKeys{}, promql.Selector{})
+	_, err := ReadTopology(context.Background(), q, 5*time.Minute, probeTestEnd, Options{}, promql.Selector{})
 
 	require.Error(t, err, "a goroutine panic must convert to a build error")
 	assert.Contains(t, err.Error(), "panic in kube_pod_info query")

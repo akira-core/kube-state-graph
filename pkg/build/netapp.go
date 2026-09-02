@@ -40,13 +40,24 @@ type volumeLabelCandidate struct {
 }
 
 // qosCandidate is one Harvest QoS workload sample — hop B. It carries no
-// aggr/node dimension, which is exactly why hop A exists.
+// aggr/node dimension, which is exactly why hop A exists. It DOES carry the
+// policy group: `volume_labels` states no policy identity, so this is the only
+// upstream statement of which QoS policy governs this FlexVol, and hop C's key
+// takes that one component from here (design.md D9).
 type qosCandidate struct {
 	ontapCluster string
 	svm          string
 	policyGroup  string
-	family       ioFamily
-	value        float64
+	// lun is empty for the FlexVol's own workload and names a LUN for a
+	// LUN-level one. ONTAP collects both and a LUN workload carries its
+	// FlexVol's `volume`, so the two must never be summed together — but on a
+	// SAN backend the QoS policy is attached to the LUN, and the FlexVol's own
+	// workload falls into ONTAP's built-in `User-Best_effort` class, which
+	// declares no ceiling. Measurement therefore reads volume-level candidates
+	// only while the policy pick reads every one (design.md D11).
+	lun    string
+	family ioFamily
+	value  float64
 }
 
 // pvcVolume is a PVC that carries a non-empty volumename (the join key).
@@ -69,7 +80,7 @@ type policyKey struct{ oc, svm, policy string }
 // resolveNetAppStorage runs the three-hop storage join of design.md D3:
 //
 //	hop A  volume_labels             → edge + aggregate + controller + PVC svm
-//	hop B  qos_* workload families   → the six measured I/O figures + policy group
+//	hop B  qos_* workload families   → the six measured I/O figures
 //	hop C  qos_policy_fixed_max_*    → the volume's declared throughput ceiling
 //
 // The hops degrade independently: a hop-B miss leaves a valid measurement-less
@@ -77,6 +88,7 @@ type policyKey struct{ oc, svm, policy string }
 // two aggregated coverage warnings (D8).
 func resolveNetAppStorage(
 	claims []pvcVolume,
+	rw *VolumeKeyRewriter,
 	volumeLabels model.Vector,
 	readOps, writeOps, readLat, writeLat, readData, writeData model.Vector,
 	policyMaxIOPS, policyMaxMBps model.Vector,
@@ -84,20 +96,51 @@ func resolveNetAppStorage(
 ) netappResult {
 	out := netappResult{svmByPVC: map[string]string{}}
 
+	// One pass over the Harvest vector resolves every claim. The join is
+	// derive-then-match, not equality: ONTAP volume names admit no `-`, so a
+	// `volume` value can never equal a `pvc-<uuid>` PV name. matcher answers
+	// which claims a given FlexVol name matches (hash-indexed for the default
+	// suffix mode — see volumeMatcher).
+	matcher := newVolumeMatcher(rw, claims)
 	volIndex := map[string][]volumeLabelCandidate{}
+	candsByClaim := make([][]volumeLabelCandidate, len(claims))
+	volsByClaim := make([][]string, len(claims))
+	volSeenByClaim := make([]map[string]bool, len(claims))
+	var matched []int
 	for _, s := range volumeLabels {
-		vn, oc := string(s.Metric["volume_name"]), string(s.Metric["cluster"])
-		if vn == "" || oc == "" {
+		vol, oc := string(s.Metric[promql.HarvestVolumeLabel]), string(s.Metric["cluster"])
+		if vol == "" || oc == "" {
 			continue
 		}
-		volIndex[vn] = append(volIndex[vn], volumeLabelCandidate{
+		cand := volumeLabelCandidate{
 			ontapCluster: oc,
 			node:         string(s.Metric["node"]),
 			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
-		})
+		}
+		volIndex[vol] = append(volIndex[vol], cand)
+		matched = matcher.match(vol, matched)
+		for _, ci := range matched {
+			candsByClaim[ci] = append(candsByClaim[ci], cand)
+			if volSeenByClaim[ci] == nil {
+				volSeenByClaim[ci] = map[string]bool{}
+			}
+			if !volSeenByClaim[ci][vol] {
+				volSeenByClaim[ci][vol] = true
+				volsByClaim[ci] = append(volsByClaim[ci], vol)
+			}
+		}
+	}
+	// A claim matching several FlexVol names gathers its QoS candidates in
+	// sorted name order, so the float summation order — and therefore the last
+	// bits of every I/O figure — is a pure function of the matched set rather
+	// than of upstream vector order (D6).
+	for i := range volsByClaim {
+		sort.Strings(volsByClaim[i])
 	}
 
+	// Keyed by the same stock `volume` label the topology family carries, so a
+	// claim looks its QoS candidates up through the FlexVol names it matched.
 	qosIndex := map[string][]qosCandidate{}
 	indexQoSFamily(qosIndex, readOps, ioReadOps)
 	indexQoSFamily(qosIndex, writeOps, ioWriteOps)
@@ -111,10 +154,16 @@ func resolveNetAppStorage(
 	// Each coverage signal is gated on ITS OWN family having been read, so a
 	// deployment running the volume template without the QoS template gets its
 	// topology graph and no spurious I/O warning. Gating on the raw vectors
-	// rather than the built indexes is deliberate: a vector whose series carry
-	// no volume_name WAS read, and a broken relabel rule is exactly the
-	// coverage failure these signals exist to surface.
+	// rather than the built indexes is deliberate: a vector whose series match
+	// no claim WAS read, and a derivation that does not fit the estate's
+	// FlexVol naming is exactly the coverage failure these signals exist to
+	// surface.
 	topoPresent := len(volumeLabels) > 0
+	// Under the scoped read this is exactly "at least one issued chunk of at
+	// least one QoS family returned series": a build whose scope was empty
+	// issued no QoS query at all, so every vector is empty and no I/O-coverage
+	// warning fires — which is right, since an empty scope means hop A drew no
+	// edge for hop B to measure.
 	qosPresent := len(readOps)+len(writeOps)+len(readLat)+len(writeLat)+len(readData)+len(writeData) > 0
 
 	type joinHit struct {
@@ -124,29 +173,38 @@ func resolveNetAppStorage(
 	hits := map[string]joinHit{} // pvcID → pick
 	topoMisses, qosMisses := 0, 0
 
-	for _, c := range claims {
-		cands := volIndex[c.volumeName]
-		svm := pickSVM(cands)
+	for i, c := range claims {
+		cands := candsByClaim[i]
+		oc, aggr := pickAggr(cands)
+		// The aggregate pick runs FIRST so the SVM pick can be scoped to the
+		// filer it landed on: both the QoS scope test and the hop-C ceiling key
+		// pair the two, and a cross-filer mismatch would silently attach a
+		// foreign tenant's ceiling.
+		svm := pickSVM(cands, oc)
 		if svm != "" {
 			out.svmByPVC[c.id] = svm
 		}
-		oc, aggr := pickAggr(cands)
 		if oc == "" || aggr == "" {
 			if topoPresent {
 				topoMisses++
 			}
 			continue
 		}
-		io := sumQoSIO(qosIndex[c.volumeName], oc, svm)
+		qcands := qosCandidatesFor(volsByClaim[i], qosIndex)
+		io := sumQoSIO(qcands, oc, svm)
 		if io == nil {
 			if qosPresent {
 				qosMisses++
 			}
 		} else {
-			// Structural, not defensive: the ceiling is attached ONLY inside
-			// this branch, so a ceiling field can never appear on an edge that
-			// carries no measurement (design.md D3 hop C).
-			applyCeiling(io, policyIndex, pickPolicy(qosIndex[c.volumeName], oc, svm))
+			// The ceiling key is assembled from BOTH topology hops: hop A owns
+			// the filer and the SVM (so it follows the aggregate this edge
+			// points at), hop B owns the policy group (the only upstream
+			// statement of which policy governs this FlexVol). Attaching it
+			// only inside this branch is therefore belt-and-braces: the policy
+			// rides on a matched workload series, so a ceiling cannot exist
+			// without a measurement in the first place (design.md D9).
+			applyCeiling(io, policyIndex, policyKey{oc, svm, pickPolicy(qcands, policyIndex, oc, svm)})
 		}
 		hits[c.id] = joinHit{oc: oc, aggr: aggr, io: io}
 	}
@@ -254,17 +312,32 @@ func resolveNetAppStorage(
 	return out
 }
 
+// qosCandidatesFor gathers the QoS candidates of every FlexVol name a claim
+// matched, concatenated in the caller's (sorted) name order so the summation
+// downstream is order-free.
+func qosCandidatesFor(volumes []string, index map[string][]qosCandidate) []qosCandidate {
+	if len(volumes) == 1 {
+		return index[volumes[0]]
+	}
+	var out []qosCandidate
+	for _, v := range volumes {
+		out = append(out, index[v]...)
+	}
+	return out
+}
+
 func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily) {
 	for _, s := range vec {
-		vn := string(s.Metric["volume_name"])
+		vol := string(s.Metric[promql.HarvestVolumeLabel])
 		oc := string(s.Metric["cluster"])
-		if vn == "" || oc == "" {
+		if vol == "" || oc == "" {
 			continue
 		}
-		dst[vn] = append(dst[vn], qosCandidate{
+		dst[vol] = append(dst[vol], qosCandidate{
 			ontapCluster: oc,
 			svm:          string(s.Metric["svm"]),
 			policyGroup:  string(s.Metric["policy_group"]),
+			lun:          string(s.Metric["lun"]),
 			family:       fam,
 			value:        float64(s.Value),
 		})
@@ -286,7 +359,7 @@ func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOM
 			if policy == "" {
 				policy = string(s.Metric["policy_group"])
 			}
-			if oc == "" || policy == "" {
+			if oc == "" || svm == "" || policy == "" {
 				continue
 			}
 			k := policyKey{oc, svm, policy}
@@ -323,20 +396,33 @@ func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOM
 	return out
 }
 
-// applyCeiling copies the resolved ceiling onto io. A zero policyKey (the
-// volume is in no QoS policy group) or a policy with no fixed-policy series
-// leaves both fields absent — absence means "no declared ceiling" and is never
-// rendered as a number.
+// applyCeiling copies the resolved ceiling onto io. An incomplete key (hop A
+// resolved no serving SVM, or no in-scope workload carried a policy group) or a
+// triple with no fixed-policy series leaves both fields absent — absence means
+// "no declared ceiling" and is never rendered as a number.
+//
+// The floats are copied, not aliased: one index entry now serves EVERY claim in
+// the SVM (D9 widened the key from a policy group to the pair), so handing out
+// the index's own pointers would make all of them one shared mutable cell.
 func applyCeiling(io *graph.IOMetrics, index map[policyKey]*graph.IOMetrics, k policyKey) {
-	if k.policy == "" {
+	// An incomplete key is IGNORED, never widened: no hop-A svm, or no policy
+	// group on any in-scope workload, leaves the ceiling absent rather than
+	// borrowing another policy group's figure from the same SVM (design.md D9).
+	if k.svm == "" || k.policy == "" {
 		return
 	}
 	c, ok := index[k]
 	if !ok {
 		return
 	}
-	io.MaxIOPS = c.MaxIOPS
-	io.MaxBytesPerSec = c.MaxBytesPerSec
+	if c.MaxIOPS != nil {
+		v := *c.MaxIOPS
+		io.MaxIOPS = &v
+	}
+	if c.MaxBytesPerSec != nil {
+		v := *c.MaxBytesPerSec
+		io.MaxBytesPerSec = &v
+	}
 }
 
 func pickAggr(cands []volumeLabelCandidate) (oc, aggr string) {
@@ -364,10 +450,27 @@ func pickOwner(cands []volumeLabelCandidate, oc, aggr string) string {
 	return node
 }
 
-func pickSVM(cands []volumeLabelCandidate) string {
+// pickSVM resolves the claim's serving SVM: the lexically-smallest non-empty
+// `svm` among the matched volume_labels candidates, scoped to the ONTAP cluster
+// the aggregate pick landed on.
+//
+// The scope is load-bearing. A derived token can match same-named FlexVols on
+// two filers sharing one VictoriaMetrics (the fifth blind spot in
+// docs/netapp-harvest-preconditions.md), and the resolved SVM is paired with
+// the picked aggregate's ONTAP cluster twice over: qosInScope rejects every
+// workload whose svm differs, and applyCeiling keys the ceiling on the
+// (ontap cluster, svm) pair. An unscoped pick could hand the other filer's SVM
+// to both — losing the edge's I/O outright, and attaching an unrelated tenant's
+// ceiling if the picked filer happens to host a same-named SVM.
+//
+// An empty oc means no aggregate resolved (the FlexGroup shape, or no candidate
+// carrying both labels): there is then neither an edge nor a ceiling, so there
+// is no filer to scope to and the pick stays over every candidate — a FlexGroup
+// claim still gains its `svm` label.
+func pickSVM(cands []volumeLabelCandidate, oc string) string {
 	var svm string
 	for _, c := range cands {
-		if c.svm == "" {
+		if c.svm == "" || (oc != "" && c.ontapCluster != oc) {
 			continue
 		}
 		if svm == "" || c.svm < svm {
@@ -377,35 +480,64 @@ func pickSVM(cands []volumeLabelCandidate) string {
 	return svm
 }
 
+// pickPolicy resolves the hop-B component of the ceiling key: the
+// `policy_group` governing this claim's FlexVol. Unlike hop A's cluster and
+// svm, the policy group exists ONLY on these series — volume_labels carries no
+// policy identity.
+//
+// Candidates are read at BOTH granularities, LUN rows included (design.md
+// D11). On a SAN backend the QoS policy is attached to the LUN while the
+// FlexVol's own workload falls into ONTAP's built-in `User-Best_effort` class,
+// which by definition declares no ceiling and therefore has no fixed-policy
+// series. Restricting the pick to volume-level rows would resolve that
+// built-in class and stop there. sumQoSIO still sums volume-level rows only,
+// so admitting LUN rows here cannot affect a measurement.
+//
+// The pick therefore PREFERS a policy the fixed-policy index actually holds,
+// falling back to the lexically-smallest non-empty value when none resolves —
+// which is the honest answer (the volume really is in that class) and leaves
+// applyCeiling attaching nothing, exactly as before. Both passes take the
+// lexically-smallest candidate, so the result is order-free (D6). The rule is
+// data-driven rather than a hardcoded list of ONTAP's built-in class names,
+// which vary by release.
+//
+// A candidate with no `svm` label of its own still contributes: the key's svm
+// comes from hop A, so such a series measures the edge AND reaches hop C
+// (design.md D9).
+func pickPolicy(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, svm string) string {
+	var resolving, any string
+	for _, c := range cands {
+		if !qosInScope(c, oc, svm) || c.policyGroup == "" {
+			continue
+		}
+		if any == "" || c.policyGroup < any {
+			any = c.policyGroup
+		}
+		if _, ok := index[policyKey{oc, svm, c.policyGroup}]; !ok {
+			continue
+		}
+		if resolving == "" || c.policyGroup < resolving {
+			resolving = c.policyGroup
+		}
+	}
+	if resolving != "" {
+		return resolving
+	}
+	return any
+}
+
 // qosInScope keeps a QoS candidate that belongs to the volume the edge was
-// drawn for. The ONTAP cluster must match the aggregate's — a volume_name
+// drawn for. The ONTAP cluster must match the aggregate's — a FlexVol name
 // colliding across two filers sharing one VictoriaMetrics would otherwise be
 // double-counted onto this edge. The svm must match too when BOTH sides
 // resolved one; a candidate with no svm label still measures the volume and is
-// kept (it simply cannot contribute a policy key).
+// kept — and, since D9 takes the ceiling key's svm from hop A, such a candidate
+// can still contribute its policy group.
 func qosInScope(c qosCandidate, oc, svm string) bool {
 	if c.ontapCluster != oc {
 		return false
 	}
 	return svm == "" || c.svm == "" || c.svm == svm
-}
-
-// pickPolicy resolves the hop-C join key: the lexically-smallest non-empty
-// (ontap cluster, svm, policy_group) triple across the in-scope QoS
-// candidates, so a volume observed under two policy groups inside the window
-// collapses deterministically.
-func pickPolicy(cands []qosCandidate, oc, svm string) policyKey {
-	var best policyKey
-	for _, c := range cands {
-		if !qosInScope(c, oc, svm) || c.policyGroup == "" || c.svm == "" {
-			continue
-		}
-		k := policyKey{c.ontapCluster, c.svm, c.policyGroup}
-		if best.policy == "" || k.svm < best.svm || (k.svm == best.svm && k.policy < best.policy) {
-			best = k
-		}
-	}
-	return best
 }
 
 // sumQoSIO sums each I/O family over the in-scope QoS candidates for one
@@ -414,7 +546,13 @@ func pickPolicy(cands []qosCandidate, oc, svm string) policyKey {
 func sumQoSIO(cands []qosCandidate, oc, svm string) *graph.IOMetrics {
 	var readOps, writeOps, readLat, writeLat, readData, writeData []float64
 	for _, c := range cands {
-		if !qosInScope(c, oc, svm) {
+		// Volume granularity. ONTAP collects a workload per LUN as well as per
+		// volume and a LUN workload carries its FlexVol's `volume`, so summing
+		// both would double-count the claim. The discard lives HERE rather than
+		// in the query selector because the policy pick below needs the LUN
+		// rows, and because a Harvest template that omits `lun` on a LUN
+		// workload would slip past a `lun=""` matcher but not past this.
+		if c.lun != "" || !qosInScope(c, oc, svm) {
 			continue
 		}
 		switch c.family {

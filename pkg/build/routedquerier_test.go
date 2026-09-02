@@ -102,8 +102,20 @@ func TestNew_RouterIsUpgraded(t *testing.T) {
 // once per SELECTED backend and that the leg count itself is unchanged — the
 // fan-out multiplies calls, never legs.
 func TestReadTopology_RoutedFanOutReachesEveryBackend(t *testing.T) {
-	fa := newRoutedFake(nil)
-	fb := newRoutedFake(nil)
+	// Both backends answer the two legs the scoped QoS read depends on, so the
+	// six workload families are issued and the full leg set is exercised.
+	joined := map[promql.Query]model.Vector{
+		promql.QPVCInfo: {&model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
+			"volumename": "pvc-9f3a",
+		}, Value: 1}},
+		promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
+			"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
+			"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
+		}, Value: 1}},
+	}
+	fa := newRoutedFake(joined)
+	fb := newRoutedFake(joined)
 	tbl, err := promql.NewTable([]promql.Backend{
 		promql.NewBackend("zone-a", "http://vm-a:8428", allFamilies(), []string{"zone-a"}, "", ""),
 		promql.NewBackend("zone-b", "http://vm-b:8428", allFamilies(), []string{"zone-b"}, "", ""),
@@ -112,7 +124,7 @@ func TestReadTopology_RoutedFanOutReachesEveryBackend(t *testing.T) {
 	r := routerOver(t, tbl, map[string]*routedFake{"zone-a": fa, "zone-b": fb})
 
 	_, err = ReadTopology(context.Background(), r.QuerierFor(promql.Selector{}),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err)
 
 	// Task 5.4: the 37-leg fan-out is per BUILD, not per backend.
@@ -136,7 +148,7 @@ func TestReadTopology_ZoneScopedRequestNarrowsTheFanOut(t *testing.T) {
 
 	sel := promql.Selector{AZ: []string{"zone-a"}}
 	q := r.QuerierFor(sel)
-	_, err = ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, sel)
+	_, err = ReadTopology(context.Background(), q, time.Minute, time.Unix(1, 0).UTC(), Options{}, sel)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, fa.calls(promql.QPodInfo))
@@ -171,7 +183,7 @@ func TestBuild_JoinsAcrossBackends(t *testing.T) {
 	})
 	netapp := newRoutedFake(map[promql.Query]model.Vector{
 		promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
-			"volume_name": "pvc-9f3a", "cluster": "ontap-prod",
+			"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
 			"node": "ontap-lab-01", "aggr": "aggr1", "svm": "svm0",
 		}, Value: 1}},
 	})
@@ -284,19 +296,31 @@ func TestBuild_RetentionClassificationStillFiresWhenAllBackendsAnswer(t *testing
 // assert that routing composed with the PromQL matchers rather than replacing
 // them.
 type queryRecordingFake struct {
-	mu      sync.Mutex
-	queries map[string][]string
+	mu       sync.Mutex
+	queries  map[string][]string
+	fixtures map[promql.Query]model.Vector
 }
 
 func newQueryRecordingFake() *queryRecordingFake {
 	return &queryRecordingFake{queries: map[string][]string{}}
 }
 
+// newQueryRecordingFakeWith answers the named legs with fixtures instead of an
+// empty vector — needed whenever a test must reach the scoped QoS read, which
+// is issued only for FlexVol names a loaded claim already matched.
+func newQueryRecordingFakeWith(fixtures map[promql.Query]model.Vector) *queryRecordingFake {
+	return &queryRecordingFake{queries: map[string][]string{}, fixtures: fixtures}
+}
+
 func (f *queryRecordingFake) Instant(_ context.Context, name, query string, _ time.Time) (model.Vector, error) {
 	f.mu.Lock()
 	f.queries[name] = append(f.queries[name], query)
+	out := f.fixtures[promql.Query(name)]
 	f.mu.Unlock()
-	return model.Vector{}, nil
+	if out == nil {
+		return model.Vector{}, nil
+	}
+	return out, nil
 }
 
 func (f *queryRecordingFake) queryFor(name promql.Query) string {
@@ -329,7 +353,7 @@ func TestRoutedBuild_ZoneMatcherStillRendered(t *testing.T) {
 
 	sel := promql.Selector{AZ: []string{"zone-a"}}
 	_, err = ReadTopology(context.Background(), r.QuerierFor(sel),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, sel)
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, sel)
 	require.NoError(t, err)
 
 	got := fa.queryFor(promql.QPodInfo)
@@ -362,8 +386,18 @@ var harvestQueries = []promql.Query{
 // string — the same one an unscoped build renders. Routing is the only effect
 // `az` has on the family.
 func TestRoutedBuild_HarvestLegsAreUnfilteredOnZoneAndCatchAllBackends(t *testing.T) {
-	zone := newQueryRecordingFake()
-	catchAll := newQueryRecordingFake()
+	joined := map[promql.Query]model.Vector{
+		promql.QPVCInfo: {&model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
+			"volumename": "pvc-9f3a", "az": "zone-a", "env": "prod",
+		}, Value: 1}},
+		promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
+			"volume": "trident_pvc_9f3a", "cluster": "ontap-prod",
+			"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
+		}, Value: 1}},
+	}
+	zone := newQueryRecordingFakeWith(joined)
+	catchAll := newQueryRecordingFakeWith(joined)
 	tbl, err := promql.NewTable([]promql.Backend{
 		promql.NewBackend("zone-a", "http://vm-a:8428", allFamilies(), []string{"zone-a"}, "", ""),
 		promql.NewBackend("netapp-all", "http://vm-netapp:8428", []promql.Family{promql.FamilyHarvest}, nil, "", ""),
@@ -379,14 +413,24 @@ func TestRoutedBuild_HarvestLegsAreUnfilteredOnZoneAndCatchAllBackends(t *testin
 
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
 	_, err = ReadTopology(context.Background(), r.QuerierFor(sel),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, sel)
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, sel)
 	require.NoError(t, err)
 
 	require.Len(t, harvestQueries, 13)
+	scoped := map[promql.Query]bool{}
+	for _, q := range promql.QoSWorkloadQueries {
+		scoped[q] = true
+	}
 	for _, q := range harvestQueries {
 		want := promql.Render(q, time.Minute, promql.LabelKeys{}, promql.Selector{})
-		assert.Equal(t, want, zone.queryFor(q), "%s on the zone backend must be the unfiltered string", q)
-		assert.Equal(t, want, catchAll.queryFor(q), "%s on the catch-all backend must be the unfiltered string", q)
+		if scoped[q] {
+			// The six workload families carry ONE extra matcher, and it is
+			// derived from upstream data (the FlexVol names the loaded claims
+			// matched), never from the request. Still no az / env.
+			want, _ = promql.RenderQoSVolumeScoped(q, time.Minute, []string{"trident_pvc_9f3a"})
+		}
+		assert.Equal(t, want, zone.queryFor(q), "%s on the zone backend must carry no request matcher", q)
+		assert.Equal(t, want, catchAll.queryFor(q), "%s on the catch-all backend must carry no request matcher", q)
 		assert.NotContains(t, want, `az=`, "%s must render no az matcher", q)
 		assert.NotContains(t, want, `env=`, "%s must render no env matcher", q)
 	}
@@ -415,7 +459,7 @@ func TestRoutedBuild_NamespaceFilterDoesNotRoute(t *testing.T) {
 
 	sel := promql.Selector{Namespace: []string{"shop"}, Cluster: []string{"alpha"}, Env: []string{"prod"}}
 	_, err = ReadTopology(context.Background(), r.QuerierFor(sel),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, sel)
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, sel)
 	require.NoError(t, err)
 
 	for name, f := range map[string]*queryRecordingFake{"zone-a": fa, "zone-b": fb} {
@@ -467,7 +511,7 @@ func TestRoutedBuild_OptionalLegDegradesOnBackendError(t *testing.T) {
 	require.NoError(t, err)
 
 	tp, err := ReadTopology(context.Background(), r.QuerierFor(promql.Selector{}),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err, "an optional leg's backend failure must not fail the build")
 	assert.NotNil(t, tp)
 	assert.Equal(t, 1, broken.calls(promql.QKubeletVolumeUsedBytes))
@@ -493,7 +537,7 @@ func TestRoutedBuild_RequiredLegFailsOnBackendError(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = ReadTopology(context.Background(), r.QuerierFor(promql.Selector{}),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `backend "zone-b"`)
 }
@@ -532,12 +576,12 @@ func TestRoutedBuild_UnfilteredHarvestMergesAcrossBackends(t *testing.T) {
 	}
 	zoneA := newRoutedFake(mergeFixtures(claims, map[promql.Query]model.Vector{
 		promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
-			"volume_name": "pv-a", "cluster": "ontap-a", "node": "n-a", "aggr": "aggr-a",
+			"volume": "trident_pv_a", "cluster": "ontap-a", "node": "n-a", "aggr": "aggr-a",
 		}, Value: 1}},
 	}))
 	zoneB := newRoutedFake(map[promql.Query]model.Vector{
 		promql.QVolumeLabels: {&model.Sample{Metric: model.Metric{
-			"volume_name": "pv-b", "cluster": "ontap-b", "node": "n-b", "aggr": "aggr-b",
+			"volume": "trident_pv_b", "cluster": "ontap-b", "node": "n-b", "aggr": "aggr-b",
 		}, Value: 1}},
 	})
 
@@ -555,7 +599,7 @@ func TestRoutedBuild_UnfilteredHarvestMergesAcrossBackends(t *testing.T) {
 	require.NoError(t, err)
 
 	tp, err := ReadTopology(context.Background(), r.QuerierFor(promql.Selector{}),
-		time.Minute, time.Unix(1, 0).UTC(), promql.LabelKeys{}, promql.Selector{})
+		time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err)
 
 	aggrs := map[string]bool{}

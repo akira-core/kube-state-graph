@@ -175,7 +175,7 @@ kube_node_info{cluster="mb-alpha",node="mb-worker-0",az="zone-a"} 1 %[1]d
 kube_node_info{cluster="mb-alpha",node="mb-worker-1",az="zone-b"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="mb-alpha",namespace="db",persistentvolumeclaim="mb-data",storageclass="netapp-nas",volumename="pvc-mb-9f3a",az="zone-a"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="mb-alpha",namespace="db",pod="mongo-0",volume="data",persistentvolumeclaim="mb-data",az="zone-a"} 1 %[1]d
-volume_labels{volume_name="pvc-mb-9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -184,16 +184,16 @@ traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb
 	// service-graph counter. Both containers serve the service-graph family,
 	// so the fan-out sees the series twice and must collapse it.
 	s.ingestInto(s.secondURL, fmt.Sprintf(`
-volume_labels{volume_name="pvc-mb-9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
 
 	s.Require().True(s.WaitForSeries(`kube_persistentvolumeclaim_info{volumename="pvc-mb-9f3a"}`, fixedNow, 30*time.Second),
 		"container A did not observe the claim fixture")
-	s.Require().True(s.WaitForSeries(`volume_labels{volume_name="pvc-mb-9f3a",aggr="aggr-shadow"}`, fixedNow, 30*time.Second),
+	s.Require().True(s.WaitForSeries(`volume_labels{volume="trident_pvc_mb_9f3a",aggr="aggr-shadow"}`, fixedNow, 30*time.Second),
 		"container A did not observe the shadow volume_labels fixture")
-	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{volume_name="pvc-mb-9f3a"}`, fixedNow, 30*time.Second),
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{volume="trident_pvc_mb_9f3a"}`, fixedNow, 30*time.Second),
 		"container B did not observe the volume_labels fixture")
 	s.Require().True(s.waitForSeriesAt(s.secondURL, `rate(traces_service_graph_request_total[5m]) > 0`, fixedNow, 30*time.Second),
 		"container B did not observe a non-zero service-graph rate")
@@ -259,7 +259,8 @@ func inventory(q url.Values) { q.Set("prune", "false") }
 
 // The storage chain is assembled from two installations: the claim comes from
 // the kube-state-metrics store, the volume it is bound to from the NetApp
-// store, and the join is the single `volumename == volume_name` equality.
+// store, and the join is the derive-then-match of the claim's `volumename`
+// against the Harvest series' stock `volume` label.
 func (s *MultiBackendSuite) TestStorageJoinAcrossTwoBackends() {
 	srv := s.startRoutedAPI(s.familySplitBackends())
 	body := s.fetchGraph(srv, inventory)

@@ -39,12 +39,18 @@ Install-side companions:
 ```
 GET /v1/graph?start=&end=&…
         │
-        ├─ ReadTopology — 37 queries in parallel
+        ├─ ReadTopology — 31 queries in parallel, then up to 6 more
         │     20 kube-state-metrics   abort the build on query error
         │      2 accumulating-cardinality annotation families
         │         (kube_replicaset_annotations, kube_job_annotations)
         │         log-and-continue (empty vector)
-        │     13 Harvest + 2 kubelet  log-and-continue (empty vector)
+        │      7 Harvest + 2 kubelet  log-and-continue (empty vector)
+        │     ── second wave, gated on kube_persistentvolumeclaim_info
+        │        and volume_labels ────────────────────────────────────
+        │      6 Harvest QoS workload legs, scoped to the FlexVol names
+        │        the loaded claims matched; NOT issued when none did.
+        │        Chunked by --netapp-qos-scope-batch-bytes; each chunk
+        │        log-and-continue (empty vector)
         │
         ├─ up{}  — only when the request is unfiltered AND pods+nodes are empty
         │           (classifies outside_retention vs a genuine empty graph)
@@ -124,7 +130,7 @@ They are **not** caller filters and are always rendered **before** any
 |---|---|---|
 | `kube_node_status_addresses` | `type=~"ExternalIP\|InternalIP"` | ExternalIP wins; InternalIP is the fallback when the node has no ExternalIP |
 | `kube_node_status_condition` | `condition="Ready"` | Only the Ready condition is surfaced as `data.ready_status` |
-| six `qos_{read,write}_{ops,latency,data}` | `lun=""` | ONTAP also collects a per-LUN workload that carries the FlexVol's `volume_name`; without this matcher LUN traffic is double-counted. An empty-string matcher also matches series that omit `lun` |
+| six `qos_{read,write}_{ops,latency,data}` | a data-derived `volume=~"…"` scope, nothing else | ONTAP also collects a per-LUN workload that carries its FlexVol's `volume`. It IS fetched — on a SAN backend it is the only series naming the QoS policy — and the reader discards non-empty-`lun` rows from every I/O sum, which is stricter than a `lun=""` matcher (that also admits rows omitting the label). The `volume` alternation names the FlexVols the loaded claims matched — derived from upstream data, not from the request |
 | `traces_service_graph_request_total` | `client!~"user\|unknown",server!~"user"` | Drops the connector's virtual peers (`client="user"` / `"unknown"`, `server="user"`). Exact, case-sensitive. `server="unknown"` **is** admitted so the unknown-server peer-address ladder can run |
 | two RED series | same sentinel **plus** `edge_relation!="link"` | Span-link series still produce an edge from `_total`, but they do not contribute rate / error / latency. An absent `edge_relation` label is retained (`!=` treats missing as `""`) |
 | `kube_job_owner` | `owner_kind="CronJob",owner_is_controller="true"` | The reader (`resolveJobCronJobOwners`) keeps exactly those rows — Jobs owned by a CronJob controller. Every other owner kind, a non-controller row, or a missing `owner_is_controller` is discarded before it is keyed or counted |
@@ -174,24 +180,32 @@ and is **never** used as a Kubernetes `?cluster=` matcher. The family carries no
 backend and the query string stays unfiltered.
 
 The storage join is three independently-degrading hops. Hops A and B are keyed
-by PVC `volumename` (bound PV name) = Harvest `volume_name`; hop C rides on a
-matched hop-B workload series and joins on the `(ontap_cluster, svm,
-policy_group)` triple recovered from it — which is why a ceiling can never
-appear without a measurement. `volume_name` is
-**not** a stock Harvest label — the deployment must relabel it onto both the
-volume-object series **and** the QoS workload series. See
+by the STOCK Harvest `volume` label (the ONTAP FlexVol name), matched against a
+token derived from the PVC's `volumename` (bound PV name) — ONTAP volume names
+admit no `-`, so the two are never compared for equality. The derivation is
+operator-configurable and defaults to "replace `-` with `_`, match as a suffix",
+which resolves a stock Trident estate without the deployment declaring its
+`storagePrefix`. Hop C is keyed on the `(ontap_cluster, svm, policy_group)`
+triple, assembled from both topology hops: hop A owns the ONTAP cluster of the
+picked aggregate and the SVM the `volume_labels` match resolved, and hop B owns
+the `policy_group` — the only upstream statement of which policy governs this
+FlexVol. An incomplete or unmatched triple is ignored, never widened to an
+SVM-wide figure. A ceiling therefore never appears without a measurement: its
+policy group is recovered FROM a matched workload series. **No relabel rule is required
+or read.** The six hop-B legs are issued in a second wave, scoped to the FlexVol
+names hop A matched. See
 [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md).
 
 | Metric | Hop | Graph role | Empty / miss |
 |---|---|---|---|
-| `volume_labels` | A — topology | Sole source of the storage *shape*: `pvc-to-netapp-aggr`, `netapp-aggr` / `netapp-node`, PVC `labels.svm`. Info series: sample **value discarded**, labels only (`cluster`, `node`, `aggr`, `svm`, `volume_name`) | No NetApp nodes, edges, or `svm` |
+| `volume_labels` | A — topology | Sole source of the storage *shape*: `pvc-to-netapp-aggr`, `netapp-aggr` / `netapp-node`, PVC `labels.svm`. Info series: sample **value discarded**, labels only (`cluster`, `node`, `aggr`, `svm`, `volume`). Read UNFILTERED — the interesting FlexVol names are not known until it has been read | No NetApp nodes, edges, or `svm`, and no QoS query is issued at all |
 | `qos_read_ops` | B — I/O | `data.metrics.read_ops` (ops/s, verbatim — never `rate()`) | Edge kept, no I/O fields |
 | `qos_write_ops` | B | `write_ops` | same |
 | `qos_read_latency` | B | `read_latency_us` (average µs, verbatim) | same |
 | `qos_write_latency` | B | `write_latency_us` | same |
 | `qos_read_data` | B | `read_bytes_per_sec` (bytes/s, verbatim) | same |
 | `qos_write_data` | B | `write_bytes_per_sec` | same |
-| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops`, joined on `(ontap_cluster, svm, policy_group)` recovered from hop B. Identity label `name`, `policy_group` fallback | No ceiling (never `0`). A ceiling cannot appear without a measurement |
+| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops`, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). A ceiling cannot appear without a measurement. A volume in no policy group gets none — another group's figure is never borrowed |
 | `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
 | `aggr_new_status` | — | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | Attribute omitted |
 | `aggr_space_used` | — | Aggregate `data.usage.used_bytes` | `usage` incomplete / omitted |
@@ -286,7 +300,7 @@ These are sometimes confused with the catalog above:
 |---|---|
 | `pod-to-node` | `kube_pod_info` (`node` label) |
 | `pod-mounts-pvc` | `kube_pod_spec_volumes_persistentvolumeclaims_info` |
-| `pvc-to-netapp-aggr` | Harvest `volume_labels` joined on `volume_name` = PVC `volumename` |
+| `pvc-to-netapp-aggr` | Harvest `volume_labels`, matching the stock `volume` label against a token derived from the PVC's `volumename` |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
 | `pod-calls-service` | `traces_service_graph_request_total` (target resolved to a service node: `://` connection string, unknown-server peer, or route engine) |
 | `service-selects-pod` | same total series + `kube_service_info` / `kube_endpointslice_*` (on-demand fan-out; not a raw series of its own) |
@@ -305,11 +319,13 @@ count by (__name__) ({__name__=~"aggr_new_status|aggr_space_total|aggr_space_use
 # The one REQUIRED non-default KSM label.
 count(kube_endpointslice_labels{label_kubernetes_io_service_name!=""})
 
-# Harvest join key present on both hops.
-count(volume_labels{volume_name!=""})
-count(qos_read_ops{volume_name!="",lun=""})
+# Harvest join key present on both hops. Compare a `volume` value here with a
+# claim's `volumename` to check the configured derivation fits the estate.
+count by (volume) (volume_labels)
+count(qos_read_ops)
 ```
 
 The code-side pins: `TestQueryDims_EveryQueryListed` fails if a `Query`
 constant is missing from the dimension table; `TestReadTopology_FanOutLegCount`
-fails if topology issues anything other than exactly 37 queries.
+fails if topology issues anything other than 31 queries when no claim matches a
+Harvest volume, or 37 when one does.

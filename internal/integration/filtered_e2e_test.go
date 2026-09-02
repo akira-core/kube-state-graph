@@ -75,7 +75,7 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 # HELP kube_persistentvolumeclaim_info dummy
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="idle-data",storageclass="netapp-nas",volumename="pvc-idle",test=%[1]q} 1 %[2]d
 # HELP volume_labels dummy
-volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume_name="pvc-idle",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_idle",test=%[1]q} 1 %[2]d
 # HELP aggr_new_status dummy
 aggr_new_status{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1 %[2]d
 # HELP node_new_status dummy
@@ -292,10 +292,10 @@ func (s *FilterSuite) TestHarvestWithoutEnvLabelStillJoins() {
 kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="lonely",uid="alpha-9",node="worker-0",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="lonely",persistentvolumeclaim="lonely-data",volume="data",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="lonely-data",storageclass="netapp-nas",volumename="pvc-lonely",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-prod",volume_name="pvc-lonely",env="other",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-prod",volume="trident_pvc_lonely",env="other",test=%[1]q} 1 %[2]d
 `, disc, t1))
 	s.Require().True(
-		s.WaitForSeries(`volume_labels{volume_name="pvc-lonely",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		s.WaitForSeries(`volume_labels{volume="trident_pvc_lonely",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe the mislabelled volume_labels series")
 
 	srv := s.StartAPIServer(nil)
