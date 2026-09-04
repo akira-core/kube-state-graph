@@ -160,6 +160,7 @@ components:
       - service-selects-pod
       - pod-to-node
       - pvc-to-netapp-aggr
+      - storage-flow
       type: string
       x-enum-varnames:
       - EdgeTypePodMountsPVC
@@ -168,6 +169,7 @@ components:
       - EdgeTypeServiceSelectsPod
       - EdgeTypePodToNode
       - EdgeTypePVCToNetAppAggr
+      - EdgeTypeStorageFlow
     github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition:
       properties:
         description:
@@ -212,6 +214,7 @@ components:
       - external
       - netapp-aggr
       - netapp-node
+      - netapp-svm
       type: string
       x-enum-varnames:
       - NodeTypePod
@@ -221,6 +224,7 @@ components:
       - NodeTypeExternal
       - NodeTypeNetAppAggr
       - NodeTypeNetAppNode
+      - NodeTypeNetAppSVM
     github_com_akira-core_kube-state-graph_pkg_graph.Owner:
       properties:
         kind:

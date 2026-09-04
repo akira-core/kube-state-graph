@@ -91,6 +91,14 @@ func connectivityExcluded(g *Graph) map[string]struct{} {
 			// (K8s nodes / NetApp aggregates) are reference-gated by
 			// infraNodePassesFilters, not by this set. Listed explicitly to keep
 			// the switch exhaustive over graph.EdgeType.
+		case EdgeTypeStorageFlow:
+			// Unreachable here: a storage-flow edge is produced only by
+			// BuildStorage and consumed only by ProjectStorage, which runs its
+			// own reachability rule instead of the connectivity prune. A graph
+			// reaching Project can hold none. Listed so the switch stays
+			// exhaustive, and so a future change that DID mix the two edge
+			// populations has to decide deliberately rather than inherit the
+			// silent "not a connectivity edge" default.
 		}
 	}
 

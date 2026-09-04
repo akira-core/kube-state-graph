@@ -13,6 +13,7 @@ const (
 	NodeTypeExternal   NodeType = "external"
 	NodeTypeNetAppAggr NodeType = "netapp-aggr"
 	NodeTypeNetAppNode NodeType = "netapp-node"
+	NodeTypeNetAppSVM  NodeType = "netapp-svm"
 )
 
 // GraphNode is the sealed interface implemented by every node kind.
@@ -75,6 +76,30 @@ type GraphNode interface {
 	// and does not materialise a node or edge. Only PVCs carry one; every
 	// other node kind, and a PVC with no resolved StorageClass, returns "".
 	StorageClass() string
+	// Hardware is an ONTAP controller's hardware identity, resolved from the
+	// Harvest `node_labels` info series. Surfaced as a top-level attribute,
+	// never inside Labels. Only NetAppNode carries one; every other node kind,
+	// and a controller no node_labels series matched, returns nil.
+	Hardware() *Hardware
+	// Perf is an ONTAP controller's raw performance counters, resolved from
+	// the Harvest `system_node` family and read VERBATIM. Surfaced as a
+	// top-level attribute, never inside Labels. Only NetAppNode carries one;
+	// every other node kind, and a controller no counter matched, returns nil.
+	//
+	// These figures are deliberately NOT turned into a health verdict —
+	// Health() stays the ONTAP-reported node_new_status. Thresholds are model-
+	// and estate-specific (an A400 at 70 % CPU is idle, a FAS2720 is not) and
+	// belong in the operator's alert rules, whose verdicts reach the node
+	// through Alerts().
+	Perf() *NodePerf
+	// Alerts is the set of active alerts the ALERTS overlay matched to this
+	// node, sorted by (Name, Severity) and de-duplicated on that pair.
+	// Surfaced as a top-level attribute, never inside Labels. Only pods, K8s
+	// nodes, PVCs, NetApp controllers and NetApp aggregates can carry alerts;
+	// services, externals, SVMs and every unalerted node return nil (the
+	// serialiser omits the attribute, so an unalerted estate serialises
+	// byte-identically to one built before the overlay existed).
+	Alerts() []Alert
 
 	isGraphNode()
 }
@@ -102,6 +127,99 @@ type Container struct {
 type UsageBytes struct {
 	UsedBytes     *float64
 	CapacityBytes *float64
+}
+
+// Hardware is an ONTAP controller's hardware identity, read verbatim from the
+// like-named labels of the Harvest `node_labels` info series. Every field is
+// independently optional and omitted by the serialiser when empty; the object
+// itself is omitted when no field resolved. It is a typed attribute, never a
+// label — the ipaddress / owner / ready_status precedent.
+type Hardware struct {
+	Model    string `json:"model,omitempty"`
+	Serial   string `json:"serial,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Location string `json:"location,omitempty"`
+}
+
+// Empty reports whether no field of h resolved. A Hardware that is Empty must
+// not be attached: the attribute is omitted entirely rather than serialised as
+// an object of absent keys.
+func (h Hardware) Empty() bool {
+	return h.Model == "" && h.Serial == "" && h.Version == "" &&
+		h.Vendor == "" && h.Location == ""
+}
+
+// NodePerf is an ONTAP controller's raw performance counters, read VERBATIM
+// from the Harvest `system_node` family — Harvest has already resolved the
+// ONTAP base counters, so no rate() is applied and no unit is converted.
+//
+// Each field is a pointer so an absent counter is omitted rather than
+// serialised as 0, and the object itself is omitted when none resolved. The
+// builder never derives a health verdict from these figures; see the Perf()
+// doc comment on GraphNode.
+type NodePerf struct {
+	// CPUBusyPct is `node_cpu_busy` — a percentage.
+	CPUBusyPct *float64
+	// TotalOps is `node_total_ops` — operations per second.
+	TotalOps *float64
+	// TotalLatencyUs is `node_total_latency` — an average in microseconds.
+	TotalLatencyUs *float64
+	// TotalBytesPerSec is `node_total_data` — bytes per second.
+	TotalBytesPerSec *float64
+}
+
+// Empty reports whether no counter of p resolved.
+func (p NodePerf) Empty() bool {
+	return p.CPUBusyPct == nil && p.TotalOps == nil &&
+		p.TotalLatencyUs == nil && p.TotalBytesPerSec == nil
+}
+
+// Alert is one active alert the ALERTS overlay matched to a node. Name is the
+// `alertname` label, State the `alertstate` label (always "firing" — pending
+// alerts are excluded at the query layer), Severity the `severity` label,
+// omitted when empty.
+//
+// The set on a node is sorted by (Name, Severity) and de-duplicated on that
+// pair, so two ALERTS series differing only in a label the matcher does not
+// read collapse to one entry and the wire form is order-independent.
+type Alert struct {
+	Name     string `json:"name"`
+	State    string `json:"state"`
+	Severity string `json:"severity,omitempty"`
+}
+
+// AlertStateFiring is the only `alertstate` value that reaches the graph. A
+// `pending` alert is a threshold crossed for less than its `for:` duration and
+// is excluded upstream by the query's fixed selector.
+const AlertStateFiring = "firing"
+
+// SortAlerts orders alerts by (Name, Severity) and removes duplicates on that
+// pair, in place semantics aside — it returns the normalised slice. Callers
+// attach the RESULT; the ordering is what makes the serialised attribute a
+// pure function of the matched set rather than of series arrival order.
+func SortAlerts(alerts []Alert) []Alert {
+	if len(alerts) == 0 {
+		return nil
+	}
+	sort.SliceStable(alerts, func(i, j int) bool {
+		if alerts[i].Name != alerts[j].Name {
+			return alerts[i].Name < alerts[j].Name
+		}
+		return alerts[i].Severity < alerts[j].Severity
+	})
+	out := alerts[:0]
+	type key struct{ name, severity string }
+	seen := make(map[key]struct{}, len(alerts))
+	for _, a := range alerts {
+		k := key{a.Name, a.Severity}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, a)
+	}
+	return out
 }
 
 // Health values for NetAppAggrNode / NetAppNode Health(). The empty string
@@ -132,6 +250,7 @@ type PodNode struct {
 	OwnerValue       *Owner
 	ApplicationValue string
 	ContainersValue  []Container
+	AlertsValue      []Alert
 }
 
 func (p *PodNode) ID() string                { return p.IDValue }
@@ -146,6 +265,9 @@ func (p *PodNode) ReadyStatus() string       { return "" }
 func (p *PodNode) Health() string            { return "" }
 func (p *PodNode) Usage() *UsageBytes        { return nil }
 func (p *PodNode) StorageClass() string      { return "" }
+func (p *PodNode) Hardware() *Hardware       { return nil }
+func (p *PodNode) Perf() *NodePerf           { return nil }
+func (p *PodNode) Alerts() []Alert           { return p.AlertsValue }
 func (p *PodNode) isGraphNode()              {}
 
 // K8sNode represents a Kubernetes node entity. ReadyStatusValue carries the
@@ -158,6 +280,7 @@ type K8sNode struct {
 	LabelsValue      map[string]string
 	IPAddressValue   []string
 	ReadyStatusValue string
+	AlertsValue      []Alert
 }
 
 func (n *K8sNode) ID() string                { return n.IDValue }
@@ -172,6 +295,9 @@ func (n *K8sNode) ReadyStatus() string       { return n.ReadyStatusValue }
 func (n *K8sNode) Health() string            { return "" }
 func (n *K8sNode) Usage() *UsageBytes        { return nil }
 func (n *K8sNode) StorageClass() string      { return "" }
+func (n *K8sNode) Hardware() *Hardware       { return nil }
+func (n *K8sNode) Perf() *NodePerf           { return nil }
+func (n *K8sNode) Alerts() []Alert           { return n.AlertsValue }
 func (n *K8sNode) isGraphNode()              {}
 
 // PVCNode represents a PersistentVolumeClaim entity. StorageClassValue is the
@@ -185,6 +311,7 @@ type PVCNode struct {
 	StorageClassValue string
 	ApplicationValue  string
 	UsageValue        *UsageBytes
+	AlertsValue       []Alert
 }
 
 func (p *PVCNode) ID() string                { return p.IDValue }
@@ -199,6 +326,9 @@ func (p *PVCNode) ReadyStatus() string       { return "" }
 func (p *PVCNode) Health() string            { return "" }
 func (p *PVCNode) Usage() *UsageBytes        { return p.UsageValue }
 func (p *PVCNode) StorageClass() string      { return p.StorageClassValue }
+func (p *PVCNode) Hardware() *Hardware       { return nil }
+func (p *PVCNode) Perf() *NodePerf           { return nil }
+func (p *PVCNode) Alerts() []Alert           { return p.AlertsValue }
 func (p *PVCNode) isGraphNode()              {}
 
 // ServiceNode represents a Kubernetes Service surfaced when a service-graph
@@ -227,6 +357,9 @@ func (s *ServiceNode) ReadyStatus() string       { return "" }
 func (s *ServiceNode) Health() string            { return "" }
 func (s *ServiceNode) Usage() *UsageBytes        { return nil }
 func (s *ServiceNode) StorageClass() string      { return "" }
+func (s *ServiceNode) Hardware() *Hardware       { return nil }
+func (s *ServiceNode) Perf() *NodePerf           { return nil }
+func (s *ServiceNode) Alerts() []Alert           { return nil }
 func (s *ServiceNode) isGraphNode()              {}
 
 // ExternalNode represents a non-pod endpoint surfaced by the missing-UID
@@ -251,6 +384,9 @@ func (e *ExternalNode) ReadyStatus() string       { return "" }
 func (e *ExternalNode) Health() string            { return "" }
 func (e *ExternalNode) Usage() *UsageBytes        { return nil }
 func (e *ExternalNode) StorageClass() string      { return "" }
+func (e *ExternalNode) Hardware() *Hardware       { return nil }
+func (e *ExternalNode) Perf() *NodePerf           { return nil }
+func (e *ExternalNode) Alerts() []Alert           { return nil }
 func (e *ExternalNode) isGraphNode()              {}
 
 // NetAppAggrNode is one ONTAP aggregate. Id excludes the owning node so an
@@ -262,6 +398,7 @@ type NetAppAggrNode struct {
 	LabelsValue map[string]string
 	HealthValue string
 	UsageValue  *UsageBytes
+	AlertsValue []Alert
 }
 
 func (n *NetAppAggrNode) ID() string                { return n.IDValue }
@@ -276,6 +413,9 @@ func (n *NetAppAggrNode) ReadyStatus() string       { return "" }
 func (n *NetAppAggrNode) Health() string            { return n.HealthValue }
 func (n *NetAppAggrNode) Usage() *UsageBytes        { return n.UsageValue }
 func (n *NetAppAggrNode) StorageClass() string      { return "" }
+func (n *NetAppAggrNode) Hardware() *Hardware       { return nil }
+func (n *NetAppAggrNode) Perf() *NodePerf           { return nil }
+func (n *NetAppAggrNode) Alerts() []Alert           { return n.AlertsValue }
 func (n *NetAppAggrNode) isGraphNode()              {}
 
 // NetAppNode is one physical ONTAP controller. Materialised only when
@@ -283,10 +423,13 @@ func (n *NetAppAggrNode) isGraphNode()              {}
 // no cluster key. It is the compound parent of its aggregates and the
 // target of no edge.
 type NetAppNode struct {
-	IDValue     string
-	NameValue   string
-	LabelsValue map[string]string
-	HealthValue string
+	IDValue       string
+	NameValue     string
+	LabelsValue   map[string]string
+	HealthValue   string
+	HardwareValue *Hardware
+	PerfValue     *NodePerf
+	AlertsValue   []Alert
 }
 
 func (n *NetAppNode) ID() string                { return n.IDValue }
@@ -301,7 +444,43 @@ func (n *NetAppNode) ReadyStatus() string       { return "" }
 func (n *NetAppNode) Health() string            { return n.HealthValue }
 func (n *NetAppNode) Usage() *UsageBytes        { return nil }
 func (n *NetAppNode) StorageClass() string      { return "" }
+func (n *NetAppNode) Hardware() *Hardware       { return n.HardwareValue }
+func (n *NetAppNode) Perf() *NodePerf           { return n.PerfValue }
+func (n *NetAppNode) Alerts() []Alert           { return n.AlertsValue }
 func (n *NetAppNode) isGraphNode()              {}
+
+// NetAppSVMNode is one ONTAP Storage Virtual Machine. An SVM spans aggregates
+// and controllers, so it is NOT a compound child of a controller and is NOT
+// the compound parent of anything — it nests directly under its
+// storage-cluster group. Labels are exactly {ontap_cluster} — no cluster key,
+// so an SVM never appears in clusters[] and is never addressed by ?cluster=.
+//
+// It is an IDENTITY only: this change resolves no SVM-level Harvest series, so
+// every attribute accessor is nil / empty, alerts included. It is materialised
+// exclusively by the storage-flow graph (as a tier of a retained claim's path,
+// or as a root); GET /v1/graph never emits one.
+type NetAppSVMNode struct {
+	IDValue     string
+	NameValue   string
+	LabelsValue map[string]string
+}
+
+func (n *NetAppSVMNode) ID() string                { return n.IDValue }
+func (n *NetAppSVMNode) Name() string              { return n.NameValue }
+func (n *NetAppSVMNode) Type() NodeType            { return NodeTypeNetAppSVM }
+func (n *NetAppSVMNode) Labels() map[string]string { return n.LabelsValue }
+func (n *NetAppSVMNode) IPAddress() []string       { return nil }
+func (n *NetAppSVMNode) Owner() *Owner             { return nil }
+func (n *NetAppSVMNode) Application() string       { return "" }
+func (n *NetAppSVMNode) Containers() []Container   { return nil }
+func (n *NetAppSVMNode) ReadyStatus() string       { return "" }
+func (n *NetAppSVMNode) Health() string            { return "" }
+func (n *NetAppSVMNode) Usage() *UsageBytes        { return nil }
+func (n *NetAppSVMNode) StorageClass() string      { return "" }
+func (n *NetAppSVMNode) Hardware() *Hardware       { return nil }
+func (n *NetAppSVMNode) Perf() *NodePerf           { return nil }
+func (n *NetAppSVMNode) Alerts() []Alert           { return nil }
+func (n *NetAppSVMNode) isGraphNode()              {}
 
 // SortNodes orders nodes deterministically by ID for stable output.
 func SortNodes(nodes []GraphNode) {
@@ -336,6 +515,14 @@ func NetAppAggrID(ontapCluster, aggr string) string {
 // NetAppNodeID returns the ONTAP-cluster-scoped controller node ID.
 func NetAppNodeID(ontapCluster, node string) string {
 	return "netapp/" + ontapCluster + "/" + node
+}
+
+// NetAppSVMID returns the ONTAP-cluster-scoped SVM node ID. SVM names are
+// unique within an ONTAP cluster, so the pair is the identity. The "/svm/"
+// infix keeps the id space disjoint from NetAppNodeID's, whose controller
+// segment sits directly under the cluster.
+func NetAppSVMID(ontapCluster, svm string) string {
+	return "netapp/" + ontapCluster + "/svm/" + svm
 }
 
 // ExternalID returns the missing-UID-fallback external node ID.

@@ -211,7 +211,8 @@
                     "pod-calls-service",
                     "service-selects-pod",
                     "pod-to-node",
-                    "pvc-to-netapp-aggr"
+                    "pvc-to-netapp-aggr",
+                    "storage-flow"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
@@ -220,7 +221,8 @@
                     "EdgeTypePodCallsService",
                     "EdgeTypeServiceSelectsPod",
                     "EdgeTypePodToNode",
-                    "EdgeTypePVCToNetAppAggr"
+                    "EdgeTypePVCToNetAppAggr",
+                    "EdgeTypeStorageFlow"
                 ]
             },
             "github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition": {
@@ -283,7 +285,8 @@
                     "service",
                     "external",
                     "netapp-aggr",
-                    "netapp-node"
+                    "netapp-node",
+                    "netapp-svm"
                 ],
                 "type": "string",
                 "x-enum-varnames": [
@@ -293,7 +296,8 @@
                     "NodeTypeService",
                     "NodeTypeExternal",
                     "NodeTypeNetAppAggr",
-                    "NodeTypeNetAppNode"
+                    "NodeTypeNetAppNode",
+                    "NodeTypeNetAppSVM"
                 ]
             },
             "github_com_akira-core_kube-state-graph_pkg_graph.Owner": {
