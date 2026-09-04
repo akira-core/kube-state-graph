@@ -777,9 +777,10 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
-// The fan-out is 42 legs: the 37 that preceded the storage-flow work plus the
+// The fan-out is 43 legs: the 37 that preceded the storage-flow work, plus the
 // five Harvest controller legs (node_labels and the four system_node counters)
-// that resolve the netapp-node data.hardware / data.perf attributes.
+// resolving the netapp-node data.hardware / data.perf attributes, plus the one
+// ALERTS leg of the alert overlay.
 // Pinning the count catches a leg silently dropped or double-registered.
 func TestReadTopology_FanOutLegCount(t *testing.T) {
 	// The six QoS workload legs are no longer unconditional: they are issued
@@ -826,7 +827,7 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 
 	t.Run("no matched volume issues no QoS workload query", func(t *testing.T) {
 		seen := fanOut(t, nil)
-		assertOncePerLeg(t, seen, 36, "36 legs, the six QoS workload families withheld")
+		assertOncePerLeg(t, seen, 37, "37 legs, the six QoS workload families withheld")
 		for _, q := range promql.QoSWorkloadQueries {
 			assert.Zero(t, seen[string(q)], string(q))
 		}
@@ -843,7 +844,7 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 				"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
 			}, Value: 1}},
 		})
-		assertOncePerLeg(t, seen, 42, "one query per leg, no duplicates")
+		assertOncePerLeg(t, seen, 43, "one query per leg, no duplicates")
 		for _, q := range promql.QoSWorkloadQueries {
 			assert.Equal(t, 1, seen[string(q)], string(q))
 		}

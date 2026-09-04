@@ -167,6 +167,14 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	}
 
 	nodes, edges := assemble(topology, sg)
+	// Alerts are baked onto the nodes BEFORE the graph is frozen — the same
+	// point PVC Application inheritance uses. It has to run here rather than in
+	// the topology parse because matching is against the ASSEMBLED node set,
+	// which only exists once the service-graph read has contributed its synth
+	// pods; and it has to run in the BUILD rather than in a projection because
+	// the attribute must reach every consumer of this graph alike (/v1/graph,
+	// /v1/storage-graph, and any embedder walking GraphNode.Alerts()).
+	attachAlerts(ctx, nodes, topology)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	// The identity table the reader composed. Every cluster-scoped id and label
 	// already carries the identity; the graph needs the table so the

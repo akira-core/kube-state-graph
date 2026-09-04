@@ -84,6 +84,13 @@ type Topology struct {
 	// projection — it is dropped unless it is a root.
 	NetAppInventory NetAppInventory
 
+	// Alerts is the RAW ALERTS vector, carried unparsed. Matching runs against
+	// the ASSEMBLED node set — which the service-graph read contributes synth
+	// pods to — so it cannot happen at parse time, and holding the vector is
+	// what lets Build resolve it at the one point every node exists but the
+	// graph is not yet frozen.
+	Alerts model.Vector
+
 	// SVMByPVC maps a PVC node id to the SVM its FlexVol lives in, as resolved
 	// by hop A. The same value is already stamped on the PVC's `svm` label; it
 	// is surfaced here as well because the storage-flow assembler needs the
@@ -240,6 +247,11 @@ type topologyVectors struct {
 	// Kubelet PVC usage.
 	KubeletVolumeUsed     model.Vector
 	KubeletVolumeCapacity model.Vector
+	// Active alerts (the alert overlay). Unlike every other vector here it is
+	// NOT consumed by parseTopology: matching needs the ASSEMBLED node set,
+	// which only exists after the service-graph read has contributed its synth
+	// pods, so the raw vector is carried through to Build untouched.
+	Alerts model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -409,6 +421,10 @@ func ReadTopology(
 	g.Go(fetchOptional(promql.QNetAppNodeTotalOps, &v.NetAppNodeTotalOps))
 	g.Go(fetchOptional(promql.QNetAppNodeTotalLatency, &v.NetAppNodeTotalLatency))
 	g.Go(fetchOptional(promql.QNetAppNodeTotalData, &v.NetAppNodeTotalData))
+	// The alert overlay. Routed through FamilyAlerts, so a table serving that
+	// family on no backend issues nothing and every node stays alert-less —
+	// the documented normal state, not a degrade.
+	g.Go(fetchOptional(promql.QAlerts, &v.Alerts))
 	g.Go(fetchOptional(promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed))
 	g.Go(fetchOptional(promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity))
 	if err := g.Wait(); err != nil {
@@ -457,6 +473,7 @@ func ReadTopology(
 		string(promql.QNetAppNodeTotalOps):         len(v.NetAppNodeTotalOps),
 		string(promql.QNetAppNodeTotalLatency):     len(v.NetAppNodeTotalLatency),
 		string(promql.QNetAppNodeTotalData):        len(v.NetAppNodeTotalData),
+		string(promql.QAlerts):                     len(v.Alerts),
 		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
 		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
 	}
@@ -1019,6 +1036,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		StorageEdges:        netapp.edges,
 		NetAppInventory:     netapp.inventory,
 		SVMByPVC:            netapp.svmByPVC,
+		Alerts:              v.Alerts,
 		PodPVCs:             bindings,
 		PodsByUID:           podsByUID,
 		ServicesByNameNS:    servicesByNameNS,
