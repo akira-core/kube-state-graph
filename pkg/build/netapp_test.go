@@ -18,9 +18,10 @@ import (
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
-// netappFixture names the three hops of the storage join so a test states only
-// the vectors it cares about. Positional arguments would make a 14-vector
-// resolver unreadable and silently mis-aligned on the next family added.
+// netappFixture names the hops of the storage join so a test states only the
+// vectors it cares about. The resolver reads nineteen same-typed vectors;
+// naming them here (and passing a topologyVectors rather than a positional
+// list) is what keeps a mis-aligned argument impossible.
 type netappFixture struct {
 	claims []pvcVolume
 	// hop A — topology.
@@ -31,6 +32,10 @@ type netappFixture struct {
 	maxIOPS, maxMBps model.Vector
 	// aggregate / controller gauges.
 	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector
+	// controller hardware identity (an info series) and the four system_node
+	// performance counters — data.hardware and data.perf, never data.health.
+	nodeLabels                                 model.Vector
+	cpuBusy, totalOps, totalLatency, totalData model.Vector
 	// rw overrides the derivation; nil exercises the shipped defaults
 	// (`-` → `_`, suffix match), which is what almost every case wants.
 	rw *VolumeKeyRewriter
@@ -43,11 +48,32 @@ func (f netappFixture) rewriter() *VolumeKeyRewriter {
 	return defaultVolumeKeyRewriter()
 }
 
+func (f netappFixture) vectors() topologyVectors {
+	return topologyVectors{
+		VolumeKey:              f.rewriter(),
+		VolumeLabels:           f.vol,
+		QoSReadOps:             f.readOps,
+		QoSWriteOps:            f.writeOps,
+		QoSReadLatency:         f.readLat,
+		QoSWriteLatency:        f.writeLat,
+		QoSReadData:            f.readData,
+		QoSWriteData:           f.writeData,
+		QoSPolicyMaxIOPS:       f.maxIOPS,
+		QoSPolicyMaxMBps:       f.maxMBps,
+		AggrStatus:             f.aggrStatus,
+		AggrSpaceUsed:          f.aggrUsed,
+		AggrSpaceTotal:         f.aggrTotal,
+		NetAppNodeStatus:       f.nodeStatus,
+		NetAppNodeLabels:       f.nodeLabels,
+		NetAppNodeCPUBusy:      f.cpuBusy,
+		NetAppNodeTotalOps:     f.totalOps,
+		NetAppNodeTotalLatency: f.totalLatency,
+		NetAppNodeTotalData:    f.totalData,
+	}
+}
+
 func (f netappFixture) run() netappResult {
-	return resolveNetAppStorage(f.claims, f.rewriter(), f.vol,
-		f.readOps, f.writeOps, f.readLat, f.writeLat, f.readData, f.writeData,
-		f.maxIOPS, f.maxMBps,
-		f.aggrStatus, f.aggrUsed, f.aggrTotal, f.nodeStatus)
+	return resolveNetAppStorage(f.claims, f.vectors())
 }
 
 func claim1() []pvcVolume { return []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}} }
@@ -751,9 +777,9 @@ func TestReadTopology_QoSLegFailureDoesNotFailBuild(t *testing.T) {
 	require.NoError(t, err, "a failing QoS leg must not fail the build")
 }
 
-// The fan-out is 37 legs (design.md D1: 18 KSM − 3 removed + 15 storage, plus
-// the 7 controller-annotation / kube_job_owner legs that resolve a pod's ArgoCD
-// Application from its controller).
+// The fan-out is 42 legs: the 37 that preceded the storage-flow work plus the
+// five Harvest controller legs (node_labels and the four system_node counters)
+// that resolve the netapp-node data.hardware / data.perf attributes.
 // Pinning the count catches a leg silently dropped or double-registered.
 func TestReadTopology_FanOutLegCount(t *testing.T) {
 	// The six QoS workload legs are no longer unconditional: they are issued
@@ -800,7 +826,7 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 
 	t.Run("no matched volume issues no QoS workload query", func(t *testing.T) {
 		seen := fanOut(t, nil)
-		assertOncePerLeg(t, seen, 31, "31 legs, the six QoS workload families withheld")
+		assertOncePerLeg(t, seen, 36, "36 legs, the six QoS workload families withheld")
 		for _, q := range promql.QoSWorkloadQueries {
 			assert.Zero(t, seen[string(q)], string(q))
 		}
@@ -817,7 +843,7 @@ func TestReadTopology_FanOutLegCount(t *testing.T) {
 				"node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
 			}, Value: 1}},
 		})
-		assertOncePerLeg(t, seen, 37, "one query per leg, no duplicates")
+		assertOncePerLeg(t, seen, 42, "one query per leg, no duplicates")
 		for _, q := range promql.QoSWorkloadQueries {
 			assert.Equal(t, 1, seen[string(q)], string(q))
 		}

@@ -70,6 +70,27 @@ type Topology struct {
 	StorageEdges []*graph.Edge
 	PodPVCs      []PodPVCBinding
 
+	// NetAppInventory is every NetApp entity the Harvest read NAMED, whether or
+	// not a claim joined it. It is deliberately wider than NetAppAggrs /
+	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:
+	// the storage-flow graph needs flowless roots (a degraded aggregate serving
+	// no claim is a valid answer to "what is on this filer?"), and the only
+	// alternative — passing the request's roots into the build — would make the
+	// build a function of the request, which both the cache key and the
+	// "selectors alone reach the queries" rule forbid.
+	//
+	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
+	// not by the Kubernetes estate, and a flowless entity costs nothing at
+	// projection — it is dropped unless it is a root.
+	NetAppInventory NetAppInventory
+
+	// SVMByPVC maps a PVC node id to the SVM its FlexVol lives in, as resolved
+	// by hop A. The same value is already stamped on the PVC's `svm` label; it
+	// is surfaced here as well because the storage-flow assembler needs the
+	// (claim → SVM) edge without re-deriving it from a label, and because a
+	// label is a presentation fact while this is a join result.
+	SVMByPVC map[string]string
+
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
 	// in practice, so this is the join key the service-graph reader uses to
@@ -206,6 +227,16 @@ type topologyVectors struct {
 	AggrSpaceUsed    model.Vector
 	AggrSpaceTotal   model.Vector
 	NetAppNodeStatus model.Vector
+	// Controller hardware identity (an info series — labels only) and the four
+	// system_node performance counters, all matched on (ontap cluster, node)
+	// and all read VERBATIM. They resolve the netapp-node data.hardware and
+	// data.perf attributes; none of them feeds data.health, which stays the
+	// ONTAP-reported NetAppNodeStatus above.
+	NetAppNodeLabels       model.Vector
+	NetAppNodeCPUBusy      model.Vector
+	NetAppNodeTotalOps     model.Vector
+	NetAppNodeTotalLatency model.Vector
+	NetAppNodeTotalData    model.Vector
 	// Kubelet PVC usage.
 	KubeletVolumeUsed     model.Vector
 	KubeletVolumeCapacity model.Vector
@@ -373,6 +404,11 @@ func ReadTopology(
 	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
 	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
 	g.Go(fetchOptional(promql.QNetAppNodeStatus, &v.NetAppNodeStatus))
+	g.Go(fetchOptional(promql.QNetAppNodeLabels, &v.NetAppNodeLabels))
+	g.Go(fetchOptional(promql.QNetAppNodeCPUBusy, &v.NetAppNodeCPUBusy))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalOps, &v.NetAppNodeTotalOps))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalLatency, &v.NetAppNodeTotalLatency))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalData, &v.NetAppNodeTotalData))
 	g.Go(fetchOptional(promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed))
 	g.Go(fetchOptional(promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity))
 	if err := g.Wait(); err != nil {
@@ -416,6 +452,11 @@ func ReadTopology(
 		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
 		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
 		string(promql.QNetAppNodeStatus):           len(v.NetAppNodeStatus),
+		string(promql.QNetAppNodeLabels):           len(v.NetAppNodeLabels),
+		string(promql.QNetAppNodeCPUBusy):          len(v.NetAppNodeCPUBusy),
+		string(promql.QNetAppNodeTotalOps):         len(v.NetAppNodeTotalOps),
+		string(promql.QNetAppNodeTotalLatency):     len(v.NetAppNodeTotalLatency),
+		string(promql.QNetAppNodeTotalData):        len(v.NetAppNodeTotalData),
 		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
 		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
 	}
@@ -888,12 +929,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn})
 		}
 	}
-	netapp := resolveNetAppStorage(claims, v.volumeKey(),
-		v.VolumeLabels,
-		v.QoSReadOps, v.QoSWriteOps, v.QoSReadLatency, v.QoSWriteLatency,
-		v.QoSReadData, v.QoSWriteData,
-		v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps,
-		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal, v.NetAppNodeStatus)
+	netapp := resolveNetAppStorage(claims, v)
 	for _, pv := range pvcs {
 		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {
 			pv.LabelsValue["svm"] = svm
@@ -981,6 +1017,8 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		NetAppAggrs:         netapp.aggrs,
 		NetAppNodes:         netapp.nodes,
 		StorageEdges:        netapp.edges,
+		NetAppInventory:     netapp.inventory,
+		SVMByPVC:            netapp.svmByPVC,
 		PodPVCs:             bindings,
 		PodsByUID:           podsByUID,
 		ServicesByNameNS:    servicesByNameNS,

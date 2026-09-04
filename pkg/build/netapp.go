@@ -71,6 +71,66 @@ type netappResult struct {
 	aggrs    []*graph.NetAppAggrNode
 	nodes    []*graph.NetAppNode
 	edges    []*graph.Edge
+	// inventory is the JOIN-INDEPENDENT half of the result: every NetApp
+	// entity the Harvest read named, whether or not a claim reached it. The
+	// four fields above stay join-only, so GET /v1/graph is unchanged.
+	inventory NetAppInventory
+}
+
+// NetAppInventoryAggr is one aggregate the Harvest read named, with the
+// controller currently owning it (empty when no volume_labels series states an
+// owner, which is also how an aggregate reaches the join with no `node` label).
+type NetAppInventoryAggr struct {
+	ONTAPCluster string
+	Aggr         string
+	// Owner is the controller currently serving the aggregate, picked by the
+	// same pickOwner rule the join uses — the lexically-smallest non-empty
+	// `node` across ALL of the aggregate's volume_labels series, so an HA
+	// takeover inside the window resolves deterministically.
+	Owner string
+}
+
+// NetAppInventorySVM is one SVM the Harvest read named. Only volume_labels
+// names an SVM, so unlike controllers and aggregates it has no second source.
+type NetAppInventorySVM struct {
+	ONTAPCluster string
+	SVM          string
+}
+
+// NetAppInventoryNode is one ONTAP controller the Harvest read named.
+type NetAppInventoryNode struct {
+	ONTAPCluster string
+	Node         string
+}
+
+// NetAppInventory is every NetApp entity named by ANY Harvest series read in
+// the build, independent of whether a claim joined it. It is what lets the
+// storage-flow graph materialise a flowless root — a degraded aggregate with no
+// claim on it is a valid answer to "what is on this filer?", where GET
+// /v1/graph's join-only rule would show nothing.
+//
+// Each slice is sorted (by ONTAP cluster, then name) and de-duplicated, so the
+// inventory is a pure function of the vectors rather than of their order (D6).
+//
+// Sources, deliberately different per entity kind:
+//   - Nodes — volume_labels' `node`, plus node_new_status, node_labels and the
+//     four system_node counters. A controller can therefore be inventoried
+//     with no volume on it at all.
+//   - Aggrs — volume_labels' `aggr`, plus the three aggr_* gauges. An
+//     aggregate serving no claim is exactly the flowless-root case.
+//   - SVMs — volume_labels ONLY. No other Harvest leg this build reads names an
+//     SVM, and the QoS workload families' `svm` is a scope test rather than an
+//     identity statement (design.md D9 re-keyed the ceiling's svm onto hop A).
+type NetAppInventory struct {
+	Nodes []NetAppInventoryNode
+	Aggrs []NetAppInventoryAggr
+	SVMs  []NetAppInventorySVM
+}
+
+// Empty reports whether the Harvest read named no NetApp entity at all — the
+// ordinary state of a non-NetApp deployment.
+func (i NetAppInventory) Empty() bool {
+	return len(i.Nodes) == 0 && len(i.Aggrs) == 0 && len(i.SVMs) == 0
 }
 
 type aggrKey struct{ oc, aggr string }
@@ -86,14 +146,20 @@ type policyKey struct{ oc, svm, policy string }
 // The hops degrade independently: a hop-B miss leaves a valid measurement-less
 // edge rather than erasing the claim's storage topology. Pure except for the
 // two aggregated coverage warnings (D8).
-func resolveNetAppStorage(
-	claims []pvcVolume,
-	rw *VolumeKeyRewriter,
-	volumeLabels model.Vector,
-	readOps, writeOps, readLat, writeLat, readData, writeData model.Vector,
-	policyMaxIOPS, policyMaxMBps model.Vector,
-	aggrStatus, aggrUsed, aggrTotal, nodeStatus model.Vector,
-) netappResult {
+// The Harvest vectors arrive as the topologyVectors bundle rather than as a
+// positional list. Nineteen same-typed model.Vector parameters are trivially
+// transposable and the compiler cannot catch it; the bundle names every one at
+// the call site and makes adding a family a one-field edit.
+func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
+	rw := v.volumeKey()
+	volumeLabels := v.VolumeLabels
+	readOps, writeOps := v.QoSReadOps, v.QoSWriteOps
+	readLat, writeLat := v.QoSReadLatency, v.QoSWriteLatency
+	readData, writeData := v.QoSReadData, v.QoSWriteData
+	policyMaxIOPS, policyMaxMBps := v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps
+	aggrStatus, aggrUsed, aggrTotal := v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal
+	nodeStatus := v.NetAppNodeStatus
+
 	out := netappResult{svmByPVC: map[string]string{}}
 
 	// One pass over the Harvest vector resolves every claim. The join is
@@ -232,6 +298,8 @@ func resolveNetAppStorage(
 	aggrHealth := healthByAggr(aggrStatus)
 	aggrUsage := usageByAggr(aggrUsed, aggrTotal)
 	nodeHealth := healthByNode(nodeStatus)
+	nodeHardware := hardwareByNode(v.NetAppNodeLabels)
+	nodePerf := perfByNode(v)
 
 	aggrSeen := map[aggrKey]*graph.NetAppAggrNode{}
 	for _, hit := range hits {
@@ -271,10 +339,12 @@ func resolveNetAppStorage(
 			continue
 		}
 		nodeSeen[nk] = &graph.NetAppNode{
-			IDValue:     graph.NetAppNodeID(oc, node),
-			NameValue:   node,
-			LabelsValue: map[string]string{"ontap_cluster": oc},
-			HealthValue: nodeHealth[nk],
+			IDValue:       graph.NetAppNodeID(oc, node),
+			NameValue:     node,
+			LabelsValue:   map[string]string{"ontap_cluster": oc},
+			HealthValue:   nodeHealth[nk],
+			HardwareValue: nodeHardware[nk],
+			PerfValue:     nodePerf[nk],
 		}
 	}
 
@@ -289,6 +359,14 @@ func resolveNetAppStorage(
 		out.nodes = append(out.nodes, n)
 	}
 	sort.Slice(out.nodes, func(i, j int) bool { return out.nodes[i].ID() < out.nodes[j].ID() })
+
+	// The inventory is collected from allByAggr (already the whole volume_labels
+	// population, not just the joining claims') plus the gauge and counter
+	// legs, so it names entities no claim reached. It is deliberately built
+	// AFTER allByAggr so the aggregate owner comes from the same pickOwner
+	// vote the join uses — a root aggregate and a joined one must not disagree
+	// about which controller currently serves them.
+	out.inventory = collectNetAppInventory(volIndex, allByAggr, v)
 
 	seenEdge := map[[2]string]bool{}
 	for _, c := range claims {
@@ -309,6 +387,112 @@ func resolveNetAppStorage(
 		out.edges = append(out.edges, e)
 	}
 	graph.SortEdges(out.edges)
+	return out
+}
+
+// collectNetAppInventory gathers every NetApp entity the Harvest read named,
+// join-independent (design.md D2). It is a pure function of the vectors: each
+// set is accumulated insert-only and then sorted, so upstream order cannot
+// reach the output.
+//
+// volIndex supplies the volume-derived half (a controller, aggregate or SVM
+// named by any volume_labels series); the gauge and counter legs supply
+// entities that carry no volume at all — an empty aggregate, or a controller
+// whose only trace in the window is its status or CPU counter.
+func collectNetAppInventory(
+	volIndex map[string][]volumeLabelCandidate,
+	allByAggr map[aggrKey][]volumeLabelCandidate,
+	v topologyVectors,
+) NetAppInventory {
+	nodes := map[nodeKey]struct{}{}
+	aggrs := map[aggrKey]struct{}{}
+	svms := map[NetAppInventorySVM]struct{}{}
+
+	for _, cands := range volIndex {
+		for _, c := range cands {
+			if c.ontapCluster == "" {
+				continue
+			}
+			if c.node != "" {
+				nodes[nodeKey{c.ontapCluster, c.node}] = struct{}{}
+			}
+			if c.aggr != "" {
+				aggrs[aggrKey{c.ontapCluster, c.aggr}] = struct{}{}
+			}
+			if c.svm != "" {
+				svms[NetAppInventorySVM{c.ontapCluster, c.svm}] = struct{}{}
+			}
+		}
+	}
+
+	// Controller-scoped legs: node_new_status, node_labels and the four
+	// system_node counters. A controller these name but no volume mentions is
+	// still a legitimate storage root.
+	for _, vec := range []model.Vector{
+		v.NetAppNodeStatus, v.NetAppNodeLabels,
+		v.NetAppNodeCPUBusy, v.NetAppNodeTotalOps,
+		v.NetAppNodeTotalLatency, v.NetAppNodeTotalData,
+	} {
+		for _, s := range vec {
+			oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
+			if oc == "" || node == "" {
+				continue
+			}
+			nodes[nodeKey{oc, node}] = struct{}{}
+		}
+	}
+
+	// Aggregate-scoped legs. These also name the owning controller on the
+	// aggr_* families, but that label is NOT read as an owner statement: the
+	// owner is decided by pickOwner over the volume series alone, so a joined
+	// and a flowless aggregate cannot disagree about it.
+	for _, vec := range []model.Vector{v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal} {
+		for _, s := range vec {
+			oc, aggr := string(s.Metric["cluster"]), string(s.Metric["aggr"])
+			if oc == "" || aggr == "" {
+				continue
+			}
+			aggrs[aggrKey{oc, aggr}] = struct{}{}
+		}
+	}
+
+	out := NetAppInventory{
+		Nodes: make([]NetAppInventoryNode, 0, len(nodes)),
+		Aggrs: make([]NetAppInventoryAggr, 0, len(aggrs)),
+		SVMs:  make([]NetAppInventorySVM, 0, len(svms)),
+	}
+	for k := range nodes {
+		out.Nodes = append(out.Nodes, NetAppInventoryNode{ONTAPCluster: k.oc, Node: k.node})
+	}
+	for k := range aggrs {
+		out.Aggrs = append(out.Aggrs, NetAppInventoryAggr{
+			ONTAPCluster: k.oc,
+			Aggr:         k.aggr,
+			Owner:        pickOwner(allByAggr[k], k.oc, k.aggr),
+		})
+	}
+	for k := range svms {
+		out.SVMs = append(out.SVMs, k)
+	}
+
+	sort.Slice(out.Nodes, func(i, j int) bool {
+		if out.Nodes[i].ONTAPCluster != out.Nodes[j].ONTAPCluster {
+			return out.Nodes[i].ONTAPCluster < out.Nodes[j].ONTAPCluster
+		}
+		return out.Nodes[i].Node < out.Nodes[j].Node
+	})
+	sort.Slice(out.Aggrs, func(i, j int) bool {
+		if out.Aggrs[i].ONTAPCluster != out.Aggrs[j].ONTAPCluster {
+			return out.Aggrs[i].ONTAPCluster < out.Aggrs[j].ONTAPCluster
+		}
+		return out.Aggrs[i].Aggr < out.Aggrs[j].Aggr
+	})
+	sort.Slice(out.SVMs, func(i, j int) bool {
+		if out.SVMs[i].ONTAPCluster != out.SVMs[j].ONTAPCluster {
+			return out.SVMs[i].ONTAPCluster < out.SVMs[j].ONTAPCluster
+		}
+		return out.SVMs[i].SVM < out.SVMs[j].SVM
+	})
 	return out
 }
 
@@ -632,6 +816,134 @@ func healthByAggr(vec model.Vector) map[aggrKey]string {
 	out := make(map[aggrKey]string, len(raw))
 	for k, vals := range raw {
 		out[k] = healthFromSamples(vals)
+	}
+	return out
+}
+
+// hardwareByNode indexes the Harvest `node_labels` info series by
+// (ontap cluster, node) — hop A's controller counterpart. It is an INFO
+// series: the sample value is discarded and only the labels are read, exactly
+// as volume_labels is.
+//
+// Each field resolves independently to the lexically-smallest NON-EMPTY value
+// seen for that key, so a duplicate series (a poller restart inside the
+// window, two Harvest instances scraping one filer) is order-free (D6) and a
+// series that carries only some of the fields cannot blank out a sibling that
+// carried the rest. A key whose every field stayed empty yields no entry at
+// all, so the attribute is omitted rather than serialised as an object of
+// absent keys.
+func hardwareByNode(vec model.Vector) map[nodeKey]*graph.Hardware {
+	if len(vec) == 0 {
+		return nil
+	}
+	acc := map[nodeKey]*graph.Hardware{}
+	for _, s := range vec {
+		oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
+		if oc == "" || node == "" {
+			continue
+		}
+		k := nodeKey{oc, node}
+		h := acc[k]
+		if h == nil {
+			h = &graph.Hardware{}
+			acc[k] = h
+		}
+		for _, f := range []struct {
+			label string
+			dst   *string
+		}{
+			{"model", &h.Model},
+			{"serial", &h.Serial},
+			{"version", &h.Version},
+			{"vendor", &h.Vendor},
+			{"location", &h.Location},
+		} {
+			v := string(s.Metric[model.LabelName(f.label)])
+			if v == "" {
+				continue
+			}
+			if *f.dst == "" || v < *f.dst {
+				*f.dst = v
+			}
+		}
+	}
+	out := make(map[nodeKey]*graph.Hardware, len(acc))
+	for k, h := range acc {
+		if h.Empty() {
+			continue
+		}
+		out[k] = h
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// netAppPerfLeg names one system_node counter and where its value lands on the
+// controller's NodePerf. Keeping the four in a table rather than four copied
+// loops is what makes "each field is independently optional" a property of the
+// code instead of a claim: a leg that returned nothing simply contributes no
+// entry, and the field stays nil.
+type netAppPerfLeg struct {
+	vec model.Vector
+	dst func(*graph.NodePerf) **float64
+}
+
+// perfByNode indexes the four Harvest `system_node` counters by
+// (ontap cluster, node).
+//
+// Values are read VERBATIM — Harvest has already resolved the ONTAP base
+// counters, so cpu_busy is a percent, total_ops per-second, total_latency an
+// average in microseconds and total_data bytes per second. No rate() is
+// applied and no unit is converted (unlike hop C's mbps ceiling, the one
+// converted figure in this file).
+//
+// On a duplicate series for one (key, counter) the SMALLEST value wins — the
+// same rule usageByAggr applies to the aggregate space gauges, and order-free
+// for the same reason: the pick must not depend on upstream vector order. A key no counter matched yields no entry,
+// so `data.perf` is omitted rather than serialised as an object of nulls, and
+// an absent counter stays nil rather than defaulting to 0 — a controller
+// reporting 0 ops and a controller whose ops counter was never read are
+// different facts.
+func perfByNode(v topologyVectors) map[nodeKey]*graph.NodePerf {
+	legs := []netAppPerfLeg{
+		{v.NetAppNodeCPUBusy, func(p *graph.NodePerf) **float64 { return &p.CPUBusyPct }},
+		{v.NetAppNodeTotalOps, func(p *graph.NodePerf) **float64 { return &p.TotalOps }},
+		{v.NetAppNodeTotalLatency, func(p *graph.NodePerf) **float64 { return &p.TotalLatencyUs }},
+		{v.NetAppNodeTotalData, func(p *graph.NodePerf) **float64 { return &p.TotalBytesPerSec }},
+	}
+
+	acc := map[nodeKey]*graph.NodePerf{}
+	for _, leg := range legs {
+		for _, s := range leg.vec {
+			oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
+			if oc == "" || node == "" {
+				continue
+			}
+			k := nodeKey{oc, node}
+			p := acc[k]
+			if p == nil {
+				p = &graph.NodePerf{}
+				acc[k] = p
+			}
+			dst := leg.dst(p)
+			val := float64(s.Value)
+			if *dst == nil || val < **dst {
+				*dst = &val
+			}
+		}
+	}
+
+	out := make(map[nodeKey]*graph.NodePerf, len(acc))
+	for k, p := range acc {
+		if p.Empty() {
+			continue
+		}
+		out[k] = p
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

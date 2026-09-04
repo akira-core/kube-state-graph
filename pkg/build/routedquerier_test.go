@@ -127,11 +127,11 @@ func TestReadTopology_RoutedFanOutReachesEveryBackend(t *testing.T) {
 		time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{})
 	require.NoError(t, err)
 
-	// Task 5.4: the 37-leg fan-out is per BUILD, not per backend.
-	assert.Equal(t, 37, fa.legCount(), "each backend sees the full leg set")
-	assert.Equal(t, 37, fb.legCount())
-	assert.Equal(t, 37, fa.totalCalls(), "each leg issued exactly once per backend")
-	assert.Equal(t, 37, fb.totalCalls())
+	// Task 5.4: the 42-leg fan-out is per BUILD, not per backend.
+	assert.Equal(t, 42, fa.legCount(), "each backend sees the full leg set")
+	assert.Equal(t, 42, fb.legCount())
+	assert.Equal(t, 42, fa.totalCalls(), "each leg issued exactly once per backend")
+	assert.Equal(t, 42, fb.totalCalls())
 }
 
 // A zone-scoped request narrows the zone-routable families to one backend, but
