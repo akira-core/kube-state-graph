@@ -96,3 +96,95 @@ func TestSerialise_OwnerlessAggrNestsUnderStorageCluster(t *testing.T) {
 	}
 	require.Equal(t, "storage-cluster/ontap-prod", got)
 }
+
+func TestSerialise_HardwareAndPerf(t *testing.T) {
+	cpu, ops := 72.5, 18500.0
+	ctrl := &graph.NetAppNode{
+		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
+		NameValue:   "ontap-prod-01",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+		HardwareValue: &graph.Hardware{
+			Model:   "AFF-A400",
+			Version: "9.14.1",
+		},
+		PerfValue: &graph.NodePerf{CPUBusyPct: &cpu, TotalOps: &ops},
+	}
+	body := cy(t, []graph.GraphNode{ctrl}, nil)
+	nodes := cyNodesByID(body)
+	h := nodes[ctrl.ID()].Hardware
+	require.NotNil(t, h)
+	assert.Equal(t, "AFF-A400", h.Model)
+	assert.Equal(t, "9.14.1", h.Version)
+	assert.Empty(t, h.Location)
+	p := nodes[ctrl.ID()].Perf
+	require.NotNil(t, p)
+	require.NotNil(t, p.CPUBusyPct)
+	require.NotNil(t, p.TotalOps)
+	assert.InDelta(t, 72.5, *p.CPUBusyPct, 1e-12)
+	assert.InDelta(t, 18500.0, *p.TotalOps, 1e-12)
+	assert.Nil(t, p.TotalLatencyUs)
+
+	raw, err := json.Marshal(nodes[ctrl.ID()])
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"id":"netapp/ontap-prod/ontap-prod-01",
+		"name":"ontap-prod-01",
+		"type":"netapp-node",
+		"parent":"storage-cluster/ontap-prod",
+		"hardware":{"model":"AFF-A400","version":"9.14.1"},
+		"perf":{"cpu_busy_pct":72.5,"total_ops":18500},
+		"labels":{"ontap_cluster":"ontap-prod"}
+	}`, string(raw))
+}
+
+func TestSerialise_HardwareAndPerfOmittedWhenAbsent(t *testing.T) {
+	ctrl := &graph.NetAppNode{
+		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
+		NameValue:   "ontap-prod-01",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+	}
+	body := cy(t, []graph.GraphNode{ctrl}, nil)
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"hardware"`)
+	assert.NotContains(t, string(raw), `"perf"`)
+	assert.NotContains(t, string(raw), `"alerts"`)
+}
+
+func TestSerialise_AlertsAttributeShape(t *testing.T) {
+	pod := &graph.PodNode{
+		IDValue:     "c1/uid-1",
+		NameValue:   "orders-0",
+		LabelsValue: map[string]string{"cluster": "c1", "namespace": "shop"},
+		AlertsValue: []graph.Alert{
+			{Name: "HighMemory", State: graph.AlertStateFiring, Severity: "critical"},
+			{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"},
+		},
+	}
+	body := cy(t, []graph.GraphNode{pod}, nil)
+	nodes := cyNodesByID(body)
+	require.Equal(t, []AlertDTO{
+		{Name: "HighMemory", State: "firing", Severity: "critical"},
+		{Name: "KubePodCrashLooping", State: "firing", Severity: "warning"},
+	}, nodes[pod.ID()].Alerts)
+	assert.NotContains(t, nodes[pod.ID()].Labels, "alertname")
+
+	raw, err := json.Marshal(nodes[pod.ID()].Alerts)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"name":"HighMemory","state":"firing","severity":"critical"},{"name":"KubePodCrashLooping","state":"firing","severity":"warning"}]`, string(raw))
+}
+
+func TestSerialise_SVMNestsUnderStorageCluster(t *testing.T) {
+	svm := &graph.NetAppSVMNode{
+		IDValue:     graph.NetAppSVMID("ontap-prod", "svm_shop"),
+		NameValue:   "svm_shop",
+		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
+	}
+	body := cy(t, []graph.GraphNode{svm}, nil)
+	nodes := cyNodesByID(body)
+	require.Contains(t, nodes, "storage-cluster/ontap-prod")
+	assert.Equal(t, "storage-cluster/ontap-prod", nodes[svm.ID()].Parent)
+	for _, n := range body.Elements.Nodes {
+		assert.NotEqual(t, svm.ID(), n.Data.Parent, "no node names the SVM as parent")
+	}
+}

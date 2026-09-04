@@ -57,24 +57,9 @@ const maxSelectorValueLen = 253
 func ParseValues(v url.Values) (Request, error) {
 	var req Request
 
-	startStr := v.Get("start")
-	endStr := v.Get("end")
-	if startStr == "" {
-		return req, &ParseError{"missing_start", "start query parameter is required"}
-	}
-	if endStr == "" {
-		return req, &ParseError{"missing_end", "end query parameter is required"}
-	}
-	start, perr := parseTimestamp(startStr)
-	if perr != nil {
-		return req, &ParseError{"invalid_start", perr.Error()}
-	}
-	end, perr := parseTimestamp(endStr)
-	if perr != nil {
-		return req, &ParseError{"invalid_end", perr.Error()}
-	}
-	if !end.After(start) {
-		return req, &ParseError{"invalid_range", "end must be after start"}
+	start, end, err := parseWindow(v)
+	if err != nil {
+		return req, err
 	}
 	req.Start, req.End = start, end
 
@@ -112,6 +97,106 @@ func ParseValues(v url.Values) (Request, error) {
 		Namespace: v["namespace"],
 	}
 	return req, nil
+}
+
+// StorageRequest is the parsed /v1/storage-graph request: a build window, the
+// upstream selector (az and env always single-valued), and the storage
+// projection scope.
+type StorageRequest struct {
+	Start    time.Time
+	End      time.Time
+	Scope    graph.StorageScope
+	Selector promql.Selector
+}
+
+// ParseStorageValues parses the /v1/storage-graph query parameters. It shares
+// timestamp and selector-value validation with ParseValues so the two
+// endpoints cannot drift on those contracts. az and env are required and
+// single-valued; edge_type and prune are ignored.
+func ParseStorageValues(v url.Values) (StorageRequest, error) {
+	var req StorageRequest
+
+	start, end, err := parseWindow(v)
+	if err != nil {
+		return req, err
+	}
+	req.Start, req.End = start, end
+
+	az, err := exactlyOne("az", v["az"])
+	if err != nil {
+		return req, err
+	}
+	env, err := exactlyOne("env", v["env"])
+	if err != nil {
+		return req, err
+	}
+
+	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "node", "aggr", "svm", "pod"} {
+		if err := validateSelectorValues(p, v[p]); err != nil {
+			return req, err
+		}
+	}
+
+	scope, serr := graph.NewStorageScope(
+		v["cluster"], v["namespace"],
+		v["ontap_cluster"], v["node"], v["aggr"], v["svm"], v["pod"],
+	)
+	if serr != nil {
+		return req, &ParseError{"invalid_scope", serr.Error()}
+	}
+	req.Scope = scope
+	req.Selector = promql.Selector{
+		AZ:        []string{az},
+		Env:       []string{env},
+		Cluster:   v["cluster"],
+		Namespace: v["namespace"],
+	}
+	return req, nil
+}
+
+// parseWindow reads the required start / end pair shared by every graph
+// endpoint: RFC 3339 or Unix seconds, and only `end > start` is enforced.
+// The reason codes are the wire contract both parsers must keep.
+func parseWindow(v url.Values) (start, end time.Time, err error) {
+	startStr := v.Get("start")
+	endStr := v.Get("end")
+	if startStr == "" {
+		return start, end, &ParseError{"missing_start", "start query parameter is required"}
+	}
+	if endStr == "" {
+		return start, end, &ParseError{"missing_end", "end query parameter is required"}
+	}
+	start, perr := parseTimestamp(startStr)
+	if perr != nil {
+		return start, end, &ParseError{"invalid_start", perr.Error()}
+	}
+	end, perr = parseTimestamp(endStr)
+	if perr != nil {
+		return start, end, &ParseError{"invalid_end", perr.Error()}
+	}
+	if !end.After(start) {
+		return start, end, &ParseError{"invalid_range", "end must be after start"}
+	}
+	return start, end, nil
+}
+
+// exactlyOne requires a selector parameter to be present with exactly one
+// non-empty value. Absence is missing_<param>; a second value is invalid_scope
+// (the message names the parameter so a client can tell az from env).
+func exactlyOne(param string, values []string) (string, error) {
+	var got []string
+	for _, v := range values {
+		if v != "" {
+			got = append(got, v)
+		}
+	}
+	if len(got) == 0 {
+		return "", &ParseError{"missing_" + param, param + " query parameter is required"}
+	}
+	if len(got) > 1 {
+		return "", &ParseError{"invalid_scope", param + " must be single-valued"}
+	}
+	return got[0], nil
 }
 
 // parsePrune reads the single-valued `prune` parameter. Absent ⇒ true (the

@@ -3,6 +3,7 @@ package graph
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 
@@ -180,4 +181,368 @@ func TestProperty_PrunedViewSubsetOfInventory(t *testing.T) {
 			require.Truef(t, invEdges[e.ID], "seed=%d: pruned view has edge %s absent from the inventory view", seed, e.ID)
 		}
 	}
+}
+
+// TestProperty_StorageProjection: random storage-flow estates × random root
+// sets. For every projection: retained ⊆ built, interior-node flow conserves
+// to 6 significant digits, and shuffling the input slices yields a
+// byte-identical view. 1000 iterations — the task pin.
+func TestProperty_StorageProjection(t *testing.T) {
+	for seed := int64(1); seed <= 1000; seed++ {
+		r := rand.New(rand.NewSource(seed))
+		g := genStorageEstate(r)
+		scope := genStorageScope(r, g)
+
+		v := ProjectStorage(g, scope)
+		assertStorageRetainedSubset(t, seed, g, v)
+		assertStorageConservation(t, seed, v)
+
+		shuffled := shuffleStorageGraph(r, g)
+		v2 := ProjectStorage(shuffled, scope)
+		require.Equalf(t, nodeIDList(v), nodeIDList(v2), "seed=%d: shuffle changed nodes", seed)
+		require.Equalf(t, edgeFingerprint(v), edgeFingerprint(v2), "seed=%d: shuffle changed edges", seed)
+	}
+}
+
+func genStorageEstate(r *rand.Rand) *Graph {
+	const oc, cluster = "ontap", "c1"
+	nCtrl := 1 + r.Intn(3)
+	nAggr := 1 + r.Intn(4)
+	nSVM := 1 + r.Intn(3)
+	nK8s := 1 + r.Intn(3)
+	nClaims := 2 + r.Intn(7)
+
+	nodes := make([]GraphNode, 0, 64)
+	ctrls := make([]string, nCtrl)
+	for i := range nCtrl {
+		name := fmt.Sprintf("ctrl-%d", i)
+		ctrls[i] = name
+		nodes = append(nodes, &NetAppNode{
+			IDValue: NetAppNodeID(oc, name), NameValue: name,
+			LabelsValue: map[string]string{"ontap_cluster": oc},
+		})
+	}
+	aggrs := make([]string, nAggr)
+	for i := range nAggr {
+		name := fmt.Sprintf("aggr-%d", i)
+		aggrs[i] = name
+		owner := ctrls[r.Intn(len(ctrls))]
+		nodes = append(nodes, &NetAppAggrNode{
+			IDValue: NetAppAggrID(oc, name), NameValue: name,
+			LabelsValue: map[string]string{"ontap_cluster": oc, "node": owner},
+		})
+	}
+	svms := make([]string, nSVM)
+	for i := range nSVM {
+		name := fmt.Sprintf("svm-%d", i)
+		svms[i] = name
+		nodes = append(nodes, &NetAppSVMNode{
+			IDValue: NetAppSVMID(oc, name), NameValue: name,
+			LabelsValue: map[string]string{"ontap_cluster": oc},
+		})
+	}
+	k8s := make([]string, nK8s)
+	for i := range nK8s {
+		name := fmt.Sprintf("worker-%d", i)
+		k8s[i] = name
+		nodes = append(nodes, &K8sNode{
+			IDValue: K8sNodeID(cluster, name), NameValue: name,
+			LabelsValue: map[string]string{"cluster": cluster},
+		})
+	}
+
+	seen := map[[2]string]bool{}
+	var edges []*Edge
+	emit := func(e *Edge) {
+		key := [2]string{e.Source, e.Target}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		edges = append(edges, e)
+	}
+
+	podSeq := 0
+	for c := range nClaims {
+		pvc := &PVCNode{
+			IDValue:     PVCID(cluster, "ns", fmt.Sprintf("claim-%d", c)),
+			NameValue:   fmt.Sprintf("claim-%d", c),
+			LabelsValue: map[string]string{"cluster": cluster, "namespace": "ns"},
+		}
+		nodes = append(nodes, pvc)
+		nMounters := r.Intn(4) // 0–3; 0 = unmounted
+		flex := r.Intn(5) == 0
+		var io *IOMetrics
+		if r.Intn(2) == 0 {
+			ops := float64(50 * (1 + r.Intn(8)))
+			io = &IOMetrics{
+				ReadOps: &ops, WriteOps: ptrFloat(ops / 2),
+				ReadLatencyUs: ptrFloat(100), MaxIOPS: ptrFloat(1000),
+			}
+		}
+		svmID := NetAppSVMID(oc, svms[r.Intn(len(svms))])
+		var aggrID, ctrlID string
+		if !flex {
+			aggrName := aggrs[r.Intn(len(aggrs))]
+			aggrID = NetAppAggrID(oc, aggrName)
+			for _, n := range nodes {
+				if n.ID() == aggrID {
+					ctrlID = NetAppNodeID(oc, n.Labels()["node"])
+					break
+				}
+			}
+		}
+		if nMounters == 0 {
+			continue
+		}
+		claimLabels := map[string]string{"tier": StorageTierSVMPVC}
+		if aggrID != "" {
+			claimLabels[ClaimAggrLabel] = aggrID
+		}
+		claim := NewEdge(EdgeTypeStorageFlow, svmID, pvc.ID(), claimLabels)
+		if io != nil {
+			claim = claim.WithIO(*io)
+		}
+		emit(claim)
+		if aggrID != "" {
+			emit(NewEdge(EdgeTypeStorageFlow, aggrID, svmID, map[string]string{"tier": StorageTierAggrSVM}))
+			if ctrlID != "" {
+				emit(NewEdge(EdgeTypeStorageFlow, ctrlID, aggrID, map[string]string{"tier": StorageTierNodeAggr}))
+			}
+		}
+		podLabels := map[string]string{"tier": StorageTierPVCPod}
+		if nMounters > 1 {
+			podLabels["attribution"] = AttributionSplit
+		}
+		for range nMounters {
+			uid := fmt.Sprintf("uid-%d", podSeq)
+			podSeq++
+			name := fmt.Sprintf("pod-%d", podSeq)
+			pl := map[string]string{"cluster": cluster, "namespace": "ns"}
+			var nodeID string
+			if r.Intn(10) != 0 {
+				wn := k8s[r.Intn(len(k8s))]
+				nodeID = K8sNodeID(cluster, wn)
+				pl["node"] = nodeID
+			}
+			pod := &PodNode{IDValue: PodID(cluster, uid), NameValue: name, LabelsValue: pl}
+			nodes = append(nodes, pod)
+			emit(NewEdge(EdgeTypeStorageFlow, pvc.ID(), pod.ID(), mapsClone(podLabels)))
+			if nodeID != "" {
+				emit(NewEdge(EdgeTypeStorageFlow, pod.ID(), nodeID, map[string]string{"tier": StorageTierPodNode}))
+			}
+		}
+	}
+	return NewGraph(nodes, edges, time.Time{})
+}
+
+func ptrFloat(v float64) *float64 { return &v }
+
+func mapsClone(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func genStorageScope(r *rand.Rand, g *Graph) StorageScope {
+	// 0 = no root (whole estate); 1 = storage; 2 = workload; 3 = mixed; 4 = typo.
+	switch r.Intn(5) {
+	case 0:
+		return StorageScope{}
+	case 1:
+		var aggrs, svms []string
+		for _, n := range g.NodesByID {
+			switch n.Type() {
+			case NodeTypeNetAppAggr:
+				aggrs = append(aggrs, n.Name())
+			case NodeTypeNetAppSVM:
+				svms = append(svms, n.Name())
+			default:
+				// other kinds are not storage roots
+			}
+		}
+		if len(aggrs) > 0 && r.Intn(2) == 0 {
+			s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, nil)
+			return s
+		}
+		if len(svms) > 0 {
+			s, _ := NewStorageScope(nil, nil, nil, nil, nil, []string{svms[r.Intn(len(svms))]}, nil)
+			return s
+		}
+		return StorageScope{}
+	case 2:
+		var pods []string
+		var nodes []string
+		for _, n := range g.NodesByID {
+			switch n.Type() {
+			case NodeTypePod:
+				pods = append(pods, n.Labels()["namespace"]+"/"+n.Name())
+			case NodeTypeK8sNode:
+				nodes = append(nodes, n.Name())
+			default:
+				// other kinds are not workload roots
+			}
+		}
+		if len(pods) > 0 && r.Intn(2) == 0 {
+			s, _ := NewStorageScope(nil, nil, nil, nil, nil, nil, []string{pods[r.Intn(len(pods))]})
+			return s
+		}
+		if len(nodes) > 0 {
+			s, _ := NewStorageScope(nil, nil, nil, []string{nodes[r.Intn(len(nodes))]}, nil, nil, nil)
+			return s
+		}
+		return StorageScope{}
+	case 3:
+		var aggrs, pods []string
+		for _, n := range g.NodesByID {
+			switch n.Type() {
+			case NodeTypeNetAppAggr:
+				aggrs = append(aggrs, n.Name())
+			case NodeTypePod:
+				pods = append(pods, n.Labels()["namespace"]+"/"+n.Name())
+			default:
+				// mixed-root picker only needs aggrs and pods
+			}
+		}
+		if len(aggrs) == 0 || len(pods) == 0 {
+			return StorageScope{}
+		}
+		s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, []string{pods[r.Intn(len(pods))]})
+		return s
+	default:
+		s, _ := NewStorageScope(nil, nil, nil, nil, []string{"typo-aggr"}, nil, nil)
+		return s
+	}
+}
+
+func shuffleStorageGraph(r *rand.Rand, g *Graph) *Graph {
+	nodes := make([]GraphNode, 0, len(g.NodesByID))
+	for _, n := range g.NodesByID {
+		nodes = append(nodes, n)
+	}
+	r.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+	edges := append([]*Edge(nil), g.Edges...)
+	r.Shuffle(len(edges), func(i, j int) { edges[i], edges[j] = edges[j], edges[i] })
+	out := NewGraph(nodes, edges, g.BuiltAt)
+	out.ClusterIdentities = g.ClusterIdentities
+	return out
+}
+
+func assertStorageRetainedSubset(t *testing.T, seed int64, g *Graph, v View) {
+	t.Helper()
+	for _, n := range v.Nodes {
+		_, ok := g.NodesByID[n.ID()]
+		require.Truef(t, ok, "seed=%d: retained node %s not in built graph", seed, n.ID())
+	}
+	builtEdges := map[string]bool{}
+	for _, e := range g.Edges {
+		builtEdges[e.ID] = true
+	}
+	for _, e := range v.Edges {
+		require.Truef(t, builtEdges[e.ID], "seed=%d: retained edge %s not in built graph", seed, e.ID)
+		_, srcOK := g.NodesByID[e.Source]
+		_, tgtOK := g.NodesByID[e.Target]
+		require.Truef(t, srcOK && tgtOK, "seed=%d: edge %s has unresolved endpoint", seed, e.ID)
+	}
+}
+
+func assertStorageConservation(t *testing.T, seed int64, v View) {
+	t.Helper()
+	type bucket struct {
+		in, out       [4]float64
+		hasIn, hasOut bool
+	}
+	by := map[string]*bucket{}
+	ensure := func(id string) *bucket {
+		b, ok := by[id]
+		if !ok {
+			b = &bucket{}
+			by[id] = b
+		}
+		return b
+	}
+	add := func(dst *[4]float64, io *IOMetrics) {
+		if io == nil {
+			return
+		}
+		if io.ReadOps != nil {
+			dst[0] += *io.ReadOps
+		}
+		if io.WriteOps != nil {
+			dst[1] += *io.WriteOps
+		}
+		if io.ReadBytesPerSec != nil {
+			dst[2] += *io.ReadBytesPerSec
+		}
+		if io.WriteBytesPerSec != nil {
+			dst[3] += *io.WriteBytesPerSec
+		}
+	}
+	for _, e := range v.Edges {
+		if e.Type != EdgeTypeStorageFlow {
+			continue
+		}
+		s, t := ensure(e.Source), ensure(e.Target)
+		s.hasOut = true
+		t.hasIn = true
+		add(&s.out, e.IO)
+		add(&t.in, e.IO)
+	}
+	for id, b := range by {
+		if !b.hasIn || !b.hasOut {
+			continue
+		}
+		n, ok := nodeByID(v, id)
+		if !ok {
+			continue
+		}
+		switch n.Type() {
+		case NodeTypePVC, NodeTypePod, NodeTypeNetAppAggr:
+		case NodeTypeNetAppSVM, NodeTypeNetAppNode, NodeTypeK8sNode, NodeTypeService, NodeTypeExternal:
+			continue
+		default:
+			continue
+		}
+		for i, name := range []string{"read_ops", "write_ops", "read_bytes", "write_bytes"} {
+			require.InDeltaf(t, round6prop(b.in[i]), round6prop(b.out[i]), 1e-9,
+				"seed=%d node=%s type=%s %s in=%g out=%g", seed, id, n.Type(), name, b.in[i], b.out[i])
+		}
+	}
+}
+
+func nodeByID(v View, id string) (GraphNode, bool) {
+	for _, n := range v.Nodes {
+		if n.ID() == id {
+			return n, true
+		}
+	}
+	return nil, false
+}
+
+func round6prop(v float64) float64 {
+	r, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 6, 64), 64)
+	return r
+}
+
+func edgeFingerprint(v View) []string {
+	out := make([]string, len(v.Edges))
+	for i, e := range v.Edges {
+		fp := e.ID + "|" + e.Labels["tier"]
+		if e.IO != nil {
+			fp += fmt.Sprintf("|%v|%v|%v|%v",
+				fmtPtr(e.IO.ReadOps), fmtPtr(e.IO.WriteOps),
+				fmtPtr(e.IO.ReadLatencyUs), fmtPtr(e.IO.MaxIOPS))
+		}
+		out[i] = fp
+	}
+	return out
+}
+
+func fmtPtr(p *float64) string {
+	if p == nil {
+		return "-"
+	}
+	return strconv.FormatFloat(*p, 'g', -1, 64)
 }

@@ -151,16 +151,52 @@ have joined and did not". The builder does not interpret StorageClass names.
 
 ## Harvest series (verified against the Harvest metric catalogue)
 
-| Series | Hop | Role |
-|---|---|---|
-| `volume_labels` | A | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED |
-| `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
-| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B |
-| `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | Aggregate health / usage |
-| `node_new_status` | — | Controller health |
+Every series below was verified against the stock templates of the NetApp
+Harvest repository at release **v26.08.0**. The **Template** column names the
+REST-collector template file (path relative to the Harvest repo root); the ZAPI
+collector ships the same object under `conf/zapi/cdot/9.8.0/` (config objects)
+or `conf/zapiperf/cdot/9.8.0/` (perf objects) with identical counter names, so a
+ZAPI-only estate exports the same metric names. A Harvest metric name is
+`<template object>_<counter>`, which is why every series here is prefixed by the
+object (`volume`, `qos`, `qos_policy_fixed`, `aggr`, `node`) rather than by the
+template name.
+
+| Series | Hop | Template (Harvest v26.08.0) | Role |
+|---|---|---|---|
+| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED |
+| `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | `conf/restperf/9.12.0/workload.yaml` (`object: qos`; counters `read_ops`, `write_ops`, `read_latency`, `write_latency`, `read_data`, `write_data`; `instance_keys` include `lun`, `policy_group`, `svm`, `volume`) | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
+| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
+| `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | `conf/rest/9.12.0/aggr.yaml` (`object: aggr`; `space.block_storage.used => space_used`, `space.block_storage.size => space_total`; `new_status` from the LabelAgent `value_to_num` mapping of `state`) | Aggregate health / usage |
+| `node_new_status` | — | `conf/rest/9.12.0/node.yaml` (`object: node`; `new_status` from the LabelAgent `value_to_num` mapping of `healthy`) | Controller health |
+| `node_labels` | — | `conf/rest/9.12.0/node.yaml` (`object: node`; `instance_keys: ha_partner, node, serial`; `instance_labels` include `model`, `vendor`, `version`, `location`) | Controller hardware identity — `data.hardware` `{model, serial, version, vendor, location}`. Info series — value ignored, labels only |
+| `node_cpu_busy`, `node_total_ops`, `node_total_latency`, `node_total_data` | — | `conf/restperf/9.12.0/system_node.yaml` (`object: node`; counters `cpu_busy`, `total_ops`, `total_latency`, `total_data`) | Controller performance — `data.perf` `{cpu_busy_pct, total_ops, total_latency_us, total_bytes_per_sec}`, read verbatim (Harvest has already resolved the base counters, so no `rate()`). Never turned into a health verdict |
 
 Required Harvest templates: volume instance labels (for `volume_labels`), QoS
-workload, and QoS fixed policy.
+workload, and QoS fixed policy. The aggregate, node and `system_node` templates
+are OPTIONAL — each of the corresponding legs degrades log-and-continue, so a
+deployment running none of them keeps its storage topology and simply carries no
+aggregate usage, controller health, `data.hardware` or `data.perf`.
+
+## SVM entity and the storage-flow chain
+
+Hop A also resolves the SVM (`volume_labels.svm`) as a first-class
+`type="netapp-svm"` node (`netapp/<ontap-cluster>/svm/<svm>`,
+`labels={ontap_cluster}`). It is an identity only in this change — no SVM-level
+Harvest series are read — and is emitted **only** by `GET /v1/storage-graph`.
+`GET /v1/graph` is unchanged: the SVM stays the PVC's `svm` label.
+
+That endpoint expresses the storage chain as directed `storage-flow` edges,
+oriented storage → workload, one hop per adjacent pair of the fixed tier chain:
+
+```
+netapp-node → netapp-aggr → netapp-svm → pvc → pod → node
+```
+
+Each edge carries `labels.tier` (`node-aggr`, `aggr-svm`, `svm-pvc`, `pvc-pod`,
+`pod-node`). A FlexGroup claim (empty `aggr`) enters at `svm-pvc`. A claim with
+no resolved SVM contributes no path — there is no `aggr → pvc` shortcut. I/O
+weights ride every hop of a measured path and conserve tier to tier; see the
+`storage-graph-api` spec.
 
 ## The QoS read is scoped
 

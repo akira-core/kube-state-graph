@@ -36,9 +36,34 @@
           "name": "mongo-0",
           "type": "pod",
           "parent": "cluster-alpha/namespace/db",
+          "alerts": [
+            {
+              "name": "KubePodCrashLooping",
+              "state": "firing",
+              "severity": "warning"
+            }
+          ],
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-0",
+          "name": "worker-0",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "alerts": [
+            {
+              "name": "KubeNodeNotReady",
+              "state": "firing",
+              "severity": "critical"
+            }
+          ],
+          "labels": {
+            "cluster": "cluster-alpha"
           }
         }
       },
@@ -49,6 +74,13 @@
           "type": "pvc",
           "parent": "cluster-alpha/namespace/db",
           "storageclass": "netapp-nas",
+          "alerts": [
+            {
+              "name": "PVCAlmostFull",
+              "state": "firing",
+              "severity": "warning"
+            }
+          ],
           "labels": {
             "cluster": "cluster-alpha",
             "namespace": "db",
@@ -81,6 +113,13 @@
             "used_bytes": 700000000000,
             "capacity_bytes": 1000000000000
           },
+          "alerts": [
+            {
+              "name": "AggrSpaceLow",
+              "state": "firing",
+              "severity": "warning"
+            }
+          ],
           "labels": {
             "node": "ontap-prod-01",
             "ontap_cluster": "ontap-prod"
@@ -94,6 +133,25 @@
           "type": "netapp-node",
           "parent": "storage-cluster/ontap-prod",
           "health": "online",
+          "hardware": {
+            "model": "AFF-A400",
+            "serial": "721234000123",
+            "version": "9.14.1",
+            "vendor": "NetApp"
+          },
+          "perf": {
+            "cpu_busy_pct": 72.5,
+            "total_ops": 18500,
+            "total_latency_us": 830,
+            "total_bytes_per_sec": 1200000000
+          },
+          "alerts": [
+            {
+              "name": "NodeCPUBusy",
+              "state": "firing",
+              "severity": "critical"
+            }
+          ],
           "labels": {
             "ontap_cluster": "ontap-prod"
           }

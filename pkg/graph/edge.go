@@ -16,7 +16,53 @@ const (
 	EdgeTypeServiceSelectsPod EdgeType = "service-selects-pod"
 	EdgeTypePodToNode         EdgeType = "pod-to-node"
 	EdgeTypePVCToNetAppAggr   EdgeType = "pvc-to-netapp-aggr"
+	EdgeTypeStorageFlow       EdgeType = "storage-flow"
 )
+
+// Tier values for the `tier` label of a storage-flow edge. They name the hop
+// on the fixed chain
+//
+//	netapp-node → netapp-aggr → netapp-svm → pvc → pod → node
+//
+// oriented storage → workload, so the body is consumable by a Sankey layout
+// with no client-side reversal. Exactly one of these is set on every
+// storage-flow edge.
+const (
+	StorageTierNodeAggr = "node-aggr"
+	StorageTierAggrSVM  = "aggr-svm"
+	StorageTierSVMPVC   = "svm-pvc"
+	StorageTierPVCPod   = "pvc-pod"
+	StorageTierPodNode  = "pod-node"
+)
+
+// StorageTiers lists the storage-flow tiers in chain order, storage first. It
+// is the single ordering the registry entry, the assembler and the projection
+// share, so a new tier cannot be added to one and forgotten in another.
+var StorageTiers = []string{
+	StorageTierNodeAggr,
+	StorageTierAggrSVM,
+	StorageTierSVMPVC,
+	StorageTierPVCPod,
+	StorageTierPodNode,
+}
+
+// AttributionSplit marks a pvc-pod storage-flow edge whose claim is mounted by
+// more than one pod (RWX). Per-pod I/O is not observable from any series the
+// build reads, so the claim's weight is split equally across its mounters;
+// this label lets a consumer tell an attributed share from a measurement. A
+// singly-mounted claim's edge carries no `attribution` label at all.
+const AttributionSplit = "split"
+
+// ClaimAggrLabel is the internal key the storage-flow assembler stamps on an
+// svm-pvc edge so ProjectStorage can recover which aggregate the claim sits
+// on after shared aggr-svm hops are deduplicated. An SVM spans aggregates, so
+// walking up from the SVM is ambiguous whenever two claims in the same SVM
+// join different aggregates — without this key, `?aggr=aggr1&pod=x` could not
+// tell the pod's aggr1 claim from its aggr2 claim.
+//
+// It is stripped from the projected view and never appears on the wire. A
+// FlexGroup claim (no aggregate) omits the key.
+const ClaimAggrLabel = "claim_aggr"
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are
 // derived (UUIDv5). Bumping this value invalidates every existing edge ID and

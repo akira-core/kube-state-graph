@@ -198,11 +198,49 @@ const (
 	QAggrSpaceTotal   Query = "aggr_space_total"
 	QNetAppNodeStatus Query = "node_new_status"
 
+	// NetApp Harvest controller hardware identity. An INFO series: its sample
+	// value is discarded, only the labels are read (`cluster` — the ONTAP
+	// cluster, `node`, and any of `model`, `serial`, `version`, `vendor`,
+	// `location`). Feeds the netapp-node `data.hardware` attribute. OPTIONAL:
+	// absence omits the attribute, never a build failure. Stock Harvest
+	// `conf/rest/9.12.0/node.yaml` (object `node`) — see
+	// docs/netapp-harvest-preconditions.md for the catalogue reference.
+	QNetAppNodeLabels Query = "node_labels"
+
+	// NetApp Harvest controller performance counters, from the stock
+	// `system_node` template (`conf/restperf/9.12.0/system_node.yaml`, object
+	// `node`, counters `cpu_busy` / `total_ops` / `total_latency` /
+	// `total_data`). Harvest has already resolved the ONTAP base counters —
+	// cpu_busy is a percent, total_ops per-second, total_latency an average in
+	// microseconds, total_data bytes per second — so these are read VERBATIM
+	// via last_over_time, NEVER wrapped in rate(), exactly like the QoS
+	// workload families. They feed the netapp-node `data.perf` attribute and
+	// are NEVER turned into a health verdict: thresholds are model- and
+	// estate-specific and belong in the operator's alert rules, whose verdicts
+	// reach the node through the alert overlay (QAlerts). Each leg is
+	// independently OPTIONAL — a miss omits one `perf` field.
+	QNetAppNodeCPUBusy      Query = "node_cpu_busy"
+	QNetAppNodeTotalOps     Query = "node_total_ops"
+	QNetAppNodeTotalLatency Query = "node_total_latency"
+	QNetAppNodeTotalData    Query = "node_total_data"
+
 	// Kubelet PVC usage (bytes). OPTIONAL; per-field independent; joined on
 	// (cluster, namespace, persistentvolumeclaim). Introduces kubelet as a
 	// fourth upstream family.
 	QKubeletVolumeUsedBytes     Query = "kubelet_volume_stats_used_bytes"
 	QKubeletVolumeCapacityBytes Query = "kubelet_volume_stats_capacity_bytes"
+
+	// QAlerts is the Prometheus / vmalert ALERTS series — the alert overlay's
+	// single leg (the alert-overlay capability). It is the sole member of the
+	// FamilyAlerts family, which is the ONE family a valid routing table may
+	// leave unserved: the alerting store is commonly a different installation
+	// from the one holding kube_*, and requiring it would invalidate every
+	// existing backends file.
+	//
+	// OPTIONAL in every direction: an unserved family, a query error, or an
+	// empty vector each leave every node without `data.alerts` and never fail
+	// the build.
+	QAlerts Query = "ALERTS"
 )
 
 // queryDims is the hardcoded "which request dimension reaches which series"
@@ -269,19 +307,27 @@ var queryDims = map[Query]dims{
 	QNodeStatusCondition: dimsClusterScoped,
 
 	// NetApp Harvest — zone-routed, no request matcher.
-	QVolumeLabels:          dimsHarvest,
-	QQoSReadOps:            dimsHarvest,
-	QQoSWriteOps:           dimsHarvest,
-	QQoSReadLatency:        dimsHarvest,
-	QQoSWriteLatency:       dimsHarvest,
-	QQoSReadData:           dimsHarvest,
-	QQoSWriteData:          dimsHarvest,
-	QQoSPolicyFixedMaxIOPS: dimsHarvest,
-	QQoSPolicyFixedMaxMBps: dimsHarvest,
-	QAggrStatus:            dimsHarvest,
-	QAggrSpaceUsed:         dimsHarvest,
-	QAggrSpaceTotal:        dimsHarvest,
-	QNetAppNodeStatus:      dimsHarvest,
+	QVolumeLabels:           dimsHarvest,
+	QQoSReadOps:             dimsHarvest,
+	QQoSWriteOps:            dimsHarvest,
+	QQoSReadLatency:         dimsHarvest,
+	QQoSWriteLatency:        dimsHarvest,
+	QQoSReadData:            dimsHarvest,
+	QQoSWriteData:           dimsHarvest,
+	QQoSPolicyFixedMaxIOPS:  dimsHarvest,
+	QQoSPolicyFixedMaxMBps:  dimsHarvest,
+	QAggrStatus:             dimsHarvest,
+	QAggrSpaceUsed:          dimsHarvest,
+	QAggrSpaceTotal:         dimsHarvest,
+	QNetAppNodeStatus:       dimsHarvest,
+	QNetAppNodeLabels:       dimsHarvest,
+	QNetAppNodeCPUBusy:      dimsHarvest,
+	QNetAppNodeTotalOps:     dimsHarvest,
+	QNetAppNodeTotalLatency: dimsHarvest,
+	QNetAppNodeTotalData:    dimsHarvest,
+
+	// Alerting store — az / env / namespace, but deliberately NOT cluster.
+	QAlerts: dimsAlerts,
 
 	// Read unfiltered for every request.
 	QServiceGraphTotal:               dimsNone,
@@ -317,18 +363,56 @@ const (
 	FamilyServiceGraph Family = "servicegraph"
 	// FamilyProbe is the up{} store-health probe.
 	FamilyProbe Family = "probe"
+	// FamilyAlerts is the ALERTS series of the alert overlay. It is the only
+	// OPTIONAL family: a routing table serving it on no backend is valid, the
+	// leg is simply not issued, and no node carries `data.alerts`. Requiring
+	// it would break every backends file written before the overlay existed.
+	FamilyAlerts Family = "alerts"
 )
 
 // Families lists every declared family in a fixed order. It is the set a
-// routing table validates against and the set it must cover — a family served
-// by no backend is a configuration error, because the queries in it would have
-// nowhere to go.
+// routing table validates a declared family NAME against, and the set
+// SingleBackendTable serves in full.
+//
+// It is NOT the set a table must cover — that is requiredFamilies. The two
+// differ by exactly FamilyAlerts.
 var Families = []Family{
 	FamilyKSM,
 	FamilyKubelet,
 	FamilyHarvest,
 	FamilyServiceGraph,
 	FamilyProbe,
+	FamilyAlerts,
+}
+
+// requiredFamilies is the subset of Families a routing table MUST cover. A
+// required family served by no backend is a configuration error, because its
+// queries would have nowhere to go and the resulting empty vector is
+// indistinguishable from a genuinely empty estate.
+//
+// FamilyAlerts is deliberately absent: an unserved alert family is the
+// documented normal state, not a misconfiguration (design D8).
+var requiredFamilies = []Family{
+	FamilyKSM,
+	FamilyKubelet,
+	FamilyHarvest,
+	FamilyServiceGraph,
+	FamilyProbe,
+}
+
+// RequiredFamilies returns the families a routing table must cover, in the
+// fixed order of Families. Exported so a configuration layer can report the
+// requirement without restating the set.
+func RequiredFamilies() []Family { return append([]Family(nil), requiredFamilies...) }
+
+// Optional reports whether a table may leave family f served by no backend.
+func (f Family) Optional() bool {
+	for _, req := range requiredFamilies {
+		if f == req {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseFamily resolves a configured family name. The bool reports whether the
@@ -379,19 +463,24 @@ var queryFamily = map[Query]Family{
 	QKubeletVolumeCapacityBytes: FamilyKubelet,
 
 	// NetApp Harvest.
-	QVolumeLabels:          FamilyHarvest,
-	QQoSReadOps:            FamilyHarvest,
-	QQoSWriteOps:           FamilyHarvest,
-	QQoSReadLatency:        FamilyHarvest,
-	QQoSWriteLatency:       FamilyHarvest,
-	QQoSReadData:           FamilyHarvest,
-	QQoSWriteData:          FamilyHarvest,
-	QQoSPolicyFixedMaxIOPS: FamilyHarvest,
-	QQoSPolicyFixedMaxMBps: FamilyHarvest,
-	QAggrStatus:            FamilyHarvest,
-	QAggrSpaceUsed:         FamilyHarvest,
-	QAggrSpaceTotal:        FamilyHarvest,
-	QNetAppNodeStatus:      FamilyHarvest,
+	QVolumeLabels:           FamilyHarvest,
+	QQoSReadOps:             FamilyHarvest,
+	QQoSWriteOps:            FamilyHarvest,
+	QQoSReadLatency:         FamilyHarvest,
+	QQoSWriteLatency:        FamilyHarvest,
+	QQoSReadData:            FamilyHarvest,
+	QQoSWriteData:           FamilyHarvest,
+	QQoSPolicyFixedMaxIOPS:  FamilyHarvest,
+	QQoSPolicyFixedMaxMBps:  FamilyHarvest,
+	QAggrStatus:             FamilyHarvest,
+	QAggrSpaceUsed:          FamilyHarvest,
+	QAggrSpaceTotal:         FamilyHarvest,
+	QNetAppNodeStatus:       FamilyHarvest,
+	QNetAppNodeLabels:       FamilyHarvest,
+	QNetAppNodeCPUBusy:      FamilyHarvest,
+	QNetAppNodeTotalOps:     FamilyHarvest,
+	QNetAppNodeTotalLatency: FamilyHarvest,
+	QNetAppNodeTotalData:    FamilyHarvest,
 
 	// Service graph.
 	QServiceGraphTotal:               FamilyServiceGraph,
@@ -400,6 +489,9 @@ var queryFamily = map[Query]Family{
 
 	// Store health.
 	QUpProbe: FamilyProbe,
+
+	// Alert overlay.
+	QAlerts: FamilyAlerts,
 }
 
 // FamilyOf returns the family query q belongs to. The bool reports whether q
@@ -478,6 +570,14 @@ const jobOwnerCronJobSelector = `owner_kind="CronJob",owner_is_controller="true"
 // at all), as docs/kube-state-metrics-preconditions.md records; there is
 // nothing there to drop.
 const argoTrackingIDPresentSelector = `annotation_argocd_argoproj_io_tracking_id!=""`
+
+// alertsFiringSelector keeps the ALERTS read at alerts that are actually
+// firing. It is a request-invariant metric-selection contract of the same
+// class as the D30 sentinel and condition="Ready" — NOT a caller filter: a
+// `pending` alert is a threshold crossed for less than its `for:` duration,
+// and surfacing it would make the graph flap on every rebuild. The value is
+// compiled in; there is no knob.
+const alertsFiringSelector = `alertstate="firing"`
 
 // serviceGraphSentinelSelector excludes the servicegraph connector's virtual
 // peers from the service-graph series at the query layer (design.md D30): an
@@ -648,6 +748,14 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		return fmt.Sprintf(`last_over_time(aggr_space_total%s[%s])`, braces(""), w)
 	case QNetAppNodeStatus:
 		return fmt.Sprintf(`last_over_time(node_new_status%s[%s])`, braces(""), w)
+	case QNetAppNodeLabels, QNetAppNodeCPUBusy, QNetAppNodeTotalOps,
+		QNetAppNodeTotalLatency, QNetAppNodeTotalData:
+		// One grouped arm for the five Harvest controller legs (same shape as
+		// the QQoS* and controller-annotation arms): each Query constant IS
+		// its bare metric name, so `q` renders it and a hand-typed name cannot
+		// drift from the constant. No fixed selector — the identity is the
+		// (cluster, node) label pair the reader joins on.
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(""), w)
 	case QKubeletVolumeUsedBytes:
 		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_used_bytes%s[%s])`, braces(""), w)
 	case QKubeletVolumeCapacityBytes:
@@ -683,6 +791,13 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		return fmt.Sprintf(
 			`rate(traces_service_graph_request_server_seconds_bucket%s[%s])`,
 			braces(serviceGraphSentinelSelector+","+serviceGraphLinkExclusionSelector), w)
+	case QAlerts:
+		// Read over the WHOLE window, not at the end instant: the endpoint's
+		// contract is "what was true in [start, end]", so an alert that fired
+		// and resolved inside the window is part of the answer. The fixed
+		// alertstate="firing" selector is rendered first, so a request matcher
+		// composes with it rather than replacing it.
+		return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, braces(alertsFiringSelector), w)
 	case QUpProbe:
 		return `up`
 	}

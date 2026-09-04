@@ -33,11 +33,26 @@ func (b *Buffer) String() string {
 // Capture swaps the default slog logger for the test's duration and returns
 // the buffer collecting its output. Tests using it must not run in parallel —
 // the default logger is process-global state.
+//
+// The captured logger runs at the handler's DEFAULT level (Info), so a Debug
+// record is dropped. That is deliberate: a test asserting that something is
+// logged at Debug rather than Warn wants both halves of the claim, and
+// CaptureLevel(t, slog.LevelDebug) supplies the level-aware form.
 func Capture(t *testing.T) *Buffer {
+	t.Helper()
+	return CaptureLevel(t, slog.LevelInfo)
+}
+
+// CaptureLevel is Capture with an explicit minimum level, so a test can assert
+// on records the default Info threshold would drop. Pass slog.LevelDebug to
+// see Debug records; the captured text still carries each record's own level,
+// so a test can distinguish "logged at Debug" from "logged at Warn" rather
+// than merely "logged".
+func CaptureLevel(t *testing.T, level slog.Level) *Buffer {
 	t.Helper()
 	buf := &Buffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	return buf
 }

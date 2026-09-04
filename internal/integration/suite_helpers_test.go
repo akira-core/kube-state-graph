@@ -23,6 +23,21 @@ func (s *VMSuite) graphURL(srv string, configureQuery func(url.Values)) string {
 	return srv + "/v1/graph?" + q.Encode()
 }
 
+// storageGraphURL builds a /v1/storage-graph URL. az and env are required by
+// the endpoint and default to zone-a / prod; configureQuery may override them
+// or add roots.
+func (s *VMSuite) storageGraphURL(srv string, configureQuery func(url.Values)) string {
+	q := url.Values{}
+	q.Set("start", strconv.FormatInt(fixedNow.Add(-5*time.Minute).Unix(), 10))
+	q.Set("end", strconv.FormatInt(fixedNow.Unix(), 10))
+	q.Set("az", "zone-a")
+	q.Set("env", "prod")
+	if configureQuery != nil {
+		configureQuery(q)
+	}
+	return srv + "/v1/storage-graph?" + q.Encode()
+}
+
 // httpGet issues a GET against the API server under test (NOT the VM
 // container — VM traffic goes through vmGet, which authenticates).
 func (s *VMSuite) httpGet(rawURL string) *http.Response {

@@ -166,12 +166,17 @@ func NewTable(backends []Backend) (*Table, error) {
 		out = append(out, normaliseBackend(b))
 	}
 
-	// A family served by no backend is fatal, not a degrade: its queries would
-	// have nowhere to go, and the resulting empty vector is indistinguishable
-	// from a genuinely empty estate.
-	for _, f := range Families {
+	// A REQUIRED family served by no backend is fatal, not a degrade: its
+	// queries would have nowhere to go, and the resulting empty vector is
+	// indistinguishable from a genuinely empty estate.
+	//
+	// The optional families (FamilyAlerts) are deliberately not checked: an
+	// unserved alert family is the documented normal state, the leg is simply
+	// not issued, and no node carries `data.alerts`. Requiring it would have
+	// broken every backends file written before the overlay existed.
+	for _, f := range requiredFamilies {
 		if _, ok := served[f]; !ok {
-			return nil, fmt.Errorf("backend table: family %q is served by no backend — every family must have at least one", f)
+			return nil, fmt.Errorf("backend table: family %q is served by no backend — every required family must have at least one", f)
 		}
 	}
 
@@ -288,9 +293,29 @@ func (t *Table) String() string {
 // appears in logs, in the per-backend failure metric, and on query spans.
 const DefaultBackendName = "default"
 
+// Unserved returns the OPTIONAL families no backend in this table serves, in
+// the fixed order of Families. It is what the configuration layer logs one
+// Info about at load ("the alert overlay is disabled"): a required family can
+// never appear here, because NewTable rejects such a table outright.
+func (t *Table) Unserved() []Family {
+	if t == nil {
+		return nil
+	}
+	var out []Family
+	for _, f := range Families {
+		// Select with no zones is the unrestricted "who serves f" answer —
+		// the same test fanoutQuerier applies before downgrading the miss.
+		if f.Optional() && len(t.Select(f, nil)) == 0 {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // SingleBackendTable synthesises the implicit routing table a deployment with
 // no routing file runs on: one backend named "default", addressed at the given
-// endpoint, serving EVERY family, with no zones (a catch-all).
+// endpoint, serving EVERY family — the five required plus the optional
+// `alerts` — with no zones (a catch-all).
 //
 // It is a table rather than a separate unrouted code path so the compatibility
 // claim is exercised by the whole existing test suite: every current unit,

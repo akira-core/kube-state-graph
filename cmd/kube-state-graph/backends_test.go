@@ -101,7 +101,8 @@ func TestInitialTable_ImplicitSingleBackend(t *testing.T) {
 	b := tbl.Backends()[0]
 	assert.Equal(t, config.DefaultBackendName, b.Name())
 	assert.Equal(t, "http://vm.example:8428", b.URL())
-	assert.Len(t, b.Families(), 5)
+	assert.Len(t, b.Families(), 6,
+		"the implicit backend serves every family — the five required plus the optional alerts")
 	assert.Empty(t, b.Zones())
 }
 

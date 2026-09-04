@@ -24,6 +24,14 @@ type PodPVCBinding struct {
 	PVCID string
 }
 
+// SVMRef is a claim's resolved SVM, qualified by the ONTAP cluster it lives on.
+// SVM names are unique within a cluster but not across filers, so the pair is
+// the identity — and the pair is what NetAppSVMID needs.
+type SVMRef struct {
+	ONTAPCluster string
+	SVM          string
+}
+
 // podKey groups pod samples by their cluster-scoped namespace/name. Multiple
 // UIDs under one key indicate restarts.
 type podKey struct{ cluster, namespace, pod string }
@@ -69,6 +77,34 @@ type Topology struct {
 	NetAppNodes  []*graph.NetAppNode
 	StorageEdges []*graph.Edge
 	PodPVCs      []PodPVCBinding
+
+	// NetAppInventory is every NetApp entity the Harvest read NAMED, whether or
+	// not a claim joined it. It is deliberately wider than NetAppAggrs /
+	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:
+	// the storage-flow graph needs flowless roots (a degraded aggregate serving
+	// no claim is a valid answer to "what is on this filer?"), and the only
+	// alternative — passing the request's roots into the build — would make the
+	// build a function of the request, which both the cache key and the
+	// "selectors alone reach the queries" rule forbid.
+	//
+	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
+	// not by the Kubernetes estate, and a flowless entity costs nothing at
+	// projection — it is dropped unless it is a root.
+	NetAppInventory NetAppInventory
+
+	// Alerts is the RAW ALERTS vector, carried unparsed. Matching runs against
+	// the ASSEMBLED node set — which the service-graph read contributes synth
+	// pods to — so it cannot happen at parse time, and holding the vector is
+	// what lets Build resolve it at the one point every node exists but the
+	// graph is not yet frozen.
+	Alerts model.Vector
+
+	// SVMByPVC maps a PVC node id to the SVM its FlexVol lives in, as resolved
+	// by hop A. The PVC's `svm` LABEL carries only the name; this carries the
+	// ONTAP cluster with it, which the storage-flow assembler needs because an
+	// SVM node id is cluster-qualified and a FlexGroup claim — entering the
+	// chain AT the SVM — has no aggregate to borrow the cluster from.
+	SVMByPVC map[string]SVMRef
 
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
@@ -206,9 +242,24 @@ type topologyVectors struct {
 	AggrSpaceUsed    model.Vector
 	AggrSpaceTotal   model.Vector
 	NetAppNodeStatus model.Vector
+	// Controller hardware identity (an info series — labels only) and the four
+	// system_node performance counters, all matched on (ontap cluster, node)
+	// and all read VERBATIM. They resolve the netapp-node data.hardware and
+	// data.perf attributes; none of them feeds data.health, which stays the
+	// ONTAP-reported NetAppNodeStatus above.
+	NetAppNodeLabels       model.Vector
+	NetAppNodeCPUBusy      model.Vector
+	NetAppNodeTotalOps     model.Vector
+	NetAppNodeTotalLatency model.Vector
+	NetAppNodeTotalData    model.Vector
 	// Kubelet PVC usage.
 	KubeletVolumeUsed     model.Vector
 	KubeletVolumeCapacity model.Vector
+	// Active alerts (the alert overlay). Unlike every other vector here it is
+	// NOT consumed by parseTopology: matching needs the ASSEMBLED node set,
+	// which only exists after the service-graph read has contributed its synth
+	// pods, so the raw vector is carried through to Build untouched.
+	Alerts model.Vector
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -373,6 +424,15 @@ func ReadTopology(
 	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
 	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
 	g.Go(fetchOptional(promql.QNetAppNodeStatus, &v.NetAppNodeStatus))
+	g.Go(fetchOptional(promql.QNetAppNodeLabels, &v.NetAppNodeLabels))
+	g.Go(fetchOptional(promql.QNetAppNodeCPUBusy, &v.NetAppNodeCPUBusy))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalOps, &v.NetAppNodeTotalOps))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalLatency, &v.NetAppNodeTotalLatency))
+	g.Go(fetchOptional(promql.QNetAppNodeTotalData, &v.NetAppNodeTotalData))
+	// The alert overlay. Routed through FamilyAlerts, so a table serving that
+	// family on no backend issues nothing and every node stays alert-less —
+	// the documented normal state, not a degrade.
+	g.Go(fetchOptional(promql.QAlerts, &v.Alerts))
 	g.Go(fetchOptional(promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed))
 	g.Go(fetchOptional(promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity))
 	if err := g.Wait(); err != nil {
@@ -416,6 +476,12 @@ func ReadTopology(
 		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
 		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
 		string(promql.QNetAppNodeStatus):           len(v.NetAppNodeStatus),
+		string(promql.QNetAppNodeLabels):           len(v.NetAppNodeLabels),
+		string(promql.QNetAppNodeCPUBusy):          len(v.NetAppNodeCPUBusy),
+		string(promql.QNetAppNodeTotalOps):         len(v.NetAppNodeTotalOps),
+		string(promql.QNetAppNodeTotalLatency):     len(v.NetAppNodeTotalLatency),
+		string(promql.QNetAppNodeTotalData):        len(v.NetAppNodeTotalData),
+		string(promql.QAlerts):                     len(v.Alerts),
 		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
 		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
 	}
@@ -438,8 +504,20 @@ func ReadTopology(
 // false for every dimension and an empty volume_labels can never be the
 // request's doing — reporting it would fire this Warn on every filtered
 // request of every non-NetApp deployment. QVolumeLabels stays in the list so
-// the contract is enforced by the table rather than by omission. It is a
-// Warn, not an error, and stays quiet for every unfiltered build.
+// the contract is enforced by the table rather than by omission.
+//
+// An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
+// on a DIFFERENT axis, and it needs its own rule because Reaches cannot
+// express it: ALERTS does carry az / env / namespace, so Reaches is true for
+// exactly the dimensions this Warn tests. What makes it wrong to report is
+// that an empty alert vector is the HEALTHY estate — the normal, desired
+// outcome — not evidence of a labelling mistake. The family is also the one a
+// table may legitimately leave unserved, in which case the router hands back
+// an empty vector by design. QAlerts stays in the candidate list for the same
+// reason QVolumeLabels does: the exclusion is enforced by an explicit rule
+// rather than by omission from a list.
+//
+// It is a Warn, not an error, and stays quiet for every unfiltered build.
 func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
 	if !sel.Active() || raw[string(promql.QPodInfo)] == 0 {
 		return
@@ -447,7 +525,11 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 	var empty []string
 	for _, q := range []promql.Query{
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
+		promql.QAlerts,
 	} {
+		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
+			continue
+		}
 		if raw[string(q)] == 0 && sel.Reaches(q) {
 			empty = append(empty, string(q))
 		}
@@ -873,15 +955,10 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn})
 		}
 	}
-	netapp := resolveNetAppStorage(claims, v.volumeKey(),
-		v.VolumeLabels,
-		v.QoSReadOps, v.QoSWriteOps, v.QoSReadLatency, v.QoSWriteLatency,
-		v.QoSReadData, v.QoSWriteData,
-		v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps,
-		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal, v.NetAppNodeStatus)
+	netapp := resolveNetAppStorage(claims, v)
 	for _, pv := range pvcs {
-		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {
-			pv.LabelsValue["svm"] = svm
+		if ref, ok := netapp.svmByPVC[pv.IDValue]; ok && ref.SVM != "" {
+			pv.LabelsValue["svm"] = ref.SVM
 		}
 	}
 
@@ -966,6 +1043,9 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		NetAppAggrs:         netapp.aggrs,
 		NetAppNodes:         netapp.nodes,
 		StorageEdges:        netapp.edges,
+		NetAppInventory:     netapp.inventory,
+		SVMByPVC:            netapp.svmByPVC,
+		Alerts:              v.Alerts,
 		PodPVCs:             bindings,
 		PodsByUID:           podsByUID,
 		ServicesByNameNS:    servicesByNameNS,

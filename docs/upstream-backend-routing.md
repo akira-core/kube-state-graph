@@ -15,7 +15,8 @@ Without routing, such an estate needs one process per store, which defeats the
 point of a cross-cluster graph.
 
 > **Configuring nothing keeps today's behaviour.** With no routing file, an
-> implicit backend named `default` at `--prom-url` serves every family, every
+> implicit backend named `default` at `--prom-url` serves every family (the five
+> required plus optional `alerts`), every
 > rendered query string is unchanged, and every response body is byte-identical
 > to a deployment from before routing existed.
 
@@ -61,13 +62,13 @@ backends:
 |---|---|---|
 | `name` | yes | Unique identity. Appears in logs, in `kube_state_graph_backend_query_failures_total{backend=…}`, on query spans, and in the `/readyz` failure body. It is also the **merge order key** — see [Fan-out and merge](#fan-out-and-merge). |
 | `url` | yes | Query endpoint. Must parse as an absolute `http` or `https` URL. |
-| `families` | yes | Non-empty subset of the five families below. |
+| `families` | yes | Non-empty subset of the six families below. `alerts` is optional: a table that serves it on no backend is valid. |
 | `zones` | no | The `az` values this backend holds. **Omitted or empty means every zone** — a catch-all. |
 | `usernameEnv` / `passwordEnv` | no | **Names** of environment variables holding this backend's basic-auth pair. |
 
 A table is rejected when it is empty, declares a duplicate `name`, declares an
 unparseable or non-HTTP(S) `url`, declares an unknown or empty `families` set,
-declares an empty zone string, **or leaves any family served by no backend**. An
+declares an empty zone string, **or leaves any required family served by no backend** (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe` — `alerts` may be left unserved). An
 unknown field is also rejected: a misspelled `zone:` for `zones:` would silently
 turn a zone-scoped backend into a catch-all.
 
@@ -80,9 +81,10 @@ Every query belongs to exactly one family. The mapping is hardcoded
 |---|---|---|
 | `ksm` | every `kube_*` kube-state-metrics series — pod, node, claim, Service, EndpointSlice, owner, controller-annotation | yes |
 | `kubelet` | `kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes` | yes |
-| `harvest` | every NetApp Harvest series: `volume_labels`, the six `qos_*` families, the two `qos_policy_fixed_max_throughput_*`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status` | yes — **without a matcher** |
+| `harvest` | every NetApp Harvest series: `volume_labels`, the six `qos_*` families, the two `qos_policy_fixed_max_throughput_*`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status`, `node_labels`, `node_cpu_busy`, `node_total_ops`, `node_total_latency`, `node_total_data` | yes — **without a matcher** |
 | `servicegraph` | the three `traces_service_graph_*` series | **no** |
 | `probe` | the `up{}` store-health probe | **no** |
+| `alerts` | the Prometheus / vmalert `ALERTS` series | yes (matcher AND route). **Optional**: a table serving it on no backend is valid — the overlay is simply off |
 
 `servicegraph` and `probe` carry no request-scoped matcher of any kind, so they
 are never narrowed by zone: a `?az=`-scoped request still reaches **every**
@@ -284,9 +286,9 @@ rather than a quiet fallback.
 ## Rollout
 
 1. Ship with no routing file. Verify `kube_state_graph_upstream_backends` is 1.
-2. Mount a **single**-entry file mirroring `--prom-url` (all five families, no
-   zones). This exercises the file path, validation and reload loop with no
-   change in routing outcome.
+2. Mount a **single**-entry file mirroring `--prom-url` (the five required
+   families plus optional `alerts`, no zones). This exercises the file path,
+   validation and reload loop with no change in routing outcome.
 3. Split `harvest` onto its own backend. Verify the storage chain still draws:
    `pvc-to-netapp-aggr` edges present, aggregate I/O populated.
 4. Add per-zone backends and their credential variables. Verify a `?az=`-scoped

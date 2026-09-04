@@ -1,5 +1,14 @@
 components:
   schemas:
+    github_com_akira-core_kube-state-graph_pkg_cytoscape.AlertDTO:
+      properties:
+        name:
+          type: string
+        severity:
+          type: string
+        state:
+          type: string
+      type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.Body:
       properties:
         apiVersion:
@@ -96,6 +105,19 @@ components:
           type: array
           uniqueItems: false
       type: object
+    github_com_akira-core_kube-state-graph_pkg_cytoscape.HardwareDTO:
+      properties:
+        location:
+          type: string
+        model:
+          type: string
+        serial:
+          type: string
+        vendor:
+          type: string
+        version:
+          type: string
+      type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.Node:
       properties:
         data:
@@ -103,6 +125,11 @@ components:
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.NodeData:
       properties:
+        alerts:
+          items:
+            $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.AlertDTO'
+          type: array
+          uniqueItems: false
         application:
           type: string
         containers:
@@ -110,6 +137,8 @@ components:
             $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Container'
           type: array
           uniqueItems: false
+        hardware:
+          $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.HardwareDTO'
         health:
           type: string
         id:
@@ -129,6 +158,8 @@ components:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Owner'
         parent:
           type: string
+        perf:
+          $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.PerfDTO'
         ready_status:
           type: string
         storageclass:
@@ -137,6 +168,17 @@ components:
           type: string
         usage:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.UsageDTO'
+      type: object
+    github_com_akira-core_kube-state-graph_pkg_cytoscape.PerfDTO:
+      properties:
+        cpu_busy_pct:
+          type: number
+        total_bytes_per_sec:
+          type: number
+        total_latency_us:
+          type: number
+        total_ops:
+          type: number
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.UsageDTO:
       properties:
@@ -160,6 +202,7 @@ components:
       - service-selects-pod
       - pod-to-node
       - pvc-to-netapp-aggr
+      - storage-flow
       type: string
       x-enum-varnames:
       - EdgeTypePodMountsPVC
@@ -168,6 +211,7 @@ components:
       - EdgeTypeServiceSelectsPod
       - EdgeTypePodToNode
       - EdgeTypePVCToNetAppAggr
+      - EdgeTypeStorageFlow
     github_com_akira-core_kube-state-graph_pkg_graph.EdgeTypeDefinition:
       properties:
         description:
@@ -212,6 +256,7 @@ components:
       - external
       - netapp-aggr
       - netapp-node
+      - netapp-svm
       type: string
       x-enum-varnames:
       - NodeTypePod
@@ -221,6 +266,7 @@ components:
       - NodeTypeExternal
       - NodeTypeNetAppAggr
       - NodeTypeNetAppNode
+      - NodeTypeNetAppSVM
     github_com_akira-core_kube-state-graph_pkg_graph.Owner:
       properties:
         kind:
@@ -551,6 +597,145 @@ paths:
       security:
       - ApiKeyAuth: []
       summary: Get multi-cluster graph (Cytoscape.js)
+      tags:
+      - graph
+  /v1/storage-graph:
+    get:
+      description: |-
+        Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
+
+        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+
+        **Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent.
+
+        `cluster` / `namespace` remain optional narrowing filters. `edge_type` and `prune` are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
+      parameters:
+      - description: Window start. RFC 3339 or Unix seconds.
+        example: "2026-05-01T12:00:00Z"
+        in: query
+        name: start
+        required: true
+        schema:
+          type: string
+      - description: Window end. Must be > start.
+        example: "2026-05-01T12:05:00Z"
+        in: query
+        name: end
+        required: true
+        schema:
+          type: string
+      - description: Availability zone (required, single-valued).
+        example: zone-a
+        in: query
+        name: az
+        required: true
+        schema:
+          type: string
+      - description: Environment (required, single-valued).
+        example: prod
+        in: query
+        name: env
+        required: true
+        schema:
+          type: string
+      - description: Restrict to listed Kubernetes clusters (repeatable, OR-combined).
+        in: query
+        name: cluster
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: Restrict to listed namespaces (repeatable, OR-combined).
+        in: query
+        name: namespace
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: 'Storage root: ONTAP cluster name.'
+        in: query
+        name: ontap_cluster
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: Root matched against both ONTAP controller and Kubernetes node
+          names.
+        in: query
+        name: node
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: 'Storage root: ONTAP aggregate name.'
+        in: query
+        name: aggr
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: 'Storage root: SVM name.'
+        in: query
+        name: svm
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: 'Workload root: `<namespace>/<pod-name>`.'
+        example: shop/orders-0
+        in: query
+        name: pod
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: API key. Required when the server is started with API keys configured.
+        in: header
+        name: X-API-Key
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Body'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: Invalid parameters (missing/invalid start|end, missing_az,
+            missing_env, invalid_scope, invalid_range)
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: Missing or invalid `X-API-Key` (only when API key auth is configured)
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: Upstream VictoriaMetrics returned an error
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: Build exceeded --build-timeout
+      security:
+      - ApiKeyAuth: []
+      summary: Get storage-flow graph (Cytoscape.js)
       tags:
       - graph
 servers:

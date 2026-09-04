@@ -4,7 +4,7 @@ This is the operator catalog of every PromQL series `kube-state-graph` reads
 from VictoriaMetrics when it builds a `/v1/graph` response.
 
 The upstream is **one or more** installations. Each series below belongs to one
-query family (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`), and a
+query family (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`, `alerts`), and a
 routing table decides which installation answers it — see
 [`upstream-backend-routing.md`](upstream-backend-routing.md). With no routing
 table configured every family is served by the single `--prom-url` endpoint and
@@ -22,29 +22,30 @@ Install-side companions:
 - NetApp Harvest relabel, hops, templates →
   [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md)
 
-## Inventory (41 series)
+## Inventory (47 series)
 
 | Family | Count | Producer |
 |---|---|---|
 | kube-state-metrics | 22 | KSM |
-| NetApp Harvest | 13 | Harvest |
+| NetApp Harvest | 18 | Harvest |
 | kubelet | 2 | kubelet `/metrics` |
 | traces service-graph | 3 | Tempo / Alloy `servicegraph` connector (or compatible) |
+| alerts | 1 | Prometheus / vmalert `ALERTS` |
 | probe | 1 | Prometheus `up` |
 
-`up` is a diagnostic, not graph data. The other 40 series are the graph inputs.
+`up` is a diagnostic, not graph data. The other 46 series are the graph inputs.
 
 ## Fan-out per `/v1/graph` request
 
 ```
 GET /v1/graph?start=&end=&…
         │
-        ├─ ReadTopology — 31 queries in parallel, then up to 6 more
+        ├─ ReadTopology — 37 queries in parallel, then up to 6 more
         │     20 kube-state-metrics   abort the build on query error
         │      2 accumulating-cardinality annotation families
         │         (kube_replicaset_annotations, kube_job_annotations)
         │         log-and-continue (empty vector)
-        │      7 Harvest + 2 kubelet  log-and-continue (empty vector)
+        │     12 Harvest + 2 kubelet + ALERTS  log-and-continue (empty vector)
         │     ── second wave, gated on kube_persistentvolumeclaim_info
         │        and volume_labels ────────────────────────────────────
         │      6 Harvest QoS workload legs, scoped to the FlexVol names
@@ -83,7 +84,7 @@ feature?". Query **errors** (timeout, 5xx, PromQL parse) are a separate axis:
 | 20 kube-state-metrics topology queries | **Fails the build** (HTTP 5xx / mapped `build.Reason`) | Feature omitted (no pods, no IPs, no `://` services, …) |
 | 2 accumulating-cardinality annotation families (`kube_replicaset_annotations`, `kube_job_annotations`) | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`). Cardinality grows with history (`revisionHistoryLimit` / Job history limits), not live object count. The degrade is silent in the response — alert on the self-metric `kube_state_graph_upstream_query_failures_total{query="kube_replicaset_annotations"}` / `{query="kube_job_annotations"}`, which `pkg/promql.Client` increments for every failed query regardless of which fetch helper called it, or on the `optional topology query failed` Warn | No `data.application` for bare-ReplicaSet / Job-owned pods — which also **reshapes the Cytoscape hierarchy** (those pods reparent from `…/application/<app>/controller/…` to `…/controller/…`, an `application` group node with no other member disappears, and a PVC that inherited its Application from such a pod re-inherits from a different mounter). A degraded `kube_job_annotations` additionally **suppresses the Job → CronJob hop** for that build (`topologyVectors.JobAnnotationsDegraded`): the hop is gated on "this Job carries no annotation of its own", which an unread family cannot establish, so following it would attribute a directly-managed Job's pod to its CronJob's Application — a wrong value, not a missing one. A genuinely annotation-less Job under an annotated CronJob therefore also loses its Application while the leg is degraded. Every degrade in this table is subtractive |
 | `traces_service_graph_request_total` | **Fails the build** | No call edges; topology still returned |
-| 13 Harvest + 2 kubelet | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` |
+| 18 Harvest + 2 kubelet + `ALERTS` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` / no `data.alerts` |
 | `traces_service_graph_request_failed_total` | Log-and-continue | Measured edges omit `error_rate` (never reports `0`) |
 | `traces_service_graph_request_server_seconds_bucket` | Log-and-continue | Measured edges omit `p90_server_ms` |
 | `up` | Warn; skip `outside_retention` classification | n/a |
@@ -104,6 +105,7 @@ hardcoded (`pkg/promql/queryDims`):
 | namespaced KSM (pod / owner / claim / Service / EndpointSlice / ReplicaSet — every `kube_*` series except the `kube_node_*` family) + kubelet volume stats | yes | yes | yes | yes |
 | `kube_node_*` | yes | yes | yes | no (nodes have no namespace; they follow **by reference** from scheduled pods) |
 | NetApp Harvest | **no** matcher — `?az=` only *routes* the leg to a zone's `harvest` backend | no | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
+| `ALERTS` | yes (also routes) | yes | **no** — an alert expression does not reliably keep `cluster`; matching uses the label through the identity ladder when present, else unique-in-estate | yes |
 | `traces_service_graph_*`, `up` | no | no | no | no |
 
 `az` / `env` match `--az-label` / `--env-label` (defaults `az` / `env`). Every
@@ -111,7 +113,7 @@ topology family that a live dimension actually reaches must carry those labels;
 a family that does not matches nothing, and the default connectivity prune can
 then empty the graph. A `selector_family_empty` warning fires when KSM matched
 but a kubelet family that the selector *can* narrow returned nothing. Harvest
-is never in that set: its thirteen legs carry no request matcher at all, so
+is never in that set: its Harvest legs carry no request matcher at all, so
 Harvest series need no `az` / `env` label — `?az=` selects which `harvest`
 backend is asked (see `upstream-backend-routing.md`) and `?env=` does not reach
 the family.
@@ -135,6 +137,7 @@ They are **not** caller filters and are always rendered **before** any
 | two RED series | same sentinel **plus** `edge_relation!="link"` | Span-link series still produce an edge from `_total`, but they do not contribute rate / error / latency. An absent `edge_relation` label is retained (`!=` treats missing as `""`) |
 | `kube_job_owner` | `owner_kind="CronJob",owner_is_controller="true"` | The reader (`resolveJobCronJobOwners`) keeps exactly those rows — Jobs owned by a CronJob controller. Every other owner kind, a non-controller row, or a missing `owner_is_controller` is discarded before it is keyed or counted |
 | six controller-annotation families (`kube_{deployment,statefulset,daemonset,replicaset,job,cronjob}_annotations`) | `annotation_argocd_argoproj_io_tracking_id!=""` | The reader (`resolveApplications`) skips an empty or absent tracking-id before `keyOf`. PromQL treats a missing label as `""`, so an **allowlisted** family returns only its annotated objects instead of one series per workload object. It saves nothing on the **un-allowlisted** case — KSM short-circuits an un-allowlisted resource to an empty family (see [`kube-state-metrics-preconditions.md`](kube-state-metrics-preconditions.md)) |
+| `ALERTS` | `alertstate="firing"` | Only firing alerts are active in the window. `pending` is a threshold crossed for less than its `for:` and is excluded upstream |
 
 ## kube-state-metrics (22)
 
@@ -172,9 +175,9 @@ The eleven KSM collectors that produce these 22 series, the ClusterRole, and
 Helm values are in
 [`kube-state-metrics-preconditions.md`](kube-state-metrics-preconditions.md).
 
-## NetApp Harvest (13)
+## NetApp Harvest (18)
 
-All 13 are OPTIONAL (log-and-continue). Harvest `cluster` is the ONTAP cluster
+All 18 are OPTIONAL (log-and-continue). Harvest `cluster` is the ONTAP cluster
 and is **never** used as a Kubernetes `?cluster=` matcher. The family carries no
 `?az=` / `?env=` matcher either: `?az=` routes the legs to a zone's `harvest`
 backend and the query string stays unfiltered.
@@ -211,6 +214,11 @@ names hop A matched. See
 | `aggr_space_used` | — | Aggregate `data.usage.used_bytes` | `usage` incomplete / omitted |
 | `aggr_space_total` | — | Aggregate `data.usage.capacity_bytes` | same |
 | `node_new_status` | — | Controller `data.health` (same mapping as aggregate) | Attribute omitted |
+| `node_labels` | — | Controller `data.hardware` `{model, serial, version, vendor, location}` from like-named labels. Info series: sample value discarded | Attribute omitted |
+| `node_cpu_busy` | — | Controller `data.perf.cpu_busy_pct` (percent, verbatim) | Field omitted |
+| `node_total_ops` | — | `data.perf.total_ops` | Field omitted |
+| `node_total_latency` | — | `data.perf.total_latency_us` | Field omitted |
+| `node_total_data` | — | `data.perf.total_bytes_per_sec` | Field omitted |
 
 Coverage warnings (each gated on its **own** family having been read):
 `netapp_volume_join_miss` (hop A miss or empty `aggr`), `netapp_qos_join_miss`
@@ -278,6 +286,35 @@ ingress-chain **entry** hop, and at least one contributing series is not
 (`service-selects-pod`, ingress gateway-pod → backend, topology edges); an
 all-link edge.
 
+## ALERTS (1)
+
+OPTIONAL (log-and-continue). The `alerts` family is the first **optional**
+routing family: a table serving it on no backend is valid and the overlay is
+off. `pending` alerts are excluded by the fixed `alertstate="firing"` selector.
+The series takes `az`, `env` and `namespace` matchers but **never** `cluster`;
+`namespace` renders in its or-absent form (`namespace=~"shop|"`) so the
+namespace-less node / controller / aggregate alerts are not excluded upstream.
+
+Matching is label-set, most-specific kind first: `{namespace, pod}` → pod;
+else `{namespace, persistentvolumeclaim}` → PVC; else `{aggr}` → aggregate
+(it outranks `node` because the stock Harvest `aggr_*` series carry the
+owning controller's `node` beside `aggr`); else `{node}` → Kubernetes node
+**or** ONTAP controller. When `cluster` is
+present it walks the Kubernetes identity ladder for kinds 1–2, and for `{cluster, node}` a Kubernetes identity hit matches the K8s node, a raw label
+equal to a known ONTAP cluster matches the controller, and **both** is counted
+ambiguous and attached to neither — a Kubernetes cluster and an ONTAP cluster
+that share a raw name cannot be disambiguated from labels alone. Missing
+`cluster` succeeds only when exactly one node of the eligible kind(s) matches.
+
+Operator precondition: the alerting store MUST stamp the same `az` / `env`
+external labels as kube-state-metrics, or its alerts vanish under those
+filters. `FamilyAlerts` is excluded from the `selector_family_empty` Warn — an
+empty alert vector is the healthy estate.
+
+| Metric | Graph role | Empty / error |
+|---|---|---|
+| `ALERTS` | `data.alerts` `[{name, state, severity}]` on pod / K8s node / PVC / netapp-node / netapp-aggr. Sorted by `(name, severity)`, omitted when empty | Attribute omitted; build succeeds |
+
 ## Probe (1)
 
 | Metric | When issued | Role |
@@ -304,17 +341,18 @@ These are sometimes confused with the catalog above:
 | `pod-calls-pod` | `traces_service_graph_request_total` |
 | `pod-calls-service` | `traces_service_graph_request_total` (target resolved to a service node: `://` connection string, unknown-server peer, or route engine) |
 | `service-selects-pod` | same total series + `kube_service_info` / `kube_endpointslice_*` (on-demand fan-out; not a raw series of its own) |
+| `storage-flow` | Harvest hop A (claim → SVM / aggregate / controller) + `kube_pod_spec_volumes_persistentvolumeclaims_info` + `kube_pod_info`. Emitted only by `GET /v1/storage-graph` |
 
 ## Verifying the store
 
 Against centralised VictoriaMetrics:
 
 ```promql
-# Every name the builder can query (41, `up` included). The alternation is
+# Every name the builder can query (47, `up` included). The alternation is
 # explicit on purpose: the useful answer is which name is MISSING from the
 # output, and a `kube_.+` / `qos_.+` wildcard buries that under the hundreds
 # of other series kube-state-metrics and Harvest publish.
-count by (__name__) ({__name__=~"aggr_new_status|aggr_space_total|aggr_space_used|kube_cronjob_annotations|kube_daemonset_annotations|kube_deployment_annotations|kube_endpointslice_endpoints|kube_endpointslice_labels|kube_job_annotations|kube_job_owner|kube_node_info|kube_node_labels|kube_node_status_addresses|kube_node_status_condition|kube_persistentvolumeclaim_annotations|kube_persistentvolumeclaim_info|kube_pod_container_info|kube_pod_info|kube_pod_owner|kube_pod_spec_volumes_persistentvolumeclaims_info|kube_replicaset_annotations|kube_replicaset_owner|kube_service_annotations|kube_service_info|kube_statefulset_annotations|kubelet_volume_stats_capacity_bytes|kubelet_volume_stats_used_bytes|node_new_status|qos_policy_fixed_max_throughput_iops|qos_policy_fixed_max_throughput_mbps|qos_read_data|qos_read_latency|qos_read_ops|qos_write_data|qos_write_latency|qos_write_ops|traces_service_graph_request_failed_total|traces_service_graph_request_server_seconds_bucket|traces_service_graph_request_total|up|volume_labels"})
+count by (__name__) ({__name__=~"ALERTS|aggr_new_status|aggr_space_total|aggr_space_used|kube_cronjob_annotations|kube_daemonset_annotations|kube_deployment_annotations|kube_endpointslice_endpoints|kube_endpointslice_labels|kube_job_annotations|kube_job_owner|kube_node_info|kube_node_labels|kube_node_status_addresses|kube_node_status_condition|kube_persistentvolumeclaim_annotations|kube_persistentvolumeclaim_info|kube_pod_container_info|kube_pod_info|kube_pod_owner|kube_pod_spec_volumes_persistentvolumeclaims_info|kube_replicaset_annotations|kube_replicaset_owner|kube_service_annotations|kube_service_info|kube_statefulset_annotations|kubelet_volume_stats_capacity_bytes|kubelet_volume_stats_used_bytes|node_cpu_busy|node_labels|node_new_status|node_total_data|node_total_latency|node_total_ops|qos_policy_fixed_max_throughput_iops|qos_policy_fixed_max_throughput_mbps|qos_read_data|qos_read_latency|qos_read_ops|qos_write_data|qos_write_latency|qos_write_ops|traces_service_graph_request_failed_total|traces_service_graph_request_server_seconds_bucket|traces_service_graph_request_total|up|volume_labels"})
 
 # The one REQUIRED non-default KSM label.
 count(kube_endpointslice_labels{label_kubernetes_io_service_name!=""})
@@ -327,5 +365,5 @@ count(qos_read_ops)
 
 The code-side pins: `TestQueryDims_EveryQueryListed` fails if a `Query`
 constant is missing from the dimension table; `TestReadTopology_FanOutLegCount`
-fails if topology issues anything other than 31 queries when no claim matches a
-Harvest volume, or 37 when one does.
+fails if topology issues anything other than 37 queries when no claim matches a
+Harvest volume, or 43 when one does.

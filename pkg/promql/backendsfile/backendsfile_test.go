@@ -115,6 +115,41 @@ backends:
 	assert.Contains(t, err.Error(), `unknown family "netapp"`)
 }
 
+// `alerts` is accepted with NO schema change — the parser has no family list of
+// its own, it delegates every name to promql.ParseFamily. A pre-overlay file
+// that never mentions alerts stays valid, which is the whole reason the family
+// is optional.
+func TestParse_AcceptsAlertsFamily(t *testing.T) {
+	tbl, err := Parse([]byte(`
+backends:
+  - name: zone-a
+    url: http://vm-a:8428
+    families: [ksm, kubelet, servicegraph, probe]
+    zones: [zone-a]
+  - name: netapp
+    url: http://vm-netapp:8428
+    families: [harvest]
+  - name: vmalert-a
+    url: http://vmalert-a:8428
+    families: [alerts]
+    zones: [zone-a]
+`), noEnv())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"vmalert-a"},
+		backendNamesOf(tbl.Select(promql.FamilyAlerts, []string{"zone-a"})),
+		"the alerts family is zone-routed like ksm")
+	assert.Empty(t, tbl.Unserved())
+}
+
+// A file written before the alert overlay existed must keep loading: the
+// five required families are covered and alerts is served by nobody.
+func TestParse_PreOverlayFileStillLoads(t *testing.T) {
+	tbl, err := Parse([]byte(yamlTable), noEnv())
+	require.NoError(t, err)
+	assert.Equal(t, []promql.Family{promql.FamilyAlerts}, tbl.Unserved())
+	assert.Empty(t, tbl.Select(promql.FamilyAlerts, nil))
+}
+
 // The structural rules live in promql.NewTable, so the file path and an
 // embedder constructing a table directly are validated identically.
 func TestParse_DelegatesStructuralValidation(t *testing.T) {

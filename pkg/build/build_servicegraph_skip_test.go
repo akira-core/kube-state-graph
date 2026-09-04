@@ -16,10 +16,11 @@ import (
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
-// newRecordingEmptyQuerier returns a MockQuerier that answers every query with
-// an empty vector and records the query NAMES it was asked for, so a test can
-// assert which legs of the fan-out were issued.
-func newRecordingEmptyQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() []string) {
+// newRecordingQuerier returns a MockQuerier that answers each query from
+// fixtures (an empty vector when the leg has no fixture) and records the query
+// NAMES it was asked for, so a test can assert which legs of the fan-out were
+// issued — and which were not.
+func newRecordingQuerier(t *testing.T, fixtures map[promql.Query]model.Vector) (*promqlmocks.MockQuerier, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var names []string
@@ -30,6 +31,9 @@ func newRecordingEmptyQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() []
 			mu.Lock()
 			names = append(names, name)
 			mu.Unlock()
+			if vec, ok := fixtures[promql.Query(name)]; ok {
+				return vec, nil
+			}
 			return model.Vector{}, nil
 		}).
 		Maybe()
@@ -40,6 +44,12 @@ func newRecordingEmptyQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() []
 		copy(out, names)
 		return out
 	}
+}
+
+// newRecordingEmptyQuerier is newRecordingQuerier with no fixtures at all.
+func newRecordingEmptyQuerier(t *testing.T) (*promqlmocks.MockQuerier, func() []string) {
+	t.Helper()
+	return newRecordingQuerier(t, nil)
 }
 
 func hasServiceGraphLeg(names []string) bool {

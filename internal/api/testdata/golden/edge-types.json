@@ -114,6 +114,38 @@
       "directed": true,
       "may_cross_cluster": false,
       "labels": null
+    },
+    {
+      "type": "storage-flow",
+      "description": "One hop of the storage flow chain served by GET /v1/storage-graph, oriented storage → workload: netapp-node → netapp-aggr → netapp-svm → pvc → pod → node. Emitted ONLY by that endpoint — GET /v1/graph never produces one, so ?edge_type=storage-flow there is a 200 with no edges. Each edge names its hop in labels.tier, and each (source, target) pair appears at most once however many claims flow through it. A claim whose match resolved an SVM but no aggregate (the FlexGroup shape) enters the chain at the svm-pvc tier; a pod scheduled on no node ends its path at pvc-pod. Cross-cluster does not apply: the NetApp tiers belong to no Kubernetes cluster, and every Kubernetes hop (pvc → pod, pod → node) is intra-cluster by construction. An edge on a path with at least one measured claim carries a typed data.metrics object holding the sum, over every claim flowing through it, of that claim's storage I/O (read_ops / write_ops / read_bytes_per_sec / write_bytes_per_sec); the claim-level svm-pvc edge additionally carries read_latency_us / write_latency_us and the declared max_iops / max_bytes_per_sec ceiling, which no other tier ever does. Weights conserve tier to tier, so a Sankey layout needs no rebalancing.",
+      "source_type": [
+        "netapp-node",
+        "netapp-aggr",
+        "netapp-svm",
+        "pvc",
+        "pod"
+      ],
+      "target_type": [
+        "netapp-aggr",
+        "netapp-svm",
+        "pvc",
+        "pod",
+        "node"
+      ],
+      "directed": true,
+      "may_cross_cluster": false,
+      "labels": [
+        {
+          "name": "tier",
+          "value_type": "string",
+          "description": "The hop this edge covers on the fixed chain: one of node-aggr, aggr-svm, svm-pvc, pvc-pod, pod-node."
+        },
+        {
+          "name": "attribution",
+          "value_type": "string",
+          "description": "Set to 'split' on a pvc-pod edge whose claim is mounted by more than one pod: per-pod I/O is not observable, so the claim's weight is divided equally across its mounters. Absent on every other edge, including a singly-mounted claim's."
+        }
+      ]
     }
   ]
 }

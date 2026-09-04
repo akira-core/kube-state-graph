@@ -167,6 +167,14 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	}
 
 	nodes, edges := assemble(topology, sg)
+	// Alerts are baked onto the nodes BEFORE the graph is frozen — the same
+	// point PVC Application inheritance uses. It has to run here rather than in
+	// the topology parse because matching is against the ASSEMBLED node set,
+	// which only exists once the service-graph read has contributed its synth
+	// pods; and it has to run in the BUILD rather than in a projection because
+	// the attribute must reach every consumer of this graph alike (/v1/graph,
+	// /v1/storage-graph, and any embedder walking GraphNode.Alerts()).
+	attachAlerts(ctx, nodes, topology)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	// The identity table the reader composed. Every cluster-scoped id and label
 	// already carries the identity; the graph needs the table so the
@@ -212,6 +220,72 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		attribute.Int("graph.node.count", len(g.NodesByID)),
 		attribute.Int("graph.edge.count", len(g.Edges)),
 		attribute.Int("kube_state_graph.cross_cluster_edges", crossCluster),
+	)
+	return g, nil
+}
+
+// BuildStorage builds the storage-flow graph served by GET /v1/storage-graph.
+//
+// It reuses ReadTopology unchanged — byte-for-byte the same fan-out, under the
+// same selector — so the two endpoints cannot disagree about what a claim, a
+// pod or an aggregate is. What it does NOT do is read the service graph: the
+// storage body uses none of it, and those three legs are the most expensive of
+// the fan-out.
+//
+// Like Build it is a pure function of (window, end, Selector): roots never
+// reach the queries, so the build stays cacheable on the same key and the
+// "selectors alone narrow the upstream" rule holds. Roots are a projection
+// concern (graph.ProjectStorage).
+//
+// There is deliberately no outside-retention classification and no up{} probe.
+// The endpoint requires az and env, so every storage build is a FILTERED build,
+// and the existing filtered-build rule already says an empty result is an empty
+// 200 rather than a retention error — which is also what makes "a root the
+// upstream does not name is simply not drawn" true.
+//
+// It also deliberately does NOT write the three last-build gauges
+// (kube_state_graph_graph_nodes / _edges / clusters observed). Those describe
+// the graph Build produces — the adapters reset the vector on every write, so
+// a storage build would wipe every pod-calls-* / pvc-to-netapp-aggr series and
+// replace them with storage-flow until the next /v1/graph request, making the
+// gauges a function of request mix rather than of the estate.
+func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	q := b.querierFor(sel)
+	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
+		trace.WithAttributes(
+			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
+			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
+			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
+		),
+	)
+	defer span.End()
+
+	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
+	if err != nil {
+		return nil, classifyReadError(span, "topology read failed", err)
+	}
+
+	nodes, edges := assembleStorageFlow(topology)
+	// Same "bake before freeze" point as Build: the overlay must reach this
+	// endpoint identically, since it is resolved onto the graph rather than by
+	// a projection.
+	attachAlerts(ctx, nodes, topology)
+	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
+	g.ClusterIdentities = topology.ClusterIdentities
+
+	slog.InfoContext(ctx, "storage graph built",
+		"clusters", topology.ClustersObserved,
+		"nodes", len(g.NodesByID),
+		"edges", len(g.Edges),
+		"start", end.Add(-window).UTC().Format(time.RFC3339),
+		"end", end.UTC().Format(time.RFC3339),
+		"selector_active", sel.Active(),
+	)
+
+	span.SetAttributes(
+		attribute.Int("kube_state_graph.cluster_count", len(topology.ClustersObserved)),
+		attribute.Int("graph.node.count", len(g.NodesByID)),
+		attribute.Int("graph.edge.count", len(g.Edges)),
 	)
 	return g, nil
 }

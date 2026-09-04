@@ -1,0 +1,185 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "storage-cluster/ontap-prod",
+          "name": "ontap-prod",
+          "type": "storage-cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/shared-data",
+          "name": "shared-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-web-0",
+          "name": "web-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-1",
+          "name": "worker-1",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/aggr/aggr1",
+          "name": "aggr1",
+          "type": "netapp-aggr",
+          "parent": "netapp/ontap-prod/ontap-prod-01",
+          "labels": {
+            "node": "ontap-prod-01",
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/ontap-prod-01",
+          "name": "ontap-prod-01",
+          "type": "netapp-node",
+          "parent": "storage-cluster/ontap-prod",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/svm/svm_shop",
+          "name": "svm_shop",
+          "type": "netapp-svm",
+          "parent": "storage-cluster/ontap-prod",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "0268d788-9f5a-576d-9f84-974b66457da6",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/ontap-prod-01",
+          "target": "netapp/ontap-prod/aggr/aggr1",
+          "labels": {
+            "tier": "node-aggr"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 50
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "443f8246-30dc-504b-bf0b-26004610c227",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/aggr/aggr1",
+          "target": "netapp/ontap-prod/svm/svm_shop",
+          "labels": {
+            "tier": "aggr-svm"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 50
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "9b7eef22-778a-5d70-96d7-fc614b325639",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/shared-data",
+          "target": "cluster-alpha/uid-web-0",
+          "labels": {
+            "attribution": "split",
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 50
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "d64f39c6-cefe-5e2c-95ec-5ef91df557c1",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-web-0",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 50
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "fb7e9c12-d9df-516a-813c-cda9356620c9",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/svm/svm_shop",
+          "target": "cluster-alpha/shop/shared-data",
+          "labels": {
+            "tier": "svm-pvc"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 50,
+            "read_latency_us": 450,
+            "max_iops": 5000
+          }
+        }
+      }
+    ]
+  }
+}
