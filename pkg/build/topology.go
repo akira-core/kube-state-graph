@@ -506,15 +506,16 @@ func ReadTopology(
 // request of every non-NetApp deployment. QVolumeLabels stays in the list so
 // the contract is enforced by the table rather than by omission.
 //
-// FamilyAlerts is excluded on a DIFFERENT axis, and it needs its own rule
-// because Reaches cannot express it: ALERTS does carry az / env / namespace,
-// so Reaches is true for exactly the dimensions this Warn tests. What makes it
-// wrong to report is that an empty alert vector is the HEALTHY estate — the
-// normal, desired outcome — not evidence of a labelling mistake. The family is
-// also the one a table may legitimately leave unserved, in which case the
-// router hands back an empty vector by design. QAlerts stays in the candidate
-// list for the same reason QVolumeLabels does: the exclusion is enforced by an
-// explicit rule rather than by omission from a list.
+// An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
+// on a DIFFERENT axis, and it needs its own rule because Reaches cannot
+// express it: ALERTS does carry az / env / namespace, so Reaches is true for
+// exactly the dimensions this Warn tests. What makes it wrong to report is
+// that an empty alert vector is the HEALTHY estate — the normal, desired
+// outcome — not evidence of a labelling mistake. The family is also the one a
+// table may legitimately leave unserved, in which case the router hands back
+// an empty vector by design. QAlerts stays in the candidate list for the same
+// reason QVolumeLabels does: the exclusion is enforced by an explicit rule
+// rather than by omission from a list.
 //
 // It is a Warn, not an error, and stays quiet for every unfiltered build.
 func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
@@ -526,7 +527,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
 		promql.QAlerts,
 	} {
-		if fam, ok := promql.FamilyOf(q); ok && fam == promql.FamilyAlerts {
+		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
 			continue
 		}
 		if raw[string(q)] == 0 && sel.Reaches(q) {

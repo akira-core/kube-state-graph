@@ -30,12 +30,12 @@ The build SHALL read the OPTIONAL `ALERTS` series over the request window from t
 
 ### Requirement: ALERTS under request-scoped selectors
 
-The `ALERTS` query SHALL carry the request's `az`, `env` and `namespace` dimensions as label matchers, composed after its fixed `alertstate="firing"` selector in the fixed order `az`, `env`, `namespace`, and SHALL be zone-routed by `az` like the `ksm` family. It SHALL NOT carry a `cluster` matcher under any request: an alert expression does not reliably preserve the `cluster` label, and a `?cluster=` request must not silently drop alerts. The `cluster` dimension reaches alerts at projection only, through the node the alert attached to. Operator precondition (documented, not assumed): the alerting store MUST stamp the same `az` / `env` external labels as the kube-state-metrics store, or its alerts vanish under an `az` / `env` filter.
+The `ALERTS` query SHALL carry the request's `az`, `env` and `namespace` dimensions as label matchers, composed after its fixed `alertstate="firing"` selector in the fixed order `az`, `env`, `namespace`, and SHALL be zone-routed by `az` like the `ksm` family. The `namespace` matcher SHALL be rendered in its or-absent form (`namespace=~"<a>|<b>|"`, the empty alternative last) so that an alert carrying NO `namespace` label — a Kubernetes node, ONTAP controller or aggregate alert, whose target node the request still loads by reference — is never excluded upstream; only namespaced alerts are narrowed. It SHALL NOT carry a `cluster` matcher under any request: an alert expression does not reliably preserve the `cluster` label, and a `?cluster=` request must not silently drop alerts. The `cluster` dimension reaches alerts at projection only, through the node the alert attached to. Operator precondition (documented, not assumed): the alerting store MUST stamp the same `az` / `env` external labels as the kube-state-metrics store, or its alerts vanish under an `az` / `env` filter.
 
 #### Scenario: Zone, environment and namespace rendered
 
 - **WHEN** a build runs with `az={zone-a}`, `env={prod}`, `cluster={c1}`, `namespace={shop}`
-- **THEN** the alerts query is issued as `last_over_time(ALERTS{alertstate="firing",<az-key>="zone-a",<env-key>="prod",namespace="shop"}[<window>])` with no `cluster` matcher, and only to the `alerts` backends whose `zones` include `zone-a` or that are catch-alls
+- **THEN** the alerts query is issued as `last_over_time(ALERTS{alertstate="firing",<az-key>="zone-a",<env-key>="prod",namespace=~"shop|"}[<window>])` with no `cluster` matcher, and only to the `alerts` backends whose `zones` include `zone-a` or that are catch-alls
 
 #### Scenario: Unfiltered build reads every alert
 
@@ -48,11 +48,11 @@ Each active alert SHALL be matched to at most one graph node by its label set, c
 
 1. non-empty `namespace` and `pod` → the `type="pod"` node with that namespace and pod name;
 2. else non-empty `namespace` and `persistentvolumeclaim` → the `type="pvc"` node with that namespace and claim name;
-3. else non-empty `node` → a `type="node"` (Kubernetes) or `type="netapp-node"` (ONTAP controller) node with that name, disambiguated by `cluster` as below;
-4. else non-empty `aggr` → the `type="netapp-aggr"` node with that name, in the ONTAP cluster the `cluster` label names;
+3. else non-empty `aggr` → the `type="netapp-aggr"` node with that name, in the ONTAP cluster the `cluster` label names (it outranks `node` because the stock Harvest `aggr_*` series carry the owning controller's `node` beside `aggr`, so an aggregate alert names both);
+4. else non-empty `node` → a `type="node"` (Kubernetes) or `type="netapp-node"` (ONTAP controller) node with that name, disambiguated by `cluster` as below;
 5. else unmatched.
 
-When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be resolved through the same cluster-identity ladder as every Kubernetes series (compose, else adopt, else verbatim) and the match restricted to that identity; for kind 3, if the resolved identity holds a Kubernetes node of that name the alert matches the Kubernetes node, if the raw label equals an ONTAP cluster known to the Harvest join that holds a controller of that name it matches the controller, and if BOTH hold the alert SHALL be counted ambiguous and attached to neither; for kind 4 the raw label must name the ONTAP cluster. When the alert carries NO `cluster` label, the match SHALL succeed only if exactly one node of the eligible kind(s) in the loaded estate carries the remaining labels; several candidates SHALL be counted ambiguous and attached to none. Only pods, Kubernetes nodes, claims, NetApp controllers and NetApp aggregates SHALL ever carry alerts; a pod is matched by name against the pods loaded in the window, so an alert for a pod the build did not load is unmatched.
+When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be resolved through the same cluster-identity ladder as every Kubernetes series (compose, else adopt, else verbatim) and the match restricted to that identity; for kind 3 the raw label must name the ONTAP cluster; for kind 4, if the resolved identity holds a Kubernetes node of that name the alert matches the Kubernetes node, if the raw label equals an ONTAP cluster known to the Harvest join that holds a controller of that name it matches the controller, and if BOTH hold the alert SHALL be counted ambiguous and attached to neither. When the alert carries NO `cluster` label, the match SHALL succeed only if exactly one node of the eligible kind(s) in the loaded estate carries the remaining labels; several candidates SHALL be counted ambiguous and attached to none. Only pods, Kubernetes nodes, claims, NetApp controllers and NetApp aggregates SHALL ever carry alerts; a pod is matched by name against the pods loaded in the window, so an alert for a pod the build did not load is unmatched.
 
 #### Scenario: Pod alert attached
 
@@ -94,10 +94,20 @@ When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be 
 - **WHEN** an active alert carries `{namespace="shop", pod="orders-0"}` with no `cluster` label and two clusters in the estate each hold such a pod
 - **THEN** no node carries the alert and it is counted ambiguous
 
+#### Scenario: Aggregate alert outranks node label
+
+- **WHEN** an active alert carries `{cluster="ontap-prod", node="ontap-prod-01", aggr="aggr1"}` (the label set a rule over the `aggr_*` series inherits)
+- **THEN** only `netapp/ontap-prod/aggr/aggr1` carries the alert; the controller does not
+
 #### Scenario: Pod alert outranks node label
 
 - **WHEN** an active alert carries `{cluster="c1", namespace="shop", pod="orders-0", node="worker-1"}`
 - **THEN** only the pod carries the alert; the node does not
+
+#### Scenario: Non-firing series discarded by the reader
+
+- **WHEN** a hand-built vector reaching the reader carries `{alertstate="pending", namespace="shop", pod="orders-0"}`
+- **THEN** no node carries it and it is counted neither unmatched nor ambiguous (the reader mirrors the query's fixed `alertstate="firing"` selector)
 
 #### Scenario: Unmatchable label set
 

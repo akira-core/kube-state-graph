@@ -103,6 +103,15 @@ const (
 	dimEnv
 	dimCluster
 	dimNamespace
+	// dimNamespaceOrAbsent renders the `namespace` dimension in its
+	// "value OR no label" form — `namespace=~"shop|"` — the same shape
+	// appendClusterMatcher gives `?cluster=unknown`. It exists for the ALERTS
+	// series alone: a namespace-less alert (a Kubernetes node, an ONTAP
+	// controller, an aggregate) is addressed to a node the request still
+	// loads by reference, so a plain `namespace="shop"` matcher would be
+	// STRICTER than the reader and silently strip those nodes of their
+	// alerts under `?namespace=`. Reaches treats it exactly as dimNamespace.
+	dimNamespaceOrAbsent
 	// dimAZRoute is a ROUTING-ONLY bit. It makes the query's family
 	// zone-routable (Family.AcceptsAZ, which Table.Select reads) without the
 	// `az` value ever being rendered as a matcher: render never emits it and
@@ -135,15 +144,18 @@ const (
 	// plus the kubelet volume-stats family.
 	dimsNamespaced = dimAZ | dimEnv | dimCluster | dimNamespace
 	// dimsAlerts: the ALERTS series. Deliberately NOT dimsNamespaced — it is
-	// dimsNamespaced MINUS dimCluster. An alert expression does not reliably
-	// preserve the `cluster` label (an aggregation that drops it, a rule
-	// written over a series that never carried it), so pushing a `?cluster=`
-	// value into the matcher would silently drop alerts the estate genuinely
-	// has. The `cluster` dimension reaches alerts at PROJECTION instead,
-	// through the node the alert attached to; the matching itself walks the
-	// cluster-identity ladder when the label IS present and falls back to
-	// uniqueness in the loaded estate when it is not.
-	dimsAlerts = dimAZ | dimEnv | dimNamespace
+	// dimsNamespaced MINUS dimCluster, with namespace in its or-absent form.
+	// An alert expression does not reliably preserve the `cluster` label (an
+	// aggregation that drops it, a rule written over a series that never
+	// carried it), so pushing a `?cluster=` value into the matcher would
+	// silently drop alerts the estate genuinely has. The `cluster` dimension
+	// reaches alerts at PROJECTION instead, through the node the alert
+	// attached to; the matching itself walks the cluster-identity ladder when
+	// the label IS present and falls back to uniqueness in the loaded estate
+	// when it is not. `namespace` narrows the pod / claim alerts upstream but
+	// must still admit the node-, controller- and aggregate-shaped alerts
+	// that carry no namespace at all — hence dimNamespaceOrAbsent.
+	dimsAlerts = dimAZ | dimEnv | dimNamespaceOrAbsent
 )
 
 // render returns the request-scoped matcher fragment for a query accepting
@@ -169,7 +181,28 @@ func (s Selector) render(d dims, keys LabelKeys) string {
 	if d&dimNamespace != 0 {
 		out = appendMatcher(out, "namespace", s.Namespace)
 	}
+	if d&dimNamespaceOrAbsent != 0 {
+		out = appendMatcherOrAbsent(out, "namespace", s.Namespace)
+	}
 	return strings.Join(out, ",")
+}
+
+// appendMatcherOrAbsent renders one dimension so that it matches any of the
+// requested values OR a series carrying no such label at all. It is always
+// the regex form with a trailing empty alternative (`key=~"a|b|"`), which
+// PromQL evaluates as "absent or empty"; the empty alternative is appended
+// after the sorted literals so the string stays a pure function of the value
+// set.
+func appendMatcherOrAbsent(dst []string, key string, values []string) []string {
+	vals := normaliseValues(values)
+	if len(vals) == 0 {
+		return dst
+	}
+	alts := make([]string, 0, len(vals)+1)
+	for _, v := range vals {
+		alts = append(alts, escapeLiteral(regexp.QuoteMeta(v)))
+	}
+	return append(dst, key+`=~"`+strings.Join(append(alts, ""), "|")+`"`)
 }
 
 // appendClusterMatcher renders the `cluster` dimension. It is the one
@@ -272,5 +305,5 @@ func (s Selector) Reaches(q Query) bool {
 	return (d&dimAZ != 0 && hasValue(s.AZ)) ||
 		(d&dimEnv != 0 && hasValue(s.Env)) ||
 		(d&dimCluster != 0 && hasValue(s.Cluster)) ||
-		(d&dimNamespace != 0 && hasValue(s.Namespace))
+		(d&(dimNamespace|dimNamespaceOrAbsent) != 0 && hasValue(s.Namespace))
 }

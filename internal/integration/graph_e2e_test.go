@@ -1469,6 +1469,8 @@ aggr_space_used{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]
 aggr_space_total{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",test=%[1]q} 1000 %[2]d
 # HELP node_new_status dummy
 node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 1 %[2]d
+# HELP node_labels dummy
+node_labels{cluster="ontap-prod",node="ontap-prod-01",model="AFF-A400",serial="721234000123",version="9.14.1",vendor="NetApp",test=%[1]q} 1 %[2]d
 # HELP kubelet_volume_stats_used_bytes dummy
 kubelet_volume_stats_used_bytes{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",test=%[1]q} 50 %[2]d
 # HELP kubelet_volume_stats_capacity_bytes dummy
@@ -1515,6 +1517,8 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 	s.Require().True(ok, "netapp-node must be present")
 	s.Equal("storage-cluster/ontap-prod", ctrl.Parent)
 	s.Equal("online", ctrl.Health)
+	s.Require().NotNil(ctrl.Hardware, "node_labels must surface data.hardware")
+	s.Equal("AFF-A400", ctrl.Hardware.Model)
 	for _, c := range body.Clusters {
 		s.NotEqual("ontap-prod", c)
 	}

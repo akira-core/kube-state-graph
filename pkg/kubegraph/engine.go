@@ -115,3 +115,27 @@ func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.B
 	}
 	return cytoscape.Serialise(g, graph.Project(g, req.Scope)), nil
 }
+
+// BuildStorage runs the storage-flow build for [end-window, end] — topology
+// only, no service-graph read. sel carries the request-scoped selector; az
+// and env are always set for this endpoint.
+func (e *Engine) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	return e.builder.BuildStorage(ctx, window, end, sel)
+}
+
+// BuildStorageFromValues parses the /v1/storage-graph query parameters, builds
+// the storage-flow graph, applies the storage projection, and serialises to
+// the Cytoscape body. Parsing failures are *ParseError; build failures
+// propagate the build layer's typed errors. The HTTP handler uses the same
+// parser, so the request contract cannot drift.
+func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
+	req, err := ParseStorageValues(v)
+	if err != nil {
+		return cytoscape.Body{}, err
+	}
+	g, err := e.builder.BuildStorage(ctx, req.End.Sub(req.Start), req.End, req.Selector)
+	if err != nil {
+		return cytoscape.Body{}, err
+	}
+	return cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope)), nil
+}

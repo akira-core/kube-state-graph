@@ -11,9 +11,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -394,6 +396,101 @@ func (s *MultiBackendSuite) TestDuplicateServiceGraphSeriesDoesNotDoubleTheRate(
 			*e.Data.Metrics.Rate, mbRate)
 	}
 	s.Equal(1, found, "expected exactly one pod-calls-pod edge")
+}
+
+// A table that leaves alerts unserved still starts and serves both graph
+// endpoints. When a dedicated alerts backend is declared, the ALERTS query
+// reaches only it.
+func (s *MultiBackendSuite) TestAlertsFamilyOptionalAndDedicated() {
+	srv := s.startRoutedAPI(s.familySplitBackends())
+	s.fetchGraph(srv, inventory)
+	resp := s.httpGet(s.storageGraphURL(srv.URL, nil))
+	s.Equal(http.StatusOK, resp.StatusCode, "an unserved alerts family still serves /v1/storage-graph")
+	_ = resp.Body.Close()
+
+	t1 := fixedNow.Unix() * 1000
+	s.ingestInto(s.secondURL, fmt.Sprintf(`
+ALERTS{alertname="KubePodCrashLooping",alertstate="firing",severity="warning",cluster="mb-alpha",namespace="db",pod="mongo-0",az="zone-a"} 1 %d
+`, t1))
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `ALERTS{alertname="KubePodCrashLooping"}`, fixedNow, 30*time.Second),
+		"container B did not observe the ALERTS fixture")
+
+	var mu sync.Mutex
+	var log [][2]string
+	cfg := config.Defaults()
+	cfg.PromURL = s.VMURL()
+	cfg.LogLevel = "error"
+	s.Require().NoError(cfg.Validate())
+	table, err := promql.NewTable([]promql.Backend{
+		promql.NewBackend("k8s", s.VMURL(),
+			[]promql.Family{promql.FamilyKSM, promql.FamilyKubelet, promql.FamilyServiceGraph, promql.FamilyProbe},
+			nil, "", ""),
+		promql.NewBackend("netapp", s.secondURL,
+			[]promql.Family{promql.FamilyHarvest}, nil, "", ""),
+		promql.NewBackend("vmalert", s.secondURL,
+			[]promql.Family{promql.FamilyAlerts}, nil, "", ""),
+	})
+	s.Require().NoError(err)
+	logger := observability.NewLogger(cfg.LogLevel)
+	metrics := observability.NewMetrics()
+	inner := promql.DefaultClientFactory(metrics)
+	router, err := promql.NewRouter(table, metrics, func(b promql.Backend) (promql.Querier, error) {
+		q, err := inner(b)
+		if err != nil {
+			return nil, err
+		}
+		return recQuerier{name: b.Name(), inner: q, mu: &mu, log: &log}, nil
+	})
+	s.Require().NoError(err)
+	builder := build.New(router, build.Options{
+		APITimeout: cfg.APITimeout,
+		LabelKeys:  promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
+	}, metrics, clock.System{})
+	httpSrv := httptest.NewServer(api.New(cfg, builder, router, metrics, logger, auth.NewKeySet(), clock.System{}).Handler())
+	s.T().Cleanup(httpSrv.Close)
+
+	body := s.fetchGraph(httpSrv, func(q url.Values) {
+		inventory(q)
+		q.Set("az", "zone-a")
+	})
+	mu.Lock()
+	seen := append([][2]string(nil), log...)
+	mu.Unlock()
+
+	var alertsBackends []string
+	for _, e := range seen {
+		if e[1] == "ALERTS" {
+			alertsBackends = append(alertsBackends, e[0])
+			s.NotEqual("k8s", e[0], "ALERTS must not reach the kube-state-metrics store")
+		}
+	}
+	s.NotEmpty(alertsBackends, "ALERTS must be issued")
+	// netapp and vmalert share a URL, so the router reuses one client and the
+	// log names the first backend that claimed that URL. What holds is that
+	// the query never went to k8s, and the series (ingested only on B) attached.
+
+	var alerted bool
+	for _, n := range body.Elements.Nodes {
+		if n.Data.ID == "mb-alpha/mb-uid-1" && len(n.Data.Alerts) > 0 {
+			alerted = true
+			s.Equal("KubePodCrashLooping", n.Data.Alerts[0].Name)
+		}
+	}
+	s.True(alerted, "the alert ingested only in the alerts store must attach")
+}
+
+type recQuerier struct {
+	name  string
+	inner promql.Querier
+	mu    *sync.Mutex
+	log   *[][2]string
+}
+
+func (q recQuerier) Instant(ctx context.Context, name, query string, ts time.Time) (model.Vector, error) {
+	q.mu.Lock()
+	*q.log = append(*q.log, [2]string{q.name, name})
+	q.mu.Unlock()
+	return q.inner.Instant(ctx, name, query, ts)
 }
 
 // storageTargets lists the distinct pvc-to-netapp-aggr edge targets in the

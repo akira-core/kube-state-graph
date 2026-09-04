@@ -83,31 +83,85 @@ func (s *Server) handleGraph(c *gin.Context) {
 	if errBody != nil {
 		return
 	}
-	g, err := s.runBuild(c.Request.Context(), req)
+	g, err := s.runBuild(c.Request.Context(), req.start, req.end, req.sel, s.builder.Build)
 	if err != nil {
 		s.mapBuildError(c, err)
 		return
 	}
 
-	view := s.projectWithSpan(c.Request.Context(), g, req.scope)
+	view := s.projectWithSpan(c.Request.Context(), "kube-state-graph.project", func() graph.View {
+		return graph.Project(g, req.scope)
+	})
 	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
 		return cytoscape.Serialise(g, view)
 	}, view)
 	s.writeJSON(c, body, "cytoscape")
 }
 
-// projectWithSpan wraps graph.Project in a `kube-state-graph.project` span.
-func (s *Server) projectWithSpan(ctx context.Context, g *graph.Graph, scope graph.Scope) graph.View {
-	ctx, span := telemetry.Tracer().Start(ctx, "kube-state-graph.project")
+// handleStorageGraph returns the storage-flow graph for [start,end].
+//
+//	@Summary		Get storage-flow graph (Cytoscape.js)
+//	@Description	Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
+//	@Description
+//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+//	@Description
+//	@Description	**Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent.
+//	@Description
+//	@Description	`cluster` / `namespace` remain optional narrowing filters. `edge_type` and `prune` are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
+//	@Tags			graph
+//	@Produce		json
+//	@Param			start			query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
+//	@Param			end				query		string		true	"Window end. Must be > start."	example(2026-05-01T12:05:00Z)
+//	@Param			az				query		string		true	"Availability zone (required, single-valued)."	example(zone-a)
+//	@Param			env				query		string		true	"Environment (required, single-valued)."	example(prod)
+//	@Param			cluster			query		[]string	false	"Restrict to listed Kubernetes clusters (repeatable, OR-combined)."	collectionFormat(multi)
+//	@Param			namespace		query		[]string	false	"Restrict to listed namespaces (repeatable, OR-combined)."	collectionFormat(multi)
+//	@Param			ontap_cluster	query		[]string	false	"Storage root: ONTAP cluster name."	collectionFormat(multi)
+//	@Param			node			query		[]string	false	"Root matched against both ONTAP controller and Kubernetes node names."	collectionFormat(multi)
+//	@Param			aggr			query		[]string	false	"Storage root: ONTAP aggregate name."	collectionFormat(multi)
+//	@Param			svm				query		[]string	false	"Storage root: SVM name."	collectionFormat(multi)
+//	@Param			pod				query		[]string	false	"Workload root: `<namespace>/<pod-name>`."	collectionFormat(multi)	example(shop/orders-0)
+//	@Param			X-API-Key		header		string		false	"API key. Required when the server is started with API keys configured."
+//	@Success		200				{object}	cytoscape.Body
+//	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, invalid_scope, invalid_range)"
+//	@Failure		401				{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
+//	@Failure		502				{object}	errorBody	"Upstream VictoriaMetrics returned an error"
+//	@Failure		504				{object}	errorBody	"Build exceeded --build-timeout"
+//	@Security		ApiKeyAuth
+//	@Router			/v1/storage-graph [get]
+func (s *Server) handleStorageGraph(c *gin.Context) {
+	req, errBody := s.parseStorageGraphRequest(c)
+	if errBody != nil {
+		return
+	}
+	g, err := s.runBuild(c.Request.Context(), req.Start, req.End, req.Selector, s.builder.BuildStorage)
+	if err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
+
+	view := s.projectWithSpan(c.Request.Context(), "kube-state-graph.project_storage", func() graph.View {
+		return graph.ProjectStorage(g, req.Scope)
+	})
+	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
+		return cytoscape.Serialise(g, view)
+	}, view)
+	s.writeJSON(c, body, "cytoscape")
+}
+
+// projectWithSpan wraps a projection callback (graph.Project or
+// graph.ProjectStorage) in a span of the given name, timing it into the
+// shared ProjectDuration histogram.
+func (s *Server) projectWithSpan(ctx context.Context, spanName string, project func() graph.View) graph.View {
+	_, span := telemetry.Tracer().Start(ctx, spanName)
 	defer span.End()
 	ptStart := time.Now()
-	view := graph.Project(g, scope)
+	view := project()
 	s.metrics.ProjectDuration.Observe(time.Since(ptStart).Seconds())
 	span.SetAttributes(
 		attribute.Int("graph.node.count", len(view.Nodes)),
 		attribute.Int("graph.edge.count", len(view.Edges)),
 	)
-	_ = trace.SpanFromContext(ctx) // keep ctx referenced for static analysis
 	return view
 }
 
@@ -125,16 +179,21 @@ func (s *Server) serialiseWithSpan(ctx context.Context, format string, fn func()
 	return fn()
 }
 
-// runBuild wraps Builder.Build in a per-request build-timeout context. On
+// buildFunc is the shape shared by Builder.Build and Builder.BuildStorage, so
+// one runBuild serves both endpoints and the timeout normalisation cannot
+// drift between them.
+type buildFunc func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error)
+
+// runBuild wraps a build in a per-request build-timeout context. On
 // context.DeadlineExceeded the error is normalised to ReasonTimeout (504) so
 // the handler-side mapBuildError surfaces the RFC 9110 §15.6.5 status.
-func (s *Server) runBuild(ctx context.Context, req graphRequest) (*graph.Graph, error) {
+func (s *Server) runBuild(ctx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
 	buildCtx, cancel := context.WithTimeout(ctx, s.cfg.BuildTimeout)
 	defer cancel()
 
-	start := time.Now()
-	g, err := s.builder.Build(buildCtx, req.end.Sub(req.start), req.end, req.sel)
-	s.metrics.BuildDuration.Observe(time.Since(start).Seconds())
+	began := time.Now()
+	g, err := run(buildCtx, end.Sub(start), end, sel)
+	s.metrics.BuildDuration.Observe(time.Since(began).Seconds())
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			s.metrics.BuildRejected.WithLabelValues("timeout").Inc()
@@ -143,6 +202,18 @@ func (s *Server) runBuild(ctx context.Context, req graphRequest) (*graph.Graph, 
 		return nil, err
 	}
 	return g, nil
+}
+
+// parseStorageGraphRequest delegates to the shared kubegraph.ParseStorageValues
+// and maps a *kubegraph.ParseError to the HTTP 400 response exactly as
+// parseGraphRequest does.
+func (s *Server) parseStorageGraphRequest(c *gin.Context) (kubegraph.StorageRequest, error) {
+	req, err := kubegraph.ParseStorageValues(c.Request.URL.Query())
+	if err != nil {
+		writeParseError(c, err)
+		return kubegraph.StorageRequest{}, err
+	}
+	return req, nil
 }
 
 // edgeTypesBody is the response shape of GET /v1/edge-types.
@@ -257,11 +328,10 @@ func (s *Server) probeUpstream(ctx context.Context) error {
 // ----- request parsing ------------------------------------------------------
 
 type graphRequest struct {
-	start  time.Time
-	end    time.Time
-	scope  graph.Scope
-	sel    promql.Selector
-	format string
+	start time.Time
+	end   time.Time
+	scope graph.Scope
+	sel   promql.Selector
 }
 
 // parseGraphRequest delegates parsing to the shared kubegraph.ParseValues (the
@@ -271,21 +341,27 @@ type graphRequest struct {
 func (s *Server) parseGraphRequest(c *gin.Context) (graphRequest, error) {
 	req, err := kubegraph.ParseValues(c.Request.URL.Query())
 	if err != nil {
-		var pe *kubegraph.ParseError
-		if errors.As(err, &pe) {
-			writeError(c, http.StatusBadRequest, pe.Reason, pe.Message)
-		} else {
-			writeError(c, http.StatusBadRequest, "invalid_request", err.Error())
-		}
+		writeParseError(c, err)
 		return graphRequest{}, err
 	}
 	return graphRequest{
-		start:  req.Start,
-		end:    req.End,
-		scope:  req.Scope,
-		sel:    req.Selector,
-		format: "cytoscape",
+		start: req.Start,
+		end:   req.End,
+		scope: req.Scope,
+		sel:   req.Selector,
 	}, nil
+}
+
+// writeParseError maps a request-parse failure to the 400 response: a
+// *kubegraph.ParseError carries its stable reason code, anything else is the
+// generic invalid_request.
+func writeParseError(c *gin.Context, err error) {
+	var pe *kubegraph.ParseError
+	if errors.As(err, &pe) {
+		writeError(c, http.StatusBadRequest, pe.Reason, pe.Message)
+		return
+	}
+	writeError(c, http.StatusBadRequest, "invalid_request", err.Error())
 }
 
 // ----- response helpers -----------------------------------------------------

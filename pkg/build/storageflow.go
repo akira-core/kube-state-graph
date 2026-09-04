@@ -224,7 +224,15 @@ func storageFlowEdges(chains []storageChain, bindings []PodPVCBinding, nodeOf ma
 		//
 		// The pair is unique by construction — a claim resolves at most one SVM
 		// — so no other claim's measurement can land on this edge.
-		emit(c.svmID, c.pvcID, graph.StorageTierSVMPVC, nil, c.io)
+		//
+		// claim_aggr recovers this claim's aggregate after aggr-svm hops are
+		// deduplicated across an SVM that spans aggregates. ProjectStorage
+		// strips it; it is not a wire label.
+		var claimLabels map[string]string
+		if c.aggrID != "" {
+			claimLabels = map[string]string{graph.ClaimAggrLabel: c.aggrID}
+		}
+		emit(c.svmID, c.pvcID, graph.StorageTierSVMPVC, claimLabels, c.io)
 
 		// A claim mounted by several pods (RWX) has no observable per-pod
 		// share, so the projection splits its weight equally across them. The

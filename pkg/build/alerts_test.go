@@ -228,6 +228,39 @@ func TestResolveAlerts_AggregateAttached(t *testing.T) {
 	}, byNode)
 }
 
+// The stock Harvest aggr_* series carry the owning controller's `node` beside
+// `aggr`, so a rule written over them names both. It is an alert about the
+// aggregate: `aggr` outranks `node`, and the controller stays clean.
+func TestResolveAlerts_AggregateOutranksNodeLabel(t *testing.T) {
+	byNode, unmatched, ambiguous := resolveOver(t, alertEstate(),
+		alertSample("AggrSpaceLow", "critical", map[string]string{
+			"cluster": "ontap-prod", "node": "ontap-prod-01", "aggr": "aggr1",
+		}))
+
+	assert.Equal(t, map[string][]graph.Alert{
+		graph.NetAppAggrID("ontap-prod", "aggr1"): {
+			{Name: "AggrSpaceLow", State: graph.AlertStateFiring, Severity: "critical"},
+		},
+	}, byNode)
+	assert.Zero(t, unmatched)
+	assert.Zero(t, ambiguous)
+}
+
+// The reader mirrors the query's fixed alertstate="firing" selector: a pending
+// alert reaching it from a hand-built vector is discarded, not attached and
+// not counted.
+func TestResolveAlerts_NonFiringIsDiscarded(t *testing.T) {
+	pending := alertSample("KubePodCrashLooping", "warning", map[string]string{
+		"cluster": "c1", "namespace": "shop", "pod": "orders-0",
+		"alertstate": "pending",
+	})
+	byNode, unmatched, ambiguous := resolveOver(t, alertEstate(), pending)
+
+	assert.Empty(t, byNode)
+	assert.Zero(t, unmatched)
+	assert.Zero(t, ambiguous)
+}
+
 // --- kind 5 and the uniqueness fallback -----------------------------------
 
 // With no cluster label the match succeeds only when exactly one node of the

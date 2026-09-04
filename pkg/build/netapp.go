@@ -128,6 +128,27 @@ type svmKey struct{ oc, svm string }
 type nodeKey struct{ oc, node string }
 type policyKey struct{ oc, svm, policy string }
 
+// nodeKeyOf reads the (ONTAP cluster, controller) identity a Harvest
+// controller-scoped series carries; ok is false when either label is empty.
+// Every controller-keyed reader goes through it so none can key differently
+// from the inventory.
+func nodeKeyOf(m model.Metric) (nodeKey, bool) {
+	oc, node := string(m["cluster"]), string(m["node"])
+	if oc == "" || node == "" {
+		return nodeKey{}, false
+	}
+	return nodeKey{oc, node}, true
+}
+
+// aggrKeyOf is nodeKeyOf for the aggregate-scoped families.
+func aggrKeyOf(m model.Metric) (aggrKey, bool) {
+	oc, aggr := string(m["cluster"]), string(m["aggr"])
+	if oc == "" || aggr == "" {
+		return aggrKey{}, false
+	}
+	return aggrKey{oc, aggr}, true
+}
+
 // resolveNetAppStorage runs the three-hop storage join of design.md D3:
 //
 //	hop A  volume_labels             → edge + aggregate + controller + PVC svm
@@ -148,8 +169,6 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	readLat, writeLat := v.QoSReadLatency, v.QoSWriteLatency
 	readData, writeData := v.QoSReadData, v.QoSWriteData
 	policyMaxIOPS, policyMaxMBps := v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps
-	aggrStatus, aggrUsed, aggrTotal := v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal
-	nodeStatus := v.NetAppNodeStatus
 
 	out := netappResult{svmByPVC: map[string]SVMRef{}}
 
@@ -294,9 +313,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	// It is built after allByAggr so the aggregate owner comes from the same
 	// pickOwner vote the join uses — a root aggregate and a joined one must not
 	// disagree about which controller currently serves them.
-	idx := buildNetAppIndexes(volIndex, allByAggr, v,
-		healthByAggr(aggrStatus), usageByAggr(aggrUsed, aggrTotal),
-		healthByNode(nodeStatus), hardwareByNode(v.NetAppNodeLabels), perfByNode(v))
+	idx := buildNetAppIndexes(volIndex, allByAggr, v)
 	out.inventory = idx.inventory
 
 	// The join-only half: the aggregates claims actually landed on, and the
@@ -373,12 +390,13 @@ func buildNetAppIndexes(
 	volIndex map[string][]volumeLabelCandidate,
 	allByAggr map[aggrKey][]volumeLabelCandidate,
 	v topologyVectors,
-	aggrHealth map[aggrKey]string,
-	aggrUsage map[aggrKey]*graph.UsageBytes,
-	nodeHealth map[nodeKey]string,
-	nodeHardware map[nodeKey]*graph.Hardware,
-	nodePerf map[nodeKey]*graph.NodePerf,
 ) netappIndexes {
+	aggrHealth := healthByAggr(v.AggrStatus)
+	aggrUsage := usageByAggr(v.AggrSpaceUsed, v.AggrSpaceTotal)
+	nodeHealth := healthByNode(v.NetAppNodeStatus)
+	nodeHardware := hardwareByNode(v.NetAppNodeLabels)
+	nodePerf := perfByNode(v)
+
 	nodes := map[nodeKey]struct{}{}
 	aggrs := map[aggrKey]struct{}{}
 	svms := map[svmKey]struct{}{}
@@ -409,25 +427,34 @@ func buildNetAppIndexes(
 		v.NetAppNodeTotalLatency, v.NetAppNodeTotalData,
 	} {
 		for _, sample := range vec {
-			oc, node := string(sample.Metric["cluster"]), string(sample.Metric["node"])
-			if oc == "" || node == "" {
+			k, ok := nodeKeyOf(sample.Metric)
+			if !ok {
 				continue
 			}
-			nodes[nodeKey{oc, node}] = struct{}{}
+			nodes[k] = struct{}{}
 		}
 	}
 
-	// Aggregate-scoped legs. These also carry the owning controller on the
-	// aggr_* families, but that label is NOT read as an owner statement: the
-	// owner is decided by pickOwner over the volume series alone, so a joined
-	// and a flowless aggregate cannot disagree about it.
+	// Aggregate-scoped legs. The aggr_* families also carry the owning
+	// controller. For a joined aggregate the owner stays pickOwner's vote over
+	// the volume series, so a joined and a flowless aggregate cannot disagree
+	// about it; the gauge's `node` is the FALLBACK for an aggregate no volume
+	// names at all (an empty aggregate), and that controller is inventoried
+	// with it so the aggregate's compound parent never dangles.
+	gaugeOwner := map[aggrKey]string{}
 	for _, vec := range []model.Vector{v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal} {
 		for _, sample := range vec {
-			oc, aggr := string(sample.Metric["cluster"]), string(sample.Metric["aggr"])
-			if oc == "" || aggr == "" {
+			k, ok := aggrKeyOf(sample.Metric)
+			if !ok {
 				continue
 			}
-			aggrs[aggrKey{oc, aggr}] = struct{}{}
+			aggrs[k] = struct{}{}
+			if node := string(sample.Metric["node"]); node != "" {
+				nodes[nodeKey{k.oc, node}] = struct{}{}
+				if cur, ok := gaugeOwner[k]; !ok || node < cur {
+					gaugeOwner[k] = node
+				}
+			}
 		}
 	}
 
@@ -448,9 +475,15 @@ func buildNetAppIndexes(
 	for k := range aggrs {
 		labels := map[string]string{"ontap_cluster": k.oc}
 		// The owner key is set only when it resolves non-empty — same rule as
-		// the PVC volumename/svm labels. An owner-less aggregate falls back to
-		// the storage-cluster compound group in the serialiser.
-		if owner := pickOwner(allByAggr[k], k.oc, k.aggr); owner != "" {
+		// the PVC volumename/svm labels. The volume vote wins; the aggr_*
+		// gauges' own `node` covers an aggregate no volume names. An aggregate
+		// with neither falls back to the storage-cluster compound group in the
+		// serialiser.
+		owner := pickOwner(allByAggr[k], k.oc, k.aggr)
+		if owner == "" {
+			owner = gaugeOwner[k]
+		}
+		if owner != "" {
 			labels["node"] = owner
 		}
 		out.aggrByKey[k] = &graph.NetAppAggrNode{
@@ -815,11 +848,10 @@ func healthFromSamples(vals []float64) string {
 func healthByAggr(vec model.Vector) map[aggrKey]string {
 	raw := map[aggrKey][]float64{}
 	for _, s := range vec {
-		oc, aggr := string(s.Metric["cluster"]), string(s.Metric["aggr"])
-		if oc == "" || aggr == "" {
+		k, ok := aggrKeyOf(s.Metric)
+		if !ok {
 			continue
 		}
-		k := aggrKey{oc, aggr}
 		raw[k] = append(raw[k], float64(s.Value))
 	}
 	out := make(map[aggrKey]string, len(raw))
@@ -847,11 +879,10 @@ func hardwareByNode(vec model.Vector) map[nodeKey]*graph.Hardware {
 	}
 	acc := map[nodeKey]*graph.Hardware{}
 	for _, s := range vec {
-		oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
-		if oc == "" || node == "" {
+		k, ok := nodeKeyOf(s.Metric)
+		if !ok {
 			continue
 		}
-		k := nodeKey{oc, node}
 		h := acc[k]
 		if h == nil {
 			h = &graph.Hardware{}
@@ -926,11 +957,10 @@ func perfByNode(v topologyVectors) map[nodeKey]*graph.NodePerf {
 	acc := map[nodeKey]*graph.NodePerf{}
 	for _, leg := range legs {
 		for _, s := range leg.vec {
-			oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
-			if oc == "" || node == "" {
+			k, ok := nodeKeyOf(s.Metric)
+			if !ok {
 				continue
 			}
-			k := nodeKey{oc, node}
 			p := acc[k]
 			if p == nil {
 				p = &graph.NodePerf{}
@@ -960,11 +990,10 @@ func perfByNode(v topologyVectors) map[nodeKey]*graph.NodePerf {
 func healthByNode(vec model.Vector) map[nodeKey]string {
 	raw := map[nodeKey][]float64{}
 	for _, s := range vec {
-		oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
-		if oc == "" || node == "" {
+		k, ok := nodeKeyOf(s.Metric)
+		if !ok {
 			continue
 		}
-		k := nodeKey{oc, node}
 		raw[k] = append(raw[k], float64(s.Value))
 	}
 	out := make(map[nodeKey]string, len(raw))
@@ -979,11 +1008,10 @@ func usageByAggr(used, total model.Vector) map[aggrKey]*graph.UsageBytes {
 		out := map[aggrKey]float64{}
 		seen := map[aggrKey]bool{}
 		for _, s := range vec {
-			oc, aggr := string(s.Metric["cluster"]), string(s.Metric["aggr"])
-			if oc == "" || aggr == "" {
+			k, ok := aggrKeyOf(s.Metric)
+			if !ok {
 				continue
 			}
-			k := aggrKey{oc, aggr}
 			v := float64(s.Value)
 			if !seen[k] || v < out[k] {
 				out[k] = v

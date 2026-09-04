@@ -40,11 +40,7 @@ func (b *Buffer) String() string {
 // CaptureLevel(t, slog.LevelDebug) supplies the level-aware form.
 func Capture(t *testing.T) *Buffer {
 	t.Helper()
-	buf := &Buffer{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return buf
+	return CaptureLevel(t, slog.LevelInfo)
 }
 
 // CaptureLevel is Capture with an explicit minimum level, so a test can assert

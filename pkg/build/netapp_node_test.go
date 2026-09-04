@@ -258,6 +258,7 @@ func TestCollectNetAppInventory_NamesEntitiesNoClaimReached(t *testing.T) {
 	assert.Equal(t, []string{
 		graph.NetAppNodeID("oc", "n1"),
 		graph.NetAppNodeID("oc", "n2"),
+		graph.NetAppNodeID("oc", "n3"),
 		graph.NetAppNodeID("oc", "n4"),
 	}, nodeIDsOf(inv.Nodes),
 		"a controller named by any leg is inventoried; n3 is only an aggr label, not a node one")
@@ -273,10 +274,12 @@ func TestCollectNetAppInventory_NamesEntitiesNoClaimReached(t *testing.T) {
 
 	// The owner label comes from the same pickOwner vote the join uses, so a
 	// flowless aggregate and a joined one cannot disagree about it. a9 is named
-	// only by the status gauge, so no volume series states an owner for it.
+	// only by the status gauge, so no volume series states an owner for it:
+	// the gauge's own `node` is the fallback, and that controller (n3) is
+	// inventoried with it so the aggregate's parent never dangles.
 	assert.Equal(t, "n1", inv.Aggrs[0].Labels()["node"])
 	assert.Equal(t, "n2", inv.Aggrs[1].Labels()["node"])
-	assert.NotContains(t, inv.Aggrs[2].Labels(), "node")
+	assert.Equal(t, "n3", inv.Aggrs[2].Labels()["node"])
 
 	// A joined aggregate is the SAME OBJECT as its inventory entry — that is
 	// what makes "a root and a joined entity carry identical attributes"

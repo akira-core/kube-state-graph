@@ -58,7 +58,36 @@ type NodeData struct {
 	Health       string            `json:"health,omitempty"`
 	Usage        *UsageDTO         `json:"usage,omitempty"`
 	StorageClass string            `json:"storageclass,omitempty"`
+	Hardware     *HardwareDTO      `json:"hardware,omitempty"`
+	Perf         *PerfDTO          `json:"perf,omitempty"`
+	Alerts       []AlertDTO        `json:"alerts,omitempty"`
 	Labels       map[string]string `json:"labels"`
+}
+
+// HardwareDTO is the wire form of graph.Hardware. Every field is omitted when
+// empty; the object itself is omitted when no field resolved.
+type HardwareDTO struct {
+	Model    string `json:"model,omitempty"`
+	Serial   string `json:"serial,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Location string `json:"location,omitempty"`
+}
+
+// PerfDTO is the wire form of graph.NodePerf. Values are rounded to 6
+// significant digits; each field is omitted when the counter did not resolve.
+type PerfDTO struct {
+	CPUBusyPct       *float64 `json:"cpu_busy_pct,omitempty"`
+	TotalOps         *float64 `json:"total_ops,omitempty"`
+	TotalLatencyUs   *float64 `json:"total_latency_us,omitempty"`
+	TotalBytesPerSec *float64 `json:"total_bytes_per_sec,omitempty"`
+}
+
+// AlertDTO is the wire form of graph.Alert. Severity is omitted when empty.
+type AlertDTO struct {
+	Name     string `json:"name"`
+	State    string `json:"state"`
+	Severity string `json:"severity,omitempty"`
 }
 
 // UsageDTO is the wire form of graph.UsageBytes. Either field may be omitted.
@@ -187,6 +216,54 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 		return nil
 	}
 	return dto
+}
+
+func hardwareDTO(h *graph.Hardware) *HardwareDTO {
+	if h == nil || h.Empty() {
+		return nil
+	}
+	return &HardwareDTO{
+		Model:    h.Model,
+		Serial:   h.Serial,
+		Version:  h.Version,
+		Vendor:   h.Vendor,
+		Location: h.Location,
+	}
+}
+
+func perfDTO(p *graph.NodePerf) *PerfDTO {
+	if p == nil || p.Empty() {
+		return nil
+	}
+	dto := &PerfDTO{}
+	if p.CPUBusyPct != nil {
+		v := round6(*p.CPUBusyPct)
+		dto.CPUBusyPct = &v
+	}
+	if p.TotalOps != nil {
+		v := round6(*p.TotalOps)
+		dto.TotalOps = &v
+	}
+	if p.TotalLatencyUs != nil {
+		v := round6(*p.TotalLatencyUs)
+		dto.TotalLatencyUs = &v
+	}
+	if p.TotalBytesPerSec != nil {
+		v := round6(*p.TotalBytesPerSec)
+		dto.TotalBytesPerSec = &v
+	}
+	return dto
+}
+
+func alertsDTO(alerts []graph.Alert) []AlertDTO {
+	if len(alerts) == 0 {
+		return nil
+	}
+	out := make([]AlertDTO, len(alerts))
+	for i, a := range alerts {
+		out[i] = AlertDTO{Name: a.Name, State: a.State, Severity: a.Severity}
+	}
+	return out
 }
 
 func usageDTO(u *graph.UsageBytes) *UsageDTO {
@@ -360,6 +437,9 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				Health:       n.Health(),
 				Usage:        usageDTO(n.Usage()),
 				StorageClass: n.StorageClass(),
+				Hardware:     hardwareDTO(n.Hardware()),
+				Perf:         perfDTO(n.Perf()),
+				Alerts:       alertsDTO(n.Alerts()),
 				Labels:       n.Labels(),
 			},
 		})
@@ -406,6 +486,8 @@ func groupNode(id, name, typ, parent string) Node {
 //	               cluster group, else ""
 //	node         → its cluster group
 //	netapp-node  → storage-cluster/<ontap_cluster>
+//	netapp-svm   → storage-cluster/<ontap_cluster> (never a child of a
+//	               controller; an SVM spans aggregates)
 //	netapp-aggr  → the real netapp-node id netapp/<oc>/<labels.node>,
 //	               falling back to storage-cluster/<oc> when no owner resolved
 //	external     → "" (no cluster identity)
@@ -433,7 +515,7 @@ func compoundParent(n graph.GraphNode) string {
 			}
 			return namespaceParentID(c, ns)
 		}
-	case graph.NodeTypeNetAppNode:
+	case graph.NodeTypeNetAppNode, graph.NodeTypeNetAppSVM:
 		if oc := labels["ontap_cluster"]; oc != "" {
 			return storageClusterParentID(oc)
 		}

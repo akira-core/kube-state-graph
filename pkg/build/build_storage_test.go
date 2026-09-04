@@ -2,45 +2,16 @@ package build
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
-	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
-
-// storageBuildQuerier answers the named legs and records every query name it
-// was asked for, so a test can assert which legs the storage build issued —
-// and, more importantly, which it did NOT.
-func storageBuildQuerier(t *testing.T, fixtures map[promql.Query]model.Vector) (*promqlmocks.MockQuerier, func() []string) {
-	t.Helper()
-	var mu sync.Mutex
-	var seen []string
-
-	q := promqlmocks.NewMockQuerier(t)
-	q.EXPECT().
-		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		RunAndReturn(func(_ context.Context, name string, _ string, _ time.Time) (model.Vector, error) {
-			mu.Lock()
-			seen = append(seen, name)
-			mu.Unlock()
-			return fixtures[promql.Query(name)], nil
-		}).
-		Maybe()
-
-	return q, func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), seen...)
-	}
-}
 
 // storageFixtures is one joined-and-mounted claim end to end: pod shop/orders-0
 // on worker-1 mounting shop/orders-data, whose FlexVol lives on
@@ -79,7 +50,7 @@ func newStorageBuilder(t *testing.T, q promql.Querier) *Builder {
 // storage body uses none of them. The up{} probe is skipped too — the endpoint
 // is always a filtered build.
 func TestBuildStorage_IssuesNoServiceGraphOrProbeQuery(t *testing.T) {
-	q, seen := storageBuildQuerier(t, storageFixtures())
+	q, seen := newRecordingQuerier(t, storageFixtures())
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
 
 	_, err := newStorageBuilder(t, q).BuildStorage(
@@ -107,7 +78,7 @@ func TestBuildStorage_IssuesNoServiceGraphOrProbeQuery(t *testing.T) {
 // The body holds only storage-flow edges and only the six node kinds the
 // storage chain names — no service, no external.
 func TestBuildStorage_EmitsOnlyStorageFlow(t *testing.T) {
-	q, _ := storageBuildQuerier(t, storageFixtures())
+	q, _ := newRecordingQuerier(t, storageFixtures())
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		context.Background(), time.Minute, time.Unix(1, 0).UTC(),
@@ -133,7 +104,7 @@ func TestBuildStorage_EmitsOnlyStorageFlow(t *testing.T) {
 
 // The whole chain is present and oriented storage → workload.
 func TestBuildStorage_DrawsTheWholeChain(t *testing.T) {
-	q, _ := storageBuildQuerier(t, storageFixtures())
+	q, _ := newRecordingQuerier(t, storageFixtures())
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		context.Background(), time.Minute, time.Unix(1, 0).UTC(),
@@ -164,7 +135,7 @@ func TestBuildStorage_CarriesClusterIdentities(t *testing.T) {
 			s.Metric["env"] = "prod"
 		}
 	}
-	q, _ := storageBuildQuerier(t, fixtures)
+	q, _ := newRecordingQuerier(t, fixtures)
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		context.Background(), time.Minute, time.Unix(1, 0).UTC(),
@@ -180,7 +151,7 @@ func TestBuildStorage_CarriesClusterIdentities(t *testing.T) {
 // never an outside-retention error: BuildStorage issues no up{} probe, so the
 // classification cannot fire.
 func TestBuildStorage_EmptyEstateIsNotOutsideRetention(t *testing.T) {
-	q, seen := storageBuildQuerier(t, nil)
+	q, seen := newRecordingQuerier(t, nil)
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		context.Background(), time.Minute, time.Unix(1, 0).UTC(),
@@ -201,7 +172,7 @@ func TestBuildStorage_MaterialisesFlowlessInventory(t *testing.T) {
 	fixtures[promql.QAggrStatus] = sampleVec(model.Sample{Metric: model.Metric{
 		"cluster": "ontap-prod", "node": "ontap-prod-02", "aggr": "aggr9",
 	}, Value: 1})
-	q, _ := storageBuildQuerier(t, fixtures)
+	q, _ := newRecordingQuerier(t, fixtures)
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		context.Background(), time.Minute, time.Unix(1, 0).UTC(),

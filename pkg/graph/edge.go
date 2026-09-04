@@ -53,6 +53,17 @@ var StorageTiers = []string{
 // singly-mounted claim's edge carries no `attribution` label at all.
 const AttributionSplit = "split"
 
+// ClaimAggrLabel is the internal key the storage-flow assembler stamps on an
+// svm-pvc edge so ProjectStorage can recover which aggregate the claim sits
+// on after shared aggr-svm hops are deduplicated. An SVM spans aggregates, so
+// walking up from the SVM is ambiguous whenever two claims in the same SVM
+// join different aggregates — without this key, `?aggr=aggr1&pod=x` could not
+// tell the pod's aggr1 claim from its aggr2 claim.
+//
+// It is stripped from the projected view and never appears on the wire. A
+// FlexGroup claim (no aggregate) omits the key.
+const ClaimAggrLabel = "claim_aggr"
+
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are
 // derived (UUIDv5). Bumping this value invalidates every existing edge ID and
 // MUST be treated as a v2 break.

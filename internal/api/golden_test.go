@@ -63,6 +63,25 @@ func TestGolden_GraphResponses(t *testing.T) {
 	}
 }
 
+func TestGolden_StorageGraphResponses(t *testing.T) {
+	g := buildStorageGraphEstate()
+	aggrScope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	require.NoError(t, err)
+	podScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"})
+	require.NoError(t, err)
+
+	scenarios := map[string]graph.View{
+		"storage-graph-aggr-root": graph.ProjectStorage(g, aggrScope),
+		"storage-graph-pod-root":  graph.ProjectStorage(g, podScope),
+	}
+	for name, view := range scenarios {
+		t.Run(name+"-cytoscape", func(t *testing.T) {
+			body := cytoscape.Serialise(g, view)
+			compareGolden(t, name+"-cytoscape.json", body)
+		})
+	}
+}
+
 func TestGolden_EdgeTypes(t *testing.T) {
 	body := map[string]any{
 		"apiVersion": APIVersion,
@@ -180,9 +199,19 @@ func buildWithStorageClass() graph.View {
 // an aggregate with health+usage nested under its real owning controller,
 // which nests under a storage-cluster group.
 func buildWithNetAppStorage() graph.View {
-	pod := &graph.PodNode{IDValue: "cluster-alpha/p1", NameValue: "mongo-0", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
+	pod := &graph.PodNode{
+		IDValue: "cluster-alpha/p1", NameValue: "mongo-0",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"},
+		AlertsValue: []graph.Alert{{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"}},
+	}
+	k8sNode := &graph.K8sNode{
+		IDValue: "cluster-alpha/worker-0", NameValue: "worker-0",
+		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
+		AlertsValue: []graph.Alert{{Name: "KubeNodeNotReady", State: graph.AlertStateFiring, Severity: "critical"}},
+	}
 	used, cap := 700000000000.0, 1000000000000.0
 	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
+	cpu, ops, lat, data := 72.5, 18500.0, 830.0, 1.2e9
 	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
@@ -191,6 +220,7 @@ func buildWithNetAppStorage() graph.View {
 			"volume": "data", "volumename": "pvc-9f3a", "svm": "svm-prod",
 		},
 		StorageClassValue: "netapp-nas",
+		AlertsValue:       []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	aggr := &graph.NetAppAggrNode{
@@ -199,12 +229,18 @@ func buildWithNetAppStorage() graph.View {
 		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-01"},
 		HealthValue: graph.HealthOnline,
 		UsageValue:  &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
+		AlertsValue: []graph.Alert{{Name: "AggrSpaceLow", State: graph.AlertStateFiring, Severity: "warning"}},
 	}
 	ctrl := &graph.NetAppNode{
 		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
 		NameValue:   "ontap-prod-01",
 		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"},
 		HealthValue: graph.HealthOnline,
+		HardwareValue: &graph.Hardware{
+			Model: "AFF-A400", Serial: "721234000123", Version: "9.14.1", Vendor: "NetApp",
+		},
+		PerfValue:   &graph.NodePerf{CPUBusyPct: &cpu, TotalOps: &ops, TotalLatencyUs: &lat, TotalBytesPerSec: &data},
+		AlertsValue: []graph.Alert{{Name: "NodeCPUBusy", State: graph.AlertStateFiring, Severity: "critical"}},
 	}
 	maxIOPS, maxBps := 5000.0, 262144000.0
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
@@ -217,7 +253,105 @@ func buildWithNetAppStorage() graph.View {
 		graph.NewEdge(graph.EdgeTypePodMountsPVC, pod.IDValue, pvcPlain.IDValue, map[string]string{"claim_name": "scratch"}),
 		ioEdge,
 	}
-	return graph.View{Nodes: []graph.GraphNode{pod, pvc, pvcPlain, aggr, ctrl}, Edges: edges}
+	return graph.View{Nodes: []graph.GraphNode{pod, k8sNode, pvc, pvcPlain, aggr, ctrl}, Edges: edges}
+}
+
+// buildStorageGraphEstate is the shared /v1/storage-graph golden fixture: two
+// Kubernetes clusters sharing one filer, a FlexGroup claim, an unmounted
+// claim, an unmeasured claim, and an RWX claim whose equal split is visible
+// from the pod-root projection.
+func buildStorageGraphEstate() *graph.Graph {
+	const oc, a, b = "ontap-prod", "cluster-alpha", "cluster-beta"
+	ctrl1 := &graph.NetAppNode{IDValue: graph.NetAppNodeID(oc, "ontap-prod-01"), NameValue: "ontap-prod-01", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	ctrl2 := &graph.NetAppNode{IDValue: graph.NetAppNodeID(oc, "ontap-prod-02"), NameValue: "ontap-prod-02", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	aggr1 := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID(oc, "aggr1"), NameValue: "aggr1", LabelsValue: map[string]string{"ontap_cluster": oc, "node": "ontap-prod-01"}}
+	aggr7 := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID(oc, "aggr7"), NameValue: "aggr7", LabelsValue: map[string]string{"ontap_cluster": oc, "node": "ontap-prod-02"}}
+	aggr9 := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID(oc, "aggr9"), NameValue: "aggr9", LabelsValue: map[string]string{"ontap_cluster": oc, "node": "ontap-prod-02"}}
+	svmShop := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_shop"), NameValue: "svm_shop", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	svmBig := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_big"), NameValue: "svm_big", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	svmPlat := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_plat"), NameValue: "svm_plat", LabelsValue: map[string]string{"ontap_cluster": oc}}
+
+	orders := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "orders-data"), NameValue: "orders-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	shared := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "shared-data"), NameValue: "shared-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	plain := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "plain-data"), NameValue: "plain-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	big := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "big-data"), NameValue: "big-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	idle := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "idle-data"), NameValue: "idle-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	db := &graph.PVCNode{IDValue: graph.PVCID(b, "db", "db-data"), NameValue: "db-data", LabelsValue: map[string]string{"cluster": b, "namespace": "db"}}
+
+	pod := func(cluster, ns, name, uid, node string) *graph.PodNode {
+		labels := map[string]string{"cluster": cluster, "namespace": ns, "node": graph.K8sNodeID(cluster, node)}
+		return &graph.PodNode{IDValue: graph.PodID(cluster, uid), NameValue: name, LabelsValue: labels}
+	}
+	orders0 := pod(a, "shop", "orders-0", "uid-orders", "worker-1")
+	web0 := pod(a, "shop", "web-0", "uid-web-0", "worker-1")
+	web1 := pod(a, "shop", "web-1", "uid-web-1", "worker-1")
+	web2 := pod(a, "shop", "web-2", "uid-web-2", "worker-2")
+	plain0 := pod(a, "shop", "plain-0", "uid-plain", "worker-1")
+	big0 := pod(a, "shop", "big-0", "uid-big", "worker-1")
+	db0 := pod(b, "db", "db-0", "uid-db", "worker-b")
+	w1 := &graph.K8sNode{IDValue: graph.K8sNodeID(a, "worker-1"), NameValue: "worker-1", LabelsValue: map[string]string{"cluster": a}}
+	w2 := &graph.K8sNode{IDValue: graph.K8sNodeID(a, "worker-2"), NameValue: "worker-2", LabelsValue: map[string]string{"cluster": a}}
+	wb := &graph.K8sNode{IDValue: graph.K8sNodeID(b, "worker-b"), NameValue: "worker-b", LabelsValue: map[string]string{"cluster": b}}
+
+	f64 := func(v float64) *float64 { return &v }
+	io := func(ops float64) *graph.IOMetrics {
+		return &graph.IOMetrics{ReadOps: f64(ops), WriteOps: f64(ops / 2), ReadLatencyUs: f64(450), MaxIOPS: f64(5000)}
+	}
+	hop := func(tier, src, tgt string, extra map[string]string, m *graph.IOMetrics) *graph.Edge {
+		l := map[string]string{"tier": tier}
+		for k, v := range extra {
+			l[k] = v
+		}
+		e := graph.NewEdge(graph.EdgeTypeStorageFlow, src, tgt, l)
+		if m != nil {
+			e = e.WithIO(*m)
+		}
+		return e
+	}
+	chain := func(ctrl, aggr, svm, pvc, p, node string, m *graph.IOMetrics, n int) []*graph.Edge {
+		var out []*graph.Edge
+		if ctrl != "" && aggr != "" {
+			out = append(out, hop(graph.StorageTierNodeAggr, ctrl, aggr, nil, nil))
+		}
+		if aggr != "" && svm != "" {
+			out = append(out, hop(graph.StorageTierAggrSVM, aggr, svm, nil, nil))
+		}
+		cl := map[string]string{}
+		if aggr != "" {
+			cl[graph.ClaimAggrLabel] = aggr
+		}
+		out = append(out, hop(graph.StorageTierSVMPVC, svm, pvc, cl, m))
+		pl := map[string]string{}
+		if n > 1 {
+			pl["attribution"] = graph.AttributionSplit
+		}
+		out = append(out, hop(graph.StorageTierPVCPod, pvc, p, pl, nil))
+		if node != "" {
+			out = append(out, hop(graph.StorageTierPodNode, p, node, nil, nil))
+		}
+		return out
+	}
+
+	edges := make([]*graph.Edge, 0, 32)
+	edges = append(edges, chain(ctrl1.ID(), aggr1.ID(), svmShop.ID(), orders.ID(), orders0.ID(), w1.ID(), io(100), 1)...)
+	edges = append(edges, hop(graph.StorageTierNodeAggr, ctrl1.ID(), aggr1.ID(), nil, nil))
+	edges = append(edges, hop(graph.StorageTierAggrSVM, aggr1.ID(), svmShop.ID(), nil, nil))
+	edges = append(edges, hop(graph.StorageTierSVMPVC, svmShop.ID(), shared.ID(), map[string]string{graph.ClaimAggrLabel: aggr1.ID()}, io(300)))
+	for _, p := range []*graph.PodNode{web0, web1, web2} {
+		edges = append(edges, hop(graph.StorageTierPVCPod, shared.ID(), p.ID(), map[string]string{"attribution": graph.AttributionSplit}, nil))
+		edges = append(edges, hop(graph.StorageTierPodNode, p.ID(), p.Labels()["node"], nil, nil))
+	}
+	edges = append(edges, chain(ctrl1.ID(), aggr1.ID(), svmShop.ID(), plain.ID(), plain0.ID(), w1.ID(), nil, 1)...)
+	edges = append(edges, chain("", "", svmBig.ID(), big.ID(), big0.ID(), w1.ID(), nil, 1)...)
+	edges = append(edges, chain(ctrl1.ID(), aggr1.ID(), svmPlat.ID(), db.ID(), db0.ID(), wb.ID(), io(50), 1)...)
+	// idle-data / aggr7 / aggr9 are inventory only: no edges.
+
+	nodes := []graph.GraphNode{
+		ctrl1, ctrl2, aggr1, aggr7, aggr9, svmShop, svmBig, svmPlat,
+		orders, shared, plain, big, idle, db,
+		orders0, web0, web1, web2, plain0, big0, db0, w1, w2, wb,
+	}
+	return graph.NewGraph(nodes, edges, time.Time{})
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

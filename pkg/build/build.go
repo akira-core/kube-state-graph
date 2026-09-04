@@ -242,6 +242,13 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // and the existing filtered-build rule already says an empty result is an empty
 // 200 rather than a retention error — which is also what makes "a root the
 // upstream does not name is simply not drawn" true.
+//
+// It also deliberately does NOT write the three last-build gauges
+// (kube_state_graph_graph_nodes / _edges / clusters observed). Those describe
+// the graph Build produces — the adapters reset the vector on every write, so
+// a storage build would wipe every pod-calls-* / pvc-to-netapp-aggr series and
+// replace them with storage-flow until the next /v1/graph request, making the
+// gauges a function of request mix rather than of the estate.
 func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
 	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
@@ -266,20 +273,14 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	g.ClusterIdentities = topology.ClusterIdentities
 
-	edgeCounts := g.EdgeCountByType()
 	slog.InfoContext(ctx, "storage graph built",
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
+		"selector_active", sel.Active(),
 	)
-
-	if b.metrics != nil {
-		b.metrics.SetGraphNodeCounts(g.NodeCountByKind())
-		b.metrics.SetGraphEdgeCounts(edgeCounts)
-		b.metrics.SetClustersObserved(len(topology.ClustersObserved))
-	}
 
 	span.SetAttributes(
 		attribute.Int("kube_state_graph.cluster_count", len(topology.ClustersObserved)),

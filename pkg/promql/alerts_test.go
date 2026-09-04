@@ -21,6 +21,12 @@ import (
 // silently delete alerts the estate genuinely has. az / env / namespace DO
 // reach it, and the fixed alertstate="firing" selector is always rendered
 // first so the request matchers compose with it rather than replace it.
+//
+// namespace renders in its OR-ABSENT form: a node-, controller- or
+// aggregate-shaped alert carries no namespace label, and the node it is
+// addressed to is still loaded by reference under ?namespace=, so a plain
+// namespace="shop" matcher would be stricter than the reader and silently
+// strip those nodes of their alerts.
 func TestRender_AlertsCarriesEveryDimensionButCluster(t *testing.T) {
 	sel := Selector{
 		AZ:        []string{"zone-a"},
@@ -31,10 +37,20 @@ func TestRender_AlertsCarriesEveryDimensionButCluster(t *testing.T) {
 	got := Render(QAlerts, time.Minute, LabelKeys{}, sel)
 
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace="shop"}[1m])`,
+		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1m])`,
 		got)
 	assert.NotContains(t, got, "cluster",
 		"a ?cluster= value must never narrow the alert read")
+}
+
+// Several namespaces still render ONE anchored alternation with the empty
+// alternative last, so the query stays a pure function of the value set.
+func TestRender_AlertsNamespaceOrAbsentIsOrderFree(t *testing.T) {
+	want := `last_over_time(ALERTS{alertstate="firing",namespace=~"platform|shop|"}[1m])`
+	assert.Equal(t, want, Render(QAlerts, time.Minute, LabelKeys{},
+		Selector{Namespace: []string{"shop", "platform"}}))
+	assert.Equal(t, want, Render(QAlerts, time.Minute, LabelKeys{},
+		Selector{Namespace: []string{"platform", "shop", "shop", ""}}))
 }
 
 func TestRender_AlertsHonoursConfiguredLabelKeys(t *testing.T) {

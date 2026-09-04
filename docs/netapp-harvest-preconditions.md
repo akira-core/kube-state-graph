@@ -177,6 +177,27 @@ are OPTIONAL — each of the corresponding legs degrades log-and-continue, so a
 deployment running none of them keeps its storage topology and simply carries no
 aggregate usage, controller health, `data.hardware` or `data.perf`.
 
+## SVM entity and the storage-flow chain
+
+Hop A also resolves the SVM (`volume_labels.svm`) as a first-class
+`type="netapp-svm"` node (`netapp/<ontap-cluster>/svm/<svm>`,
+`labels={ontap_cluster}`). It is an identity only in this change — no SVM-level
+Harvest series are read — and is emitted **only** by `GET /v1/storage-graph`.
+`GET /v1/graph` is unchanged: the SVM stays the PVC's `svm` label.
+
+That endpoint expresses the storage chain as directed `storage-flow` edges,
+oriented storage → workload, one hop per adjacent pair of the fixed tier chain:
+
+```
+netapp-node → netapp-aggr → netapp-svm → pvc → pod → node
+```
+
+Each edge carries `labels.tier` (`node-aggr`, `aggr-svm`, `svm-pvc`, `pvc-pod`,
+`pod-node`). A FlexGroup claim (empty `aggr`) enters at `svm-pvc`. A claim with
+no resolved SVM contributes no path — there is no `aggr → pvc` shortcut. I/O
+weights ride every hop of a measured path and conserve tier to tier; see the
+`storage-graph-api` spec.
+
 ## The QoS read is scoped
 
 ONTAP collects a QoS workload for every volume on the filer, and the resolver

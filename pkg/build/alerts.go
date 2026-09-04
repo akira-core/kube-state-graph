@@ -10,10 +10,11 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// Label names the ALERTS matcher reads. `alertstate` is deliberately absent:
-// the query's fixed selector already restricts the read to firing alerts, so
-// the reader never re-tests it and a series reaching here is firing by
-// construction.
+// Label names the ALERTS reader consumes. `alertstate` is re-tested against
+// graph.AlertStateFiring even though the query's fixed selector already
+// restricts the read to firing alerts: every fixed selector mirrors a discard
+// its reader performs, so the pushdown stays output-preserving for a vector
+// that did not come through the query (a hand-built Topology, an embedder).
 const (
 	alertNameLabel      = "alertname"
 	alertStateLabel     = "alertstate"
@@ -147,15 +148,19 @@ func newAlertIndex(nodes []graph.GraphNode) alertIndex {
 	return idx
 }
 
-// unique returns the single id in ids, or "" when there are none or several.
-// "Several" is the ambiguous case the caller counts: an alert naming a pod
-// two clusters both hold, with nothing to disambiguate them, attaches to
-// neither rather than to whichever the slice happened to hold first.
-func unique(ids []string) string {
-	if len(ids) != 1 {
-		return ""
+// matchUnique resolves the no-cluster-label fallback over a candidate set:
+// exactly one id matches, several are the ambiguous case the caller counts
+// (an alert naming a pod two clusters both hold, with nothing to disambiguate
+// them, attaches to neither rather than to whichever the slice happened to
+// hold first), and none is unmatched.
+func matchUnique(ids []string) alertMatch {
+	switch len(ids) {
+	case 0:
+		return alertMatch{}
+	case 1:
+		return alertMatch{id: ids[0]}
 	}
-	return ids[0]
+	return alertMatch{ambiguous: true}
 }
 
 // alertMatch is one resolution outcome. Exactly one of the three states holds:
@@ -189,6 +194,13 @@ func resolveAlerts(vec model.Vector, idx alertIndex, clusters *clusterResolver) 
 	}
 	acc := map[string][]graph.Alert{}
 	for _, s := range vec {
+		// Mirrors the query's fixed alertstate="firing" selector, so the
+		// pushdown is output-preserving: a hand-built Topology or an embedder's
+		// vector carrying a pending alert is discarded here exactly as the
+		// upstream matcher would have discarded it.
+		if string(s.Metric[alertStateLabel]) != graph.AlertStateFiring {
+			continue
+		}
 		m := resolveOneAlert(s.Metric, idx, clusters)
 		switch {
 		case m.ambiguous:
@@ -226,15 +238,19 @@ func resolveOneAlert(m model.Metric, idx alertIndex, clusters *clusterResolver) 
 	aggr := string(m[alertAggrLabel])
 	rawCluster := string(m[alertClusterLabel])
 
+	// `aggr` outranks `node`: the stock Harvest aggr_* series carry the owning
+	// controller's `node` beside `aggr`, so an alert written over them names
+	// both, and it is an alert about the aggregate — attaching it to the
+	// controller would make every aggregate alert land one tier up.
 	switch {
 	case ns != "" && pod != "":
 		return matchNamespaced(idx.podsByCluster, idx.podsByName, m, rawCluster, ns, pod, clusters)
 	case ns != "" && pvc != "":
 		return matchNamespaced(idx.pvcsByCluster, idx.pvcsByName, m, rawCluster, ns, pvc, clusters)
-	case node != "":
-		return matchNodeShaped(idx, m, rawCluster, node, clusters)
 	case aggr != "":
 		return matchAggr(idx, rawCluster, aggr)
+	case node != "":
+		return matchNodeShaped(idx, m, rawCluster, node, clusters)
 	}
 	return alertMatch{}
 }
@@ -259,11 +275,7 @@ func matchNamespaced(
 		// same-named pod in a different cluster must not absorb the alert.
 		return alertMatch{}
 	}
-	ids := byName[alertNameKey{namespace, name}]
-	if len(ids) > 1 {
-		return alertMatch{ambiguous: true}
-	}
-	return alertMatch{id: unique(ids)}
+	return matchUnique(byName[alertNameKey{namespace, name}])
 }
 
 // matchNodeShaped resolves the `{cluster, node}` shape, which the Kubernetes
@@ -296,11 +308,7 @@ func matchNodeShaped(idx alertIndex, m model.Metric, rawCluster, node string, cl
 	// No cluster label: the eligible kinds are BOTH, so uniqueness is tested
 	// over their union. Two candidates of the same kind are as ambiguous as one
 	// of each.
-	ids := append(append([]string(nil), idx.k8sNodesByName[node]...), idx.ctrlsByName[node]...)
-	if len(ids) > 1 {
-		return alertMatch{ambiguous: true}
-	}
-	return alertMatch{id: unique(ids)}
+	return matchUnique(append(append([]string(nil), idx.k8sNodesByName[node]...), idx.ctrlsByName[node]...))
 }
 
 // matchAggr resolves the aggregate kind. Its `cluster` label is an ONTAP
@@ -313,11 +321,7 @@ func matchAggr(idx alertIndex, rawCluster, aggr string) alertMatch {
 		}
 		return alertMatch{}
 	}
-	ids := idx.aggrsByName[aggr]
-	if len(ids) > 1 {
-		return alertMatch{ambiguous: true}
-	}
-	return alertMatch{id: unique(ids)}
+	return matchUnique(idx.aggrsByName[aggr])
 }
 
 // attachAlerts resolves the build's ALERTS vector against the assembled node

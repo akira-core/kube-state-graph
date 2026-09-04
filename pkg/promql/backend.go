@@ -303,17 +303,9 @@ func (t *Table) Unserved() []Family {
 	}
 	var out []Family
 	for _, f := range Families {
-		if !f.Optional() {
-			continue
-		}
-		served := false
-		for _, b := range t.backends {
-			if b.serves(f) {
-				served = true
-				break
-			}
-		}
-		if !served {
+		// Select with no zones is the unrestricted "who serves f" answer —
+		// the same test fanoutQuerier applies before downgrading the miss.
+		if f.Optional() && len(t.Select(f, nil)) == 0 {
 			out = append(out, f)
 		}
 	}

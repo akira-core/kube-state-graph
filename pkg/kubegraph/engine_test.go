@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
@@ -84,6 +86,61 @@ func TestBuildFromValues_EmptyUpstream(t *testing.T) {
 
 // Probe issues an up{} query through the engine's querier — reachability for a
 // readiness check, surfacing the upstream error verbatim.
+func TestBuildStorageFromValues_EmptyUpstream(t *testing.T) {
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(model.Vector{}, nil).Maybe()
+
+	eng := kubegraph.New(q, kubegraph.Options{APITimeout: 5 * time.Second})
+	body, err := eng.BuildStorageFromValues(context.Background(), url.Values{
+		"start": {"1700000000"},
+		"end":   {"1700003600"},
+		"az":    {"zone-a"},
+		"env":   {"prod"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "v1", body.APIVersion)
+	assert.Empty(t, body.Elements.Nodes)
+	assert.Empty(t, body.Elements.Edges)
+	assert.Empty(t, body.Clusters)
+}
+
+func TestBuildStorageFromValues_ParseErrorReason(t *testing.T) {
+	eng := kubegraph.New(promqlmocks.NewMockQuerier(t), kubegraph.Options{})
+	_, err := eng.BuildStorageFromValues(context.Background(), url.Values{
+		"start": {"1700000000"},
+		"end":   {"1700003600"},
+		"env":   {"prod"},
+	})
+	var pe *kubegraph.ParseError
+	require.ErrorAs(t, err, &pe)
+	assert.Equal(t, "missing_az", pe.Reason)
+}
+
+func TestBuildStorageFromValues_AgreesWithComposedPipeline(t *testing.T) {
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(model.Vector{}, nil).Maybe()
+	eng := kubegraph.New(q, kubegraph.Options{APITimeout: 5 * time.Second})
+	vals := url.Values{
+		"start": {"1700000000"},
+		"end":   {"1700003600"},
+		"az":    {"zone-a"},
+		"env":   {"prod"},
+		"aggr":  {"aggr1"},
+	}
+
+	facade, err := eng.BuildStorageFromValues(context.Background(), vals)
+	require.NoError(t, err)
+
+	req, err := kubegraph.ParseStorageValues(vals)
+	require.NoError(t, err)
+	g, err := eng.BuildStorage(context.Background(), req.End.Sub(req.Start), req.End, req.Selector)
+	require.NoError(t, err)
+	composed := cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope))
+	assert.Equal(t, composed, facade)
+}
+
 func TestEngine_Probe(t *testing.T) {
 	t.Run("reachable", func(t *testing.T) {
 		q := promqlmocks.NewMockQuerier(t)

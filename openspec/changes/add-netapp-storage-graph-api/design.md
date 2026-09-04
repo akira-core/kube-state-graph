@@ -209,9 +209,12 @@ Query-count pins move: 31 → 36 first-wave legs without a matched volume
 ### D7. Alert overlay: one leg, one resolver, five node kinds
 
 - **Query**: `QAlerts = "ALERTS"`, fixed selector `alertstate="firing"`
-  rendered first, `queryDims[QAlerts] = dimAZ | dimEnv | dimNamespace`
+  rendered first, `queryDims[QAlerts] = dimAZ | dimEnv | dimNamespaceOrAbsent`
   (a new `dimsAlerts` constant — deliberately not `dimsNamespaced`, which
-  carries `dimCluster`), `queryFamily[QAlerts] = FamilyAlerts`.
+  carries `dimCluster`; `namespace` renders as `namespace=~"shop|"` so the
+  namespace-less node / controller / aggregate alerts are not excluded
+  upstream — those nodes are still loaded by reference under
+  `?namespace=`), `queryFamily[QAlerts] = FamilyAlerts`.
   `Family.AcceptsAZ()` derives routability from `dimAZ` unchanged.
 - **Resolver** `resolveAlerts(vec, idx alertIndex) map[nodeID][]Alert` in
   `pkg/build/alerts.go`, pure. `alertIndex` is built once from the
