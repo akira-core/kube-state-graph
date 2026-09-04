@@ -21,11 +21,32 @@ func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, looku
 	if err != nil {
 		return nil, err
 	}
+	logUnservedFamilies(table, logger)
 	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m))
 	if err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+// logUnservedFamilies reports each OPTIONAL family the live table leaves
+// served by no backend. A required family can never appear here — NewTable
+// rejects such a table — so this is purely the operator's confirmation that a
+// feature they did not configure is off, rather than silently broken. It is
+// Info, not Warn: an unserved optional family is a choice, not a defect.
+func logUnservedFamilies(table *promql.Table, logger *slog.Logger) {
+	for _, f := range table.Unserved() {
+		switch f {
+		case promql.FamilyAlerts:
+			logger.Info("alert overlay disabled — no backend serves the alerts family",
+				"family", string(f),
+			)
+		default:
+			logger.Info("optional upstream family is served by no backend",
+				"family", string(f),
+			)
+		}
+	}
 }
 
 func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEnvFunc) (*promql.Table, error) {

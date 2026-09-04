@@ -134,6 +134,16 @@ const (
 	// dimsNamespaced: pod-, claim-, Service- and EndpointSlice-scoped series
 	// plus the kubelet volume-stats family.
 	dimsNamespaced = dimAZ | dimEnv | dimCluster | dimNamespace
+	// dimsAlerts: the ALERTS series. Deliberately NOT dimsNamespaced — it is
+	// dimsNamespaced MINUS dimCluster. An alert expression does not reliably
+	// preserve the `cluster` label (an aggregation that drops it, a rule
+	// written over a series that never carried it), so pushing a `?cluster=`
+	// value into the matcher would silently drop alerts the estate genuinely
+	// has. The `cluster` dimension reaches alerts at PROJECTION instead,
+	// through the node the alert attached to; the matching itself walks the
+	// cluster-identity ladder when the label IS present and falls back to
+	// uniqueness in the loaded estate when it is not.
+	dimsAlerts = dimAZ | dimEnv | dimNamespace
 )
 
 // render returns the request-scoped matcher fragment for a query accepting

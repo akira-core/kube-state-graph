@@ -140,10 +140,27 @@ func (f *fanoutQuerier) Instant(ctx context.Context, name, query string, ts time
 
 	selected := f.table.Select(fam, f.az)
 	if len(selected) == 0 {
-		// A requested zone no backend declares. An empty filtered result is a
-		// legitimate empty graph, not an error, so this returns an empty vector
-		// — but it is logged, because it is otherwise indistinguishable from an
-		// estate that genuinely holds nothing.
+		// Two different situations reach here, and they deserve different log
+		// levels.
+		//
+		// An OPTIONAL family served by no backend at all is the documented
+		// normal state — the operator chose not to declare an alerting store,
+		// the leg contributes nothing, and every build is expected to land
+		// here. Warning on it once per build per query would train the
+		// operator to ignore the level. Debug.
+		//
+		// Anything else is a requested zone no backend declares: a required
+		// family that IS served, just not for this zone. An empty filtered
+		// result is a legitimate empty graph rather than an error, so it still
+		// returns an empty vector — but it is otherwise indistinguishable from
+		// an estate that genuinely holds nothing, so it warns.
+		if fam.Optional() && len(f.table.Select(fam, nil)) == 0 {
+			slog.DebugContext(ctx, "optional upstream family is served by no backend",
+				"query_name", name,
+				"family", string(fam),
+			)
+			return model.Vector{}, nil
+		}
 		slog.WarnContext(ctx, "no upstream backend serves this query for the requested zones",
 			"query_name", name,
 			"family", string(fam),
