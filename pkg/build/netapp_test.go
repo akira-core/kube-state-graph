@@ -160,7 +160,7 @@ func TestResolveNetAppStorage_JoinHit(t *testing.T) {
 		writeOps: sampleVec(qosSample("pvc-9f3a", "ontap-prod", "svm-prod", "", 40)),
 	}.run()
 
-	assert.Equal(t, "svm-prod", res.svmByPVC["c/db/data"])
+	assert.Equal(t, "svm-prod", res.svmByPVC["c/db/data"].SVM)
 	require.Len(t, res.aggrs, 1)
 	assert.Equal(t, graph.NetAppAggrID("ontap-prod", "aggr1"), res.aggrs[0].ID())
 	assert.Equal(t, "ontap-prod-01", res.aggrs[0].Labels()["node"])
@@ -192,7 +192,7 @@ func TestResolveNetAppStorage_FlexGroupEmptyAggr(t *testing.T) {
 			vol:    sampleVec(volLabelSample("pvc-fg", "oc", "n1", "", "svm-fg")),
 		}.run()
 		assert.Empty(t, res.edges, "empty aggr emits no edge")
-		assert.Equal(t, "svm-fg", res.svmByPVC["c/db/data"], "svm still resolves")
+		assert.Equal(t, "svm-fg", res.svmByPVC["c/db/data"].SVM, "svm still resolves")
 	})
 	assert.True(t, hasMsg(recs, "netapp_volume_join_miss"), "empty-aggr counts as a miss")
 }
@@ -228,7 +228,7 @@ func TestResolveNetAppStorage_DuplicateAggrPick(t *testing.T) {
 	}.run()
 	require.Len(t, res.edges, 1)
 	assert.Equal(t, graph.NetAppAggrID("oc", "aggr-a"), res.edges[0].Target)
-	assert.Equal(t, "svm-a", res.svmByPVC["c/db/data"])
+	assert.Equal(t, "svm-a", res.svmByPVC["c/db/data"].SVM)
 }
 
 func TestResolveNetAppStorage_TakeoverPicksLexicalOwner(t *testing.T) {
@@ -325,7 +325,7 @@ func TestResolveNetAppStorage_TopologyWithoutQoS(t *testing.T) {
 		assert.Nil(t, res.edges[0].IO, "no QoS match ⇒ no metrics object")
 		require.Len(t, res.aggrs, 1)
 		require.Len(t, res.nodes, 1)
-		assert.Equal(t, "svm-prod", res.svmByPVC["c/db/data"])
+		assert.Equal(t, "svm-prod", res.svmByPVC["c/db/data"].SVM)
 	})
 	assert.True(t, hasMsg(recs, "netapp_qos_join_miss"))
 	assert.False(t, hasMsg(recs, "netapp_volume_join_miss"))
@@ -565,7 +565,7 @@ func TestResolveNetAppStorage_SVMComesFromTopologyOnly(t *testing.T) {
 			vol:     sampleVec(volLabelSample("pvc-x", "oc", "n1", "a1", "svm-a")),
 			readOps: sampleVec(qosSample("pvc-x", "oc", "svm-b", "", 99)),
 		}.run()
-		assert.Equal(t, "svm-a", res.svmByPVC["c/db/data"])
+		assert.Equal(t, "svm-a", res.svmByPVC["c/db/data"].SVM)
 		assert.Nil(t, res.edges[0].IO, "another SVM's workload is not this volume")
 	})
 	assert.True(t, hasMsg(recs, "netapp_qos_join_miss"))
@@ -611,7 +611,7 @@ func TestResolveNetAppStorage_SVMScopedToPickedCluster(t *testing.T) {
 			policySample("oc-a", "alpha", "gold", 100),
 		),
 	}.run()
-	assert.Equal(t, "zulu", res.svmByPVC["c/db/data"],
+	assert.Equal(t, "zulu", res.svmByPVC["c/db/data"].SVM,
 		"svm must come from the filer the aggregate pick landed on")
 	require.Len(t, res.edges, 1)
 	assert.Equal(t, graph.NetAppAggrID("oc-a", "aggr1"), res.edges[0].Target)

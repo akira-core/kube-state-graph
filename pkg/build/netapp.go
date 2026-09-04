@@ -67,7 +67,7 @@ type pvcVolume struct {
 
 // netappResult is the demand-driven output of resolveNetAppStorage.
 type netappResult struct {
-	svmByPVC map[string]string
+	svmByPVC map[string]SVMRef
 	aggrs    []*graph.NetAppAggrNode
 	nodes    []*graph.NetAppNode
 	edges    []*graph.Edge
@@ -77,40 +77,20 @@ type netappResult struct {
 	inventory NetAppInventory
 }
 
-// NetAppInventoryAggr is one aggregate the Harvest read named, with the
-// controller currently owning it (empty when no volume_labels series states an
-// owner, which is also how an aggregate reaches the join with no `node` label).
-type NetAppInventoryAggr struct {
-	ONTAPCluster string
-	Aggr         string
-	// Owner is the controller currently serving the aggregate, picked by the
-	// same pickOwner rule the join uses — the lexically-smallest non-empty
-	// `node` across ALL of the aggregate's volume_labels series, so an HA
-	// takeover inside the window resolves deterministically.
-	Owner string
-}
-
-// NetAppInventorySVM is one SVM the Harvest read named. Only volume_labels
-// names an SVM, so unlike controllers and aggregates it has no second source.
-type NetAppInventorySVM struct {
-	ONTAPCluster string
-	SVM          string
-}
-
-// NetAppInventoryNode is one ONTAP controller the Harvest read named.
-type NetAppInventoryNode struct {
-	ONTAPCluster string
-	Node         string
-}
-
 // NetAppInventory is every NetApp entity named by ANY Harvest series read in
-// the build, independent of whether a claim joined it. It is what lets the
-// storage-flow graph materialise a flowless root — a degraded aggregate with no
-// claim on it is a valid answer to "what is on this filer?", where GET
+// the build, MATERIALISED, independent of whether a claim joined it. It is
+// what lets the storage-flow graph draw a flowless root — a degraded aggregate
+// with no claim on it is a valid answer to "what is on this filer?", where GET
 // /v1/graph's join-only rule would show nothing.
 //
-// Each slice is sorted (by ONTAP cluster, then name) and de-duplicated, so the
-// inventory is a pure function of the vectors rather than of their order (D6).
+// The entries are fully-built nodes rather than bare identities so a flowless
+// entity and a joined one cannot disagree about their attributes: the join
+// lists (netappResult.aggrs / .nodes) SELECT from this set rather than
+// constructing a second copy, so `data.health`, `data.usage`, `data.hardware`
+// and `data.perf` are resolved exactly once, in one place.
+//
+// Each slice is sorted by node id and de-duplicated, so the inventory is a pure
+// function of the vectors rather than of their order (D6).
 //
 // Sources, deliberately different per entity kind:
 //   - Nodes — volume_labels' `node`, plus node_new_status, node_labels and the
@@ -122,9 +102,9 @@ type NetAppInventoryNode struct {
 //     SVM, and the QoS workload families' `svm` is a scope test rather than an
 //     identity statement (design.md D9 re-keyed the ceiling's svm onto hop A).
 type NetAppInventory struct {
-	Nodes []NetAppInventoryNode
-	Aggrs []NetAppInventoryAggr
-	SVMs  []NetAppInventorySVM
+	Nodes []*graph.NetAppNode
+	Aggrs []*graph.NetAppAggrNode
+	SVMs  []*graph.NetAppSVMNode
 }
 
 // Empty reports whether the Harvest read named no NetApp entity at all — the
@@ -133,7 +113,18 @@ func (i NetAppInventory) Empty() bool {
 	return len(i.Nodes) == 0 && len(i.Aggrs) == 0 && len(i.SVMs) == 0
 }
 
+// netappIndexes is the inventory keyed for lookup. The join path selects its
+// own (narrower) node set from these maps, which is what makes "a joined and a
+// flowless aggregate carry identical attributes" structural rather than a rule
+// two construction sites have to keep agreeing on.
+type netappIndexes struct {
+	aggrByKey map[aggrKey]*graph.NetAppAggrNode
+	nodeByKey map[nodeKey]*graph.NetAppNode
+	inventory NetAppInventory
+}
+
 type aggrKey struct{ oc, aggr string }
+type svmKey struct{ oc, svm string }
 type nodeKey struct{ oc, node string }
 type policyKey struct{ oc, svm, policy string }
 
@@ -160,7 +151,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	aggrStatus, aggrUsed, aggrTotal := v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal
 	nodeStatus := v.NetAppNodeStatus
 
-	out := netappResult{svmByPVC: map[string]string{}}
+	out := netappResult{svmByPVC: map[string]SVMRef{}}
 
 	// One pass over the Harvest vector resolves every claim. The join is
 	// derive-then-match, not equality: ONTAP volume names admit no `-`, so a
@@ -246,9 +237,9 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		// filer it landed on: both the QoS scope test and the hop-C ceiling key
 		// pair the two, and a cross-filer mismatch would silently attach a
 		// foreign tenant's ceiling.
-		svm := pickSVM(cands, oc)
+		svmOC, svm := pickSVM(cands, oc)
 		if svm != "" {
-			out.svmByPVC[c.id] = svm
+			out.svmByPVC[c.id] = SVMRef{ONTAPCluster: svmOC, SVM: svm}
 		}
 		if oc == "" || aggr == "" {
 			if topoPresent {
@@ -295,37 +286,28 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		}
 	}
 
-	aggrHealth := healthByAggr(aggrStatus)
-	aggrUsage := usageByAggr(aggrUsed, aggrTotal)
-	nodeHealth := healthByNode(nodeStatus)
-	nodeHardware := hardwareByNode(v.NetAppNodeLabels)
-	nodePerf := perfByNode(v)
+	// Every NetApp node is constructed ONCE, here, for the whole inventory. The
+	// join lists below then SELECT from it, so a flowless aggregate (a
+	// storage-flow root) and a joined one are literally the same object and
+	// cannot disagree about health, usage, hardware or perf.
+	//
+	// It is built after allByAggr so the aggregate owner comes from the same
+	// pickOwner vote the join uses — a root aggregate and a joined one must not
+	// disagree about which controller currently serves them.
+	idx := buildNetAppIndexes(volIndex, allByAggr, v,
+		healthByAggr(aggrStatus), usageByAggr(aggrUsed, aggrTotal),
+		healthByNode(nodeStatus), hardwareByNode(v.NetAppNodeLabels), perfByNode(v))
+	out.inventory = idx.inventory
 
+	// The join-only half: the aggregates claims actually landed on, and the
+	// controllers those aggregates name as their owner. `hits` iterates in map
+	// order, so nothing here may depend on which claim is seen first — every
+	// value comes from the order-free index (D6).
 	aggrSeen := map[aggrKey]*graph.NetAppAggrNode{}
 	for _, hit := range hits {
-		k := aggrKey{hit.oc, hit.aggr}
-		if _, ok := aggrSeen[k]; ok {
-			continue
+		if a, ok := idx.aggrByKey[aggrKey{hit.oc, hit.aggr}]; ok {
+			aggrSeen[aggrKey{hit.oc, hit.aggr}] = a
 		}
-		// pickOwner over allByAggr[k] is a superset of this claim's own
-		// candidates for the same (cluster, aggr), so no per-claim fallback is
-		// needed — and none may exist: `hits` iterates in map order, so a
-		// fallback would make labels.node arrival-order dependent (D6).
-		labels := map[string]string{"ontap_cluster": hit.oc}
-		// The owner key is set only when it resolves non-empty — same rule as
-		// the PVC volumename/svm labels. An owner-less aggregate falls back to
-		// the storage-cluster compound group in the serialiser.
-		if owner := pickOwner(allByAggr[k], hit.oc, hit.aggr); owner != "" {
-			labels["node"] = owner
-		}
-		n := &graph.NetAppAggrNode{
-			IDValue:     graph.NetAppAggrID(hit.oc, hit.aggr),
-			NameValue:   hit.aggr,
-			LabelsValue: labels,
-			HealthValue: aggrHealth[k],
-			UsageValue:  aggrUsage[k],
-		}
-		aggrSeen[k] = n
 	}
 
 	nodeSeen := map[nodeKey]*graph.NetAppNode{}
@@ -334,17 +316,8 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		if oc == "" || node == "" {
 			continue
 		}
-		nk := nodeKey{oc, node}
-		if _, ok := nodeSeen[nk]; ok {
-			continue
-		}
-		nodeSeen[nk] = &graph.NetAppNode{
-			IDValue:       graph.NetAppNodeID(oc, node),
-			NameValue:     node,
-			LabelsValue:   map[string]string{"ontap_cluster": oc},
-			HealthValue:   nodeHealth[nk],
-			HardwareValue: nodeHardware[nk],
-			PerfValue:     nodePerf[nk],
+		if n, ok := idx.nodeByKey[nodeKey{oc, node}]; ok {
+			nodeSeen[nodeKey{oc, node}] = n
 		}
 	}
 
@@ -352,21 +325,13 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	for _, a := range aggrSeen {
 		out.aggrs = append(out.aggrs, a)
 	}
-	sort.Slice(out.aggrs, func(i, j int) bool { return out.aggrs[i].ID() < out.aggrs[j].ID() })
+	sortByID(out.aggrs)
 
 	out.nodes = make([]*graph.NetAppNode, 0, len(nodeSeen))
 	for _, n := range nodeSeen {
 		out.nodes = append(out.nodes, n)
 	}
-	sort.Slice(out.nodes, func(i, j int) bool { return out.nodes[i].ID() < out.nodes[j].ID() })
-
-	// The inventory is collected from allByAggr (already the whole volume_labels
-	// population, not just the joining claims') plus the gauge and counter
-	// legs, so it names entities no claim reached. It is deliberately built
-	// AFTER allByAggr so the aggregate owner comes from the same pickOwner
-	// vote the join uses — a root aggregate and a joined one must not disagree
-	// about which controller currently serves them.
-	out.inventory = collectNetAppInventory(volIndex, allByAggr, v)
+	sortByID(out.nodes)
 
 	seenEdge := map[[2]string]bool{}
 	for _, c := range claims {
@@ -390,23 +355,33 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	return out
 }
 
-// collectNetAppInventory gathers every NetApp entity the Harvest read named,
-// join-independent (design.md D2). It is a pure function of the vectors: each
-// set is accumulated insert-only and then sorted, so upstream order cannot
-// reach the output.
+// buildNetAppIndexes materialises every NetApp entity the Harvest read named,
+// join-independent (design.md D2), and returns them both as sorted slices and
+// keyed for lookup. It is a pure function of the vectors: each set is
+// accumulated insert-only and then sorted, so upstream order cannot reach the
+// output.
 //
 // volIndex supplies the volume-derived half (a controller, aggregate or SVM
 // named by any volume_labels series); the gauge and counter legs supply
 // entities that carry no volume at all — an empty aggregate, or a controller
 // whose only trace in the window is its status or CPU counter.
-func collectNetAppInventory(
+//
+// The attribute lookups are passed in rather than re-derived so this is the
+// ONE place a NetApp node is constructed; the join path selects from the
+// result.
+func buildNetAppIndexes(
 	volIndex map[string][]volumeLabelCandidate,
 	allByAggr map[aggrKey][]volumeLabelCandidate,
 	v topologyVectors,
-) NetAppInventory {
+	aggrHealth map[aggrKey]string,
+	aggrUsage map[aggrKey]*graph.UsageBytes,
+	nodeHealth map[nodeKey]string,
+	nodeHardware map[nodeKey]*graph.Hardware,
+	nodePerf map[nodeKey]*graph.NodePerf,
+) netappIndexes {
 	nodes := map[nodeKey]struct{}{}
 	aggrs := map[aggrKey]struct{}{}
-	svms := map[NetAppInventorySVM]struct{}{}
+	svms := map[svmKey]struct{}{}
 
 	for _, cands := range volIndex {
 		for _, c := range cands {
@@ -420,7 +395,7 @@ func collectNetAppInventory(
 				aggrs[aggrKey{c.ontapCluster, c.aggr}] = struct{}{}
 			}
 			if c.svm != "" {
-				svms[NetAppInventorySVM{c.ontapCluster, c.svm}] = struct{}{}
+				svms[svmKey{c.ontapCluster, c.svm}] = struct{}{}
 			}
 		}
 	}
@@ -433,8 +408,8 @@ func collectNetAppInventory(
 		v.NetAppNodeCPUBusy, v.NetAppNodeTotalOps,
 		v.NetAppNodeTotalLatency, v.NetAppNodeTotalData,
 	} {
-		for _, s := range vec {
-			oc, node := string(s.Metric["cluster"]), string(s.Metric["node"])
+		for _, sample := range vec {
+			oc, node := string(sample.Metric["cluster"]), string(sample.Metric["node"])
 			if oc == "" || node == "" {
 				continue
 			}
@@ -442,13 +417,13 @@ func collectNetAppInventory(
 		}
 	}
 
-	// Aggregate-scoped legs. These also name the owning controller on the
+	// Aggregate-scoped legs. These also carry the owning controller on the
 	// aggr_* families, but that label is NOT read as an owner statement: the
 	// owner is decided by pickOwner over the volume series alone, so a joined
 	// and a flowless aggregate cannot disagree about it.
 	for _, vec := range []model.Vector{v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal} {
-		for _, s := range vec {
-			oc, aggr := string(s.Metric["cluster"]), string(s.Metric["aggr"])
+		for _, sample := range vec {
+			oc, aggr := string(sample.Metric["cluster"]), string(sample.Metric["aggr"])
 			if oc == "" || aggr == "" {
 				continue
 			}
@@ -456,44 +431,65 @@ func collectNetAppInventory(
 		}
 	}
 
-	out := NetAppInventory{
-		Nodes: make([]NetAppInventoryNode, 0, len(nodes)),
-		Aggrs: make([]NetAppInventoryAggr, 0, len(aggrs)),
-		SVMs:  make([]NetAppInventorySVM, 0, len(svms)),
+	out := netappIndexes{
+		aggrByKey: make(map[aggrKey]*graph.NetAppAggrNode, len(aggrs)),
+		nodeByKey: make(map[nodeKey]*graph.NetAppNode, len(nodes)),
 	}
 	for k := range nodes {
-		out.Nodes = append(out.Nodes, NetAppInventoryNode{ONTAPCluster: k.oc, Node: k.node})
+		out.nodeByKey[k] = &graph.NetAppNode{
+			IDValue:       graph.NetAppNodeID(k.oc, k.node),
+			NameValue:     k.node,
+			LabelsValue:   map[string]string{"ontap_cluster": k.oc},
+			HealthValue:   nodeHealth[k],
+			HardwareValue: nodeHardware[k],
+			PerfValue:     nodePerf[k],
+		}
 	}
 	for k := range aggrs {
-		out.Aggrs = append(out.Aggrs, NetAppInventoryAggr{
-			ONTAPCluster: k.oc,
-			Aggr:         k.aggr,
-			Owner:        pickOwner(allByAggr[k], k.oc, k.aggr),
-		})
-	}
-	for k := range svms {
-		out.SVMs = append(out.SVMs, k)
+		labels := map[string]string{"ontap_cluster": k.oc}
+		// The owner key is set only when it resolves non-empty — same rule as
+		// the PVC volumename/svm labels. An owner-less aggregate falls back to
+		// the storage-cluster compound group in the serialiser.
+		if owner := pickOwner(allByAggr[k], k.oc, k.aggr); owner != "" {
+			labels["node"] = owner
+		}
+		out.aggrByKey[k] = &graph.NetAppAggrNode{
+			IDValue:     graph.NetAppAggrID(k.oc, k.aggr),
+			NameValue:   k.aggr,
+			LabelsValue: labels,
+			HealthValue: aggrHealth[k],
+			UsageValue:  aggrUsage[k],
+		}
 	}
 
-	sort.Slice(out.Nodes, func(i, j int) bool {
-		if out.Nodes[i].ONTAPCluster != out.Nodes[j].ONTAPCluster {
-			return out.Nodes[i].ONTAPCluster < out.Nodes[j].ONTAPCluster
-		}
-		return out.Nodes[i].Node < out.Nodes[j].Node
-	})
-	sort.Slice(out.Aggrs, func(i, j int) bool {
-		if out.Aggrs[i].ONTAPCluster != out.Aggrs[j].ONTAPCluster {
-			return out.Aggrs[i].ONTAPCluster < out.Aggrs[j].ONTAPCluster
-		}
-		return out.Aggrs[i].Aggr < out.Aggrs[j].Aggr
-	})
-	sort.Slice(out.SVMs, func(i, j int) bool {
-		if out.SVMs[i].ONTAPCluster != out.SVMs[j].ONTAPCluster {
-			return out.SVMs[i].ONTAPCluster < out.SVMs[j].ONTAPCluster
-		}
-		return out.SVMs[i].SVM < out.SVMs[j].SVM
-	})
+	out.inventory = NetAppInventory{
+		Nodes: make([]*graph.NetAppNode, 0, len(out.nodeByKey)),
+		Aggrs: make([]*graph.NetAppAggrNode, 0, len(out.aggrByKey)),
+		SVMs:  make([]*graph.NetAppSVMNode, 0, len(svms)),
+	}
+	for _, n := range out.nodeByKey {
+		out.inventory.Nodes = append(out.inventory.Nodes, n)
+	}
+	for _, a := range out.aggrByKey {
+		out.inventory.Aggrs = append(out.inventory.Aggrs, a)
+	}
+	for k := range svms {
+		out.inventory.SVMs = append(out.inventory.SVMs, &graph.NetAppSVMNode{
+			IDValue:     graph.NetAppSVMID(k.oc, k.svm),
+			NameValue:   k.svm,
+			LabelsValue: map[string]string{"ontap_cluster": k.oc},
+		})
+	}
+	sortByID(out.inventory.Nodes)
+	sortByID(out.inventory.Aggrs)
+	sortByID(out.inventory.SVMs)
 	return out
+}
+
+// sortByID orders any slice of graph nodes by id, so every inventory slice is a
+// pure function of the set rather than of map iteration.
+func sortByID[T graph.GraphNode](nodes []T) {
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID() < nodes[j].ID() })
 }
 
 // qosCandidatesFor gathers the QoS candidates of every FlexVol name a claim
@@ -651,17 +647,30 @@ func pickOwner(cands []volumeLabelCandidate, oc, aggr string) string {
 // carrying both labels): there is then neither an edge nor a ceiling, so there
 // is no filer to scope to and the pick stays over every candidate — a FlexGroup
 // claim still gains its `svm` label.
-func pickSVM(cands []volumeLabelCandidate, oc string) string {
-	var svm string
+// It returns the SVM together with the ONTAP cluster the winning candidate sat
+// on. When oc is non-empty that is oc by construction (the scope guarantees
+// it); when it is empty — the FlexGroup shape — the returned cluster is the
+// lexically-smallest one among the candidates carrying the winning SVM name.
+// The storage-flow graph needs it: an SVM node id is cluster-qualified, and a
+// FlexGroup claim enters the chain AT the SVM, so there is no aggregate to
+// borrow the cluster from.
+func pickSVM(cands []volumeLabelCandidate, oc string) (string, string) {
+	var svm, svmOC string
 	for _, c := range cands {
 		if c.svm == "" || (oc != "" && c.ontapCluster != oc) {
 			continue
 		}
-		if svm == "" || c.svm < svm {
-			svm = c.svm
+		switch {
+		case svm == "" || c.svm < svm:
+			svm, svmOC = c.svm, c.ontapCluster
+		case c.svm == svm && c.ontapCluster < svmOC:
+			// The same SVM name on two filers — only reachable unscoped, i.e.
+			// for a FlexGroup claim. Pick deterministically rather than by
+			// vector order.
+			svmOC = c.ontapCluster
 		}
 	}
-	return svm
+	return svmOC, svm
 }
 
 // pickPolicy resolves the hop-B component of the ceiling key: the

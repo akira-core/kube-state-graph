@@ -224,6 +224,71 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	return g, nil
 }
 
+// BuildStorage builds the storage-flow graph served by GET /v1/storage-graph.
+//
+// It reuses ReadTopology unchanged — byte-for-byte the same fan-out, under the
+// same selector — so the two endpoints cannot disagree about what a claim, a
+// pod or an aggregate is. What it does NOT do is read the service graph: the
+// storage body uses none of it, and those three legs are the most expensive of
+// the fan-out.
+//
+// Like Build it is a pure function of (window, end, Selector): roots never
+// reach the queries, so the build stays cacheable on the same key and the
+// "selectors alone narrow the upstream" rule holds. Roots are a projection
+// concern (graph.ProjectStorage).
+//
+// There is deliberately no outside-retention classification and no up{} probe.
+// The endpoint requires az and env, so every storage build is a FILTERED build,
+// and the existing filtered-build rule already says an empty result is an empty
+// 200 rather than a retention error — which is also what makes "a root the
+// upstream does not name is simply not drawn" true.
+func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+	q := b.querierFor(sel)
+	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
+		trace.WithAttributes(
+			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
+			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
+			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
+		),
+	)
+	defer span.End()
+
+	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
+	if err != nil {
+		return nil, classifyReadError(span, "topology read failed", err)
+	}
+
+	nodes, edges := assembleStorageFlow(topology)
+	// Same "bake before freeze" point as Build: the overlay must reach this
+	// endpoint identically, since it is resolved onto the graph rather than by
+	// a projection.
+	attachAlerts(ctx, nodes, topology)
+	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
+	g.ClusterIdentities = topology.ClusterIdentities
+
+	edgeCounts := g.EdgeCountByType()
+	slog.InfoContext(ctx, "storage graph built",
+		"clusters", topology.ClustersObserved,
+		"nodes", len(g.NodesByID),
+		"edges", len(g.Edges),
+		"start", end.Add(-window).UTC().Format(time.RFC3339),
+		"end", end.UTC().Format(time.RFC3339),
+	)
+
+	if b.metrics != nil {
+		b.metrics.SetGraphNodeCounts(g.NodeCountByKind())
+		b.metrics.SetGraphEdgeCounts(edgeCounts)
+		b.metrics.SetClustersObserved(len(topology.ClustersObserved))
+	}
+
+	span.SetAttributes(
+		attribute.Int("kube_state_graph.cluster_count", len(topology.ClustersObserved)),
+		attribute.Int("graph.node.count", len(g.NodesByID)),
+		attribute.Int("graph.edge.count", len(g.Edges)),
+	)
+	return g, nil
+}
+
 // classifyReadError maps an upstream read failure to a typed build error and
 // records it on the build span. context.Canceled (client disconnect) is NOT a
 // server/upstream fault: it is recorded as a span event but does not set the

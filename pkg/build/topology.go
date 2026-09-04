@@ -24,6 +24,14 @@ type PodPVCBinding struct {
 	PVCID string
 }
 
+// SVMRef is a claim's resolved SVM, qualified by the ONTAP cluster it lives on.
+// SVM names are unique within a cluster but not across filers, so the pair is
+// the identity — and the pair is what NetAppSVMID needs.
+type SVMRef struct {
+	ONTAPCluster string
+	SVM          string
+}
+
 // podKey groups pod samples by their cluster-scoped namespace/name. Multiple
 // UIDs under one key indicate restarts.
 type podKey struct{ cluster, namespace, pod string }
@@ -92,11 +100,11 @@ type Topology struct {
 	Alerts model.Vector
 
 	// SVMByPVC maps a PVC node id to the SVM its FlexVol lives in, as resolved
-	// by hop A. The same value is already stamped on the PVC's `svm` label; it
-	// is surfaced here as well because the storage-flow assembler needs the
-	// (claim → SVM) edge without re-deriving it from a label, and because a
-	// label is a presentation fact while this is a join result.
-	SVMByPVC map[string]string
+	// by hop A. The PVC's `svm` LABEL carries only the name; this carries the
+	// ONTAP cluster with it, which the storage-flow assembler needs because an
+	// SVM node id is cluster-qualified and a FlexGroup claim — entering the
+	// chain AT the SVM — has no aggregate to borrow the cluster from.
+	SVMByPVC map[string]SVMRef
 
 	// PodsByUID indexes every pod in Pods by its raw Kubernetes UID (without
 	// the cluster prefix). K8s pod UIDs are UUIDv4 and unique across clusters
@@ -948,8 +956,8 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	}
 	netapp := resolveNetAppStorage(claims, v)
 	for _, pv := range pvcs {
-		if svm := netapp.svmByPVC[pv.IDValue]; svm != "" {
-			pv.LabelsValue["svm"] = svm
+		if ref, ok := netapp.svmByPVC[pv.IDValue]; ok && ref.SVM != "" {
+			pv.LabelsValue["svm"] = ref.SVM
 		}
 	}
 

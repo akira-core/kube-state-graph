@@ -222,6 +222,16 @@ func TestResolveNetAppStorage_PerfDuplicateSeriesIsOrderFree(t *testing.T) {
 
 // --- inventory ------------------------------------------------------------
 
+// nodeIDsOf projects any inventory slice to its ids, which is what the
+// order-and-membership assertions below actually care about.
+func nodeIDsOf[T graph.GraphNode](nodes []T) []string {
+	out := make([]string, len(nodes))
+	for i, n := range nodes {
+		out[i] = n.ID()
+	}
+	return out
+}
+
 // The inventory is JOIN-INDEPENDENT: it names entities no claim reached, which
 // is what lets the storage-flow graph draw a flowless root. The join-only
 // NetAppAggrs / NetAppNodes lists stay narrow so GET /v1/graph is unchanged.
@@ -245,20 +255,34 @@ func TestCollectNetAppInventory_NamesEntitiesNoClaimReached(t *testing.T) {
 	}.run()
 
 	inv := res.inventory
-	assert.Equal(t, []NetAppInventoryNode{
-		{ONTAPCluster: "oc", Node: "n1"},
-		{ONTAPCluster: "oc", Node: "n2"},
-		{ONTAPCluster: "oc", Node: "n4"},
-	}, inv.Nodes, "a controller named by any leg is inventoried; n3 is only an aggr label, not a node one")
-	assert.Equal(t, []NetAppInventoryAggr{
-		{ONTAPCluster: "oc", Aggr: "a1", Owner: "n1"},
-		{ONTAPCluster: "oc", Aggr: "a2", Owner: "n2"},
-		{ONTAPCluster: "oc", Aggr: "a9"},
-	}, inv.Aggrs, "a9 is named only by the status gauge, so it has no volume-derived owner")
-	assert.Equal(t, []NetAppInventorySVM{
-		{ONTAPCluster: "oc", SVM: "svm0"},
-		{ONTAPCluster: "oc", SVM: "svm_other"},
-	}, inv.SVMs)
+	assert.Equal(t, []string{
+		graph.NetAppNodeID("oc", "n1"),
+		graph.NetAppNodeID("oc", "n2"),
+		graph.NetAppNodeID("oc", "n4"),
+	}, nodeIDsOf(inv.Nodes),
+		"a controller named by any leg is inventoried; n3 is only an aggr label, not a node one")
+	assert.Equal(t, []string{
+		graph.NetAppAggrID("oc", "a1"),
+		graph.NetAppAggrID("oc", "a2"),
+		graph.NetAppAggrID("oc", "a9"),
+	}, nodeIDsOf(inv.Aggrs))
+	assert.Equal(t, []string{
+		graph.NetAppSVMID("oc", "svm0"),
+		graph.NetAppSVMID("oc", "svm_other"),
+	}, nodeIDsOf(inv.SVMs))
+
+	// The owner label comes from the same pickOwner vote the join uses, so a
+	// flowless aggregate and a joined one cannot disagree about it. a9 is named
+	// only by the status gauge, so no volume series states an owner for it.
+	assert.Equal(t, "n1", inv.Aggrs[0].Labels()["node"])
+	assert.Equal(t, "n2", inv.Aggrs[1].Labels()["node"])
+	assert.NotContains(t, inv.Aggrs[2].Labels(), "node")
+
+	// A joined aggregate is the SAME OBJECT as its inventory entry — that is
+	// what makes "a root and a joined entity carry identical attributes"
+	// structural rather than two construction sites agreeing by convention.
+	assert.Same(t, inv.Aggrs[0], res.aggrs[0])
+	assert.Same(t, inv.Nodes[0], res.nodes[0])
 
 	// The join-only lists stay narrow — this is what keeps /v1/graph unchanged.
 	require.Len(t, res.aggrs, 1)
@@ -289,11 +313,11 @@ func TestCollectNetAppInventory_OrderFree(t *testing.T) {
 	}.run()
 
 	assert.Equal(t, fwd.inventory, rev.inventory)
-	// And it is genuinely sorted by (ontap cluster, name), not merely stable.
-	assert.Equal(t, []NetAppInventorySVM{
-		{ONTAPCluster: "oc-a", SVM: "svm_a"},
-		{ONTAPCluster: "oc-b", SVM: "svm_b"},
-	}, fwd.inventory.SVMs)
+	// And it is genuinely sorted by node id, not merely stable.
+	assert.Equal(t, []string{
+		graph.NetAppSVMID("oc-a", "svm_a"),
+		graph.NetAppSVMID("oc-b", "svm_b"),
+	}, nodeIDsOf(fwd.inventory.SVMs))
 }
 
 // A non-NetApp deployment reads no Harvest series at all, so the inventory is
@@ -319,8 +343,8 @@ func TestCollectNetAppInventory_SkipsIncompleteKeys(t *testing.T) {
 		aggrStatus: sampleVec(model.Sample{Metric: model.Metric{"cluster": "oc"}, Value: 1}),
 	}.run()
 
-	assert.Equal(t, []NetAppInventoryNode{{ONTAPCluster: "oc", Node: "n1"}}, res.inventory.Nodes)
-	assert.Equal(t, []NetAppInventoryAggr{{ONTAPCluster: "oc", Aggr: "a1", Owner: "n1"}}, res.inventory.Aggrs)
+	assert.Equal(t, []string{graph.NetAppNodeID("oc", "n1")}, nodeIDsOf(res.inventory.Nodes))
+	assert.Equal(t, []string{graph.NetAppAggrID("oc", "a1")}, nodeIDsOf(res.inventory.Aggrs))
 }
 
 // --- Topology plumbing ----------------------------------------------------
@@ -377,10 +401,14 @@ func TestParseTopology_InventoryDoesNotDisturbTheJoin(t *testing.T) {
 	assert.Len(t, tp.NetAppInventory.Aggrs, 2)
 	assert.Len(t, tp.NetAppInventory.SVMs, 2)
 
-	// SVMByPVC mirrors the label rather than replacing it.
+	// SVMByPVC mirrors the label and adds the ONTAP cluster the label cannot
+	// carry — which is what a FlexGroup claim, entering the chain at the SVM,
+	// has no aggregate to supply.
 	require.Len(t, tp.PVCs, 1)
 	assert.Equal(t, "svm_prod", tp.PVCs[0].Labels()["svm"])
-	assert.Equal(t, map[string]string{tp.PVCs[0].ID(): "svm_prod"}, tp.SVMByPVC)
+	assert.Equal(t, map[string]SVMRef{
+		tp.PVCs[0].ID(): {ONTAPCluster: "oc", SVM: "svm_prod"},
+	}, tp.SVMByPVC)
 }
 
 // Each of the five new legs is OPTIONAL: a query error degrades log-and-continue
