@@ -349,6 +349,70 @@ func TestProjectStorage_FlexGroupClaimStartsAtSVM(t *testing.T) {
 	}
 }
 
+// The assembler stamps claim_aggr on every claim that has an aggregate, so a
+// FlexGroup claim sharing its SVM with a FlexVol claim is the one unstamped
+// svm-pvc edge, and the SVM's single incoming aggr-svm belongs to the FlexVol
+// claim. The FlexGroup claim must not borrow it.
+func TestProjectStorage_FlexGroupSharingSVMBorrowsNoAggregate(t *testing.T) {
+	ctrl, aggr, svm := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	orders, big := stPVC("shop", "orders-data"), stPVC("shop", "big-data")
+	podA, podB := stPod("shop", "orders-0", "uid-1", "worker-1"), stPod("shop", "big-0", "uid-2", "worker-2")
+	n1, n2 := stNode("worker-1"), stNode("worker-2")
+	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), orders.ID(), podA.ID(), n1.ID(), stIO(100), 1)
+	edges = append(edges, stChain("", "", svm.ID(), big.ID(), podB.ID(), n2.ID(), stIO(40), 1)...)
+	g := stGraph([]GraphNode{ctrl, aggr, svm, orders, big, podA, podB, n1, n2}, edges)
+
+	t.Run("pod root draws no aggregate", func(t *testing.T) {
+		v := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/big-0"}))
+		ids := viewIDs(v)
+		assert.False(t, ids[aggr.ID()], "FlexGroup claim borrowed the FlexVol claim's aggregate")
+		assert.False(t, ids[ctrl.ID()])
+		assert.Equal(t, []string{
+			"pod-node " + podB.ID() + " -> " + n2.ID(),
+			"pvc-pod " + big.ID() + " -> " + podB.ID(),
+			"svm-pvc " + svm.ID() + " -> " + big.ID(),
+		}, sortedTiers(v))
+	})
+
+	t.Run("aggregate root keeps only its own claim", func(t *testing.T) {
+		v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1"}, nil, nil))
+		ids := viewIDs(v)
+		assert.True(t, ids[orders.ID()])
+		assert.False(t, ids[big.ID()], "FlexGroup claim retained under ?aggr=aggr1")
+		assert.False(t, ids[podB.ID()])
+	})
+
+	t.Run("aggregate hops weigh only the FlexVol claim", func(t *testing.T) {
+		v := ProjectStorage(g, StorageScope{})
+		for _, hop := range []*Edge{edgeBetween(v, aggr.ID(), svm.ID()), edgeBetween(v, ctrl.ID(), aggr.ID())} {
+			require.NotNil(t, hop)
+			require.NotNil(t, hop.IO)
+			assert.InDelta(t, 100.0, *hop.IO.ReadOps, 1e-12, "%s carries the FlexGroup claim's I/O", hop.Labels["tier"])
+		}
+	})
+}
+
+// A hand-built graph that stamps no claim at all still resolves a claim whose
+// SVM has exactly one incoming aggr-svm — the fallback kept for embedders.
+func TestProjectStorage_UnstampedGraphFallsBackToTheSVMsOnlyAggregate(t *testing.T) {
+	ctrl, aggr, svm := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	pvc, pod, node := stPVC("shop", "orders-data"), stPod("shop", "orders-0", "uid-1", "worker-1"), stNode("worker-1")
+	edges := []*Edge{
+		stHop(StorageTierNodeAggr, ctrl.ID(), aggr.ID(), nil, nil),
+		stHop(StorageTierAggrSVM, aggr.ID(), svm.ID(), nil, nil),
+		stHop(StorageTierSVMPVC, svm.ID(), pvc.ID(), nil, stIO(100)),
+		stHop(StorageTierPVCPod, pvc.ID(), pod.ID(), nil, nil),
+		stHop(StorageTierPodNode, pod.ID(), node.ID(), nil, nil),
+	}
+	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pod, node}, edges)
+
+	v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1"}, nil, nil))
+	ids := viewIDs(v)
+	assert.True(t, ids[pvc.ID()], "unstamped claim not recovered through the SVM's only aggregate")
+	assert.True(t, ids[pod.ID()])
+	assert.Len(t, v.Edges, 5)
+}
+
 func TestProjectStorage_ClaimAggrLabelStrippedFromView(t *testing.T) {
 	v := ProjectStorage(twoClaimsOnAggr1(), StorageScope{})
 	for _, e := range v.Edges {

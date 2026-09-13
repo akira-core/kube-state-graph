@@ -225,6 +225,13 @@ func extractFlowUnits(g *Graph) []flowUnit {
 		nodeOf[e.Source] = e
 	}
 
+	// The assembler stamps claim_aggr on every claim that has an aggregate, so
+	// once one claim carries it an unstamped claim is FlexGroup-shaped, not a
+	// hand-built graph that omitted the key.
+	stamped := slices.ContainsFunc(svmPVC, func(e *Edge) bool {
+		return e.Labels[ClaimAggrLabel] != ""
+	})
+
 	out := make([]flowUnit, 0, len(svmPVC))
 	for _, claim := range svmPVC {
 		pvcID, svmID := claim.Target, claim.Source
@@ -236,7 +243,7 @@ func extractFlowUnits(g *Graph) []flowUnit {
 			// no flow unit.
 			continue
 		}
-		aggrID := claimAggrOf(claim, incomingAggr[svmID])
+		aggrID := claimAggrOf(claim, incomingAggr[svmID], stamped)
 		ctrlID := ownerOf[aggrID]
 		for _, pe := range mounters {
 			u := flowUnit{
@@ -300,15 +307,17 @@ func cmpUnit(a, b flowUnit) int {
 }
 
 // claimAggrOf recovers the claim's aggregate. The assembler stamps it on the
-// svm-pvc edge; a unique incoming aggr-svm is the fallback for hand-built
-// graphs that omitted the key. Several incoming hops with no stamp cannot be
-// disambiguated — the claim is treated as FlexGroup-shaped (no aggr) rather
-// than guessed.
-func claimAggrOf(claim *Edge, incoming []*Edge) string {
+// svm-pvc edge of every claim that has one, so in a stamped graph an unstamped
+// claim is FlexGroup-shaped (no aggr) — even when its SVM has a single incoming
+// aggr-svm, which then belongs to another claim in the same SVM. A unique
+// incoming aggr-svm is the fallback only for a hand-built graph that stamps no
+// claim at all. Several incoming hops with no stamp cannot be disambiguated —
+// the claim is treated as FlexGroup-shaped rather than guessed.
+func claimAggrOf(claim *Edge, incoming []*Edge, stamped bool) string {
 	if id := claim.Labels[ClaimAggrLabel]; id != "" {
 		return id
 	}
-	if len(incoming) == 1 {
+	if !stamped && len(incoming) == 1 {
 		return incoming[0].Source
 	}
 	return ""

@@ -18,7 +18,7 @@ See proposal.md — Why. The current state that shapes the approach:
 
 **Non-Goals:**
 
-- Changing `ProjectStorage`, `claimAggrOf` or the `claim_aggr` key.
+- Changing `ProjectStorage`'s input contract or the `claim_aggr` key. `claimAggrOf` changes only where its fallback contradicts the FlexGroup scenario (D4).
 - Attributing a FlexGroup claim to aggregates; it keeps no `aggr`.
 - Any new query, edge type, tier, or label on an edge.
 - Client behaviour; that is the frontend change `sankey-svm-grouping`.
@@ -45,15 +45,18 @@ Stamping in the topology gives `/v1/graph` the label too, where it restates the 
 
 _Alternative — stamp only in `assembleStorageFlow`._ Rejected: the same PVC would carry different labels per endpoint, against the `storage-graph-api` rule that retained nodes carry what they carry in `/v1/graph`, and the reusable engine would need an endpoint-specific copy of each PVC. A label restating an edge already has precedent: pod `labels.node` beside `pod-to-node`.
 
-### D4. Keep `claim_aggr` and `claimAggrOf` unchanged
+### D4. Keep `claim_aggr`; narrow `claimAggrOf`'s fallback to unstamped graphs
 
 The projection keeps reading the edge-stamped key. It and the new label come from `netappResult.edges` in the same build, so they cannot disagree.
+
+The fallback is narrowed; review found it contradicting two scenarios of this change. The assembler leaves `claim_aggr` off a FlexGroup claim's `svm-pvc` edge, so `claimAggrOf` fell back to the SVM's single incoming `aggr-svm` for it — and when that hop belongs to a FlexVol claim in the same SVM, the FlexGroup claim inherited its aggregate: `?pod=` drew `node-aggr` / `aggr-svm` for it, `?aggr=` retained a PVC with no `labels.aggr`, and its I/O was summed onto the aggregate's hops. That breaks "A FlexGroup claim names no aggregate" and "A storage root keeps each claim's own aggregate". The assembler stamps every claim that has an aggregate, so the fallback now applies only when no `svm-pvc` edge in the graph carries the key — a hand-built graph. The input contract and the embedder fallback the alternative below protects are unchanged. An assembled graph holding only FlexGroup claims has no `aggr-svm` hop for the fallback to find, so the graph-wide test is exact there too.
 
 _Alternative — have `ProjectStorage` read the PVC label and drop `claim_aggr`._ It would remove an internal key, but it changes the projection's input contract and its fallback for hand-built graphs — embedders of the reusable engine can build a graph whose PVCs carry no labels at all — for no change on the wire. The comment on `ClaimAggrLabel` gains a pointer to the public PVC label; its "never appears on the wire" still holds for the edge key.
 
 ### D5. Tests pin the contract where it can drift
 
 - **Unit** (`pkg/build`): a resolved claim's label equals its edge target; with conflicting matched series it equals the picked target; a FlexGroup claim has `svm`, no `aggr` and no edge; a join miss, a claim with no `volumename` and a window without Harvest have no `aggr`; an empty `svm` leaves `aggr` set with no `svm`; no PVC has more than one `pvc-to-netapp-aggr` edge.
+- **Projection** (`pkg/graph`, and the FlexVol + FlexGroup storage-flow test carried through `ProjectStorage`): a FlexGroup claim sharing an SVM with a FlexVol claim draws no `node-aggr` / `aggr-svm` hop under `?pod=`, is not retained under `?aggr=`, and adds nothing to the aggregate's hop weights; a graph that stamps no claim still falls back to the SVM's only aggregate.
 - **Golden**: refresh with `go test ./internal/api/ -update -run Golden`. The bar for review is a diff that only adds `"aggr"` to PVC nodes.
 - **Integration**: extend the storage-graph e2e fixture so `svm_shop` holds a second mounted claim on `aggr2` (its `volume_labels` series, a PVC and a pod mounting it). Then assert that `?svm=svm_shop` returns two PVCs each naming its own aggregate, with both aggregates in the body; that `?aggr=aggr1` returns only PVCs naming `aggr1`; and that no `storage-flow` edge carries a label beyond `tier` and `attribution`.
 
@@ -64,6 +67,7 @@ _Alternative — have `ProjectStorage` read the PVC label and drop `claim_aggr`.
 - [A client parses the id to pull out names] → The value is documented as an opaque node id; the frontend matches it against node ids.
 - [The new e2e claim disturbs existing storage-graph assertions, such as node or edge counts and weights] → Add it so existing scopes are unaffected where possible, and update any expected count deliberately in the same commit; run the full integration suite.
 - [`/v1/graph` states a claim's aggregate twice, as a label and as an edge] → Accepted, with pod `labels.node` as the precedent.
+- [An embedder's hand-built graph stamps `claim_aggr` on some claims but not others] → Its unstamped claims now read as FlexGroup instead of borrowing an SVM's sole aggregate. Stamp every claim that has an aggregate, as the assembler does.
 
 ## Migration Plan
 

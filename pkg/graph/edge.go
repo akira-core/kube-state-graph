@@ -65,7 +65,10 @@ const AttributionSplit = "split"
 // same fact — see CLAUDE.md's PVC-label rule.
 //
 // This key is stripped from the projected view and never appears on the wire.
-// A FlexGroup claim (no aggregate) omits the key.
+// A FlexGroup claim (no aggregate) omits the key, and ProjectStorage reads that
+// omission as "no aggregate" whenever any claim in the graph carries the key;
+// only a graph that stamps no claim at all falls back to the SVM's sole
+// incoming aggr-svm hop.
 const ClaimAggrLabel = "claim_aggr"
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are

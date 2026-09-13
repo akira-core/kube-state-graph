@@ -3,6 +3,7 @@ package build
 import (
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
@@ -310,7 +311,7 @@ func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
 	_, hasAggr := flexGroupPVC.Labels()["aggr"]
 	assert.False(t, hasAggr, "FlexGroup claim resolves svm but no aggr")
 
-	_, edges := assembleStorageFlow(tp)
+	nodes, edges := assembleStorageFlow(tp)
 
 	byTier := map[string]int{}
 	for _, e := range edges {
@@ -322,6 +323,36 @@ func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
 		"only the FlexVol claim's aggregate draws an aggr-svm edge")
 	assert.Equal(t, 2, byTier[graph.StorageTierSVMPVC],
 		"both claims share the SVM's svm-pvc fan-out")
+
+	// The edges above are right; the projection must keep them right. The
+	// SVM's single incoming aggr-svm is the FlexVol claim's, and the FlexGroup
+	// claim — whose svm-pvc edge carries no claim_aggr — must not borrow it.
+	g := graph.NewGraph(nodes, edges, time.Unix(0, 0).UTC())
+
+	podRoot, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{ns + "/big-0"})
+	require.NoError(t, err)
+	view := graph.ProjectStorage(g, podRoot)
+	for _, n := range view.Nodes {
+		assert.NotContains(t, []graph.NodeType{graph.NodeTypeNetAppAggr, graph.NodeTypeNetAppNode}, n.Type(),
+			"?pod=shop/big-0 drew %s for a FlexGroup claim", n.ID())
+	}
+	for _, e := range view.Edges {
+		assert.NotContains(t, []string{graph.StorageTierNodeAggr, graph.StorageTierAggrSVM}, e.Labels["tier"],
+			"?pod=shop/big-0 drew %s -> %s for a FlexGroup claim", e.Source, e.Target)
+	}
+
+	aggrRoot, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	require.NoError(t, err)
+	view = graph.ProjectStorage(g, aggrRoot)
+	var retained []string
+	for _, n := range view.Nodes {
+		if n.Type() == graph.NodeTypePVC {
+			retained = append(retained, n.Name())
+			assert.Equal(t, graph.NetAppAggrID(sfOC, "aggr1"), n.Labels()["aggr"],
+				"?aggr=aggr1 retained PVC %s", n.ID())
+		}
+	}
+	assert.Equal(t, []string{"orders-data"}, retained)
 }
 
 // A claim with no resolved SVM contributes NO path — not even the aggregate
