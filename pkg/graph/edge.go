@@ -59,10 +59,13 @@ const AttributionSplit = "split"
 // on after shared aggr-svm hops are deduplicated. An SVM spans aggregates, so
 // walking up from the SVM is ambiguous whenever two claims in the same SVM
 // join different aggregates — without this key, `?aggr=aggr1&pod=x` could not
-// tell the pod's aggr1 claim from its aggr2 claim.
+// tell the pod's aggr1 claim from its aggr2 claim. The PVC's own public
+// `aggr` label (stamped in pkg/build/topology.go, from the same
+// pvc-to-netapp-aggr edge target) is what a client reads on the wire for this
+// same fact — see CLAUDE.md's PVC-label rule.
 //
-// It is stripped from the projected view and never appears on the wire. A
-// FlexGroup claim (no aggregate) omits the key.
+// This key is stripped from the projected view and never appears on the wire.
+// A FlexGroup claim (no aggregate) omits the key.
 const ClaimAggrLabel = "claim_aggr"
 
 // edgeNamespace is the fixed UUID namespace under which all edge IDs are

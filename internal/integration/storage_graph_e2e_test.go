@@ -10,6 +10,7 @@ import (
 
 	"github.com/akira-core/kube-state-graph/internal/config"
 	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
 // TestStorageGraph ingests a two-SVM, two-aggregate estate with a shared RWX
@@ -21,11 +22,15 @@ func (s *GraphSuite) TestStorageGraph() {
 	s.IngestExpFmt(fmt.Sprintf(`
 kube_pod_info{cluster="c1",namespace="shop",pod="rwx-0",uid="uid-rwx-0",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_info{cluster="c1",namespace="shop",pod="rwx-1",uid="uid-rwx-1",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="catalog-0",uid="uid-catalog-0",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_node_info{cluster="c1",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="shared-data",storageclass="netapp-nas",volumename="pvc-shared",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="catalog-data",storageclass="netapp-nas",volumename="pvc-catalog",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="rwx-0",persistentvolumeclaim="shared-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="rwx-1",persistentvolumeclaim="shared-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="catalog-0",persistentvolumeclaim="catalog-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_shop",volume="trident_pvc_catalog",test=%[1]q} 1 %[2]d
 volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_other",volume="trident_pvc_other",test=%[1]q} 1 %[2]d
 qos_read_ops{cluster="ontap-prod",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 300 %[2]d
 volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm_idle",volume="vol_unclaimed",test=%[1]q} 1 %[2]d
@@ -40,6 +45,9 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.Require().True(
 		s.WaitForSeries(`volume_labels{volume="trident_pvc_shared",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe the storage-graph volume_labels")
+	s.Require().True(
+		s.WaitForSeries(`volume_labels{volume="trident_pvc_catalog",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the second SVM-sharing volume_labels series")
 
 	srv := s.StartAPIServer(func(cfg *config.Config) {})
 
@@ -78,6 +86,26 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	rawSVM, err := json.Marshal(svm)
 	s.Require().NoError(err)
 	s.NotContains(string(rawSVM), `"status"`, "SVM status key must be absent")
+	s.assertNoStrayStorageFlowLabels(aggrBody)
+
+	// expose-claim-aggregate: svm_shop spans aggr1 (shared-data) and aggr2
+	// (catalog-data). `?aggr=aggr1` retains only shared-data; `?svm=svm_shop`
+	// retains both claims, each naming its own aggregate.
+	shared := byID[graph.PVCID(ident, "shop", "shared-data")]
+	s.Equal("netapp/ontap-prod/aggr/aggr1", shared.Labels["aggr"])
+	s.NotContains(byID, graph.PVCID(ident, "shop", "catalog-data"),
+		"?aggr=aggr1 must not retain svm_shop's aggr2 claim")
+
+	svmBody := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("svm", "svm_shop") })
+	s.assertStorageConservation(svmBody)
+	s.assertNoStrayStorageFlowLabels(svmBody)
+	svmByID := nodesByID(svmBody)
+	s.Contains(svmByID, "netapp/ontap-prod/aggr/aggr1")
+	s.Contains(svmByID, "netapp/ontap-prod/aggr/aggr2")
+	sharedInSVM := svmByID[graph.PVCID(ident, "shop", "shared-data")]
+	catalogInSVM := svmByID[graph.PVCID(ident, "shop", "catalog-data")]
+	s.Equal("netapp/ontap-prod/aggr/aggr1", sharedInSVM.Labels["aggr"])
+	s.Equal("netapp/ontap-prod/aggr/aggr2", catalogInSVM.Labels["aggr"])
 
 	podBody := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pod", "shop/rwx-0") })
 	s.assertStorageConservation(podBody)
@@ -125,6 +153,24 @@ func (s *GraphSuite) assertHasSplit(body cytoscape.Body) {
 		}
 	}
 	s.True(found, "RWX pvc-pod edges must carry attribution=split")
+}
+
+// assertNoStrayStorageFlowLabels pins the storage-graph-api spec's "No
+// storage-flow edge names a claim's aggregate": every storage-flow edge's
+// labels hold only `tier` and, on a split pvc-pod edge, `attribution` — never
+// the internal `claim_aggr` key the assembler stamps and ProjectStorage
+// strips.
+func (s *GraphSuite) assertNoStrayStorageFlowLabels(body cytoscape.Body) {
+	s.T().Helper()
+	for _, e := range body.Elements.Edges {
+		if e.Data.Type != "storage-flow" {
+			continue
+		}
+		for k := range e.Data.Labels {
+			s.Contains([]string{"tier", "attribution"}, k,
+				"storage-flow edge %s -> %s carries an unexpected label %q", e.Data.Source, e.Data.Target, k)
+		}
+	}
 }
 
 func (s *GraphSuite) assertStorageConservation(body cytoscape.Body) {

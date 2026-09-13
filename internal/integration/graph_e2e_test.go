@@ -1503,10 +1503,12 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 	s.Require().True(ok, "pvc node must be present")
 	s.Equal("pvc-9f3a", pvc.Labels["volumename"])
 	s.Equal("svm-prod", pvc.Labels["svm"])
+	s.Equal("netapp/ontap-prod/aggr/aggr1", pvc.Labels["aggr"])
 	s.Equal("netapp-nas", pvc.StorageClass)
 	s.Equal("normal", pvc.Status)
 	s.Require().NotNil(pvc.Usage)
 	s.InDelta(50.0, *pvc.Usage.UsedBytes, 1e-9)
+	s.Contains(byID, pvc.Labels["aggr"], "the labels.aggr node must be in the same /v1/graph response")
 
 	// The QoS-less claim keeps its whole storage topology — svm included.
 	// Only its measurements are missing (design.md D3: the hops degrade
@@ -1541,6 +1543,7 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 		switch e.Data.Source {
 		case "cluster-alpha/shop/netapp-data":
 			found = true
+			s.Equal(pvc.Labels["aggr"], e.Data.Target, "labels.aggr must equal the pvc-to-netapp-aggr edge target")
 			s.Require().NotNil(e.Data.Metrics)
 			s.Require().NotNil(e.Data.Metrics.ReadOps)
 			// 150, NOT 240: the LUN-level workload carries the same stock

@@ -907,6 +907,17 @@ live under `openspec/specs/`.
   reject every in-scope workload and key the ceiling on a foreign tenant (D10);
   with no aggregate resolved (FlexGroup) the pick is unscoped and the claim
   still gains its `svm`. **`volumename` ≠ `volume`**.
+  A third plain label, **`aggr`**, is copied verbatim from the `target` of the
+  same claim's `pvc-to-netapp-aggr` edge — never composed or re-derived — so it
+  is an **opaque node id** (`netapp/<ontap_cluster>/aggr/<aggr>`), matched
+  against a `netapp-aggr` node's `data.id` and never parsed for its aggregate
+  name or ONTAP cluster. It is absent, never an empty string, whenever the
+  claim resolved no aggregate (a FlexGroup volume, a join miss, a claim with no
+  `volumename`, or a window without Harvest), and it is independent of `svm`:
+  an empty-`svm` series still yields `aggr`, and a FlexGroup series yields
+  `svm` with no `aggr`. Both `GET /v1/graph` and `GET /v1/storage-graph` carry
+  it, stamped once in the shared topology beside `svm` — on `/v1/graph` it
+  restates the `pvc-to-netapp-aggr` edge already in the body.
   All 20 Harvest/kubelet legs plus `ALERTS` are OPTIONAL (log-and-continue). **Two** coverage
   warnings, each gated on its OWN family having been read:
   `slog.Warn("netapp_volume_join_miss", "count", n)` (hop-A miss or

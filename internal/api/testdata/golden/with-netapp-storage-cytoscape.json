@@ -85,6 +85,7 @@
           ],
           "status": "warning",
           "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
             "cluster": "cluster-alpha",
             "namespace": "db",
             "svm": "svm-prod",
