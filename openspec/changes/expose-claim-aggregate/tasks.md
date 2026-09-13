@@ -1,0 +1,23 @@
+## 1. Stamp the label (design D1–D3)
+
+- [ ] 1.1 In `pkg/build/topology.go`, right after `resolveNetAppStorage` returns, index `netapp.edges` of type `pvc-to-netapp-aggr` by source (PVC id) to target, and set `labels["aggr"]` to that target in the loop that stamps `svm` — copying `edge.Target`, never composing the id; verify `go build ./...` succeeds and `TestParseTopology_NetAppJoinAndUsage` passes with a new assertion, next to its `svm` one, that the PVC's `aggr` equals its edge target
+- [ ] 1.2 Add unit tests beside `TestParseTopology_NetAppJoinAndUsage` in `pkg/build/netapp_test.go`, one per scenario of "PVC aggr label from the Harvest join" and "PVC `aggr` label": the label equals the edge target; conflicting matched series follow the pick (`aggr-a`); a FlexGroup claim has `svm`, no `aggr` and no edge; a join miss and a claim with no `volumename` have no `aggr`; an empty `svm` leaves `aggr` set with no `svm`; the same aggregate name on two filers yields two distinct ids; QoS series without a `volume_labels` match yield no `aggr`; a window without `volume_labels` gives no PVC an `aggr` key; and no PVC has more than one `pvc-to-netapp-aggr` edge — verify `go test ./pkg/build/ -run 'TestParseTopology_' -count=1` passes, and that the new tests fail with the stamp from 1.1 removed
+- [ ] 1.3 Add a storage-flow unit test in `pkg/build/storageflow_test.go` where a FlexVol claim and a FlexGroup claim share one SVM, built through the topology so the stamp runs: the FlexVol PVC names its aggregate, the FlexGroup PVC carries `svm` and no `aggr`, and no `node-aggr` or `aggr-svm` edge exists for the FlexGroup claim; verify `go test ./pkg/build/ -run 'TestAssembleStorageFlow_' -count=1` passes
+
+## 2. Wire-level tests (design D5)
+
+- [ ] 2.1 Refresh the goldens with `go test ./internal/api/ -update -run Golden`; verify the diffs of `with-netapp-storage-cytoscape.json`, `storage-graph-aggr-root-cytoscape.json` and `storage-graph-pod-root-cytoscape.json` at most add `"aggr"` to PVC nodes — no other key, node, edge or ordering change, and a golden whose PVCs gain nothing is noted as building without the Harvest join — and that `go test ./internal/api/ -run Golden -count=1` passes without `-update`
+- [ ] 2.2 Extend the storage-graph e2e fixture in `internal/integration/storage_graph_e2e_test.go` with a second mounted claim in `svm_shop` on `aggr2` (its `volume_labels` series, a PVC and a pod mounting it), updating any existing expected count deliberately rather than loosening it; verify `go test ./internal/integration/ -run 'TestGraphSuite/TestStorageGraph' -count=1` passes (Docker required)
+- [ ] 2.3 Add assertions to `TestStorageGraph`: `?svm=svm_shop` returns two PVCs, one naming `aggr1` and one naming `aggr2`, with both aggregate nodes in the body; `?aggr=aggr1` returns only PVCs naming `aggr1`; every `storage-flow` edge's `labels` holds only `tier` and, on a split `pvc-pod` edge, `attribution`; verify the command from 2.2 passes, and that the `svm=svm_shop` assertion fails with the stamp removed
+- [ ] 2.4 In the graph e2e NetApp case, assert that `/v1/graph` carries the label too: the PVC's `labels.aggr` equals the target of its `pvc-to-netapp-aggr` edge, and that node is in the response; verify `go test ./internal/integration/ -run 'TestGraphSuite' -count=1` passes
+
+## 3. Documentation (design D2, D4)
+
+- [ ] 3.1 Extend `CLAUDE.md`'s PVC-label rule ("Both `volumename` and `svm` are **plain labels**…") with `aggr`: copied from the claim's `pvc-to-netapp-aggr` edge target, an opaque node id clients match against `data.id`, absent without an aggregate, independent of `svm`; verify the paragraph states nothing the three delta specs contradict
+- [ ] 3.2 Point the `ClaimAggrLabel` comment in `pkg/graph/edge.go` at the public PVC label, keeping "never appears on the wire" for the edge key; verify `make lint` passes
+
+## 4. Gates
+
+- [ ] 4.1 Run `make test`, `make vet` and `make lint`; verify all three pass (the integration suites need Docker)
+- [ ] 4.2 Run `openspec validate expose-claim-aggregate --strict`; verify it passes, and that every scenario in the three delta specs maps to a test from groups 1–2
+- [ ] 4.3 Check a real body: in the demo repository run `make redeploy-backend BACKEND_SRC=../kube-state-graph`, then request `/v1/storage-graph` with `aggr=aggr1&aggr=aggr2`; verify each of `svm_demo`'s three PVCs names one of the two aggregates and that `make verify` still reports 0 failed, and record the output in the PR description
