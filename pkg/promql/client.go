@@ -206,6 +206,10 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		return nil, fmt.Errorf("prom query %s: %w", name, err)
 	}
 	span.SetAttributes(attribute.Int("kube_state_graph.result_series_count", len(vec)))
+	// Recorded beside the span attribute, from the same len(vec), so the two
+	// signals cannot disagree. A failed query returned above and contributes
+	// no observation.
+	seriesMetricsOf(c.metrics).ObserveQuerySeries(name, len(vec))
 	slog.DebugContext(ctx, "promql result",
 		"name", name,
 		"series", len(vec),

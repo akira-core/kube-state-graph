@@ -3,6 +3,7 @@ package kubegraph
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 	"unicode"
@@ -143,9 +144,42 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		AZ:        []string{az},
 		Env:       []string{env},
 		Cluster:   v["cluster"],
-		Namespace: v["namespace"],
+		Namespace: deriveStorageNamespaces(scope, v["namespace"]),
 	}
 	return req, nil
+}
+
+// deriveStorageNamespaces returns the namespace selector a storage request's
+// build is narrowed by: the explicit `namespace` parameter whenever it carries a
+// value, and otherwise — when every root is a pod root — the roots' own
+// namespaces.
+//
+// The derived case is output-preserving, which is what lets the parser push it
+// upstream unasked. With pod roots only, a retained path is anchored on a root
+// pod; its claim lives in that pod's namespace (a pod can only reference a claim
+// in its own namespace), and every other pod on the path mounts that same claim.
+// Nothing a pod-rooted body draws lies outside the roots' namespaces, so reading
+// only those namespaces changes the queries and never the body.
+//
+// Any storage-side or `node` root suppresses it: those roots select paths in
+// every namespace. An explicit namespace is never widened, intersected or
+// replaced — an intersection could come out empty, which the selector reads as
+// "no filter", the one outcome that would WIDEN the read. The projection's own
+// namespace filter (StorageScope.Namespaces) is untouched: this narrows the
+// upstream read only.
+func deriveStorageNamespaces(scope graph.StorageScope, explicit []string) []string {
+	if slices.ContainsFunc(explicit, func(ns string) bool { return ns != "" }) {
+		return explicit
+	}
+	if scope.Roots.RequestedStorage() || len(scope.Roots.Pods) == 0 {
+		return explicit
+	}
+	namespaces := make([]string, 0, len(scope.Roots.Pods))
+	for ref := range scope.Roots.Pods {
+		namespaces = append(namespaces, ref.Namespace)
+	}
+	slices.Sort(namespaces)
+	return slices.Compact(namespaces)
 }
 
 // parseWindow reads the required start / end pair shared by every graph

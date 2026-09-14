@@ -101,8 +101,16 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 
 	seen := captured()
 	assert.Equal(t,
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop"}[1h])`,
-		seen["kube_pod_info"])
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop"}[1h])`,
+		seen["kube_pod_spec_volumes_persistentvolumeclaims_info"])
+	assert.NotContains(t, seen, "kube_pod_info",
+		"no claim binding and no pod root: the pod read has an empty scope and is not issued")
+	for _, skipped := range []string{
+		"kube_pod_container_info", "kube_service_info", "kube_endpointslice_endpoints",
+		"kube_endpointslice_labels", "kube_service_annotations",
+	} {
+		assert.NotContains(t, seen, skipped, "the storage body cannot carry %s, so it is never read", skipped)
+	}
 	assert.Equal(t,
 		`last_over_time(volume_labels[1h])`,
 		seen["volume_labels"], "Harvest takes no request matcher — az only routes it")
@@ -112,6 +120,29 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 	assert.NotContains(t, seen, "traces_service_graph_request_total",
 		"storage-graph never reads the service graph")
 	assert.NotContains(t, seen, "up", "no retention probe on a filtered build")
+}
+
+// Pod-only roots push their namespaces into every namespaced leg, and their
+// names into the pod scope; Harvest is never narrowed by a root.
+func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
+	q, captured := recordingQuerier(t)
+	s := newServerWithMocks(t, q, nil)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"pod": {"shop/orders-0", "platform/redis-0"}}))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	seen := captured()
+	assert.Equal(t,
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1h])`,
+		seen["kube_pod_info"])
+	assert.Equal(t,
+		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"platform|shop|"}[1h])`,
+		seen["ALERTS"])
+	assert.Equal(t, `last_over_time(volume_labels[1h])`, seen["volume_labels"])
 }
 
 func TestStorageGraph_Timeout504(t *testing.T) {

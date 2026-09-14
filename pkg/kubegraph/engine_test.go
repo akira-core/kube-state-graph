@@ -135,7 +135,7 @@ func TestBuildStorageFromValues_AgreesWithComposedPipeline(t *testing.T) {
 
 	req, err := kubegraph.ParseStorageValues(vals)
 	require.NoError(t, err)
-	g, err := eng.BuildStorage(t.Context(), req.End.Sub(req.Start), req.End, req.Selector)
+	g, err := eng.BuildStorage(t.Context(), req.End.Sub(req.Start), req.End, req.Selector, req.Scope.Roots)
 	require.NoError(t, err)
 	composed := cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope))
 	assert.Equal(t, composed, facade)

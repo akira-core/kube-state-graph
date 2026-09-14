@@ -1,3 +1,83 @@
+# BREAKING changes — harden the topology read against upstream series limits
+
+A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
+reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
+now degrades instead of failing the build.
+
+## `kube_pod_container_info` no longer fails the build
+
+*cluster-topology-source — Topology series consumed*
+
+A query error on `kube_pod_container_info` — typically VictoriaMetrics'
+`the number of matching timeseries exceeds …; either narrow down the search or
+increase -search.maxUniqueTimeseries` — used to fail every build with a mapped
+HTTP 5xx. It now logs `optional topology query failed` and returns **200** with
+`data.containers` absent on every pod. Nothing else in the body moves. Caller
+cancellation (build timeout, client disconnect) still fails the request.
+
+The family's cardinality multiplies with the live object count — one series per
+container per image variant, and, read over the whole window, one per pod that
+existed at any instant of it — so it is the leg a memory-derived series limit
+rejects first. If you alert on `/v1/graph` 5xx for it, alert instead on
+`kube_state_graph_upstream_query_failures_total{query="kube_pod_container_info"}`.
+
+## `/v1/storage-graph` pods carry no `data.containers`
+
+*storage-graph-api — Attributes and compound groups carry over; Storage build
+reads only what it draws*
+
+The storage build never issues `kube_pod_container_info`, so a storage-graph pod
+node has no `containers` field. Every other attribute and every compound group
+is unchanged, and the Sankey reads none of it. Read containers from `/v1/graph`.
+
+The storage build also no longer issues `kube_service_info`,
+`kube_endpointslice_endpoints`, `kube_endpointslice_labels` or
+`kube_service_annotations`, and reads `kube_pod_info` / `kube_pod_owner` only
+for the pods a claim binding names plus the request's `pod=` roots — no query
+at all when that set is empty. Those change the queries, not the body. A
+failed pod chunk fails the build, as an unscoped `kube_pod_info` error does.
+
+## Pod-only roots narrow the upstream read
+
+*storage-graph-api — Pod-only roots narrow the upstream read*
+
+A `/v1/storage-graph` request whose roots are all `pod=<ns>/<name>` and that
+carries no `namespace` now renders the roots' namespaces as a `namespace`
+matcher on every namespaced kube-state-metrics, kubelet and `ALERTS` query. The
+body is identical; the queries — and anything inspecting them, such as upstream
+query logs or recording tests — differ. An explicit `namespace` always wins, and
+any storage-side or `node` root suppresses the derivation.
+
+## In-process embedder (`pkg/`) signature changes
+
+| Before | After |
+|---|---|
+| `build.Builder.BuildStorage(ctx, window, end, sel)` | `build.Builder.BuildStorage(ctx, window, end, sel, roots graph.StorageRoots)` |
+| `kubegraph.Engine.BuildStorage(ctx, window, end, sel)` | `kubegraph.Engine.BuildStorage(ctx, window, end, sel, roots graph.StorageRoots)` |
+
+A pod root that mounts no claim is drawable only if the build reads its pod, so
+the roots must reach the build; a compile error is the honest failure, where a
+roots-less sibling would silently drop every claimless root. Pass
+`graph.StorageRoots{}` for a request with no roots, and pass the SAME roots you
+hand `graph.ProjectStorage`. `kubegraph.Engine.BuildStorageFromValues`,
+`kubegraph.ParseStorageValues` and every `/v1/graph` signature are unchanged.
+
+## New self-metric (additive)
+
+*graph-api — Self-metrics endpoint*
+
+`kube_state_graph_upstream_query_result_series{query}` — a histogram of the
+series each successful upstream query returned (buckets 1024 … 1048576; no
+`backend` label). An embedder's `promql.Metrics` opts in through the optional
+`promql.SeriesMetrics` upgrade; an implementation without it is unaffected.
+
+## `RawSeriesCount` (debug log only)
+
+`Topology.RawSeriesCount` now carries a key only for a family the build issued.
+A family the storage plan skips, and a second-wave family whose scope came out
+empty — the QoS workload legs with no matched FlexVol, the storage pod legs
+with no binding and no root — are absent rather than `0`.
+
 # BREAKING changes — remove the edge-type catalogue and the `edge_type` filter
 
 A declared v1 break. No compatibility shim, no redirect, no deprecation window.

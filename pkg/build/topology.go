@@ -83,10 +83,11 @@ type Topology struct {
 	// not a claim joined it. It is deliberately wider than NetAppAggrs /
 	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:
 	// the storage-flow graph needs flowless roots (a degraded aggregate serving
-	// no claim is a valid answer to "what is on this filer?"), and the only
-	// alternative — passing the request's roots into the build — would make the
-	// build a function of the request, which both the cache key and the
-	// "selectors alone reach the queries" rule forbid.
+	// no claim is a valid answer to "what is on this filer?"), and a storage
+	// root must stay drawable without any Harvest read being narrowed by it.
+	// Roots reach exactly one read — the storage build's pod scope, which a pod
+	// root mounting no claim must enter to be drawn (readScopedPods) — and
+	// never a Harvest leg.
 	//
 	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
 	// not by the Kubernetes estate, and a flowless entity costs nothing at
@@ -155,10 +156,17 @@ type Topology struct {
 	// 0 means "nothing matched the fixed selector", never "the collector is
 	// off". Every leg is also narrowed by the request's own az/env/cluster/
 	// namespace matchers per promql.queryDims. And because
-	// kube_replicaset_annotations / kube_job_annotations are fetchOptional, a
-	// 0 for those two ALSO covers "the query errored and the leg degraded" —
-	// the accompanying `optional topology query failed` Warn is the only thing
-	// that separates the two.
+	// kube_replicaset_annotations, kube_job_annotations and
+	// kube_pod_container_info are fetchOptional, a 0 for those three ALSO
+	// covers "the query errored and the leg degraded" — the accompanying
+	// `optional topology query failed` Warn is the only thing that separates
+	// the two.
+	//
+	// A family the read did not ISSUE has no key at all: a leg the endpoint's
+	// plan skips (the storage build never reads the container or service-side
+	// families) and a second-wave family whose scope came out empty (no claim
+	// matched a FlexVol; no pod could be drawn). An absent key means "never
+	// read"; 0 means "read, matched nothing".
 	RawSeriesCount map[string]int
 
 	// ClusterIdentities is the identity table the reader composed, handed to
@@ -221,6 +229,13 @@ type topologyVectors struct {
 	// its own.
 	JobAnnotationsDegraded bool
 
+	// QoSScopeIssued and PodScopeIssued record that a second wave computed a
+	// non-empty scope and issued its queries. Each is written only by its own
+	// wave's goroutine and read only after the group's Wait, so both are
+	// race-free; tallySeries reads them so a family is counted iff it was read.
+	QoSScopeIssued bool
+	PodScopeIssued bool
+
 	// VolumeKey derives each claim's Harvest match token from its bound PV
 	// name and decides how that token is compared against the stock `volume`
 	// label. Like JobAnnotationsDegraded it is a build-scoped FACT rather than
@@ -274,7 +289,12 @@ type topologyVectors struct {
 // semantics (a non-NetApp deployment must build cleanly). Existing KSM
 // legs keep abort-on-error semantics, except kube_replicaset_annotations
 // and kube_job_annotations whose cardinality accumulates with history
-// and which degrade like Harvest (harden-controller-annotation-legs D3).
+// (harden-controller-annotation-legs D3) and kube_pod_container_info whose
+// cardinality multiplies with containers, image variants and pod churn
+// (harden-topology-read-cardinality D1); all three degrade like Harvest.
+//
+// ReadTopology is the /v1/graph read: every leg, every pod (fullPlan). The
+// storage build reads through the same fan-out under storagePlan.
 func ReadTopology(
 	ctx context.Context,
 	q promql.Querier,
@@ -282,6 +302,23 @@ func ReadTopology(
 	end time.Time,
 	opts Options,
 	sel promql.Selector,
+) (Topology, error) {
+	return readTopology(ctx, q, window, end, opts, sel, fullPlan)
+}
+
+// readTopology is ReadTopology under an endpoint's read plan: plan decides which
+// first-wave legs are issued at all and whether the pod families are read by
+// reference (see topologyPlan). Everything else — the fan-out, the error
+// semantics, the parse — is shared, so the two endpoints cannot disagree about
+// what a pod, a claim or an aggregate is.
+func readTopology(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	plan topologyPlan,
 ) (Topology, error) {
 	keys := opts.LabelKeys
 	// Each goroutine writes a distinct field, so concurrent writes to v are
@@ -372,120 +409,68 @@ func ReadTopology(
 		return fetchOptionalTracking(name, dst, nil)
 	}
 
-	g.Go(fetch(promql.QPodInfo, &v.Pod))
-	g.Go(fetch(promql.QNodeInfo, &v.Node))
-	g.Go(fetch(promql.QNodeAddresses, &v.Addr))
-	g.Go(fetch(promql.QPVCBindings, &v.PVC))
-	g.Go(fetch(promql.QNodeLabels, &v.NodeLabels))
-	g.Go(fetch(promql.QServiceInfo, &v.Service))
-	g.Go(fetch(promql.QEndpointSliceEndpoints, &v.EpEndpoints))
-	g.Go(fetch(promql.QEndpointSliceLabels, &v.EpLabels))
-	g.Go(fetch(promql.QPodOwner, &v.PodOwner))
-	g.Go(fetch(promql.QReplicaSetOwner, &v.ReplicaSetOwner))
-	// Signalled, not awaited by a barrier: the scoped QoS read depends on these
-	// two legs alone, so it starts as soon as they land instead of behind the
-	// slowest kube-state-metrics leg (design D5).
-	pvcInfoDone, volumeLabelsDone := make(chan struct{}), make(chan struct{})
-	g.Go(signalWhenDone(fetch(promql.QPVCInfo, &v.PVCInfo), pvcInfoDone))
-	g.Go(signalWhenDone(fetchOptional(promql.QVolumeLabels, &v.VolumeLabels), volumeLabelsDone))
+	// Second-wave prerequisites. Each is closed when its leg returns, whatever it
+	// returns (signalWhenDone), so a scoped wave starts as soon as the families
+	// its scope is computed from land instead of behind the slowest
+	// kube-state-metrics leg (design D5 of the scoped QoS read).
+	pvcInfoDone, volumeLabelsDone, bindingsDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	signals := map[promql.Query]chan struct{}{
+		promql.QPVCInfo:      pvcInfoDone,
+		promql.QVolumeLabels: volumeLabelsDone,
+		promql.QPVCBindings:  bindingsDone,
+	}
+	legs := topologyLegs(&v)
+	for _, l := range legs {
+		if !plan.issuesFirstWave(l.query) {
+			continue
+		}
+		var run func() error
+		switch {
+		case !l.optional:
+			run = fetch(l.query, l.dst)
+		case l.degraded != nil:
+			run = fetchOptionalTracking(l.query, l.dst, l.degraded)
+		default:
+			run = fetchOptional(l.query, l.dst)
+		}
+		if done, ok := signals[l.query]; ok {
+			run = signalWhenDone(run, done)
+			delete(signals, l.query)
+		}
+		g.Go(run)
+	}
+	// A prerequisite this plan never issues can never signal. Closing it lets the
+	// wave it gates compute an empty scope and issue nothing, instead of waiting
+	// forever.
+	for _, done := range signals {
+		close(done)
+	}
+
+	// The six QoS workload families are NOT issued in the first wave. They are
+	// the one leg whose useful population is not known until another leg has
+	// been read: ONTAP collects a workload per volume on the filer, and the
+	// resolver consults them only for claims that already matched a
+	// volume_labels series. readScopedQoS waits on exactly the two families its
+	// scope is computed from and then issues each workload query restricted to
+	// the FlexVol names those claims actually matched.
 	g.Go(func() error {
 		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v,
 			pvcInfoDone, volumeLabelsDone)
 	})
-	g.Go(fetch(promql.QPodContainerInfo, &v.PodContainerInfo))
-	g.Go(fetch(promql.QNodeStatusCondition, &v.NodeStatus))
-	g.Go(fetch(promql.QServiceAnnotations, &v.ServiceAnnotations))
-	g.Go(fetch(promql.QPVCAnnotations, &v.PVCAnnotations))
-	// The four live-object-count controller-annotation families and
-	// kube_job_owner use `fetch`: an upstream fault is rare and fail-fast
-	// is the right response. kube_replicaset_annotations and
-	// kube_job_annotations use `fetchOptional` — their cardinality
-	// accumulates with history (revisionHistoryLimit / Job history limits)
-	// and can exceed an upstream series limit in an otherwise ordinary
-	// estate; losing an `application` string is never worth failing the
-	// whole graph (harden-controller-annotation-legs D3). Caller cancellation
-	// still fails the request.
-	g.Go(fetch(promql.QJobOwner, &v.JobOwner))
-	g.Go(fetch(promql.QDeploymentAnnotations, &v.DeploymentAnnotations))
-	g.Go(fetch(promql.QStatefulSetAnnotations, &v.StatefulSetAnnotations))
-	g.Go(fetch(promql.QDaemonSetAnnotations, &v.DaemonSetAnnotations))
-	g.Go(fetchOptional(promql.QReplicaSetAnnotations, &v.ReplicaSetAnnotations))
-	g.Go(fetchOptionalTracking(promql.QJobAnnotations, &v.JobAnnotations, &v.JobAnnotationsDegraded))
-	g.Go(fetch(promql.QCronJobAnnotations, &v.CronJobAnnotations))
-	// The six QoS workload families are NOT issued here. They are the one leg
-	// whose useful population is not known until another leg has been read:
-	// ONTAP collects a workload per volume on the filer, and the resolver
-	// consults them only for claims that already matched a volume_labels
-	// series. readScopedQoS below waits on exactly the two families its scope
-	// is computed from and then issues each workload query restricted to the
-	// FlexVol names those claims actually matched.
-	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxIOPS, &v.QoSPolicyMaxIOPS))
-	g.Go(fetchOptional(promql.QQoSPolicyFixedMaxMBps, &v.QoSPolicyMaxMBps))
-	g.Go(fetchOptional(promql.QAggrStatus, &v.AggrStatus))
-	g.Go(fetchOptional(promql.QAggrSpaceUsed, &v.AggrSpaceUsed))
-	g.Go(fetchOptional(promql.QAggrSpaceTotal, &v.AggrSpaceTotal))
-	g.Go(fetchOptional(promql.QNetAppNodeStatus, &v.NetAppNodeStatus))
-	g.Go(fetchOptional(promql.QNetAppNodeLabels, &v.NetAppNodeLabels))
-	g.Go(fetchOptional(promql.QNetAppNodeCPUBusy, &v.NetAppNodeCPUBusy))
-	g.Go(fetchOptional(promql.QNetAppNodeTotalOps, &v.NetAppNodeTotalOps))
-	g.Go(fetchOptional(promql.QNetAppNodeTotalLatency, &v.NetAppNodeTotalLatency))
-	g.Go(fetchOptional(promql.QNetAppNodeTotalData, &v.NetAppNodeTotalData))
-	// The alert overlay. Routed through FamilyAlerts, so a table serving that
-	// family on no backend issues nothing and every node stays alert-less —
-	// the documented normal state, not a degrade.
-	g.Go(fetchOptional(promql.QAlerts, &v.Alerts))
-	g.Go(fetchOptional(promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed))
-	g.Go(fetchOptional(promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity))
+	// Under a pod-scoping plan kube_pod_info and kube_pod_owner are a second
+	// wave too: restricted to the pods a claim-binding series names plus the
+	// request's pod roots, issued once the binding family has landed.
+	if plan.scopePods {
+		g.Go(func() error {
+			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, &v, bindingsDone)
+		})
+	}
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
 	}
 
 	t := parseTopology(v, keys)
-	t.RawSeriesCount = map[string]int{
-		string(promql.QPodInfo):                    len(v.Pod),
-		string(promql.QNodeInfo):                   len(v.Node),
-		string(promql.QNodeAddresses):              len(v.Addr),
-		string(promql.QPVCBindings):                len(v.PVC),
-		string(promql.QNodeLabels):                 len(v.NodeLabels),
-		string(promql.QServiceInfo):                len(v.Service),
-		string(promql.QEndpointSliceEndpoints):     len(v.EpEndpoints),
-		string(promql.QEndpointSliceLabels):        len(v.EpLabels),
-		string(promql.QPodOwner):                   len(v.PodOwner),
-		string(promql.QReplicaSetOwner):            len(v.ReplicaSetOwner),
-		string(promql.QPVCInfo):                    len(v.PVCInfo),
-		string(promql.QPodContainerInfo):           len(v.PodContainerInfo),
-		string(promql.QNodeStatusCondition):        len(v.NodeStatus),
-		string(promql.QServiceAnnotations):         len(v.ServiceAnnotations),
-		string(promql.QPVCAnnotations):             len(v.PVCAnnotations),
-		string(promql.QJobOwner):                   len(v.JobOwner),
-		string(promql.QDeploymentAnnotations):      len(v.DeploymentAnnotations),
-		string(promql.QStatefulSetAnnotations):     len(v.StatefulSetAnnotations),
-		string(promql.QDaemonSetAnnotations):       len(v.DaemonSetAnnotations),
-		string(promql.QReplicaSetAnnotations):      len(v.ReplicaSetAnnotations),
-		string(promql.QJobAnnotations):             len(v.JobAnnotations),
-		string(promql.QCronJobAnnotations):         len(v.CronJobAnnotations),
-		string(promql.QVolumeLabels):               len(v.VolumeLabels),
-		string(promql.QQoSReadOps):                 len(v.QoSReadOps),
-		string(promql.QQoSWriteOps):                len(v.QoSWriteOps),
-		string(promql.QQoSReadLatency):             len(v.QoSReadLatency),
-		string(promql.QQoSWriteLatency):            len(v.QoSWriteLatency),
-		string(promql.QQoSReadData):                len(v.QoSReadData),
-		string(promql.QQoSWriteData):               len(v.QoSWriteData),
-		string(promql.QQoSPolicyFixedMaxIOPS):      len(v.QoSPolicyMaxIOPS),
-		string(promql.QQoSPolicyFixedMaxMBps):      len(v.QoSPolicyMaxMBps),
-		string(promql.QAggrStatus):                 len(v.AggrStatus),
-		string(promql.QAggrSpaceUsed):              len(v.AggrSpaceUsed),
-		string(promql.QAggrSpaceTotal):             len(v.AggrSpaceTotal),
-		string(promql.QNetAppNodeStatus):           len(v.NetAppNodeStatus),
-		string(promql.QNetAppNodeLabels):           len(v.NetAppNodeLabels),
-		string(promql.QNetAppNodeCPUBusy):          len(v.NetAppNodeCPUBusy),
-		string(promql.QNetAppNodeTotalOps):         len(v.NetAppNodeTotalOps),
-		string(promql.QNetAppNodeTotalLatency):     len(v.NetAppNodeTotalLatency),
-		string(promql.QNetAppNodeTotalData):        len(v.NetAppNodeTotalData),
-		string(promql.QAlerts):                     len(v.Alerts),
-		string(promql.QKubeletVolumeUsedBytes):     len(v.KubeletVolumeUsed),
-		string(promql.QKubeletVolumeCapacityBytes): len(v.KubeletVolumeCapacity),
-	}
+	t.RawSeriesCount = tallySeries(legs, plan, &v)
 	warnSelectorFamilyEmpty(ctx, sel, keys, t.RawSeriesCount)
 	return t, nil
 }

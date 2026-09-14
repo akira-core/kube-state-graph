@@ -2,7 +2,6 @@ package promql
 
 import (
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -59,45 +58,9 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, volumes []string) (str
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
-// ChunkQoSVolumeScope splits a sorted, de-duplicated scope into chunks whose
-// rendered alternation fits the byte budget, so a large estate is read through
-// several narrow queries instead of one query the upstream would reject for
-// length (`-search.maxQueryLen`).
-//
-// The split is a pure function of the input slice and the budget, so which
-// claims share a chunk — and therefore which claims a failing chunk costs their
-// measurements — is deterministic across rebuilds.
-//
-// A single name longer than the budget still gets its own chunk rather than
-// being dropped: a silently missing claim is precisely the failure mode this
-// capability exists to remove, and an over-length query that upstream rejects
-// degrades one chunk, visibly.
+// ChunkQoSVolumeScope splits a sorted, de-duplicated FlexVol scope into
+// chunks whose rendered alternation fits the byte budget. It is ChunkScope
+// under the name the QoS workload read was introduced with.
 func ChunkQoSVolumeScope(volumes []string, budget int) [][]string {
-	if len(volumes) == 0 {
-		return nil
-	}
-	if budget <= 0 {
-		return [][]string{volumes}
-	}
-	var (
-		out  [][]string
-		cur  []string
-		used int
-	)
-	for _, v := range volumes {
-		// The rendered cost of this value: its escaped form plus the `|`
-		// separator it needs once it is not first in the chunk.
-		cost := len(escapeLiteral(regexp.QuoteMeta(v)))
-		if len(cur) > 0 {
-			cost++
-		}
-		if len(cur) > 0 && used+cost > budget {
-			out = append(out, cur)
-			cur, used = nil, 0
-			cost = len(escapeLiteral(regexp.QuoteMeta(v)))
-		}
-		cur = append(cur, v)
-		used += cost
-	}
-	return append(out, cur)
+	return ChunkScope(volumes, budget)
 }

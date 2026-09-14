@@ -88,9 +88,10 @@ type Config struct {
 	// suffix, which resolves a FlexVol without the deployment declaring the
 	// provisioner's storage prefix.
 	NetAppVolumeMatchMode string
-	// NetAppQoSScopeBatchBytes bounds the rendered `volume` alternation of one
-	// scoped QoS workload query (--netapp-qos-scope-batch-bytes /
-	// KSG_NETAPP_QOS_SCOPE_BATCH_BYTES), so a large estate is split across
+	// NetAppQoSScopeBatchBytes bounds every data-derived alternation one query
+	// carries — the scoped QoS workload read's `volume` and the storage build's
+	// `pod` scope (--netapp-qos-scope-batch-bytes /
+	// KSG_NETAPP_QOS_SCOPE_BATCH_BYTES) — so a large estate is split across
 	// several queries instead of exceeding the upstream's query-length limit.
 	NetAppQoSScopeBatchBytes int
 	// BackendsFile is the path to the mounted routing table declaring the
@@ -169,7 +170,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.StringVar(&cfg.NetAppVolumeMatchMode, "netapp-volume-match-mode", cfg.NetAppVolumeMatchMode, "How the derived token is matched against the stock Harvest `volume` label: exact, suffix, contains or regex.")
-	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one scoped QoS query's `volume` alternation. A larger matched set is split across several queries.")
+	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, or a storage-graph pod read's `pod`. A larger set is split across several queries.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")

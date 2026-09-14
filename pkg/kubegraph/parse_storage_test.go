@@ -78,3 +78,57 @@ func TestParseStorageValues_IgnoresEdgeTypeAndPrune(t *testing.T) {
 	_, err := kubegraph.ParseStorageValues(v)
 	require.NoError(t, err, "edge_type and prune are ignored, even when invalid")
 }
+
+// Spec: "Pod-only roots narrow the upstream read" — the derived selector, and
+// every rule that suppresses it.
+func TestParseStorageValues_DerivesNamespaceFromPodOnlyRoots(t *testing.T) {
+	cases := []struct {
+		name  string
+		extra url.Values
+		want  []string
+	}{
+		{"pod roots push their namespaces", url.Values{"pod": {"shop/orders-0", "platform/redis-0"}}, []string{"platform", "shop"}},
+		{"one namespace collapses", url.Values{"pod": {"shop/a", "shop/b"}}, []string{"shop"}},
+		{"a storage root suppresses it", url.Values{"pod": {"shop/orders-0"}, "aggr": {"aggr1"}}, nil},
+		{"an ontap_cluster root suppresses it", url.Values{"pod": {"shop/orders-0"}, "ontap_cluster": {"ontap-prod"}}, nil},
+		{"a node root suppresses it", url.Values{"pod": {"shop/orders-0"}, "node": {"n1"}}, nil},
+		{"an explicit namespace wins", url.Values{"pod": {"shop/orders-0"}, "namespace": {"platform"}}, []string{"platform"}},
+		{"an empty namespace value is no namespace", url.Values{"pod": {"shop/x"}, "namespace": {""}}, []string{"shop"}},
+		{"no root derives nothing", url.Values{}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := storageBase()
+			for k, vs := range tc.extra {
+				v[k] = vs
+			}
+			req, err := kubegraph.ParseStorageValues(v)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, req.Selector.Namespace)
+		})
+	}
+}
+
+// The derivation narrows the upstream read only: the projection's own
+// namespace filter stays exactly what the request said.
+func TestParseStorageValues_DerivedNamespaceLeavesTheProjectionAlone(t *testing.T) {
+	v := storageBase()
+	v["pod"] = []string{"shop/orders-0"}
+	req, err := kubegraph.ParseStorageValues(v)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"shop"}, req.Selector.Namespace)
+	assert.Empty(t, req.Scope.Namespaces)
+}
+
+// Spec: "Root order does not change the queries".
+func TestParseStorageValues_DerivedNamespaceIsOrderFree(t *testing.T) {
+	a, b := storageBase(), storageBase()
+	a["pod"] = []string{"b/x", "a/y"}
+	b["pod"] = []string{"a/y", "b/x", "a/y"}
+	ra, err := kubegraph.ParseStorageValues(a)
+	require.NoError(t, err)
+	rb, err := kubegraph.ParseStorageValues(b)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, ra.Selector.Namespace)
+	assert.Equal(t, ra.Selector, rb.Selector)
+}
