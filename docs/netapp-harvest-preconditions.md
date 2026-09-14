@@ -45,7 +45,7 @@ several backends with different prefixes still resolves.
 |---|---|---|
 | `--netapp-volume-key-rewrite` / `KSG_NETAPP_VOLUME_KEY_REWRITE` | `-=_` | Ordered `<regex>=<replacement>` rules producing the match token from the PV name. Repeat the flag for several rules; the env form is semicolon-separated. Each entry splits on its FIRST `=`; a pattern needing a literal `=` writes `\x3d`. The first flag occurrence REPLACES the default list rather than appending to it |
 | `--netapp-volume-match-mode` / `KSG_NETAPP_VOLUME_MATCH_MODE` | `suffix` | `exact`, `suffix`, `contains`, or `regex` (the token is compiled as a regular expression) |
-| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one scoped QoS query's `volume` alternation. A larger matched set is split across several queries |
+| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, or a `/v1/storage-graph` pod read's `pod`. A larger matched set is split across several queries |
 
 An uncompilable pattern or an unknown match mode is a **startup failure**, never
 a silent fallback to the defaults: a typo would otherwise resolve a different

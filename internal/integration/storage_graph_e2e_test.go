@@ -23,6 +23,8 @@ func (s *GraphSuite) TestStorageGraph() {
 kube_pod_info{cluster="c1",namespace="shop",pod="rwx-0",uid="uid-rwx-0",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_info{cluster="c1",namespace="shop",pod="rwx-1",uid="uid-rwx-1",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_info{cluster="c1",namespace="shop",pod="catalog-0",uid="uid-catalog-0",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="idle-0",uid="uid-idle-0",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_container_info{cluster="c1",namespace="shop",pod="rwx-0",uid="uid-rwx-0",container="app",image="reg/app:1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_node_info{cluster="c1",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="shared-data",storageclass="netapp-nas",volumename="pvc-shared",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="catalog-data",storageclass="netapp-nas",volumename="pvc-catalog",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
@@ -112,6 +114,25 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.assertHasSplit(podBody)
 	s.Contains(nodesByID(podBody), ident+"/uid-rwx-0")
 	s.NotContains(nodesByID(podBody), ident+"/uid-rwx-1", "the other RWX mounter is not this pod root")
+
+	// harden-topology-read-cardinality: the storage build never reads the
+	// container family, and reads pods by reference.
+	for _, n := range podBody.Elements.Nodes {
+		s.Empty(n.Data.Containers, "a storage-graph node never carries data.containers (%s)", n.Data.ID)
+	}
+	// A pod root that mounts no claim is drawable only because its name joins
+	// the pod scope.
+	idle := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pod", "shop/idle-0") })
+	s.Contains(nodesByID(idle), ident+"/uid-idle-0", "a claimless pod root is still read and drawn")
+	s.Empty(idle.Elements.Edges)
+	s.NotContains(nodesByID(podBody), ident+"/uid-idle-0", "a claimless pod that is not a root is never drawn")
+	// Pod-only roots derive the namespace selector; the body must equal the same
+	// request with that namespace given explicitly.
+	explicit := s.fetchStorageGraph(srv.URL, func(q url.Values) {
+		q.Set("pod", "shop/rwx-0")
+		q.Set("namespace", "shop")
+	})
+	s.Equal(podBody, explicit, "the derived namespace changes the queries, never the body")
 
 	claimless := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("aggr", "aggr9") })
 	ids := nodesByID(claimless)

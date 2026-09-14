@@ -132,7 +132,11 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 	if errBody != nil {
 		return
 	}
-	g, err := s.runBuild(c.Request.Context(), req.Start, req.End, req.Selector, s.builder.BuildStorage)
+	g, err := s.runBuild(c.Request.Context(), req.Start, req.End, req.Selector,
+		func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+			// The roots reach the build: a pod root's name joins the pod scope.
+			return s.builder.BuildStorage(ctx, window, end, sel, req.Scope.Roots)
+		})
 	if err != nil {
 		s.mapBuildError(c, err)
 		return
@@ -177,9 +181,9 @@ func (s *Server) serialiseWithSpan(ctx context.Context, format string, fn func()
 	return fn()
 }
 
-// buildFunc is the shape shared by Builder.Build and Builder.BuildStorage, so
-// one runBuild serves both endpoints and the timeout normalisation cannot
-// drift between them.
+// buildFunc is the shape shared by Builder.Build and a closure binding the
+// request's roots into Builder.BuildStorage, so one runBuild serves both
+// endpoints and the timeout normalisation cannot drift between them.
 type buildFunc func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error)
 
 // runBuild wraps a build in a per-request build-timeout context. On

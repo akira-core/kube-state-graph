@@ -37,9 +37,10 @@ type Options struct {
 	// build, where the only honest options would be a silent fallback to a
 	// different estate's naming or a panic.
 	VolumeKey *VolumeKeyRewriter
-	// QoSScopeBatchBytes bounds the rendered `volume` alternation of one
-	// scoped QoS workload query, so a large estate is split across several
-	// queries rather than exceeding the upstream's query-length limit. Zero
-	// (the default) means DefaultQoSScopeBatchBytes.
+	// QoSScopeBatchBytes bounds every data-derived alternation one query
+	// carries — the scoped QoS workload read's `volume` and the storage
+	// build's `pod` scope — so a large estate is split across several queries
+	// rather than exceeding the upstream's query-length limit. Zero (the
+	// default) means DefaultQoSScopeBatchBytes.
 	QoSScopeBatchBytes int
 }

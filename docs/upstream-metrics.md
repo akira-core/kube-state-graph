@@ -41,10 +41,12 @@ Install-side companions:
 GET /v1/graph?start=&end=&…
         │
         ├─ ReadTopology — 37 queries in parallel, then up to 6 more
-        │     20 kube-state-metrics   abort the build on query error
-        │      2 accumulating-cardinality annotation families
-        │         (kube_replicaset_annotations, kube_job_annotations)
-        │         log-and-continue (empty vector)
+        │     19 kube-state-metrics   abort the build on query error
+        │      3 kube-state-metrics legs log-and-continue (empty vector):
+        │         kube_replicaset_annotations, kube_job_annotations
+        │         (cardinality accumulates with history) and
+        │         kube_pod_container_info (cardinality multiplies with
+        │         containers, image variants and pod churn)
         │     12 Harvest + 2 kubelet + ALERTS  log-and-continue (empty vector)
         │     ── second wave, gated on kube_persistentvolumeclaim_info
         │        and volume_labels ────────────────────────────────────
@@ -74,6 +76,42 @@ v1 has no result cache: this fan-out runs on every request.
 | `traces_service_graph_*` | `rate(<metric>[<window>])` evaluated at `end` |
 | `up` | bare `up` (no window) |
 
+## Fan-out per `/v1/storage-graph` request
+
+The storage build reads through the same topology fan-out under a narrower
+plan: it issues only what a storage-flow body can carry, and it reads pods by
+reference.
+
+```
+GET /v1/storage-graph?start=&end=&az=&env=&…
+        │
+        └─ ReadTopology (storage plan) — 30 queries in parallel, then up to 8 more
+              never issued: kube_pod_container_info, kube_service_info,
+                kube_endpointslice_endpoints, kube_endpointslice_labels,
+                kube_service_annotations (the body carries no containers
+                and no service node)
+              ── second wave, gated on
+                 kube_pod_spec_volumes_persistentvolumeclaims_info ──────────
+               2 pod legs (kube_pod_info, kube_pod_owner), scoped to the pods
+                 a claim binding names plus the request's pod=<ns>/<name>
+                 roots; NOT issued when the scope is empty. Chunked by
+                 --netapp-qos-scope-batch-bytes; a chunk error FAILS the build
+              ── second wave, gated on kube_persistentvolumeclaim_info
+                 and volume_labels ────────────────────────────────────────
+               6 Harvest QoS workload legs, exactly as for /v1/graph
+```
+
+No `up{}` probe and no service-graph read. Pods that mount no claim — in a
+large estate, nearly all of them — are never fetched. A pod name is unique per
+namespace only, so the scope may admit a same-named pod from another
+namespace; it lies on no drawn path and the projection drops it.
+
+**Pod-only roots narrow every namespaced leg.** When every root is a
+`pod=<ns>/<name>` root and the request carries no `namespace`, the parser adds
+the roots' namespaces as the `namespace` selector — output-preserving, since a
+pod-rooted body draws nothing outside them. Any storage-side or `node` root
+suppresses this, and an explicit `namespace` always wins.
+
 ## Query error vs empty vector
 
 The README **"Required?"** column answers "does an **empty vector** drop this
@@ -81,8 +119,10 @@ feature?". Query **errors** (timeout, 5xx, PromQL parse) are a separate axis:
 
 | Legs | Query error | Empty vector |
 |---|---|---|
-| 20 kube-state-metrics topology queries | **Fails the build** (HTTP 5xx / mapped `build.Reason`) | Feature omitted (no pods, no IPs, no `://` services, …) |
+| 19 kube-state-metrics topology queries | **Fails the build** (HTTP 5xx / mapped `build.Reason`) | Feature omitted (no pods, no IPs, no `://` services, …) |
 | 2 accumulating-cardinality annotation families (`kube_replicaset_annotations`, `kube_job_annotations`) | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`). Cardinality grows with history (`revisionHistoryLimit` / Job history limits), not live object count. The degrade is silent in the response — alert on the self-metric `kube_state_graph_upstream_query_failures_total{query="kube_replicaset_annotations"}` / `{query="kube_job_annotations"}`, which `pkg/promql.Client` increments for every failed query regardless of which fetch helper called it, or on the `optional topology query failed` Warn | No `data.application` for bare-ReplicaSet / Job-owned pods — which also **reshapes the Cytoscape hierarchy** (those pods reparent from `…/application/<app>/controller/…` to `…/controller/…`, an `application` group node with no other member disappears, and a PVC that inherited its Application from such a pod re-inherits from a different mounter). A degraded `kube_job_annotations` additionally **suppresses the Job → CronJob hop** for that build (`topologyVectors.JobAnnotationsDegraded`): the hop is gated on "this Job carries no annotation of its own", which an unread family cannot establish, so following it would attribute a directly-managed Job's pod to its CronJob's Application — a wrong value, not a missing one. A genuinely annotation-less Job under an annotated CronJob therefore also loses its Application while the leg is degraded. Every degrade in this table is subtractive |
+| `kube_pod_container_info` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context, which still fails the request (`optionalQueryFatal`). Cardinality **multiplies** with the live object count (containers × image variants, and every pod that existed at any instant of the window), so it is the largest kube-state-metrics family and the first to meet a memory-derived series limit (`the number of matching timeseries exceeds …`). Alert on `kube_state_graph_upstream_query_failures_total{query="kube_pod_container_info"}`, or watch it approach the cap (below) | No `data.containers` on any pod; nothing else moves |
+| Scoped `kube_pod_info` / `kube_pod_owner` chunks (`/v1/storage-graph` only) | **Fails the build** — a pod is topology, and a missing chunk would be a smaller, plausible, wrong body | n/a — an empty scope issues no query |
 | `traces_service_graph_request_total` | **Fails the build** | No call edges; topology still returned |
 | 18 Harvest + 2 kubelet + `ALERTS` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` / no `data.alerts` |
 | `traces_service_graph_request_failed_total` | Log-and-continue | Measured edges omit `error_rate` (never reports `0`) |
@@ -93,6 +133,22 @@ An **unfiltered** build with zero parsed pods **and** zero parsed nodes, plus a
 healthy `up{}`, is classified `outside_retention` (HTTP 400). A **filtered**
 build never probes `up{}`: zero rows means "nothing in scope" and returns HTTP
 200 with empty `elements`.
+
+### Watching a leg approach an upstream series limit
+
+VictoriaMetrics rejects a query whose matchers SELECT more series than
+`-search.maxUniqueTimeseries` (derived from vmselect memory when unset) — the
+count is taken before any aggregation, so no `sum by` helps. Every successful
+query records its result size in
+`kube_state_graph_upstream_query_result_series{query}` (buckets 1024 … 1048576;
+one observation per issued query, per chunk of a scoped read, and per backend a
+routed query reaches), and both build log lines (`graph built`,
+`storage graph built`) name the `largest_leg`. A leg whose high quantile sits
+one bucket below the cap is the next rejection:
+
+```promql
+histogram_quantile(0.99, sum by (query, le) (rate(kube_state_graph_upstream_query_result_series_bucket[1h])))
+```
 
 ## Which request filter reaches which series
 
@@ -167,7 +223,7 @@ degrade as in the last column.
 | `kube_replicaset_annotations{annotation_argocd_argoproj_io_tracking_id!=""}` | Same, for pods whose owner stayed a bare ReplicaSet. **Requires** `--metric-annotations-allowlist=replicasets=[…]`. Query error **degrades** (log-and-continue) — cardinality accumulates with `revisionHistoryLimit` | `cluster`, `namespace`, `replicaset`, `annotation_argocd_argoproj_io_tracking_id` | Same |
 | `kube_job_annotations{annotation_argocd_argoproj_io_tracking_id!=""}` | Same, for Job-owned pods. Identity label is **`job_name`**, not `job`. **Requires** `--metric-annotations-allowlist=jobs=[…]`. Query error **degrades** (log-and-continue) — cardinality accumulates with Job history limits | `cluster`, `namespace`, `job_name`, `annotation_argocd_argoproj_io_tracking_id` | Same |
 | `kube_cronjob_annotations{annotation_argocd_argoproj_io_tracking_id!=""}` | Same, for pods reached through `kube_job_owner`. **Requires** `--metric-annotations-allowlist=cronjobs=[…]` | `cluster`, `namespace`, `cronjob`, `annotation_argocd_argoproj_io_tracking_id` | Same |
-| `kube_pod_container_info` | Pod `data.containers` = `[{name, image}]`, ordered by `(name, image)`; latest-seen image wins on a mid-window change | `cluster`, `namespace`, `pod`, `container`, `image` | Attribute omitted |
+| `kube_pod_container_info` | Pod `data.containers` = `[{name, image}]`, ordered by `(name, image)`; latest-seen image wins on a mid-window change | `cluster`, `namespace`, `pod`, `container`, `image` | Attribute omitted. A query error **degrades** too. Never read by `/v1/storage-graph` |
 | `kube_service_annotations` | Service `data.application`. **Requires** `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]` | `cluster`, `namespace`, `service`, `annotation_argocd_argoproj_io_tracking_id` | Attribute omitted |
 | `kube_persistentvolumeclaim_annotations` | PVC's **own** `data.application` (same parse). **Requires** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`. An app-less PVC additionally **inherits** the lexically-smallest Application among pods that mount it | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | Own annotation omitted; inheritance may still fill it |
 
@@ -379,4 +435,6 @@ count(qos_read_ops)
 The code-side pins: `TestQueryDims_EveryQueryListed` fails if a `Query`
 constant is missing from the dimension table; `TestReadTopology_FanOutLegCount`
 fails if topology issues anything other than 37 queries when no claim matches a
-Harvest volume, or 43 when one does.
+Harvest volume, or 43 when one does. `TestBuildStorage_FanOutLegCount` pins the
+storage plan the same way: 32 with a non-empty pod scope and no matched FlexVol,
+38 with one, and 30 / 36 when the pod scope is empty.

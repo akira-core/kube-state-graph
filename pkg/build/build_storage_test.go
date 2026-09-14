@@ -44,16 +44,17 @@ func newStorageBuilder(t *testing.T, q promql.Querier) *Builder {
 	return New(q, Options{}, nil, nil)
 }
 
-// The storage build reuses ReadTopology unchanged and skips the service-graph
-// read entirely: those three legs are the most expensive of the fan-out and the
-// storage body uses none of them. The up{} probe is skipped too — the endpoint
-// is always a filtered build.
+// The storage build reads the topology under the storage plan and skips the
+// service-graph read entirely: those three legs are the most expensive of the
+// fan-out and the storage body uses none of them. The up{} probe is skipped too
+// — the endpoint is always a filtered build — and so are the five families the
+// storage body cannot carry.
 func TestBuildStorage_IssuesNoServiceGraphOrProbeQuery(t *testing.T) {
 	q, seen := newRecordingQuerier(t, storageFixtures())
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
 
 	_, err := newStorageBuilder(t, q).BuildStorage(
-		t.Context(), time.Minute, time.Unix(1, 0).UTC(), sel)
+		t.Context(), time.Minute, time.Unix(1, 0).UTC(), sel, graph.StorageRoots{})
 	require.NoError(t, err)
 
 	issued := map[string]bool{}
@@ -65,6 +66,12 @@ func TestBuildStorage_IssuesNoServiceGraphOrProbeQuery(t *testing.T) {
 		promql.QServiceGraphFailedTotal,
 		promql.QServiceGraphServerSecondsBucket,
 		promql.QUpProbe,
+		// The five families the storage body cannot carry (the storage plan).
+		promql.QPodContainerInfo,
+		promql.QServiceInfo,
+		promql.QEndpointSliceEndpoints,
+		promql.QEndpointSliceLabels,
+		promql.QServiceAnnotations,
 	} {
 		assert.Falsef(t, issued[string(forbidden)], "%s must not be issued by BuildStorage", forbidden)
 	}
@@ -81,7 +88,7 @@ func TestBuildStorage_EmitsOnlyStorageFlow(t *testing.T) {
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 	require.NoError(t, err)
 
 	require.NotEmpty(t, g.Edges)
@@ -107,7 +114,7 @@ func TestBuildStorage_DrawsTheWholeChain(t *testing.T) {
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 	require.NoError(t, err)
 
 	tiers := map[string]int{}
@@ -138,7 +145,7 @@ func TestBuildStorage_CarriesClusterIdentities(t *testing.T) {
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 	require.NoError(t, err)
 
 	require.NotNil(t, g.ClusterIdentities)
@@ -154,7 +161,7 @@ func TestBuildStorage_EmptyEstateIsNotOutsideRetention(t *testing.T) {
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 	require.NoError(t, err, "an empty filtered estate is an empty graph, not an error")
 	assert.Empty(t, g.NodesByID)
 	assert.Empty(t, g.Edges)
@@ -175,7 +182,7 @@ func TestBuildStorage_MaterialisesFlowlessInventory(t *testing.T) {
 
 	g, err := newStorageBuilder(t, q).BuildStorage(
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+		promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 	require.NoError(t, err)
 
 	assert.Contains(t, g.NodesByID, graph.NetAppAggrID("ontap-prod", "aggr9"),

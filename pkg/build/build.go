@@ -199,15 +199,19 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 			crossCluster += n
 		}
 	}
+	leg, legSeries := largestLeg(topology.RawSeriesCount)
 	slog.InfoContext(ctx, "graph built",
 		"selector_active", filtered,
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
 		"cross_cluster_edges", crossCluster,
+		"largest_leg", leg,
+		"largest_leg_series", legSeries,
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 	)
+	slog.DebugContext(ctx, "graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 
 	// Self-metrics: observational gauges for last build (no-op when unset).
 	if b.metrics != nil {
@@ -227,16 +231,23 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 
 // BuildStorage builds the storage-flow graph served by GET /v1/storage-graph.
 //
-// It reuses ReadTopology unchanged — byte-for-byte the same fan-out, under the
-// same selector — so the two endpoints cannot disagree about what a claim, a
-// pod or an aggregate is. What it does NOT do is read the service graph: the
-// storage body uses none of it, and those three legs are the most expensive of
-// the fan-out.
+// It reads through Build's topology fan-out under the storage plan
+// (storagePlan): the five families its body cannot carry — the container list
+// and the four service-side families — are never issued, and kube_pod_info /
+// kube_pod_owner are read BY REFERENCE, restricted to the pods a claim binding
+// names plus the request's pod roots. Every other leg is issued exactly as
+// Build issues it, so the two endpoints cannot disagree about what a claim, a
+// pod or an aggregate is. It does NOT read the service graph: the storage body
+// uses none of it, and those three legs are the most expensive of the fan-out.
 //
-// Like Build it is a pure function of (window, end, Selector): roots never
-// reach the queries, so the build stays cacheable on the same key and the
-// "selectors alone narrow the upstream" rule holds. Roots are a projection
-// concern (graph.ProjectStorage).
+// It is a pure function of (window, end, Selector, roots), and roots reach
+// exactly one read: the pod names of pod=<ns>/<name> roots join the pod scope,
+// because a root mounting no claim is drawable only if its pod is read. A root
+// can only ADD a pod to that scope, never narrow a read, so which paths are
+// drawn stays a projection concern (graph.ProjectStorage). This revises the
+// storage-graph design's "roots never reach the build" stance
+// (harden-topology-read-cardinality D7): v1 has no result cache whose key it
+// would widen, and the alternative was reading every pod in the estate.
 //
 // There is deliberately no outside-retention classification and no up{} probe.
 // The endpoint requires az and env, so every storage build is a FILTERED build,
@@ -250,7 +261,12 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // a storage build would wipe every pod-calls-* / pvc-to-netapp-aggr series and
 // replace them with storage-flow until the next /v1/graph request, making the
 // gauges a function of request mix rather than of the estate.
-func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots) (*graph.Graph, error) {
+	return b.buildStorage(ctx, window, end, sel, storagePlan(roots))
+}
+
+// buildStorage is BuildStorage under an explicit read plan.
+func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
 	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(
@@ -261,7 +277,7 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 	)
 	defer span.End()
 
-	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
+	topology, err := readTopology(ctx, q, window, end, b.opts, sel, plan)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
@@ -275,14 +291,18 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	g.ClusterIdentities = topology.ClusterIdentities
 
+	leg, legSeries := largestLeg(topology.RawSeriesCount)
 	slog.InfoContext(ctx, "storage graph built",
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
+		"largest_leg", leg,
+		"largest_leg_series", legSeries,
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
 	)
+	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 
 	span.SetAttributes(
 		attribute.Int("kube_state_graph.cluster_count", len(topology.ClustersObserved)),

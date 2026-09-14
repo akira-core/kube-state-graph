@@ -111,3 +111,28 @@ func TestMetrics_EstablishedUpstreamMetricsKeepTheirLabels(t *testing.T) {
 			"the established upstream metrics must carry no backend label: %s", line)
 	}
 }
+
+// The result-series histogram is labelled by query only and bucketed on powers
+// of two, so an operator can read how close a leg sits to an upstream series
+// limit. 70000 series lands above the 65536 bucket — just past a memory-derived
+// ~67k VictoriaMetrics cap — which is exactly the reading this metric exists to
+// surface before the limit starts rejecting the query.
+func TestMetrics_ResultSeriesHistogramExposed(t *testing.T) {
+	m := observability.NewMetrics()
+	m.ObserveQuerySeries("kube_pod_info", 1200)
+	m.ObserveQuerySeries("kube_pod_container_info", 70000)
+	body := scrapeMetrics(t, m)
+
+	for _, want := range []string{
+		`kube_state_graph_upstream_query_result_series_bucket{query="kube_pod_info",le="1024"} 0`,
+		`kube_state_graph_upstream_query_result_series_bucket{query="kube_pod_info",le="2048"} 1`,
+		`kube_state_graph_upstream_query_result_series_bucket{query="kube_pod_info",le="+Inf"} 1`,
+		`kube_state_graph_upstream_query_result_series_count{query="kube_pod_info"} 1`,
+		`kube_state_graph_upstream_query_result_series_bucket{query="kube_pod_container_info",le="65536"} 0`,
+		`kube_state_graph_upstream_query_result_series_bucket{query="kube_pod_container_info",le="131072"} 1`,
+	} {
+		assert.Contains(t, body, want)
+	}
+	assert.NotContains(t, body, `kube_state_graph_upstream_query_result_series_bucket{backend=`,
+		"the histogram carries no backend label")
+}

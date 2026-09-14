@@ -13,12 +13,31 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// qosScopeConcurrency bounds the second-wave QoS reads in flight at once
-// (six families × however many chunks the scope was split into). It is a
+// scopeConcurrency bounds one second wave's reads in flight at once (its
+// families × however many chunks its scope was split into). Each wave — the QoS
+// workload read and the storage build's pod read — has its own limit. It is a
 // site-invariant tuning value like routeResolveConcurrency, not a knob: the
 // queries it bounds are already narrow, and the upstream's own limits are the
 // backstop that matters.
-const qosScopeConcurrency = 8
+const scopeConcurrency = 8
+
+// scopedTarget is one family a second wave reads, with the slot it lands in.
+type scopedTarget struct {
+	query promql.Query
+	dst   *model.Vector
+}
+
+// qosTargets are the six QoS workload families the scoped QoS read issues.
+func qosTargets(v *topologyVectors) []scopedTarget {
+	return []scopedTarget{
+		{promql.QQoSReadOps, &v.QoSReadOps},
+		{promql.QQoSWriteOps, &v.QoSWriteOps},
+		{promql.QQoSReadLatency, &v.QoSReadLatency},
+		{promql.QQoSWriteLatency, &v.QoSWriteLatency},
+		{promql.QQoSReadData, &v.QoSReadData},
+		{promql.QQoSWriteData, &v.QoSWriteData},
+	}
+}
 
 // signalWhenDone closes done when fn returns, whatever it returns. Closing on
 // the error path too is what keeps the scoped QoS read from blocking when a
@@ -72,19 +91,10 @@ func readScopedQoS(
 	if len(scope) == 0 {
 		return nil
 	}
+	v.QoSScopeIssued = true
 	chunks := promql.ChunkQoSVolumeScope(scope, opts.qosScopeBatchBytes())
 
-	targets := []struct {
-		query promql.Query
-		dst   *model.Vector
-	}{
-		{promql.QQoSReadOps, &v.QoSReadOps},
-		{promql.QQoSWriteOps, &v.QoSWriteOps},
-		{promql.QQoSReadLatency, &v.QoSReadLatency},
-		{promql.QQoSWriteLatency, &v.QoSWriteLatency},
-		{promql.QQoSReadData, &v.QoSReadData},
-		{promql.QQoSWriteData, &v.QoSWriteData},
-	}
+	targets := qosTargets(v)
 
 	// One slot per (family, chunk). Writing into a pre-sized slot rather than
 	// appending is what makes the merge below order-free.
@@ -94,7 +104,7 @@ func readScopedQoS(
 	}
 
 	var wave errgroup.Group
-	wave.SetLimit(qosScopeConcurrency)
+	wave.SetLimit(scopeConcurrency)
 	for ti, t := range targets {
 		for ci, chunk := range chunks {
 			wave.Go(func() error {

@@ -20,6 +20,12 @@ type Metrics struct {
 	HTTPRequests      *prometheus.CounterVec
 	AuthRejected      *prometheus.CounterVec
 
+	// UpstreamQuerySeries observes how many series each successful upstream
+	// query returned, by query name. Powers-of-two buckets put 65536 one bucket
+	// below a memory-derived VictoriaMetrics series cap of ~67k, so an operator
+	// sees a leg approaching the limit before the limit rejects it.
+	UpstreamQuerySeries *prometheus.HistogramVec
+
 	// Upstream backend routing. These are SEPARATE metrics rather than a
 	// `backend` label on UpstreamQueryDur / UpstreamQueryFail: adding a label
 	// to an established self-metric is a contract change that breaks every
@@ -74,6 +80,11 @@ func NewMetrics() *Metrics {
 			Name: "kube_state_graph_upstream_query_failures_total",
 			Help: "Upstream PromQL query failures by query name.",
 		}, []string{"query"}),
+		UpstreamQuerySeries: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "kube_state_graph_upstream_query_result_series",
+			Help:    "Series returned per successful upstream PromQL query, by query name.",
+			Buckets: prometheus.ExponentialBuckets(1024, 2, 11), // 1024 … 1048576
+		}, []string{"query"}),
 		HTTPRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kube_state_graph_http_requests_total",
 			Help: "HTTP requests by path and status.",
@@ -106,6 +117,7 @@ func NewMetrics() *Metrics {
 		m.ClustersObserved,
 		m.UpstreamQueryDur,
 		m.UpstreamQueryFail,
+		m.UpstreamQuerySeries,
 		m.HTTPRequests,
 		m.AuthRejected,
 		m.UpstreamBackends,

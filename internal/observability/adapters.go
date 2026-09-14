@@ -17,6 +17,13 @@ func (m *Metrics) IncQueryFailure(name string) {
 	m.UpstreamQueryFail.WithLabelValues(name).Inc()
 }
 
+// ObserveQuerySeries records how many series one successful upstream query
+// returned, labelled by query name. Satisfies pkg/promql.SeriesMetrics — the
+// OPTIONAL upgrade over pkg/promql.Metrics.
+func (m *Metrics) ObserveQuerySeries(name string, n int) {
+	m.UpstreamQuerySeries.WithLabelValues(name).Observe(float64(n))
+}
+
 // SetGraphNodeCounts replaces the last-build node-count gauge with counts keyed
 // by [cluster, kind]. Satisfies pkg/build.Metrics.
 func (m *Metrics) SetGraphNodeCounts(counts map[[2]string]int) {

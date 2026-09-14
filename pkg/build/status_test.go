@@ -69,7 +69,7 @@ func TestBuildPaths_AttachStatusBeforeGraphFreeze(t *testing.T) {
 		},
 		"storage": func(b *Builder) (*graph.Graph, error) {
 			return b.BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(),
-				promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}})
+				promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, graph.StorageRoots{})
 		},
 	}
 

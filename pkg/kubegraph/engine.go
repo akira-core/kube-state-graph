@@ -118,9 +118,13 @@ func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.B
 
 // BuildStorage runs the storage-flow build for [end-window, end] — topology
 // only, no service-graph read. sel carries the request-scoped selector; az
-// and env are always set for this endpoint.
-func (e *Engine) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
-	return e.builder.BuildStorage(ctx, window, end, sel)
+// and env are always set for this endpoint. roots are the request's storage
+// roots: the pod names of its pod roots join the build's pod scope, so a pod
+// root that mounts no claim is still read and drawn. Pass graph.StorageRoots{}
+// for a request with no roots — and pass the SAME roots to
+// graph.ProjectStorage, or a claimless pod root cannot be drawn.
+func (e *Engine) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots) (*graph.Graph, error) {
+	return e.builder.BuildStorage(ctx, window, end, sel, roots)
 }
 
 // BuildStorageFromValues parses the /v1/storage-graph query parameters, builds
@@ -133,7 +137,7 @@ func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cyto
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	g, err := e.builder.BuildStorage(ctx, req.End.Sub(req.Start), req.End, req.Selector)
+	g, err := e.builder.BuildStorage(ctx, req.End.Sub(req.Start), req.End, req.Selector, req.Scope.Roots)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}

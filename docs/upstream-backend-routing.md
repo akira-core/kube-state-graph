@@ -202,6 +202,7 @@ backend the new table no longer declares has its idle connections released.
 | `kube_state_graph_upstream_backends` | gauge | Backends in the live routing table |
 | `kube_state_graph_backend_config_reload_total{result}` | counter | Reload attempts by `ok` / `error` / `unchanged` |
 | `kube_state_graph_backend_query_failures_total{backend}` | counter | Upstream query failures per backend |
+| `kube_state_graph_upstream_query_result_series{query}` | histogram | Series returned per successful upstream query (buckets 1024 … 1048576). A routed query contributes one observation per backend it reaches; it carries no `backend` label |
 
 `kube_state_graph_upstream_query_duration_seconds` and
 `kube_state_graph_upstream_query_failures_total` keep their existing
