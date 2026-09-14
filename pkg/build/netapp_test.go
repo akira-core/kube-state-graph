@@ -744,6 +744,163 @@ func TestParseTopology_NetAppJoinAndUsage(t *testing.T) {
 	require.Len(t, tp.StorageEdges, 1)
 	require.NotNil(t, tp.StorageEdges[0].IO)
 	assert.InDelta(t, 5000.0, *tp.StorageEdges[0].IO.MaxIOPS, 1e-12)
+	assert.Equal(t, tp.StorageEdges[0].Target, tp.PVCs[0].Labels()["aggr"])
+}
+
+// pvcBindingVectors is the minimal topologyVectors that materialises one PVC
+// node mounted by one pod, with the given bound PV name (`volumename` on
+// PVCInfo). resolvePVCInfo never materialises a PVC on its own — the
+// pod-mounts-pvc binding metric (v.PVC) does — so every scenario below needs
+// both.
+func pvcBindingVectors(cluster, ns, pod, claim, volumeName string) topologyVectors {
+	return topologyVectors{
+		PVC: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+			"pod": model.LabelValue(pod), "claim_name": model.LabelValue(claim), "volume": model.LabelValue(claim),
+		}}),
+		Pod: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+			"pod": model.LabelValue(pod), "uid": "u1", "node": "w0",
+		}}),
+		PVCInfo: sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+			"persistentvolumeclaim": model.LabelValue(claim), "volumename": model.LabelValue(volumeName),
+		}}),
+	}
+}
+
+// TestParseTopology_PVCAggrLabel pins "PVC aggr label from the Harvest join"
+// and "PVC aggr label" (design.md D1-D2): the stamp in parseTopology, not just
+// the edge resolveNetAppStorage draws.
+func TestParseTopology_PVCAggrLabel(t *testing.T) {
+	t.Run("equals edge target", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-9f3a")
+		v.VolumeLabels = sampleVec(volLabelSample("pvc-9f3a", "oc", "n1", "a1", "svm-prod"))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		require.Len(t, tp.StorageEdges, 1)
+		assert.Equal(t, graph.NetAppAggrID("oc", "a1"), tp.PVCs[0].Labels()["aggr"])
+		assert.Equal(t, tp.StorageEdges[0].Target, tp.PVCs[0].Labels()["aggr"])
+	})
+
+	t.Run("conflicting matched series follow the pick", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-x")
+		v.VolumeLabels = sampleVec(
+			volLabelSample("pvc-x", "oc", "n1", "aggr-b", "svm-b"),
+			volLabelSample("pvc-x", "oc", "n1", "aggr-a", "svm-a"),
+		)
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		assert.Equal(t, graph.NetAppAggrID("oc", "aggr-a"), tp.PVCs[0].Labels()["aggr"])
+	})
+
+	t.Run("FlexGroup claim has svm no aggr and no edge", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-fg")
+		v.VolumeLabels = sampleVec(volLabelSample("pvc-fg", "oc", "n1", "", "svm-big"))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		assert.Equal(t, "svm-big", tp.PVCs[0].Labels()["svm"])
+		_, hasAggr := tp.PVCs[0].Labels()["aggr"]
+		assert.False(t, hasAggr)
+		assert.Empty(t, tp.StorageEdges)
+	})
+
+	t.Run("join miss yields no aggr", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-nope")
+		v.VolumeLabels = sampleVec(volLabelSample("pvc-other", "oc", "n1", "aggr1", "svm"))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		_, hasAggr := tp.PVCs[0].Labels()["aggr"]
+		assert.False(t, hasAggr)
+	})
+
+	t.Run("claim with no volumename yields no aggr", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "")
+		v.VolumeLabels = sampleVec(volLabelSample("data", "oc", "n1", "aggr1", "svm"))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		_, hasVN := tp.PVCs[0].Labels()["volumename"]
+		assert.False(t, hasVN)
+		_, hasAggr := tp.PVCs[0].Labels()["aggr"]
+		assert.False(t, hasAggr)
+	})
+
+	t.Run("empty svm leaves aggr set with no svm", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-x")
+		v.VolumeLabels = sampleVec(volLabelSample("pvc-x", "oc", "n1", "aggr1", ""))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		assert.Equal(t, graph.NetAppAggrID("oc", "aggr1"), tp.PVCs[0].Labels()["aggr"])
+		_, hasSVM := tp.PVCs[0].Labels()["svm"]
+		assert.False(t, hasSVM)
+	})
+
+	t.Run("same aggregate name on two filers yields two distinct ids", func(t *testing.T) {
+		v := topologyVectors{
+			PVC: sampleVec(
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "pod": "p1", "claim_name": "data1", "volume": "data1"}},
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "pod": "p2", "claim_name": "data2", "volume": "data2"}},
+			),
+			Pod: sampleVec(
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "pod": "p1", "uid": "u1", "node": "w0"}},
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "pod": "p2", "uid": "u2", "node": "w0"}},
+			),
+			PVCInfo: sampleVec(
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data1", "volumename": "pvc-a"}},
+				model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data2", "volumename": "pvc-b"}},
+			),
+			VolumeLabels: sampleVec(
+				volLabelSample("pvc-a", "ontap-a", "n1", "aggr1", "svm-a"),
+				volLabelSample("pvc-b", "ontap-b", "n1", "aggr1", "svm-b"),
+			),
+		}
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 2)
+		byName := map[string]*graph.PVCNode{}
+		for _, p := range tp.PVCs {
+			byName[p.Name()] = p
+		}
+		aggr1 := byName["data1"].Labels()["aggr"]
+		aggr2 := byName["data2"].Labels()["aggr"]
+		assert.Equal(t, graph.NetAppAggrID("ontap-a", "aggr1"), aggr1)
+		assert.Equal(t, graph.NetAppAggrID("ontap-b", "aggr1"), aggr2)
+		assert.NotEqual(t, aggr1, aggr2)
+	})
+
+	t.Run("QoS series without a volume_labels match yield no aggr", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-x")
+		v.QoSReadOps = sampleVec(qosSample("pvc-x", "oc", "svm", "gold", 10))
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		_, hasAggr := tp.PVCs[0].Labels()["aggr"]
+		assert.False(t, hasAggr)
+		assert.Empty(t, tp.StorageEdges)
+	})
+
+	t.Run("window without volume_labels gives no PVC an aggr key", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-x")
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		_, hasAggr := tp.PVCs[0].Labels()["aggr"]
+		assert.False(t, hasAggr)
+	})
+
+	t.Run("no PVC has more than one pvc-to-netapp-aggr edge", func(t *testing.T) {
+		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-x")
+		v.VolumeLabels = sampleVec(
+			volLabelSample("pvc-x", "oc", "n1", "aggr-b", "svm-b"),
+			volLabelSample("pvc-x", "oc", "n1", "aggr-a", "svm-a"),
+		)
+		tp := parseTopology(v, promql.LabelKeys{})
+		require.Len(t, tp.PVCs, 1)
+		count := 0
+		for _, e := range tp.StorageEdges {
+			if e.Type == graph.EdgeTypePVCToNetAppAggr && e.Source == tp.PVCs[0].ID() {
+				count++
+			}
+		}
+		assert.Equal(t, 1, count)
+	})
 }
 
 func TestReadTopology_HarvestLegFailureDoesNotFailBuild(t *testing.T) {

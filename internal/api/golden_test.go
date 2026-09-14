@@ -235,6 +235,7 @@ func buildWithNetAppStorage() graph.View {
 		LabelsValue: map[string]string{
 			"cluster": "cluster-alpha", "namespace": "db",
 			"volume": "data", "volumename": "pvc-9f3a", "svm": "svm-prod",
+			"aggr": graph.NetAppAggrID("ontap-prod", "aggr1"),
 		},
 		StorageClassValue: "netapp-nas",
 		AlertsValue:       []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
@@ -288,12 +289,14 @@ func buildStorageGraphEstate() *graph.Graph {
 	svmBig := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_big"), NameValue: "svm_big", LabelsValue: map[string]string{"ontap_cluster": oc}}
 	svmPlat := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_plat"), NameValue: "svm_plat", LabelsValue: map[string]string{"ontap_cluster": oc}}
 
-	orders := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "orders-data"), NameValue: "orders-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
-	shared := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "shared-data"), NameValue: "shared-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
-	plain := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "plain-data"), NameValue: "plain-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	orders := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "orders-data"), NameValue: "orders-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop", "aggr": aggr1.ID()}}
+	shared := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "shared-data"), NameValue: "shared-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop", "aggr": aggr1.ID()}}
+	plain := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "plain-data"), NameValue: "plain-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop", "aggr": aggr1.ID()}}
+	// big-data is the FlexGroup shape: an SVM but no aggregate, so no aggr key.
 	big := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "big-data"), NameValue: "big-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
+	// idle-data joins nothing (inventory-only aggregates): no aggr key either.
 	idle := &graph.PVCNode{IDValue: graph.PVCID(a, "shop", "idle-data"), NameValue: "idle-data", LabelsValue: map[string]string{"cluster": a, "namespace": "shop"}}
-	db := &graph.PVCNode{IDValue: graph.PVCID(b, "db", "db-data"), NameValue: "db-data", LabelsValue: map[string]string{"cluster": b, "namespace": "db"}}
+	db := &graph.PVCNode{IDValue: graph.PVCID(b, "db", "db-data"), NameValue: "db-data", LabelsValue: map[string]string{"cluster": b, "namespace": "db", "aggr": aggr1.ID()}}
 
 	pod := func(cluster, ns, name, uid, node string) *graph.PodNode {
 		labels := map[string]string{"cluster": cluster, "namespace": ns, "node": graph.K8sNodeID(cluster, node)}

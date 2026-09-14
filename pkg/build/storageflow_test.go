@@ -3,11 +3,14 @@ package build
 import (
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 // --- fixture helpers ------------------------------------------------------
@@ -237,6 +240,119 @@ func TestAssembleStorageFlow_FlexGroupStartsAtTheSVM(t *testing.T) {
 		"pvc-pod " + graph.PVCID(sfCluster, "shop", "big-data") + " -> " + graph.PodID(sfCluster, "uid-1"),
 		"svm-pvc netapp/ontap-prod/svm/svm_big -> " + graph.PVCID(sfCluster, "shop", "big-data"),
 	}, tiersOf(edges))
+}
+
+// The spec's "PVC aggr label" and "FlexGroup claim resolves svm but no aggr",
+// exercised through the storage-flow chain: unlike the fixtures above, this
+// Topology is built through parseTopology so the pkg/build/topology.go
+// aggr-label stamp (design.md D1) actually runs. A FlexVol claim and a
+// FlexGroup claim share one SVM: the FlexVol PVC names its aggregate, the
+// FlexGroup PVC carries svm and no aggr, and the FlexGroup claim draws no
+// node-aggr / aggr-svm edge of its own — those tiers are shared with (and
+// wholly accounted for by) the FlexVol claim's aggregate.
+func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
+	cluster, ns := "c", "shop"
+	v := topologyVectors{
+		PVC: sampleVec(
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"pod": "orders-0", "claim_name": "orders-data", "volume": "orders-data",
+			}},
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"pod": "big-0", "claim_name": "big-data", "volume": "big-data",
+			}},
+		),
+		Pod: sampleVec(
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"pod": "orders-0", "uid": "uid-1", "node": "worker-1",
+			}},
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"pod": "big-0", "uid": "uid-2", "node": "worker-2",
+			}},
+		),
+		PVCInfo: sampleVec(
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"persistentvolumeclaim": "orders-data", "volumename": "pvc-orders",
+			}},
+			model.Sample{Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
+				"persistentvolumeclaim": "big-data", "volumename": "pvc-big",
+			}},
+		),
+		VolumeLabels: sampleVec(
+			volLabelSample("pvc-orders", sfOC, sfCtrl, "aggr1", "svm_shop"),
+			volLabelSample("pvc-big", sfOC, sfCtrl, "", "svm_shop"),
+		),
+	}
+
+	tp := parseTopology(v, promql.LabelKeys{})
+	require.Len(t, tp.PVCs, 2)
+
+	var flexVolPVC, flexGroupPVC *graph.PVCNode
+	for _, pv := range tp.PVCs {
+		switch pv.Name() {
+		case "orders-data":
+			flexVolPVC = pv
+		case "big-data":
+			flexGroupPVC = pv
+		}
+	}
+	require.NotNil(t, flexVolPVC)
+	require.NotNil(t, flexGroupPVC)
+
+	assert.Equal(t, graph.NetAppAggrID(sfOC, "aggr1"), flexVolPVC.Labels()["aggr"])
+	assert.Equal(t, "svm_shop", flexVolPVC.Labels()["svm"])
+
+	assert.Equal(t, "svm_shop", flexGroupPVC.Labels()["svm"])
+	_, hasAggr := flexGroupPVC.Labels()["aggr"]
+	assert.False(t, hasAggr, "FlexGroup claim resolves svm but no aggr")
+
+	nodes, edges := assembleStorageFlow(tp)
+
+	byTier := map[string]int{}
+	for _, e := range edges {
+		byTier[e.Labels["tier"]]++
+	}
+	assert.Equal(t, 1, byTier[graph.StorageTierNodeAggr],
+		"only the FlexVol claim's aggregate draws a node-aggr edge")
+	assert.Equal(t, 1, byTier[graph.StorageTierAggrSVM],
+		"only the FlexVol claim's aggregate draws an aggr-svm edge")
+	assert.Equal(t, 2, byTier[graph.StorageTierSVMPVC],
+		"both claims share the SVM's svm-pvc fan-out")
+
+	// The edges above are right; the projection must keep them right. The
+	// SVM's single incoming aggr-svm is the FlexVol claim's, and the FlexGroup
+	// claim — whose svm-pvc edge carries no claim_aggr — must not borrow it.
+	g := graph.NewGraph(nodes, edges, time.Unix(0, 0).UTC())
+
+	podRoot, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{ns + "/big-0"})
+	require.NoError(t, err)
+	view := graph.ProjectStorage(g, podRoot)
+	for _, n := range view.Nodes {
+		assert.NotContains(t, []graph.NodeType{graph.NodeTypeNetAppAggr, graph.NodeTypeNetAppNode}, n.Type(),
+			"?pod=shop/big-0 drew %s for a FlexGroup claim", n.ID())
+	}
+	for _, e := range view.Edges {
+		assert.NotContains(t, []string{graph.StorageTierNodeAggr, graph.StorageTierAggrSVM}, e.Labels["tier"],
+			"?pod=shop/big-0 drew %s -> %s for a FlexGroup claim", e.Source, e.Target)
+	}
+
+	aggrRoot, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	require.NoError(t, err)
+	view = graph.ProjectStorage(g, aggrRoot)
+	var retained []string
+	for _, n := range view.Nodes {
+		if n.Type() == graph.NodeTypePVC {
+			retained = append(retained, n.Name())
+			assert.Equal(t, graph.NetAppAggrID(sfOC, "aggr1"), n.Labels()["aggr"],
+				"?aggr=aggr1 retained PVC %s", n.ID())
+		}
+	}
+	assert.Equal(t, []string{"orders-data"}, retained)
 }
 
 // A claim with no resolved SVM contributes NO path — not even the aggregate

@@ -954,9 +954,18 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		}
 	}
 	netapp := resolveNetAppStorage(claims, v)
+	aggrByPVC := make(map[string]string, len(netapp.edges))
+	for _, e := range netapp.edges {
+		if e.Type == graph.EdgeTypePVCToNetAppAggr {
+			aggrByPVC[e.Source] = e.Target
+		}
+	}
 	for _, pv := range pvcs {
 		if ref, ok := netapp.svmByPVC[pv.IDValue]; ok && ref.SVM != "" {
 			pv.LabelsValue["svm"] = ref.SVM
+		}
+		if aggr, ok := aggrByPVC[pv.IDValue]; ok {
+			pv.LabelsValue["aggr"] = aggr
 		}
 	}
 

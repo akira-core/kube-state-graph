@@ -38,6 +38,7 @@
           "parent": "cluster-alpha/namespace/shop",
           "status": "normal",
           "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
             "cluster": "cluster-alpha",
             "namespace": "shop"
           }
