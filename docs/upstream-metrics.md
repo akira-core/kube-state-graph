@@ -79,32 +79,71 @@ v1 has no result cache: this fan-out runs on every request.
 ## Fan-out per `/v1/storage-graph` request
 
 The storage build reads through the same topology fan-out under a narrower
-plan: it issues only what a storage-flow body can carry, and it reads pods by
-reference.
+plan: it issues only what a storage-flow body can carry, and it reads pods,
+Kubernetes nodes and controllers BY REFERENCE — restricted to the names the
+build's own earlier waves already named, never to the whole estate.
 
 ```
 GET /v1/storage-graph?start=&end=&az=&env=&…
         │
-        └─ ReadTopology (storage plan) — 30 queries in parallel, then up to 8 more
+        └─ ReadTopology (storage plan) — 18 queries in parallel, then up to
+           20 more across three by-reference waves
               never issued: kube_pod_container_info, kube_service_info,
                 kube_endpointslice_endpoints, kube_endpointslice_labels,
                 kube_service_annotations (the body carries no containers
                 and no service node)
-              ── second wave, gated on
-                 kube_pod_spec_volumes_persistentvolumeclaims_info ──────────
+              read UNRESTRICTED, exactly as for /v1/graph (18 legs): the
+                claim-binding family (the scope root every wave below is
+                computed from), kube_persistentvolumeclaim_info,
+                kube_persistentvolumeclaim_annotations, the two kubelet
+                families, every NetApp Harvest inventory leg (a storage root
+                must be drawable with no claim), and ALERTS
+              ── wave 1, gated on kube_pod_spec_volumes_persistentvolumeclaims_info ──
                2 pod legs (kube_pod_info, kube_pod_owner), scoped to the pods
                  a claim binding names plus the request's pod=<ns>/<name>
                  roots; NOT issued when the scope is empty. Chunked by
                  --netapp-qos-scope-batch-bytes; a chunk error FAILS the build
-              ── second wave, gated on kube_persistentvolumeclaim_info
+              ── wave 2 (nodes), gated on wave 1 ─────────────────────────
+               4 kube_node_* legs, scoped to the Kubernetes nodes the loaded
+                 pods are scheduled on plus the request's node=<name> roots;
+                 NOT issued when that scope is empty. Chunked the same way; a
+                 chunk error FAILS the build
+              ── wave 3 (controllers), gated on wave 1, itself two stages ──
+               stage A: kube_replicaset_owner, kube_replicaset_annotations,
+                 kube_job_owner, kube_job_annotations, kube_statefulset_annotations,
+                 kube_daemonset_annotations — each scoped to the loaded pods'
+                 owner names of its OWN kind; a kind no pod is owned by issues
+                 nothing for it
+               stage B, gated on stage A: kube_deployment_annotations (scoped
+                 to direct Deployment owners plus every Deployment a landed
+                 kube_replicaset_owner row resolved a ReplicaSet up to),
+                 kube_cronjob_annotations (direct CronJob owners plus every
+                 owner_name a landed kube_job_owner row carries)
+               kube_replicaset_owner, kube_job_owner, kube_deployment_annotations,
+                 kube_statefulset_annotations, kube_daemonset_annotations and
+                 kube_cronjob_annotations FAIL the build on a chunk error;
+                 kube_replicaset_annotations degrades (log-and-continue);
+                 kube_job_annotations degrades AND suppresses the Job → CronJob
+                 hop for the whole build, exactly as its unscoped degrade does
+              ── wave 4 (QoS), gated on kube_persistentvolumeclaim_info
                  and volume_labels ────────────────────────────────────────
                6 Harvest QoS workload legs, exactly as for /v1/graph
 ```
 
-No `up{}` probe and no service-graph read. Pods that mount no claim — in a
-large estate, nearly all of them — are never fetched. A pod name is unique per
-namespace only, so the scope may admit a same-named pod from another
-namespace; it lies on no drawn path and the projection drops it.
+No `up{}` probe and no service-graph read. A pod / node / controller name is
+unique per namespace (or per cluster, for nodes) only, so a by-reference scope
+may admit a same-named object from another namespace or cluster; it is
+consulted by no loaded pod and the body is unchanged.
+
+**Fan-out per build** (design.md D6): the 18 unrestricted legs, plus 2 when the
+pod scope is non-empty, plus 4 when any loaded pod is scheduled or a `node=`
+root exists, plus 2 (owner + annotations) for each of ReplicaSet / Job that
+owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
+1 for Deployment when any ReplicaSet resolved to one (or a pod is directly
+Deployment-owned), plus 1 for CronJob when any Job resolved one (or a pod is
+directly CronJob-owned), plus 6 when a claim matched a FlexVol. An empty scope
+with no roots reads 18; every controller kind present with a matched volume
+reads 38.
 
 **Pod-only roots narrow every namespaced leg.** When every root is a
 `pod=<ns>/<name>` root and the request carries no `namespace`, the parser adds
@@ -123,6 +162,10 @@ feature?". Query **errors** (timeout, 5xx, PromQL parse) are a separate axis:
 | 2 accumulating-cardinality annotation families (`kube_replicaset_annotations`, `kube_job_annotations`) | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`). Cardinality grows with history (`revisionHistoryLimit` / Job history limits), not live object count. The degrade is silent in the response — alert on the self-metric `kube_state_graph_upstream_query_failures_total{query="kube_replicaset_annotations"}` / `{query="kube_job_annotations"}`, which `pkg/promql.Client` increments for every failed query regardless of which fetch helper called it, or on the `optional topology query failed` Warn | No `data.application` for bare-ReplicaSet / Job-owned pods — which also **reshapes the Cytoscape hierarchy** (those pods reparent from `…/application/<app>/controller/…` to `…/controller/…`, an `application` group node with no other member disappears, and a PVC that inherited its Application from such a pod re-inherits from a different mounter). A degraded `kube_job_annotations` additionally **suppresses the Job → CronJob hop** for that build (`topologyVectors.JobAnnotationsDegraded`): the hop is gated on "this Job carries no annotation of its own", which an unread family cannot establish, so following it would attribute a directly-managed Job's pod to its CronJob's Application — a wrong value, not a missing one. A genuinely annotation-less Job under an annotated CronJob therefore also loses its Application while the leg is degraded. Every degrade in this table is subtractive |
 | `kube_pod_container_info` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context, which still fails the request (`optionalQueryFatal`). Cardinality **multiplies** with the live object count (containers × image variants, and every pod that existed at any instant of the window), so it is the largest kube-state-metrics family and the first to meet a memory-derived series limit (`the number of matching timeseries exceeds …`). Alert on `kube_state_graph_upstream_query_failures_total{query="kube_pod_container_info"}`, or watch it approach the cap (below) | No `data.containers` on any pod; nothing else moves |
 | Scoped `kube_pod_info` / `kube_pod_owner` chunks (`/v1/storage-graph` only) | **Fails the build** — a pod is topology, and a missing chunk would be a smaller, plausible, wrong body | n/a — an empty scope issues no query |
+| Scoped `kube_node_info` / `kube_node_status_addresses` / `kube_node_labels` / `kube_node_status_condition` chunks (`/v1/storage-graph` only) | **Fails the build** — a Kubernetes node is topology, same reasoning as a pod chunk | n/a — an empty scope (no scheduled pod, no `node=` root) issues no query |
+| Scoped `kube_replicaset_owner` / `kube_job_owner` / `kube_deployment_annotations` / `kube_statefulset_annotations` / `kube_daemonset_annotations` / `kube_cronjob_annotations` chunks (`/v1/storage-graph` only) | **Fails the build** — required exactly as their unscoped read is | n/a — an owner kind no loaded pod is owned by (or, for the two Stage-B families, no first-stage series resolved) issues no query |
+| Scoped `kube_replicaset_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue — degrades exactly as its unscoped read does | No Application for the ReplicaSets the failed chunk carried |
+| Scoped `kube_job_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue AND suppresses the Job → CronJob hop for the WHOLE build (any chunk degrading sets `JobAnnotationsDegraded` build-wide) — same rule as the unscoped degrade | No Application for the Jobs the failed chunk carried; additionally, build-wide, no Application for any Job-owned pod that could only resolve it through its CronJob (a Job carrying its own annotation in a successful chunk still resolves) |
 | `traces_service_graph_request_total` | **Fails the build** | No call edges; topology still returned |
 | 18 Harvest + 2 kubelet + `ALERTS` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` / no `data.alerts` |
 | `traces_service_graph_request_failed_total` | Log-and-continue | Measured edges omit `error_rate` (never reports `0`) |
@@ -436,5 +479,8 @@ The code-side pins: `TestQueryDims_EveryQueryListed` fails if a `Query`
 constant is missing from the dimension table; `TestReadTopology_FanOutLegCount`
 fails if topology issues anything other than 37 queries when no claim matches a
 Harvest volume, or 43 when one does. `TestBuildStorage_FanOutLegCount` pins the
-storage plan the same way: 32 with a non-empty pod scope and no matched FlexVol,
-38 with one, and 30 / 36 when the pod scope is empty.
+storage plan's by-reference fan-out the same way: 18 legs when nothing is
+named, growing by exactly what the loaded pods, nodes and resolved owners name
+(design.md D6) — 22 with a `node=` root alone, 25 / 27 / 27 with one
+StatefulSet-, Deployment- or CronJob-owned pod, and 32 with every controller
+kind present, 38 with one matched FlexVol added.

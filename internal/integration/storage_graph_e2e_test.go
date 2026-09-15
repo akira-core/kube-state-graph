@@ -146,6 +146,52 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.Empty(unknown.Clusters)
 }
 
+// TestStorageGraph_ByReferenceControllersAndNodes proves the
+// scope-controller-legs-by-reference waves against a real VictoriaMetrics: a
+// `node=` root naming a Kubernetes node no pod is scheduled on is still
+// drawn, and a Job-owned pod with no annotation of its own resolves its
+// ArgoCD Application through kube_job_owner -> kube_cronjob_annotations.
+func (s *GraphSuite) TestStorageGraph_ByReferenceControllersAndNodes() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`
+kube_pod_info{cluster="c1",namespace="batch",pod="nightly-28901-x",uid="uid-nightly",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_owner{cluster="c1",namespace="batch",pod="nightly-28901-x",owner_kind="Job",owner_name="nightly-28901",owner_is_controller="true",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_job_owner{cluster="c1",namespace="batch",job_name="nightly-28901",owner_kind="CronJob",owner_name="nightly",owner_is_controller="true",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_cronjob_annotations{cluster="c1",namespace="batch",cronjob="nightly",annotation_argocd_argoproj_io_tracking_id="reports:batch/CronJob:batch/nightly",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_node_info{cluster="c1",node="worker-1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_node_info{cluster="c1",node="worker-empty",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+`, disc, t1))
+	s.Require().True(
+		s.WaitForSeries(`kube_cronjob_annotations{cronjob="nightly",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the CronJob annotation series")
+	s.Require().True(
+		s.WaitForSeries(`kube_node_info{node="worker-empty",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the pod-less node")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	const ident = "zone-a-prod-c1"
+
+	// A node= root naming a Kubernetes node no pod is scheduled on is still
+	// drawn, restricted through the by-reference node wave.
+	nodeBody := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("node", "worker-empty") })
+	byID := nodesByID(nodeBody)
+	s.Contains(byID, ident+"/worker-empty", "the node root is drawn with no flow through it")
+	s.Empty(nodeBody.Elements.Edges)
+
+	// A Job-owned pod root resolves its Application through the two-stage
+	// controller wave: kube_pod_owner names the Job, kube_job_owner (required,
+	// scoped to that Job's name) resolves its CronJob, and
+	// kube_cronjob_annotations (stage B, scoped to that CronJob's name)
+	// supplies the tracking-id.
+	podBody := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pod", "batch/nightly-28901-x") })
+	podByID := nodesByID(podBody)
+	s.Require().Contains(podByID, ident+"/uid-nightly")
+	pod := podByID[ident+"/uid-nightly"]
+	s.Equal("reports", pod.Application,
+		"resolved through the CronJob, since the Job itself carries no annotation")
+}
+
 func (s *GraphSuite) fetchStorageGraph(base string, configure func(url.Values)) cytoscape.Body {
 	s.T().Helper()
 	resp := s.httpGet(s.storageGraphURL(base, configure))

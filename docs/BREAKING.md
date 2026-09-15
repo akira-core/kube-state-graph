@@ -4,6 +4,39 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
+## Non-breaking: storage build reads Kubernetes nodes and controllers by reference
+
+*storage-graph-api — Storage build reads only what it draws (scope-controller-legs-by-reference)*
+
+Not a compatibility break: every `/v1/storage-graph` body is byte-identical to
+today's. What changes is which upstream queries the build issues and how they
+are shaped.
+
+Previously the four `kube_node_*` families and the eight controller-owner /
+controller-annotation families (`kube_replicaset_owner`,
+`kube_replicaset_annotations`, `kube_job_owner`, `kube_job_annotations`,
+`kube_deployment_annotations`, `kube_statefulset_annotations`,
+`kube_daemonset_annotations`, `kube_cronjob_annotations`) were read
+UNRESTRICTED — across the whole estate — even though the storage body only
+ever consults them for the Kubernetes nodes and controllers the pods it draws
+actually name. Four of the eight accumulate one series per RETAINED object
+rather than per LIVE one (`kube_replicaset_owner`, `kube_replicaset_annotations`
+by ReplicaSet history, `kube_job_owner`, `kube_job_annotations` by Job
+history), so a CronJob-heavy estate could exceed an upstream series limit on
+`kube_job_owner` — a REQUIRED leg — regardless of the request window.
+
+All twelve now read BY REFERENCE, in three waves gated on the pod wave: nodes
+restricted to the Kubernetes nodes the loaded pods are scheduled on plus the
+request's `node=` roots, and controllers restricted (in two stages, since a
+Deployment or CronJob name is only known one hop after ReplicaSet / Job) to
+the owner names those pods' resolved owners carry. `RawSeriesCount` for these
+twelve families now counts only the series a build's OWN scope matched, and is
+absent (never `0`) when that build's scope for the family was empty —
+operators reading the per-family series-count histogram or the `raw_series_counts`
+Debug log should expect these twelve to track the loaded pod count, not the
+estate size. A `node=` root now reaches the build as an input to the node
+wave, alongside the `pod=` root the pod wave already used.
+
 ## `kube_pod_container_info` no longer fails the build
 
 *cluster-topology-source — Topology series consumed*

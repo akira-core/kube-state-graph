@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
@@ -165,8 +166,14 @@ type Topology struct {
 	// A family the read did not ISSUE has no key at all: a leg the endpoint's
 	// plan skips (the storage build never reads the container or service-side
 	// families) and a second-wave family whose scope came out empty (no claim
-	// matched a FlexVol; no pod could be drawn). An absent key means "never
-	// read"; 0 means "read, matched nothing".
+	// matched a FlexVol; no pod, node or controller name reached its scope).
+	// An absent key means "never read"; 0 means "read, matched nothing". This
+	// covers the twelve by-reference families under a storage build
+	// (scope-controller-legs-by-reference) exactly as it already covers the
+	// QoS workload six: a StatefulSet-only estate, for example, carries a
+	// `kube_statefulset_annotations` entry but no key at all for
+	// `kube_job_owner`, `kube_deployment_annotations`, or any other kind no
+	// loaded pod is owned by.
 	RawSeriesCount map[string]int
 
 	// ClusterIdentities is the identity table the reader composed, handed to
@@ -229,12 +236,24 @@ type topologyVectors struct {
 	// its own.
 	JobAnnotationsDegraded bool
 
-	// QoSScopeIssued and PodScopeIssued record that a second wave computed a
-	// non-empty scope and issued its queries. Each is written only by its own
-	// wave's goroutine and read only after the group's Wait, so both are
-	// race-free; tallySeries reads them so a family is counted iff it was read.
-	QoSScopeIssued bool
-	PodScopeIssued bool
+	// ScopeIssued records, per query, that a second wave issued at least one
+	// chunk for that family (QoS workload, by-reference pod, by-reference
+	// node, by-reference controller). tallySeries reads it after g.Wait() so a
+	// family is counted iff it was actually read — an entry the map does not
+	// carry means the family's scope was empty and nothing was issued.
+	//
+	// Several second-wave goroutines (QoS, pods, nodes, controllers) run
+	// CONCURRENTLY and write into this ONE map, so every write goes through
+	// the package-level markScopeIssued under a caller-supplied *sync.Mutex —
+	// Go maps are not safe for concurrent writes even to disjoint keys. The
+	// mutex is deliberately NOT a field of this struct: topologyVectors is
+	// passed BY VALUE into a couple of dozen existing resolver functions
+	// (parseTopology, resolveControllerApplications, resolveNetAppStorage,
+	// volumeKey, ...), and embedding a sync.Mutex here would make every one of
+	// those calls a lock copy — go vet's copylocks check flags it, correctly.
+	// Reads happen only after g.Wait(), when every writer has returned, so
+	// they need no lock.
+	ScopeIssued map[promql.Query]bool
 
 	// VolumeKey derives each claim's Harvest match token from its bound PV
 	// name and decides how that token is compared against the stock `volume`
@@ -276,6 +295,22 @@ type topologyVectors struct {
 	// which only exists after the service-graph read has contributed its synth
 	// pods, so the raw vector is carried through to Build untouched.
 	Alerts model.Vector
+}
+
+// markScopeIssued records that q's by-reference or QoS scope was non-empty
+// and at least one chunk reached the upstream. mu MUST be the one *sync.Mutex
+// shared by every second-wave goroutine of this read (readTopology creates it
+// and threads it through readScopedQoS / readScopedPods / readScopedNodes /
+// readScopedControllers): the QoS, pod, node and controller waves run
+// concurrently and each may call this for its own families, and Go maps are
+// not safe for concurrent writes even to disjoint keys.
+func markScopeIssued(v *topologyVectors, mu *sync.Mutex, q promql.Query) {
+	mu.Lock()
+	defer mu.Unlock()
+	if v.ScopeIssued == nil {
+		v.ScopeIssued = make(map[promql.Query]bool)
+	}
+	v.ScopeIssued[q] = true
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -446,6 +481,14 @@ func readTopology(
 		close(done)
 	}
 
+	// scopeMu guards every second-wave write to v.ScopeIssued — QoS, pods,
+	// nodes and controllers all run concurrently and each may mark its own
+	// families issued. It is a plain local *sync.Mutex, deliberately NOT a
+	// field of topologyVectors: that struct is passed BY VALUE into a couple
+	// of dozen existing resolver functions, and embedding a lock there would
+	// make every one of those calls a lock copy (go vet's copylocks check).
+	var scopeMu sync.Mutex
+
 	// The six QoS workload families are NOT issued in the first wave. They are
 	// the one leg whose useful population is not known until another leg has
 	// been read: ONTAP collects a workload per volume on the filer, and the
@@ -454,15 +497,29 @@ func readTopology(
 	// scope is computed from and then issues each workload query restricted to
 	// the FlexVol names those claims actually matched.
 	g.Go(func() error {
-		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v,
+		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu,
 			pvcInfoDone, volumeLabelsDone)
 	})
-	// Under a pod-scoping plan kube_pod_info and kube_pod_owner are a second
-	// wave too: restricted to the pods a claim-binding series names plus the
-	// request's pod roots, issued once the binding family has landed.
-	if plan.scopePods {
+	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
+	// kube_node_* families and the eight controller-owner /
+	// controller-annotation families are three more second waves
+	// (scope-controller-legs-by-reference): pods restricted to the pods a
+	// claim-binding series names plus the request's pod roots, issued once
+	// the binding family has landed; nodes and controllers each restricted to
+	// what the LOADED pods name, issued once the pod wave has landed (podsDone
+	// closes on every return path of readScopedPods, success or failure, so
+	// the two later waves compute an empty scope and issue nothing rather
+	// than block forever when the pod wave fails).
+	if plan.byReference {
+		podsDone := make(chan struct{})
+		g.Go(signalWhenDone(func() error {
+			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, &v, &scopeMu, bindingsDone)
+		}, podsDone))
 		g.Go(func() error {
-			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, &v, bindingsDone)
+			return readScopedNodes(ctx, callerCtx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
+		})
+		g.Go(func() error {
+			return readScopedControllers(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
 		})
 	}
 	if err := g.Wait(); err != nil {

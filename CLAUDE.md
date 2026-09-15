@@ -100,12 +100,24 @@ kubegraph.ParseStorageValues  ── StorageRequest{Start, End, Scope, Selector}
                                   (deriveStorageNamespaces — output-preserving, narrows the upstream only)
    ▼
 Builder.BuildStorage(…, roots) ── readTopology under storagePlan: never issues kube_pod_container_info or the
-                                  4 service/endpointslice families; kube_pod_info + kube_pod_owner are a
-                                  SECOND WAVE scoped to binding pods ∪ pod= root names (podscope.go: empty
-                                  scope ⇒ not issued; chunked by the QoS byte budget; a chunk error FAILS the
-                                  build) — 30 first-wave legs, 32/38 total with a pod scope, 30/36 without;
-                                  skips ReadServiceGraph; assembleStorageFlow, attachAlerts, attachStatus;
-                                  no up{} probe. Roots reach this one read only (revises storage D2)
+                                  4 service/endpointslice families; pods, Kubernetes nodes and controllers are
+                                  read BY REFERENCE in three more waves, all gated on the claim-binding leg:
+                                  kube_pod_info + kube_pod_owner scoped to binding pods ∪ pod= root names
+                                  (podscope.go); the 4 kube_node_* families scoped to those pods' nodes ∪
+                                  node= root names, gated on the pod wave (nodescope.go); the 8
+                                  controller-owner/controller-annotation families scoped to those pods'
+                                  resolved owners, gated on the pod wave and itself two stages — ReplicaSet/
+                                  Job/StatefulSet/DaemonSet first, Deployment/CronJob second, since a
+                                  Deployment or CronJob name is only known one hop later (controllerscope.go)
+                                  — every empty scope ⇒ not issued; every scope chunked by the QoS byte
+                                  budget through the shared issueScopedFamilies (scopedread.go); a required
+                                  family's chunk error FAILS the build, an optional one degrades, and a
+                                  degraded kube_job_annotations chunk suppresses the Job → CronJob hop
+                                  build-wide — 18 first-wave legs, growing per build with what the loaded
+                                  pods, nodes and owners actually name (18 with none; 38 with every
+                                  controller kind present and a matched volume); skips ReadServiceGraph;
+                                  assembleStorageFlow, attachAlerts, attachStatus; no up{} probe. Roots reach
+                                  this one read only (revises storage D2)
    ▼
 graph.ProjectStorage          ── reachability over storage-flow units + root-always
    ▼
@@ -934,8 +946,11 @@ live under `openspec/specs/`.
   missing ceiling — an SVM with no fixed-policy series is normal. Tests: `pkg/build/volumekey_test.go`, `pkg/build/qosscope_test.go`,
   `pkg/build/netapp_test.go` (incl. the fan-out pin: 37 legs with no matched
   volume, 43 with one), `pkg/build/build_storage_plan_test.go` (the storage
-  plan's parity pin and its fan-out pin: 32 / 38 with a pod scope, 30 / 36
-  without), `pkg/build/podscope_test.go`, `pkg/promql/scope_test.go`,
+  plan's parity pin and its by-reference fan-out pin: 18 legs with nothing
+  named, growing per named pod/node/owner up to 38 with every controller kind
+  present and a matched volume), `pkg/build/podscope_test.go`,
+  `pkg/build/nodescope_test.go`, `pkg/build/controllerscope_test.go`,
+  `pkg/build/scopedread_test.go`, `pkg/promql/scope_test.go`,
   `pkg/promql/qosscope_test.go`,
   `pkg/promql/queries_test.go` (`TestRender_QoSVolumeGranularity` pins the
   ABSENCE of any `lun` matcher),

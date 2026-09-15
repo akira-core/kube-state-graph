@@ -25,9 +25,16 @@ type topologyLeg struct {
 	degraded *bool
 }
 
-// topologyLegs is the first wave of the topology fan-out. The QoS workload
-// families, and the pod families under a pod-scoping plan, are second waves
-// and are not listed here (readScopedQoS, readScopedPods).
+// topologyLegs is the first wave of the topology fan-out under fullPlan. The
+// QoS workload six are always a second wave (readScopedQoS); under a
+// by-reference plan (storagePlan) the two pod families, the four kube_node_*
+// families and the eight controller-owner / controller-annotation families
+// are ALSO withdrawn from this first-wave list and become three more second
+// waves (readScopedPods, readScopedNodes, readScopedControllers) — none of
+// the fourteen are listed here in that case. issuesFirstWave is what decides,
+// per plan, which of the legs below actually launch; a family a plan does not
+// launch here has no topologyVectors slot written until its own second wave
+// runs (or stays nil if its scope came out empty).
 func topologyLegs(v *topologyVectors) []topologyLeg {
 	return []topologyLeg{
 		{query: promql.QPodInfo, dst: &v.Pod},
@@ -91,22 +98,35 @@ func topologyLegs(v *topologyVectors) []topologyLeg {
 }
 
 // topologyPlan is the endpoint-dependent part of a topology read: which
-// first-wave legs it issues at all, and whether it reads the pod families by
-// reference. /v1/graph reads everything (fullPlan); /v1/storage-graph reads
-// only what its body can draw (storagePlan).
+// first-wave legs it issues at all, and whether it reads the pod / node /
+// controller families by reference. /v1/graph reads everything (fullPlan);
+// /v1/storage-graph reads only what its body can draw (storagePlan).
 type topologyPlan struct {
 	// skip names first-wave legs this read never issues. A skipped leg is
 	// neither launched nor tallied, and its topologyVectors slot stays nil —
 	// the state parseTopology already handles for a degraded optional leg.
 	skip map[promql.Query]bool
-	// scopePods reads kube_pod_info and kube_pod_owner BY REFERENCE,
+	// byReference reads every promql.ReferenceScopedQueries family BY
+	// REFERENCE instead of in the first wave: kube_pod_info / kube_pod_owner
 	// restricted to the pods a claim-binding series names plus podRoots
-	// (readScopedPods). False reads both unscoped, in the first wave.
-	scopePods bool
+	// (readScopedPods); the four kube_node_* families restricted to those
+	// pods' nodes plus nodeRoots (readScopedNodes); and the eight
+	// controller-owner / controller-annotation families restricted to those
+	// pods' resolved owners (readScopedControllers). One bit governs all
+	// three waves together — pods, nodes and controllers are by-reference or
+	// not as a unit, since a plan that scoped controllers over an
+	// unrestricted pod read would derive a scope from the whole estate.
+	// False reads every one of them unscoped, in the first wave.
+	byReference bool
 	// podRoots are the pod-name segments of the request's pod=<ns>/<name>
 	// roots, sorted. A pod root mounting no claim is drawable only if its pod
 	// is read, so the roots must reach the scope.
 	podRoots []string
+	// nodeRoots are the request's node=<name> roots, sorted. A node root
+	// naming a Kubernetes node no loaded pod runs on is drawable only if the
+	// node families are read for it, so the roots must reach the node scope
+	// exactly as podRoots reaches the pod scope.
+	nodeRoots []string
 }
 
 // fullPlan is the /v1/graph read: every leg, every pod.
@@ -133,7 +153,12 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 		names = append(names, ref.Name)
 	}
 	slices.Sort(names) // map order must not reach the scope
-	return topologyPlan{skip: storageSkippedLegs, scopePods: true, podRoots: names}
+	nodeNames := make([]string, 0, len(roots.Nodes))
+	for n := range roots.Nodes {
+		nodeNames = append(nodeNames, n)
+	}
+	slices.Sort(nodeNames)
+	return topologyPlan{skip: storageSkippedLegs, byReference: true, podRoots: names, nodeRoots: nodeNames}
 }
 
 // issuesFirstWave reports whether the plan launches q in the first wave.
@@ -141,7 +166,7 @@ func (p topologyPlan) issuesFirstWave(q promql.Query) bool {
 	if p.skip[q] {
 		return false
 	}
-	return !p.scopePods || !slices.Contains(promql.PodScopedQueries, q)
+	return !p.byReference || !slices.Contains(promql.ReferenceScopedQueries, q)
 }
 
 // tallySeries is RawSeriesCount for one read: one entry per family the read
@@ -149,20 +174,17 @@ func (p topologyPlan) issuesFirstWave(q promql.Query) bool {
 // empty issued nothing, so its families are absent too — 0 means "read,
 // matched nothing", and a family never read has no count to report.
 func tallySeries(legs []topologyLeg, plan topologyPlan, v *topologyVectors) map[string]int {
-	raw := make(map[string]int, len(legs)+len(promql.QoSWorkloadQueries))
+	raw := make(map[string]int, len(legs)+len(promql.QoSWorkloadQueries)+len(promql.ReferenceScopedQueries))
 	for _, l := range legs {
 		if plan.issuesFirstWave(l.query) {
 			raw[string(l.query)] = len(*l.dst)
 		}
 	}
-	if v.QoSScopeIssued {
-		for _, t := range qosTargets(v) {
-			raw[string(t.query)] = len(*t.dst)
-		}
-	}
-	if v.PodScopeIssued {
-		for _, t := range podTargets(v) {
-			raw[string(t.query)] = len(*t.dst)
+	for _, targets := range [][]scopedTarget{qosTargets(v), podTargets(v), nodeTargets(v), controllerTargets(v)} {
+		for _, t := range targets {
+			if v.ScopeIssued[t.query] {
+				raw[string(t.query)] = len(*t.dst)
+			}
 		}
 	}
 	return raw

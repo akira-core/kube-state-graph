@@ -2,6 +2,8 @@ package build
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -45,6 +47,21 @@ func withValue(s *model.Sample, v float64) *model.Sample {
 // namespace (platform/orders-0), a pod that mounts nothing (shop/api-0), a
 // claim no FlexVol backs (platform/cache-data), a Service with an endpoint
 // slice, and container info on every pod.
+//
+// It also carries every controller kind the by-reference controller wave must
+// resolve identically to an unrestricted read
+// (scope-controller-legs-by-reference): a DaemonSet-owned pod (shop/daemon-0),
+// a bare ReplicaSet-owned pod with NO kube_replicaset_owner row at all
+// (shop/rs-bare-0), a Job-owned pod whose Job carries its own tracking-id
+// (shop/job-annotated-0), a Job-owned pod resolved through its CronJob because
+// the Job itself carries none (shop/job-cronjob-0, via kube_job_owner to
+// CronJob "nightly"), a pod with no controller owner at all
+// (shop/ownerless-0), an unscheduled pod with no `node` label
+// (shop/unscheduled-0), a third Kubernetes node no pod is scheduled on
+// (worker-3, for a `node=` root with no mounting pod), and a StatefulSet named
+// "orders" in `platform` — the same name as the `shop` StatefulSet, carrying a
+// DIFFERENT tracking-id and owning no pod at all — to prove a same-named
+// controller in another namespace is inert noise.
 func planEstate() map[promql.Query]model.Vector {
 	type pod struct{ ns, name, uid, node, ownerKind, owner string }
 	pods := []pod{
@@ -55,14 +72,22 @@ func planEstate() map[promql.Query]model.Vector {
 		{"platform", "orders-0", "uid-p0", "worker-2", "ReplicaSet", "orders-6c4"},
 		{"platform", "redis-0", "uid-r0", "worker-1", "StatefulSet", "redis"},
 		{"platform", "cache-0", "uid-c0", "worker-2", "StatefulSet", "cache"},
+		{"shop", "daemon-0", "uid-d0", "worker-1", "DaemonSet", "logger"},
+		{"shop", "rs-bare-0", "uid-rb0", "worker-2", "ReplicaSet", "rs-bare-x1"},
+		{"shop", "job-annotated-0", "uid-ja0", "worker-1", "Job", "batch-1"},
+		{"shop", "job-cronjob-0", "uid-jc0", "worker-2", "Job", "nightly-28901"},
+		{"shop", "ownerless-0", "uid-oe0", "worker-1", "", ""},
+		{"shop", "unscheduled-0", "uid-us0", "", "StatefulSet", "orders"},
 	}
 	podInfo := make(model.Vector, 0, len(pods))
 	podOwner := make(model.Vector, 0, len(pods))
 	containers := make(model.Vector, 0, len(pods))
 	for _, p := range pods {
 		podInfo = append(podInfo, planKSM("namespace", p.ns, "pod", p.name, "uid", p.uid, "node", p.node))
-		podOwner = append(podOwner, planKSM("namespace", p.ns, "pod", p.name,
-			"owner_kind", p.ownerKind, "owner_name", p.owner, "owner_is_controller", "true"))
+		if p.ownerKind != "" {
+			podOwner = append(podOwner, planKSM("namespace", p.ns, "pod", p.name,
+				"owner_kind", p.ownerKind, "owner_name", p.owner, "owner_is_controller", "true"))
+		}
 		containers = append(containers, withValue(planKSM("namespace", p.ns, "pod", p.name, "uid", p.uid,
 			"container", "app", "image", "reg/"+p.name+":1"), 100))
 	}
@@ -75,22 +100,42 @@ func planEstate() map[promql.Query]model.Vector {
 			planKSM("namespace", "shop", "replicaset", "web-7d9", "owner_kind", "Deployment", "owner_name", "web"),
 			planKSM("namespace", "shop", "replicaset", "api-5f6", "owner_kind", "Deployment", "owner_name", "api"),
 			planKSM("namespace", "platform", "replicaset", "orders-6c4", "owner_kind", "Deployment", "owner_name", "orders"),
+			// rs-bare-x1 deliberately has NO row here: a bare ReplicaSet with no
+			// Deployment owner of its own.
 		},
 		promql.QStatefulSetAnnotations: {
 			planKSM("namespace", "shop", "statefulset", "orders", tracking, "shop-orders:apps/StatefulSet:shop/orders"),
 			planKSM("namespace", "platform", "statefulset", "redis", tracking, "platform-redis:apps/StatefulSet:platform/redis"),
+			// Noise: same name as the shop StatefulSet, different namespace,
+			// different tracking-id, owns no pod at all.
+			planKSM("namespace", "platform", "statefulset", "orders", tracking, "cross-ns-orders:apps/StatefulSet:platform/orders"),
 		},
 		promql.QDeploymentAnnotations: {
 			planKSM("namespace", "shop", "deployment", "web", tracking, "storefront:apps/Deployment:shop/web"),
 		},
-		promql.QNodeInfo: {planKSM("node", "worker-1"), planKSM("node", "worker-2")},
+		promql.QDaemonSetAnnotations: {
+			planKSM("namespace", "shop", "daemonset", "logger", tracking, "observability:apps/DaemonSet:shop/logger"),
+		},
+		promql.QJobAnnotations: {
+			planKSM("namespace", "shop", "job_name", "batch-1", tracking, "batch-app:batch/Job:shop/batch-1"),
+		},
+		promql.QJobOwner: {
+			planKSM("namespace", "shop", "job_name", "nightly-28901",
+				"owner_kind", "CronJob", "owner_name", "nightly", "owner_is_controller", "true"),
+		},
+		promql.QCronJobAnnotations: {
+			planKSM("namespace", "shop", "cronjob", "nightly", tracking, "reports:batch/CronJob:shop/nightly"),
+		},
+		promql.QNodeInfo: {planKSM("node", "worker-1"), planKSM("node", "worker-2"), planKSM("node", "worker-3")},
 		promql.QNodeAddresses: {
 			planKSM("node", "worker-1", "type", "InternalIP", "address", "192.168.0.1"),
 			planKSM("node", "worker-2", "type", "InternalIP", "address", "192.168.0.2"),
+			planKSM("node", "worker-3", "type", "InternalIP", "address", "192.168.0.3"),
 		},
 		promql.QNodeStatusCondition: {
 			planKSM("node", "worker-1", "condition", "Ready", "status", "true"),
 			planKSM("node", "worker-2", "condition", "Ready", "status", "true"),
+			planKSM("node", "worker-3", "condition", "Ready", "status", "true"),
 		},
 		promql.QPVCBindings: {
 			planKSM("namespace", "shop", "pod", "orders-0", "persistentvolumeclaim", "orders-data", "volume", "data"),
@@ -190,6 +235,27 @@ func TestBuildStorage_PlanIsOutputPreserving(t *testing.T) {
 		"kubernetes node root": {scope: func() (graph.StorageScope, error) {
 			return graph.NewStorageScope(nil, nil, nil, []string{"worker-2"}, nil, nil, nil)
 		}},
+		"kubernetes node root with no mounting pod": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, []string{"worker-3"}, nil, nil, nil)
+		}},
+		"daemonset-owned pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/daemon-0"})
+		}},
+		"bare replicaset-owned pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/rs-bare-0"})
+		}},
+		"job with its own annotation, pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/job-annotated-0"})
+		}},
+		"job resolved through its cronjob, pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/job-cronjob-0"})
+		}},
+		"ownerless pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/ownerless-0"})
+		}},
+		"unscheduled pod root": {scope: func() (graph.StorageScope, error) {
+			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/unscheduled-0"})
+		}},
 		"namespace filter": {namespaces: []string{"shop"}, scope: func() (graph.StorageScope, error) {
 			return graph.NewStorageScope(nil, []string{"shop"}, nil, nil, nil, nil, nil)
 		}},
@@ -255,71 +321,186 @@ func TestBuildStorage_CrossNamespaceNameCollisionIsHarmless(t *testing.T) {
 	assert.False(t, drawn[collider], "the collider lies on no path and is not a root")
 }
 
-// The storage plan's fan-out has four shapes — a pod scope or not, a matched
-// FlexVol or not — and every one is pinned, together with the rule that a
-// family the read did not issue has no RawSeriesCount entry at all.
+// storageUnrestrictedLegs are the eighteen families the storage plan's first
+// wave issues under EVERY shape (design.md D6 / D8): the claim families (the
+// scope root plus the three that co-move with it), the Harvest inventory, and
+// ALERTS. Every other first-wave family the fullPlan issues (kube_pod_info,
+// kube_pod_owner, the four kube_node_* families, the eight controller-owner /
+// controller-annotation families) moved to a by-reference wave and is present
+// here iff this build's pods, nodes or controllers named it.
+var storageUnrestrictedLegs = []promql.Query{
+	promql.QPVCBindings, promql.QPVCInfo, promql.QVolumeLabels, promql.QPVCAnnotations,
+	promql.QQoSPolicyFixedMaxIOPS, promql.QQoSPolicyFixedMaxMBps,
+	promql.QAggrStatus, promql.QAggrSpaceUsed, promql.QAggrSpaceTotal,
+	promql.QNetAppNodeStatus, promql.QNetAppNodeLabels, promql.QNetAppNodeCPUBusy,
+	promql.QNetAppNodeTotalOps, promql.QNetAppNodeTotalLatency, promql.QNetAppNodeTotalData,
+	promql.QAlerts, promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes,
+}
+
+// The storage plan's fan-out is 18 first-wave legs plus a per-build addition
+// for each by-reference family a loaded pod, node or owner actually named
+// (design.md D6). Every case pins the EXACT set of families issued, not just
+// a count, so a family added to the wrong wave — or omitted from one it
+// belongs in — fails here even when the total happens to match.
 func TestBuildStorage_FanOutLegCount(t *testing.T) {
-	binding := sampleVec(model.Sample{Metric: model.Metric{
-		"cluster": "c", "namespace": "db", "pod": "db-0", "persistentvolumeclaim": "data",
-	}})
+	require.Len(t, storageUnrestrictedLegs, 18, "design D6: the fixed first wave")
+
+	binding := func(ns, pod string) model.Vector {
+		return sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": model.LabelValue(pod), "persistentvolumeclaim": "data-" + model.LabelValue(pod),
+		}})
+	}
+	podInfo := func(ns, pod, node string) model.Vector {
+		return sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": model.LabelValue(pod), "uid": "u-" + model.LabelValue(pod), "node": model.LabelValue(node),
+		}})
+	}
+	owner := func(ns, pod, kind, name string) model.Vector {
+		return sampleVec(model.Sample{Metric: model.Metric{
+			"cluster": "c", "namespace": model.LabelValue(ns), "pod": model.LabelValue(pod),
+			"owner_kind": model.LabelValue(kind), "owner_name": model.LabelValue(name), "owner_is_controller": "true",
+		}})
+	}
+	merge := func(vs ...model.Vector) model.Vector {
+		var out model.Vector
+		for _, v := range vs {
+			out = append(out, v...)
+		}
+		return out
+	}
 	claimInfo := sampleVec(model.Sample{Metric: model.Metric{
-		"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data", "volumename": "pvc-9f3a",
+		"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-db-0", "volumename": "pvc-9f3a",
 	}})
 	volume := sampleVec(model.Sample{Metric: model.Metric{
 		"volume": "trident_pvc_9f3a", "cluster": "ontap-prod", "node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
 	}})
 
 	cases := []struct {
-		name                 string
-		fixtures             map[promql.Query]model.Vector
-		want                 int
-		podScoped, qosScoped bool
+		name        string
+		fixtures    map[promql.Query]model.Vector
+		roots       graph.StorageRoots
+		byReference []promql.Query // by-reference families this build must issue
+		matchVolume bool           // also load a claim that matches a FlexVol: +6 QoS legs
+		want        int
 	}{
-		{"pod scope, no matched volume", map[promql.Query]model.Vector{promql.QPVCBindings: binding}, 32, true, false},
-		{"pod scope and a matched volume", map[promql.Query]model.Vector{
-			promql.QPVCBindings: binding, promql.QPVCInfo: claimInfo, promql.QVolumeLabels: volume,
-		}, 38, true, true},
-		{"empty pod scope, no matched volume", nil, 30, false, false},
-		{"empty pod scope and a matched volume", map[promql.Query]model.Vector{
-			promql.QPVCInfo: claimInfo, promql.QVolumeLabels: volume,
-		}, 36, false, true},
+		{"empty scope, no roots", nil, graph.StorageRoots{}, nil, false, 18},
+		{"node root alone, no mounting pod", nil,
+			graph.StorageRoots{Nodes: map[string]struct{}{"n9": {}}}, promql.NodeScopedQueries, false, 22},
+		{"one statefulset-owned scheduled pod", map[promql.Query]model.Vector{
+			promql.QPVCBindings: binding("db", "db-0"),
+			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
+			promql.QPodOwner:    owner("db", "db-0", "StatefulSet", "orders"),
+		}, graph.StorageRoots{},
+			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, []promql.Query{promql.QStatefulSetAnnotations}),
+			false, 25},
+		{"one deployment-owned pod via replicaset", map[promql.Query]model.Vector{
+			promql.QPVCBindings: binding("db", "db-0"),
+			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
+			promql.QPodOwner:    owner("db", "db-0", "ReplicaSet", "web-7d9"),
+			promql.QReplicaSetOwner: sampleVec(model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "replicaset": "web-7d9", "owner_kind": "Deployment", "owner_name": "web",
+			}}),
+		}, graph.StorageRoots{},
+			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries,
+				[]promql.Query{promql.QReplicaSetOwner, promql.QReplicaSetAnnotations, promql.QDeploymentAnnotations}),
+			false, 27},
+		{"one cronjob-owned pod via job", map[promql.Query]model.Vector{
+			promql.QPVCBindings: binding("db", "db-0"),
+			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
+			promql.QPodOwner:    owner("db", "db-0", "Job", "nightly-28901"),
+			promql.QJobOwner: sampleVec(model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "job_name": "nightly-28901",
+				"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
+			}}),
+		}, graph.StorageRoots{},
+			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries,
+				[]promql.Query{promql.QJobOwner, promql.QJobAnnotations, promql.QCronJobAnnotations}),
+			false, 27},
+		{"every controller kind present", map[promql.Query]model.Vector{
+			promql.QPVCBindings: merge(binding("db", "sts-0"), binding("db", "ds-0"), binding("db", "dep-0"),
+				binding("db", "rs-0"), binding("db", "job-0"), binding("db", "cj-0")),
+			promql.QPodInfo: merge(podInfo("db", "sts-0", "n1"), podInfo("db", "ds-0", "n1"), podInfo("db", "dep-0", "n1"),
+				podInfo("db", "rs-0", "n1"), podInfo("db", "job-0", "n1"), podInfo("db", "cj-0", "n1")),
+			promql.QPodOwner: merge(
+				owner("db", "sts-0", "StatefulSet", "orders"),
+				owner("db", "ds-0", "DaemonSet", "logger"),
+				owner("db", "dep-0", "ReplicaSet", "web-7d9"),
+				owner("db", "rs-0", "ReplicaSet", "rs-bare"),
+				owner("db", "job-0", "Job", "batch-1"),
+				owner("db", "cj-0", "Job", "nightly-28901"),
+			),
+			promql.QReplicaSetOwner: sampleVec(model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "replicaset": "web-7d9", "owner_kind": "Deployment", "owner_name": "web",
+			}}),
+			promql.QJobOwner: sampleVec(model.Sample{Metric: model.Metric{
+				"cluster": "c", "namespace": "db", "job_name": "nightly-28901",
+				"owner_kind": "CronJob", "owner_name": "nightly", "owner_is_controller": "true",
+			}}),
+		}, graph.StorageRoots{},
+			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, promql.ControllerScopedQueries),
+			false, 32},
+		{"every controller kind present, and a matched volume", nil /* filled below */, graph.StorageRoots{},
+			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, promql.ControllerScopedQueries),
+			true, 38},
 	}
+	// The last case reuses the richest fixture with the volume join added.
+	cases[len(cases)-1].fixtures = merge2(cases[5].fixtures, map[promql.Query]model.Vector{
+		promql.QPVCInfo: claimInfo, promql.QVolumeLabels: volume,
+	})
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := promqlfake.New(tc.fixtures)
 			tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
-				Options{}, promql.Selector{}, storagePlan(graph.StorageRoots{}))
+				Options{}, promql.Selector{}, storagePlan(tc.roots))
 			require.NoError(t, err)
 
 			seen := map[string]int{}
 			for _, is := range f.Issued() {
 				seen[is.Name]++
 			}
-			assert.Len(t, seen, tc.want, "distinct families issued")
-			total := 0
-			for _, n := range seen {
-				total += n
+			want := make(map[string]bool, tc.want)
+			for _, q := range storageUnrestrictedLegs {
+				want[string(q)] = true
 			}
-			assert.Equal(t, tc.want, total, "each family issued exactly once")
-			assert.Len(t, tp.RawSeriesCount, tc.want, "one tally entry per issued family, none for the rest")
+			for _, q := range tc.byReference {
+				want[string(q)] = true
+			}
+			if tc.matchVolume {
+				for _, q := range promql.QoSWorkloadQueries {
+					want[string(q)] = true
+				}
+			}
+			assert.Len(t, want, tc.want, "expected-set size must match the design D6 pin")
+			assert.Len(t, seen, tc.want, "distinct families issued")
+			for name := range want {
+				assert.Equal(t, 1, seen[name], "%s issued exactly once", name)
+				assert.Contains(t, tp.RawSeriesCount, name, "%s tallied", name)
+			}
+			for name := range seen {
+				assert.True(t, want[name], "unexpected family issued: %s", name)
+			}
 
 			for q := range storageSkippedLegs {
 				assert.Zero(t, seen[string(q)], "%s is never read by the storage build", q)
 				assert.NotContains(t, tp.RawSeriesCount, string(q), "a skipped family is absent, never 0")
 			}
-			for _, q := range promql.PodScopedQueries {
-				assert.Equal(t, tc.podScoped, seen[string(q)] == 1, "%s issued iff the pod scope is non-empty", q)
-				assert.Equal(t, tc.podScoped, tp.RawSeriesCount[string(q)] >= 0 && hasKey(tp.RawSeriesCount, string(q)), q)
-			}
-			for _, q := range promql.QoSWorkloadQueries {
-				assert.Equal(t, tc.qosScoped, seen[string(q)] == 1, "%s issued iff a claim matched a FlexVol", q)
-				assert.Equal(t, tc.qosScoped, hasKey(tp.RawSeriesCount, string(q)), q)
+			for _, q := range promql.ReferenceScopedQueries {
+				if want[string(q)] {
+					continue
+				}
+				assert.NotContains(t, tp.RawSeriesCount, string(q), "%s: a family this case did not name is absent, never 0", q)
 			}
 		})
 	}
 }
 
-func hasKey(m map[string]int, k string) bool {
-	_, ok := m[k]
-	return ok
+// merge2 returns a new map combining a and b, with b's entries winning on a
+// key collision. Used only to derive the richest fan-out case's
+// matched-volume variant from its base fixture without mutating it.
+func merge2(a, b map[promql.Query]model.Vector) map[promql.Query]model.Vector {
+	out := make(map[promql.Query]model.Vector, len(a)+len(b))
+	maps.Copy(out, a)
+	maps.Copy(out, b)
+	return out
 }

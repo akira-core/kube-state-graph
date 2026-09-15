@@ -655,6 +655,41 @@ const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 // failure/bucket series filtered away upstream and then read as error_rate=0.
 const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 
+// serviceGraphFailedSelector and serviceGraphBucketSelector are the two
+// OPTIONAL RED series' fixed selectors: the D30 sentinel composed with the
+// D1b/D6 link exclusion. Named separately from the two constants above so
+// fixedSelector (below) can hold one string per query without recomputing the
+// concatenation at every Render call.
+const (
+	serviceGraphFailedSelector = serviceGraphSentinelSelector + "," + serviceGraphLinkExclusionSelector
+	serviceGraphBucketSelector = serviceGraphSentinelSelector + "," + serviceGraphLinkExclusionSelector
+)
+
+// fixedSelector is the query's request-invariant metric-selection contract —
+// identical for every request, rendered FIRST by Render's braces helper and by
+// RenderScoped (scope.go), so a scoped rendering of a family can never drop
+// the fixed selector its unscoped rendering carries (scope-controller-legs-by-
+// reference D2). A query with no entry renders no fixed selector — the zero
+// value of a missing map key is "", and braces("") is exactly the pre-existing
+// behaviour. This is a single source of truth: Render's switch below reads it
+// through braces(fixedSelector[q]) instead of restating each literal, so the
+// scoped and unscoped renderings of the same family cannot drift.
+var fixedSelector = map[Query]string{
+	QNodeAddresses:                   `type=~"ExternalIP|InternalIP"`,
+	QNodeStatusCondition:             `condition="Ready"`,
+	QJobOwner:                        jobOwnerCronJobSelector,
+	QDeploymentAnnotations:           argoTrackingIDPresentSelector,
+	QStatefulSetAnnotations:          argoTrackingIDPresentSelector,
+	QDaemonSetAnnotations:            argoTrackingIDPresentSelector,
+	QReplicaSetAnnotations:           argoTrackingIDPresentSelector,
+	QJobAnnotations:                  argoTrackingIDPresentSelector,
+	QCronJobAnnotations:              argoTrackingIDPresentSelector,
+	QAlerts:                          alertsFiringSelector,
+	QServiceGraphTotal:               serviceGraphSentinelSelector,
+	QServiceGraphFailedTotal:         serviceGraphFailedSelector,
+	QServiceGraphServerSecondsBucket: serviceGraphBucketSelector,
+}
+
 // Render returns the PromQL string for the named query, parameterised by
 // `window` (the bucketed end-start) and by the request-scoped `sel` selector.
 // Every series is queried at its bare name — there is no configurable
@@ -692,52 +727,54 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		}
 	}
 
+	fx := braces(fixedSelector[q])
+
 	switch q {
 	case QPodInfo:
-		return fmt.Sprintf(`last_over_time(kube_pod_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_pod_info%s[%s])`, fx, w)
 	case QNodeInfo:
-		return fmt.Sprintf(`last_over_time(kube_node_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_node_info%s[%s])`, fx, w)
 	case QNodeAddresses:
 		// ExternalIP preferred, InternalIP fallback; anchored alternation
 		// selects exactly the two types — the topology reader applies the
 		// preference at parse time.
-		return fmt.Sprintf(`last_over_time(kube_node_status_addresses%s[%s])`, braces(`type=~"ExternalIP|InternalIP"`), w)
+		return fmt.Sprintf(`last_over_time(kube_node_status_addresses%s[%s])`, fx, w)
 	case QPVCBindings:
-		return fmt.Sprintf(`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info%s[%s])`, fx, w)
 	case QNodeLabels:
-		return fmt.Sprintf(`last_over_time(kube_node_labels%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_node_labels%s[%s])`, fx, w)
 	case QServiceInfo:
-		return fmt.Sprintf(`last_over_time(kube_service_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_service_info%s[%s])`, fx, w)
 	case QEndpointSliceEndpoints:
-		return fmt.Sprintf(`last_over_time(kube_endpointslice_endpoints%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_endpointslice_endpoints%s[%s])`, fx, w)
 	case QEndpointSliceLabels:
-		return fmt.Sprintf(`last_over_time(kube_endpointslice_labels%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_endpointslice_labels%s[%s])`, fx, w)
 	case QPodOwner:
-		return fmt.Sprintf(`last_over_time(kube_pod_owner%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_pod_owner%s[%s])`, fx, w)
 	case QReplicaSetOwner:
-		return fmt.Sprintf(`last_over_time(kube_replicaset_owner%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_replicaset_owner%s[%s])`, fx, w)
 	case QJobOwner:
-		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, braces(jobOwnerCronJobSelector), w)
+		return fmt.Sprintf(`last_over_time(kube_job_owner%s[%s])`, fx, w)
 	case QPVCInfo:
-		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_info%s[%s])`, fx, w)
 	case QPodContainerInfo:
 		// tlast_over_time (MetricsQL) — value is each series' last-sample timestamp
 		// (unix seconds). A container that changed image in the window has one
 		// series per image (image is a label); the resolver picks the image with
 		// the greatest last-sample timestamp (the current one). last_over_time
 		// would stamp every series at the eval instant, flattening recency.
-		return fmt.Sprintf(`tlast_over_time(kube_pod_container_info%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`tlast_over_time(kube_pod_container_info%s[%s])`, fx, w)
 	case QNodeStatusCondition:
 		// condition="Ready" is a fixed, request-invariant metric-selection
 		// contract (anchored equality), not a caller filter — the reader reads
 		// the active row's `status` label at parse time. The four other node
 		// conditions (MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable)
 		// are never surfaced, so they are excluded here.
-		return fmt.Sprintf(`last_over_time(kube_node_status_condition%s[%s])`, braces(`condition="Ready"`), w)
+		return fmt.Sprintf(`last_over_time(kube_node_status_condition%s[%s])`, fx, w)
 	case QServiceAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_service_annotations%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_service_annotations%s[%s])`, fx, w)
 	case QPVCAnnotations:
-		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kube_persistentvolumeclaim_annotations%s[%s])`, fx, w)
 	case QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
 		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations:
 		// One grouped arm for the six controller-annotation families (same
@@ -745,9 +782,9 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// metric name, so `q` renders it and a seventh family costs one
 		// constant in the case list rather than a copy-pasted Sprintf whose
 		// hand-typed metric name only render-baseline.txt would catch.
-		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(argoTrackingIDPresentSelector), w)
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, fx, w)
 	case QVolumeLabels:
-		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, fx, w)
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
 		// Volume-granularity restriction (design.md D2): ONTAP collects a
 		// workload per LUN as well as per volume, and a LUN workload carries
@@ -756,19 +793,19 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// a fixed,
 		// request-invariant metric-selection contract (same class as the D30
 		// sentinel matcher and condition="Ready"), NOT a caller filter.
-		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(""), w)
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, fx, w)
 	case QQoSPolicyFixedMaxIOPS:
-		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, fx, w)
 	case QQoSPolicyFixedMaxMBps:
-		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_mbps%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_mbps%s[%s])`, fx, w)
 	case QAggrStatus:
-		return fmt.Sprintf(`last_over_time(aggr_new_status%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(aggr_new_status%s[%s])`, fx, w)
 	case QAggrSpaceUsed:
-		return fmt.Sprintf(`last_over_time(aggr_space_used%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(aggr_space_used%s[%s])`, fx, w)
 	case QAggrSpaceTotal:
-		return fmt.Sprintf(`last_over_time(aggr_space_total%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(aggr_space_total%s[%s])`, fx, w)
 	case QNetAppNodeStatus:
-		return fmt.Sprintf(`last_over_time(node_new_status%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(node_new_status%s[%s])`, fx, w)
 	case QNetAppNodeLabels, QNetAppNodeCPUBusy, QNetAppNodeTotalOps,
 		QNetAppNodeTotalLatency, QNetAppNodeTotalData:
 		// One grouped arm for the five Harvest controller legs (same shape as
@@ -776,11 +813,11 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// its bare metric name, so `q` renders it and a hand-typed name cannot
 		// drift from the constant. No fixed selector — the identity is the
 		// (cluster, node) label pair the reader joins on.
-		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, braces(""), w)
+		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, fx, w)
 	case QKubeletVolumeUsedBytes:
-		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_used_bytes%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_used_bytes%s[%s])`, fx, w)
 	case QKubeletVolumeCapacityBytes:
-		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_capacity_bytes%s[%s])`, braces(""), w)
+		return fmt.Sprintf(`last_over_time(kubelet_volume_stats_capacity_bytes%s[%s])`, fx, w)
 	case QServiceGraphTotal:
 		// Service-graph metrics come from Alloy/Tempo, not kube-state-metrics.
 		// The metric carries a single `cluster` label representing the trace
@@ -791,12 +828,11 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// `user` / `unknown` peers upstream. It is a metric-selection contract,
 		// identical for every request — NOT a caller-supplied filter — so it
 		// does not violate the "no filters pushed to PromQL" rule (D2 / D7).
-		return fmt.Sprintf(`rate(traces_service_graph_request_total%s[%s])`, braces(serviceGraphSentinelSelector), w)
+		return fmt.Sprintf(`rate(traces_service_graph_request_total%s[%s])`, fx, w)
 	case QServiceGraphFailedTotal:
 		// OPTIONAL Errors counter. Raw label granularity so failures join the
 		// total series by exact identity (design D4).
-		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total%s[%s])`,
-			braces(serviceGraphSentinelSelector+","+serviceGraphLinkExclusionSelector), w)
+		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total%s[%s])`, fx, w)
 	case QServiceGraphServerSecondsBucket:
 		// OPTIONAL Duration classic histogram.
 		//
@@ -809,16 +845,14 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// Series identity has no such coupling. The cost is bucket-count
 		// multiplied cardinality on the wire; the metric is OPTIONAL, so a store
 		// that refuses the query degrades exactly as an absent one.
-		return fmt.Sprintf(
-			`rate(traces_service_graph_request_server_seconds_bucket%s[%s])`,
-			braces(serviceGraphSentinelSelector+","+serviceGraphLinkExclusionSelector), w)
+		return fmt.Sprintf(`rate(traces_service_graph_request_server_seconds_bucket%s[%s])`, fx, w)
 	case QAlerts:
 		// Read over the WHOLE window, not at the end instant: the endpoint's
 		// contract is "what was true in [start, end]", so an alert that fired
 		// and resolved inside the window is part of the answer. The fixed
 		// alertstate="firing" selector is rendered first, so a request matcher
 		// composes with it rather than replacing it.
-		return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, braces(alertsFiringSelector), w)
+		return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, fx, w)
 	case QUpProbe:
 		return `up`
 	}

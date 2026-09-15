@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -123,9 +124,17 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 }
 
 // Pod-only roots push their namespaces into every namespaced leg, and their
-// names into the pod scope; Harvest is never narrowed by a root.
+// names into the pod scope; Harvest is never narrowed by a root. The loaded
+// pod's owner also drives the controller wave, so a StatefulSet-owned root
+// carries BOTH the derived namespace matcher and the by-reference
+// `statefulset=` scope on the same query.
 func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
-	q, captured := recordingQuerier(t)
+	q, captured := recordingQuerierWith(t, map[string]model.Vector{
+		"kube_pod_owner": {&model.Sample{Metric: model.Metric{
+			"namespace": "shop", "pod": "orders-0",
+			"owner_kind": "StatefulSet", "owner_name": "orders", "owner_is_controller": "true",
+		}, Value: 1}},
+	})
 	s := newServerWithMocks(t, q, nil)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -143,6 +152,10 @@ func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"platform|shop|"}[1h])`,
 		seen["ALERTS"])
 	assert.Equal(t, `last_over_time(volume_labels[1h])`, seen["volume_labels"])
+	assert.Equal(t,
+		`last_over_time(kube_statefulset_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",env="prod",namespace=~"platform|shop",statefulset="orders"}[1h])`,
+		seen["kube_statefulset_annotations"],
+		"the derived namespace matcher and the by-reference controller scope both reach this query")
 }
 
 func TestStorageGraph_Timeout504(t *testing.T) {
