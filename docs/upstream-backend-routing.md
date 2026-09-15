@@ -285,6 +285,29 @@ Other rules:
 - The result is bounded (`LabelQuery.Limit`, default `promql.DefaultLabelQueryLimit`). Exceeding it is an error naming the bound and the observed count, never a truncation.
 - A family **no backend serves** is an error naming the family (unlike the server's optional `alerts` leg, which is Debug-empty). A requested zone no backend covers stays empty-plus-Warn. A backend error fails the call naming that backend.
 
+#### Pod ArgoCD Application
+
+`build.ResolvePodApplication` is built on this path. It resolves one pod's
+Application with the graph build's rules (controller owner, ReplicaSet →
+Deployment, controller annotation, Job → CronJob) in two to five `ksm` queries:
+
+```go
+app, err := build.ResolvePodApplication(ctx, router, build.PodApplicationRequest{
+    Cluster:   "c1",
+    Namespace: "shop",
+    Pod:       "checkout-7d9-abc",
+    At:        end,
+    Window:    5 * time.Minute,
+})
+```
+
+`Cluster` is the raw `cluster` label. `AZ` and `Env` are optional, as on the
+graph request. Each one left empty is read off the pod-owner series and pinned
+for the remaining queries, so only the first query reaches every `ksm` backend.
+A pod found in two zones or environments returns `build.ErrAmbiguousPod`; pass
+`AZ` / `Env` to pick one. A pod with no Application returns `""` and no error.
+Any upstream error fails the call.
+
 `env`, `cluster` and `namespace` are ordinary filters here, not named dimensions: they never route, and the helper does not apply the graph build's per-query dimension rules to them. A `cluster` filter on `harvest` matches the ONTAP cluster label.
 
 Three ways to obtain the table, all producing the same validated value:

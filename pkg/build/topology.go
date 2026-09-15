@@ -1288,7 +1288,7 @@ var controllerAnnotationFamilies = []controllerAnnotationFamily{
 func resolveControllerApplications(v topologyVectors, mc *clusterResolver) map[controllerKey]string {
 	out := map[controllerKey]string{}
 	for _, f := range controllerAnnotationFamilies {
-		apps := resolveApplications(f.vec(v), "annotation_argocd_argoproj_io_tracking_id",
+		apps := resolveApplications(f.vec(v), argoTrackingIDLabel,
 			func(m model.Metric) (controllerKey, bool) {
 				name := string(m[f.nameLabel])
 				if name == "" {
@@ -1412,7 +1412,7 @@ func resolvePodApplications(
 // yields an empty map (services carry no Application). Deterministic per
 // "absent when empty" (lexically-smallest raw tracking-id wins on collision).
 func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[serviceKey]string {
-	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
+	return resolveApplications(vec, argoTrackingIDLabel, func(m model.Metric) (serviceKey, bool) {
 		svc := string(m["service"])
 		if svc == "" {
 			return serviceKey{}, false
@@ -1426,7 +1426,7 @@ func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[servi
 // label, keyed identically to resolvePVCInfo so the per-PVC assembly
 // can join it. OPTIONAL/graceful and deterministic like the service variant.
 func resolvePVCApplications(vec model.Vector, mc *clusterResolver) map[pvcKey]string {
-	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
+	return resolveApplications(vec, argoTrackingIDLabel, func(m model.Metric) (pvcKey, bool) {
 		claim := string(m["persistentvolumeclaim"])
 		if claim == "" {
 			return pvcKey{}, false
@@ -1467,6 +1467,14 @@ func argoAppName(raw string) string {
 	return raw
 }
 
+// usableTrackingID reports whether raw yields a non-empty Application. Every
+// tracking-id pick applies it BEFORE the lexically-smallest comparison: ':'
+// sorts below every letter and digit, so a malformed ":apps/..." sibling would
+// otherwise win and suppress a valid Application.
+func usableTrackingID(raw string) bool {
+	return raw != "" && argoAppName(raw) != ""
+}
+
 // resolveApplications builds a key → ArgoCD Application index from a vector
 // carrying a tracking-id under `label`. For each key it keeps the
 // lexically-smallest non-empty raw tracking-id (the tie-break is on the raw
@@ -1480,13 +1488,8 @@ func resolveApplications[K comparable](vec model.Vector, label string, keyOf fun
 	out := make(map[K]string, len(vec))
 	for _, s := range vec {
 		raw := string(s.Metric[model.LabelName(label)])
-		// Skip a value whose derived Application would be empty — an empty
-		// tracking-id, or an empty leading segment like ":apps/..." — BEFORE the
-		// min-pick. Otherwise a malformed sibling could win the lexically-smallest
-		// race (':' = 0x3A sorts below every letter/digit) and suppress a valid
-		// Application for the same key. Among the surviving (non-empty-app) series
-		// the smallest raw tracking-id still wins (the documented tie-break).
-		if raw == "" || argoAppName(raw) == "" {
+		// Among the usable series the smallest raw tracking-id wins.
+		if !usableTrackingID(raw) {
 			continue
 		}
 		key, ok := keyOf(s.Metric)
