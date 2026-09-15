@@ -120,6 +120,10 @@ func podAppFixture() *labelStore {
 	s.add("kube_pod_owner", podOwner("prod", "c1", "multi-1", "StatefulSet", "db"))
 	s.add("kube_pod_owner", podOwner("prod", "c1", "multi-1", "DaemonSet", "agent"))
 	s.add("kube_daemonset_annotations", annotation("prod", "c1", "daemonset", "agent", "agent-app"))
+	// ReplicaSet and Job owners: the ReplicaSet collapses to its Deployment
+	// BEFORE the min-pick, so Deployment < Job wins (Job < ReplicaSet would not).
+	s.add("kube_pod_owner", podOwner("prod", "c1", "rs-job-1", "ReplicaSet", "web-7d9"))
+	s.add("kube_pod_owner", podOwner("prod", "c1", "rs-job-1", "Job", "own-job"))
 	// Same raw names in another cluster must never leak in.
 	s.add("kube_pod_owner", podOwner("prod", "c2", "web-abc", "StatefulSet", "db"))
 	s.add("kube_deployment_annotations", annotation("prod", "c2", "deployment", "web", "other-cluster-app"))
@@ -141,6 +145,7 @@ func TestResolvePodApplication(t *testing.T) {
 		{"cron-job-1", "batch-app", []string{"kube_pod_owner", "kube_job_annotations", "kube_job_owner", "kube_cronjob_annotations"}},
 		{"rc-1", "", []string{"kube_pod_owner"}},
 		{"multi-1", "agent-app", []string{"kube_pod_owner", "kube_daemonset_annotations"}},
+		{"rs-job-1", "shop-app", []string{"kube_pod_owner", "kube_replicaset_owner", "kube_deployment_annotations"}},
 		{"orphan", "", []string{"kube_pod_owner"}},
 		{"missing", "", []string{"kube_pod_owner"}},
 	}

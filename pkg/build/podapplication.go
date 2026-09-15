@@ -1,6 +1,7 @@
 package build
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -51,6 +52,11 @@ var ErrAmbiguousPod = errors.New("pod application lookup: pod matches more than 
 // It returns "" and a nil error when the pod resolves no Application. Any
 // upstream error fails the lookup — unlike the build, nothing degrades,
 // because a skipped leg could substitute the CronJob's Application for a Job's.
+//
+// Every later query is matched on the (az, env) pinned from the pod-owner rows,
+// so a controller family that does not carry the same az / env labels as
+// kube_pod_owner resolves nothing here, where an unfiltered build could still
+// adopt it into the pod's cluster identity.
 func ResolvePodApplication(ctx context.Context, q LabelQuerier, req PodApplicationRequest) (string, error) {
 	if err := req.validate(); err != nil {
 		return "", err
@@ -77,42 +83,11 @@ func ResolvePodApplication(ctx context.Context, q LabelQuerier, req PodApplicati
 		return "", err
 	}
 
-	kind, name, ok := minOwner(owners)
-	if !ok {
-		return "", nil
-	}
-	if kind == "ReplicaSet" {
-		rsOwners, err := l.query(ctx, promql.QReplicaSetOwner, map[string]string{
-			"replicaset": name,
-			"owner_kind": "Deployment",
-		})
-		if err != nil {
-			return "", err
-		}
-		if dep, ok := minLabel(rsOwners, "owner_name"); ok {
-			kind, name = "Deployment", dep
-		}
-	}
-
-	app, ok, err := l.controllerApplication(ctx, kind, name)
-	if err != nil || ok || kind != "Job" {
-		return app, err
-	}
-
-	jobOwners, err := l.query(ctx, promql.QJobOwner, map[string]string{
-		"job_name":            name,
-		"owner_kind":          "CronJob",
-		"owner_is_controller": "true",
-	})
-	if err != nil {
+	kind, name, ok, err := l.controllerOwner(ctx, owners)
+	if err != nil || !ok {
 		return "", err
 	}
-	cronJob, ok := minLabel(jobOwners, "owner_name")
-	if !ok {
-		return "", nil
-	}
-	app, _, err = l.controllerApplication(ctx, "CronJob", cronJob)
-	return app, err
+	return resolveOwnerApplication(ctx, l, kind, name)
 }
 
 func (r PodApplicationRequest) validate() error {
@@ -196,10 +171,43 @@ func (l *podAppLookup) query(ctx context.Context, metric promql.Query, filters m
 	return sets, nil
 }
 
-// controllerApplication reads one controller's tracking-id from its
-// annotation family. ok is false for a kind with no family and for a
-// controller carrying no usable tracking-id.
-func (l *podAppLookup) controllerApplication(ctx context.Context, kind, name string) (string, bool, error) {
+// controllerOwner picks the pod's controller owner exactly as resolvePodOwners
+// does: every ReplicaSet owner is collapsed to its Deployment FIRST, then the
+// lexically-smallest (kind, name) wins. Rows missing either label are skipped.
+// A pod normally has one controller row, so this issues at most one
+// kube_replicaset_owner query.
+func (l *podAppLookup) controllerOwner(ctx context.Context, owners []map[string]string) (kind, name string, ok bool, err error) {
+	refs := make([]ownerRef, 0, len(owners))
+	for _, s := range owners {
+		if k, n := s["owner_kind"], s["owner_name"]; k != "" && n != "" {
+			refs = append(refs, ownerRef{k, n})
+		}
+	}
+	slices.SortFunc(refs, func(a, b ownerRef) int { return cmp.Or(cmp.Compare(a.kind, b.kind), cmp.Compare(a.name, b.name)) })
+	for _, ref := range slices.Compact(refs) {
+		if ref.kind == "ReplicaSet" {
+			rsOwners, err := l.query(ctx, promql.QReplicaSetOwner, map[string]string{
+				"replicaset": ref.name,
+				"owner_kind": "Deployment",
+			})
+			if err != nil {
+				return "", "", false, err
+			}
+			if dep, found := minLabel(rsOwners, "owner_name"); found {
+				ref = ownerRef{"Deployment", dep}
+			}
+		}
+		if !ok || ownerLess(ref.kind, ref.name, kind, name) {
+			kind, name, ok = ref.kind, ref.name, true
+		}
+	}
+	return kind, name, ok, nil
+}
+
+// controllerApp reads one controller's tracking-id from its annotation family.
+// ok is false for a kind with no family and for a controller carrying no
+// usable tracking-id.
+func (l *podAppLookup) controllerApp(ctx context.Context, kind, name string) (string, bool, error) {
 	i := slices.IndexFunc(controllerAnnotationFamilies, func(f controllerAnnotationFamily) bool { return f.kind == kind })
 	if i < 0 {
 		return "", false, nil
@@ -211,7 +219,7 @@ func (l *podAppLookup) controllerApplication(ctx context.Context, kind, name str
 	}
 	best := ""
 	for _, s := range sets {
-		if raw := s[argoTrackingIDLabel]; usableTrackingID(raw) && (best == "" || raw < best) {
+		if raw := s[argoTrackingIDLabel]; betterTrackingID(best, raw) {
 			best = raw
 		}
 	}
@@ -221,19 +229,18 @@ func (l *podAppLookup) controllerApplication(ctx context.Context, kind, name str
 	return argoAppName(best), true, nil
 }
 
-// minOwner mirrors resolvePodOwners' tie-break: lexically-smallest
-// (owner_kind, owner_name), skipping rows missing either.
-func minOwner(sets []map[string]string) (kind, name string, ok bool) {
-	for _, s := range sets {
-		k, n := s["owner_kind"], s["owner_name"]
-		if k == "" || n == "" {
-			continue
-		}
-		if !ok || k < kind || (k == kind && n < name) {
-			kind, name, ok = k, n, true
-		}
+// cronJobOf reads the CronJob controlling a Job from kube_job_owner.
+func (l *podAppLookup) cronJobOf(ctx context.Context, job string) (string, bool, error) {
+	jobOwners, err := l.query(ctx, promql.QJobOwner, map[string]string{
+		"job_name":            job,
+		"owner_kind":          "CronJob",
+		"owner_is_controller": "true",
+	})
+	if err != nil {
+		return "", false, err
 	}
-	return kind, name, ok
+	cronJob, ok := minLabel(jobOwners, "owner_name")
+	return cronJob, ok, nil
 }
 
 // minLabel returns the lexically-smallest non-empty value of label.

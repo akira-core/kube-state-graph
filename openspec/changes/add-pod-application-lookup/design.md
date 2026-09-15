@@ -69,9 +69,16 @@ label query already permits.
 `QueryLabels` sorts label sets by full label-key order, so incidental labels
 such as `instance` decide ordering before `owner_kind` does. Each pick is
 therefore explicit and mirrors its batch counterpart: min `(owner_kind,
-owner_name)` for the controller owner; min non-empty `owner_name` for the
+owner_name)` for the controller owner, compared AFTER every ReplicaSet owner is
+collapsed to its Deployment; min non-empty `owner_name` for the
 ReplicaSet → Deployment and Job → CronJob hops; min raw tracking-id among values
 passing `usableTrackingID` for the annotation.
+
+The two paths share the rules rather than restating them: `ownerLess` is the
+owner comparison, `betterTrackingID` the tracking-id pick, and
+`resolveOwnerApplication` the controller → (Job → CronJob) chain, driven by an
+`ownerAppSource` the build answers from its indexes and the lookup answers with
+one query per question.
 
 ### D4. Every upstream error fails the lookup
 
@@ -104,3 +111,14 @@ consumers outside the package.
   literal label, not an absent one, unlike the graph request's `unknown` bucket.
   `Cluster` is required, so a pod whose series carry no `cluster` label cannot be
   looked up. Such an estate is out of scope.
+- **No identity adoption.** An unfiltered build can adopt a family whose series
+  lack the `az` / `env` labels into the pod's composed cluster identity. The
+  lookup matches every leg after the first on the pinned `(az, env)`, so a
+  controller family whose labels differ from `kube_pod_owner`'s resolves no
+  Application. Dropping the pin on a miss would let another zone's same-named
+  controller answer instead.
+- **One routing snapshot per leg.** Each `QueryLabels` call reads the current
+  routing table, so a backends-file reload between legs can route them to
+  different tables — unlike `Builder.Build`, which binds one querier. The effect
+  is a transient miss, never a wrong value; binding one snapshot would need a
+  new `pkg/promql` surface.
