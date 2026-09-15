@@ -2,14 +2,11 @@ package build
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"runtime/debug"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
@@ -55,12 +52,13 @@ func podScope(bindings model.Vector, roots []string) []string {
 // could be bound or is a root, so no pod could be drawn. That mirrors the QoS
 // read's empty-scope rule.
 //
-// Unlike a QoS chunk, a pod chunk FAILS CLOSED. A pod is topology, not a
-// measurement: a missing chunk would be a smaller, plausible, wrong body with no
-// signal — the partial fan-out that backend routing D6 forbids — so the first
-// chunk error fails the build exactly as an unscoped kube_pod_info error does.
-// Results merge in CHUNK ORDER, so the vectors and everything parsed from them
-// are a pure function of the scope rather than of upstream timing.
+// Unlike a QoS chunk, a pod chunk FAILS CLOSED (legRequired). A pod is
+// topology, not a measurement: a missing chunk would be a smaller, plausible,
+// wrong body with no signal — the partial fan-out that backend routing D6
+// forbids — so the first chunk error fails the build exactly as an unscoped
+// kube_pod_info error does. Results merge in CHUNK ORDER (issueScopedFamilies),
+// so the vectors and everything parsed from them are a pure function of the
+// scope rather than of upstream timing.
 //
 // A pod name is unique within a namespace only, so the scope MAY admit a
 // same-named pod from another namespace. Such a pod lies on no drawn path and is
@@ -74,6 +72,7 @@ func readScopedPods(
 	sel promql.Selector,
 	roots []string,
 	v *topologyVectors,
+	scopeMu *sync.Mutex,
 	bindingsDone <-chan struct{},
 ) error {
 	select {
@@ -88,77 +87,9 @@ func readScopedPods(
 	if len(scope) == 0 {
 		return nil
 	}
-	v.PodScopeIssued = true
-	chunks := promql.ChunkScope(scope, opts.qosScopeBatchBytes())
-	targets := podTargets(v)
-
-	// One slot per (family, chunk). Writing into a pre-sized slot rather than
-	// appending is what makes the merge below order-free.
-	parts := make([][]model.Vector, len(targets))
-	for i := range parts {
-		parts[i] = make([]model.Vector, len(chunks))
+	families := make([]scopedFamily, 0, len(promql.PodScopedQueries))
+	for _, t := range podTargets(v) {
+		families = append(families, scopedFamily{query: t.query, dst: t.dst, scope: scope, mode: legRequired})
 	}
-
-	wave, wctx := errgroup.WithContext(ctx)
-	wave.SetLimit(scopeConcurrency)
-	for ti, t := range targets {
-		for ci, chunk := range chunks {
-			wave.Go(func() error {
-				out, err := instantScopedPods(wctx, q, t.query, window, end, opts.LabelKeys, sel, chunk)
-				if err != nil {
-					return err
-				}
-				parts[ti][ci] = out
-				return nil
-			})
-		}
-	}
-	if err := wave.Wait(); err != nil {
-		return err
-	}
-
-	for ti, t := range targets {
-		var merged model.Vector
-		for _, part := range parts[ti] {
-			merged = append(merged, part...)
-		}
-		*t.dst = merged
-	}
-	return nil
-}
-
-// instantScopedPods issues one pod family's query for one chunk of the scope,
-// under the bare family name, so self-metrics and span dimensions carry one
-// label value per family however many chunks a build issues. It recovers its
-// own panics for the reason fetch does: errgroup does not propagate them, and
-// an unrecovered panic here would kill the process.
-func instantScopedPods(
-	ctx context.Context,
-	q promql.Querier,
-	name promql.Query,
-	window time.Duration,
-	end time.Time,
-	keys promql.LabelKeys,
-	sel promql.Selector,
-	pods []string,
-) (out model.Vector, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.ErrorContext(ctx, "panic in scoped pod query",
-				"query", string(name),
-				"panic", fmt.Sprint(rec),
-				"stack", string(debug.Stack()),
-			)
-			out, err = nil, fmt.Errorf("panic in %s query: %v", name, rec)
-		}
-	}()
-
-	rendered, ok := promql.RenderScoped(name, window, keys, sel, pods)
-	if !ok {
-		// Unreachable for a non-empty chunk of a scopeable family. Failing is the
-		// only honest answer: an unscoped fallback would read the whole estate,
-		// and an empty vector would silently draw no pods.
-		return nil, fmt.Errorf("%s: no scoped rendering for %d pods", name, len(pods))
-	}
-	return q.Instant(ctx, string(name), rendered, end)
+	return issueScopedFamilies(ctx, ctx, q, window, end, opts, sel, v, scopeMu, families)
 }

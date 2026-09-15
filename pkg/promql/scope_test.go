@@ -59,16 +59,75 @@ func TestRenderScoped(t *testing.T) {
 		assert.False(t, ok)
 	})
 
-	t.Run("only the pod-scoped families are scopeable", func(t *testing.T) {
-		for _, q := range PodScopedQueries {
+	t.Run("only the reference-scoped families are scopeable", func(t *testing.T) {
+		for _, q := range ReferenceScopedQueries {
 			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
 			assert.True(t, ok, string(q))
 		}
-		for _, q := range []Query{QPodContainerInfo, QPVCBindings, QNodeInfo, QQoSReadOps, QAlerts} {
+		for _, q := range []Query{QPodContainerInfo, QPVCBindings, QQoSReadOps, QAlerts} {
 			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
 			assert.False(t, ok, string(q))
 		}
 	})
+
+	t.Run("a fixed selector is rendered ahead of the scope", func(t *testing.T) {
+		got, ok := RenderScoped(QJobOwner, time.Minute, LabelKeys{}, Selector{}, []string{"b", "a"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",job_name=~"a|b"}[1m])`,
+			got, "the CronJob-controller selector must survive a scoped render")
+	})
+
+	t.Run("the node type alternation precedes the node scope", func(t *testing.T) {
+		got, ok := RenderScoped(QNodeAddresses, time.Minute, LabelKeys{}, Selector{}, []string{"n2", "n1"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",node=~"n1|n2"}[1m])`,
+			got)
+	})
+
+	t.Run("the tracking-id selector survives a scoped controller-annotation render", func(t *testing.T) {
+		got, ok := RenderScoped(QDeploymentAnnotations, time.Minute, LabelKeys{}, Selector{}, []string{"web"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!="",deployment="web"}[1m])`,
+			got)
+	})
+
+	t.Run("a non-scopeable query still returns ok=false", func(t *testing.T) {
+		for _, q := range []Query{QPodContainerInfo, QPVCBindings, QQoSReadOps, QAlerts, QUpProbe} {
+			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
+			assert.False(t, ok, string(q))
+		}
+	})
+}
+
+// TestRenderScoped_IsRenderPlusOneMatcher pins, for EVERY scopeable query and
+// with and without a request-scoped selector, that the scoped string is
+// exactly Render's output with one `<label>=~"…"` (or `<label>="…"`) matcher
+// appended as the last element inside the braces — so a family's fixed
+// selector can never drift between its unscoped and scoped renderings
+// (scope-controller-legs-by-reference D2).
+func TestRenderScoped_IsRenderPlusOneMatcher(t *testing.T) {
+	t.Parallel()
+	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
+	for _, q := range ReferenceScopedQueries {
+		label := scopedLabel[q]
+		for _, s := range []Selector{{}, sel} {
+			t.Run(string(q), func(t *testing.T) {
+				got, ok := RenderScoped(q, time.Minute, LabelKeys{}, s, []string{"b", "a"})
+				require.True(t, ok)
+				base := Render(q, time.Minute, LabelKeys{}, s)
+				want := strings.TrimSuffix(base, "}[1m])") + `,` + label + `=~"a|b"}[1m])`
+				if !strings.Contains(base, "{") {
+					// No fixed selector and no request matcher: Render emits no
+					// braces at all, so the scoped form opens its own.
+					want = strings.TrimSuffix(base, "[1m])") + `{` + label + `=~"a|b"}[1m])`
+				}
+				assert.Equal(t, want, got)
+			})
+		}
+	}
 }
 
 // A data-derived scope is not a request dimension: the pod families keep the
@@ -80,6 +139,36 @@ func TestQueryDims_ScopedPodLegsUnchanged(t *testing.T) {
 		assert.Equal(t, dimsNamespaced, queryDims[q], string(q))
 		assert.Equal(t, `last_over_time(`+string(q)+`[1m])`,
 			Render(q, time.Minute, LabelKeys{}, Selector{}), "Render itself is untouched")
+	}
+}
+
+// A by-reference plan changes WHICH BUILD issues a family, never what
+// dimension that family accepts once it is issued: every ReferenceScopedQueries
+// member keeps the queryDims entry it had before this capability existed, and
+// TestQueryDims_EveryQueryListed still holds.
+func TestQueryDims_ReferenceScopedLegsUnchanged(t *testing.T) {
+	t.Parallel()
+	want := map[Query]dims{
+		QPodInfo:  dimsNamespaced,
+		QPodOwner: dimsNamespaced,
+
+		QNodeInfo:            dimsClusterScoped,
+		QNodeAddresses:       dimsClusterScoped,
+		QNodeLabels:          dimsClusterScoped,
+		QNodeStatusCondition: dimsClusterScoped,
+
+		QReplicaSetOwner:        dimsNamespaced,
+		QReplicaSetAnnotations:  dimsNamespaced,
+		QJobOwner:               dimsNamespaced,
+		QJobAnnotations:         dimsNamespaced,
+		QDeploymentAnnotations:  dimsNamespaced,
+		QStatefulSetAnnotations: dimsNamespaced,
+		QDaemonSetAnnotations:   dimsNamespaced,
+		QCronJobAnnotations:     dimsNamespaced,
+	}
+	assert.Len(t, want, len(ReferenceScopedQueries), "the pin must cover every scoped query")
+	for _, q := range ReferenceScopedQueries {
+		assert.Equal(t, want[q], queryDims[q], string(q))
 	}
 }
 

@@ -119,8 +119,9 @@ func scopedQoSVectors(t *testing.T, q promql.Querier, opts Options, v *topologyV
 		close(c)
 		return c
 	}
+	var mu sync.Mutex
 	require.NoError(t, readScopedQoS(ctx, ctx, q, time.Minute, time.Unix(1, 0).UTC(),
-		opts, v, done(), done()))
+		opts, v, &mu, done(), done()))
 }
 
 // The QoS read waits for the two legs its scope is computed from, and the query

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
@@ -75,6 +76,7 @@ func readScopedQoS(
 	end time.Time,
 	opts Options,
 	v *topologyVectors,
+	scopeMu *sync.Mutex,
 	prerequisites ...<-chan struct{},
 ) error {
 	for _, done := range prerequisites {
@@ -91,7 +93,6 @@ func readScopedQoS(
 	if len(scope) == 0 {
 		return nil
 	}
-	v.QoSScopeIssued = true
 	chunks := promql.ChunkQoSVolumeScope(scope, opts.qosScopeBatchBytes())
 
 	targets := qosTargets(v)
@@ -127,6 +128,7 @@ func readScopedQoS(
 			merged = append(merged, part...)
 		}
 		*t.dst = merged
+		markScopeIssued(v, scopeMu, t.query)
 	}
 	return nil
 }

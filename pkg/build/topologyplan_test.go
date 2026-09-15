@@ -31,19 +31,21 @@ func TestTopologyPlans(t *testing.T) {
 		assert.True(t, fullPlan.issuesFirstWave(l.query), "the full plan issues %s", l.query)
 	}
 
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"b/y", "a/x", "c/x"})
+	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n1"}, nil, nil, []string{"b/y", "a/x", "c/x"})
 	require.NoError(t, err)
 	p := storagePlan(scope.Roots)
-	assert.True(t, p.scopePods)
+	assert.True(t, p.byReference)
 	assert.Equal(t, []string{"x", "x", "y"}, p.podRoots, "root names are sorted: map order must not reach the scope")
+	assert.Equal(t, []string{"n1"}, p.nodeRoots)
 	issued := 0
 	for _, l := range legs {
 		if p.issuesFirstWave(l.query) {
 			issued++
 		}
 	}
-	assert.Equal(t, 30, issued, "37 less the five skipped families less the two pod families moved to a wave")
-	for _, q := range promql.PodScopedQueries {
+	assert.Equal(t, 18, issued,
+		"37 less the five skipped families less the fourteen pod/node/controller families moved to by-reference waves")
+	for _, q := range promql.ReferenceScopedQueries {
 		assert.False(t, p.issuesFirstWave(q), "%s is read by reference, in a second wave", q)
 	}
 }

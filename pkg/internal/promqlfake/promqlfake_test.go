@@ -43,3 +43,23 @@ func TestQuerier_AppliesRenderedMatchers(t *testing.T) {
 	}
 	assert.Len(t, f.QueriesFor(promql.QPodInfo), len(cases))
 }
+
+func TestQuerier_ScopeValues(t *testing.T) {
+	f := New(nil)
+	_, err := f.Instant(t.Context(), string(promql.QPodInfo),
+		`last_over_time(kube_pod_info{pod=~"a|b"}[1m])`, time.Unix(1, 0))
+	require.NoError(t, err)
+	_, err = f.Instant(t.Context(), string(promql.QJobOwner),
+		`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",job_name="x"}[1m])`, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	_, err = f.Instant(t.Context(), string(promql.QNodeInfo),
+		`last_over_time(kube_node_info{node=~"ip-1\\.ec2|ip-2\\.ec2"}[1m])`, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	assert.Equal(t, [][]string{{"a", "b"}}, f.ScopeValues(promql.QPodInfo, "pod"))
+	assert.Equal(t, [][]string{{"ip-1.ec2", "ip-2.ec2"}}, f.ScopeValues(promql.QNodeInfo, "node"),
+		"QuoteMeta escapes are removed: the entry is the literal value set")
+	assert.Equal(t, [][]string{{"x"}}, f.ScopeValues(promql.QJobOwner, "job_name"))
+	assert.Nil(t, f.ScopeValues(promql.QJobOwner, "no_such_label"))
+}

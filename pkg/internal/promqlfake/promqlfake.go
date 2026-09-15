@@ -88,6 +88,64 @@ func (f *Querier) QueriesFor(name promql.Query) []string {
 	return out
 }
 
+// ScopeValues returns, for every query issued under family name, the value
+// set the query's matcher on label named — one entry per issued query (so a
+// chunked scope reports one entry per chunk, in issue order). An exact-equality
+// matcher (`label="v"`) reports a single-element set; an alternation
+// (`label=~"a|b"`) reports one element per alternative, in the rendered order
+// (RenderScoped sorts values before rendering, so this is the sorted set). A
+// query carrying no matcher on label contributes no entry. Lets a test assert
+// "restricted to exactly {…}" on the value set a data-derived scope rendered,
+// rather than string-matching the whole query.
+func (f *Querier) ScopeValues(name promql.Query, label string) [][]string {
+	var out [][]string
+	for _, q := range f.QueriesFor(name) {
+		matchers, err := parseSelector(q)
+		if err != nil {
+			continue
+		}
+		for _, m := range matchers {
+			if m.name != label {
+				continue
+			}
+			switch m.op {
+			case "=":
+				out = append(out, []string{m.val})
+			case "=~":
+				// RenderScoped QuoteMeta-escapes every alternative, so a value
+				// like `ip-10-0-0-1.ec2.internal` arrives as `ip-10-0-0-1\.ec2\.internal`.
+				// Split on UNESCAPED separators and drop the escapes so the entry
+				// is the literal value set that was rendered.
+				out = append(out, splitQuotedAlternation(m.val))
+			}
+		}
+	}
+	return out
+}
+
+// splitQuotedAlternation inverts the `regexp.QuoteMeta` + `|`-join a scoped
+// alternation is rendered with: it splits on every `|` not preceded by an
+// escaping backslash and removes the backslash from each `\x` escape.
+func splitQuotedAlternation(re string) []string {
+	var (
+		out []string
+		cur strings.Builder
+	)
+	for i := 0; i < len(re); i++ {
+		switch c := re[i]; {
+		case c == '\\' && i+1 < len(re):
+			i++
+			cur.WriteByte(re[i])
+		case c == '|':
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	return append(out, cur.String())
+}
+
 type matcher struct {
 	name string
 	op   string

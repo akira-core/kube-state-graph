@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,9 +41,10 @@ func (d delayedQuerier) Instant(ctx context.Context, name, query string, ts time
 func scopedPodVectors(t *testing.T, q promql.Querier, opts Options, roots []string, bindings model.Vector) (*topologyVectors, error) {
 	t.Helper()
 	v := &topologyVectors{PVC: bindings}
+	var mu sync.Mutex
 	done := make(chan struct{})
 	close(done)
-	err := readScopedPods(t.Context(), q, time.Minute, time.Unix(1, 0).UTC(), opts, promql.Selector{}, roots, v, done)
+	err := readScopedPods(t.Context(), q, time.Minute, time.Unix(1, 0).UTC(), opts, promql.Selector{}, roots, v, &mu, done)
 	return v, err
 }
 
@@ -182,7 +184,8 @@ func TestReadScopedPods_ChunksMergeInChunkOrder(t *testing.T) {
 		order = append(order, string(s.Metric["pod"]))
 	}
 	assert.Equal(t, []string{"a", "b", "c"}, order, "the merged vector follows chunk order, not completion order")
-	assert.True(t, v.PodScopeIssued)
+	assert.True(t, v.ScopeIssued[promql.QPodInfo])
+	assert.True(t, v.ScopeIssued[promql.QPodOwner])
 	assert.Len(t, f.QueriesFor(promql.QPodInfo), 3, "one query per chunk")
 	assert.Len(t, f.QueriesFor(promql.QPodOwner), 3, "one query per chunk")
 	for _, is := range f.Issued() {

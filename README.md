@@ -163,9 +163,13 @@ accumulates with history, not live object count), `kube_pod_container_info`
 Harvest, kubelet, and the two RED series log-and-continue. Details in the
 catalog. `/v1/storage-graph` reads less: it never issues
 `kube_pod_container_info` or the four Service / EndpointSlice families (its
-body carries no `data.containers` and no service node), and it reads
-`kube_pod_info` / `kube_pod_owner` only for pods a claim binding names or a
-`pod=` root names.
+body carries no `data.containers` and no service node), and it reads pods,
+Kubernetes nodes and controllers **by reference**: `kube_pod_info` /
+`kube_pod_owner` only for pods a claim binding names or a `pod=` root names;
+the four `kube_node_*` families only for the Kubernetes nodes those pods are
+scheduled on or a `node=` root names; and the eight controller-owner /
+controller-annotation families only for the owner names those pods' resolved
+owners carry.
 
 ### Topology metrics — produced by [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
 

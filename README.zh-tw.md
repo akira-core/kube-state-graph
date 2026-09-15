@@ -83,7 +83,7 @@ service-graph 系列**每次請求都完整讀取**：其 `cluster` label 常缺
 
 完整營運者目錄（全部 **41** 條系列、PromQL 包裝、固定 selector、query 失敗 vs 空向量、每次請求的 fan-out）見 [`docs/upstream-metrics.md`](docs/upstream-metrics.md)（英文）。
 
-摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；13 條 Harvest + 2 條 kubelet 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。v1 無結果快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），`kube_pod_info`／`kube_pod_owner` 只讀 claim binding 或 `pod=` root 點名的 pod。
+摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；13 條 Harvest + 2 條 kubelet 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。v1 無結果快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），並改依參照讀 pod、Kubernetes node 與 controller：`kube_pod_info`／`kube_pod_owner` 只讀 claim binding 或 `pod=` root 點名的 pod；四條 `kube_node_*` 只讀這些 pod 排程所在的節點或 `node=` root 點名的節點；八條 controller-owner／controller-annotation 只讀這些 pod 解析出的 owner 名稱。
 
 K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫入的 `cluster` 標籤。Harvest 的 `cluster` 是 **ONTAP** 叢集，不用來當 `?cluster=`。
 
