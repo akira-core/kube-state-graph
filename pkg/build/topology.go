@@ -1437,6 +1437,10 @@ type indexedOwnerApps struct {
 	cluster, namespace     string
 }
 
+var _ ownerAppSource = indexedOwnerApps{}
+
+// controllerApp answers from the index, so it never errors; the error result is
+// the ownerAppSource contract, which podAppLookup satisfies with real queries.
 func (s indexedOwnerApps) controllerApp(_ context.Context, kind, name string) (string, bool, error) {
 	app, ok := s.ctrlApps[controllerKey{s.cluster, s.namespace, kind, name}]
 	return app, ok, nil
