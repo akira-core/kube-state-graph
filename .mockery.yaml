@@ -22,6 +22,7 @@ packages:
       Querier:
   github.com/akira-core/kube-state-graph/pkg/build:
     interfaces:
+      LabelQuerier:
       RouteResolver:
   github.com/akira-core/kube-state-graph/pkg/route/store:
     interfaces:

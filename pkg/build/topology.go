@@ -1161,14 +1161,19 @@ func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc *clusterResolver) ma
 		}
 		key := podNameKey{cluster, ns, pod}
 		// Deterministic pick: lexically-smallest (kind, name) wins on collision.
-		if cur, ok := owners[key]; ok {
-			if kind > cur.kind || (kind == cur.kind && name >= cur.name) {
-				continue
-			}
+		if cur, ok := owners[key]; ok && !ownerLess(kind, name, cur.kind, cur.name) {
+			continue
 		}
 		owners[key] = ownerRef{kind, name}
 	}
 	return owners
+}
+
+// ownerLess is the controller-owner tie-break shared by resolvePodOwners and
+// ResolvePodApplication: lexically-smallest (kind, name), compared AFTER the
+// ReplicaSet → Deployment collapse.
+func ownerLess(kind, name, curKind, curName string) bool {
+	return kind < curKind || (kind == curKind && name < curName)
 }
 
 // resolvePodContainers builds the (cluster, namespace, pod) → sorted container
@@ -1288,7 +1293,7 @@ var controllerAnnotationFamilies = []controllerAnnotationFamily{
 func resolveControllerApplications(v topologyVectors, mc *clusterResolver) map[controllerKey]string {
 	out := map[controllerKey]string{}
 	for _, f := range controllerAnnotationFamilies {
-		apps := resolveApplications(f.vec(v), "annotation_argocd_argoproj_io_tracking_id",
+		apps := resolveApplications(f.vec(v), argoTrackingIDLabel,
 			func(m model.Metric) (controllerKey, bool) {
 				name := string(m[f.nameLabel])
 				if name == "" {
@@ -1383,26 +1388,72 @@ func resolvePodApplications(
 	jobAnnotationsDegraded bool,
 ) map[podNameKey]string {
 	out := make(map[podNameKey]string, len(owners))
+	src := indexedOwnerApps{ctrlApps: ctrlApps, jobCronJobs: jobCronJobs, jobAnnotationsDegraded: jobAnnotationsDegraded}
 	for pod, owner := range owners {
-		key := controllerKey{pod.cluster, pod.namespace, owner.kind, owner.name}
-		if app, ok := ctrlApps[key]; ok {
-			out[pod] = app
-			continue
-		}
-		// Job → CronJob: the only hop, and only on a miss the Job family was
-		// actually read to establish.
-		if owner.kind != "Job" || jobAnnotationsDegraded {
-			continue
-		}
-		cronJob, ok := jobCronJobs[jobKey{pod.cluster, pod.namespace, owner.name}]
-		if !ok {
-			continue
-		}
-		if app, ok := ctrlApps[controllerKey{pod.cluster, pod.namespace, "CronJob", cronJob}]; ok {
+		src.cluster, src.namespace = pod.cluster, pod.namespace
+		// The index source never errors.
+		if app, _ := resolveOwnerApplication(context.Background(), src, owner.kind, owner.name); app != "" {
 			out[pod] = app
 		}
 	}
 	return out
+}
+
+// ownerAppSource answers the two questions the controller → Application chain
+// asks, for one (cluster, namespace). The build answers them from whole-estate
+// indexes; ResolvePodApplication answers them with one upstream query each.
+type ownerAppSource interface {
+	// controllerApp returns the controller's Application; ok is false when the
+	// controller carries no usable tracking-id or its kind has no family.
+	controllerApp(ctx context.Context, kind, name string) (app string, ok bool, err error)
+	// cronJobOf returns the CronJob controlling a Job; ok is false when none
+	// does or when the answer cannot be established.
+	cronJobOf(ctx context.Context, job string) (cronJob string, ok bool, err error)
+}
+
+// resolveOwnerApplication is the ONE statement of how a pod's (already
+// ReplicaSet-collapsed) controller owner resolves an Application: the
+// controller's own annotation first, then — for a Job only — its owning
+// CronJob's. It returns "" when nothing resolves.
+func resolveOwnerApplication[S ownerAppSource](ctx context.Context, src S, kind, name string) (string, error) {
+	app, ok, err := src.controllerApp(ctx, kind, name)
+	if err != nil || ok || kind != "Job" {
+		return app, err
+	}
+	cronJob, ok, err := src.cronJobOf(ctx, name)
+	if err != nil || !ok {
+		return "", err
+	}
+	app, _, err = src.controllerApp(ctx, "CronJob", cronJob)
+	return app, err
+}
+
+// indexedOwnerApps is the build's ownerAppSource over the resolved indexes,
+// scoped to one (cluster, namespace).
+type indexedOwnerApps struct {
+	ctrlApps               map[controllerKey]string
+	jobCronJobs            map[jobKey]string
+	jobAnnotationsDegraded bool
+	cluster, namespace     string
+}
+
+var _ ownerAppSource = indexedOwnerApps{}
+
+// controllerApp answers from the index, so it never errors; the error result is
+// the ownerAppSource contract, which podAppLookup satisfies with real queries.
+func (s indexedOwnerApps) controllerApp(_ context.Context, kind, name string) (string, bool, error) {
+	app, ok := s.ctrlApps[controllerKey{s.cluster, s.namespace, kind, name}]
+	return app, ok, nil
+}
+
+// cronJobOf reports no CronJob when kube_job_annotations degraded: the hop
+// needs that family to establish the Job has no annotation of its own.
+func (s indexedOwnerApps) cronJobOf(_ context.Context, job string) (string, bool, error) {
+	if s.jobAnnotationsDegraded {
+		return "", false, nil
+	}
+	cronJob, ok := s.jobCronJobs[jobKey{s.cluster, s.namespace, job}]
+	return cronJob, ok, nil
 }
 
 // resolveServiceApplications builds the (cluster, namespace, service) → ArgoCD
@@ -1412,7 +1463,7 @@ func resolvePodApplications(
 // yields an empty map (services carry no Application). Deterministic per
 // "absent when empty" (lexically-smallest raw tracking-id wins on collision).
 func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[serviceKey]string {
-	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (serviceKey, bool) {
+	return resolveApplications(vec, argoTrackingIDLabel, func(m model.Metric) (serviceKey, bool) {
 		svc := string(m["service"])
 		if svc == "" {
 			return serviceKey{}, false
@@ -1426,7 +1477,7 @@ func resolveServiceApplications(vec model.Vector, mc *clusterResolver) map[servi
 // label, keyed identically to resolvePVCInfo so the per-PVC assembly
 // can join it. OPTIONAL/graceful and deterministic like the service variant.
 func resolvePVCApplications(vec model.Vector, mc *clusterResolver) map[pvcKey]string {
-	return resolveApplications(vec, "annotation_argocd_argoproj_io_tracking_id", func(m model.Metric) (pvcKey, bool) {
+	return resolveApplications(vec, argoTrackingIDLabel, func(m model.Metric) (pvcKey, bool) {
 		claim := string(m["persistentvolumeclaim"])
 		if claim == "" {
 			return pvcKey{}, false
@@ -1467,6 +1518,21 @@ func argoAppName(raw string) string {
 	return raw
 }
 
+// usableTrackingID reports whether raw yields a non-empty Application. Every
+// tracking-id pick applies it BEFORE the lexically-smallest comparison: ':'
+// sorts below every letter and digit, so a malformed ":apps/..." sibling would
+// otherwise win and suppress a valid Application.
+func usableTrackingID(raw string) bool {
+	return raw != "" && argoAppName(raw) != ""
+}
+
+// betterTrackingID reports whether raw should replace best ("" when nothing is
+// picked yet): among usable tracking-ids the lexically-smallest raw value wins.
+// Every tracking-id pick goes through it.
+func betterTrackingID(best, raw string) bool {
+	return usableTrackingID(raw) && (best == "" || raw < best)
+}
+
 // resolveApplications builds a key → ArgoCD Application index from a vector
 // carrying a tracking-id under `label`. For each key it keeps the
 // lexically-smallest non-empty raw tracking-id (the tie-break is on the raw
@@ -1480,20 +1546,15 @@ func resolveApplications[K comparable](vec model.Vector, label string, keyOf fun
 	out := make(map[K]string, len(vec))
 	for _, s := range vec {
 		raw := string(s.Metric[model.LabelName(label)])
-		// Skip a value whose derived Application would be empty — an empty
-		// tracking-id, or an empty leading segment like ":apps/..." — BEFORE the
-		// min-pick. Otherwise a malformed sibling could win the lexically-smallest
-		// race (':' = 0x3A sorts below every letter/digit) and suppress a valid
-		// Application for the same key. Among the surviving (non-empty-app) series
-		// the smallest raw tracking-id still wins (the documented tie-break).
-		if raw == "" || argoAppName(raw) == "" {
+		// Filter before keyOf, which tallies missing-cluster samples.
+		if !usableTrackingID(raw) {
 			continue
 		}
 		key, ok := keyOf(s.Metric)
 		if !ok {
 			continue
 		}
-		if cur, ok := out[key]; !ok || raw < cur {
+		if betterTrackingID(out[key], raw) {
 			out[key] = raw
 		}
 	}
