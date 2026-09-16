@@ -1,3 +1,10 @@
+## Purpose
+
+Resolves the ArgoCD Application of one named pod on demand through the routed
+label query, applying the same controller-annotation rules the graph build
+applies to every pod, so a consumer that already knows the pod does not have to
+run a whole graph build or re-implement those rules.
+
 ## ADDED Requirements
 
 ### Requirement: On-demand pod Application resolution
