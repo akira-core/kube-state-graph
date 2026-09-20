@@ -63,3 +63,48 @@ func TestQuerier_ScopeValues(t *testing.T) {
 	assert.Equal(t, [][]string{{"x"}}, f.ScopeValues(promql.QJobOwner, "job_name"))
 	assert.Nil(t, f.ScopeValues(promql.QJobOwner, "no_such_label"))
 }
+
+// The rooted volume-label read's second phase restricts `volume` with a
+// dot-star-prefixed alternation (suffix mode). The fake must apply it under
+// PromQL's full anchoring — a suffix branch matches volumes that END with the
+// token and nothing else — or every test built on it would prove nothing about
+// what the real upstream returns.
+func TestQuerier_SuffixTokenAlternation(t *testing.T) {
+	vol := func(name string) *model.Sample {
+		return &model.Sample{Metric: model.Metric{"volume": model.LabelValue(name)}, Value: 1}
+	}
+	f := New(map[promql.Query]model.Vector{
+		promql.QVolumeLabels: {
+			vol("trident_pvc_a"), vol("snap_trident_pvc_b"), vol("pvc_a"),
+			vol("trident_pvc_a_clone"), vol("trident_pvc_c"),
+		},
+	})
+	q, ok := promql.RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a", "pvc_b"}, true, nil)
+	require.True(t, ok)
+
+	got, err := f.Instant(t.Context(), string(promql.QVolumeLabels), q, time.Unix(1, 0))
+	require.NoError(t, err)
+	names := make([]string, 0, len(got))
+	for _, s := range got {
+		names = append(names, string(s.Metric["volume"]))
+	}
+	assert.ElementsMatch(t, []string{"trident_pvc_a", "snap_trident_pvc_b", "pvc_a"}, names,
+		"suffix means ENDS with: the dot-star also matches the empty prefix, and a trailing suffix does not match")
+
+	assert.Equal(t, [][]string{{".*pvc_a", ".*pvc_b"}}, f.ScopeValues(promql.QVolumeLabels, "volume"),
+		"the prefix is a wildcard, not an escaped literal, so it survives the escape inversion verbatim")
+
+	// The rooted phase-1 selector: cluster AND aggr in one selector.
+	rooted, ok := promql.RenderVolumeLabelsRooted(time.Minute, []string{"ontap-prod"}, []string{"aggr1"})
+	require.True(t, ok)
+	f2 := New(map[promql.Query]model.Vector{
+		promql.QVolumeLabels: {
+			{Metric: model.Metric{"cluster": "ontap-prod", "aggr": "aggr1"}, Value: 1},
+			{Metric: model.Metric{"cluster": "ontap-lab", "aggr": "aggr1"}, Value: 1},
+			{Metric: model.Metric{"cluster": "ontap-prod", "aggr": "aggr2"}, Value: 1},
+		},
+	})
+	got, err = f2.Instant(t.Context(), string(promql.QVolumeLabels), rooted, time.Unix(1, 0))
+	require.NoError(t, err)
+	require.Len(t, got, 1, "both matchers must hold: an AND, not a union")
+}

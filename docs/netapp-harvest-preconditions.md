@@ -45,7 +45,7 @@ several backends with different prefixes still resolves.
 |---|---|---|
 | `--netapp-volume-key-rewrite` / `KSG_NETAPP_VOLUME_KEY_REWRITE` | `-=_` | Ordered `<regex>=<replacement>` rules producing the match token from the PV name. Repeat the flag for several rules; the env form is semicolon-separated. Each entry splits on its FIRST `=`; a pattern needing a literal `=` writes `\x3d`. The first flag occurrence REPLACES the default list rather than appending to it |
 | `--netapp-volume-match-mode` / `KSG_NETAPP_VOLUME_MATCH_MODE` | `suffix` | `exact`, `suffix`, `contains`, or `regex` (the token is compiled as a regular expression) |
-| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, or a `/v1/storage-graph` pod read's `pod`. A larger matched set is split across several queries |
+| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, a `/v1/storage-graph` pod read's `pod`, or a storage-rooted `volume_labels` read's `aggr` / `cluster` / token set. A larger matched set is split across several queries |
 
 An uncompilable pattern or an unknown match mode is a **startup failure**, never
 a silent fallback to the defaults: a typo would otherwise resolve a different
@@ -74,7 +74,10 @@ Harvest series. `contains` and `regex` cost claims × series.
 1. Deploy with the defaults. Nothing to configure for stock Trident + stock
    Harvest.
 2. Read `netapp_volume_join_miss` from the build logs. Zero means the
-   derivation covers the estate.
+   derivation covers the estate. Read it from an **unrooted** request
+   (`/v1/graph`, or `/v1/storage-graph` with no `ontap_cluster=` / `aggr=`
+   root): a rooted request counts only the claims it actually asked about, so it
+   cannot report a derivation that fits no claim at all — see below.
 3. If non-zero, look at what the filer actually calls its volumes:
    `count by (volume) (volume_labels)`, and compare with a claim's
    `volumename`. Adjust the rewrite rules or the match mode.
@@ -133,7 +136,13 @@ Two coverage signals, each gated on its OWN family being present:
 
 - `slog.Warn("netapp_volume_join_miss", "count", n)` — claims with no hop-A
   match, or only empty-`aggr` matches, **iff** at least one `volume_labels`
-  series was read.
+  series was read. Under a `/v1/storage-graph` request rooted at
+  `ontap_cluster=` / `aggr=` the read is restricted to the rooted components, so
+  the count is taken over the claims that MATCHED a series: a FlexGroup still
+  reports, while a claim with no candidate at all is one the request did not ask
+  about and is not counted. A derivation that fits NO claim therefore reports
+  nothing on a rooted request — alert on it from the unrooted path, the one
+  `make verify` and `scripts/wait-ready.sh` exercise.
 - `slog.Warn("netapp_qos_join_miss", "count", n)` — claims that DID draw their
   edge but matched no QoS workload series, **iff** at least one QoS series was
   read. Under the scoped read that means "at least one issued chunk of at least
@@ -163,7 +172,7 @@ template name.
 
 | Series | Hop | Template (Harvest v26.08.0) | Role |
 |---|---|---|---|
-| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED |
+| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=`, then re-read for the matched claims' tokens) |
 | `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | `conf/restperf/9.12.0/workload.yaml` (`object: qos`; counters `read_ops`, `write_ops`, `read_latency`, `write_latency`, `read_data`, `write_data`; `instance_keys` include `lun`, `policy_group`, `svm`, `volume`) | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
 | `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | `conf/rest/9.12.0/aggr.yaml` (`object: aggr`; `space.block_storage.used => space_used`, `space.block_storage.size => space_total`; `new_status` from the LabelAgent `value_to_num` mapping of `state`) | Aggregate health / usage |

@@ -108,6 +108,51 @@ func NewVolumeKeyRewriter(rules []VolumeKeyRule, mode VolumeMatchMode) (*VolumeK
 	return out, nil
 }
 
+// tokenScopeKind says how a match mode's per-token comparison renders as ONE
+// branch of an anchored regular-expression alternation — the form a data-derived
+// `volume` restriction takes on the wire. It is what decides whether the
+// two-phase rooted volume-label read (see volumelabelscope.go) may run at all.
+type tokenScopeKind int
+
+const (
+	// tokenScopeNone: the mode's comparison cannot be rendered into an anchored
+	// alternation branch without changing what it selects. A build configured
+	// with such a mode reads the volume-label family unrestricted.
+	tokenScopeNone tokenScopeKind = iota
+	// tokenScopeExact: the branch is the escaped token alone.
+	tokenScopeExact
+	// tokenScopeSuffix: the branch is `.*` followed by the escaped token.
+	tokenScopeSuffix
+)
+
+// volumeModeTokenScope classifies EVERY declared match mode. It is a table
+// beside the mode enum rather than a switch with a default, so a mode added to
+// VolumeMatchModes must be classified deliberately —
+// TestVolumeModeTokenScope_EveryModeClassified fails on a missing entry, and the
+// safe reading of an unclassified mode is still "unrestricted".
+//
+// `contains` would need `.*tok.*`, which is expressible, but a `contains` token
+// is chosen precisely because the estate's naming is irregular; and a `regex`
+// token IS operator-supplied RE2 whose own anchors (`^`, `$`) change meaning
+// inside a fully-anchored alternation. Both read unrestricted rather than be
+// reasoned about case by case.
+var volumeModeTokenScope = map[VolumeMatchMode]tokenScopeKind{
+	VolumeMatchExact:    tokenScopeExact,
+	VolumeMatchSuffix:   tokenScopeSuffix,
+	VolumeMatchContains: tokenScopeNone,
+	VolumeMatchRegex:    tokenScopeNone,
+}
+
+// tokenScope reports how this rewriter's mode renders as an alternation branch.
+// A zero-value rewriter (no mode) and any unclassified mode answer
+// tokenScopeNone.
+func (r *VolumeKeyRewriter) tokenScope() tokenScopeKind {
+	if r == nil {
+		return tokenScopeNone
+	}
+	return volumeModeTokenScope[r.mode]
+}
+
 func validVolumeMatchMode(m VolumeMatchMode) bool {
 	return slices.Contains(VolumeMatchModes, m)
 }
@@ -339,10 +384,23 @@ func (m *volumeMatcher) any(volume string) bool {
 // entity claim list (an unbound PVC contributes a name no claim will later
 // join): the scope decides only what is FETCHED, never what joins, and the
 // authoritative join stays in resolveNetAppStorage.
-func qosVolumeScope(pvcInfo, volumeLabels model.Vector, rw *VolumeKeyRewriter) []string {
-	if len(pvcInfo) == 0 || len(volumeLabels) == 0 {
-		return nil
-	}
+// claimVolumeMatcher turns a kube_persistentvolumeclaim_info vector into the
+// claim list and the matcher every Harvest read joins through: one pvcVolume
+// per DISTINCT bound PersistentVolume name, and a volumeMatcher indexing their
+// derived tokens.
+//
+// It is shared by qosVolumeScope and by the rooted volume-label read's
+// phase-2 scope so the two cannot disagree about what a claim is or what token
+// it derives. They ask different questions of the result — which FlexVol names
+// matched, versus which CLAIMS matched — but a claim admitted by one and not
+// the other would mean a volume fetched for and then not joined, or the
+// reverse. Keeping the step in one place is what makes that structural rather
+// than a promise in two comments.
+//
+// The claim set is deliberately every bound claim the read loaded, which is a
+// SUPERSET of the claims the parse binds to a pod: an unmounted claim costs a
+// token and is dropped at projection exactly as it always has been.
+func claimVolumeMatcher(pvcInfo model.Vector, rw *VolumeKeyRewriter) ([]pvcVolume, *volumeMatcher) {
 	claims := make([]pvcVolume, 0, len(pvcInfo))
 	seenPV := make(map[string]bool, len(pvcInfo))
 	for _, s := range pvcInfo {
@@ -354,10 +412,19 @@ func qosVolumeScope(pvcInfo, volumeLabels model.Vector, rw *VolumeKeyRewriter) [
 		claims = append(claims, pvcVolume{volumeName: vn})
 	}
 	if len(claims) == 0 {
+		return nil, nil
+	}
+	return claims, newVolumeMatcher(rw, claims)
+}
+
+func qosVolumeScope(pvcInfo, volumeLabels model.Vector, rw *VolumeKeyRewriter) []string {
+	if len(pvcInfo) == 0 || len(volumeLabels) == 0 {
 		return nil
 	}
-
-	m := newVolumeMatcher(rw, claims)
+	_, m := claimVolumeMatcher(pvcInfo, rw)
+	if m == nil {
+		return nil
+	}
 	seenVol := make(map[string]bool, len(volumeLabels))
 	out := make([]string, 0, len(volumeLabels))
 	for _, s := range volumeLabels {

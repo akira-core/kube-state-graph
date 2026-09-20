@@ -120,28 +120,43 @@ func RenderScoped(q Query, window time.Duration, keys LabelKeys, sel Selector, v
 // being dropped: a silently missing value is a silently missing node or
 // measurement, and an over-length query the upstream rejects fails visibly.
 func ChunkScope(values []string, budget int) [][]string {
+	return ChunkScopeWithOverhead(values, budget, 0)
+}
+
+// ChunkScopeWithOverhead is ChunkScope for an alternation whose every branch
+// carries a fixed extra cost beyond the escaped value — the two bytes of the
+// `.*` prefix a suffix-mode token branch renders with. Ignoring it would let a
+// chunk overrun the budget by that much per value, which at the default budget
+// and a typical token length is a few percent of the headroom the budget leaves
+// under `-search.maxQueryLen`; accounting for it keeps the budget a real bound.
+//
+// overhead is per value and never negative; a negative value is treated as zero.
+func ChunkScopeWithOverhead(values []string, budget, overhead int) [][]string {
 	if len(values) == 0 {
 		return nil
 	}
 	if budget <= 0 {
 		return [][]string{values}
 	}
+	overhead = max(overhead, 0)
 	var (
 		out  [][]string
 		cur  []string
 		used int
 	)
 	for _, v := range values {
-		// The rendered cost of this value: its escaped form plus the `|`
-		// separator it needs once it is not first in the chunk.
-		cost := len(escapeLiteral(regexp.QuoteMeta(v)))
+		// The rendered cost of this value: its escaped form, its fixed branch
+		// overhead, plus the `|` separator it needs once it is not first in
+		// the chunk.
+		base := len(escapeLiteral(regexp.QuoteMeta(v))) + overhead
+		cost := base
 		if len(cur) > 0 {
 			cost++
 		}
 		if len(cur) > 0 && used+cost > budget {
 			out = append(out, cur)
 			cur, used = nil, 0
-			cost = len(escapeLiteral(regexp.QuoteMeta(v)))
+			cost = base
 		}
 		cur = append(cur, v)
 		used += cost

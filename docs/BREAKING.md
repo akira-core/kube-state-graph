@@ -4,6 +4,53 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
+## Non-breaking: a storage-rooted request restricts the `volume_labels` read
+
+*storage-graph-api — Storage-side roots narrow the Harvest topology read (scope-volume-labels-by-storage-root)*
+
+Not a compatibility break: every `/v1/storage-graph` body is byte-identical to
+today's for an estate whose aggregates and controllers are each named by their
+own Harvest gauge families (the stock `aggr_*` and `node_*` templates). What
+changes is one upstream query.
+
+Previously `volume_labels` — the largest leg in a NetApp estate, and the one leg
+no request parameter narrowed — was read for the WHOLE filer on every request,
+including a request that named a single aggregate. It is now read restricted to
+the rooted components when the request carries `ontap_cluster=` and/or `aggr=`
+and carries no `svm=` and no `node=`: phase 1 issues
+`volume_labels{cluster=…,aggr=…}` (the two matchers AND-combined), and phase 2
+re-reads it for the derived tokens of exactly the claims phase 1 matched, so each
+claim's aggregate and SVM are still picked over its whole candidate set. Nothing
+inverts a FlexVol name back to a PV name; phase 2 renders the derivation the join
+already computes, forward.
+
+What operators may notice:
+
+- A rooted build issues one more sequential Harvest hop (phase 2), and — when a
+  claim matched — more `volume_labels` queries under the one family name. The
+  per-family series-count histogram and the `raw_series_counts` Debug log for
+  `volume_labels` now track the rooted components rather than the filer.
+- **`netapp_volume_join_miss` counts differently on a storage-rooted request.**
+  There it counts only claims that matched at least one volume-label series, so
+  a FlexGroup still reports while a claim off the rooted components does not. A
+  derivation that fits no claim at all therefore reports nothing on a rooted
+  request — alert on it from an unrooted one.
+- **The restriction is capped and falls back.** `ontap_cluster=` and `aggr=` are
+  repeatable and nothing bounds how many values a request may carry, so a
+  restriction that would take more than eight queries is not applied: the leg
+  reads unrestricted, logs `storage roots did not yield a bounded volume-label
+  restriction`, and returns the same body.
+- `--netapp-qos-scope-batch-bytes` now also bounds the rooted read's
+  alternations, and phase 1 charges its repeated matcher at rendered length.
+- An `svm=` or `node=` root, the `contains` / `regex` volume-match modes, and
+  `/v1/graph` all read `volume_labels` exactly as before.
+
+One body-changing corner is documented, not hidden: an aggregate or controller
+named by `volume_labels` alone — no `aggr_*` / `node_*` series — outside the
+rooted components is not materialised by a restricted read, which can change
+whether an alert without a `cluster` label matches a unique entity. The stock
+Harvest templates name every one.
+
 ## Non-breaking: storage build reads Kubernetes nodes and controllers by reference
 
 *storage-graph-api — Storage build reads only what it draws (scope-controller-legs-by-reference)*

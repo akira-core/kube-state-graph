@@ -97,7 +97,10 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                 computed from), kube_persistentvolumeclaim_info,
                 kube_persistentvolumeclaim_annotations, the two kubelet
                 families, every NetApp Harvest inventory leg (a storage root
-                must be drawable with no claim), and ALERTS
+                must be drawable with no claim), and ALERTS — except that
+                volume_labels is read RESTRICTED when the request roots at an
+                ontap_cluster= or aggr= (see "Storage-side roots narrow the
+                volume-label read" below)
               ── wave 1, gated on kube_pod_spec_volumes_persistentvolumeclaims_info ──
                2 pod legs (kube_pod_info, kube_pod_owner), scoped to the pods
                  a claim binding names plus the request's pod=<ns>/<name>
@@ -150,6 +153,50 @@ reads 38.
 the roots' namespaces as the `namespace` selector — output-preserving, since a
 pod-rooted body draws nothing outside them. Any storage-side or `node` root
 suppresses this, and an explicit `namespace` always wins.
+
+**Storage-side roots narrow the volume-label read.** `volume_labels` is the
+largest leg of a NetApp estate and no request dimension narrows it, so a request
+rooted at `?ontap_cluster=` and/or `?aggr=` restricts it to the rooted
+components, in two phases:
+
+1. **Phase 1 — the roots.** One first-wave query,
+   `volume_labels{cluster=~"…",aggr=~"…"}`, the two matchers AND-combined —
+   exactly how the projection combines them (an `aggr=` root names an aggregate
+   only *within* the `ontap_cluster=` values). Chunked by the same byte budget,
+   charging the repeated matcher at its rendered length. **Capped:** these are
+   repeatable parameters whose count nothing bounds, so a restriction that would
+   take more than eight queries is not applied at all — the leg reads
+   unrestricted, logs that it did, and the body is unchanged.
+2. **Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked
+   lexically-smallest over its *whole* candidate set, so a Trident clone or a
+   same-named FlexVol on a second filer could otherwise move a claim onto or off
+   the rooted aggregate. After phase 1, and once `kube_persistentvolumeclaim_info`
+   has landed, the family is read again restricted on `volume` to the derived
+   tokens of exactly the claims phase 1 matched (`volume=~".*<token>"` in the
+   default `suffix` mode, `volume=~"<token>"` in `exact`) and merged into phase
+   1's vector. This is the *forward* derivation the join already computes — no
+   FlexVol name is ever inverted back to a PV name. It is **not issued** when
+   phase 1 matched no claim, nor when phase 1 fell back to the unrestricted
+   read; a rooted component with no claim is still drawn from the unrestricted
+   aggregate / controller / policy families. When the restriction names ONLY
+   ONTAP clusters, phase 2 additionally carries `cluster!~"…"` for them: phase 1
+   read those filers whole, so the only candidates left to find are elsewhere,
+   and without the exclusion phase 2 re-scans a family it already has with a
+   regex no index can serve.
+
+Only `ontap_cluster=` and `aggr=` restrict, and only when the request carries
+**no `svm=` and no `node=` root**: the aggregate's owning controller is a vote
+over every one of its series (a subset can elect a different controller), the
+projection *unions* `aggr=` with `svm=`, and `node=` also names a Kubernetes
+node. `pod=` composes freely. The `contains` and `regex` volume-match modes read
+unrestricted. The QoS wave then scopes over the *merged* result, and its `volume`
+set shrinks with it. `/v1/graph` carries no roots and never restricts.
+
+The fan-out above counts unchanged (the leg is still one first-wave leg); a
+restricted build swaps its one bare `volume_labels` query for one or more
+chunked phase-1 queries plus, when a claim matched, one or more phase-2 queries.
+The one extra sequential Harvest hop is the price; it is worth paying where an
+upstream series limit binds, and an unrooted request never pays it.
 
 ## Query error vs empty vector
 
@@ -300,7 +347,7 @@ names hop A matched. See
 
 | Metric | Hop | Graph role | Empty / miss |
 |---|---|---|---|
-| `volume_labels` | A — topology | Sole source of the storage *shape*: `pvc-to-netapp-aggr`, `netapp-aggr` / `netapp-node`, PVC `labels.svm`. Info series: sample **value discarded**, labels only (`cluster`, `node`, `aggr`, `svm`, `volume`). Read UNFILTERED — the interesting FlexVol names are not known until it has been read | No NetApp nodes, edges, or `svm`, and no QoS query is issued at all |
+| `volume_labels` | A — topology | Sole source of the storage *shape*: `pvc-to-netapp-aggr`, `netapp-aggr` / `netapp-node`, PVC `labels.svm`. Info series: sample **value discarded**, labels only (`cluster`, `node`, `aggr`, `svm`, `volume`). Read UNFILTERED — the interesting FlexVol names are not known until it has been read — except by a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=`, which reads it restricted to those components and then re-reads it for the matched claims' tokens | No NetApp nodes, edges, or `svm`, and no QoS query is issued at all |
 | `qos_read_ops` | B — I/O | `data.metrics.read_ops` (ops/s, verbatim — never `rate()`) | Edge kept, no I/O fields |
 | `qos_write_ops` | B | `write_ops` | same |
 | `qos_read_latency` | B | `read_latency_us` (average µs, verbatim) | same |
@@ -320,9 +367,11 @@ names hop A matched. See
 | `node_total_data` | — | `data.perf.total_bytes_per_sec` | Field omitted |
 
 Coverage warnings (each gated on its **own** family having been read):
-`netapp_volume_join_miss` (hop A miss or empty `aggr`), `netapp_qos_join_miss`
-(edge drawn, no QoS match). No warning for a missing ceiling — a volume in no
-policy group is normal.
+`netapp_volume_join_miss` (hop A miss or empty `aggr`; under a **storage-rooted**
+request it counts only claims that matched at least one series, so a FlexGroup
+still reports while a claim off the rooted components — which the request never
+asked about — does not), `netapp_qos_join_miss` (edge drawn, no QoS match). No
+warning for a missing ceiling — a volume in no policy group is normal.
 
 ## kubelet (2)
 
