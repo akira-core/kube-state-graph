@@ -44,7 +44,7 @@
 
 ## 8. Integration
 
-- [ ] 8.1 Add a `/v1/storage-graph` integration case to the storage suite that compares a rooted request's body, on the default `suffix` mode (restricted read), against the same request under the `contains` mode (which reads `volume_labels` whole), over a fixture with a clone on a lexically-smaller aggregate; the suite has no facility for inspecting issued queries, so the query shape is pinned at unit level instead. **Written and vetted (`internal/integration/storage_graph_e2e_test.go`); needs a run with Docker available: `go test ./internal/integration/ -run TestGraphSuite`**
+- [x] 8.1 Add a `/v1/storage-graph` integration case to the storage suite that compares a rooted request's body, on the default `suffix` mode (restricted read), against the same request under the `contains` mode (which reads `volume_labels` whole), over a fixture with a clone on a lexically-smaller aggregate; the suite has no facility for inspecting issued queries, so the query shape is pinned at unit level instead. **Ran on CI** (`test` job, Docker available): `internal/integration` passed in 27.7s with no skip, against 1.1s and 8 skips where Docker is absent
 - [x] 8.2 Confirm `promqlfake` handles the phase-2 `.*<token>` alternation correctly under its anchored-regex semantics, extending its scope-value helper if the escape inversion needs it; verify `go test ./pkg/internal/promqlfake/` passes with a case covering the suffix form
 
 ## 9. Documentation
