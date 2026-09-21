@@ -240,7 +240,7 @@ The reusable graph engine SHALL expose the storage-graph build in-process with t
 
 The storage-graph build SHALL NOT issue the following kube-state-metrics families: `kube_pod_container_info`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_service_annotations`. The body contains no `service` or `external` node and no `service-selects-pod` edge, so the four service-side families can contribute nothing to it, and it does not carry `containers` (see "Attributes and compound groups carry over"). A family the build does not issue SHALL be absent from the build's per-family series tally, never reported as zero.
 
-Every other family the `/v1/graph` topology read issues falls into one of two classes. The **unrestricted** class is read exactly as `/v1/graph` reads it, under the request-scoped matchers alone: the claim-binding family `kube_pod_spec_volumes_persistentvolumeclaims_info` (the root every by-reference scope is computed from — nothing precedes it that could restrict it); `kube_persistentvolumeclaim_info`, `kube_persistentvolumeclaim_annotations` and the two kubelet volume-stats families (one series per claim the binding family already names, so a restriction could not select fewer than the binding read already does); every Harvest family (a storage root SHALL be drawable whether or not a claim reaches it, and an SVM is named by `volume_labels` alone); and `ALERTS` (already restricted to firing alerts). The **by-reference** class — the two pod families, the four Kubernetes-node families and the eight controller families below — is read restricted to the object names the families read before it actually carry. A by-reference family whose scope is empty SHALL NOT be issued at all and SHALL be absent from the tally; when issued, its tally entry is the count of series its restriction matched.
+Every other family the `/v1/graph` topology read issues falls into one of two classes. The **unrestricted** class is read exactly as `/v1/graph` reads it, under the request-scoped matchers alone: the claim-binding family `kube_pod_spec_volumes_persistentvolumeclaims_info` (the root every by-reference scope is computed from — nothing precedes it that could restrict it); `kube_persistentvolumeclaim_info`, `kube_persistentvolumeclaim_annotations` and the two kubelet volume-stats families (one series per claim the binding family already names, so a restriction could not select fewer than the binding read already does); every Harvest family except the volume-label topology family under a storage-side-rooted request (a storage root SHALL be drawable whether or not a claim reaches it, and an SVM is named by `volume_labels` alone; `volume_labels` alone leaves this class when the request names the components it should read, per "Storage-side roots narrow the Harvest topology read"); and `ALERTS` (already restricted to firing alerts). The **by-reference** class — the two pod families, the four Kubernetes-node families and the eight controller families below — is read restricted to the object names the families read before it actually carry. A by-reference family whose scope is empty SHALL NOT be issued at all and SHALL be absent from the tally; when issued, its tally entry is the count of series its restriction matched.
 
 Every by-reference restriction SHALL be a sorted, de-duplicated, anchored alternation on the family's own identity label, **composed with** the family's fixed, request-invariant selector where it has one (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `owner_kind="CronJob",owner_is_controller="true"`, `annotation_argocd_argoproj_io_tracking_id!=""`) and with the request-scoped matchers the family already carries — never replacing either. It is derived from upstream data and from the request's roots, not from a selector-level dimension, so the request-scoped selector table is unchanged. Every restriction SHALL be **chunked deterministically** under one byte budget shared with the QoS workload read, one query per chunk per family, results merged in **chunk order**, every chunk issued under the bare family name for self-metrics and span dimensions, and a single name SHALL always be issued even when it alone exceeds the budget. A chunk SHALL keep its family's error class: a chunk of a family whose unrestricted read fails the build (`kube_pod_info`, `kube_pod_owner`, the four Kubernetes-node families, `kube_replicaset_owner`, `kube_job_owner`, `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_cronjob_annotations`) fails the build exactly as that unrestricted error does; a chunk of a family whose unrestricted read degrades (`kube_replicaset_annotations`, `kube_job_annotations`) degrades on its own, costing only the Applications the names in that chunk would have supplied, and a degraded `kube_job_annotations` chunk suppresses the Job → CronJob hop for the whole build exactly as a degraded unrestricted read does. Caller-originated cancellation SHALL fail the request whatever the family.
 
@@ -352,3 +352,124 @@ An explicit `namespace` parameter SHALL be used as given — never widened, inte
 
 - **WHEN** a client sends `?pod=b/x&pod=a/y` and then `?pod=a/y&pod=b/x`
 - **THEN** both requests render `namespace=~"a|b"` and return byte-identical bodies
+
+### Requirement: Storage-side roots narrow the Harvest topology read
+
+When a `/v1/storage-graph` request carries at least one `ontap_cluster=` or `aggr=` root, the build SHALL read the Harvest volume-label topology family restricted to the rooted components instead of reading the whole filer, and the body SHALL be byte-identical to the body an unrestricted read produces for every estate whose aggregates and controllers are each named by their own Harvest gauge families (the stock `aggr_*` and `node_*` templates). An aggregate or controller named by the volume-label family alone, outside the rooted components, is not materialised by a restricted read; that can change whether an alert without a `cluster` label matches a unique entity, and is the only divergence.
+
+**Phase 1 — the root restriction.** The build SHALL issue the family restricted by the request's `ontap_cluster=` and `aggr=` values: `ontap_cluster=` restricts the family's `cluster` label and `aggr=` restricts its `aggr` label. A request carrying both SHALL issue ONE query carrying both matchers, because the projection combines them as a narrowing — an `aggr=` root names an aggregate only within the `ontap_cluster=` values, so an aggregate of that name on another filer is not a root and its volumes need not be read. Each value set SHALL be rendered as a sorted, de-duplicated, anchored alternation, escaped so a value carrying a regex metacharacter matches itself and nothing else. The restriction is the ONLY matcher this query carries; Harvest takes no request-scoped selector.
+
+The restriction is derived from the request's roots, not from a selector-level dimension, so the request-scoped selector table is unchanged and `az` still reaches Harvest through backend selection alone. A `pod=` root does not prevent it: the projection ANDs the workload roots with the storage roots, so every retained path is one the restriction keeps.
+
+**Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked lexically-smallest over that claim's WHOLE candidate set, so a phase-1-only read could place a claim on a rooted aggregate where an unrestricted read would place it on a lexically-smaller one — a clone whose FlexVol name also matches the claim's derived token, or the same FlexVol name on a second filer. After phase 1, and after the claim-info family has landed, the build SHALL therefore issue a second restricted read of the same family, restricted on `volume` to the derived tokens of exactly the claims phase 1 matched, expressed in the **forward** direction of the configured derivation — the direction the join already computes. Nothing inverts a FlexVol name back to a PersistentVolume name. The two phases' results SHALL be merged and de-duplicated by label set before the parse, and every downstream consumer — the aggregate and SVM picks, the owning-controller vote, the inventory, and the QoS workload read's `volume` scope — SHALL run over the merged result.
+
+When phase 1 matched no claim, phase 2 SHALL NOT be issued.
+
+**Roots stay drawable.** The aggregate, controller and policy Harvest families are unrestricted in every build, so a rooted component with no claim on it is materialised from those families exactly as it is today. A phase 1 that returns nothing therefore still draws its roots; it draws no path through them, which is the same outcome an unrestricted read gives for a component no claim reaches.
+
+**Roots that SHALL disable the restriction.** A request carrying an `svm=` or a `node=` root SHALL read this family unrestricted and single-phase, whatever other roots it carries. The owning controller of an aggregate is a vote over ALL of that aggregate's volume-label series (see the `netapp-storage-graph` capability's "NetApp aggregate entity"); restricting by `aggr` keeps every series of a rooted aggregate and leaves the vote intact, while restricting by `svm` or `node` leaves it running over a subset that can elect a different controller and move the `node-aggr` tier. The projection also UNIONS `aggr=` with `svm=`, so a request naming both retains paths reached only through the SVM, which a restriction by `aggr` alone would drop. `node=` names a Kubernetes node as well as an ONTAP controller and is admitted as a root whether or not any path reaches it.
+
+**Match modes that SHALL NOT restrict.** Phase 2 expresses the `exact` and `suffix` volume-match modes exactly. A build configured with `contains` or `regex` SHALL read the family unrestricted and single-phase, because those modes cannot be rendered into an anchored alternation without changing their semantics.
+
+**Mechanics.** Each phase's restriction SHALL be chunked deterministically under the byte budget shared with the QoS workload read, one query per chunk, results merged in chunk order, each chunk issued under the bare family name so self-metrics and span dimensions carry one value per family however many queries a build issues. A single value SHALL always be issued even when it alone exceeds the budget. Phase 1 chunks ONE of its two alternations and repeats the other verbatim in every chunk; the repeated matcher SHALL be charged against the budget at its RENDERED length, escaping and wrapper included, so the budget bounds what is actually sent. Each chunk SHALL keep the family's existing error class: a failed chunk is logged and treated as an empty vector, exactly as a failed unrestricted read of this OPTIONAL family is. The per-family series tally SHALL report the merged series count under the one family name.
+
+**A restriction SHALL be bounded, or not applied.** `ontap_cluster=` and `aggr=` are repeatable and the request parser bounds each value's length but never their COUNT, so this is the one scope a client can inflate. When the restriction would take more than a fixed maximum number of queries, the build SHALL read the family unrestricted and single-phase instead, and SHALL log that it did so. That is the read this leg performed before the restriction existed: one query, the same body, and a fan-out one request cannot enlarge. A restriction that cannot be rendered at all — every value normalising away, which an embedder filling the root sets directly can produce where the request parser cannot — SHALL take the same path. This family is OPTIONAL and SHALL NOT fail a build for either reason.
+
+**Coverage signalling.** Under a restricted read the join-coverage signal that counts loaded claims resolving no aggregate SHALL count only the claims that matched at least one volume-label series. A claim that matched none is outside the rooted components — the request did not ask about it — and counting it would fire the signal on nearly the whole estate; a claim that DID match a series and still resolved no aggregate is a FlexGroup, which is a genuine coverage miss under either read and SHALL still be counted. An unrestricted read SHALL count both, unchanged.
+
+`GET /v1/graph` carries no roots and SHALL always read this family unrestricted and single-phase.
+
+#### Scenario: Aggregate root restricts the topology read
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00` against a filer holding 20000 volume-label series of which 834 carry `aggr="aggr00"`
+- **THEN** phase 1 issues the family restricted to `aggr=~"aggr00"` and loads those 834 series, phase 2 issues it restricted to the derived tokens of the claims that matched, no other filer volume is loaded, and the body is byte-identical to the body an unrestricted read produces
+
+#### Scenario: A request with no storage-side root is unrestricted
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0`
+- **THEN** the volume-label family is issued once with no matcher of any kind, no second phase is issued, and the read is exactly the read a build performs today
+
+#### Scenario: Cluster and aggregate roots narrow one query
+
+- **WHEN** a client sends `?az=zone-a&env=prod&ontap_cluster=ontap-prod&aggr=aggr00`
+- **THEN** phase 1 issues one query carrying both `cluster=~"ontap-prod"` and `aggr=~"aggr00"`, a volume on an `aggr00` of a different filer is not loaded, and the body is byte-identical to the body an unrestricted read produces
+
+#### Scenario: Cluster root alone restricts by cluster
+
+- **WHEN** a client sends `?az=zone-a&env=prod&ontap_cluster=ontap-prod`
+- **THEN** phase 1 issues the family restricted to `cluster=~"ontap-prod"` alone, every SVM of that filer is loaded and is a root, and the body is byte-identical to the unrestricted body
+
+#### Scenario: A clone on a lexically-smaller aggregate keeps its pick
+
+- **WHEN** a claim's derived token matches FlexVol `trident_pvc_x` on `aggr09` and a clone `snap_trident_pvc_x` on `aggr00`, and the request roots at `aggr=aggr09`
+- **THEN** phase 2 loads both series, the aggregate pick resolves to `aggr00` exactly as an unrestricted read resolves it, the claim is not retained by the `aggr09` root, and the body is byte-identical to the unrestricted body
+
+#### Scenario: A cross-filer FlexVol-name collision keeps its pick
+
+- **WHEN** one FlexVol name exists on `ontap-prod` and on `ontap-lab`, the claim's token matches both, and the request roots at `aggr=` on `ontap-prod` while `ontap-lab` sorts first
+- **THEN** phase 2 loads the `ontap-lab` series too, the pick resolves to the lexically-smallest `(ontap-cluster, aggr)` exactly as an unrestricted read resolves it, and the body is byte-identical to the unrestricted body
+
+#### Scenario: An SVM root does not restrict the read
+
+- **WHEN** a client sends `?az=zone-a&env=prod&svm=svm_shop`
+- **THEN** the volume-label family is issued unrestricted and single-phase, every aggregate's owning-controller vote runs over all of that aggregate's series, and the body is byte-identical to the body a build produces today
+
+#### Scenario: An SVM root disables an aggregate root
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00&svm=svm_shop` and `svm_shop` holds a claim on `aggr09`
+- **THEN** the volume-label family is issued unrestricted and single-phase, the `aggr09` claim is retained through its SVM exactly as in an unrestricted build, and the body is byte-identical to the body a build produces today
+
+#### Scenario: A node root does not restrict the read
+
+- **WHEN** a client sends `?az=zone-a&env=prod&node=ontap-prod-01`
+- **THEN** the volume-label family is issued unrestricted and single-phase, and the root still resolves against both the ONTAP controller and the Kubernetes node of that name
+
+#### Scenario: A node root disables an aggregate root
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00&node=ontap-prod-01`
+- **THEN** the volume-label family is issued unrestricted and single-phase and the body is byte-identical to the body a build produces today
+
+#### Scenario: A pod root composes with an aggregate root
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00&pod=shop/orders-0`
+- **THEN** phase 1 is restricted to `aggr=~"aggr00"`, the pod root joins the pod scope as it does today, and the body is byte-identical to the unrestricted body
+
+#### Scenario: A non-default match mode opts out
+
+- **WHEN** the deployment configures the `contains` volume-match mode and a client sends `?az=zone-a&env=prod&aggr=aggr00`
+- **THEN** the volume-label family is issued unrestricted and single-phase and the body is byte-identical to the body a build produces today
+
+#### Scenario: A rooted aggregate with no claim is still drawn
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00`, no volume on `aggr00` matches any loaded claim, and the aggregate and controller families name `aggr00` and its owner
+- **THEN** phase 2 is not issued, and the body contains `aggr00` with its health and usage attributes and its owning controller, and no path through them
+
+#### Scenario: Takeover ownership survives the restriction
+
+- **WHEN** a rooted aggregate's volume-label series disagree on the owning `node` because a takeover happened inside the window
+- **THEN** phase 1 loads every series of that aggregate, the vote resolves to the lexically-smallest non-empty `node` exactly as an unrestricted read resolves it, and the `node-aggr` tier names that controller
+
+#### Scenario: Join-coverage signal counts only what the restriction still explains
+
+- **WHEN** a restricted build loads claims of which one joins, one matches a FlexGroup series carrying no `aggr`, and the rest match no series at all
+- **THEN** the join-coverage warning counts the FlexGroup claim and not the claims that matched nothing, and the same estate read unrestricted counts both
+
+#### Scenario: An unbounded root set reads the family unrestricted
+
+- **WHEN** a client sends thousands of `aggr=` values, enough that the restriction would take more queries than the maximum
+- **THEN** the build issues one unrestricted `volume_labels` query and no second phase, logs that the roots did not yield a bounded restriction, returns 200, and the body is byte-identical to the body the restriction would have produced
+
+#### Scenario: A cluster-only restriction does not re-read what it already has
+
+- **WHEN** a client sends `?az=zone-a&env=prod&ontap_cluster=ontap-prod` and a matched claim also has a candidate on `ontap-lab`
+- **THEN** phase 2 excludes `ontap-prod` from its own selector, loads the `ontap-lab` candidate, and the aggregate pick is the one the whole-filer read makes; a request that also names an `aggr=` root excludes no cluster, because phase 1 then read only part of one
+
+#### Scenario: The QoS scope narrows with the topology read
+
+- **WHEN** a restricted build's merged volume-label result names 60 FlexVols that loaded claims matched, against 1200 in an unrestricted build
+- **THEN** the QoS workload queries restrict `volume` to those 60 names, are chunked under the same budget, and every I/O measurement on a retained path is identical to the unrestricted build's
+
+#### Scenario: A failed restricted chunk degrades
+
+- **WHEN** one phase-1 chunk fails with an upstream error while every other query succeeds
+- **THEN** the request returns 200, the claims whose volumes that chunk carried draw no aggregate edge, the failure is logged and counted on `kube_state_graph_upstream_query_failures_total{query="volume_labels"}`, and the build does not fail
