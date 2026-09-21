@@ -85,10 +85,14 @@ type Topology struct {
 	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:
 	// the storage-flow graph needs flowless roots (a degraded aggregate serving
 	// no claim is a valid answer to "what is on this filer?"), and a storage
-	// root must stay drawable without any Harvest read being narrowed by it.
-	// Roots reach exactly one read — the storage build's pod scope, which a pod
-	// root mounting no claim must enter to be drawn (readScopedPods) — and
-	// never a Harvest leg.
+	// root must stay drawable when no claim reaches it. That is why the
+	// aggregate, controller and policy Harvest families are NEVER narrowed by a
+	// root: they are what draws a rooted component with no volume on it. Roots
+	// reach the pod scope (readScopedPods), the node scope (readScopedNodes) and
+	// — for an ontap_cluster= / aggr= root with no svm= / node= root — the
+	// volume_labels leg itself (readRootedVolumeLabels), which is safe because
+	// that leg is restricted to exactly the components the root names and each
+	// matched claim's whole candidate set is recovered in a second phase.
 	//
 	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
 	// not by the Kubernetes estate, and a flowless entity costs nothing at
@@ -261,6 +265,15 @@ type topologyVectors struct {
 	// a vector, carried here so parseTopology keeps its two-argument shape.
 	// Nil means the defaults (`-` → `_`, suffix match).
 	VolumeKey *VolumeKeyRewriter
+	// VolumeLabelsRestricted records that VolumeLabels was read restricted to
+	// the request's rooted components (scope-volume-labels-by-storage-root)
+	// rather than whole. Like VolumeKey and JobAnnotationsDegraded it is a
+	// build-scoped FACT the parse needs: under a restriction every claim outside
+	// the rooted components resolves no aggregate BY CONSTRUCTION, so the
+	// join-coverage signal that counts such claims no longer distinguishes a
+	// derivation that does not fit the estate's naming from a claim the request
+	// did not ask about, and is suppressed.
+	VolumeLabelsRestricted bool
 	// NetApp Harvest storage series, in join order (design.md D3):
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
@@ -363,6 +376,12 @@ func readTopology(
 	// The parse must derive claim tokens exactly as the scope computation below
 	// did, or a claim could be fetched for and then not joined.
 	v.VolumeKey = opts.volumeKey()
+	// Whether this build reads the volume-label family restricted to the rooted
+	// components. A plan property AND a configuration property (the match
+	// mode), so it is decided once, here, and both the launch and the parse read
+	// the same answer.
+	restrictVolumeLabels := plan.restrictsVolumeLabels(v.VolumeKey)
+	v.VolumeLabelsRestricted = restrictVolumeLabels
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -461,6 +480,11 @@ func readTopology(
 		}
 		var run func() error
 		switch {
+		case l.query == promql.QVolumeLabels && restrictVolumeLabels:
+			// Phase 1 of the rooted read: a first-wave leg, because its
+			// restriction comes from the request and nothing precedes it. It
+			// keeps this leg's OPTIONAL error class and its done-signal.
+			run = readRootedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v, l.dst)
 		case !l.optional:
 			run = fetch(l.query, l.dst)
 		case l.degraded != nil:
@@ -496,9 +520,24 @@ func readTopology(
 	// volume_labels series. readScopedQoS waits on exactly the two families its
 	// scope is computed from and then issues each workload query restricted to
 	// the FlexVol names those claims actually matched.
+	//
+	// Under a rooted volume-label read the QoS scope must be computed over the
+	// MERGED result, so it waits on phase 2 instead of phase 1: the candidate
+	// set the parse sees and the volume scope the QoS wave reads must be the
+	// same set. Phase 2 waits on phase 1 and the claim-info family, then
+	// closes volumeLabelsFinal on every return path.
+	volumeLabelsFinal := volumeLabelsDone
+	if restrictVolumeLabels {
+		finalDone := make(chan struct{})
+		g.Go(signalWhenDone(func() error {
+			return readTokenScopedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v,
+				pvcInfoDone, volumeLabelsDone)
+		}, finalDone))
+		volumeLabelsFinal = finalDone
+	}
 	g.Go(func() error {
 		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu,
-			pvcInfoDone, volumeLabelsDone)
+			pvcInfoDone, volumeLabelsFinal)
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
 	// kube_node_* families and the eight controller-owner /
@@ -606,7 +645,14 @@ func (a nodeAddrs) pick() string {
 // volumeKey resolves the derivation this parse uses, adopting the defaults for
 // a zero topologyVectors — which is what every hand-built test fixture and
 // every embedder that configures nothing passes.
-func (v topologyVectors) volumeKey() *VolumeKeyRewriter {
+//
+// POINTER receiver, deliberately. topologyVectors is the struct every leg of
+// the fan-out writes its own slot of, so a value receiver would make
+// `v.volumeKey()` on the shared struct copy every one of those slots while
+// siblings are still writing them — a data race that only shows up when the
+// timing happens to overlap. A pointer receiver reads the one field instead,
+// so the method is safe to call from inside the fan-out as well as after it.
+func (v *topologyVectors) volumeKey() *VolumeKeyRewriter {
 	if v.VolumeKey != nil {
 		return v.VolumeKey
 	}

@@ -236,6 +236,17 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	// FlexVol naming is exactly the coverage failure these signals exist to
 	// surface.
 	topoPresent := len(volumeLabels) > 0
+	// Under a RESTRICTED read (scope-volume-labels-by-storage-root) the count
+	// is taken over the claims that MATCHED something, not over every loaded
+	// claim: a claim with no candidate at all is off the rooted components —
+	// the request did not ask about it — and counting it would fire the signal
+	// on nearly the whole estate. A claim that DID match a volume and still
+	// resolved no aggregate is a FlexGroup, which is a genuine coverage miss
+	// under either read, so the signal keeps its meaning where it still has
+	// one. An unrestricted read counts both, as it always has.
+	countsMiss := func(cands []volumeLabelCandidate) bool {
+		return topoPresent && (!v.VolumeLabelsRestricted || len(cands) > 0)
+	}
 	// Under the scoped read this is exactly "at least one issued chunk of at
 	// least one QoS family returned series": a build whose scope was empty
 	// issued no QoS query at all, so every vector is empty and no I/O-coverage
@@ -262,7 +273,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 			out.svmByPVC[c.id] = SVMRef{ONTAPCluster: svmOC, SVM: svm}
 		}
 		if oc == "" || aggr == "" {
-			if topoPresent {
+			if countsMiss(cands) {
 				topoMisses++
 			}
 			continue

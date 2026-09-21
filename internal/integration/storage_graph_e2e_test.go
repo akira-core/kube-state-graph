@@ -146,6 +146,113 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.Empty(unknown.Clusters)
 }
 
+// TestStorageGraph_RootedVolumeLabelsMatchTheWholeFilerRead proves, against a
+// real VictoriaMetrics, that restricting the volume-label topology read to the
+// request's rooted components — and recovering each matched claim's candidate
+// set in a second phase — draws exactly what reading the whole filer draws
+// (scope-volume-labels-by-storage-root).
+//
+// The control is the `contains` volume-match mode, which the rooted read opts
+// out of by design: it reads the family whole. On this fixture `contains` and
+// the default `suffix` mode select the same volumes, so the two servers differ
+// in exactly one thing — which read they issue.
+//
+// The fixture is the hazard the second phase exists for: the claim's token
+// (pvc_rv) ends BOTH trident_pvc_rv on rv-aggr9 and a clone
+// snap_trident_pvc_rv on the lexically-smaller rv-aggr0. Every name is unique to
+// this test because the suite shares one VictoriaMetrics.
+func (s *GraphSuite) TestStorageGraph_RootedVolumeLabelsMatchTheWholeFilerRead() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`
+kube_pod_info{cluster="c1",namespace="rvshop",pod="rv-0",uid="uid-rv-0",node="worker-rv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_node_info{cluster="c1",node="worker-rv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="rvshop",persistentvolumeclaim="rv-data",storageclass="netapp-nas",volumename="pvc-rv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="rvshop",pod="rv-0",persistentvolumeclaim="rv-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="rv_unrelated",test=%[1]q} 1 %[2]d
+qos_read_ops{cluster="ontap-rv",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 300 %[2]d
+qos_read_ops{cluster="ontap-rv",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 50 %[2]d
+aggr_new_status{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",test=%[1]q} 1 %[2]d
+aggr_new_status{cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",test=%[1]q} 1 %[2]d
+node_new_status{cluster="ontap-rv",node="rv-ctl-09",test=%[1]q} 1 %[2]d
+node_new_status{cluster="ontap-rv",node="rv-ctl-00",test=%[1]q} 1 %[2]d
+`, disc, t1))
+	for _, series := range []string{
+		`volume_labels{volume="snap_trident_pvc_rv",test=` + strconv.Quote(disc) + `}`,
+		`volume_labels{volume="trident_pvc_rv",test=` + strconv.Quote(disc) + `}`,
+		`kube_pod_spec_volumes_persistentvolumeclaims_info{pod="rv-0",test=` + strconv.Quote(disc) + `}`,
+	} {
+		s.Require().True(s.WaitForSeries(series, fixedNow, 30*time.Second), "VM did not observe %s", series)
+	}
+
+	rooted := s.StartAPIServer(func(cfg *config.Config) {})
+	whole := s.StartAPIServer(func(cfg *config.Config) { cfg.NetAppVolumeMatchMode = "contains" })
+	const (
+		ident   = "zone-a-prod-c1"
+		pod     = ident + "/uid-rv-0"
+		aggr0   = "netapp/ontap-rv/aggr/rv-aggr0"
+		aggr9   = "netapp/ontap-rv/aggr/rv-aggr9"
+		claimID = ident + "/rvshop/rv-data"
+	)
+	both := func(configure func(url.Values)) (rootedBody, wholeBody cytoscape.Body) {
+		rootedBody = s.fetchStorageGraph(rooted.URL, configure)
+		wholeBody = s.fetchStorageGraph(whole.URL, configure)
+		s.Require().NotEmpty(rootedBody.Elements.Nodes, "a vacuous body would prove nothing")
+		s.Equal(wholeBody, rootedBody, "the rooted read must draw exactly what the whole-filer read draws")
+		return rootedBody, wholeBody
+	}
+
+	// The control is only a control while `contains` and `suffix` select the
+	// same volumes on this VictoriaMetrics — which the suite shares, and which
+	// none of these queries scope to the fixture's `test=` discriminator. Assert
+	// that precondition on an UNROOTED request, where neither server restricts
+	// anything and the two modes therefore differ in nothing but the join: if a
+	// later fixture ingests a volume whose name CONTAINS a token it does not end
+	// with, this fails and names the reason instead of turning a real regression
+	// into a green comparison below.
+	s.Require().Equal(
+		s.fetchStorageGraph(whole.URL, nil),
+		s.fetchStorageGraph(rooted.URL, nil),
+		"contains and suffix must select the same volumes here, or the whole-read control is not one")
+
+	// Rooted at the LARGER aggregate: the claim's pick is rv-aggr0 (the clone
+	// sorts first), so the claim is NOT under this root — which a phase-1-only
+	// read, seeing only rv-aggr9, would get wrong.
+	larger, _ := both(func(q url.Values) { q.Set("aggr", "rv-aggr9") })
+	ids := nodesByID(larger)
+	s.Contains(ids, aggr9, "the root itself is always drawn")
+	s.Contains(ids, "netapp/ontap-rv/rv-ctl-09", "with its owning controller")
+	s.NotContains(ids, pod, "the pick is the lexically-smaller aggregate, so no path reaches this root")
+
+	// Rooted at the SMALLER aggregate: the claim IS retained, its I/O sums both
+	// volumes (the QoS scope is computed over the merged candidate set), and it
+	// names rv-aggr0.
+	smaller, _ := both(func(q url.Values) { q.Set("aggr", "rv-aggr0") })
+	ids = nodesByID(smaller)
+	s.Contains(ids, pod)
+	s.Equal(aggr0, ids[claimID].Labels["aggr"])
+
+	// cluster AND aggregate narrow ONE selector.
+	both(func(q url.Values) {
+		q.Set("ontap_cluster", "ontap-rv")
+		q.Set("aggr", "rv-aggr0")
+	})
+
+	// A cluster root alone roots every entity of that filer.
+	filer, _ := both(func(q url.Values) { q.Set("ontap_cluster", "ontap-rv") })
+	ids = nodesByID(filer)
+	s.Contains(ids, aggr0)
+	s.Contains(ids, aggr9)
+	s.Contains(ids, pod)
+
+	// A typo roots nothing: never the whole filer.
+	typo := s.fetchStorageGraph(rooted.URL, func(q url.Values) { q.Set("aggr", "rv-typo") })
+	s.Empty(typo.Elements.Nodes)
+	s.Empty(typo.Elements.Edges)
+}
+
 // TestStorageGraph_ByReferenceControllersAndNodes proves the
 // scope-controller-legs-by-reference waves against a real VictoriaMetrics: a
 // `node=` root naming a Kubernetes node no pod is scheduled on is still

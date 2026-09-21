@@ -241,13 +241,18 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // uses none of it, and those three legs are the most expensive of the fan-out.
 //
 // It is a pure function of (window, end, Selector, roots), and roots reach
-// exactly one read: the pod names of pod=<ns>/<name> roots join the pod scope,
-// because a root mounting no claim is drawable only if its pod is read. A root
-// can only ADD a pod to that scope, never narrow a read, so which paths are
-// drawn stays a projection concern (graph.ProjectStorage). This revises the
-// storage-graph design's "roots never reach the build" stance
+// three reads. The pod names of pod=<ns>/<name> roots join the pod scope, and
+// node=<name> roots join the node scope, because a root mounting no claim (or
+// naming a node no pod runs on) is drawable only if it is read; those can only
+// ADD a name to a scope, never narrow a read. The ontap_cluster= and aggr= roots
+// restrict the Harvest volume-label topology read to the rooted components
+// (scope-volume-labels-by-storage-root) — the one place a root NARROWS a read,
+// made output-preserving by recovering each matched claim's whole candidate set
+// in a second phase, and disabled by any svm= or node= root. Either way which
+// paths are drawn stays a projection concern (graph.ProjectStorage). This
+// revises the storage-graph design's "roots never reach the build" stance
 // (harden-topology-read-cardinality D7): v1 has no result cache whose key it
-// would widen, and the alternative was reading every pod in the estate.
+// would widen, and the alternative was reading the whole estate.
 //
 // There is deliberately no outside-retention classification and no up{} probe.
 // The endpoint requires az and env, so every storage build is a FILTERED build,

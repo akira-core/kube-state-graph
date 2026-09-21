@@ -1,6 +1,7 @@
 package build
 
 import (
+	"maps"
 	"slices"
 
 	"github.com/prometheus/common/model"
@@ -127,6 +128,18 @@ type topologyPlan struct {
 	// node families are read for it, so the roots must reach the node scope
 	// exactly as podRoots reaches the pod scope.
 	nodeRoots []string
+	// volumeClusters and volumeAggrs are the request's ontap_cluster= and
+	// aggr= roots, sorted and de-duplicated: the two storage-side roots the
+	// Harvest volume-label topology read may be restricted by
+	// (scope-volume-labels-by-storage-root). They are values, not a decision —
+	// restrictsVolumeLabels is the decision.
+	volumeClusters []string
+	volumeAggrs    []string
+	// svmRoot records that the request carries an svm= root. svm= is never
+	// pushed down (the aggregate owner vote runs over every series of an
+	// aggregate) and, because the projection UNIONS it with aggr=, its mere
+	// presence disables the restriction for the whole request.
+	svmRoot bool
 }
 
 // fullPlan is the /v1/graph read: every leg, every pod.
@@ -158,7 +171,44 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 		nodeNames = append(nodeNames, n)
 	}
 	slices.Sort(nodeNames)
-	return topologyPlan{skip: storageSkippedLegs, byReference: true, podRoots: names, nodeRoots: nodeNames}
+	return topologyPlan{
+		skip: storageSkippedLegs, byReference: true, podRoots: names, nodeRoots: nodeNames,
+		// sortedNames drops empty values, which is what keeps
+		// restrictsVolumeLabels and the renderer in agreement: the renderer
+		// normalises too, so a plan carrying only empty values would answer
+		// "restricted" to a query that cannot be rendered. graph.NewStorageScope
+		// already drops them for an HTTP caller, but pkg/build is an importable
+		// engine and StorageRoots is an exported map an embedder fills itself.
+		volumeClusters: sortedNames(slices.Collect(maps.Keys(roots.ONTAPClusters))),
+		volumeAggrs:    sortedNames(slices.Collect(maps.Keys(roots.Aggrs))),
+		svmRoot:        len(roots.SVMs) > 0,
+	}
+}
+
+// restrictsVolumeLabels reports whether this build reads the Harvest
+// volume-label topology family restricted to the rooted components, in two
+// phases (see volumelabelscope.go), instead of whole.
+//
+// All four must hold:
+//
+//   - the plan is by-reference — only /v1/storage-graph carries roots, so
+//     fullPlan answers false structurally rather than by having none;
+//   - the request roots at an ONTAP cluster or an aggregate;
+//   - it roots at NO SVM and NO node. The projection UNIONS aggr= with svm=, so
+//     a restriction by aggregate alone would drop units reached only through
+//     the SVM; svm= itself cannot be pushed because the aggregate owner vote
+//     runs over every series of the aggregate; and node= names a Kubernetes
+//     node as well and is admitted as a root whether or not any path reaches it;
+//   - the configured match mode renders as an alternation branch, because the
+//     second phase restricts on the claims' derived tokens.
+//
+// pod= composes freely: the projection ANDs the workload roots with the storage
+// roots, so every retained path is one the restriction keeps.
+func (p topologyPlan) restrictsVolumeLabels(rw *VolumeKeyRewriter) bool {
+	return p.byReference &&
+		len(p.volumeClusters)+len(p.volumeAggrs) > 0 &&
+		!p.svmRoot && len(p.nodeRoots) == 0 &&
+		rw.tokenScope() != tokenScopeNone
 }
 
 // issuesFirstWave reports whether the plan launches q in the first wave.
