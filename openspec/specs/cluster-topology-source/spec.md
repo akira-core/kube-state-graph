@@ -62,7 +62,7 @@ The kubelet volume-stats series of the "PVC usage from kubelet volume stats" req
 
 Every series above SHALL be queried at its bare (unprefixed) name — there is no configurable metric-name prefix. A request with no selector-level filter SHALL issue each query exactly as listed, with no request-scoped matcher.
 
-Which of the families above a build issues depends on the endpoint. A `/v1/graph` build SHALL issue every family. A `/v1/storage-graph` build SHALL issue the subset the `storage-graph-api` capability's "Storage build reads only what it draws" requirement defines: the families whose output that body cannot carry are not read at all, and two are read restricted to the pods the body can draw. A family a build does not issue SHALL be absent from that build's per-family series tally, never reported as zero — zero means "read, matched nothing".
+Which of the families above a build issues, and how, depends on the endpoint. A `/v1/graph` build SHALL issue every family unrestricted. A `/v1/storage-graph` build SHALL issue the subset the `storage-graph-api` capability's "Storage build reads only what it draws" requirement defines: the families whose output that body cannot carry are not read at all; the pod families, the four Kubernetes-node families and the eight controller-owner / controller-annotation families are read **by reference** — each restricted to the object names the families read before it actually carry (claim bindings name the pods, the loaded pods name their nodes and owners, the resolved owners name their Deployments and CronJobs), composed with the family's fixed selector and the request-scoped matchers listed above; and the claim, Harvest and `ALERTS` families are read unrestricted. A family a build does not issue — including a by-reference family whose scope came out empty — SHALL be absent from that build's per-family series tally, never reported as zero: zero means "read, matched nothing", and a by-reference family's count is the count of series its restriction matched.
 
 The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes. Under a selector-level filter the indexes hold only the in-scope services and the in-scope backing pods.
 
@@ -83,7 +83,7 @@ A degrade SHALL be **subtractive**: it removes Applications the failed family wo
 #### Scenario: All families queried
 
 - **WHEN** a `/v1/graph` build runs against an upstream containing all families above
-- **THEN** the reader emits exactly one PromQL query per family for the build, each evaluated at the caller-supplied `end` over `end - start`; a `/v1/storage-graph` build against the same upstream issues only the subset the `storage-graph-api` capability defines
+- **THEN** the reader emits exactly one PromQL query per family for the build, each evaluated at the caller-supplied `end` over `end - start`; a `/v1/storage-graph` build against the same upstream issues only the subset the `storage-graph-api` capability defines, its by-reference families one query per chunk of their scope
 
 #### Scenario: Missing optional family
 
@@ -179,6 +179,11 @@ A degrade SHALL be **subtractive**: it removes Applications the failed family wo
 
 - **WHEN** the caller's context is already cancelled when the `kube_pod_container_info` query returns its error
 - **THEN** the build returns an error rather than degrading
+
+#### Scenario: Storage build tallies a by-reference family by what it matched
+
+- **WHEN** a `/v1/storage-graph` build loads pods owned by two StatefulSets and no other controller kind
+- **THEN** the build's per-family tally carries `kube_statefulset_annotations` with the count of series its `statefulset` restriction matched and carries no key at all for `kube_replicaset_owner`, `kube_job_owner`, `kube_deployment_annotations`, `kube_daemonset_annotations`, `kube_replicaset_annotations`, `kube_job_annotations` or `kube_cronjob_annotations`
 
 ### Requirement: Service and endpoint indexes
 
