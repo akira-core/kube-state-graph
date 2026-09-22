@@ -125,7 +125,7 @@ func TestMergeVolumeLabels_DeduplicatesByLabelSet(t *testing.T) {
 
 func vlrRoots(t *testing.T, ontap, nodes, aggrs, svms, pods []string) graph.StorageRoots {
 	t.Helper()
-	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods)
+	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
 	require.NoError(t, err)
 	return scope.Roots
 }
@@ -448,7 +448,7 @@ func vlrParity(t *testing.T, fx map[promql.Query]model.Vector, scope graph.Stora
 
 func vlrScope(t *testing.T, ontap, nodes, aggrs, svms, pods []string) graph.StorageScope {
 	t.Helper()
-	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods)
+	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
 	require.NoError(t, err)
 	return scope
 }

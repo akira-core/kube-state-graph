@@ -14,15 +14,17 @@ import (
 //     svm-pvc edge up (aggr-svm, node-aggr; absent for a FlexGroup) and down
 //     (pvc-pod, then that pod's pod-node).
 //  2. Resolve roots to node-id sets. Exclusive storage parameters
-//     (ontap_cluster / aggr / svm) and exclusive workload parameters (pod)
-//     are AND-combined across sides. `node=` is one selector matched against
-//     both tiers; its hits are OR-combined with each other (values of one
-//     selector) and AND-combined with the exclusive sides. A requested
-//     selector that resolved to nothing retains nothing — `?aggr=typo` is
-//     empty, not the estate.
+//     (ontap_cluster / aggr / svm) and exclusive workload parameters (pod,
+//     application) are AND-combined across sides. `node=` is one selector
+//     matched against both tiers; its hits are OR-combined with each other
+//     (values of one selector) and AND-combined with the exclusive sides. A
+//     requested selector that resolved to nothing retains nothing —
+//     `?aggr=typo` is empty, not the estate. An application root matches a
+//     pod (materialised) or a claim (retention only).
 //  3. A unit is kept iff it hits every requested selector group and its
 //     pod / PVC / K8s node pass the re-applied cluster / namespace filters.
-//     Storage-side nodes are never dropped by those filters.
+//     Storage-side nodes are never dropped by those filters. A claim hit
+//     retains the unit; it does not materialise the claim on its own.
 //  4. Nodes = ∪ retained units ∪ resolved root ids ∪ owning controllers of
 //     admitted aggregates (pullNetAppParents). Edges = the retained units'
 //     hops, weighted over those units (n = mounter count in the *built*
@@ -33,11 +35,11 @@ func ProjectStorage(g *Graph, scope StorageScope) View {
 	}
 
 	units := extractFlowUnits(g)
-	storageIDs, workloadIDs, nodeIDs := resolveStorageRoots(g, scope)
+	storageIDs, workloadIDs, claimHits, nodeIDs := resolveStorageRoots(g, scope)
 
 	storageExclusive := len(scope.Roots.ONTAPClusters) > 0 ||
 		len(scope.Roots.Aggrs) > 0 || len(scope.Roots.SVMs) > 0
-	workloadExclusive := len(scope.Roots.Pods) > 0
+	workloadExclusive := len(scope.Roots.Pods) > 0 || len(scope.Roots.Applications) > 0
 	nodeRequested := len(scope.Roots.Nodes) > 0
 
 	rawName := g.ClusterRawName
@@ -46,7 +48,10 @@ func ProjectStorage(g *Graph, scope StorageScope) View {
 		if storageExclusive && !u.intersects(storageIDs) {
 			continue
 		}
-		if workloadExclusive && !u.intersects(workloadIDs) {
+		// A pod hit materialises; a claim hit only retains. Either satisfies
+		// the workload side, so an application root keeps a path whose pod or
+		// whose claim carries it.
+		if workloadExclusive && !u.intersects(workloadIDs) && !u.intersects(claimHits) {
 			continue
 		}
 		if nodeRequested && !u.intersects(nodeIDs) {
@@ -323,9 +328,10 @@ func claimAggrOf(claim *Edge, incoming []*Edge, stamped bool) string {
 	return ""
 }
 
-func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, nodeHits map[string]struct{}) {
+func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claimHits, nodeHits map[string]struct{}) {
 	storage = map[string]struct{}{}
 	workload = map[string]struct{}{}
+	claimHits = map[string]struct{}{}
 	nodeHits = map[string]struct{}{}
 	ocSet := scope.Roots.ONTAPClusters
 	namedAggrOrSVM := len(scope.Roots.Aggrs) > 0 || len(scope.Roots.SVMs) > 0
@@ -361,8 +367,21 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, nodeH
 			if _, ok := scope.Roots.Pods[ref]; ok {
 				workload[n.ID()] = struct{}{}
 			}
+			if app := n.Application(); app != "" {
+				if _, ok := scope.Roots.Applications[app]; ok {
+					workload[n.ID()] = struct{}{}
+				}
+			}
+		case NodeTypePVC:
+			// A claim hit retains the path and is never materialised on its
+			// own — admitRoot runs over workload only.
+			if app := n.Application(); app != "" {
+				if _, ok := scope.Roots.Applications[app]; ok {
+					claimHits[n.ID()] = struct{}{}
+				}
+			}
 		default:
-			// service / external / PVC are never storage or workload roots
+			// service / external are never storage or workload roots
 		}
 	}
 
@@ -381,7 +400,7 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, nodeH
 			}
 		}
 	}
-	return storage, workload, nodeHits
+	return storage, workload, claimHits, nodeHits
 }
 
 // weightRetained sums each retained edge's I/O over the retained units that

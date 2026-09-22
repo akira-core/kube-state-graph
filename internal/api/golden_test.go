@@ -69,14 +69,19 @@ func TestGolden_GraphResponses(t *testing.T) {
 func TestGolden_StorageGraphResponses(t *testing.T) {
 	g := buildStorageGraphEstate()
 	stampFixtureStatuses(slices.Collect(maps.Values(g.NodesByID)))
-	aggrScope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	aggrScope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
 	require.NoError(t, err)
-	podScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"})
+	podScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
 	require.NoError(t, err)
+	appScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{"checkout"})
+	require.NoError(t, err)
+	appGraph := applicationRootEstate(g)
+	stampFixtureStatuses(slices.Collect(maps.Values(appGraph.NodesByID)))
 
 	scenarios := map[string]graph.View{
-		"storage-graph-aggr-root": graph.ProjectStorage(g, aggrScope),
-		"storage-graph-pod-root":  graph.ProjectStorage(g, podScope),
+		"storage-graph-aggr-root":        graph.ProjectStorage(g, aggrScope),
+		"storage-graph-pod-root":         graph.ProjectStorage(g, podScope),
+		"storage-graph-application-root": graph.ProjectStorage(appGraph, appScope),
 	}
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
@@ -372,6 +377,30 @@ func buildStorageGraphEstate() *graph.Graph {
 		orders0, web0, web1, web2, plain0, big0, db0, w1, w2, wb,
 	}
 	return graph.NewGraph(nodes, edges, time.Time{})
+}
+
+// applicationRootEstate is the storage golden plus one mounting pod that
+// resolves the root Application and one claimless pod that resolves it and
+// therefore has no edge. The shared estate is not mutated.
+func applicationRootEstate(base *graph.Graph) *graph.Graph {
+	const cluster = "cluster-alpha"
+	nodes := make([]graph.GraphNode, 0, len(base.NodesByID)+1)
+	for _, n := range base.NodesByID {
+		if pod, ok := n.(*graph.PodNode); ok && pod.Name() == "orders-0" && pod.Labels()["cluster"] == cluster {
+			cloned := *pod
+			cloned.ApplicationValue = "checkout"
+			nodes = append(nodes, &cloned)
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	nodes = append(nodes, &graph.PodNode{
+		IDValue:          graph.PodID(cluster, "uid-stateless"),
+		NameValue:        "stateless-0",
+		LabelsValue:      map[string]string{"cluster": cluster, "namespace": "shop"},
+		ApplicationValue: "checkout",
+	})
+	return graph.NewGraph(nodes, base.Edges, time.Time{})
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

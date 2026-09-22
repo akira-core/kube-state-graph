@@ -73,6 +73,27 @@ func TestCronJobScope(t *testing.T) {
 	assert.Empty(t, cronJobScope(nil, nil))
 }
 
+// The scoped-query capture (promqlfake.ScopeValues) reads a tracking-id
+// restriction back to the Application names and reads the owner matchers a
+// recovery query adds beside the identity-label scope.
+func TestScopedQueryCapture_RoundTripsTrackingIDAndOwner(t *testing.T) {
+	f := promqlfake.New(nil)
+	track, ok := promql.RenderTrackingIDScoped(promql.QDeploymentAnnotations, time.Minute, promql.LabelKeys{}, promql.Selector{}, []string{"b", "a"})
+	require.True(t, ok)
+	_, err := f.Instant(t.Context(), string(promql.QDeploymentAnnotations), track, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	owner, ok := promql.RenderOwnerScoped(promql.QPodOwner, time.Minute, promql.LabelKeys{}, promql.Selector{}, "ReplicaSet", []string{"web-7d9f", "web-8"})
+	require.True(t, ok)
+	_, err = f.Instant(t.Context(), string(promql.QPodOwner), owner, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	assert.Equal(t, [][]string{{"a", "b"}}, f.ScopeValues(promql.QDeploymentAnnotations, promql.TrackingIDLabel))
+	assert.Equal(t, [][]string{{"true"}}, f.ScopeValues(promql.QPodOwner, "owner_is_controller"))
+	assert.Equal(t, [][]string{{"ReplicaSet"}}, f.ScopeValues(promql.QPodOwner, "owner_kind"))
+	assert.Equal(t, [][]string{{"web-7d9f", "web-8"}}, f.ScopeValues(promql.QPodOwner, "owner_name"))
+}
+
 func indexOfIssuedQuery(issued []promqlfake.Issued, name promql.Query) int {
 	for i, is := range issued {
 		if is.Name == string(name) {

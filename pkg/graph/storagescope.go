@@ -25,7 +25,7 @@ func (r PodRef) String() string { return r.Namespace + "/" + r.Name }
 // StorageRoots is the resolved root selection of a storage-flow request: the
 // components a path must touch to be retained.
 //
-// The five sets mirror the five root parameters. They are RAW NAMES, not node
+// The sets mirror the root parameters. They are RAW NAMES, not node
 // ids — resolution to ids happens in ProjectStorage against the built graph,
 // because an id needs the ONTAP cluster (or the Kubernetes cluster identity)
 // that only the graph knows.
@@ -48,6 +48,12 @@ type StorageRoots struct {
 	SVMs map[string]struct{}
 	// Pods selects one pod by (namespace, name). Workload side.
 	Pods map[PodRef]struct{}
+	// Applications selects an ArgoCD Application by the name data.application
+	// carries (the tracking-id segment before the first ":"). Workload side:
+	// a pod whose Application() is a root value is materialised, and a claim
+	// whose Application() is a root value retains its path but is never
+	// materialised on its own.
+	Applications map[string]struct{}
 }
 
 // RequestedStorage reports whether the request carried any root that could
@@ -63,7 +69,7 @@ func (r StorageRoots) RequestedStorage() bool {
 // resolve to a workload-side component. See RequestedStorage for why this is a
 // property of the request rather than of the resolution.
 func (r StorageRoots) RequestedWorkload() bool {
-	return len(r.Pods) > 0 || len(r.Nodes) > 0
+	return len(r.Pods) > 0 || len(r.Applications) > 0 || len(r.Nodes) > 0
 }
 
 // Any reports whether any root at all was requested. No root means "the whole
@@ -104,10 +110,21 @@ type StorageScope struct {
 // self-contained form is what keeps a root unambiguous: `namespace` is already
 // an OR-combined narrowing filter, so qualifying a pod root with it would make
 // `?namespace=a&namespace=b&pod=x` undecidable.
-func NewStorageScope(clusters, namespaces, ontapClusters, nodes, aggrs, svms, pods []string) (StorageScope, error) {
+//
+// applications carries the raw `application=<name>` values. Empty values are
+// dropped, so a bare `?application=` is a no-op; a value is matched exactly
+// against data.application.
+func NewStorageScope(clusters, namespaces, ontapClusters, nodes, aggrs, svms, pods, applications []string) (StorageScope, error) {
 	refs, err := podRefSet(pods)
 	if err != nil {
 		return StorageScope{}, err
+	}
+	// stringSet keeps an empty map when every value was blank. A bare
+	// `?application=` is a no-op, so the field stays nil — the same shape
+	// podRefSet gives a bare `?pod=`.
+	apps := stringSet(applications)
+	if len(apps) == 0 {
+		apps = nil
 	}
 	return StorageScope{
 		Clusters:   stringSet(clusters),
@@ -118,6 +135,7 @@ func NewStorageScope(clusters, namespaces, ontapClusters, nodes, aggrs, svms, po
 			Aggrs:         stringSet(aggrs),
 			SVMs:          stringSet(svms),
 			Pods:          refs,
+			Applications:  apps,
 		},
 	}, nil
 }

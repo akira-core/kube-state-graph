@@ -31,7 +31,7 @@ func TestTopologyPlans(t *testing.T) {
 		assert.True(t, fullPlan.issuesFirstWave(l.query), "the full plan issues %s", l.query)
 	}
 
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n1"}, nil, nil, []string{"b/y", "a/x", "c/x"})
+	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n1"}, nil, nil, []string{"b/y", "a/x", "c/x"}, nil)
 	require.NoError(t, err)
 	p := storagePlan(scope.Roots)
 	assert.True(t, p.byReference)

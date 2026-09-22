@@ -4,6 +4,31 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
+## Non-breaking: `/v1/storage-graph` accepts an `application=` root
+
+*storage-graph-api — Root selectors from either end of the flow; Roots are always materialised when the upstream knows them; Storage-reachability projection; Storage build reads only what it draws; Pod-only roots narrow the upstream read; Deterministic storage-graph body. cluster-topology-source — Application-rooted recovery reads of the owner and annotation families.*
+
+Not a compatibility break on the wire. `application=<argo-app>` is an optional,
+repeatable workload root. A value is the ArgoCD Application name exactly as
+`data.application` carries it (the tracking-id segment before the first `:`).
+A path is retained when its pod or its claim carries that Application. Every
+loaded pod that resolves it is materialised, including a pod that mounts no
+claim; a claim is never materialised on its own. A request that does not send
+`application=` issues the same queries and returns a byte-identical body.
+
+The build recovers those pods before it reads them: controller-annotation
+families restricted by tracking-id prefix, then `kube_replicaset_owner` /
+`kube_job_owner`, then `kube_pod_owner`. The recovery only supplies pod names.
+Under an application root the claim-binding half of the pod scope narrows to
+related claims, and `application=` suppresses the pod-only namespace derivation.
+
+### In-process embedders
+
+`graph.NewStorageScope` gains an `applications []string` parameter.
+`graph.StorageRoots` gains `Applications map[string]struct{}`. Pass `nil` for
+a request with no application root. `ParseStorageValues` fills the field from
+`application=`.
+
 ## Non-breaking: a storage-rooted request restricts the `volume_labels` read
 
 *storage-graph-api — Storage-side roots narrow the Harvest topology read (scope-volume-labels-by-storage-root)*

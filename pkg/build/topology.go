@@ -259,6 +259,14 @@ type topologyVectors struct {
 	// they need no lock.
 	ScopeIssued map[promql.Query]bool
 
+	// ExtraSeriesCount is the series a wave read WITHOUT landing them in a
+	// slot above — the application recovery, whose vectors are local because
+	// the by-reference controller wave writes the same families later.
+	// tallySeries adds the count into the family's entry (creating it when
+	// the by-reference wave did not issue the family). Writes go through
+	// addExtraSeries under the same mutex as ScopeIssued.
+	ExtraSeriesCount map[promql.Query]int
+
 	// VolumeKey derives each claim's Harvest match token from its bound PV
 	// name and decides how that token is compared against the stock `volume`
 	// label. Like JobAnnotationsDegraded it is a build-scoped FACT rather than
@@ -324,6 +332,18 @@ func markScopeIssued(v *topologyVectors, mu *sync.Mutex, q promql.Query) {
 		v.ScopeIssued = make(map[promql.Query]bool)
 	}
 	v.ScopeIssued[q] = true
+}
+
+// addExtraSeries adds n to the family's recovery tally. n may be zero: a
+// family that was issued and matched nothing is present with 0, which is
+// distinct from a family that was never issued.
+func addExtraSeries(v *topologyVectors, mu *sync.Mutex, q promql.Query, n int) {
+	mu.Lock()
+	defer mu.Unlock()
+	if v.ExtraSeriesCount == nil {
+		v.ExtraSeriesCount = make(map[promql.Query]int)
+	}
+	v.ExtraSeriesCount[q] += n
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -468,10 +488,12 @@ func readTopology(
 	// its scope is computed from land instead of behind the slowest
 	// kube-state-metrics leg (design D5 of the scoped QoS read).
 	pvcInfoDone, volumeLabelsDone, bindingsDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	pvcAnnotationsDone := make(chan struct{})
 	signals := map[promql.Query]chan struct{}{
-		promql.QPVCInfo:      pvcInfoDone,
-		promql.QVolumeLabels: volumeLabelsDone,
-		promql.QPVCBindings:  bindingsDone,
+		promql.QPVCInfo:        pvcInfoDone,
+		promql.QVolumeLabels:   volumeLabelsDone,
+		promql.QPVCBindings:    bindingsDone,
+		promql.QPVCAnnotations: pvcAnnotationsDone,
 	}
 	legs := topologyLegs(&v)
 	for _, l := range legs {
@@ -550,9 +572,21 @@ func readTopology(
 	// the two later waves compute an empty scope and issue nothing rather
 	// than block forever when the pod wave fails).
 	if plan.byReference {
+		appDone := make(chan struct{})
+		var recovered []string
+		if len(plan.applicationRoots) > 0 {
+			g.Go(signalWhenDone(func() error {
+				names, err := readScopedApplications(ctx, callerCtx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
+				recovered = names
+				return err
+			}, appDone))
+		} else {
+			close(appDone)
+		}
 		podsDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, &v, &scopeMu, bindingsDone)
+			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, plan.applicationRoots, &v, &scopeMu,
+				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
 		}, podsDone))
 		g.Go(func() error {
 			return readScopedNodes(ctx, callerCtx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)

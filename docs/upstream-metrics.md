@@ -101,10 +101,36 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                 volume_labels is read RESTRICTED when the request roots at an
                 ontap_cluster= or aggr= (see "Storage-side roots narrow the
                 volume-label read" below)
-              ── wave 1, gated on kube_pod_spec_volumes_persistentvolumeclaims_info ──
+              ── recovery, only when the request carries application=;
+                 starts with the first wave (request-derived) ─────────────
+               three stages, each waiting on the previous. Stage 1: the six
+               controller-annotation families restricted on
+               annotation_argocd_argoproj_io_tracking_id to the root
+               Applications (`(?:app)(?::.*)?`), composed with the fixed `!=""`
+               and the same request matchers as the by-reference reads.
+               Deployment / StatefulSet / DaemonSet / CronJob fail the build;
+               ReplicaSet / Job degrade and do NOT set JobAnnotationsDegraded.
+               Capped at 16 chunks per family; past that the family is read
+               once unrestricted and filtered in the reader
+               (application_root_restriction_unbounded). Stage 2: kube_replicaset_owner
+               for the recovered Deployment names and kube_job_owner for the
+               recovered CronJob names (required; an empty name set issues
+               nothing). Stage 3: kube_pod_owner once per non-empty kind
+               (ReplicaSet = stage-1 ∪ stage-2, Job = stage-1 ∪ stage-2,
+               StatefulSet, DaemonSet, and the direct Deployment / CronJob
+               arms), required. Series are tallied under the family name and
+               added to whatever the by-reference read of that family contributes.
+               The wave yields pod names only.
+              ── wave 1, gated on kube_pod_spec_volumes_persistentvolumeclaims_info
+                 and, under application=, also on the recovery and on
+                 kube_persistentvolumeclaim_annotations ───────────────────
                2 pod legs (kube_pod_info, kube_pod_owner), scoped to the pods
                  a claim binding names plus the request's pod=<ns>/<name>
-                 roots; NOT issued when the scope is empty. Chunked by
+                 roots plus the recovered names. Under application= the binding
+                 half narrows to claims own-annotated with a root Application
+                 or mounted by a recovered / pod= pod, every mounter of such a
+                 claim included, so an unrelated binding pod is not read.
+                 NOT issued when the scope is empty. Chunked by
                  --netapp-qos-scope-batch-bytes; a chunk error FAILS the build
               ── wave 2 (nodes), gated on wave 1 ─────────────────────────
                4 kube_node_* legs, scoped to the Kubernetes nodes the loaded
@@ -138,7 +164,7 @@ unique per namespace (or per cluster, for nodes) only, so a by-reference scope
 may admit a same-named object from another namespace or cluster; it is
 consulted by no loaded pod and the body is unchanged.
 
-**Fan-out per build** (design.md D6): the 18 unrestricted legs, plus 2 when the
+**Fan-out per build** (design.md D6 / D11): the 18 unrestricted legs, plus 2 when the
 pod scope is non-empty, plus 4 when any loaded pod is scheduled or a `node=`
 root exists, plus 2 (owner + annotations) for each of ReplicaSet / Job that
 owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
@@ -146,13 +172,21 @@ owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
 Deployment-owned), plus 1 for CronJob when any Job resolved one (or a pod is
 directly CronJob-owned), plus 6 when a claim matched a FlexVol. An empty scope
 with no roots reads 18; every controller kind present with a matched volume
-reads 38.
+reads 38. An `application=` root adds the recovery on top of whatever the
+bindings still require:
+
+| Request | Recovery queries | Then |
+|---|---|---|
+| `application=x`, nothing matches | 6 (stage 1 only) | no pod query when the only bindings are unrelated |
+| one Deployment-managed claimless pod | 6 + 1 (`kube_replicaset_owner`) + 2 (`kube_pod_owner` for ReplicaSet and the direct Deployment arm) | pods 2, nodes 4, controllers 3 |
+| one CronJob-managed claimless pod | 6 + 1 (`kube_job_owner`) + 2 (`kube_pod_owner` for Job and the direct CronJob arm) | pods 2, nodes 4, controllers 3 |
+| every kind present, matched volume | 6 + 2 + 6 | the 38-leg forward maximum |
 
 **Pod-only roots narrow every namespaced leg.** When every root is a
 `pod=<ns>/<name>` root and the request carries no `namespace`, the parser adds
 the roots' namespaces as the `namespace` selector — output-preserving, since a
-pod-rooted body draws nothing outside them. Any storage-side or `node` root
-suppresses this, and an explicit `namespace` always wins.
+pod-rooted body draws nothing outside them. Any storage-side, `node` or
+`application` root suppresses this, and an explicit `namespace` always wins.
 
 **Storage-side roots narrow the volume-label read.** `volume_labels` is the
 largest leg of a NetApp estate and no request dimension narrows it, so a request
@@ -267,6 +301,10 @@ the family.
 The `cluster` value `unknown` is rendered `cluster=~"unknown|"` (literal plus
 the empty alternative) because an absent `cluster` label and a literal
 `unknown` land in the same bucket.
+
+The application recovery carries the same request matchers as the by-reference
+reads of those families (`az`, `env`, `cluster`, `namespace`), composed with
+the fixed selector and the recovery key. It adds no new `queryDims` entry.
 
 ## Fixed selectors (request-invariant)
 

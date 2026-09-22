@@ -116,6 +116,14 @@ func (f *Querier) ScopeValues(name promql.Query, label string) [][]string {
 				// like `ip-10-0-0-1.ec2.internal` arrives as `ip-10-0-0-1\.ec2\.internal`.
 				// Split on UNESCAPED separators and drop the escapes so the entry
 				// is the literal value set that was rendered.
+				//
+				// A tracking-id restriction wraps the alternation as
+				// `(?:a|b)(?::.*)?`. Unwrap that group back to the Application
+				// names; every other regex keeps the existing split.
+				if vals, ok := unwrapTrackingIDGroup(m.val); ok {
+					out = append(out, vals)
+					continue
+				}
 				out = append(out, splitQuotedAlternation(m.val))
 			}
 		}
@@ -144,6 +152,17 @@ func splitQuotedAlternation(re string) []string {
 		}
 	}
 	return append(out, cur.String())
+}
+
+// unwrapTrackingIDGroup inverts the `(?:a|b)(?::.*)?` wrapper
+// RenderTrackingIDScoped puts around an Application alternation. ok is false
+// when re is not that shape.
+func unwrapTrackingIDGroup(re string) ([]string, bool) {
+	const prefix, suffix = "(?:", ")(?::.*)?"
+	if !strings.HasPrefix(re, prefix) || !strings.HasSuffix(re, suffix) {
+		return nil, false
+	}
+	return splitQuotedAlternation(re[len(prefix) : len(re)-len(suffix)]), true
 }
 
 type matcher struct {

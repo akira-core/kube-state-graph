@@ -126,7 +126,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, err
 	}
 
-	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "node", "aggr", "svm", "pod"} {
+	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "node", "aggr", "svm", "pod", "application"} {
 		if err := validateSelectorValues(p, v[p]); err != nil {
 			return req, err
 		}
@@ -134,7 +134,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 
 	scope, serr := graph.NewStorageScope(
 		v["cluster"], v["namespace"],
-		v["ontap_cluster"], v["node"], v["aggr"], v["svm"], v["pod"],
+		v["ontap_cluster"], v["node"], v["aggr"], v["svm"], v["pod"], v["application"],
 	)
 	if serr != nil {
 		return req, &ParseError{"invalid_scope", serr.Error()}
@@ -161,17 +161,18 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 // Nothing a pod-rooted body draws lies outside the roots' namespaces, so reading
 // only those namespaces changes the queries and never the body.
 //
-// Any storage-side or `node` root suppresses it: those roots select paths in
-// every namespace. An explicit namespace is never widened, intersected or
-// replaced — an intersection could come out empty, which the selector reads as
-// "no filter", the one outcome that would WIDEN the read. The projection's own
-// namespace filter (StorageScope.Namespaces) is untouched: this narrows the
-// upstream read only.
+// Any storage-side, `node` or `application` root suppresses it: those roots
+// select paths in every namespace (an Application is not bound to one). An
+// explicit namespace is never widened, intersected or replaced — an
+// intersection could come out empty, which the selector reads as "no filter",
+// the one outcome that would WIDEN the read. The projection's own namespace
+// filter (StorageScope.Namespaces) is untouched: this narrows the upstream
+// read only.
 func deriveStorageNamespaces(scope graph.StorageScope, explicit []string) []string {
 	if slices.ContainsFunc(explicit, func(ns string) bool { return ns != "" }) {
 		return explicit
 	}
-	if scope.Roots.RequestedStorage() || len(scope.Roots.Pods) == 0 {
+	if scope.Roots.RequestedStorage() || len(scope.Roots.Applications) > 0 || len(scope.Roots.Pods) == 0 {
 		return explicit
 	}
 	namespaces := make([]string, 0, len(scope.Roots.Pods))
