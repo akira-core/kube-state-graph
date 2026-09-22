@@ -52,9 +52,10 @@ The endpoint SHALL accept the following optional, repeatable root selectors, eac
 - `node=<name>` — matched against BOTH the ONTAP controller name and the Kubernetes node name; a hit on either tier makes that node a root on its own side, and a name present on both tiers makes both roots;
 - `aggr=<name>` — a storage root naming an ONTAP aggregate;
 - `svm=<name>` — a storage root naming an SVM;
-- `pod=<namespace>/<pod-name>` — a workload root naming one pod; a value without exactly one `/` separating two non-empty segments SHALL be rejected 400 `invalid_scope`.
+- `pod=<namespace>/<pod-name>` — a workload root naming one pod; a value without exactly one `/` separating two non-empty segments SHALL be rejected 400 `invalid_scope`;
+- `application=<name>` — a workload root naming an ArgoCD Application, in the form `data.application` carries it (the segment of the tracking-id before the first `:`). A path is retained by it when its **pod or its claim** carries that Application — the claim's own annotation or the Application it inherited from a mounting pod, exactly as the body reports it. A value containing `:` can name no Application and matches nothing.
 
-Values of one selector SHALL be OR-combined. Roots on the **storage side** (`ontap_cluster`, `aggr`, `svm`, and `node` hits on a controller) and roots on the **workload side** (`pod`, and `node` hits on a Kubernetes node) SHALL be **AND-combined across sides**: when both sides carry at least one root, a path is retained only if it touches a root on EACH side; when only one side carries roots, a path is retained if it touches any of them; when no root is given, every complete path in the selected estate is retained. Root names are matched exactly and case-sensitively. A storage root SHALL be matched across every ONTAP cluster the selected zone's Harvest backends return unless `ontap_cluster` narrows it; a workload root SHALL be matched across every Kubernetes cluster in the selected estate unless `cluster` narrows it.
+Values of one selector SHALL be OR-combined. Roots on the **storage side** (`ontap_cluster`, `aggr`, `svm`, and `node` hits on a controller) and roots on the **workload side** (`pod`, `application`, and `node` hits on a Kubernetes node) SHALL be **AND-combined across sides**: when both sides carry at least one root, a path is retained only if it touches a root on EACH side; when only one side carries roots, a path is retained if it touches any of them; when no root is given, every complete path in the selected estate is retained. Within the workload side, `pod` and `application` roots are OR-combined with each other. Root names are matched exactly and case-sensitively. A storage root SHALL be matched across every ONTAP cluster the selected zone's Harvest backends return unless `ontap_cluster` narrows it; a workload root SHALL be matched across every Kubernetes cluster in the selected estate unless `cluster` narrows it.
 
 #### Scenario: Storage root finds its consumers
 
@@ -65,6 +66,26 @@ Values of one selector SHALL be OR-combined. Roots on the **storage side** (`ont
 
 - **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0` and that pod mounts one NetApp-backed claim on `(ontap-prod, ontap-prod-01, aggr1, svm_shop)`
 - **THEN** the body contains exactly the chain `netapp/ontap-prod/ontap-prod-01 → netapp/ontap-prod/aggr/aggr1 → netapp/ontap-prod/svm/svm_shop → <pvc> → <pod> → <node>`
+
+#### Scenario: Application root finds its storage across namespaces
+
+- **WHEN** a client sends `?az=zone-a&env=prod&application=checkout`, pods `shop/orders-0` and `platform/queue-0` resolve `data.application="checkout"` and mount claims on `aggr1` and `aggr2` respectively, and pod `shop/ledger-0` resolves `data.application="ledger"` and mounts a claim on `aggr1`
+- **THEN** the body contains the complete paths of the two `checkout` claims — both controllers, both aggregates, both SVMs, both PVCs, both pods and their nodes — and neither `shop/ledger-0` nor its claim
+
+#### Scenario: Application root matches a claim's own Application
+
+- **WHEN** a client sends `?az=zone-a&env=prod&application=billing`, claim `shop/ledger-data` carries its own tracking-id naming `billing` and is mounted by pod `shop/ledger-0`, which resolves `data.application="ledger"`
+- **THEN** the claim's complete path, `shop/ledger-0` included, is retained; `shop/ledger-0` is present as part of that path and would not be drawn on its own
+
+#### Scenario: Application root intersects a storage root
+
+- **WHEN** a client sends `?aggr=aggr1&application=checkout` and `checkout` pods mount one claim on `aggr1` and one on `aggr2`
+- **THEN** the body contains only the `aggr1` path; the `aggr2` chain and every non-`checkout` claim on `aggr1` are absent
+
+#### Scenario: Application and pod roots union on the workload side
+
+- **WHEN** a client sends `?application=checkout&pod=platform/redis-0` and `platform/redis-0` resolves `data.application="cache"`
+- **THEN** the body contains every `checkout` path and the `platform/redis-0` path
 
 #### Scenario: node matches both tiers
 
@@ -86,9 +107,16 @@ Values of one selector SHALL be OR-combined. Roots on the **storage side** (`ont
 - **WHEN** a client sends `?pod=orders-0`
 - **THEN** the server returns 400 with `reason: "invalid_scope"`
 
+#### Scenario: Application root value is validated like every selector value
+
+- **WHEN** a client sends `?application=` followed by a value of 300 bytes, or a value carrying a control character
+- **THEN** the server returns 400 with `reason: "invalid_scope"`; a bare `?application=` is a no-op
+
 ### Requirement: Roots are always materialised when the upstream knows them
 
 A root the upstream names in the window SHALL appear in the body even when no flow passes through it. A storage root "exists" when at least one Harvest series read in the build names it (`volume_labels`, `node_labels`, `node_new_status`, the node performance counters, or the `aggr_*` families; an SVM only via `volume_labels`); a workload root exists when `kube_node_info` (node) or `kube_pod_info` (pod) names it in the selected estate. A flowless root SHALL be emitted with its ordinary attributes and its compound parent (an aggregate root also materialises the controller currently owning it, so that `data.parent` never dangles) and **no** edges. A root NO series names SHALL NOT be drawn: the body is simply empty of it, with no error and no marker.
+
+An `application=` root exists when at least one pod loaded in the selected estate resolves that Application, and **every** such pod SHALL be materialised with its ordinary attributes and compound parents and no edges — including pods that mount no claim, which the build loads for exactly this purpose (see "Application roots recover their pods upstream") — so a stateless Application returns its pods rather than an empty body. A claim carrying a root Application SHALL NOT be materialised on its own: it participates in path retention only, and appears only on a retained path. An Application no loaded pod resolves is not drawn.
 
 #### Scenario: Aggregate with no claims still shows
 
@@ -100,9 +128,19 @@ A root the upstream names in the window SHALL appear in the body even when no fl
 - **WHEN** a client sends `?pod=shop/web-0` and that pod mounts no claim that joins the Harvest topology
 - **THEN** the body contains the pod node (with its namespace / application / controller groups) and no edge
 
+#### Scenario: Stateless Application still shows
+
+- **WHEN** a client sends `?az=zone-a&env=prod&application=checkout` and the three pods resolving `checkout` mount no claim
+- **THEN** the body contains the three pods, each with `data.application="checkout"`, their controller, application, namespace and cluster groups, and no edge
+
 #### Scenario: Unknown root is not drawn
 
 - **WHEN** a client sends `?aggr=typo` and no Harvest series in the window carries `aggr="typo"`
+- **THEN** the server returns 200 with empty `nodes` and `edges` and an empty `clusters` array
+
+#### Scenario: Unknown Application is not drawn
+
+- **WHEN** a client sends `?application=typo` and no loaded pod resolves that Application
 - **THEN** the server returns 200 with empty `nodes` and `edges` and an empty `clusters` array
 
 ### Requirement: Fixed tier chain and the `storage-flow` edge
@@ -159,7 +197,7 @@ A claim mounted by more than one pod SHALL have its weight **split equally** acr
 
 ### Requirement: Storage-reachability projection
 
-The body SHALL retain a node iff it lies on a **complete** storage-flow path (`netapp-node → … → pod`, or `netapp-svm → … → pod` for a FlexGroup claim) that satisfies the root rule of "Root selectors from either end of the flow", or it is a materialised root (or a root's real compound parent). An **unmounted** claim SHALL be dropped, and so SHALL any aggregate, SVM or controller reachable only through unmounted claims; a pod none of whose claims joins the Harvest topology SHALL be dropped; a Kubernetes node hosting only dropped pods SHALL be dropped. The `/v1/graph` connectivity prune SHALL NOT apply. `cluster` / `namespace` narrow the claim / pod / node side upstream and are re-applied at projection; a storage root is never dropped by them.
+The body SHALL retain a node iff it lies on a **complete** storage-flow path (`netapp-node → … → pod`, or `netapp-svm → … → pod` for a FlexGroup claim) that satisfies the root rule of "Root selectors from either end of the flow", or it is a materialised root (or a root's real compound parent). An `application=` root is satisfied by a path whose pod or whose claim carries the Application; the pods it materialises are those whose own `data.application` is a root value. An **unmounted** claim SHALL be dropped, and so SHALL any aggregate, SVM or controller reachable only through unmounted claims; a pod none of whose claims joins the Harvest topology SHALL be dropped unless it is a materialised root; a Kubernetes node hosting only dropped pods SHALL be dropped. The `/v1/graph` connectivity prune SHALL NOT apply. `cluster` / `namespace` narrow the claim / pod / node side upstream and are re-applied at projection; a storage root is never dropped by them.
 
 #### Scenario: Unmounted claim dropped with its lonely aggregate
 
@@ -170,6 +208,11 @@ The body SHALL retain a node iff it lies on a **complete** storage-flow path (`n
 
 - **WHEN** a client sends `?aggr=aggr1&namespace=shop` and `aggr1` serves claims in `shop` and `platform`
 - **THEN** the body contains `aggr1`, its controller, and only the `shop` claims' SVMs, PVCs, pods and nodes
+
+#### Scenario: Namespace filter narrows an application root
+
+- **WHEN** a client sends `?application=checkout&namespace=shop` and `checkout` pods exist in `shop` and `platform`
+- **THEN** only the `shop` pods and their paths are in the body, whether drawn on a path or materialised as roots
 
 ### Requirement: Attributes and compound groups carry over
 
@@ -220,12 +263,17 @@ Whenever a PVC carrying `labels.aggr` is in the body, the node it names SHALL be
 
 ### Requirement: Deterministic storage-graph body
 
-The body SHALL be byte-identical for identical `(window, az, env, roots, cluster, namespace)` against identical upstream state: nodes and edges sorted as in `/v1/graph`, `clusters` sorted, weights order-independent, and no time-of-build or echo-of-input field. Root selector values given in a different order or repeated SHALL produce an identical body.
+The body SHALL be byte-identical for identical `(window, az, env, roots, cluster, namespace)` against identical upstream state — `roots` covering every root selector, `application` included — with nodes and edges sorted as in `/v1/graph`, `clusters` sorted, weights order-independent, and no time-of-build or echo-of-input field. Root selector values given in a different order or repeated SHALL produce an identical body, and SHALL issue identical upstream queries.
 
 #### Scenario: Root order does not matter
 
 - **WHEN** a client sends `?aggr=b&aggr=a` and then `?aggr=a&aggr=b&aggr=a`
 - **THEN** both bodies are byte-identical
+
+#### Scenario: Application root order does not matter
+
+- **WHEN** a client sends `?application=b&application=a` and then `?application=a&application=b&application=a`
+- **THEN** both requests issue identical recovery queries and return byte-identical bodies
 
 ### Requirement: In-process storage-graph engine surface
 
@@ -244,7 +292,7 @@ Every other family the `/v1/graph` topology read issues falls into one of two cl
 
 Every by-reference restriction SHALL be a sorted, de-duplicated, anchored alternation on the family's own identity label, **composed with** the family's fixed, request-invariant selector where it has one (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `owner_kind="CronJob",owner_is_controller="true"`, `annotation_argocd_argoproj_io_tracking_id!=""`) and with the request-scoped matchers the family already carries — never replacing either. It is derived from upstream data and from the request's roots, not from a selector-level dimension, so the request-scoped selector table is unchanged. Every restriction SHALL be **chunked deterministically** under one byte budget shared with the QoS workload read, one query per chunk per family, results merged in **chunk order**, every chunk issued under the bare family name for self-metrics and span dimensions, and a single name SHALL always be issued even when it alone exceeds the budget. A chunk SHALL keep its family's error class: a chunk of a family whose unrestricted read fails the build (`kube_pod_info`, `kube_pod_owner`, the four Kubernetes-node families, `kube_replicaset_owner`, `kube_job_owner`, `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_cronjob_annotations`) fails the build exactly as that unrestricted error does; a chunk of a family whose unrestricted read degrades (`kube_replicaset_annotations`, `kube_job_annotations`) degrades on its own, costing only the Applications the names in that chunk would have supplied, and a degraded `kube_job_annotations` chunk suppresses the Job → CronJob hop for the whole build exactly as a degraded unrestricted read does. Caller-originated cancellation SHALL fail the request whatever the family.
 
-**Pods.** The build SHALL read `kube_pod_info` and `kube_pod_owner` restricted to the union of (a) the `pod` names of every claim-binding series it loaded and (b) the pod-name segment of every `pod=<namespace>/<pod-name>` root the request carries. The pod read SHALL wait on the claim-binding family alone and SHALL NOT wait on families it does not read. Because a root has to be in the restriction to be loaded, the storage build SHALL receive the request's roots as an input. A `pod=` root that mounts no claim SHALL still be materialised, as "Roots are always materialised when the upstream knows them" requires. When the pod scope is empty — no claim-binding series was loaded and the request carries no `pod=` root — no pod query is issued, no controller query is issued, and the body holds no complete path: it contains only the roots the storage side materialised and any `node=` root the Kubernetes-node read below still draws.
+**Pods.** The build SHALL read `kube_pod_info` and `kube_pod_owner` restricted to the union of (a) the `pod` names of every claim-binding series it loaded, (b) the pod-name segment of every `pod=<namespace>/<pod-name>` root the request carries, and (c) the pod names the application recovery of "Application roots recover their pods upstream" returned. Under an `application=` root, (a) SHALL be narrowed to the binding pods of claims that are own-annotated with a root Application or mounted by a pod in (b) ∪ (c) — every mounter of such a claim included — as that requirement defines. The pod read SHALL wait on the claim-binding family and — when the request carries an `application=` root — on the recovery and on `kube_persistentvolumeclaim_annotations` alone, and SHALL NOT wait on families it does not read. Because a root has to be in the restriction to be loaded, the storage build SHALL receive the request's roots as an input. A `pod=` root that mounts no claim SHALL still be materialised, as "Roots are always materialised when the upstream knows them" requires; so SHALL every recovered pod that resolves a root Application. When the pod scope is empty — no (possibly narrowed) claim-binding pod, no `pod=` root, and no recovered name — no pod query is issued, no controller query is issued, and the body holds no complete path: it contains only the roots the storage side materialised and any `node=` root the Kubernetes-node read below still draws.
 
 **Kubernetes nodes.** The build SHALL read `kube_node_info`, `kube_node_status_addresses`, `kube_node_labels` and `kube_node_status_condition` restricted on `node` to the union of (a) the `node` label of every pod the pod read loaded and (b) every `node=` root the request carries. The node read SHALL wait on the pod read alone. A `node=` root naming a Kubernetes node that no loaded pod is scheduled on SHALL still be materialised, so a request with node roots and no mounting pod issues the node families for the roots alone. An unscheduled pod contributes no name.
 
@@ -256,6 +304,11 @@ The by-reference reads SHALL be **output-preserving**: the reader consults a nod
 
 - **WHEN** a build for `?az=zone-a&env=prod&pod=shop/web-0` loads claim-binding series naming pods `orders-0`, `orders-1` and `catalog-0` while the estate holds 40000 pods
 - **THEN** every issued `kube_pod_info` and `kube_pod_owner` query restricts `pod` to exactly `{catalog-0, orders-0, orders-1, web-0}` alongside `<az-key>="zone-a",<env-key>="prod"`, no series for any other pod is fetched, and the body is byte-identical to the body an unrestricted pod read would produce
+
+#### Scenario: Pod read is restricted to mounting pods, roots and recovered pods
+
+- **WHEN** a build for `?az=zone-a&env=prod&application=checkout` loads claim-binding series naming pods `orders-0` and `catalog-0` (unrelated claims, unannotated), the recovery returns `web-7d9f-abc` and `orders-0`, and `catalog-0`'s claim is mounted by nobody else
+- **THEN** every issued `kube_pod_info` and `kube_pod_owner` query restricts `pod` to exactly `{orders-0, web-7d9f-abc}`, and the body is byte-identical to the body an unrestricted pod read would produce for the same root
 
 #### Scenario: Empty scope issues no pod query
 
@@ -329,9 +382,9 @@ The by-reference reads SHALL be **output-preserving**: the reader consults a nod
 
 ### Requirement: Pod-only roots narrow the upstream read
 
-When a `/v1/storage-graph` request carries at least one `pod=<namespace>/<pod-name>` root, no `ontap_cluster`, `aggr`, `svm` or `node` root, and no `namespace` parameter, the request parser SHALL derive the build's `namespace` selector from the roots: the sorted, de-duplicated set of their namespace segments, rendered into every namespaced kube-state-metrics, kubelet and `ALERTS` query exactly as an explicit `?namespace=` with those values would be. The derivation SHALL be output-preserving: with pod roots only, every retained path is anchored on a root pod, its claim lies in that pod's namespace, and every other pod on the path mounts the same claim in the same namespace, so no retained node lies outside the derived set; the Kubernetes node, Harvest and storage-inventory families are not namespaced and are read as before.
+When a `/v1/storage-graph` request carries at least one `pod=<namespace>/<pod-name>` root, no `ontap_cluster`, `aggr`, `svm`, `node` or `application` root, and no `namespace` parameter, the request parser SHALL derive the build's `namespace` selector from the roots: the sorted, de-duplicated set of their namespace segments, rendered into every namespaced kube-state-metrics, kubelet and `ALERTS` query exactly as an explicit `?namespace=` with those values would be. The derivation SHALL be output-preserving: with pod roots only, every retained path is anchored on a root pod, its claim lies in that pod's namespace, and every other pod on the path mounts the same claim in the same namespace, so no retained node lies outside the derived set; the Kubernetes node, Harvest and storage-inventory families are not namespaced and are read as before.
 
-An explicit `namespace` parameter SHALL be used as given — never widened, intersected or replaced by the roots' namespaces; a root outside it is dropped by the projection as today. Any storage-side or `node` root SHALL suppress the derivation: those roots select paths across namespaces. The derived set SHALL be a pure function of the root set, so root order does not change the issued queries, and the in-process engine surface SHALL derive it identically, since both share one parser.
+An explicit `namespace` parameter SHALL be used as given — never widened, intersected or replaced by the roots' namespaces; a root outside it is dropped by the projection as today. Any storage-side, `node` or `application` root SHALL suppress the derivation: those roots select paths across namespaces (an Application is not bound to one namespace). The derived set SHALL be a pure function of the root set, so root order does not change the issued queries, and the in-process engine surface SHALL derive it identically, since both share one parser.
 
 #### Scenario: Pod roots push their namespaces upstream
 
@@ -342,6 +395,11 @@ An explicit `namespace` parameter SHALL be used as given — never widened, inte
 
 - **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0&aggr=aggr1`
 - **THEN** no query carries a `namespace` matcher, and the body is the intersection the root rule already defines
+
+#### Scenario: An application root does not derive a namespace
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0&application=checkout`
+- **THEN** no query carries a `namespace` matcher, and `checkout` pods in every namespace of the selected estate are candidates
 
 #### Scenario: Explicit namespace wins over roots
 
@@ -473,3 +531,99 @@ When phase 1 matched no claim, phase 2 SHALL NOT be issued.
 
 - **WHEN** one phase-1 chunk fails with an upstream error while every other query succeeds
 - **THEN** the request returns 200, the claims whose volumes that chunk carried draw no aggregate edge, the failure is logged and counted on `kube_state_graph_upstream_query_failures_total{query="volume_labels"}`, and the build does not fail
+
+### Requirement: Application roots recover their pods upstream
+
+When a `/v1/storage-graph` request carries at least one `application=` root, the build SHALL recover, before it reads pods, the names of every pod owned by a controller whose ArgoCD tracking-id names one of the root Applications, and SHALL add those names to the pod scope of "Storage build reads only what it draws". The recovery is a **candidate generator, never a judge**: a recovered pod is read exactly like any other scoped pod, its Application is resolved by the same controller-annotation rules every pod's is, and whether it is a root is decided solely by the projection over that resolved value. A recovered pod whose resolved Application is not a root value — a controller whose lexically-smallest tracking-id in the window names a different Application — is loaded and then dropped, so the body is a pure function of the forward resolution and never of the recovery.
+
+The recovery SHALL run in three stages, each waiting on the previous alone, and SHALL start with the first wave (its first stage is derived from the request, so nothing precedes it):
+
+**Stage 1 — controllers by tracking-id.** Each of the six controller-annotation families (`kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_replicaset_annotations`, `kube_job_annotations`, `kube_cronjob_annotations`) SHALL be issued restricted on `annotation_argocd_argoproj_io_tracking_id` to exactly the values whose segment before the first `:` is one of the root values (a value with no `:` matches when it equals a root value verbatim), composed with the family's fixed selector and the request-scoped matchers — never replacing either. Root values SHALL be sorted, de-duplicated and escaped so a value carrying a regex metacharacter matches itself and nothing else. The stage yields one name set per kind from each family's identity label (`deployment`, `statefulset`, `daemonset`, `replicaset`, `job_name`, `cronjob`).
+
+**Stage 2 — the reverse hops.** `kube_replicaset_owner` SHALL be issued restricted to `owner_kind="Deployment"` and `owner_name` in the stage-1 Deployment names, yielding ReplicaSet names; `kube_job_owner` SHALL be issued restricted on `owner_name` to the stage-1 CronJob names beside its fixed selector, yielding Job names. A stage-1 name set that is empty SHALL issue no query for its hop.
+
+**Stage 3 — pods by owner.** `kube_pod_owner` SHALL be issued restricted to `owner_is_controller="true"`, one query per owner kind whose name set is non-empty: `ReplicaSet` (stage-1 ReplicaSet names ∪ stage-2 ReplicaSet names), `Job` (stage-1 Job names ∪ stage-2 Job names), `StatefulSet`, `DaemonSet`, and — for a pod directly owned by either — `Deployment` and `CronJob` for the stage-1 names of those kinds. The recovered `pod` labels are the names the pod scope gains.
+
+Every restriction SHALL be chunked deterministically under the byte budget shared with every other data-derived alternation, one query per chunk, results merged in chunk order, each chunk issued under the bare family name. Each family SHALL keep the error class its by-reference read has: a chunk error on `kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_cronjob_annotations`, `kube_replicaset_owner`, `kube_job_owner` or `kube_pod_owner` fails the build; a chunk error on `kube_replicaset_annotations` or `kube_job_annotations` is logged and costs only the names that chunk would have supplied, and SHALL NOT suppress the Job → CronJob hop — the recovery establishes nothing about a loaded Job's own annotation; only the by-reference read of that family does. Caller-originated cancellation fails the request whatever the family.
+
+**Stage 1 SHALL be bounded, or unrestricted.** `application=` is repeatable and the parser bounds each value's length, never their count, so stage 1 is a request-derived scope a client can inflate. When a family's root restriction would take more than a fixed maximum number of queries, that family SHALL be issued with its fixed selector and the request-scoped matchers only — the shape `/v1/graph` issues it in — and its rows filtered to the root Applications in the reader, and the build SHALL log that it did so. Stages 2 and 3 are derived from upstream data and need no bound.
+
+**Tally.** Series a stage returns SHALL be counted under the family's name in the build's per-family tally, added to whatever the by-reference read of the same family contributes, so a family issued by both reports the total and a family the recovery issued is present even when the by-reference read did not issue it.
+
+**The recovered names narrow the claim-binding half of the pod scope.** Under an application root every retained path must satisfy the root, so a claim-binding pod SHALL enter the pod scope only when its claim is (a) own-annotated (`kube_persistentvolumeclaim_annotations`) with a tracking-id whose Application segment is a root value, or (b) mounted by a recovered pod or by a `pod=` root pod. Case (b) SHALL admit EVERY mounter of such a claim, not only the recovered one: a shared claim's `pvc-pod` weight is split over the mounters present in the built graph, and an Application a claim inherits comes from its mounters, so a co-mounter that is not loaded would change the split and the inheritance. The pod read therefore also waits on `kube_persistentvolumeclaim_annotations` when the request carries an application root. The narrowing is output-preserving: a pod can be a root only if it resolves a root Application, and every such pod is in the recovered set; a path can be retained only through a pod hit (its pod is recovered) or a claim hit (the claim is own-annotated, or inherits from a mounter that is recovered), so every pod on a retained path — and every co-mounter its weights depend on — is in the scope.
+
+A request with no `application=` root SHALL issue no recovery query, so its queries and body are unchanged. An empty stage yields nothing downstream: when no controller carries a root Application, stages 2 and 3 issue nothing, and the pod scope holds only the `pod=` roots and the binding pods of own-annotated claims.
+
+#### Scenario: A Deployment-managed stateless pod is recovered and drawn
+
+- **WHEN** a client sends `?az=zone-a&env=prod&application=checkout`, Deployment `shop/web` carries tracking-id `checkout:apps/Deployment:shop/web`, `kube_replicaset_owner` names ReplicaSet `web-7d9f` as owned by Deployment `web`, `kube_pod_owner` names pod `web-7d9f-abc` as controlled by that ReplicaSet, and the pod mounts no claim
+- **THEN** stage 1 issues the six annotation families each with a matcher on `annotation_argocd_argoproj_io_tracking_id` admitting exactly the values whose segment before the first `:` is `checkout`, alongside `annotation_argocd_argoproj_io_tracking_id!=""` and `<az-key>="zone-a",<env-key>="prod"`; stage 2 issues `kube_replicaset_owner` restricted to `owner_kind="Deployment"` and `owner_name` in `{web}` and no `kube_job_owner`; stage 3 issues `kube_pod_owner` restricted to `owner_is_controller="true"`, `owner_kind="ReplicaSet"` and `owner_name` in `{web-7d9f}`; the pod read restricts `pod` to `{web-7d9f-abc}` plus every claim-binding pod; and the body contains `web-7d9f-abc` with `data.application="checkout"`, its compound parents, and no edge
+
+#### Scenario: A CronJob-managed pod is recovered through the reverse Job hop
+
+- **WHEN** a client sends `?application=reports`, CronJob `batch/nightly` carries tracking-id `reports:batch/CronJob:batch/nightly`, `kube_job_owner` names Job `nightly-28901` as controlled by it, and `kube_pod_owner` names pod `nightly-28901-x` as controlled by that Job
+- **THEN** stage 2 issues `kube_job_owner` with `owner_kind="CronJob",owner_is_controller="true"` and `owner_name` in `{nightly}`, stage 3 issues `kube_pod_owner` for kind `Job` with `owner_name` in `{nightly-28901}`, and the body contains `nightly-28901-x` with `data.application="reports"` and `data.owner={kind:"Job", name:"nightly-28901"}`
+
+#### Scenario: An over-admitted pod is loaded and dropped
+
+- **WHEN** a client sends `?application=beta`, and StatefulSet `shop/db` carries two tracking-ids in the window, `alpha:apps/StatefulSet:shop/db` and `beta:apps/StatefulSet:shop/db`
+- **THEN** stage 1 admits `db`, its pods are read, each resolves `data.application="alpha"` (the lexically-smallest tracking-id), none is a root, and the body is byte-identical to the body of the same request against an estate where `db` carries only the `alpha` tracking-id
+
+#### Scenario: No controller carries the Application
+
+- **WHEN** a client sends `?application=typo` and no controller-annotation series in the selected estate carries a tracking-id naming `typo`
+- **THEN** stage 1 issues its six queries, no stage-2 or stage-3 query is issued, no claim is own-annotated with `typo` so no binding pod enters the scope, no pod query is issued, and the body is empty
+
+#### Scenario: Only related binding pods are read under an application root
+
+- **WHEN** a client sends `?application=checkout`, the recovery returns `orders-0`, and claim-binding series name `orders-0` (claim `orders-data`), `catalog-0` (claim `catalog-data`, unannotated, mounted by nobody else) and `ledger-0` (claim `ledger-data`, own-annotated `billing:…`)
+- **THEN** every `kube_pod_info` and `kube_pod_owner` query restricts `pod` to exactly `{orders-0}`; `catalog-0` and `ledger-0` are never read; and the body is byte-identical to the body a build reading every binding pod produces
+
+#### Scenario: Every mounter of a related claim is read
+
+- **WHEN** a client sends `?application=checkout`, the recovery returns `orders-0`, and the RWX claim `shared-data` is mounted by `orders-0` and by `report-0`, whose controller resolves `alpha`
+- **THEN** the pod scope is `{orders-0, report-0}`, the claim inherits `alpha` (the lexically-smallest mounter Application) so `report-0`'s path is not retained, and the `pvc-pod` edge to `orders-0` carries half the claim's figures with `labels.attribution="split"` — exactly as when every binding pod is read
+
+#### Scenario: A co-mounter that sorts after the root is drawn through inheritance
+
+- **WHEN** the same claim is instead mounted by `orders-0` (`checkout`) and `zeta-0` (`zeta`)
+- **THEN** the claim inherits `checkout`, both `pvc-pod` paths are retained, and `zeta-0` is present as part of the claim's path with a split edge of its own
+
+#### Scenario: A degrading stage-1 family degrades alone
+
+- **WHEN** a stage-1 `kube_job_annotations` chunk fails with an upstream error while every other query succeeds, and the root Application owns one directly-annotated Job whose pod mounts nothing and one CronJob whose Job-owned pod mounts a claim
+- **THEN** the request returns 200, the claimless Job pod is not drawn, the mounting pod is loaded through its binding, resolves its Application through the by-reference read and the CronJob hop, and is drawn as a root; the failure is logged and counted on `kube_state_graph_upstream_query_failures_total{query="kube_job_annotations"}`
+
+#### Scenario: A required stage failure fails the build
+
+- **WHEN** a stage-3 `kube_pod_owner` chunk fails with an upstream error
+- **THEN** the build returns an error and the request is mapped as an upstream failure, exactly as an unrestricted `kube_pod_owner` failure is
+
+#### Scenario: An unbounded root set reads stage 1 unrestricted
+
+- **WHEN** a client sends thousands of `application=` values, enough that a family's restriction would take more queries than the maximum
+- **THEN** that family is issued once with `annotation_argocd_argoproj_io_tracking_id!=""` and the request-scoped matchers only, its rows are filtered to the root Applications in the reader, the build logs that the roots did not yield a bounded restriction, and the body is byte-identical to the body the restriction would have produced
+
+#### Scenario: The namespace filter narrows the recovery
+
+- **WHEN** a client sends `?application=checkout&namespace=shop` and `checkout` owns controllers in `shop` and `platform`
+- **THEN** every stage-1, stage-2 and stage-3 query carries `namespace="shop"`, only the `shop` pods are recovered, and the body holds no `platform` pod
+
+#### Scenario: A request without the root issues no recovery
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr1`
+- **THEN** no query restricted on `annotation_argocd_argoproj_io_tracking_id` or on `owner_name` is issued, and the queries and body are byte-identical to the build before this root existed
+
+#### Scenario: The recovery is tallied under the family name
+
+- **WHEN** a client sends `?application=checkout`, stage 1 returns two `kube_deployment_annotations` series, and the by-reference controller read later returns three for the loaded pods' Deployments
+- **THEN** the per-family tally carries `kube_deployment_annotations` with `5`, and a family only the recovery issued is present with the count of series its restriction matched
+
+### Requirement: Application roots compose with the Harvest restriction
+
+An `application=` root SHALL NOT disable the restricted volume-label read of "Storage-side roots narrow the Harvest topology read": it is a workload-side root, the projection ANDs the workload roots with the storage roots, so every path an `ontap_cluster=` / `aggr=` restriction keeps is one the application root can still retain, and the body is byte-identical to the unrestricted body exactly as it is for `pod=`.
+
+#### Scenario: An application root composes with an aggregate root
+
+- **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00&application=checkout`
+- **THEN** phase 1 of the volume-label read is restricted to `aggr=~"aggr00"`, the application recovery runs as it does without the aggregate root, the body holds only the `checkout` paths on `aggr00`, and it is byte-identical to the body an unrestricted volume-label read produces
