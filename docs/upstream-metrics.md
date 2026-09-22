@@ -165,7 +165,7 @@ components, in two phases:
    only *within* the `ontap_cluster=` values). Chunked by the same byte budget,
    charging the repeated matcher at its rendered length. **Capped:** these are
    repeatable parameters whose count nothing bounds, so a restriction that would
-   take more than eight queries is not applied at all — the leg reads
+   take more than sixteen queries is not applied at all — the leg reads
    unrestricted, logs that it did, and the body is unchanged.
 2. **Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked
    lexically-smallest over its *whole* candidate set, so a Trident clone or a

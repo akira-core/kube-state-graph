@@ -16,11 +16,15 @@ import (
 
 // scopeConcurrency bounds one second wave's reads in flight at once (its
 // families × however many chunks its scope was split into). Each wave — the QoS
-// workload read and the storage build's pod read — has its own limit. It is a
+// workload read, both phases of the rooted volume-label read, and the storage
+// build's pod, node and controller reads — has its own limit, and waves overlap:
+// the node and controller waves run beside the QoS wave, so one storage build
+// can hold up to three times this many scoped reads in flight. It is a
 // site-invariant tuning value like routeResolveConcurrency, not a knob: the
 // queries it bounds are already narrow, and the upstream's own limits are the
-// backstop that matters.
-const scopeConcurrency = 8
+// backstop that matters. It binds only when a wave's families × chunks exceeds
+// it, so it throttles only a scope large enough to split into several chunks.
+const scopeConcurrency = 16
 
 // scopedTarget is one family a second wave reads, with the slot it lands in.
 type scopedTarget struct {

@@ -914,7 +914,7 @@ live under `openspec/specs/`.
     `--netapp-qos-scope-batch-bytes` (default 8192) is chunked deterministically
     (`promql.ChunkQoSVolumeScope`); a single over-budget name still gets its own
     query rather than being dropped. Chunks are issued concurrently under
-    `qosScopeConcurrency` and merged **in chunk-index order, never completion
+    `scopeConcurrency` and merged **in chunk-index order, never completion
     order** — `sumQoSIO` adds float64s, so a timing-dependent merge would make
     the last bits of every I/O figure depend on which chunk answered first.
     Each chunk degrades on its own (log-and-continue), so a failed chunk costs
