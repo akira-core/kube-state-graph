@@ -19,6 +19,7 @@ func TestNewStorageScope_DeduplicatesAndDropsEmpties(t *testing.T) {
 		[]string{"aggr1", "aggr2", "aggr1"},
 		[]string{"svm_shop"},
 		[]string{"shop/orders-0", "shop/orders-0", ""},
+		[]string{"b", "a", "", "a"},
 	)
 	require.NoError(t, err)
 
@@ -29,11 +30,13 @@ func TestNewStorageScope_DeduplicatesAndDropsEmpties(t *testing.T) {
 	assert.Len(t, a.Roots.Aggrs, 2)
 	assert.Equal(t, map[string]struct{}{"svm_shop": {}}, a.Roots.SVMs)
 	assert.Equal(t, map[PodRef]struct{}{{Namespace: "shop", Name: "orders-0"}: {}}, a.Roots.Pods)
+	assert.Equal(t, map[string]struct{}{"a": {}, "b": {}}, a.Roots.Applications)
 
 	// The same values in a different order build the identical scope.
 	b, err := NewStorageScope(
 		[]string{"c1"}, []string{"shop"}, []string{"ontap-prod"}, []string{"n1"},
 		[]string{"aggr2", "aggr1"}, []string{"svm_shop"}, []string{"shop/orders-0"},
+		[]string{"a", "b"},
 	)
 	require.NoError(t, err)
 	assert.Equal(t, a, b)
@@ -42,10 +45,16 @@ func TestNewStorageScope_DeduplicatesAndDropsEmpties(t *testing.T) {
 // A bare `?aggr=` (or any other bare root) is a no-op, not a root that matches
 // nothing — the same convention every other set follows.
 func TestNewStorageScope_BareValuesAreNoOps(t *testing.T) {
-	s, err := NewStorageScope(nil, nil, []string{""}, []string{""}, []string{""}, []string{""}, []string{""})
+	s, err := NewStorageScope(nil, nil, []string{""}, []string{""}, []string{""}, []string{""}, []string{""}, nil)
 	require.NoError(t, err)
 	assert.False(t, s.Roots.Any(), "bare values leave no root requested")
 	assert.Nil(t, s.Roots.Pods)
+	assert.Nil(t, s.Roots.Applications)
+
+	bareApp, err := NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{""})
+	require.NoError(t, err)
+	assert.Nil(t, bareApp.Roots.Applications)
+	assert.False(t, bareApp.Roots.Any())
 }
 
 // A NON-empty malformed pod root is an error rather than a silent drop:
@@ -59,7 +68,7 @@ func TestNewStorageScope_RejectsMalformedPodRoot(t *testing.T) {
 		"shop/sub/orders", // two separators
 		"/",               // both empty
 	} {
-		_, err := NewStorageScope(nil, nil, nil, nil, nil, nil, []string{bad})
+		_, err := NewStorageScope(nil, nil, nil, nil, nil, nil, []string{bad}, nil)
 		require.Errorf(t, err, "%q must be rejected", bad)
 		assert.Contains(t, err.Error(), bad, "the error must name the offending value")
 	}
@@ -93,6 +102,11 @@ func TestStorageRoots_RequestedPerSide(t *testing.T) {
 		{
 			"pod is workload only",
 			StorageRoots{Pods: map[PodRef]struct{}{{Namespace: "shop", Name: "o-0"}: {}}},
+			false, true,
+		},
+		{
+			"application is workload only",
+			StorageRoots{Applications: map[string]struct{}{"checkout": {}}},
 			false, true,
 		},
 		{

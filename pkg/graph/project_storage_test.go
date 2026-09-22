@@ -139,7 +139,7 @@ func edgeBetween(v View, src, tgt string) *Edge {
 }
 
 func scopeRoots(ontap, nodes, aggrs, svms, pods []string) StorageScope {
-	s, err := NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods)
+	s, err := NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -633,4 +633,166 @@ func TestProjectStorage_LatencyOnlyClaimKeepsLatencyOnItsEdge(t *testing.T) {
 	shared := edgeBetween(v, ctrl.ID(), aggr.ID())
 	require.NotNil(t, shared)
 	assert.Nil(t, shared.IO, "no flow figure exists to share up the chain")
+}
+
+func appPod(ns, name, uid, node, app string) *PodNode {
+	p := stPod(ns, name, uid, node)
+	p.ApplicationValue = app
+	return p
+}
+
+func appPVC(ns, claim, app string) *PVCNode {
+	p := stPVC(ns, claim)
+	p.ApplicationValue = app
+	return p
+}
+
+func appScope(namespaces, aggrs, pods, apps []string) StorageScope {
+	s, err := NewStorageScope(nil, namespaces, nil, nil, aggrs, nil, pods, apps)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// Two checkout pods in different namespaces, on different aggregates, plus a
+// ledger pod sharing aggr1. Only the checkout paths are retained.
+func TestProjectStorage_ApplicationRootFindsItsStorageAcrossNamespaces(t *testing.T) {
+	ctrl1, aggr1, svm1 := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	ctrl2, aggr2, svm2 := stCtrl("ontap-prod-02"), stAggr("aggr2", "ontap-prod-02"), stSVM("svm_plat")
+	orders := appPVC("shop", "orders-data", "")
+	queue := appPVC("platform", "queue-data", "")
+	ledgerPVC := appPVC("shop", "ledger-data", "")
+	ordersPod := appPod("shop", "orders-0", "uid-o", "worker-1", "checkout")
+	queuePod := appPod("platform", "queue-0", "uid-q", "worker-2", "checkout")
+	ledgerPod := appPod("shop", "ledger-0", "uid-l", "worker-1", "ledger")
+	n1, n2 := stNode("worker-1"), stNode("worker-2")
+	edges := stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), orders.ID(), ordersPod.ID(), n1.ID(), stIO(10), 1)
+	edges = append(edges, stChain(ctrl2.ID(), aggr2.ID(), svm2.ID(), queue.ID(), queuePod.ID(), n2.ID(), stIO(20), 1)...)
+	edges = append(edges, stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), ledgerPVC.ID(), ledgerPod.ID(), n1.ID(), stIO(30), 1)...)
+	g := stGraph([]GraphNode{
+		ctrl1, ctrl2, aggr1, aggr2, svm1, svm2,
+		orders, queue, ledgerPVC, ordersPod, queuePod, ledgerPod, n1, n2,
+	}, edges)
+
+	ids := viewIDs(ProjectStorage(g, appScope(nil, nil, nil, []string{"checkout"})))
+	for _, id := range []string{
+		ctrl1.ID(), ctrl2.ID(), aggr1.ID(), aggr2.ID(), svm1.ID(), svm2.ID(),
+		orders.ID(), queue.ID(), ordersPod.ID(), queuePod.ID(), n1.ID(), n2.ID(),
+	} {
+		assert.True(t, ids[id], id)
+	}
+	assert.False(t, ids[ledgerPod.ID()])
+	assert.False(t, ids[ledgerPVC.ID()])
+}
+
+// A claim's own Application retains the whole path. The mounting pod is
+// present only because it sits on that path: drop the svm-pvc edge and the
+// pod is gone (claimHits never materialises a root).
+func TestProjectStorage_ApplicationRootMatchesClaimOwnApplication(t *testing.T) {
+	ctrl, aggr, svm := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	pvc := appPVC("shop", "ledger-data", "billing")
+	pod := appPod("shop", "ledger-0", "uid-l", "worker-1", "ledger")
+	node := stNode("worker-1")
+	nodes := []GraphNode{ctrl, aggr, svm, pvc, pod, node}
+	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvc.ID(), pod.ID(), node.ID(), stIO(10), 1)
+	ids := viewIDs(ProjectStorage(stGraph(nodes, edges), appScope(nil, nil, nil, []string{"billing"})))
+	assert.True(t, ids[pod.ID()], "the pod is drawn as part of the claim's path")
+	assert.True(t, ids[pvc.ID()])
+
+	var stripped []*Edge
+	for _, e := range edges {
+		if e.Labels["tier"] == StorageTierSVMPVC {
+			continue
+		}
+		stripped = append(stripped, e)
+	}
+	gone := viewIDs(ProjectStorage(stGraph(nodes, stripped), appScope(nil, nil, nil, []string{"billing"})))
+	assert.False(t, gone[pod.ID()], "without the path the pod is not a root")
+	assert.False(t, gone[pvc.ID()], "a claim hit is never materialised on its own")
+}
+
+func TestProjectStorage_ApplicationRootIntersectsStorageRoot(t *testing.T) {
+	ctrl1, aggr1, svm1 := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	ctrl2, aggr2, svm2 := stCtrl("ontap-prod-02"), stAggr("aggr2", "ontap-prod-02"), stSVM("svm_other")
+	pvc1, pvc2 := appPVC("shop", "on-1", ""), appPVC("shop", "on-2", "")
+	pod1 := appPod("shop", "a-0", "uid-1", "worker-1", "checkout")
+	pod2 := appPod("shop", "b-0", "uid-2", "worker-1", "checkout")
+	other := appPod("shop", "c-0", "uid-3", "worker-1", "ledger")
+	pvcO := appPVC("shop", "other", "")
+	n := stNode("worker-1")
+	edges := stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), pvc1.ID(), pod1.ID(), n.ID(), stIO(1), 1)
+	edges = append(edges, stChain(ctrl2.ID(), aggr2.ID(), svm2.ID(), pvc2.ID(), pod2.ID(), n.ID(), stIO(1), 1)...)
+	edges = append(edges, stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), pvcO.ID(), other.ID(), n.ID(), stIO(1), 1)...)
+	g := stGraph([]GraphNode{ctrl1, ctrl2, aggr1, aggr2, svm1, svm2, pvc1, pvc2, pvcO, pod1, pod2, other, n}, edges)
+
+	v := ProjectStorage(g, appScope(nil, []string{"aggr1"}, nil, []string{"checkout"}))
+	ids := viewIDs(v)
+	assert.True(t, ids[pod1.ID()])
+	assert.True(t, ids[aggr1.ID()])
+	assert.True(t, ids[pvc1.ID()])
+	assert.False(t, ids[aggr2.ID()], "the aggr2 chain is the other side of the AND")
+	assert.False(t, ids[svm2.ID()])
+	assert.False(t, ids[pvc2.ID()])
+	assert.False(t, ids[ctrl2.ID()])
+	assert.True(t, ids[pod2.ID()], "a checkout pod is still materialised when its chain was filtered out")
+	assert.Nil(t, edgeBetween(v, pvc2.ID(), pod2.ID()))
+	assert.False(t, ids[other.ID()], "non-checkout on aggr1 is absent")
+}
+
+func TestProjectStorage_ApplicationAndPodRootsUnion(t *testing.T) {
+	ctrl, aggr, svm := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	pvcC, pvcR := appPVC("shop", "c-data", ""), appPVC("platform", "r-data", "")
+	checkout := appPod("shop", "orders-0", "uid-c", "worker-1", "checkout")
+	redis := appPod("platform", "redis-0", "uid-r", "worker-2", "cache")
+	n1, n2 := stNode("worker-1"), stNode("worker-2")
+	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvcC.ID(), checkout.ID(), n1.ID(), stIO(1), 1)
+	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvcR.ID(), redis.ID(), n2.ID(), stIO(1), 1)...)
+	g := stGraph([]GraphNode{ctrl, aggr, svm, pvcC, pvcR, checkout, redis, n1, n2}, edges)
+
+	ids := viewIDs(ProjectStorage(g, appScope(nil, nil, []string{"platform/redis-0"}, []string{"checkout"})))
+	assert.True(t, ids[checkout.ID()])
+	assert.True(t, ids[redis.ID()])
+}
+
+func TestProjectStorage_StatelessApplicationStillShows(t *testing.T) {
+	names := []string{"a-0", "b-0", "c-0"}
+	nodes := make([]GraphNode, 0, len(names))
+	for _, name := range names {
+		nodes = append(nodes, appPod("shop", name, "uid-"+name, "worker-1", "checkout"))
+	}
+	v := ProjectStorage(stGraph(nodes, nil), appScope(nil, nil, nil, []string{"checkout"}))
+	assert.Len(t, v.Nodes, 3)
+	assert.Empty(t, v.Edges)
+}
+
+func TestProjectStorage_UnknownApplicationIsNotDrawn(t *testing.T) {
+	pod := appPod("shop", "orders-0", "uid-o", "worker-1", "checkout")
+	v := ProjectStorage(stGraph([]GraphNode{pod}, nil), appScope(nil, nil, nil, []string{"typo"}))
+	assert.Empty(t, v.Nodes)
+	assert.Empty(t, v.Edges)
+}
+
+func TestProjectStorage_NamespaceFilterNarrowsApplicationRoot(t *testing.T) {
+	ctrl, aggr, svm := stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01"), stSVM("svm_shop")
+	shopPVC, platPVC := appPVC("shop", "s-data", ""), appPVC("platform", "p-data", "")
+	shop := appPod("shop", "orders-0", "uid-s", "worker-1", "checkout")
+	plat := appPod("platform", "queue-0", "uid-p", "worker-2", "checkout")
+	claimless := appPod("platform", "idle-0", "uid-i", "", "checkout")
+	n1, n2 := stNode("worker-1"), stNode("worker-2")
+	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), shopPVC.ID(), shop.ID(), n1.ID(), stIO(1), 1)
+	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svm.ID(), platPVC.ID(), plat.ID(), n2.ID(), stIO(1), 1)...)
+	g := stGraph([]GraphNode{ctrl, aggr, svm, shopPVC, platPVC, shop, plat, claimless, n1, n2}, edges)
+
+	ids := viewIDs(ProjectStorage(g, appScope([]string{"shop"}, nil, nil, []string{"checkout"})))
+	assert.True(t, ids[shop.ID()])
+	assert.False(t, ids[plat.ID()])
+	assert.False(t, ids[claimless.ID()], "a materialised root still honours namespace")
+}
+
+func TestProjectStorage_ApplicationClaimIsNeverMaterialised(t *testing.T) {
+	pvc := appPVC("shop", "idle-data", "checkout")
+	v := ProjectStorage(stGraph([]GraphNode{pvc}, nil), appScope(nil, nil, nil, []string{"checkout"}))
+	assert.Empty(t, v.Nodes, "an unmounted claim is a retention hit only")
+	assert.Empty(t, v.Edges)
 }

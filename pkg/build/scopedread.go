@@ -35,12 +35,22 @@ const (
 // families are each scoped on a DIFFERENT set of names), the slot its merged
 // vector lands in, its error class, and — for legOptionalTracking only — the
 // flag to set when any chunk of it degraded.
+//
+// render, when non-nil, replaces promql.RenderScoped for this family's
+// chunks. nil keeps today's identity-label scope. budgetOverhead is the
+// per-value argument of promql.ChunkScopeWithOverhead (zero for an
+// identity-label scope). budgetReserve is subtracted once from the byte
+// budget before chunking — the tracking-id wrapper, which a chunk pays once
+// rather than once per value.
 type scopedFamily struct {
-	query    promql.Query
-	dst      *model.Vector
-	scope    []string
-	mode     legMode
-	degraded *bool
+	query          promql.Query
+	dst            *model.Vector
+	scope          []string
+	mode           legMode
+	degraded       *bool
+	render         func(chunk []string) (string, bool)
+	budgetOverhead int
+	budgetReserve  int
 }
 
 // issueScopedFamilies issues several families, each restricted to its OWN
@@ -74,7 +84,11 @@ func issueScopedFamilies(
 		if len(fam.scope) == 0 {
 			continue
 		}
-		chunksByFamily[fi] = promql.ChunkScope(fam.scope, opts.qosScopeBatchBytes())
+		budget := opts.qosScopeBatchBytes() - fam.budgetReserve
+		if budget < 1 {
+			budget = 1
+		}
+		chunksByFamily[fi] = promql.ChunkScopeWithOverhead(fam.scope, budget, fam.budgetOverhead)
 	}
 
 	parts := make([][]model.Vector, len(families))
@@ -90,7 +104,7 @@ func issueScopedFamilies(
 	for fi, fam := range families {
 		for ci, chunk := range chunksByFamily[fi] {
 			wave.Go(func() error {
-				out, degraded, err := issueScopedChunk(wctx, callerCtx, q, fam.query, window, end, opts.LabelKeys, sel, chunk, fam.mode)
+				out, degraded, err := issueScopedChunk(wctx, callerCtx, q, fam.query, window, end, opts.LabelKeys, sel, chunk, fam.mode, fam.render)
 				if err != nil {
 					return err
 				}
@@ -137,6 +151,7 @@ func issueScopedChunk(
 	sel promql.Selector,
 	values []string,
 	mode legMode,
+	render func(chunk []string) (string, bool),
 ) (out model.Vector, degraded bool, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -149,7 +164,15 @@ func issueScopedChunk(
 		}
 	}()
 
-	rendered, ok := promql.RenderScoped(name, window, keys, sel, values)
+	var (
+		rendered string
+		ok       bool
+	)
+	if render != nil {
+		rendered, ok = render(values)
+	} else {
+		rendered, ok = promql.RenderScoped(name, window, keys, sel, values)
+	}
 	if !ok {
 		// Unreachable for a non-empty chunk of a scopeable family. Failing is
 		// the only honest answer: an unscoped fallback would read the whole

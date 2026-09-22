@@ -165,7 +165,7 @@ catalog. `/v1/storage-graph` reads less: it never issues
 `kube_pod_container_info` or the four Service / EndpointSlice families (its
 body carries no `data.containers` and no service node), and it reads pods,
 Kubernetes nodes and controllers **by reference**: `kube_pod_info` /
-`kube_pod_owner` only for pods a claim binding names or a `pod=` root names;
+`kube_pod_owner` only for pods a claim binding names, a `pod=` root names, or — when the request roots at `application=<argo-app>` — the pods that recovery read found for that Application (loaded even when they mount nothing). An `application=` root is workload-side: a path is kept when its pod or its claim carries the Application, and it suppresses the pod-only namespace derivation. The other by-reference reads are unchanged:
 the four `kube_node_*` families only for the Kubernetes nodes those pods are
 scheduled on or a `node=` root names; and the eight controller-owner /
 controller-annotation families only for the owner names those pods' resolved

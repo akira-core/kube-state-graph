@@ -44,7 +44,8 @@ func scopedPodVectors(t *testing.T, q promql.Querier, opts Options, roots []stri
 	var mu sync.Mutex
 	done := make(chan struct{})
 	close(done)
-	err := readScopedPods(t.Context(), q, time.Minute, time.Unix(1, 0).UTC(), opts, promql.Selector{}, roots, v, &mu, done)
+	var recovered []string
+	err := readScopedPods(t.Context(), q, time.Minute, time.Unix(1, 0).UTC(), opts, promql.Selector{}, roots, nil, v, &mu, done, done, done, &recovered)
 	return v, err
 }
 
@@ -87,7 +88,7 @@ func TestReadScopedPods_RestrictedToMountingPodsAndRoots(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QPVCBindings: {bind("orders-0"), bind("orders-1"), bind("catalog-0")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"})
+	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
 	require.NoError(t, err)
 
 	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -112,7 +113,7 @@ func TestReadScopedPods_EmptyScopeIssuesNothing(t *testing.T) {
 	fixtures := map[promql.Query]model.Vector{
 		promql.QAggrStatus: {planHarvest("cluster", "ontap-prod", "node", "ontap-prod-01", "aggr", "aggr1")},
 	}
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
 	require.NoError(t, err)
 
 	f := promqlfake.New(fixtures)
@@ -146,7 +147,7 @@ func TestReadScopedPods_ClaimlessRootIsLoaded(t *testing.T) {
 		promql.QPodInfo:  {planKSM("namespace", "shop", "pod", "web-0", "uid", "uid-w0", "node", "worker-1")},
 		promql.QNodeInfo: {planKSM("node", "worker-1")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"})
+	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
 	require.NoError(t, err)
 
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)

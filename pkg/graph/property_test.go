@@ -364,11 +364,11 @@ func genStorageScope(r *rand.Rand, g *Graph) StorageScope {
 			}
 		}
 		if len(aggrs) > 0 && r.Intn(2) == 0 {
-			s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, nil)
+			s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, nil, nil)
 			return s
 		}
 		if len(svms) > 0 {
-			s, _ := NewStorageScope(nil, nil, nil, nil, nil, []string{svms[r.Intn(len(svms))]}, nil)
+			s, _ := NewStorageScope(nil, nil, nil, nil, nil, []string{svms[r.Intn(len(svms))]}, nil, nil)
 			return s
 		}
 		return StorageScope{}
@@ -386,11 +386,11 @@ func genStorageScope(r *rand.Rand, g *Graph) StorageScope {
 			}
 		}
 		if len(pods) > 0 && r.Intn(2) == 0 {
-			s, _ := NewStorageScope(nil, nil, nil, nil, nil, nil, []string{pods[r.Intn(len(pods))]})
+			s, _ := NewStorageScope(nil, nil, nil, nil, nil, nil, []string{pods[r.Intn(len(pods))]}, nil)
 			return s
 		}
 		if len(nodes) > 0 {
-			s, _ := NewStorageScope(nil, nil, nil, []string{nodes[r.Intn(len(nodes))]}, nil, nil, nil)
+			s, _ := NewStorageScope(nil, nil, nil, []string{nodes[r.Intn(len(nodes))]}, nil, nil, nil, nil)
 			return s
 		}
 		return StorageScope{}
@@ -409,10 +409,10 @@ func genStorageScope(r *rand.Rand, g *Graph) StorageScope {
 		if len(aggrs) == 0 || len(pods) == 0 {
 			return StorageScope{}
 		}
-		s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, []string{pods[r.Intn(len(pods))]})
+		s, _ := NewStorageScope(nil, nil, nil, nil, []string{aggrs[r.Intn(len(aggrs))]}, nil, []string{pods[r.Intn(len(pods))]}, nil)
 		return s
 	default:
-		s, _ := NewStorageScope(nil, nil, nil, nil, []string{"typo-aggr"}, nil, nil)
+		s, _ := NewStorageScope(nil, nil, nil, nil, []string{"typo-aggr"}, nil, nil, nil)
 		return s
 	}
 }

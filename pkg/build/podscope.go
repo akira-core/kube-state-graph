@@ -45,8 +45,10 @@ func podScope(bindings model.Vector, roots []string) []string {
 // Pods that mount no claim — in a large estate, nearly all of them — are never
 // fetched.
 //
-// It waits on the claim-binding family alone: the scope is computed from it and
-// from the request's roots, and from nothing else.
+// It waits on the claim-binding family, and — when the request carries an
+// application root — on the application recovery and on
+// kube_persistentvolumeclaim_annotations. The scope is then podScope, or
+// podScopeUnderApp when an application root narrowed the binding half.
 //
 // An empty scope issues no query at all and leaves both families unread: no pod
 // could be bound or is a root, so no pod could be drawn. That mirrors the QoS
@@ -70,20 +72,42 @@ func readScopedPods(
 	end time.Time,
 	opts Options,
 	sel promql.Selector,
-	roots []string,
+	podRoots []string,
+	applicationRoots []string,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
 	bindingsDone <-chan struct{},
+	appDone <-chan struct{},
+	pvcAnnotationsDone <-chan struct{},
+	recovered *[]string,
 ) error {
-	select {
-	case <-bindingsDone:
-	case <-ctx.Done():
-		// A sibling leg failed (or the caller went away). The group already
-		// carries that error; adding another would only mask it.
+	// A sibling leg failed (or the caller went away). The group already
+	// carries that error; adding another would only mask it.
+	wait := func(done <-chan struct{}) bool {
+		select {
+		case <-done:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	if !wait(bindingsDone) || !wait(appDone) {
+		return nil
+	}
+	if len(applicationRoots) > 0 && !wait(pvcAnnotationsDone) {
 		return nil
 	}
 
-	scope := podScope(v.PVC, roots)
+	var scope []string
+	if len(applicationRoots) > 0 {
+		var names []string
+		if recovered != nil {
+			names = *recovered
+		}
+		scope = podScopeUnderApp(v.PVC, v.PVCAnnotations, names, podRoots, applicationRoots)
+	} else {
+		scope = podScope(v.PVC, podRoots)
+	}
 	if len(scope) == 0 {
 		return nil
 	}

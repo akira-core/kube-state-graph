@@ -140,6 +140,12 @@ type topologyPlan struct {
 	// aggregate) and, because the projection UNIONS it with aggr=, its mere
 	// presence disables the restriction for the whole request.
 	svmRoot bool
+	// applicationRoots are the request's application=<name> values, sorted.
+	// Non-empty launches the recovery wave and narrows the pod scope to the
+	// pods related to those Applications (see appscope.go). The volume-label
+	// restriction ignores them: an application root is workload-side, and the
+	// projection ANDs it with the storage roots.
+	applicationRoots []string
 }
 
 // fullPlan is the /v1/graph read: every leg, every pod.
@@ -179,9 +185,10 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 		// "restricted" to a query that cannot be rendered. graph.NewStorageScope
 		// already drops them for an HTTP caller, but pkg/build is an importable
 		// engine and StorageRoots is an exported map an embedder fills itself.
-		volumeClusters: sortedNames(slices.Collect(maps.Keys(roots.ONTAPClusters))),
-		volumeAggrs:    sortedNames(slices.Collect(maps.Keys(roots.Aggrs))),
-		svmRoot:        len(roots.SVMs) > 0,
+		volumeClusters:   sortedNames(slices.Collect(maps.Keys(roots.ONTAPClusters))),
+		volumeAggrs:      sortedNames(slices.Collect(maps.Keys(roots.Aggrs))),
+		svmRoot:          len(roots.SVMs) > 0,
+		applicationRoots: sortedNames(slices.Collect(maps.Keys(roots.Applications))),
 	}
 }
 
@@ -232,9 +239,15 @@ func tallySeries(legs []topologyLeg, plan topologyPlan, v *topologyVectors) map[
 	}
 	for _, targets := range [][]scopedTarget{qosTargets(v), podTargets(v), nodeTargets(v), controllerTargets(v)} {
 		for _, t := range targets {
-			if v.ScopeIssued[t.query] {
-				raw[string(t.query)] = len(*t.dst)
+			extra, hasExtra := v.ExtraSeriesCount[t.query]
+			if !v.ScopeIssued[t.query] && !hasExtra {
+				continue
 			}
+			n := extra
+			if v.ScopeIssued[t.query] {
+				n += len(*t.dst)
+			}
+			raw[string(t.query)] = n
 		}
 	}
 	return raw

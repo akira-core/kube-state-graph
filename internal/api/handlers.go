@@ -103,7 +103,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Description
 //	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
 //	@Description
-//	@Description	**Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent.
+//	@Description	**Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
 //	@Description
 //	@Description	`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
 //	@Tags			graph
@@ -119,6 +119,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Param			aggr			query		[]string	false	"Storage root: ONTAP aggregate name."	collectionFormat(multi)
 //	@Param			svm				query		[]string	false	"Storage root: SVM name."	collectionFormat(multi)
 //	@Param			pod				query		[]string	false	"Workload root: `<namespace>/<pod-name>`."	collectionFormat(multi)	example(shop/orders-0)
+//	@Param			application		query		[]string	false	"Workload root: ArgoCD Application name, as `data.application` carries it (the tracking-id segment before the first `:`); matches a path whose pod or claim carries it; every pod resolving it is drawn even with no claim"	collectionFormat(multi)	example(checkout)
 //	@Param			X-API-Key		header		string		false	"API key. Required when the server is started with API keys configured."
 //	@Success		200				{object}	cytoscape.Body
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, invalid_scope, invalid_range)"

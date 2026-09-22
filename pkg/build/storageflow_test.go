@@ -329,7 +329,7 @@ func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
 	// claim — whose svm-pvc edge carries no claim_aggr — must not borrow it.
 	g := graph.NewGraph(nodes, edges, time.Unix(0, 0).UTC())
 
-	podRoot, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{ns + "/big-0"})
+	podRoot, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{ns + "/big-0"}, nil)
 	require.NoError(t, err)
 	view := graph.ProjectStorage(g, podRoot)
 	for _, n := range view.Nodes {
@@ -341,7 +341,7 @@ func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
 			"?pod=shop/big-0 drew %s -> %s for a FlexGroup claim", e.Source, e.Target)
 	}
 
-	aggrRoot, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	aggrRoot, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
 	require.NoError(t, err)
 	view = graph.ProjectStorage(g, aggrRoot)
 	var retained []string

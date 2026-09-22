@@ -174,6 +174,44 @@ func TestStorageGraph_Timeout504(t *testing.T) {
 	assert.Equal(t, "timeout", errField["reason"])
 }
 
+func TestStorageGraph_ApplicationRootIssuesRecovery(t *testing.T) {
+	q, captured := recordingQuerier(t)
+	s := newServerWithMocks(t, q, nil)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"application": {"checkout"}}))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	seen := captured()
+	got := seen["kube_deployment_annotations"]
+	assert.Contains(t, got, `annotation_argocd_argoproj_io_tracking_id!=""`)
+	assert.Contains(t, got, `az="zone-a"`)
+	assert.Contains(t, got, `env="prod"`)
+	assert.Contains(t, got, `annotation_argocd_argoproj_io_tracking_id=~"(?:checkout)(?::.*)?"`)
+}
+
+func TestStorageGraph_ApplicationRootSuppressesNamespaceDerivation(t *testing.T) {
+	q, captured := recordingQuerier(t)
+	s := newServerWithMocks(t, q, nil)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{
+		"pod":         {"shop/x"},
+		"application": {"y"},
+	}))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	for name, query := range captured() {
+		assert.NotContains(t, query, "namespace=", "%s must not carry a derived namespace matcher", name)
+	}
+}
+
 func TestStorageGraph_EmbedderAndServerAgree(t *testing.T) {
 	q := newMockQuerier(t, nil)
 	s := newServerWithMocks(t, q, nil)
@@ -181,11 +219,12 @@ func TestStorageGraph_EmbedderAndServerAgree(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	vals := url.Values{
-		"start": {"1746442800"},
-		"end":   {"1746446400"},
-		"az":    {"zone-a"},
-		"env":   {"prod"},
-		"aggr":  {"aggr1"},
+		"start":       {"1746442800"},
+		"end":         {"1746446400"},
+		"az":          {"zone-a"},
+		"env":         {"prod"},
+		"aggr":        {"aggr1"},
+		"application": {"checkout"},
 	}
 	resp, err := http.Get(srv.URL + "/v1/storage-graph?" + vals.Encode())
 	require.NoError(t, err)

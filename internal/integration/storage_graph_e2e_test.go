@@ -299,6 +299,57 @@ kube_node_info{cluster="c1",node="worker-empty",az="zone-a",env="prod",test=%[1]
 		"resolved through the CronJob, since the Job itself carries no annotation")
 }
 
+// TestStorageGraphApplicationRoot recovers a Deployment-managed claimless pod
+// and a mounting pod from one tracking-id, draws both, leaves the claimless
+// pod edgeless, and returns an empty body for an Application no controller names.
+func (s *GraphSuite) TestStorageGraphApplicationRoot() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	const app = "ksg-app-root"
+	s.IngestExpFmt(fmt.Sprintf(`
+kube_deployment_annotations{cluster="c1",namespace="shop",deployment="approot-web",annotation_argocd_argoproj_io_tracking_id="%[3]s:apps/Deployment:shop/approot-web",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_replicaset_owner{cluster="c1",namespace="shop",replicaset="approot-web-7d9f",owner_kind="Deployment",owner_name="approot-web",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_owner{cluster="c1",namespace="shop",pod="approot-web-abc",owner_kind="ReplicaSet",owner_name="approot-web-7d9f",owner_is_controller="true",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="approot-web-abc",uid="uid-approot-web",node="worker-approot",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_statefulset_annotations{cluster="c1",namespace="shop",statefulset="approot-orders",annotation_argocd_argoproj_io_tracking_id="%[3]s:apps/StatefulSet:shop/approot-orders",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_owner{cluster="c1",namespace="shop",pod="approot-orders-0",owner_kind="StatefulSet",owner_name="approot-orders",owner_is_controller="true",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="approot-orders-0",uid="uid-approot-orders",node="worker-approot",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="approot-orders-0",persistentvolumeclaim="approot-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="approot-data",volumename="pvc-approot",storageclass="netapp-nas",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-approot",aggr="aggr-approot",svm="svm_approot",volume="trident_pvc_approot",test=%[1]q} 1 %[2]d
+kube_node_info{cluster="c1",node="worker-approot",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+`, disc, t1, app))
+	s.Require().True(
+		s.WaitForSeries(`kube_deployment_annotations{deployment="approot-web",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the application-root deployment annotation")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	const ident = "zone-a-prod-c1"
+	body := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("application", app) })
+	byID := nodesByID(body)
+	claimless := ident + "/uid-approot-web"
+	mounting := ident + "/uid-approot-orders"
+	s.Require().Contains(byID, claimless)
+	s.Require().Contains(byID, mounting)
+	s.Equal(app, byID[claimless].Application)
+	s.Equal(app, byID[mounting].Application)
+	for _, e := range body.Elements.Edges {
+		s.NotEqual(claimless, e.Data.Source, "the claimless pod has no edge")
+		s.NotEqual(claimless, e.Data.Target, "the claimless pod has no edge")
+	}
+	mounted := false
+	for _, e := range body.Elements.Edges {
+		if e.Data.Source == mounting || e.Data.Target == mounting {
+			mounted = true
+		}
+	}
+	s.True(mounted, "the mounting pod sits on its storage path")
+
+	typo := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("application", "ksg-app-root-typo") })
+	s.Empty(typo.Elements.Nodes)
+	s.Empty(typo.Elements.Edges)
+}
+
 func (s *GraphSuite) fetchStorageGraph(base string, configure func(url.Values)) cytoscape.Body {
 	s.T().Helper()
 	resp := s.httpGet(s.storageGraphURL(base, configure))

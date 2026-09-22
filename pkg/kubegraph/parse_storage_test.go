@@ -39,6 +39,8 @@ func TestParseStorageValues_Errors(t *testing.T) {
 		{"malformed pod root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"orders-0"}}, "invalid_scope", "orders-0"},
 		{"pod empty name", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"shop/"}}, "invalid_scope", ""},
 		{"selector value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {strings.Repeat("a", 254)}}, "invalid_scope", ""},
+		{"application value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "application": {strings.Repeat("a", 300)}}, "invalid_scope", "application"},
+		{"application control character", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "application": {"check\nout"}}, "invalid_scope", "application"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -69,6 +71,12 @@ func TestParseStorageValues_HappyPath(t *testing.T) {
 	assert.Equal(t, []string{"c1"}, req.Selector.Cluster)
 	assert.Equal(t, map[string]struct{}{"aggr1": {}}, req.Scope.Roots.Aggrs)
 	assert.Len(t, req.Scope.Roots.Pods, 1)
+
+	apps := storageBase()
+	apps["application"] = []string{"checkout", "a"}
+	req, err = kubegraph.ParseStorageValues(apps)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]struct{}{"a": {}, "checkout": {}}, req.Scope.Roots.Applications)
 }
 
 func TestParseStorageValues_IgnoresEdgeTypeAndPrune(t *testing.T) {
@@ -92,7 +100,9 @@ func TestParseStorageValues_DerivesNamespaceFromPodOnlyRoots(t *testing.T) {
 		{"a storage root suppresses it", url.Values{"pod": {"shop/orders-0"}, "aggr": {"aggr1"}}, nil},
 		{"an ontap_cluster root suppresses it", url.Values{"pod": {"shop/orders-0"}, "ontap_cluster": {"ontap-prod"}}, nil},
 		{"a node root suppresses it", url.Values{"pod": {"shop/orders-0"}, "node": {"n1"}}, nil},
+		{"an application root suppresses it", url.Values{"pod": {"shop/orders-0"}, "application": {"checkout"}}, nil},
 		{"an explicit namespace wins", url.Values{"pod": {"shop/orders-0"}, "namespace": {"platform"}}, []string{"platform"}},
+		{"explicit namespace wins over an application root", url.Values{"pod": {"shop/orders-0"}, "application": {"checkout"}, "namespace": {"platform"}}, []string{"platform"}},
 		{"an empty namespace value is no namespace", url.Values{"pod": {"shop/x"}, "namespace": {""}}, []string{"shop"}},
 		{"no root derives nothing", url.Values{}, nil},
 	}
@@ -131,4 +141,28 @@ func TestParseStorageValues_DerivedNamespaceIsOrderFree(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, ra.Selector.Namespace)
 	assert.Equal(t, ra.Selector, rb.Selector)
+}
+
+func TestParseStorageValues_ApplicationRootDoesNotDeriveNamespace(t *testing.T) {
+	v := storageBase()
+	v["pod"] = []string{"shop/orders-0"}
+	v["application"] = []string{"checkout"}
+	req, err := kubegraph.ParseStorageValues(v)
+	require.NoError(t, err)
+	assert.Empty(t, req.Selector.Namespace)
+	assert.Equal(t, map[string]struct{}{"checkout": {}}, req.Scope.Roots.Applications)
+
+	bare := storageBase()
+	bare["application"] = []string{""}
+	req, err = kubegraph.ParseStorageValues(bare)
+	require.NoError(t, err)
+	assert.Nil(t, req.Scope.Roots.Applications, "a bare application= is a no-op")
+
+	explicit := storageBase()
+	explicit["pod"] = []string{"shop/orders-0"}
+	explicit["application"] = []string{"checkout"}
+	explicit["namespace"] = []string{"platform"}
+	req, err = kubegraph.ParseStorageValues(explicit)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"platform"}, req.Selector.Namespace)
 }

@@ -49,7 +49,7 @@ func TestReadScopedNodes_RestrictedToPodNodesAndRoots(t *testing.T) {
 		promql.QPVCBindings: {bind("orders-0"), bind("orders-1")},
 		promql.QPodInfo:     {podInfo("orders-0", "n1"), podInfo("orders-1", "n2")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -67,7 +67,7 @@ func TestReadScopedNodes_RootWithoutPodsIsLoaded(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QNodeInfo: {planKSM("node", "n9")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -93,7 +93,7 @@ func TestReadScopedNodes_EmptyScopeIssuesNothing(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QAggrStatus: {planHarvest("cluster", "ontap-prod", "node", "ontap-prod-01", "aggr", "aggr1")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
 	require.NoError(t, err)
 
 	tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, storageSel, storagePlan(scope.Roots))
@@ -123,7 +123,7 @@ func TestReadScopedNodes_ChunkFailureFailsBuild(t *testing.T) {
 	})
 	f.Fail = failN2
 
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 	_, err = New(f, Options{QoSScopeBatchBytes: 1}, nil, nil).
 		BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
