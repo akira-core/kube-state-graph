@@ -114,8 +114,12 @@ func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prom url: %w", err)
 	}
+	// The idle pool is sized to keep one build's scoped second waves warm: a
+	// storage build can hold two waves of pkg/build's scopeConcurrency (16)
+	// against one store at once. A smaller pool only closes the surplus after
+	// each burst for the next build to re-dial; it never caps what is in flight.
 	base := &http.Transport{
-		MaxIdleConnsPerHost: 16,
+		MaxIdleConnsPerHost: 32,
 		IdleConnTimeout:     30 * time.Second,
 	}
 	c, err := promapi.NewClient(promapi.Config{

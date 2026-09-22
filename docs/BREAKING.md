@@ -37,7 +37,7 @@ What operators may notice:
   request — alert on it from an unrooted one.
 - **The restriction is capped and falls back.** `ontap_cluster=` and `aggr=` are
   repeatable and nothing bounds how many values a request may carry, so a
-  restriction that would take more than eight queries is not applied: the leg
+  restriction that would take more than sixteen queries is not applied: the leg
   reads unrestricted, logs `storage roots did not yield a bounded volume-label
   restriction`, and returns the same body.
 - `--netapp-qos-scope-batch-bytes` now also bounds the rooted read's

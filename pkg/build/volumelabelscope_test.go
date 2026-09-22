@@ -270,7 +270,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 		// A cluster set that eats the whole budget collapses the per-chunk
 		// budget to the floor, which would otherwise put every aggregate in a
 		// query of its own. The same cap catches it.
-		_, ok = rootedVolumeLabelsChunks([]string{strings.Repeat("c", 9000)}, manyAggrRoots(9, 0), DefaultQoSScopeBatchBytes)
+		_, ok = rootedVolumeLabelsChunks([]string{strings.Repeat("c", 9000)}, manyAggrRoots(maxRootedVolumeLabelChunks+1, 0), DefaultQoSScopeBatchBytes)
 		assert.False(t, ok, "a budget collapsed to the floor")
 
 		// What a real request looks like is nowhere near it: a filer has tens
