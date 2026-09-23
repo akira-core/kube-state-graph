@@ -119,20 +119,14 @@ that accepts it. Routing narrows *which store is asked*; the matcher narrows
 backend selection. The one family that routes without a matcher is `harvest`
 (above): for it, backend selection is the *only* effect `az` has.
 
-**One build, two routing decisions: the volume hub.** A `/v1/storage-graph`
-request rooted at `ontap_cluster=`, `aggr=` or `svm=` runs in hub mode
-(`storage-graph-api`, "Storage-side roots read the claim chain through the
-volume hub"): it finds the claims on the rooted filer in every zone, so its
-`ksm`, `kubelet` and `alerts` queries are dispatched to every backend serving
-them — and render no `az` / `env` matcher — while its `harvest` queries are
-still routed by `az`. Both decisions come from ONE routing snapshot: the
-builder binds its querier through the optional
-`promql.FamilyZoneQuerierSource` upgrade,
-`QuerierForFamilyZones(sel, promql.FamilyHarvest)`, which a `*promql.Router`
-implements. Two `QuerierFor` calls could straddle a reload and read half the
-build from one table and half from another. An embedder's own `QuerierSource`
-without the upgrade still works: every zone-routed family is then routed by
-`az`, so hub mode finds claims only in the stores the request's zone reaches.
+**The volume hub routes like every other storage build.** A
+`/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=` runs
+in hub mode (`storage-graph-api`, "Storage-side roots read the claim chain
+through the volume hub"): it reads the claims FROM the rooted filer's rows, but
+every one of its queries is routed by the request's `az` and carries the
+request's matchers exactly as outside hub mode. No query reaches a store of
+another zone; a filer shared across zones is drawn with the requested zone's
+claims only.
 
 A requested zone that no backend declares yields an **empty result, not an
 error** — an empty filtered result is a legitimate empty graph. A `WARN` names

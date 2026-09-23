@@ -174,9 +174,10 @@ controller-annotation families only for the owner names those pods' resolved
 owners carry. A request rooted at `ontap_cluster=`, `aggr=` or `svm=` is read
 through the **volume hub**: the claim families are read FROM the rooted
 `volume_labels` rows (a FlexVol name embedding `pvc_<uid>` names the PV
-`pvc-<uid>`), and every Kubernetes query drops the `az` / `env` matchers, so a
-filer shared across zones or environments is drawn with every claim on it
-(`az` still selects the Harvest store). A statically provisioned PV is not
+`pvc-<uid>`), under the same `az` / `env` matchers and the same zone routing as
+every other storage request — no query reaches a store of another zone, so a
+filer shared across zones is drawn with the requested zone's claims only. A
+statically provisioned PV is not
 reached from a storage root — see
 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md).
 

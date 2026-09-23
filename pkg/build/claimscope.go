@@ -266,23 +266,25 @@ func readHubClaimInfo(
 		// Under a cluster= / namespace= filter an empty claim read is the
 		// filter's ordinary outcome — the rooted filer serves other namespaces
 		// — not a whole-hub miss, so it is not worth an operator's attention.
+		// az / env are not such a filter: every storage request carries them.
+		narrowed := len(sel.Cluster) > 0 || len(sel.Namespace) > 0
 		level := slog.LevelWarn
-		if sel.Active() {
+		if narrowed {
 			level = slog.LevelDebug
 		}
 		slog.Log(ctx, level, "storage_root_claim_miss",
 			"reason", "no_claim",
 			"candidates", len(cands),
-			"selector_active", sel.Active())
+			"narrowed", narrowed)
 	}
 	return nil
 }
 
 // hubClaimKey is one claim as the hub's claim-info read names it. The zone and
-// environment labels are part of it because a hub-mode read spans every zone
-// and environment: a claim name is unique only per namespace, and a raw
-// cluster name is reused across zones, so (az, env, cluster) is the claim's
-// cluster identity — the key every structure of the parse is built on. The
+// environment labels are part of it because (az, env, cluster) is the claim's
+// cluster identity — the key every structure of the parse is built on — and a
+// claim name is unique only per namespace of one cluster. The request's az /
+// env matchers pin one pair today; the key does not rely on that. The
 // cluster is bucketed exactly as the parse buckets it (bucketCluster): an
 // absent label and a literal `unknown` are one cluster there, so they must be
 // one here, or the filter would drop a row the parse joins.

@@ -89,9 +89,8 @@ type Router struct {
 }
 
 var (
-	_ Querier                 = (*Router)(nil)
-	_ QuerierSource           = (*Router)(nil)
-	_ FamilyZoneQuerierSource = (*Router)(nil)
+	_ Querier       = (*Router)(nil)
+	_ QuerierSource = (*Router)(nil)
 )
 
 // NewRouter constructs a Router serving table t. factory may be nil, in which
@@ -210,30 +209,17 @@ func closeIdle(q Querier) {
 // snapshot is read ONCE here and closed over, which is what makes "a reload
 // does not disturb a build in flight" structural rather than best-effort.
 func (r *Router) QuerierFor(sel Selector) Querier {
-	return r.querier(r.state.Load(), normaliseValues(sel.AZ), nil)
-}
-
-// QuerierForFamilyZones is QuerierFor with the zone applied to the named
-// families only. The snapshot is read ONCE, here, exactly as QuerierFor reads
-// it, so both dispatch decisions of a build come from the same table.
-func (r *Router) QuerierForFamilyZones(sel Selector, zoned ...Family) Querier {
-	set := make(map[Family]bool, len(zoned))
-	for _, f := range zoned {
-		set[f] = true
-	}
-	return r.querier(r.state.Load(), normaliseValues(sel.AZ), set)
+	return r.querier(r.state.Load(), normaliseValues(sel.AZ))
 }
 
 // querier binds one routing snapshot and one zone set into a dispatcher. It is
-// the single place a fanoutQuerier is constructed, so QuerierFor,
-// QuerierForFamilyZones and QueryLabels cannot drift over what a bound querier
-// closes over. zoned nil applies az to every family.
-func (r *Router) querier(st *routerState, az []string, zoned map[Family]bool) *fanoutQuerier {
+// the single place a fanoutQuerier is constructed, so QuerierFor and
+// QueryLabels cannot drift over what a bound querier closes over.
+func (r *Router) querier(st *routerState, az []string) *fanoutQuerier {
 	return &fanoutQuerier{
 		table:   st.table,
 		clients: st.clients,
 		az:      az,
-		zoned:   zoned,
 		metrics: r.metrics,
 	}
 }

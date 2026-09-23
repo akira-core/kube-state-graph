@@ -37,7 +37,8 @@ Constraints that shape the approach:
 
 - A storage-exclusive-rooted request reads the Kubernetes side proportional to
   the claims on the rooted components, not to the zone.
-- Claims on a rooted filer are found in every zone and environment.
+- Every query stays inside the request's zone and environment: the same
+  backends and the same `az` / `env` matchers as any other storage request.
 - `svm=` gets the same restricted Harvest read `aggr=` has, without changing the
   owner vote.
 - Every pick (aggregate, SVM, owner, QoS, ceiling) stays the forward join's.
@@ -46,7 +47,8 @@ Constraints that shape the approach:
 
 - A `volume=` root (deferred; the hub makes it cheap to add later).
 - Changing the cross-filer / DR same-name pick rule.
-- Relaxing `az` / `env` outside hub mode, or on `/v1/graph`.
+- Finding a rooted filer's claims in other zones or environments. An earlier
+  revision did (D7 / D8 as first written); it is withdrawn — see D7.
 - Filtering root volumes out of `volume_labels` (considered, rejected: the
   extraction already ignores them, and a matcher would remove empty SVMs and
   `aggr0` from the inventory).
@@ -74,8 +76,8 @@ first-wave claim families under `az` / `env`).
 The decision is taken ONCE, before the fan-out launches
 (`topologyPlan.resolveVolumeLabelRead`), not when phase 1 returns: condition 4
 is a pure function of the roots, the match mode and the byte budget, and the
-decision also picks the request matchers (D7) and the routing snapshot (D8) of
-every Kubernetes leg, which must be known before the first of them starts. A
+decision also picks which claim families leave the first wave (D5), which must
+be known before the first of them starts. A
 build whose phase 1 would be unbounded therefore never withholds the claim
 families at all — it issues them first-wave under the original selector, which
 is exactly "today's build".
@@ -172,7 +174,7 @@ never attach a wrong one.
 | `kubelet_volume_stats_used_bytes` / `_capacity_bytes` | `persistentvolumeclaim` | loaded claim names | pvc_info | fails the build |
 
 Every claim-keyed read, every volume-label phase and owner completion fails the build on a query error, per `fail-storage-graph-on-any-leg-error` (this change is sequenced after it; `ALERTS` is the storage build's only optional leg). Each is composed
-with the family's fixed selector (if any) and the relaxed request matchers (D7).
+with the family's fixed selector (if any) and the request's matchers (D7).
 
 Claim names are unique per namespace only, so the four claim-name scopes may
 return same-named claims from other namespaces or clusters. Rows of those four
@@ -202,45 +204,31 @@ identical either way; one wide read of a one-series-per-claim family is cheaper
 than dozens of chunk round-trips. The fallback is logged at Debug with the
 family and scope size.
 
-### D7 — Relaxed selector in hub mode
+### D7 — Hub mode keeps the request's zone
 
-The build derives `hubSel = sel` with `AZ` and `Env` cleared, keeping `Cluster`
-and `Namespace`, and uses it for EVERY kube-state-metrics, kubelet and `ALERTS`
-query of the build — the claim-keyed families, the pod / node / controller waves,
-the application recovery, and the first-wave families that stay first-wave.
-Harvest queries render no request matcher in any build, so nothing changes there.
+Hub mode changes WHICH Kubernetes families the build reads and how they are
+scoped (D5), never WHERE they are read from. Every kube-state-metrics, kubelet
+and `ALERTS` query of a hub build renders the request's full selector —
+`az`, `env`, `cluster`, `namespace` — and the build dispatches through the one
+querier `QuerierFor(sel)` binds, exactly as every other storage build does. A
+claim on the rooted filer that lives in another zone or environment is
+therefore not loaded and not drawn; to see it, request that zone.
 
-Cluster identity is unaffected: `clusterResolver` composes each series' identity
-from that series' own `az` / `env` labels, so two zones' `c1` stay
-`zone-a-prod-c1` and `zone-b-prod-c1`, and `clusters[]` lists both.
+An earlier revision cleared `az` / `env` on those queries and routed them to
+every backend, so a filer shared across zones drew every zone's claims. It was
+withdrawn before release: operators require that a request queries only the
+backends of its own `az` / `env`. Keeping the zone also removed three
+consequences that revision had to manage — a storage-rooted request failing
+when ANY zone's store was down, other zones' alerts reaching the overlay, and
+other zones' same-named `pod=` / `node=` / `application=` roots being drawn.
 
-`selector_family_empty` and every `Selector.Reaches` check use `hubSel`.
+### D8 — No per-family zone routing
 
-### D8 — One routing snapshot, zone applied to `harvest` only
-
-`b.src.QuerierFor(sel)` binds one snapshot with `az` for every family. Hub mode
-needs `az` for `harvest` and no `az` for `ksm`, `kubelet`, `alerts`. Two
-`QuerierFor` calls would load two snapshots and can straddle a reload, breaking
-routing D2 ("the build cannot probe a different set of stores than it read
-from").
-
-New OPTIONAL upgrade in `pkg/promql`:
-
-```go
-type FamilyZoneQuerierSource interface {
-    QuerierSource
-    // QuerierForFamilyZones binds ONE routing snapshot. Families in zoned
-    // dispatch by sel.AZ; every other family dispatches with no zone.
-    QuerierForFamilyZones(sel Selector, zoned ...Family) Querier
-}
-```
-
-`*Router` implements it by giving the bound `fanoutQuerier` a per-family zone
-decision. `Builder.buildStorage` type-asserts for it in hub mode and falls back
-to `QuerierFor(sel)` for a plain `QuerierSource` (zone routing everywhere —
-matchers still relaxed, so cross-zone discovery is limited to the stores the
-zone reaches) and to the plain `Querier` otherwise. Same pattern as
-`QuerierSource`, `Prober`, `RouterMetrics`, `SeriesMetrics`.
+With D7 as it stands, one `QuerierFor(sel)` routes every family by the
+request's `az`, Harvest included. The optional
+`promql.FamilyZoneQuerierSource` upgrade (one snapshot, `az` applied to named
+families only) that the withdrawn revision added has no caller and is removed;
+`pkg/promql` is as it was before this change.
 
 ### D9 — Wave wiring and critical path
 
@@ -273,17 +261,21 @@ failures that are silent today:
   — phase 1 returned rows with a `volume` and none produced a candidate
   (FlexVol naming does not embed `pvc_`, e.g. a Trident `nameTemplate`);
 - `slog.Warn("storage_root_claim_miss", "reason", "no_claim", "candidates", m)`
-  — candidates were produced and the claim-info read returned none (claims live in
-  a store the build does not reach, or PVs were renamed).
+  — candidates were produced and the claim-info read returned none (the filer
+  serves claims of another zone or environment only, or PVs were renamed). Under a
+  `cluster=` / `namespace=` filter the same outcome is the filter working, and is
+  logged at Debug instead.
 
 Counts of volumes, candidates, claims and bindings are also logged at Debug on
 every hub build.
 
 ### D11 — Alert matching agrees on zone
 
-D7 drops `az` / `env` from `ALERTS`, so a hub build reads every zone's firing
-alerts while its Harvest read stays in the requested zone (D8). The Kubernetes
-kinds were already safe: a cluster-qualified alert resolves through
+A build can hold same-named objects and alerts from several zones: an
+unfiltered `GET /v1/graph` reads every zone, and a catch-all alerting or
+Harvest backend answers for every zone under any `?az=`. (The withdrawn D7
+revision made every hub build such a build; the rule stays for the others.)
+The Kubernetes kinds were already safe: a cluster-qualified alert resolves through
 `clusterResolver.identify`, which composes the identity from the ALERT's own
 `az` / `env`, so a zone-b alert cannot find a zone-a pod. The NetApp kinds were
 not — `matchAggr` and the controller side of `matchNodeShaped` compare the raw
@@ -306,10 +298,9 @@ configured `LabelKeys` and:
   the pair (the Kubernetes candidates need no check there — see above);
 - filters the no-`cluster` uniqueness candidates of every kind to those whose
   zone is unknown or agrees, BEFORE `matchUnique`, so a same-named object in
-  another zone neither absorbs the alert nor makes it ambiguous. This also
-  covers the Kubernetes regression the relaxed read introduced: a request-zone
-  pod whose alert carries no `cluster` stayed unique in a single-zone build and
-  turned ambiguous once hub mode loaded another zone's same-named pod.
+  another zone neither absorbs the alert nor makes it ambiguous — which, on an
+  unfiltered `GET /v1/graph`, turns a no-`cluster` alert on a pod whose name
+  another zone reuses from ambiguous (dropped) into matched.
 
 Unknown never excludes: an alert with no pair, or a candidate whose series
 carried none, falls back to the label comparison. That keeps the
@@ -323,10 +314,10 @@ zone.
 
 Alternatives rejected:
 
-- **Filter NetApp matches on the REQUEST's `az` / `env` in hub mode.** Correct
-  only while the Harvest backends are zone-declared; a catch-all Harvest backend
-  returns every zone's filers and the filter would drop their alerts. It also
-  leaves the no-`cluster` Kubernetes regression in place.
+- **Filter NetApp matches on the REQUEST's `az` / `env`.** Correct only while
+  the Harvest backends are zone-declared; a catch-all Harvest backend returns
+  every zone's filers and the filter would drop their alerts. It also does
+  nothing for an unfiltered `GET /v1/graph`, which has no request zone.
 - **Compose a NetApp identity `<az>-<env>-<ontap_cluster>` into the node ids.**
   Solves cross-zone filer-name reuse too, but moves every NetApp id, the PVC
   `labels.aggr` value and every golden, for an estate where filer names do not
@@ -342,32 +333,20 @@ Alternatives rejected:
 - [Operator uses a custom `--volume-name-prefix` or Trident `nameTemplate`] →
   Extraction yields nothing; D10 `no_pv_candidate` names it. Same class as the
   existing forward-derivation blind spots.
-- [Cross-zone bodies break the "one estate per body" statement] → BREAKING note;
-  scoped to hub mode; `clusters[]` lists every identity drawn.
+- [A filer shared across zones draws only the requested zone's claims] →
+  Accepted (D7): a request never reaches another zone's stores. Request each
+  zone to see its claims on the filer.
 - [SVM spread over every aggregate makes owner completion read nearly the whole
   filer] → No worse than today, where `svm=` reads the whole filer unrestricted.
 - [Large `ontap_cluster=` root inflates claim scopes] → D6 bound falls back to
   one unscoped-and-filtered read per family.
 - [One extra sequential round-trip] → Accepted; the Kubernetes waves shrink from
   zone-wide to claim-proportional.
-- [Relaxed `ALERTS` reads every zone's firing alerts] → Firing-only, small; alerts
-  still attach only to loaded entities, and D11 keeps another zone's alert off a
-  same-named NetApp entity or no-`cluster` Kubernetes object. The overlay now
-  depends on every zone's alert store; `ALERTS` stays optional, so an outage
-  there degrades the overlay rather than failing the build.
-- [Hub mode's Kubernetes reads fan out to every zone's backend and fail closed]
-  → A storage-rooted request now fails when ANY zone's kube-state-metrics or
-  kubelet store is down, not only the requested zone's. Accepted: a partial
-  fan-out would draw a plausible, smaller, wrong body — the routing D6 rule.
-  The 502 names the failing family; the backend shows in
-  `kube_state_graph_backend_query_failures_total{backend}`.
-- [An embedder's `QuerierSource` lacks the upgrade] → Falls back to zone routing
-  everywhere; body correct for the zone, cross-zone discovery lost.
 - [Claim-binding exporter labels only `claim_name`] → Out of the documented
   contract; hub mode draws no path for it. Noted in the preconditions doc.
 
 ## Migration Plan
 
 No flag. Deploy; storage-rooted requests switch to hub mode. Rollback is a
-revert; there is no persisted state. Clients that assumed one zone per storage
-body must read `clusters[]` / `labels.cluster` instead.
+revert; there is no persisted state. A storage body still describes the
+request's zone and environment only.

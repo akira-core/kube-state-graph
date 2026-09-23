@@ -128,8 +128,9 @@ does not scan the zone's claims: it reads the rooted `volume_labels` rows first
 and derives candidate PersistentVolume names from their `volume` label — every
 suffix that starts with `pvc_` at the start of the name or right after a `_`,
 with `_` rewritten to `-` (`trident_pvc_ab12_cd34` → `pvc-ab12-cd34`). Only
-claims bound to a candidate PV are read, in every zone and environment the
-routing table reaches (the request's `az` still selects the Harvest store). The
+claims bound to a candidate PV are read, under the request's `az` / `env`
+matchers and from the backends its `az` selects — a filer shared across zones
+is drawn with the requested zone's claims only. The
 configured derivation above still decides every pick; extraction only decides
 which claims are loaded. That adds a precondition the forward join does not
 have:
@@ -168,9 +169,8 @@ entity-naming series (`volume_labels`, `aggr_*`, `node_*`, `system_node_*` — n
 the QoS families), and an alert naming that filer's aggregate or controller
 attaches only when its own `az` / `env` pair is one of them. This keeps another
 zone's alert about an identically named filer off this one, which matters
-whenever a build reads alerts from zones whose Harvest stores it did not read —
-every `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=`
-does. A filer whose series carry no pair, or an alert without one, matches on
+whenever one build holds several zones' filers or alerts — an unfiltered
+`/v1/graph`, or a catch-all alerting or Harvest backend. A filer whose series carry no pair, or an alert without one, matches on
 the ONTAP cluster name alone, exactly as before. Only series carrying BOTH
 labels count; a half-stamped series is ignored.
 

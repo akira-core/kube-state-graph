@@ -174,10 +174,9 @@ D9 — the Harvest tail is unchanged):
 ```
 
 Critical path: 6 round-trips in hub mode (4 for an unrooted request). Every
-kube-state-metrics, kubelet and `ALERTS` query of a hub build carries the
-request's `cluster` / `namespace` matchers and NO `az` / `env` matcher, and is
-dispatched to every backend serving its family, while the Harvest legs are
-still routed by `az` — both decisions from one routing snapshot.
+query of a hub build carries the request's matchers and is routed by the
+request's `az` exactly as outside hub mode — no query reaches a store of another
+zone.
 
 **The storage build fails closed.** On `/v1/storage-graph` a query error of any
 family — every Harvest leg, both kubelet volume-stats legs, every scoped
@@ -570,8 +569,8 @@ The check applies to the cluster-qualified aggregate and controller lookups
 identity) and removes other-zone candidates BEFORE the missing-`cluster`
 uniqueness test, so a same-named object in another zone neither absorbs an
 alert nor makes it ambiguous. An unknown zone on either side never excludes.
-It matters most in a hub-mode storage build, whose `ALERTS` read spans every
-zone while its Harvest read stays in the requested one.
+It matters wherever one build holds several zones' objects or alerts — an
+unfiltered `/v1/graph`, or a catch-all alerting or Harvest backend.
 
 Operator precondition: the alerting store MUST stamp the same `az` / `env`
 external labels as kube-state-metrics, or its alerts vanish under those

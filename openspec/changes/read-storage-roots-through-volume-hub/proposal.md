@@ -11,18 +11,12 @@ claim lives on the rooted filer. The pod, Kubernetes-node and controller waves
 then scale with the zone, not with the answer, and the projection discards almost
 all of it.
 
-The same shape produces a wrong-looking answer. A filer is routinely shared by
-Kubernetes clusters in several zones or environments, but `az` / `env` are
-required and single-valued, so `?ontap_cluster=X` draws X's aggregates and SVMs
-as roots and draws NO path whenever the claims on X belong to a different zone or
-environment than the one the request named. Operators read that as "the graph
-cannot trace a filer back to its pods".
-
 `volume_labels` already carries every storage-side coordinate in one row
 (`cluster`, `node`, `aggr`, `svm`, `volume`), and a dynamically provisioned PV is
 named `pvc-<claim UID>` — a name that is recoverable from the FlexVol name and
 unique across every cluster. The rooted Harvest rows can therefore name the claims
-directly, and the claim chain can be read forward from them, in every zone.
+directly, and the claim chain can be read forward from them — still inside the
+request's zone and environment.
 
 ## What Changes
 
@@ -44,13 +38,12 @@ directly, and the claim chain can be read forward from them, in every zone.
    `persistentvolumeclaim` to the loaded claims. All five leave the first wave.
    When a scope would exceed a fixed number of chunks, the family is read with no
    scope and filtered in the reader instead.
-4. **BREAKING (storage-graph, hub mode only): `az` / `env` no longer bound the
-   Kubernetes side.** In hub mode every kube-state-metrics, kubelet and `ALERTS`
-   query drops the `az` / `env` matchers and is dispatched to every backend
-   serving its family; `az` keeps selecting the `harvest` backends. A filer shared
-   across zones or environments is drawn with every claim on it. `cluster` and
-   `namespace` keep narrowing as today. `az` and `env` stay required and
-   single-valued on the request.
+4. **Hub mode stays in the request's zone.** Every query of a hub build carries
+   the request's `az` / `env` matchers where it did before and is sent only to the
+   backends the request's `az` selects, exactly as outside hub mode. A filer
+   shared across zones is drawn with the requested zone's claims only. (An
+   earlier revision of this change read every zone; it was withdrawn before
+   release — design D7.)
 5. **`svm=` is restricted too.** Phase 1 of the Harvest read gains a
    `{svm=~…}` query (AND-ed with `ontap_cluster=` when present), unioned with the
    `aggr=` / cluster query. A new **owner-completion** phase re-reads
@@ -67,13 +60,13 @@ directly, and the claim chain can be read forward from them, in every zone.
 8. **Hub coverage signal.** A new aggregated warning reports when the rooted
    Harvest rows yielded no PV candidate, or candidates that named no claim — the
    case that is silent today.
-9. **Alert matching agrees on zone.** Because hub mode reads every zone's
-   `ALERTS`, an alert's `az` / `env` pair must agree with the zone of the node it
-   attaches to. NetApp controllers and aggregates take their zone from the
+9. **Alert matching agrees on zone.** An alert's `az` / `env` pair must agree
+   with the zone of the node it attaches to, wherever one build holds several
+   zones' objects or alerts (an unfiltered `/v1/graph`, a catch-all backend). NetApp controllers and aggregates take their zone from the
    `az` / `env` their Harvest series carry, Kubernetes objects from their cluster
    identity; a known, different zone never matches, and an unknown one falls back
-   to today's label comparison. Also fixes a no-`cluster` alert on a request-zone
-   pod turning ambiguous once another zone's same-named pod is loaded.
+   to today's label comparison. A no-`cluster` alert on a pod whose name another
+   zone reuses resolves by zone instead of being dropped as ambiguous.
 
 **Sequencing.** This change goes AFTER `fail-storage-graph-on-any-leg-error`.
 That change renames three `storage-graph-api` requirements this change modifies
@@ -90,19 +83,17 @@ None.
 
 ### Modified Capabilities
 
-- `storage-graph-api`: **Storage-flow graph endpoint** — `az` / `env` stop
-  bounding the Kubernetes side in hub mode. **Storage build reads only what the body
+- `storage-graph-api`: **Storage build reads only what the body
   draws** — the five claim-keyed families leave the unrestricted class in hub mode.
   **Storage-side roots restrict the Harvest topology read** (replaced by **Storage-side roots narrow the Harvest topology read per component**) — `svm=` is restricted
   with owner completion, `node=` no longer disables the restriction beside a
   storage-exclusive root. New requirement **Storage-side roots read the claim chain
-  through the volume hub** — extraction, claim-keyed scopes, selector relaxation,
-  routing, bound fallback, static-PV limitation, coverage signal.
-- `cluster-topology-source`: **Topology series consumed**, **Request-scoped
-  upstream selectors**, **Backend routing composes with request-scoped selectors**
-  and **Application-rooted recovery reads of the owner and annotation families** —
-  hub mode drops the `az` / `env` matchers and `az` routing on the Kubernetes
-  families, and reads the claim families by reference.
+  through the volume hub** — extraction, claim-keyed scopes, unchanged matchers
+  and routing, bound fallback, static-PV limitation, coverage signal.
+  **Application roots compose with the Harvest restriction** — citation of the
+  renamed requirement.
+- `cluster-topology-source`: **Topology series consumed** — a hub-mode storage
+  build reads the claim families by reference.
 - `alert-overlay`: **Label-set matching to graph nodes** — a zone-agreement rule
   over the alert's `az` / `env` and the candidate node's zone.
 - `netapp-storage-graph`: **Harvest legs under request-scoped selectors** — the
@@ -120,13 +111,11 @@ None.
   bound fallback and reader-side filter.
 - `pkg/build/topology.go` — wave wiring: claim families gated on phase 1, pods
   gated on the claim families.
-- `pkg/build/build.go` — relaxed selector and routing in hub mode.
-- `pkg/build/alerts.go`, `pkg/build/netapp.go` — per-ONTAP-cluster zone sets and
+- `pkg/build/alerts.go`, `pkg/build/topology.go` — per-ONTAP-cluster zone sets and
   the zone-agreeing alert match.
 - `pkg/promql` — `scopedLabel` entries for the five claim-keyed families; an
-  SVM-rooted and an aggregate-completion renderer for `volume_labels`; an optional
-  querier-source upgrade that binds ONE routing snapshot with `az` applied to the
-  `harvest` family only.
+  SVM-rooted and an aggregate-completion renderer for `volume_labels`. Routing is
+  unchanged.
 - Docs: `docs/BREAKING.md`, `docs/upstream-metrics.md`,
   `docs/netapp-harvest-preconditions.md`, `docs/upstream-backend-routing.md`,
   `README.md`, `README.zh-tw.md`, `CLAUDE.md`, OpenAPI description of

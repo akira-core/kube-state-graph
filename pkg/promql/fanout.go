@@ -120,19 +120,7 @@ type fanoutQuerier struct {
 	table   *Table
 	clients map[string]Querier // backend name → client
 	az      []string
-	// zoned, when non-nil, names the only families az routes; every other
-	// family dispatches with no zone (QuerierForFamilyZones). Nil routes
-	// every zone-routable family by az, which is QuerierFor.
-	zoned   map[Family]bool
 	metrics Metrics
-}
-
-// zonesFor is the zone set family fam is selected by.
-func (f *fanoutQuerier) zonesFor(fam Family) []string {
-	if f.zoned != nil && !f.zoned[fam] {
-		return nil
-	}
-	return f.az
 }
 
 // Instant resolves the query's family from the hardcoded classification
@@ -158,8 +146,7 @@ func (f *fanoutQuerier) Instant(ctx context.Context, name, query string, ts time
 // rather than substitute for one another. Instant and QueryLabels share this
 // core so a change to zone selection or merge semantics moves both paths.
 func (f *fanoutQuerier) issue(ctx context.Context, fam Family, name, query string, ts time.Time) (model.Vector, error) {
-	az := f.zonesFor(fam)
-	selected := f.table.Select(fam, az)
+	selected := f.table.Select(fam, f.az)
 	if len(selected) == 0 {
 		// Two different situations reach here, and they deserve different log
 		// levels.
@@ -185,7 +172,7 @@ func (f *fanoutQuerier) issue(ctx context.Context, fam Family, name, query strin
 		slog.WarnContext(ctx, "no upstream backend serves this query for the requested zones",
 			"query_name", name,
 			"family", string(fam),
-			"az", az,
+			"az", f.az,
 		)
 		return model.Vector{}, nil
 	}

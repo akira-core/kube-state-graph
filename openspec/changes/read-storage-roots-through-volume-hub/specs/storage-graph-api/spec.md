@@ -10,7 +10,7 @@ A `/v1/storage-graph` build SHALL be in **hub mode** iff it carries at least one
 
 **Bounded claim scopes.** When a claim-keyed family's restriction would take more than a fixed maximum number of queries, the build SHALL issue that family once with no restriction — its fixed selector and the request matchers only — and SHALL keep only the rows the restriction would have admitted. The body SHALL be identical either way.
 
-**Relaxed request matchers.** In hub mode every kube-state-metrics, kubelet and `ALERTS` query of the build — first wave, claim-keyed reads, pod, Kubernetes-node and controller reads, and the application recovery — SHALL carry the request's `cluster` and `namespace` matchers and SHALL NOT carry the `az` or `env` matcher, and SHALL be dispatched to every backend serving its family regardless of `az`. The Harvest queries SHALL still be dispatched to the backends `az` selects. Both dispatch decisions SHALL be taken from one routing snapshot for the whole build. Cluster identities SHALL still be composed from each series' own zone and environment labels, so a cluster name reused across zones stays distinct.
+**Request matchers and routing are unchanged.** Hub mode changes which Kubernetes families the build reads and how they are scoped, never where they are read from: every kube-state-metrics, kubelet and `ALERTS` query of a hub-mode build — first wave, claim-keyed reads, pod, Kubernetes-node and controller reads, and the application recovery — SHALL carry the request's `az`, `env`, `cluster` and `namespace` matchers exactly as outside hub mode, and every query of the build, the Harvest queries included, SHALL be dispatched only to the backends the request's `az` selects. A claim on the rooted filer that lives in another zone or environment SHALL therefore not be loaded and SHALL NOT be drawn.
 
 **Static PersistentVolumes.** A claim bound to a PersistentVolume whose name yields no candidate — a statically provisioned PV, or a provisioner configured with a non-`pvc` volume-name prefix — SHALL NOT be found from a storage root, even when the forward join would match it. `/v1/graph` and every build outside hub mode SHALL still join it.
 
@@ -59,12 +59,17 @@ A `/v1/storage-graph` build SHALL be in **hub mode** iff it carries at least one
 #### Scenario: A large claim scope falls back to a filtered read
 
 - **WHEN** a client roots at `ontap_cluster=` on a filer whose candidates would take more claim-info queries than the maximum
-- **THEN** `kube_persistentvolumeclaim_info` is issued once with no `volumename` restriction and no `<az-key>` / `<env-key>` matcher, only the candidate rows are kept, and the body is byte-identical to the body the chunked restriction would have produced
+- **THEN** `kube_persistentvolumeclaim_info` is issued once with no `volumename` restriction and only the request's matchers, only the candidate rows are kept, and the body is byte-identical to the body the chunked restriction would have produced
 
 #### Scenario: A request outside hub mode reads claims as before
 
 - **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0`, or `?az=zone-a&env=prod&node=ontap-prod-01`, or roots at `aggr=` under the `contains` match mode
 - **THEN** the claim families are issued in the first wave with `<az-key>="zone-a",<env-key>="prod"` and no claim-keyed restriction, exactly as before this requirement
+
+#### Scenario: A storage-exclusive root stays in the request's zone
+
+- **WHEN** two backends serve `ksm` with `zones: [zone-a]` and `zones: [zone-b]`, two backends serve `harvest` likewise, filer `ontap-prod` holds FlexVols whose claims live in a `zone-a` and a `zone-b` cluster, and a client sends `?az=zone-a&env=prod&ontap_cluster=ontap-prod`
+- **THEN** no query is issued to either `zone-b` backend, every kube-state-metrics, kubelet and `ALERTS` query carries `<az-key>="zone-a",<env-key>="prod"`, the body contains the `zone-a` claim's complete path and not the `zone-b` claim, and `clusters` lists `zone-a` identities only
 
 ### Requirement: Storage-side roots narrow the Harvest topology read per component
 
@@ -196,49 +201,6 @@ When phase 1 matched no claim, phase 2 SHALL NOT be issued.
 
 ## MODIFIED Requirements
 
-### Requirement: Storage-flow graph endpoint
-
-The server SHALL expose `GET /v1/storage-graph` returning a storage-flow graph for a caller-specified `[start, end]` window, in the same `{ apiVersion, clusters, elements: { nodes, edges } }` Cytoscape.js shape as `GET /v1/graph`. `start` and `end` SHALL be required and validated exactly as for `/v1/graph` (RFC 3339 or Unix seconds; `end > start`; `missing_start` / `missing_end` / `invalid_start` / `invalid_end` / `invalid_range`). The endpoint SHALL sit behind the same API-key authentication, the same per-build timeout (`--build-timeout` → 504 `timeout`), and the same upstream / outside-retention / cancelled error mapping as `/v1/graph`, and SHALL be described in the served OpenAPI document.
-
-`az` and `env` SHALL be **required** and **single-valued**: a request lacking either SHALL be rejected 400 with `reason: "missing_az"` / `reason: "missing_env"`, and a request repeating either SHALL be rejected 400 with `reason: "invalid_scope"`. Outside hub mode (see "Storage-side roots read the claim chain through the volume hub"), the two values SHALL be pushed upstream exactly as the `/v1/graph` selector-level `az` / `env` dimensions are (matchers on the Kubernetes families, backend selection for Harvest), so the body describes one estate. In hub mode — a request carrying an `ontap_cluster=`, `aggr=` or `svm=` root whose Harvest topology read is restricted — `az` SHALL still select the `harvest` backends, but neither value SHALL be rendered as a matcher on, or select the backends of, any kube-state-metrics, kubelet or `ALERTS` query: a filer shared across zones or environments is drawn with the claims of every zone and environment that use it. The two values stay required and single-valued in both modes. `cluster` and `namespace` SHALL be accepted as optional, repeatable narrowing filters with `/v1/graph` semantics. `prune` SHALL be ignored (this endpoint applies its own reachability projection, never the connectivity prune). `edge_type` — withdrawn from `/v1/graph` as well, so no longer a parameter of any endpoint — and any other unknown parameter SHALL be ignored without error, whatever value they carry.
-
-The top-level `clusters` array SHALL list the Kubernetes cluster identities present on emitted `pod` / `node` / `pvc` nodes and never an ONTAP cluster name.
-
-#### Scenario: Successful request
-
-- **WHEN** a client sends `GET /v1/storage-graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z&az=zone-a&env=prod&aggr=aggr1`
-- **THEN** the server returns 200 with a body containing exactly `apiVersion: "v1"`, `clusters`, and `elements` with `nodes` and `edges`
-
-#### Scenario: Missing az
-
-- **WHEN** a client sends `GET /v1/storage-graph?start=...&end=...&env=prod`
-- **THEN** the server returns 400 with `reason: "missing_az"`
-
-#### Scenario: Repeated env
-
-- **WHEN** a client sends `GET /v1/storage-graph?start=...&end=...&az=zone-a&env=prod&env=dev`
-- **THEN** the server returns 400 with `reason: "invalid_scope"` and a message naming `env`
-
-#### Scenario: Zone and environment reach upstream
-
-- **WHEN** a client sends `?az=zone-a&env=prod` with no `ontap_cluster=`, `aggr=` or `svm=` root
-- **THEN** every kube-state-metrics, kubelet and `ALERTS` query carries `<az-key>="zone-a",<env-key>="prod"`, every Harvest query is issued only to the `harvest` backends whose `zones` include `zone-a` (or catch-alls) with no matcher, and no series from another zone or environment contributes to the body
-
-#### Scenario: Unauthenticated request rejected when keys configured
-
-- **WHEN** API keys are configured and a client sends `GET /v1/storage-graph` without `X-API-Key`
-- **THEN** the server returns 401 exactly as `/v1/graph` would
-
-#### Scenario: Graph-only and withdrawn parameters are ignored
-
-- **WHEN** a client sends `GET /v1/storage-graph?start=...&end=...&az=zone-a&env=prod&prune=false&edge_type=not-a-type`
-- **THEN** the server returns 200 with a body byte-identical to the same request without `prune` and `edge_type` — neither value is validated, and neither narrows or widens the body
-
-#### Scenario: A storage-exclusive root reads claims in every zone
-
-- **WHEN** two backends serve `ksm` with `zones: [zone-a]` and `zones: [zone-b]`, one backend serves `harvest` with `zones: [zone-a]`, filer `ontap-prod` holds FlexVol `trident_pvc_ab12` whose claim lives in a `zone-b` cluster, and a client sends `?az=zone-a&env=prod&ontap_cluster=ontap-prod`
-- **THEN** every Harvest query is issued to the `zone-a` `harvest` backend only, every kube-state-metrics and `ALERTS` query carries no `<az-key>` / `<env-key>` matcher and is issued to both `ksm` backends, the body contains the `zone-b` claim's complete path, and `clusters` lists that claim's `zone-b` cluster identity
-
 ### Requirement: Storage build reads only what the body draws
 
 The storage-graph build SHALL NOT issue the following kube-state-metrics families: `kube_pod_container_info`, `kube_service_info`, `kube_endpointslice_endpoints`, `kube_endpointslice_labels`, `kube_service_annotations`. The body contains no `service` or `external` node and no `service-selects-pod` edge, so the four service-side families can contribute nothing to it, and it does not carry `containers` (see "Attributes and compound groups carry over"). A family the build does not issue SHALL be absent from the build's per-family series tally, never reported as zero.
@@ -347,7 +309,7 @@ An `application=` root SHALL NOT disable the restricted volume-label read of "St
 #### Scenario: An application root composes with an aggregate root
 
 - **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00&application=checkout`
-- **THEN** phase 1 of the volume-label read is restricted to `aggr=~"aggr00"`, the application recovery runs with no `<az-key>` / `<env-key>` matcher, the body holds only the `checkout` paths on `aggr00`, and it is byte-identical to the body an unrestricted volume-label read produces
+- **THEN** phase 1 of the volume-label read is restricted to `aggr=~"aggr00"`, the application recovery runs as it does without the aggregate root, the body holds only the `checkout` paths on `aggr00`, and it is byte-identical to the body an unrestricted volume-label read produces
 
 ## REMOVED Requirements
 

@@ -526,15 +526,16 @@ func hasPod(body cytoscape.Body, id string) bool {
 // see them, and they can see none of the suite's own.
 var hubNow = fixedNow.Add(2 * time.Hour)
 
-// TestStorageGraphHubReadsEveryZone (read-storage-roots-through-volume-hub
+// TestStorageGraphHubStaysInTheRequestZone (read-storage-roots-through-volume-hub
 // task 8.5): two Kubernetes zones behind the routing table, each in its own
 // installation, running a cluster of the SAME raw name, and one zoned Harvest
-// store per zone. A request rooted at a filer from zone-a draws the claim a
-// zone-b cluster keeps on that filer, while zone-b's Harvest store — which
-// holds a lexically-smaller filer with a FlexVol of the same name — is never
-// asked: had it been, the claim's pick would move there and the rooted body
-// would lose its path.
-func (s *MultiBackendSuite) TestStorageGraphHubReadsEveryZone() {
+// store per zone. A zone-a request rooted at a filer that also serves a zone-b
+// claim draws zone-a's claim only: zone-b's kube-state-metrics store is not
+// asked, and neither is zone-b's Harvest store — which holds a
+// lexically-smaller filer with a FlexVol of the same name, so a query reaching
+// it would move the zone-a claim's pick there and the rooted body would lose
+// its path.
+func (s *MultiBackendSuite) TestStorageGraphHubStaysInTheRequestZone() {
 	t1 := hubNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`
 kube_pod_info{cluster="hub-c1",namespace="shop",pod="a-0",uid="hub-uid-a0",node="hub-worker-a",az="zone-a",env="prod"} 1 %[1]d
@@ -580,19 +581,21 @@ volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="onta
 	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
 
 	ids := nodeIDs(body)
-	s.Contains(ids, "zone-b-dev-hub-c1/hub-uid-b0", "the zone-b pod is drawn from the zone-b store")
-	s.Contains(ids, "zone-b-dev-hub-c1/shop/b-data", "with its claim")
-	s.Contains(ids, "zone-a-prod-hub-c1/hub-uid-a0", "and zone-a's, on the same filer")
+	s.Contains(ids, "zone-a-prod-hub-c1/hub-uid-a0", "zone-a's pod on the rooted filer is drawn")
+	s.Contains(ids, "zone-a-prod-hub-c1/shop/a-data", "with its claim")
 	s.Contains(ids, "netapp/ontap-hub/aggr/aggr-hub")
+	s.NotContains(ids, "zone-b-dev-hub-c1/hub-uid-b0", "zone-b's store is not asked, so its pod is not drawn")
+	s.NotContains(ids, "zone-b-dev-hub-c1/shop/b-data")
 	s.NotContains(ids, "netapp/ontap-aaa-zoneb/aggr/aggr-zb", "zone-b's Harvest store is never asked")
-	s.Equal([]string{"zone-a-prod-hub-c1", "zone-b-dev-hub-c1"}, body.Clusters,
-		"one raw cluster name in two zones is two identities")
+	s.Equal([]string{"zone-a-prod-hub-c1"}, body.Clusters, "the body holds the request's zone only")
 
 	var flows int
 	for _, e := range body.Elements.Edges {
-		if e.Data.Type == string(graph.EdgeTypeStorageFlow) && strings.HasPrefix(e.Data.Source, "zone-b-dev-hub-c1/") {
+		s.False(strings.HasPrefix(e.Data.Source, "zone-b-") || strings.HasPrefix(e.Data.Target, "zone-b-"),
+			"no edge touches zone-b: %s -> %s", e.Data.Source, e.Data.Target)
+		if e.Data.Type == string(graph.EdgeTypeStorageFlow) && strings.HasPrefix(e.Data.Target, "zone-a-prod-hub-c1/") {
 			flows++
 		}
 	}
-	s.Positive(flows, "the zone-b claim's path is drawn end to end")
+	s.Positive(flows, "the zone-a claim's path is drawn end to end")
 }

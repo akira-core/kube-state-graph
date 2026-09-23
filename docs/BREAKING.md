@@ -4,9 +4,9 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
-## `/v1/storage-graph` reads a rooted filer's claims in every zone
+## `/v1/storage-graph` reads a rooted filer's claims through the volume hub
 
-*storage-graph-api — Storage-side roots read the claim chain through the volume hub; Storage-side roots narrow the Harvest topology read per component; Storage-flow graph endpoint; Storage build reads only what it draws. cluster-topology-source — Topology series consumed; Request-scoped upstream selectors; Backend routing composes with request-scoped selectors; Application-rooted recovery reads of the owner and annotation families. netapp-storage-graph — Harvest legs under request-scoped selectors.*
+*storage-graph-api — Storage-side roots read the claim chain through the volume hub; Storage-side roots narrow the Harvest topology read per component; Storage build reads only what it draws. cluster-topology-source — Topology series consumed. netapp-storage-graph — Harvest legs under request-scoped selectors. alert-overlay — Label-set matching to graph nodes.*
 
 **What changed.** A `/v1/storage-graph` request carrying an `ontap_cluster=`,
 `aggr=` or `svm=` root — a storage-EXCLUSIVE root — is now read in **hub
@@ -19,23 +19,20 @@ is read restricted to those names, and the claim-binding family,
 families restricted to the claims that read returned. The pod, Kubernetes-node
 and controller reads follow from there as before. Which aggregate, SVM and
 controller a claim lands on is still decided by the configured forward
-derivation alone.
+derivation alone. Hub mode reads from the same backends, under the same `az` /
+`env` / `cluster` / `namespace` matchers, as every other storage request: a
+filer shared across zones is drawn with the requested zone's claims only, and
+the body describes one zone and environment, as before.
 
 Three things a client can see:
 
-- **`az` / `env` no longer bound the Kubernetes side of a hub-mode body.**
-  Every kube-state-metrics, kubelet and `ALERTS` query of a hub build drops the
-  `az` / `env` matchers and is dispatched to every backend serving its family;
-  `az` still selects the `harvest` backends. A filer shared by clusters in
-  several zones or environments is drawn with every claim on it, so one body
-  can now carry several zones' cluster identities — read `clusters[]` /
-  `labels.cluster` rather than assuming the request's zone. `cluster` and
-  `namespace` still narrow; `az` and `env` stay required and single-valued.
-  Alerts from every zone reach the overlay, but one attaches only to a node of
-  its own zone: a Kubernetes object through its cluster identity, a NetApp
-  aggregate or controller through the `az` / `env` its Harvest series carry.
-  The rule applies on every endpoint; it only changes a body where an alert's
-  `az` / `env` disagreed with its target's — which, before, attached it anyway.
+- **An alert attaches only to a node of its own zone.** A Kubernetes object's
+  zone is its cluster identity's; a NetApp aggregate's or controller's is the
+  `az` / `env` its Harvest series carry. An alert whose `az` / `env` disagrees
+  with a known zone no longer attaches (it used to), and a no-`cluster` alert
+  on a pod whose name another zone reuses now resolves by zone instead of being
+  dropped as ambiguous. Applies on every endpoint; an unknown zone on either
+  side matches as before.
 - **Statically provisioned PVs are not reached from a storage root.** A claim
   bound to a PV whose name embeds no `pvc_` (a static PV, a provisioner with a
   custom volume-name prefix or a Trident `nameTemplate`) draws no path in a
@@ -59,19 +56,13 @@ a hub that found no claim; and a claim scope too large for sixteen chunks is
 read once unrestricted and filtered in the reader, with the same body. Every
 hub read fails the build on a query error, like every other storage leg.
 
-**Migration.** A client that assumed one zone per storage body must read
-`clusters[]` instead. A deployment whose FlexVol names do not embed the PV name
+**Migration.** A deployment whose FlexVol names do not embed the PV name
 (`storage_root_claim_miss` with `reason="no_pv_candidate"`) gets no path from a
 storage root; root at the workload side instead. Rollback is a revert — there is
 no flag and no persisted state.
 
 ### In-process embedders
 
-`promql.FamilyZoneQuerierSource` (`QuerierForFamilyZones(sel, zoned ...Family)`)
-is a new OPTIONAL upgrade of `QuerierSource`; `*promql.Router` implements it.
-`build.Builder` type-asserts for it in hub mode. An embedder's own
-`QuerierSource` without it still works: every family is then zone-routed by
-`az`, so hub mode finds claims only in the stores the request's zone reaches.
 `promql.ClaimScopedQueries`, `promql.VolumeNameLabel`, `promql.ClaimLabel`,
 `promql.RenderVolumeLabelsSVMRooted`, `promql.RenderVolumeLabelsOwnerCompletion`
 and `promql.OwnerCompletionClusterCost` are new; `promql.RenderScoped` now

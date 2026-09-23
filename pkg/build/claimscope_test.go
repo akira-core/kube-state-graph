@@ -134,9 +134,9 @@ func TestVolumeHub_RootedVolumesNameTheirClaims(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t,
-		[]string{`last_over_time(kube_persistentvolumeclaim_info{volumename="pvc-ab12-cd34"}[1m])`},
+		[]string{`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",volumename="pvc-ab12-cd34"}[1m])`},
 		q.QueriesFor(promql.QPVCInfo),
-		"one query, restricted to the one candidate the rooted rows yield — and no az / env matcher")
+		"one query, restricted to the one candidate the rooted rows yield, under the request's az / env")
 	for _, fam := range promql.ClaimScopedQueries[1:] {
 		assert.Equal(t, [][]string{{"orders-data"}}, q.ScopeValues(fam, promql.ClaimLabel),
 			"%s is restricted to the claim the claim-info read returned", fam)
@@ -324,8 +324,8 @@ func TestVolumeHub_UnboundedClaimScopeReadsWideAndFilters(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, fam := range promql.ClaimScopedQueries {
-		assert.Equal(t, []string{promql.Render(fam, time.Minute, promql.LabelKeys{}, promql.Selector{})},
-			wideQ.QueriesFor(fam), "%s: one unscoped query — no scope and no az / env matcher", fam)
+		assert.Equal(t, []string{promql.Render(fam, time.Minute, promql.LabelKeys{}, vlrSel)},
+			wideQ.QueriesFor(fam), "%s: one unscoped query — no scope, the request's az / env only", fam)
 		assert.Len(t, chunkedQ.QueriesFor(fam), 1, "%s: the roomy budget fits the scope in one chunk", fam)
 		assert.NotEqual(t, wideQ.QueriesFor(fam), chunkedQ.QueriesFor(fam))
 	}
@@ -511,7 +511,7 @@ func TestVolumeHub_ParityWithThePreChangeRead(t *testing.T) {
 
 			assert.NotEmpty(t, hub.ScopeValues(promql.QPVCInfo, promql.VolumeNameLabel), "the hub build read claims by PV name")
 			for _, qy := range hub.QueriesFor(promql.QPVCInfo) {
-				assert.NotContains(t, qy, `az=`, "hub mode renders no az matcher")
+				assert.Contains(t, qy, `az="zone-a",env="prod"`, "hub mode keeps the request's az / env")
 			}
 			assert.Equal(t,
 				[]string{promql.Render(promql.QPVCInfo, time.Minute, promql.LabelKeys{}, vlrSel)},

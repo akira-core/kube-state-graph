@@ -7,7 +7,7 @@
 - [x] 1.1 Add `scopedLabel` entries for the claim-keyed families — `QPVCInfo` → `volumename`; `QPVCBindings`, `QPVCAnnotations`, `QKubeletVolumeUsedBytes`, `QKubeletVolumeCapacityBytes` → `persistentvolumeclaim` — and export them as `promql.ClaimScopedQueries`; verify a `pkg/promql/scope_test.go` case renders each with its fixed selector (if any), the request matchers and the scope, in that order
 - [x] 1.2 Add an SVM-rooted phase-1 renderer (`{cluster=~OC?, svm=~S}`) beside `RenderVolumeLabelsRooted`; verify `pkg/promql/volumelabels_test.go` pins svm-only, cluster+svm, escaping, and `ok == false` for an empty SVM set
 - [x] 1.3 Add an owner-completion renderer taking one ONTAP cluster and its aggregate set (`{cluster="c", aggr=~"a|b"}`); verify a unit test pins the string, escaping, and `ok == false` for an empty set
-- [x] 1.4 Add the optional `promql.FamilyZoneQuerierSource` upgrade (`QuerierForFamilyZones(sel, zoned ...Family)`) and implement it on `*Router` by binding ONE snapshot with a per-family zone decision on the bound `fanoutQuerier`; verify `pkg/promql/router_test.go` cases show a `harvest` query goes only to the zone's backends while a `ksm` / `kubelet` / `alerts` query from the same bound querier reaches every backend serving it, and that a reload between two calls on one bound querier does not change the snapshot
+- [x] 1.4 (Withdrawn with D7 / D8's first revision) The optional `promql.FamilyZoneQuerierSource` upgrade is NOT added: `pkg/promql` routing is unchanged by this change; verify `pkg/promql/router_test.go` carries no family-zone case
 - [x] 1.5 Verify `queryDims`, the fixed-selector table and `pkg/promql/testdata/render-baseline.txt` are untouched by running `go test ./pkg/promql/ -run 'TestRender_EmptySelectorMatchesBaseline|TestQueryDims_EveryQueryListed|TestQueryFamily_EveryQueryListed'`
 
 ## 2. PV candidate extraction
@@ -34,11 +34,11 @@
 - [x] 5.4 Add the bounded fallback (`maxHubClaimChunks`): an over-cap scope issues the family once with no restriction and filters rows in the reader; verify a case shows one unscoped query and a body byte-identical to the chunked build
 - [x] 5.5 Re-wire `pvcInfoDone`, `bindingsDone` and `pvcAnnotationsDone` to close when the claim-keyed reads return (every return path), so the pod, application and QoS waves compute empty scopes instead of blocking; verify with `go test -race ./pkg/build/` and a case where the claim-info read fails
 
-## 6. Relaxed selector and routing
+## 6. Request matchers and routing
 
-- [x] 6.1 In `buildStorage`, derive `hubSel` (az / env cleared) and pass it to every kube-state-metrics, kubelet and `ALERTS` leg, the claim-keyed reads, the pod / node / controller waves and the application recovery when hub mode can engage; keep the original selector when it cannot; verify rendered-query assertions in `build_storage_plan_test.go` show no `<az-key>` / `<env-key>` matcher in hub mode and the usual matchers otherwise
-- [x] 6.2 Bind the querier through `QuerierForFamilyZones(sel, FamilyHarvest)` when the source implements it, else `QuerierFor(sel)`, else the plain `Querier`; verify `routedquerier_test.go` cases for all three sources
-- [x] 6.3 Confirm cluster identities stay per-zone for cross-zone claims; verify an identity test where `c1` exists in `zone-a` and `zone-b` yields two identities and `clusters[]` lists both
+- [x] 6.1 In `buildStorage`, pass the request's full selector to every leg in hub mode exactly as outside it; verify `hubrouting_test.go` (`TestBuildStorage_HubKeepsTheRequestMatchers`) shows `<az-key>="zone-a",<env-key>="prod"` on every kube-state-metrics, kubelet and `ALERTS` query in both modes
+- [x] 6.2 Bind the querier through `QuerierFor(sel)` in hub mode, as outside it; verify over a two-zone `*promql.Router` that no query reaches a `zone-b` backend (`TestBuildStorage_HubStaysInTheRequestZone`)
+- [x] 6.3 Confirm a hub body over two zones is byte-identical to the pre-change read's (`TestBuildStorage_HubMatchesThePreChangeReadAcrossZones`) and that `clusters[]` lists the request zone's identities only
 
 ## 7. Coverage signal
 
@@ -47,15 +47,15 @@
 ## 8. Output tests
 
 - [x] 8.1 Extend the storage parity harness: a single-zone estate whose joined PVs are all `pvc-…` built in hub mode and with the pre-change read produces byte-identical bodies for `ontap_cluster=`, `aggr=`, `svm=`, `aggr=`+`svm=`, `aggr=`+`node=`, `aggr=`+`pod=`, `aggr=`+`application=`
-- [x] 8.2 Add a two-zone fixture where the rooted filer serves a claim in the other zone; verify the hub body draws that claim's complete path and the pre-change read does not
+- [x] 8.2 Add a two-zone fixture where the rooted filer serves a claim in each zone; verify the hub body draws the request zone's claim and not the other zone's, and that neither `zone-b` store is queried
 - [x] 8.3 Add a static-PV fixture (`mongo-data-01` ↔ `mongo_data_01`); verify the hub body draws no path through it while `/v1/graph` still draws its `pvc-to-netapp-aggr` edge
 - [x] 8.4 Update the fan-out pins in `build_storage_plan_test.go` for hub-mode leg counts (claim-keyed legs leave the first wave; owner completion appears only with `svm=`); verify the pins and the counts documented in `docs/upstream-metrics.md` agree
-- [x] 8.5 Add a `/v1/storage-graph` integration case in `internal/integration` with two KSM zones behind the routing table and one zoned Harvest store, asserting the cross-zone path; verify it runs (not skipped) on CI
+- [x] 8.5 Add a `/v1/storage-graph` integration case in `internal/integration` with two KSM zones behind the routing table and one zoned Harvest store per zone, asserting the body holds the request zone only (`TestStorageGraphHubStaysInTheRequestZone`); verify it runs (not skipped) on CI
 
 ## 9. Documentation
 
-- [x] 9.1 Add the hub-mode entry to `docs/BREAKING.md` (cross-zone bodies under storage-exclusive roots; static PVs not reached from storage roots)
-- [x] 9.2 Update `docs/upstream-metrics.md` (storage fan-out waves, hub critical path), `docs/netapp-harvest-preconditions.md` (PV-name requirement for hub mode, `storage_root_claim_miss`, `claim_name`-only exporters), and `docs/upstream-backend-routing.md` (the family-zone upgrade)
+- [x] 9.1 Add the hub-mode entry to `docs/BREAKING.md` (static PVs not reached from storage roots; bodies stay in the request's zone)
+- [x] 9.2 Update `docs/upstream-metrics.md` (storage fan-out waves, hub critical path), `docs/netapp-harvest-preconditions.md` (PV-name requirement for hub mode, `storage_root_claim_miss`, `claim_name`-only exporters), and `docs/upstream-backend-routing.md` (hub mode routes like every storage build)
 - [x] 9.3 Update the `/v1/storage-graph` OpenAPI annotations for the az / env semantics in hub mode and run `make docs && make check-docs`
 - [x] 9.4 Update `CLAUDE.md`, `README.md` and `README.zh-tw.md` where they state `svm=` / `node=` disable the restriction, that the claim families are unrestricted, or that storage bodies describe one zone; verify no remaining sentence contradicts the new behaviour
 
@@ -68,5 +68,13 @@
 - [x] 11.1 Collect, per ONTAP cluster, the `(az, env)` pairs carried by the entity-naming Harvest series (`volume_labels`, `aggr_*`, the controller families), counting only series with both configured labels; carry the result on `Topology` beside the cluster resolver; verify a `pkg/build` case for a stamped filer, an unstamped filer (empty set) and a half-stamped series (not counted)
 - [x] 11.2 Carry a zone per alert-index candidate — the ONTAP zone set for controllers and aggregates, the composed identity's components for pods, claims and Kubernetes nodes — and read the alert's pair through the configured `LabelKeys`
 - [x] 11.3 Reject a cluster-qualified aggregate or controller candidate whose known zone set lacks the alert's pair; filter every kind's no-`cluster` candidates to unknown-or-agreeing zones before `matchUnique`; verify `alerts_test.go` cases for every new `alert-overlay` scenario (own zone attached, other zone unmatched for aggregate and controller, unstamped Harvest falls back, no-`cluster` disambiguated by zone, no-`cluster` other-zone-only unmatched) and that every existing case is unchanged
-- [x] 11.4 Add a hub-mode build case where a zone-b alert names the rooted zone-a filer's aggregate and a zone-a alert names it too; verify only the zone-a alert is on the aggregate and its `data.status` folds from it alone
+- [x] 11.4 Add a hub-mode build case where zone-a's alert store holds a zone-a and a misfiled zone-b alert on the rooted aggregate and zone-b's store holds another; verify zone-b's store is never asked, only the zone-a alert is on the aggregate, and its `data.status` folds from it alone
 - [x] 11.5 Update `CLAUDE.md` (alert overlay + Harvest precondition) and `docs/netapp-harvest-preconditions.md`; run `make lint vet test` and `openspec validate read-storage-roots-through-volume-hub --strict`
+
+## 12. Revision: hub mode stays in the request's zone (D7 / D8 revised)
+
+- [x] 12.1 Remove `hubSelector` / `hubQuerierFor` from `pkg/build` and the `FamilyZoneQuerierSource` upgrade from `pkg/promql`; `buildStorage` renders the request selector and binds `QuerierFor(sel)` in every mode
+- [x] 12.2 Keep `storage_root_claim_miss` `no_claim` at Warn unless a `cluster=` / `namespace=` filter narrowed the request (az / env are on every storage request)
+- [x] 12.3 Revise the spec deltas: drop the MODIFIED "Storage-flow graph endpoint", "Request-scoped upstream selectors", "Backend routing composes with request-scoped selectors" and "Application-rooted recovery reads" blocks; state the unchanged matchers and routing in the hub requirement with a two-zone scenario; fix the `netapp-storage-graph` hub scenario and the `alert-overlay` rationale
+- [x] 12.4 Update the `/v1/storage-graph` OpenAPI text (az / env pin one estate in every mode) and the `/v1/graph` 502 text (names the failing family); run `make docs && make check-docs`
+- [x] 12.5 Update `CLAUDE.md`, `README.md`, `README.zh-tw.md`, `docs/BREAKING.md`, `docs/upstream-backend-routing.md`, `docs/netapp-harvest-preconditions.md`; run `make lint vet test`, the Docker integration suite and `openspec validate read-storage-roots-through-volume-hub --strict`

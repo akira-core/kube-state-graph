@@ -17,7 +17,7 @@ When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be 
 - on the cluster-qualified path of kind 3 and of kind 4's controller side, a candidate whose zone set does not contain the alert's zone is not a match (the Kubernetes candidates of kinds 1, 2 and 4 are already zone-exact there, because the identity they are keyed on is composed from the alert's own `az` / `env`);
 - on the no-`cluster` path, every candidate whose zone is known and different is removed BEFORE uniqueness is tested, so a same-named object in another zone neither absorbs the alert nor makes it ambiguous.
 
-An alert with no zone, and a candidate whose zone is unknown, SHALL never be excluded by this rule — matching then reduces to the label comparison above, which is what an estate whose Harvest series carry no `az` / `env` pair observes. The rule applies on every build path; it is what keeps a zone's alerts off another zone's same-named NetApp entity when a build reads alerts from zones whose Harvest stores it did not read, as a hub-mode storage build does.
+An alert with no zone, and a candidate whose zone is unknown, SHALL never be excluded by this rule — matching then reduces to the label comparison above, which is what an estate whose Harvest series carry no `az` / `env` pair observes. The rule applies on every build path; it matters wherever one build holds same-named objects or alerts from several zones — an unfiltered `GET /v1/graph`, or a build whose alerting or Harvest backend is a catch-all.
 
 #### Scenario: Pod alert attached
 
