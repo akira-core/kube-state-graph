@@ -13,13 +13,13 @@ func TestRenderVolumeLabelsRooted(t *testing.T) {
 	t.Parallel()
 
 	t.Run("aggregate alone renders an aggr matcher only", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsRooted(5*time.Minute, nil, []string{"aggr00"})
+		got, ok := RenderVolumeLabelsRooted(5*time.Minute, LabelKeys{}, Selector{}, nil, []string{"aggr00"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{aggr="aggr00"}[5m])`, got)
 	})
 
 	t.Run("cluster alone renders a cluster matcher only", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsRooted(5*time.Minute, []string{"ontap-prod"}, nil)
+		got, ok := RenderVolumeLabelsRooted(5*time.Minute, LabelKeys{}, Selector{}, []string{"ontap-prod"}, nil)
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod"}[5m])`, got)
 	})
@@ -27,16 +27,14 @@ func TestRenderVolumeLabelsRooted(t *testing.T) {
 	t.Run("both are AND-combined in one selector, cluster first", func(t *testing.T) {
 		// The projection combines these two as a narrowing, so a single selector
 		// carrying both is exactly its rule — not two merged queries.
-		got, ok := RenderVolumeLabelsRooted(5*time.Minute,
-			[]string{"ontap-prod"}, []string{"aggr00"})
+		got, ok := RenderVolumeLabelsRooted(5*time.Minute, LabelKeys{}, Selector{}, []string{"ontap-prod"}, []string{"aggr00"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr00"}[5m])`, got)
 	})
 
 	t.Run("several values render one anchored alternation each, sorted", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsRooted(time.Minute,
-			[]string{"ontap-b", "ontap-a"}, []string{"aggr2", "aggr1"})
+		got, ok := RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, []string{"ontap-b", "ontap-a"}, []string{"aggr2", "aggr1"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(volume_labels{cluster=~"ontap-a|ontap-b",aggr=~"aggr1|aggr2"}[1m])`, got,
@@ -44,14 +42,14 @@ func TestRenderVolumeLabelsRooted(t *testing.T) {
 	})
 
 	t.Run("duplicates and empties are normalised away", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsRooted(time.Minute, []string{"", "c1", "c1"}, []string{""})
+		got, ok := RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, []string{"", "c1", "c1"}, []string{""})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="c1"}[1m])`, got,
 			"an all-empty set contributes no matcher rather than an empty one")
 	})
 
 	t.Run("a metacharacter matches itself literally", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsRooted(time.Minute, nil, []string{"aggr.a", "aggr_b"})
+		got, ok := RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, nil, []string{"aggr.a", "aggr_b"})
 		require.True(t, ok)
 		assert.Contains(t, got, `aggr=~"aggr\\.a|aggr_b"`,
 			"QuoteMeta then string-escape, so the parser unquotes into the regex aggr\\.a")
@@ -60,9 +58,9 @@ func TestRenderVolumeLabelsRooted(t *testing.T) {
 	t.Run("no value at all is not renderable", func(t *testing.T) {
 		// Never an unrestricted fallback: the caller decides that, because an
 		// empty restriction means "no root", not "match nothing".
-		_, ok := RenderVolumeLabelsRooted(time.Minute, nil, nil)
+		_, ok := RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, nil, nil)
 		assert.False(t, ok)
-		_, ok = RenderVolumeLabelsRooted(time.Minute, []string{""}, []string{"", ""})
+		_, ok = RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, []string{""}, []string{"", ""})
 		assert.False(t, ok)
 	})
 }
@@ -71,14 +69,13 @@ func TestRenderVolumeLabelsSVMRooted(t *testing.T) {
 	t.Parallel()
 
 	t.Run("svm alone renders an svm matcher only", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsSVMRooted(5*time.Minute, nil, []string{"svm_shop"})
+		got, ok := RenderVolumeLabelsSVMRooted(5*time.Minute, LabelKeys{}, Selector{}, nil, []string{"svm_shop"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{svm="svm_shop"}[5m])`, got)
 	})
 
 	t.Run("cluster and svm are AND-combined in one selector, cluster first", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsSVMRooted(time.Minute,
-			[]string{"ontap-b", "ontap-a"}, []string{"svm_b", "svm_a", "svm_a"})
+		got, ok := RenderVolumeLabelsSVMRooted(time.Minute, LabelKeys{}, Selector{}, []string{"ontap-b", "ontap-a"}, []string{"svm_b", "svm_a", "svm_a"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(volume_labels{cluster=~"ontap-a|ontap-b",svm=~"svm_a|svm_b"}[1m])`, got,
@@ -86,7 +83,7 @@ func TestRenderVolumeLabelsSVMRooted(t *testing.T) {
 	})
 
 	t.Run("a metacharacter matches itself literally", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsSVMRooted(time.Minute, []string{"ontap.prod"}, []string{"svm.a", "svm_b"})
+		got, ok := RenderVolumeLabelsSVMRooted(time.Minute, LabelKeys{}, Selector{}, []string{"ontap.prod"}, []string{"svm.a", "svm_b"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(volume_labels{cluster="ontap.prod",svm=~"svm\\.a|svm_b"}[1m])`, got,
@@ -94,9 +91,9 @@ func TestRenderVolumeLabelsSVMRooted(t *testing.T) {
 	})
 
 	t.Run("an empty svm set is not renderable, whatever the clusters", func(t *testing.T) {
-		_, ok := RenderVolumeLabelsSVMRooted(time.Minute, []string{"ontap-prod"}, nil)
+		_, ok := RenderVolumeLabelsSVMRooted(time.Minute, LabelKeys{}, Selector{}, []string{"ontap-prod"}, nil)
 		assert.False(t, ok, "a cluster set alone is the cluster group's shape, not this one's")
-		_, ok = RenderVolumeLabelsSVMRooted(time.Minute, nil, []string{"", ""})
+		_, ok = RenderVolumeLabelsSVMRooted(time.Minute, LabelKeys{}, Selector{}, nil, []string{"", ""})
 		assert.False(t, ok)
 	})
 }
@@ -105,19 +102,19 @@ func TestRenderVolumeLabelsOwnerCompletion(t *testing.T) {
 	t.Parallel()
 
 	t.Run("one cluster equality and the aggregate alternation", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsOwnerCompletion(5*time.Minute, "ontap-prod", []string{"aggr07", "aggr03", "aggr03"})
+		got, ok := RenderVolumeLabelsOwnerCompletion(5*time.Minute, LabelKeys{}, Selector{}, "ontap-prod", []string{"aggr07", "aggr03", "aggr03"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr03|aggr07"}[5m])`, got)
 	})
 
 	t.Run("one aggregate renders an equality", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", []string{"aggr03"})
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, LabelKeys{}, Selector{}, "ontap-prod", []string{"aggr03"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr03"}[1m])`, got)
 	})
 
 	t.Run("escaping", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, `on"tap`, []string{"aggr.1", "aggr_2"})
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, LabelKeys{}, Selector{}, `on"tap`, []string{"aggr.1", "aggr_2"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="on\"tap",aggr=~"aggr\\.1|aggr_2"}[1m])`, got)
 	})
@@ -125,15 +122,15 @@ func TestRenderVolumeLabelsOwnerCompletion(t *testing.T) {
 	t.Run("an empty cluster is still an equality, never dropped", func(t *testing.T) {
 		// An aggregate name is unique only within its filer: dropping the matcher
 		// would read every filer's aggregate of that name.
-		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "", []string{"aggr1"})
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, LabelKeys{}, Selector{}, "", []string{"aggr1"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster="",aggr="aggr1"}[1m])`, got)
 	})
 
 	t.Run("an empty aggregate set is not renderable", func(t *testing.T) {
-		_, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", nil)
+		_, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, LabelKeys{}, Selector{}, "ontap-prod", nil)
 		assert.False(t, ok)
-		_, ok = RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", []string{""})
+		_, ok = RenderVolumeLabelsOwnerCompletion(time.Minute, LabelKeys{}, Selector{}, "ontap-prod", []string{""})
 		assert.False(t, ok)
 	})
 
@@ -147,7 +144,7 @@ func TestRenderVolumeLabelsTokenScoped(t *testing.T) {
 	t.Parallel()
 
 	t.Run("suffix renders a dot-star prefix on every branch, always as a regex", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsTokenScoped(5*time.Minute, []string{"pvc_b", "pvc_a"}, true, nil)
+		got, ok := RenderVolumeLabelsTokenScoped(5*time.Minute, LabelKeys{}, Selector{}, []string{"pvc_b", "pvc_a"}, true, nil)
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{volume=~".*pvc_a|.*pvc_b"}[5m])`, got)
 	})
@@ -155,23 +152,23 @@ func TestRenderVolumeLabelsTokenScoped(t *testing.T) {
 	t.Run("suffix with one token is still the regex form", func(t *testing.T) {
 		// The prefix needs a regex, so the one-value equality shortcut appendMatcher
 		// takes elsewhere would be WRONG here: volume="pvc_a" would demand equality.
-		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, true, nil)
+		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, true, nil)
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{volume=~".*pvc_a"}[1m])`, got)
 	})
 
 	t.Run("exact renders the token alone", func(t *testing.T) {
-		one, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, false, nil)
+		one, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, false, nil)
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{volume="pvc_a"}[1m])`, one)
 
-		many, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_b", "pvc_a"}, false, nil)
+		many, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_b", "pvc_a"}, false, nil)
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{volume=~"pvc_a|pvc_b"}[1m])`, many)
 	})
 
 	t.Run("escaping is applied to the token and never to the prefix", func(t *testing.T) {
-		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc.a", "pvc_b"}, true, nil)
+		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc.a", "pvc_b"}, true, nil)
 		require.True(t, ok)
 		assert.Contains(t, got, `volume=~".*pvc\\.a|.*pvc_b"`,
 			"the token's dot is escaped; the prefix's dot-star is left as the wildcard it is")
@@ -179,16 +176,16 @@ func TestRenderVolumeLabelsTokenScoped(t *testing.T) {
 	})
 
 	t.Run("an empty scope renders nothing at all", func(t *testing.T) {
-		_, ok := RenderVolumeLabelsTokenScoped(time.Minute, nil, true, nil)
+		_, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, nil, true, nil)
 		assert.False(t, ok)
-		_, ok = RenderVolumeLabelsTokenScoped(time.Minute, []string{"", ""}, false, nil)
+		_, ok = RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"", ""}, false, nil)
 		assert.False(t, ok)
 	})
 
 	t.Run("it never carries an aggr matcher", func(t *testing.T) {
 		// Phase 2 must reach volumes on ANY aggregate — a clone on a
 		// lexically-smaller one is exactly what it exists to recover.
-		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, true, nil)
+		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, true, nil)
 		require.True(t, ok)
 		assert.NotContains(t, got, "aggr")
 		assert.NotContains(t, got, "cluster")
@@ -198,21 +195,21 @@ func TestRenderVolumeLabelsTokenScoped(t *testing.T) {
 		// A restriction by ONTAP cluster alone read those filers whole, so the
 		// only candidates left are elsewhere. Without this, phase 2 re-scans
 		// the family phase 1 already returned.
-		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, true, []string{"ontap-prod"})
+		got, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, true, []string{"ontap-prod"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(volume_labels{cluster!~"ontap-prod",volume=~".*pvc_a"}[1m])`, got)
 
-		many, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, false, []string{"b", "a", "", "a"})
+		many, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, false, []string{"b", "a", "", "a"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(volume_labels{cluster!~"a|b",volume="pvc_a"}[1m])`, many,
 			"sorted and de-duplicated like every other alternation; always the regex form")
 
-		esc, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, true, []string{"ontap.a"})
+		esc, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, true, []string{"ontap.a"})
 		require.True(t, ok)
 		assert.Contains(t, esc, `cluster!~"ontap\\.a"`, "an excluded name matches itself literally")
 
-		none, ok := RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a"}, true, []string{"", ""})
+		none, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, []string{"pvc_a"}, true, []string{"", ""})
 		require.True(t, ok)
 		assert.NotContains(t, none, "cluster", "an all-empty exclusion adds no matcher")
 	})
@@ -244,7 +241,7 @@ func TestChunkScopeWithOverhead(t *testing.T) {
 		}
 		many = normaliseValues(many)
 		for _, chunk := range ChunkScopeWithOverhead(many, budget, VolumeTokenBranchOverhead) {
-			q, ok := RenderVolumeLabelsTokenScoped(time.Minute, chunk, true, nil)
+			q, ok := RenderVolumeLabelsTokenScoped(time.Minute, LabelKeys{}, Selector{}, chunk, true, nil)
 			require.True(t, ok)
 			alt := q[strings.Index(q, `~"`)+2 : strings.LastIndex(q, `"}`)]
 			assert.LessOrEqual(t, len(alt), budget, "chunk %v rendered %q", chunk, alt)
@@ -273,22 +270,66 @@ func TestChunkScopeWithOverhead(t *testing.T) {
 // makes a root-derived restriction a different mechanism from a selector-level
 // dimension: Harvest keeps its routing-only bit, and no request dimension
 // reaches the family.
-func TestVolumeLabelsRenderers_LeaveTheDimensionTableAlone(t *testing.T) {
+// Every restricted Harvest renderer carries the request's az / env ahead of
+// its own restriction, and never cluster / namespace
+// (read-storage-roots-through-volume-hub D13).
+func TestHarvestRenderers_CarryTheRequestZone(t *testing.T) {
 	t.Parallel()
-
-	assert.Equal(t, dimsHarvest, queryDims[QVolumeLabels])
-	assert.Equal(t, dimAZRoute, queryDims[QVolumeLabels])
 
 	full := Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"},
 		Cluster: []string{"c1"}, Namespace: []string{"shop"},
 	}
-	for _, dim := range []string{"az", "env", "namespace"} {
-		assert.False(t, full.Reaches(QVolumeLabels), "dimension %s must not reach Harvest", dim)
+	keys := LabelKeys{AZ: "zone", Env: "tier"}
+	render := func(got string, ok bool) string {
+		require.True(t, ok)
+		return got
 	}
-	assert.Equal(t, `last_over_time(volume_labels[5m])`,
-		Render(QVolumeLabels, 5*time.Minute, LabelKeys{}, full),
-		"the unrestricted rendering is still bare under every request dimension")
+	for name, tc := range map[string]struct{ got, want string }{
+		"phase 1, aggregate group": {
+			render(RenderVolumeLabelsRooted(time.Minute, keys, full, []string{"ontap-prod"}, []string{"aggr1"})),
+			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
+		},
+		"phase 1, SVM group": {
+			render(RenderVolumeLabelsSVMRooted(time.Minute, keys, full, nil, []string{"svm_a"})),
+			`last_over_time(volume_labels{zone="zone-a",tier="prod",svm="svm_a"}[1m])`,
+		},
+		"owner completion": {
+			render(RenderVolumeLabelsOwnerCompletion(time.Minute, keys, full, "ontap-prod", []string{"aggr1"})),
+			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
+		},
+		"phase 2": {
+			render(RenderVolumeLabelsTokenScoped(time.Minute, keys, full, []string{"pvc_a"}, true, []string{"ontap-prod"})),
+			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster!~"ontap-prod",volume=~".*pvc_a"}[1m])`,
+		},
+		"QoS chunk": {
+			render(RenderQoSVolumeScoped(QQoSReadOps, time.Minute, keys, full, []string{"trident_pvc_a"})),
+			`last_over_time(qos_read_ops{zone="zone-a",tier="prod",volume="trident_pvc_a"}[1m])`,
+		},
+	} {
+		assert.Equal(t, tc.want, tc.got, name)
+	}
+
+	got, ok := RenderVolumeLabelsRooted(time.Minute, keys, Selector{}, nil, []string{"aggr1"})
+	require.True(t, ok)
+	assert.Equal(t, `last_over_time(volume_labels{aggr="aggr1"}[1m])`, got,
+		"an unfiltered request renders the restriction alone")
+}
+
+// RequestMatcherCost is the rendered length of the request matchers a query
+// repeats in every chunk, the separating comma included, so a chunker can
+// take it off its byte budget.
+func TestRequestMatcherCost(t *testing.T) {
+	t.Parallel()
+
+	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: []string{"shop"}}
+	assert.Equal(t, len(`az="zone-a",env="prod"`)+1, RequestMatcherCost(QVolumeLabels, LabelKeys{}, sel),
+		"Harvest carries az and env only")
+	assert.Equal(t, len(`az="zone-a",env="prod",namespace="shop"`)+1,
+		RequestMatcherCost(QPVCInfo, LabelKeys{}, sel))
+	assert.Zero(t, RequestMatcherCost(QVolumeLabels, LabelKeys{}, Selector{}),
+		"nothing rendered, nothing charged")
+	assert.Zero(t, RequestMatcherCost(QServiceGraphTotal, LabelKeys{}, sel))
 }
 
 func TestMatcherCost(t *testing.T) {
@@ -303,7 +344,7 @@ func TestMatcherCost(t *testing.T) {
 
 	t.Run("it agrees with what the renderer emits", func(t *testing.T) {
 		for _, values := range [][]string{{"a"}, {"a", "b"}, {"ontap.a", "ontap.b"}, {`quo"te`}} {
-			q, ok := RenderVolumeLabelsRooted(time.Minute, values, nil)
+			q, ok := RenderVolumeLabelsRooted(time.Minute, LabelKeys{}, Selector{}, values, nil)
 			require.True(t, ok)
 			sel := q[strings.Index(q, "{")+1 : strings.LastIndex(q, "}")]
 			assert.Equal(t, len(sel), MatcherCost("cluster", values), "for %q", values)

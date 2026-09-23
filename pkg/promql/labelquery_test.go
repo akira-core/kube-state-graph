@@ -247,7 +247,9 @@ func TestQueryLabels_AZRejectedOnUnroutedFamilies(t *testing.T) {
 	}
 }
 
-func TestQueryLabels_HarvestAZRoutesWithoutMatcher(t *testing.T) {
+// Harvest routes by az AND carries the az matcher, like every zone-routed
+// family (read-storage-roots-through-volume-hub D13).
+func TestQueryLabels_HarvestAZRoutesAndMatches(t *testing.T) {
 	tbl := ksmTable(t)
 	fakes := fakesFor(tbl)
 	r := routerForTable(t, tbl, fakes)
@@ -260,8 +262,7 @@ func TestQueryLabels_HarvestAZRoutesWithoutMatcher(t *testing.T) {
 	assert.Equal(t, []string{"n-b"}, calledBackends(fakes))
 	qs := issuedQueries(fakes)
 	require.Len(t, qs, 1)
-	assert.Equal(t, "volume_labels", qs[0])
-	assert.NotContains(t, qs[0], "az=")
+	assert.Equal(t, `volume_labels{az="zone-b"}`, qs[0])
 }
 
 func TestQueryLabels_AZMatcherUsesConfiguredKey(t *testing.T) {

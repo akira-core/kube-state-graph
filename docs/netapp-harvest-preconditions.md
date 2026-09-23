@@ -110,10 +110,10 @@ build where hop A matched nothing issues no hop-B query at all.
    volume, so hop B can miss where hop A hit. The claim keeps its edge,
    aggregate, controller and `svm` and simply carries no `metrics` key.
 5. **A FlexVol name matched from two zones or environments.** The Harvest legs
-   carry no `az` / `env` matcher (see below), so whenever one build reads more
-   than one zone's Harvest series — an unfiltered request, a catch-all
-   `harvest` backend, or any `?env=` request — two filers whose volume names
-   both match one claim's token are both candidates, and the claim joins the
+   carry the request's `az` / `env` matchers (see below), so only a build that
+   reads several zones' Harvest series — an unfiltered request — can see two
+   filers whose volume names both match one claim's token. Both are then
+   candidates, and the claim joins the
    lexically-smallest `(ontap_cluster, aggr)` with no warning. FlexVol names
    derived from Kubernetes PV names (`pvc-<uuid>`) do not collide; a
    hand-chosen naming scheme that does is the operator's risk. Everything the
@@ -153,18 +153,30 @@ The operator-configured rewrite rules and match mode do not change the
 extraction: an ordered list of regexps cannot be inverted, so a custom rule set
 can make a storage-rooted request find fewer claims, never attach a wrong one.
 
-## Zone and environment labels are NOT required on Harvest
+## Zone and environment labels are REQUIRED on Harvest
 
-The `az` / `env` request filters are pushed down as PromQL matchers on the
-kube-state-metrics and kubelet families only. The Harvest family is **routed**
-by zone instead — `?az=` selects which `harvest` backend of the routing table is
-asked (see `upstream-backend-routing.md`) and the query it receives carries no
-request matcher. Stamping the configured `az` / `env` labels onto Harvest series
-is therefore unnecessary for the graph itself. `?env=` has no effect on the
-Harvest legs at all.
+Every Harvest series MUST carry the configured `az` / `env` labels (default
+`az` / `env`, see `--az-label` / `--env-label`) — the same two labels
+kube-state-metrics carries. The `az` / `env` request filters are pushed down as
+PromQL matchers on every Harvest query exactly as on the kube-state-metrics and
+kubelet families, and `?az=` also selects which `harvest` backend of the
+routing table is asked (see `upstream-backend-routing.md`). A request therefore
+reads only its own zone's and environment's filers, even from a catch-all
+`harvest` backend or a store holding several environments. `cluster` and
+`namespace` never reach Harvest.
 
-When the labels ARE present, the build reads them for one purpose: matching
-alerts. Each ONTAP cluster collects the `az` / `env` pairs carried by its
+A Harvest series WITHOUT the labels matches nothing under any `az` / `env`
+filter — and `/v1/storage-graph` always carries both — so its filer drops out
+of every filtered body with no error. No warning can flag it: an empty Harvest
+read is also what a deployment without NetApp storage returns. Stamp the labels
+in Harvest's own configuration (per-poller `labels`) or in the collector that
+ships the series. To find unlabelled series:
+
+```promql
+count by (__name__) ({__name__=~"volume_labels|aggr_.*|node_.*|qos_.*", az=""})
+```
+
+The labels also scope alert matching. Each ONTAP cluster collects the `az` / `env` pairs carried by its
 entity-naming series (`volume_labels`, `aggr_*`, `node_*`, `system_node_*` — not
 the QoS families), and an alert naming that filer's aggregate or controller
 attaches only when its own `az` / `env` pair is one of them. This keeps another

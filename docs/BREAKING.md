@@ -66,7 +66,35 @@ no flag and no persisted state.
 `promql.ClaimScopedQueries`, `promql.VolumeNameLabel`, `promql.ClaimLabel`,
 `promql.RenderVolumeLabelsSVMRooted`, `promql.RenderVolumeLabelsOwnerCompletion`
 and `promql.OwnerCompletionClusterCost` are new; `promql.RenderScoped` now
-accepts the five claim-keyed families. No existing signature changed.
+accepts the five claim-keyed families. The Harvest renderer signatures change
+with the entry below.
+
+## NetApp Harvest queries carry the request's `az` / `env`
+
+*netapp-storage-graph — Harvest legs carry the request zone and environment (replaces Harvest legs under request-scoped selectors). cluster-topology-source — Request-scoped upstream selectors; Backend routing composes with request-scoped selectors.*
+
+**What changed.** Every NetApp Harvest query — `volume_labels`, the `qos_*`
+families, `qos_policy_fixed_max_throughput_*`, `aggr_*` and the controller
+families, including every restricted `volume_labels` / `qos_*` read — now
+carries the request's `az` and `env` matchers, exactly as a kube-state-metrics
+query does. Before, `?az=` only picked which `harvest` backend was asked and
+`?env=` did not reach Harvest at all, so a catch-all `harvest` backend or a
+store holding several environments answered with other zones' and
+environments' filers. `cluster` and `namespace` still never reach Harvest.
+
+**Who is affected.** A deployment whose Harvest series do not carry the
+configured `az` / `env` labels: its NetApp side is now empty under every
+filtered request, and `/v1/storage-graph` is always filtered. Nothing errors
+and no warning fires — an empty Harvest read is also what a deployment without
+NetApp storage returns. Unfiltered `/v1/graph` requests are unchanged.
+
+**Migration.** Stamp the labels on every Harvest series (Harvest's per-poller
+`labels`, or the collector that ships the series), using the same label names
+as kube-state-metrics (`--az-label` / `--env-label`). Find unlabelled series
+with `count by (__name__) ({__name__=~"volume_labels|aggr_.*|node_.*|qos_.*", az=""})`.
+For in-process embedders, `promql.RenderVolumeLabelsRooted`,
+`RenderVolumeLabelsTokenScoped` and `RenderQoSVolumeScoped` take `(keys, sel)`
+after the window, and `promql.RequestMatcherCost` is new.
 
 ## `/v1/storage-graph` fails on any upstream query error
 

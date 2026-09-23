@@ -277,17 +277,16 @@ func (s *FilterSuite) TestUnfilteredRequestKeepsRealCrossClusterPartner() {
 	s.ElementsMatch([]string{"zone-a-prod-cluster-alpha", "zone-b-prod-cluster-beta"}, s.fetch(srv.URL, nil).Clusters)
 }
 
-// Harvest is zone-ROUTED, never zone- or env-MATCHED: the env value on a
-// volume_labels series plays no part in whether it joins. A claim whose only
-// Harvest series carries a DIFFERENT env value (or none) still draws its
-// storage chain under `?env=prod` — the specs' "Harvest lacking the label
-// still joins" scenario.
-func (s *FilterSuite) TestHarvestWithoutEnvLabelStillJoins() {
+// Harvest carries the request's env matcher (read-storage-roots-through-volume-hub
+// D13): a claim whose only Harvest series carries a DIFFERENT env value draws
+// no storage chain under `?env=prod` — the spec's "Environment filter reaches
+// Harvest" scenario. The claim itself is still loaded.
+func (s *FilterSuite) TestHarvestOfAnotherEnvDoesNotJoin() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	// A second claim whose ONLY Harvest series carries a different env value.
 	// Its pod and claim keep the suite's stamped labels and are loaded
-	// normally; the Harvest leg is issued without an env matcher.
+	// normally; the Harvest leg carries env="prod" and so never sees it.
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="lonely",uid="alpha-9",node="worker-0",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="lonely",persistentvolumeclaim="lonely-data",volume="data",test=%[1]q} 1 %[2]d
@@ -306,16 +305,12 @@ volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-pr
 	ids := nodeIDs(body)
 
 	s.Contains(ids, "zone-a-prod-cluster-alpha/shop/lonely-data", "the claim itself is still loaded")
-	s.Contains(ids, "netapp/ontap-prod/aggr/aggr9", "the differently-labelled aggregate still joins: env never reaches Harvest")
-	s.Contains(ids, "netapp/ontap-prod/ontap-prod-02", "and pulls its controller with it")
+	s.NotContains(ids, "netapp/ontap-prod/aggr/aggr9", "the other environment's aggregate is never read")
 
-	var joined bool
 	for _, e := range body.Elements.Edges {
-		if e.Data.Source == "zone-a-prod-cluster-alpha/shop/lonely-data" && e.Data.Target == "netapp/ontap-prod/aggr/aggr9" {
-			joined = true
-		}
+		s.False(e.Data.Source == "zone-a-prod-cluster-alpha/shop/lonely-data" && e.Data.Target == "netapp/ontap-prod/aggr/aggr9",
+			"no pvc-to-netapp-aggr edge from a Harvest series of another environment")
 	}
-	s.True(joined, "the claim draws its pvc-to-netapp-aggr edge from a Harvest series the env filter would have excluded")
 }
 
 // A rebound label key changes the MATCHER, never the request parameter name.

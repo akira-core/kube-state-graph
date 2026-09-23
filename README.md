@@ -125,14 +125,13 @@ filter appears as an `external` node rather than a real pod — the request's
 inbound and outbound dependencies stay visible without loading the rest of the
 estate.
 
-> **Operator precondition.** The kube-state-metrics and kubelet families must
-> carry the configured `az` / `env` labels. A family that does not simply
-> matches nothing under those filters, and because the default projection keeps
-> only connectivity-connected workload, a missing label can turn a filtered
-> request into an empty graph rather than a partial one. The NetApp Harvest
-> family is exempt: it carries no request matcher — `?az=` selects which
-> `harvest` backend of the routing table is asked, `?env=` does not reach it —
-> so Harvest series need no `az` / `env` label.
+> **Operator precondition.** The kube-state-metrics, kubelet and NetApp Harvest
+> families must carry the configured `az` / `env` labels. A family that does not
+> simply matches nothing under those filters, and because the default projection
+> keeps only connectivity-connected workload, a missing label can turn a filtered
+> request into an empty graph rather than a partial one. Harvest carries `az` /
+> `env` only — its `cluster` is the ONTAP cluster — and `?az=` also selects
+> which `harvest` backend of the routing table is asked.
 
 ## Upstream metrics consumed
 

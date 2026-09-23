@@ -262,11 +262,12 @@ func (p topologyPlan) restrictsVolumeLabels(rw *VolumeKeyRewriter) bool {
 }
 
 // resolveVolumeLabelRead decides the volume hub for this build and renders its
-// phase-1 read. It is a pure function of the plan, the match mode, the window
-// and the byte budget, and it is idempotent: a resolved plan is returned as is,
-// so the storage build can resolve once to pick its request matchers and
-// routing and hand the resolved plan to the read.
-func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.Duration, budget int) topologyPlan {
+// phase-1 read under the request's own matchers (keys, sel — az / env on
+// Harvest). It is a pure function of the plan, the match mode, the window, the
+// byte budget and the request, and it is idempotent: a resolved plan is
+// returned as is, so the storage build can resolve once for its span and log
+// and hand the resolved plan to the read.
+func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) topologyPlan {
 	if p.resolved {
 		return p
 	}
@@ -274,12 +275,15 @@ func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.
 	if !p.restrictsVolumeLabels(rw) {
 		return p
 	}
+	// Every chunk repeats the request matchers, so they come off the budget
+	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunks.
+	budget -= promql.RequestMatcherCost(promql.QVolumeLabels, keys, sel)
 	queries, ok := rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, budget)
 	for i := range queries {
 		if !ok {
 			break
 		}
-		queries[i].rendered, ok = queries[i].render(window)
+		queries[i].rendered, ok = queries[i].render(window, keys, sel)
 	}
 	if !ok {
 		// Too many chunks, or a value set that normalised away. The build reads

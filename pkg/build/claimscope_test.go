@@ -356,16 +356,16 @@ func TestVolumeHub_UnboundedClaimScopeReadsWideAndFilters(t *testing.T) {
 func TestVolumeHub_ClaimFamiliesLeaveTheFirstWaveOnlyInHubMode(t *testing.T) {
 	suffix := defaultVolumeKeyRewriter()
 	hub := storagePlan(vlrRoots(t, nil, nil, []string{"aggr1"}, nil, nil)).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes)
+		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
 	require.True(t, hub.hub)
 	unbounded := storagePlan(vlrRoots(t, nil, nil, manyAggrRoots(5000, 240), nil, nil)).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes)
+		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
 	require.False(t, unbounded.hub)
 	require.True(t, unbounded.phaseOneUnbounded)
 	podOnly := storagePlan(vlrRoots(t, nil, nil, nil, nil, []string{"shop/orders-0"})).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes)
+		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
 	require.False(t, podOnly.hub)
-	full := fullPlan.resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes)
+	full := fullPlan.resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
 	require.False(t, full.hub)
 
 	for _, qy := range promql.ClaimScopedQueries {
@@ -472,7 +472,7 @@ func TestVolumeHub_CompletionRowsAreNeverACandidateSource(t *testing.T) {
 			completion = append(completion, qy)
 		}
 	}
-	assert.Equal(t, []string{`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr3"}[1m])`}, completion,
+	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr3"}[1m])`}, completion,
 		"owner completion re-reads the touched aggregate whole")
 	assert.Equal(t, [][]string{{"pvc-shop"}}, q.ScopeValues(promql.QPVCInfo, promql.VolumeNameLabel),
 		"trident_pvc_other came back through completion, never a candidate")

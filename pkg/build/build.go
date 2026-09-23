@@ -284,7 +284,7 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 // binds, so no query reaches a store of another zone and no series of another
 // zone or environment reaches the body.
 func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
-	plan = plan.resolveVolumeLabelRead(b.opts.volumeKey(), window, b.opts.qosScopeBatchBytes())
+	plan = plan.resolveVolumeLabelRead(b.opts.volumeKey(), window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
 	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(

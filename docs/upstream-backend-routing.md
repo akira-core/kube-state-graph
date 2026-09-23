@@ -92,15 +92,13 @@ backend serving them. Narrowing them would drop edges whose series happen to
 live in another zone's store, and the connectivity prune would then delete the
 pods on both ends.
 
-`harvest` is the opposite special case: it **is** routed by zone, but the query
-string sent to the selected backend is the unfiltered one — no `az` and no
-`env` matcher (the `qos_*` families carry only their data-derived `volume` scope). A per-zone
-Harvest store already holds only its own zone's series, so the store boundary is
-the zone filter, and the Harvest series therefore need **not** carry the
-configured `az` / `env` labels at all. Two consequences: `?env=` has no effect
-on the Harvest legs, and a catch-all `harvest` backend (no `zones`) under
-`?az=` returns every zone's series, narrowed only by reference through the
-loaded claims — both exactly what an unfiltered build already does.
+`harvest` is routed by zone like `ksm` and `kubelet`, and — like them — carries
+the `az` and `env` matchers on every query (the `qos_*` families and the
+restricted `volume_labels` reads add their data- or root-derived scope after
+them). A catch-all `harvest` backend (no `zones`) under `?az=` therefore returns
+the requested zone's series only, and `?env=` narrows Harvest too. Every Harvest
+series must carry the configured `az` / `env` labels; see
+`netapp-harvest-preconditions.md`.
 
 ## Backend selection
 
@@ -116,8 +114,7 @@ Routing composes **with** the PromQL matchers, never instead of them: an `az`
 value that selects a backend is still rendered as a label matcher on every query
 that accepts it. Routing narrows *which store is asked*; the matcher narrows
 *what that store returns*. `env`, `cluster` and `namespace` play no part in
-backend selection. The one family that routes without a matcher is `harvest`
-(above): for it, backend selection is the *only* effect `az` has.
+backend selection. No family is routed by zone without the matcher.
 
 **The volume hub routes like every other storage build.** A
 `/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=` runs
@@ -281,8 +278,7 @@ sets, err := router.QueryLabels(ctx, promql.LabelQuery{
 
 | Family | `az` set |
 |---|---|
-| `ksm`, `kubelet`, `alerts` | routed to the zone's backends **and** rendered as a matcher (the configured `az` label key) |
-| `harvest` | routed to the zone's backends, **no** matcher — the per-zone store is the filter |
+| `ksm`, `kubelet`, `alerts`, `harvest` | routed to the zone's backends **and** rendered as a matcher (the configured `az` label key) |
 | `servicegraph`, `probe` | **request error** naming the family; pass the `az` label as a filter with the field left empty |
 
 Other rules:

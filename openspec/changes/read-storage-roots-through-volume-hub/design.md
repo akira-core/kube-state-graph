@@ -325,6 +325,43 @@ Alternatives rejected:
 - **Add `labels.az` / `labels.env` to nodes.** A wire change the matcher does
   not need; the zone lives in the build-internal index only.
 
+### D13 — Harvest queries carry the request's `az` / `env`
+
+D7 keeps every Kubernetes and `ALERTS` query in the request's zone, but the
+Harvest legs still reached their store through backend selection alone: `az`
+picked the `harvest` backend and rendered no matcher, and `env` did not reach
+Harvest at all. A zone's store holding several environments' filers, or a
+catch-all `harvest` backend, therefore still answered with filers outside the
+request's `az` / `env`.
+
+Every Harvest query now carries the request's `az` and `env` matchers exactly
+as a kube-state-metrics query does — `dimsHarvest = dimAZ | dimEnv`, so the
+routing-only `dimAZRoute` bit loses its one user and is removed, and
+`Family.AcceptsAZ` / `RendersAZ` agree for every family. `Render` covers the
+unrestricted legs through `queryDims`. The five restricted Harvest renderers
+(`RenderVolumeLabelsRooted`, `…SVMRooted`, `…OwnerCompletion`,
+`…TokenScoped`, `RenderQoSVolumeScoped`) take `(keys, sel)` like
+`RenderScoped` and render the request matchers ahead of their own restriction;
+`RequestMatcherCost` lets the phase-1 and owner-completion chunkers take the
+repeated fragment off their byte budget, as they already do for the repeated
+cluster matcher. `cluster` and `namespace` still never reach Harvest.
+
+Always on, no flag: every Harvest series MUST carry the configured `az` / `env`
+labels (BREAKING, `docs/BREAKING.md`). A Harvest series without them matches
+nothing under any filter, and `/v1/storage-graph` is always filtered. The
+`selector_family_empty` Warn keeps excluding the Harvest families: an empty
+Harvest read is also the normal state of a deployment with no NetApp storage,
+so it cannot tell a missing label from a missing filer.
+
+Alternatives rejected:
+
+- **An opt-in flag.** Keeps estates with unlabelled Harvest working, at the
+  cost of a switch every deployment that wants the guarantee must remember.
+  The operators this serves label every series; the flag was declined.
+- **Filter Harvest rows in Go by the series' `az` / `env`.** The query would
+  still fetch other zones' rows from a catch-all store — the fan-out D7
+  exists to prevent.
+
 ## Risks / Trade-offs
 
 - [Static PVs are not found from a storage root] → Documented limitation in
@@ -333,6 +370,9 @@ Alternatives rejected:
 - [Operator uses a custom `--volume-name-prefix` or Trident `nameTemplate`] →
   Extraction yields nothing; D10 `no_pv_candidate` names it. Same class as the
   existing forward-derivation blind spots.
+- [Harvest series without the `az` / `env` labels vanish from every filtered
+  build] → Documented precondition and BREAKING entry (D13); no Warn can tell
+  it from an estate without NetApp storage.
 - [A filer shared across zones draws only the requested zone's claims] →
   Accepted (D7): a request never reaches another zone's stores. Request each
   zone to see its claims on the filer.

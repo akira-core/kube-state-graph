@@ -121,7 +121,7 @@ func scopedQoSVectors(t *testing.T, q promql.Querier, opts Options, v *topologyV
 	}
 	var mu sync.Mutex
 	require.NoError(t, readScopedQoS(ctx, ctx, q, time.Minute, time.Unix(1, 0).UTC(),
-		opts, v, &mu, false, done(), done()))
+		opts, promql.Selector{}, v, &mu, false, done(), done()))
 }
 
 // The QoS read waits for the two legs its scope is computed from, and the query
@@ -282,7 +282,7 @@ func TestReadScopedQoS_FailClosedChunkFailsTheRead(t *testing.T) {
 	close(done)
 	var mu sync.Mutex
 	err := readScopedQoS(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
-		Options{QoSScopeBatchBytes: 21}, &v, &mu, true, done, done)
+		Options{QoSScopeBatchBytes: 21}, promql.Selector{}, &v, &mu, true, done, done)
 	require.Error(t, err)
 	qe, ok := errors.AsType[*QueryError](err)
 	require.True(t, ok)

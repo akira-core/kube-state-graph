@@ -109,8 +109,7 @@ func TestParseFamily(t *testing.T) {
 // TestFamilyAcceptsAZ pins the zone-routable set. The service-graph and probe
 // families accept no request dimension, so backend selection must never narrow
 // them by zone — narrowing them would drop edges the loaded topology needs
-// (design D4). Harvest is zone-routable through the routing-only dimAZRoute
-// bit even though it renders no az matcher.
+// (design D4).
 func TestFamilyAcceptsAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.AcceptsAZ())
 	assert.True(t, FamilyKubelet.AcceptsAZ())
@@ -121,29 +120,32 @@ func TestFamilyAcceptsAZ(t *testing.T) {
 	assert.False(t, Family("not-a-family").AcceptsAZ(), "an unknown family is never zone-routable")
 }
 
-// TestFamilyRendersAZ pins the matcher bit independently of zone-routability.
-// ksm / kubelet / alerts route AND render; harvest routes without rendering;
-// servicegraph / probe do neither.
+// TestFamilyRendersAZ pins the matcher bit. Every zone-routed family —
+// ksm, kubelet, alerts and harvest — also renders the az matcher
+// (read-storage-roots-through-volume-hub D13); servicegraph / probe do neither.
+// No family routes by zone without the matcher any more.
 func TestFamilyRendersAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.RendersAZ())
 	assert.True(t, FamilyKubelet.RendersAZ())
 	assert.True(t, FamilyAlerts.RendersAZ())
-	assert.False(t, FamilyHarvest.RendersAZ(), "Harvest routes by zone without an az matcher")
+	assert.True(t, FamilyHarvest.RendersAZ(), "Harvest carries the az matcher like every zone-routed family")
 	assert.False(t, FamilyServiceGraph.RendersAZ())
 	assert.False(t, FamilyProbe.RendersAZ())
 	assert.False(t, Family("not-a-family").RendersAZ(), "an unknown family never renders az")
+	for _, f := range Families {
+		assert.Equal(t, f.AcceptsAZ(), f.RendersAZ(), "%q: routing and matcher agree", f)
+	}
 }
 
 // TestFamilyAcceptsAZ_HomogeneousWithinFamily is the guard the derivation
-// depends on: every query in a family must agree about zone-routability
-// (dimAZ or dimAZRoute).
+// depends on: every query in a family must agree about the az dimension.
 // A family whose queries disagreed would resolve to the conservative false,
 // silently widening its fan-out — so the disagreement is caught here instead.
 func TestFamilyAcceptsAZ_HomogeneousWithinFamily(t *testing.T) {
 	seen := map[Family]bool{}
 	first := map[Family]Query{}
 	for q, f := range queryFamily {
-		az := queryDims[q]&(dimAZ|dimAZRoute) != 0
+		az := queryDims[q]&dimAZ != 0
 		if prev, ok := seen[f]; ok {
 			assert.Equal(t, prev, az,
 				"family %q is inhomogeneous: %s and %s disagree about the az dimension",

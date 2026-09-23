@@ -78,3 +78,11 @@
 - [x] 12.3 Revise the spec deltas: drop the MODIFIED "Storage-flow graph endpoint", "Request-scoped upstream selectors", "Backend routing composes with request-scoped selectors" and "Application-rooted recovery reads" blocks; state the unchanged matchers and routing in the hub requirement with a two-zone scenario; fix the `netapp-storage-graph` hub scenario and the `alert-overlay` rationale
 - [x] 12.4 Update the `/v1/storage-graph` OpenAPI text (az / env pin one estate in every mode) and the `/v1/graph` 502 text (names the failing family); run `make docs && make check-docs`
 - [x] 12.5 Update `CLAUDE.md`, `README.md`, `README.zh-tw.md`, `docs/BREAKING.md`, `docs/upstream-backend-routing.md`, `docs/netapp-harvest-preconditions.md`; run `make lint vet test`, the Docker integration suite and `openspec validate read-storage-roots-through-volume-hub --strict`
+
+## 13. Harvest queries carry the request's az / env (D13)
+
+- [x] 13.1 Set `dimsHarvest = dimAZ | dimEnv` and remove `dimAZRoute`; verify `pkg/promql` cases render `<az-key>` / `<env-key>` (and never `cluster` / `namespace`) on every Harvest query under a selector, the empty-selector baseline is unchanged, and `Family.AcceptsAZ` / `RendersAZ` agree for every family
+- [x] 13.2 Give the five restricted Harvest renderers `(keys, sel)`, rendering the request matchers ahead of the restriction; add `RequestMatcherCost` and charge it in the phase-1 and owner-completion chunkers; verify renderer and chunking cases
+- [x] 13.3 Thread the request selector to every restricted Harvest read in `pkg/build` (phase 1 via `resolveVolumeLabelRead`, owner completion, phase 2, scoped QoS); verify a storage build over a catch-all `harvest` backend holding three zone/env filers loads only the request's
+- [x] 13.4 Keep the Harvest families out of `selector_family_empty` by an explicit rule; verify the Warn stays quiet for an empty Harvest read under a filter
+- [x] 13.5 Stamp `az` / `env` on the Harvest fixtures of unit, golden and integration tests that run filtered; update `CLAUDE.md`, `README.md`, `README.zh-tw.md`, `docs/BREAKING.md`, `docs/netapp-harvest-preconditions.md`, `docs/upstream-backend-routing.md`, `docs/upstream-metrics.md`; run `make lint vet test`, the Docker integration suite, `make check-docs` and `openspec validate --strict`

@@ -362,12 +362,12 @@ func TestRoutedBuild_ZoneMatcherStillRendered(t *testing.T) {
 		"selecting a backend must not replace the pushed-down matcher")
 	assert.Empty(t, fb.queryFor(promql.QPodInfo), "the other zone's store is not asked")
 
-	// The Harvest leg is zone-routed the same way but carries NO matcher: for
-	// that family the selected store is the zone boundary.
+	// The Harvest leg is zone-routed the same way AND carries the matcher
+	// (read-storage-roots-through-volume-hub D13).
 	hv := fa.queryFor(promql.QVolumeLabels)
 	require.NotEmpty(t, hv, "the zone-a store must have been asked for Harvest")
-	assert.Equal(t, `last_over_time(volume_labels[1m])`, hv,
-		"Harvest is routed by zone, never narrowed by matcher")
+	assert.Equal(t, `last_over_time(volume_labels{az="zone-a"}[1m])`, hv,
+		"Harvest is routed by zone and narrowed by the matcher")
 	assert.Empty(t, fb.queryFor(promql.QVolumeLabels), "the other zone's Harvest store is not asked")
 }
 
@@ -382,10 +382,10 @@ var harvestQueries = []promql.Query{
 }
 
 // Under a zone-scoped request every Harvest leg reaches the zone's backend AND
-// any catch-all backend, and each receives the byte-identical UNFILTERED
-// string — the same one an unscoped build renders. Routing is the only effect
-// `az` has on the family.
-func TestRoutedBuild_HarvestLegsAreUnfilteredOnZoneAndCatchAllBackends(t *testing.T) {
+// any catch-all backend, and each receives the byte-identical string carrying
+// the request's az / env — so the catch-all answers for the requested zone
+// only (read-storage-roots-through-volume-hub D13).
+func TestRoutedBuild_HarvestLegsCarryTheZoneOnZoneAndCatchAllBackends(t *testing.T) {
 	joined := map[promql.Query]model.Vector{
 		promql.QPVCInfo: {&model.Sample{Metric: model.Metric{
 			"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data",
@@ -422,17 +422,17 @@ func TestRoutedBuild_HarvestLegsAreUnfilteredOnZoneAndCatchAllBackends(t *testin
 		scoped[q] = true
 	}
 	for _, q := range harvestQueries {
-		want := promql.Render(q, time.Minute, promql.LabelKeys{}, promql.Selector{})
+		want := promql.Render(q, time.Minute, promql.LabelKeys{}, sel)
 		if scoped[q] {
-			// The six workload families carry ONE extra matcher, and it is
-			// derived from upstream data (the FlexVol names the loaded claims
-			// matched), never from the request. Still no az / env.
-			want, _ = promql.RenderQoSVolumeScoped(q, time.Minute, []string{"trident_pvc_9f3a"})
+			// The six workload families carry ONE extra matcher, derived
+			// from upstream data (the FlexVol names the loaded claims
+			// matched), after the request's az / env.
+			want, _ = promql.RenderQoSVolumeScoped(q, time.Minute, promql.LabelKeys{}, sel, []string{"trident_pvc_9f3a"})
 		}
-		assert.Equal(t, want, zone.queryFor(q), "%s on the zone backend must carry no request matcher", q)
-		assert.Equal(t, want, catchAll.queryFor(q), "%s on the catch-all backend must carry no request matcher", q)
-		assert.NotContains(t, want, `az=`, "%s must render no az matcher", q)
-		assert.NotContains(t, want, `env=`, "%s must render no env matcher", q)
+		assert.Equal(t, want, zone.queryFor(q), "%s on the zone backend", q)
+		assert.Equal(t, want, catchAll.queryFor(q), "%s on the catch-all backend", q)
+		assert.Contains(t, want, `az="zone-a",env="prod"`, "%s carries the request zone", q)
+		assert.NotContains(t, want, `cluster="c"`, "%s never carries the Kubernetes cluster", q)
 	}
 	// The kube-state-metrics leg on the same backend keeps its matcher, which
 	// is what makes this a per-family contract rather than a router quirk.

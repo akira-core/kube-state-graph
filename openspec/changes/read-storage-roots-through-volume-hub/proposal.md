@@ -67,6 +67,11 @@ request's zone and environment.
    identity; a known, different zone never matches, and an unknown one falls back
    to today's label comparison. A no-`cluster` alert on a pod whose name another
    zone reuses resolves by zone instead of being dropped as ambiguous.
+11. **BREAKING: Harvest queries carry the request's `az` / `env`.** Every NetApp
+   Harvest query — the unrestricted legs and every restricted `volume_labels` /
+   `qos_*` read — renders the request's `az` and `env` matchers, like every
+   kube-state-metrics query. Every Harvest series must carry the configured
+   `az` / `env` labels; one without them no longer reaches a filtered build.
 
 **Sequencing.** This change goes AFTER `fail-storage-graph-on-any-leg-error`.
 That change renames three `storage-graph-api` requirements this change modifies
@@ -93,10 +98,14 @@ None.
   **Application roots compose with the Harvest restriction** — citation of the
   renamed requirement.
 - `cluster-topology-source`: **Topology series consumed** — a hub-mode storage
-  build reads the claim families by reference.
+  build reads the claim families by reference. **Request-scoped upstream
+  selectors** and **Backend routing composes with request-scoped selectors** —
+  `az` / `env` render on every Harvest query.
 - `alert-overlay`: **Label-set matching to graph nodes** — a zone-agreement rule
   over the alert's `az` / `env` and the candidate node's zone.
-- `netapp-storage-graph`: **Harvest legs under request-scoped selectors** — the
+- `netapp-storage-graph`: **Harvest legs under request-scoped selectors** is
+  replaced by **Harvest legs carry the request zone and environment** — `az` /
+  `env` matchers on every Harvest query, the labelling precondition, and the
   "narrowed by reference through the loaded claims" statement gains the hub-mode
   direction (claims loaded FROM the rooted Harvest rows), and the `volume_labels`
   scope list gains the SVM and owner-completion restrictions.
@@ -114,8 +123,9 @@ None.
 - `pkg/build/alerts.go`, `pkg/build/topology.go` — per-ONTAP-cluster zone sets and
   the zone-agreeing alert match.
 - `pkg/promql` — `scopedLabel` entries for the five claim-keyed families; an
-  SVM-rooted and an aggregate-completion renderer for `volume_labels`. Routing is
-  unchanged.
+  SVM-rooted and an aggregate-completion renderer for `volume_labels`;
+  `dimsHarvest = dimAZ | dimEnv` (the routing-only bit is removed) and the
+  restricted Harvest renderers take `(keys, sel)`.
 - Docs: `docs/BREAKING.md`, `docs/upstream-metrics.md`,
   `docs/netapp-harvest-preconditions.md`, `docs/upstream-backend-routing.md`,
   `README.md`, `README.zh-tw.md`, `CLAUDE.md`, OpenAPI description of

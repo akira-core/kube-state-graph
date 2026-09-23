@@ -57,20 +57,15 @@ func TestSelector_Render(t *testing.T) {
 			`cluster="c1"`,
 		},
 		{
-			// Harvest is zone-ROUTED, never zone-MATCHED: the routing-only bit
-			// must not leak into the query string under any dimension.
-			"harvest query renders no request matcher",
+			// Harvest takes az and env only: its `cluster` is an ONTAP
+			// cluster and it carries no namespace (D13).
+			"harvest query renders the zone and environment only",
 			Selector{
 				AZ: []string{"zone-a"}, Env: []string{"prod"},
 				Cluster: []string{"c1"}, Namespace: []string{"shop"},
 			},
 			LabelKeys{}, dimsHarvest,
-			``,
-		},
-		{
-			"routing-only bit renders nothing on its own",
-			Selector{AZ: []string{"zone-a"}}, LabelKeys{}, dimAZRoute,
-			``,
+			`az="zone-a",env="prod"`,
 		},
 		{
 			// Both spellings of the bucket must match: a series with no
@@ -219,31 +214,34 @@ func TestQueryDims_UnfilteredFamilies(t *testing.T) {
 	}
 }
 
-// TestQueryDims_HarvestNeverCarriesClusterOrNamespace pins the Harvest rule:
-// its `cluster` label is the ONTAP cluster name, so a Kubernetes cluster value
-// pushed into it would match nothing — and since the family is zone-ROUTED
-// rather than zone-matched, no az/env matcher is rendered either. The query
-// string under a fully-populated selector is the unfiltered one.
-func TestQueryDims_HarvestNeverCarriesClusterOrNamespace(t *testing.T) {
-	for _, q := range []Query{
-		QVolumeLabels, QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency,
-		QQoSReadData, QQoSWriteData, QQoSPolicyFixedMaxIOPS, QQoSPolicyFixedMaxMBps,
-		QAggrStatus, QAggrSpaceUsed, QAggrSpaceTotal, QNetAppNodeStatus,
-	} {
-		assert.Equal(t, dimsHarvest, queryDims[q], "%s must be zone-routed with no matcher", q)
-		assert.Zero(t, queryDims[q]&(dimAZ|dimEnv|dimCluster|dimNamespace),
-			"%s must render no request-scoped matcher", q)
+// TestQueryDims_HarvestCarriesZoneOnly pins the Harvest rule
+// (read-storage-roots-through-volume-hub D13): every Harvest query carries the
+// request's az and env, like a kube-state-metrics query, so no other zone's or
+// environment's filer reaches a filtered build. Its `cluster` label is the
+// ONTAP cluster name, so a Kubernetes cluster value would match nothing, and
+// it carries no namespace — those two never reach it.
+func TestQueryDims_HarvestCarriesZoneOnly(t *testing.T) {
+	for q, fam := range queryFamily {
+		if fam != FamilyHarvest {
+			continue
+		}
+		assert.Equal(t, dimsHarvest, queryDims[q], "%s", q)
+		assert.Equal(t, dimAZ|dimEnv, queryDims[q], "%s carries az and env", q)
+		assert.Zero(t, queryDims[q]&(dimCluster|dimNamespace|dimNamespaceOrAbsent),
+			"%s never carries cluster or namespace", q)
 	}
 	sel := Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"},
 		Cluster: []string{"c1"}, Namespace: []string{"shop"},
 	}
-	got := Render(QVolumeLabels, time.Minute, LabelKeys{}, sel)
-	assert.Equal(t, `last_over_time(volume_labels[1m])`, got)
-	assert.Equal(t, `last_over_time(qos_read_ops[1m])`,
+	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod"}[1m])`,
+		Render(QVolumeLabels, time.Minute, LabelKeys{}, sel))
+	assert.Equal(t, `last_over_time(qos_read_ops{az="zone-a",env="prod"}[1m])`,
 		Render(QQoSReadOps, time.Minute, LabelKeys{}, sel),
-		"a Harvest query carries no matcher at all — not a request one, and "+
-			"since D11 not a lun one either")
+		"no lun matcher (D11), and no cluster / namespace")
+	assert.Equal(t, `last_over_time(aggr_new_status{zone="zone-a",tier="prod"}[1m])`,
+		Render(QAggrStatus, time.Minute, LabelKeys{AZ: "zone", Env: "tier"}, sel),
+		"the configured keys, as on every other family")
 }
 
 // TestQueryDims_ControllerAnnotationFamiliesAreNamespaced pins the third
@@ -295,8 +293,8 @@ func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
 			`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",cluster="cluster-alpha"}[1m])`},
 		"node condition": {QNodeStatusCondition,
 			`last_over_time(kube_node_status_condition{condition="Ready",az="zone-a",cluster="cluster-alpha"}[1m])`},
-		"qos workload (Harvest routes, never matches)": {QQoSReadOps,
-			`last_over_time(qos_read_ops[1m])`},
+		"qos workload (Harvest takes az / env, never cluster)": {QQoSReadOps,
+			`last_over_time(qos_read_ops{az="zone-a"}[1m])`},
 		"job owner cronjob": {QJobOwner,
 			`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
 		"deployment annotations": {QDeploymentAnnotations,
@@ -373,9 +371,9 @@ func TestSelector_Reaches(t *testing.T) {
 		"cluster reaches node info":         {Selector{Cluster: []string{"a"}}, QNodeInfo, true},
 		"cluster misses Harvest":            {Selector{Cluster: []string{"a"}}, QVolumeLabels, false},
 		"namespace misses Harvest":          {Selector{Namespace: []string{"ns"}}, QVolumeLabels, false},
-		"az misses Harvest (routing only)":  {Selector{AZ: []string{"z"}}, QVolumeLabels, false},
-		"env misses Harvest":                {Selector{Env: []string{"prod"}}, QVolumeLabels, false},
-		"az misses QoS (routing only)":      {Selector{AZ: []string{"z"}}, QQoSReadOps, false},
+		"az reaches Harvest":                {Selector{AZ: []string{"z"}}, QVolumeLabels, true},
+		"env reaches Harvest":               {Selector{Env: []string{"prod"}}, QVolumeLabels, true},
+		"az reaches QoS":                    {Selector{AZ: []string{"z"}}, QQoSReadOps, true},
 		"az reaches kubelet":                {Selector{AZ: []string{"z"}}, QKubeletVolumeUsedBytes, true},
 		"nothing reaches the service graph": {Selector{AZ: []string{"z"}, Cluster: []string{"a"}}, QServiceGraphTotal, false},
 		"nothing reaches the up probe":      {Selector{Env: []string{"prod"}}, QUpProbe, false},

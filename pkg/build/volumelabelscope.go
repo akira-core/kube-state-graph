@@ -104,11 +104,11 @@ type rootedVolumeLabelsQuery struct {
 
 // render is the query's PromQL. ok is false when its value sets normalise
 // away, which only an embedder filling StorageRoots directly can produce.
-func (r rootedVolumeLabelsQuery) render(window time.Duration) (string, bool) {
+func (r rootedVolumeLabelsQuery) render(window time.Duration, keys promql.LabelKeys, sel promql.Selector) (string, bool) {
 	if r.group == groupSVM {
-		return promql.RenderVolumeLabelsSVMRooted(window, r.clusters, r.svms)
+		return promql.RenderVolumeLabelsSVMRooted(window, keys, sel, r.clusters, r.svms)
 	}
-	return promql.RenderVolumeLabelsRooted(window, r.clusters, r.aggrs)
+	return promql.RenderVolumeLabelsRooted(window, keys, sel, r.clusters, r.aggrs)
 }
 
 // maxRootedVolumeLabelChunks bounds how many queries the phase-1 restriction may
@@ -431,17 +431,19 @@ func readOwnerCompletion(
 	window time.Duration,
 	end time.Time,
 	opts Options,
+	sel promql.Selector,
 	targets map[string][]string,
 ) (model.Vector, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
 	clusters := slices.Sorted(maps.Keys(targets))
+	request := promql.RequestMatcherCost(promql.QVolumeLabels, opts.LabelKeys, sel)
 	var rendered []string
 	for _, c := range clusters {
-		budget := max(opts.qosScopeBatchBytes()-promql.OwnerCompletionClusterCost(c), 1)
+		budget := max(opts.qosScopeBatchBytes()-request-promql.OwnerCompletionClusterCost(c), 1)
 		for _, chunk := range promql.ChunkScope(targets[c], budget) {
-			query, ok := promql.RenderVolumeLabelsOwnerCompletion(window, c, chunk)
+			query, ok := promql.RenderVolumeLabelsOwnerCompletion(window, opts.LabelKeys, sel, c, chunk)
 			if !ok {
 				continue // unreachable: targets hold no empty aggregate
 			}
@@ -468,6 +470,7 @@ func readTokenScopedVolumeLabels(
 	window time.Duration,
 	end time.Time,
 	opts Options,
+	sel promql.Selector,
 	plan topologyPlan,
 	v *topologyVectors,
 ) (model.Vector, error) {
@@ -512,7 +515,7 @@ func readTokenScopedVolumeLabels(
 	chunks := promql.ChunkScopeWithOverhead(tokens, opts.qosScopeBatchBytes(), overhead)
 	rendered := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		query, ok := promql.RenderVolumeLabelsTokenScoped(window, chunk, suffix, excludeClusters)
+		query, ok := promql.RenderVolumeLabelsTokenScoped(window, opts.LabelKeys, sel, chunk, suffix, excludeClusters)
 		if !ok {
 			// Unreachable for a non-empty chunk. Failing is the only honest
 			// answer under a fail-closed read: an incomplete candidate set
@@ -547,6 +550,7 @@ func readVolumeLabelsTail(
 	window time.Duration,
 	end time.Time,
 	opts Options,
+	sel promql.Selector,
 	plan topologyPlan,
 	v *topologyVectors,
 	svmRows *model.Vector,
@@ -570,7 +574,7 @@ func readVolumeLabelsTail(
 	tail, tctx := errgroup.WithContext(ctx)
 	tail.Go(func() (err error) {
 		defer recoverScopedPanic(tctx, promql.QVolumeLabels, &err)
-		completion, err = readOwnerCompletion(tctx, q, window, end, opts, completed)
+		completion, err = readOwnerCompletion(tctx, q, window, end, opts, sel, completed)
 		return err
 	})
 	tail.Go(func() (err error) {
@@ -580,7 +584,7 @@ func readVolumeLabelsTail(
 		case <-tctx.Done():
 			return nil
 		}
-		phaseTwo, err = readTokenScopedVolumeLabels(tctx, q, window, end, opts, plan, v)
+		phaseTwo, err = readTokenScopedVolumeLabels(tctx, q, window, end, opts, sel, plan, v)
 		return err
 	})
 	if err := tail.Wait(); err != nil {
@@ -594,7 +598,7 @@ func readVolumeLabelsTail(
 	}
 	var late model.Vector
 	if len(plan.volumeSVMs) > 0 {
-		late, err = readOwnerCompletion(ctx, q, window, end, opts,
+		late, err = readOwnerCompletion(ctx, q, window, end, opts, sel,
 			withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed))
 		if err != nil {
 			return err

@@ -410,7 +410,7 @@ func readTopology(
 	// the launch, the waves and the parse all read the same answer. A storage
 	// build has usually resolved it already, to pick its request matchers and
 	// routing; resolving is idempotent.
-	plan = plan.resolveVolumeLabelRead(v.VolumeKey, window, opts.qosScopeBatchBytes())
+	plan = plan.resolveVolumeLabelRead(v.VolumeKey, window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
 	if plan.phaseOneUnbounded {
 		slog.WarnContext(ctx, "storage roots did not yield a bounded volume-label restriction; reading the family unrestricted",
 			"query", string(promql.QVolumeLabels),
@@ -595,13 +595,13 @@ func readTopology(
 		}, bindingsDone), pvcAnnotationsDone))
 		finalDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readVolumeLabelsTail(ctx, q, window, end, opts, plan, &v, &svmRows,
+			return readVolumeLabelsTail(ctx, q, window, end, opts, sel, plan, &v, &svmRows,
 				volumeLabelsDone, pvcInfoDone)
 		}, finalDone))
 		volumeLabelsFinal = finalDone
 	}
 	g.Go(func() error {
-		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu, plan.failClosed,
+		return readScopedQoS(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, plan.failClosed,
 			pvcInfoDone, volumeLabelsFinal)
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
@@ -658,12 +658,13 @@ func readTopology(
 // selector demonstrably matches the deployment's labelling, yet a kubelet
 // family came back empty. A family is reported ONLY when a dimension the
 // request actually carries reaches it (promql.Selector.Reaches). In practice
-// that is the kubelet pair alone: the Harvest families render NO request
-// matcher (az only routes them to a backend, env is inert), so Reaches is
-// false for every dimension and an empty volume_labels can never be the
-// request's doing — reporting it would fire this Warn on every filtered
-// request of every non-NetApp deployment. QVolumeLabels stays in the list so
-// the contract is enforced by the table rather than by omission.
+// that is the kubelet pair alone. The Harvest families DO carry az / env now
+// (read-storage-roots-through-volume-hub D13), so Reaches is true for them,
+// but an empty volume_labels is also the ordinary state of a deployment with
+// no NetApp storage — reporting it would fire this Warn on every filtered
+// request of every such deployment, and nothing in the build can tell the
+// two apart. They are excluded by an explicit rule below; QVolumeLabels stays
+// in the list so the exclusion is a rule rather than an omission.
 //
 // An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
 // on a DIFFERENT axis, and it needs its own rule because Reaches cannot
@@ -686,7 +687,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
 		promql.QAlerts,
 	} {
-		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
+		if fam, ok := promql.FamilyOf(q); ok && (fam.Optional() || fam == promql.FamilyHarvest) {
 			continue
 		}
 		// Present-and-zero only: a family absent from the tally was never

@@ -248,7 +248,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 		require.Greater(t, len(got), 1, "only %d bytes are left for the aggregates", remaining)
 
 		for _, c := range got {
-			q, rok := promql.RenderVolumeLabelsRooted(time.Minute, c.clusters, c.aggrs)
+			q, rok := promql.RenderVolumeLabelsRooted(time.Minute, promql.LabelKeys{}, promql.Selector{}, c.clusters, c.aggrs)
 			require.True(t, rok)
 			sel := q[strings.Index(q, "{")+1 : strings.LastIndex(q, "}")]
 			alt := sel[strings.LastIndex(sel, `aggr=`):]
@@ -462,7 +462,7 @@ func vlrScope(t *testing.T, ontap, nodes, aggrs, svms, pods []string) graph.Stor
 	return scope
 }
 
-const vlrBare = `last_over_time(volume_labels[1m])`
+const vlrBare = `last_over_time(volume_labels{az="zone-a",env="prod"}[1m])`
 
 // -------------------------------------------------- 7. output preservation
 
@@ -554,7 +554,7 @@ func TestRootedVolumeLabels_ClusterAndAggregateAreAnded(t *testing.T) {
 
 	// And the query shape says the same thing: one selector, both matchers.
 	_, q := vlrBuild(t, fx, vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil).Roots, Options{}, true)
-	assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr1"}[1m])`,
+	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
 		q.QueriesFor(promql.QVolumeLabels)[0])
 }
 
@@ -978,9 +978,9 @@ func TestRootedVolumeLabelsChunks_Groups(t *testing.T) {
 		require.Len(t, got, 2)
 		assert.Equal(t, rootedVolumeLabelsQuery{group: groupAggr, clusters: []string{"ontap-prod"}, aggrs: []string{"aggr2", "aggr1"}}, got[0])
 		assert.Equal(t, rootedVolumeLabelsQuery{group: groupSVM, clusters: []string{"ontap-prod"}, svms: []string{"svm_b", "svm_a"}}, got[1])
-		q, rok := got[1].render(time.Minute)
+		q, rok := got[1].render(time.Minute, promql.LabelKeys{}, vlrSel)
 		require.True(t, rok)
-		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",svm=~"svm_a|svm_b"}[1m])`, q)
+		assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",svm=~"svm_a|svm_b"}[1m])`, q)
 	})
 
 	t.Run("svm alone is the SVM group alone", func(t *testing.T) {
@@ -1046,7 +1046,7 @@ func TestOwnerCompletionTargets(t *testing.T) {
 func completionQueries(q *promqlfake.Querier) []string {
 	var out []string
 	for _, s := range q.QueriesFor(promql.QVolumeLabels) {
-		if strings.Contains(s, `{cluster="`) && strings.Contains(s, "aggr") &&
+		if strings.Contains(s, `,cluster="`) && strings.Contains(s, "aggr") &&
 			!strings.Contains(s, "svm") && !strings.Contains(s, "volume=") {
 			out = append(out, s)
 		}
@@ -1065,8 +1065,8 @@ func TestRootedVolumeLabels_SVMRootCompletesEveryTouchedAggregate(t *testing.T) 
 	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
-	assert.Contains(t, restricted.QueriesFor(promql.QVolumeLabels), `last_over_time(volume_labels{svm="svm_shop"}[1m])`)
-	assert.Equal(t, []string{`last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr03|aggr07"}[1m])`},
+	assert.Contains(t, restricted.QueriesFor(promql.QVolumeLabels), `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
+	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr=~"aggr03|aggr07"}[1m])`},
 		completionQueries(restricted), "one completion query per ONTAP cluster, restricted to the touched aggregates")
 	assert.True(t, vlrIDs(body)["zone-a-prod-c1/uid-o0"], "the svm_shop claim is drawn")
 	for _, s := range restricted.QueriesFor(promql.QVolumeLabels) {
@@ -1085,9 +1085,9 @@ func TestRootedVolumeLabels_AggregateAndSVMRootsAreUnioned(t *testing.T) {
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	vl := restricted.QueriesFor(promql.QVolumeLabels)
-	assert.Contains(t, vl, `last_over_time(volume_labels{aggr="aggr00"}[1m])`)
-	assert.Contains(t, vl, `last_over_time(volume_labels{svm="svm_shop"}[1m])`)
-	assert.Equal(t, []string{`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr09"}[1m])`},
+	assert.Contains(t, vl, `last_over_time(volume_labels{az="zone-a",env="prod",aggr="aggr00"}[1m])`)
+	assert.Contains(t, vl, `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
+	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr09"}[1m])`},
 		completionQueries(restricted), "aggr00 was read whole by the aggregate group; aggr09 was not")
 	ids := vlrIDs(body)
 	assert.True(t, ids["zone-a-prod-c1/uid-o0"], "the aggr09 claim is retained through its SVM")
@@ -1153,8 +1153,8 @@ func TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates(t *testing.T)
 	assert.True(t, ids["netapp/ontap-prod/ontap-prod-01"], "aggr0's owner is voted over every aggr0 series")
 	assert.False(t, ids["netapp/ontap-prod/ontap-prod-05"], "not over the clone alone")
 	assert.Equal(t, []string{
-		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr9"}[1m])`,
-		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr0"}[1m])`,
+		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr9"}[1m])`,
+		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr0"}[1m])`,
 	}, completionQueries(restricted), "aggr9 completed after phase 1, aggr0 after phase 2")
 
 	t.Run("no svm root, no phase-2 completion", func(t *testing.T) {
@@ -1186,7 +1186,7 @@ func TestRootedVolumeLabels_OwnerCompletionFailureFailsTheBuild(t *testing.T) {
 	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
 	q := promqlfake.New(vlrMultiFiler())
 	q.Fail = func(name, query string) error {
-		if name == string(promql.QVolumeLabels) && strings.Contains(query, `{cluster="`) {
+		if name == string(promql.QVolumeLabels) && strings.Contains(query, `,cluster="`) {
 			return errors.New("upstream said no")
 		}
 		return nil

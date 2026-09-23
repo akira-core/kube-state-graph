@@ -28,9 +28,11 @@ func planKSM(pairs ...string) *model.Sample {
 	return &model.Sample{Metric: m, Value: 1}
 }
 
-// planHarvest is one Harvest series: no Kubernetes cluster, no az / env.
+// planHarvest is one Harvest series: no Kubernetes cluster, stamped with the
+// fixture zone (az / env) every Harvest series must carry
+// (read-storage-roots-through-volume-hub D13); a pair overrides it.
 func planHarvest(pairs ...string) *model.Sample {
-	m := model.Metric{}
+	m := model.Metric{"az": "zone-a", "env": "prod"}
 	for i := 0; i+1 < len(pairs); i += 2 {
 		m[model.LabelName(pairs[i])] = model.LabelValue(pairs[i+1])
 	}

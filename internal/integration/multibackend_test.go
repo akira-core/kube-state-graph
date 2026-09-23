@@ -178,7 +178,7 @@ kube_node_info{cluster="mb-alpha",node="mb-worker-0",az="zone-a"} 1 %[1]d
 kube_node_info{cluster="mb-alpha",node="mb-worker-1",az="zone-b"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="mb-alpha",namespace="db",persistentvolumeclaim="mb-data",storageclass="netapp-nas",volumename="pvc-mb-9f3a",az="zone-a"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="mb-alpha",namespace="db",pod="mongo-0",volume="data",persistentvolumeclaim="mb-data",az="zone-a"} 1 %[1]d
-volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb",az="zone-a",env="prod"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -187,7 +187,7 @@ traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb
 	// service-graph counter. Both containers serve the service-graph family,
 	// so the fan-out sees the series twice and must collapse it.
 	s.ingestInto(s.secondURL, fmt.Sprintf(`
-volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb",az="zone-b",env="prod"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -334,11 +334,11 @@ func (s *MultiBackendSuite) TestZoneRoutingSelectsTheBackend() {
 	})
 	s.True(hasPod(zoneA, "mb-alpha/mb-uid-1"), "the zone-a pod is served by the zone-a store")
 
-	// Harvest is zone-routed WITHOUT a matcher. Neither store's volume_labels
-	// carries an az label, both hold the claim's PV name, and only the zone-a
-	// store's copy may join: routing alone keeps the zone-b series out.
+	// Harvest is zone-routed AND matched. Both stores hold the claim's PV
+	// name, each stamped with its own zone, and only the zone-a store's copy
+	// may join.
 	s.Equal([]string{"netapp/ontap-mb-shadow/aggr/aggr-shadow"}, storageTargets(zoneA),
-		"the zone-a claim joins the zone-a store's Harvest series, which carries no az label")
+		"the zone-a claim joins the zone-a store's Harvest series")
 	s.NotContains(nodeIDs(zoneA), "netapp/ontap-mb/aggr/aggr-mb",
 		"the zone-b store's colliding volume_labels is not loaded under ?az=zone-a")
 
@@ -542,17 +542,17 @@ kube_pod_info{cluster="hub-c1",namespace="shop",pod="a-0",uid="hub-uid-a0",node=
 kube_node_info{cluster="hub-c1",node="hub-worker-a",az="zone-a",env="prod"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="hub-c1",namespace="shop",persistentvolumeclaim="a-data",storageclass="netapp-nas",volumename="pvc-hub-aaaa",az="zone-a",env="prod"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="hub-c1",namespace="shop",pod="a-0",volume="data",persistentvolumeclaim="a-data",az="zone-a",env="prod"} 1 %[1]d
-volume_labels{volume="trident_pvc_hub_aaaa",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub"} 1 %[1]d
-volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub"} 1 %[1]d
-aggr_new_status{cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub"} 1 %[1]d
-node_new_status{cluster="ontap-hub",node="ontap-hub-01"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_aaaa",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub",az="zone-a",env="prod"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub",az="zone-a",env="prod"} 1 %[1]d
+aggr_new_status{cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",az="zone-a",env="prod"} 1 %[1]d
+node_new_status{cluster="ontap-hub",node="ontap-hub-01",az="zone-a",env="prod"} 1 %[1]d
 `, t1))
 	s.ingestInto(s.secondURL, fmt.Sprintf(`
 kube_pod_info{cluster="hub-c1",namespace="shop",pod="b-0",uid="hub-uid-b0",node="hub-worker-b",az="zone-b",env="dev"} 1 %[1]d
 kube_node_info{cluster="hub-c1",node="hub-worker-b",az="zone-b",env="dev"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="hub-c1",namespace="shop",persistentvolumeclaim="b-data",storageclass="netapp-nas",volumename="pvc-hub-bbbb",az="zone-b",env="dev"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="hub-c1",namespace="shop",pod="b-0",volume="data",persistentvolumeclaim="b-data",az="zone-b",env="dev"} 1 %[1]d
-volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="ontap-zb-01",aggr="aggr-zb",svm="svm-zb"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="ontap-zb-01",aggr="aggr-zb",svm="svm-zb",az="zone-b",env="dev"} 1 %[1]d
 `, t1))
 	s.Require().True(s.WaitForSeries(`volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-hub"}`, hubNow, 30*time.Second))
 	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{persistentvolumeclaim="a-data"}`, hubNow, 30*time.Second))

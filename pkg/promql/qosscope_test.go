@@ -12,15 +12,14 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 	t.Parallel()
 
 	t.Run("one name renders an exact matcher beside lun", func(t *testing.T) {
-		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, []string{"trident_pvc_a"})
+		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, []string{"trident_pvc_a"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(qos_read_ops{volume="trident_pvc_a"}[1m])`, got)
 	})
 
 	t.Run("several names render one anchored alternation", func(t *testing.T) {
-		got, ok := RenderQoSVolumeScoped(QQoSWriteData, 5*time.Minute,
-			[]string{"trident_pvc_b", "trident_pvc_a"})
+		got, ok := RenderQoSVolumeScoped(QQoSWriteData, 5*time.Minute, LabelKeys{}, Selector{}, []string{"trident_pvc_b", "trident_pvc_a"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(qos_write_data{volume=~"trident_pvc_a|trident_pvc_b"}[5m])`, got,
@@ -28,14 +27,13 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 	})
 
 	t.Run("duplicates and empties are normalised away", func(t *testing.T) {
-		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute,
-			[]string{"v_a", "", "v_a"})
+		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, []string{"v_a", "", "v_a"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(qos_read_ops{volume="v_a"}[1m])`, got)
 	})
 
 	t.Run("a metacharacter in a name matches itself literally", func(t *testing.T) {
-		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, []string{"vol.a", "vol_b"})
+		got, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, []string{"vol.a", "vol_b"})
 		require.True(t, ok)
 		assert.Contains(t, got, `volume=~"vol\\.a|vol_b"`,
 			"QuoteMeta then string-escape, so the parser unquotes into the regex vol\\.a")
@@ -44,26 +42,26 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 	t.Run("an empty scope renders nothing at all", func(t *testing.T) {
 		// Never an unscoped fallback: an empty scope means no claim matched, so
 		// the unrestricted read could only fetch series the reader discards.
-		_, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, nil)
+		_, ok := RenderQoSVolumeScoped(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, nil)
 		assert.False(t, ok)
-		_, ok = RenderQoSVolumeScoped(QQoSReadOps, time.Minute, []string{"", ""})
+		_, ok = RenderQoSVolumeScoped(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, []string{"", ""})
 		assert.False(t, ok)
 	})
 
 	t.Run("only the six workload families are scopeable", func(t *testing.T) {
 		for _, q := range QoSWorkloadQueries {
-			_, ok := RenderQoSVolumeScoped(q, time.Minute, []string{"v"})
+			_, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"})
 			assert.True(t, ok, string(q))
 		}
 		for _, q := range []Query{QVolumeLabels, QQoSPolicyFixedMaxIOPS, QAggrStatus, QPodInfo} {
-			_, ok := RenderQoSVolumeScoped(q, time.Minute, []string{"v"})
+			_, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"})
 			assert.False(t, ok, string(q))
 		}
 	})
 
 	t.Run("the volume scope is the only matcher", func(t *testing.T) {
 		for _, q := range QoSWorkloadQueries {
-			got, ok := RenderQoSVolumeScoped(q, time.Minute, []string{"v"})
+			got, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"})
 			require.True(t, ok)
 			assert.NotContains(t, got, "lun",
 				"volume granularity is the reader's rule, never a matcher (D11)")

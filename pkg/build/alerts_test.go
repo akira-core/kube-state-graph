@@ -619,7 +619,15 @@ func TestResolveAlerts_ZoneReadThroughConfiguredKeys(t *testing.T) {
 // ontapZonesOf collects the zone set of every ONTAP cluster from the
 // entity-naming Harvest families, counting only series carrying the full pair.
 func TestOntapZonesOf(t *testing.T) {
-	h := func(pairs ...string) model.Sample { return *planHarvest(pairs...) }
+	// Built bare rather than through planHarvest, whose fixture zone would
+	// stamp the half-stamped and unstamped cases.
+	h := func(pairs ...string) model.Sample {
+		m := model.Metric{}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			m[model.LabelName(pairs[i])] = model.LabelValue(pairs[i+1])
+		}
+		return model.Sample{Metric: m, Value: 1}
+	}
 	v := topologyVectors{
 		VolumeLabels: sampleVec(
 			h("cluster", "ontap-prod", "volume", "v1", "az", "zone-a", "env", "prod"),

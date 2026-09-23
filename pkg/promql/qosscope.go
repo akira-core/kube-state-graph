@@ -22,12 +22,14 @@ func isQoSWorkloadQuery(q Query) bool {
 }
 
 // RenderQoSVolumeScoped renders one QoS workload query restricted to a known
-// set of ONTAP FlexVol names. That scope is the query's ONLY matcher — volume
+// set of ONTAP FlexVol names, after the request's az / env matchers (the only
+// request dimensions a Harvest query takes). That scope is its ONLY other
+// matcher — volume
 // granularity is enforced by the reader, not here, because the LUN rows a
 // `lun=""` matcher would drop are the only ones naming the QoS policy on a SAN
 // backend (design.md D11):
 //
-//	last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
+//	last_over_time(qos_read_ops{az="zone-a",env="prod",volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //
 // The values are FlexVol names the volume-object family already returned, so
 // the restriction is EXACT: pkg/build's derive-then-match runs once, in Go,
@@ -45,7 +47,7 @@ func isQoSWorkloadQuery(q Query) bool {
 // caller MUST skip the query rather than fall back to an unscoped read: an
 // empty scope means no claim matched anything, so the unrestricted read could
 // only fetch series the reader would discard.
-func RenderQoSVolumeScoped(q Query, window time.Duration, volumes []string) (string, bool) {
+func RenderQoSVolumeScoped(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string) (string, bool) {
 	if !isQoSWorkloadQuery(q) {
 		return "", false
 	}
@@ -53,7 +55,7 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, volumes []string) (str
 	if len(vals) == 0 {
 		return "", false
 	}
-	matchers := appendMatcher(nil, HarvestVolumeLabel, vals)
+	matchers := appendMatcher(requestMatchers(q, keys, sel), HarvestVolumeLabel, vals)
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
