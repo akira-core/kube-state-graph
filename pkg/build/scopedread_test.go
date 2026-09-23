@@ -1,7 +1,6 @@
 package build
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -20,9 +19,9 @@ func TestIssueScoped_EmptyScopeIssuesNothing(t *testing.T) {
 	f := promqlfake.New(nil)
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	err := issueScopedFamilies(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+	err := issueScopedFamilies(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
 		Options{}, promql.Selector{}, v, &mu, []scopedFamily{
-			{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: nil, mode: legRequired},
+			{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: nil},
 		})
 	require.NoError(t, err)
 	assert.Empty(t, f.Issued())
@@ -39,16 +38,18 @@ func TestIssueScoped_RequiredChunkFails(t *testing.T) {
 	}
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	err := issueScopedFamilies(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+	err := issueScopedFamilies(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
 		Options{}, promql.Selector{}, v, &mu, []scopedFamily{
-			{query: promql.QReplicaSetOwner, dst: &v.ReplicaSetOwner, scope: []string{"a"}, mode: legRequired},
+			{query: promql.QReplicaSetOwner, dst: &v.ReplicaSetOwner, scope: []string{"a"}},
 		})
-	require.Error(t, err, "a legRequired chunk failure fails the whole read")
+	require.Error(t, err, "a chunk failure fails the whole read")
 }
 
-// A failed OPTIONAL chunk degrades on its own: the other chunks of the same
-// family still land, and the family is still counted as issued.
-func TestIssueScoped_OptionalChunkDegradesAlone(t *testing.T) {
+// Every family fails closed, the two that degrade on /v1/graph included: a
+// by-reference wave only runs on /v1/storage-graph
+// (fail-storage-graph-on-any-leg-error). One failed chunk of three fails the
+// read, and the error names the family and nothing from the upstream text.
+func TestIssueScoped_AnyChunkFailureFailsAndNamesFamily(t *testing.T) {
 	const tracking = "annotation_argocd_argoproj_io_tracking_id"
 	rsRow := func(rs string) *model.Sample {
 		return &model.Sample{Metric: model.Metric{"replicaset": model.LabelValue(rs), tracking: "x:y/z:ns/n"}, Value: 1}
@@ -58,63 +59,22 @@ func TestIssueScoped_OptionalChunkDegradesAlone(t *testing.T) {
 	})
 	f.Fail = func(name, query string) error {
 		if name == string(promql.QReplicaSetAnnotations) && strings.Contains(query, `replicaset="b"`) {
-			return errors.New("upstream 5xx")
+			return errors.New(`Post "http://vm-internal:8428/api/v1/query": upstream 5xx`)
 		}
 		return nil
 	}
 	v := &topologyVectors{}
 	var mu sync.Mutex
 	// A budget below one name's rendered length forces one chunk per name.
-	err := issueScopedFamilies(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+	err := issueScopedFamilies(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
 		Options{QoSScopeBatchBytes: 1}, promql.Selector{}, v, &mu, []scopedFamily{
-			{query: promql.QReplicaSetAnnotations, dst: &v.ReplicaSetAnnotations, scope: []string{"a", "b", "c"}, mode: legOptional},
+			{query: promql.QReplicaSetAnnotations, dst: &v.ReplicaSetAnnotations, scope: []string{"a", "b", "c"}},
 		})
-	require.NoError(t, err)
-	assert.Len(t, v.ReplicaSetAnnotations, 2, "the failed chunk's series are missing, the other two survive")
-	assert.True(t, v.ScopeIssued[promql.QReplicaSetAnnotations], "the family is still counted as issued overall")
-}
-
-// legOptionalTracking sets the shared flag iff at least one chunk degraded —
-// the kube_job_annotations contract that suppresses the Job -> CronJob hop.
-func TestIssueScoped_OptionalTrackingSetsFlag(t *testing.T) {
-	f := promqlfake.New(nil)
-	f.Fail = func(name, _ string) error {
-		if name == string(promql.QJobAnnotations) {
-			return errors.New("upstream 5xx")
-		}
-		return nil
-	}
-	v := &topologyVectors{}
-	var mu sync.Mutex
-	err := issueScopedFamilies(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
-		Options{}, promql.Selector{}, v, &mu, []scopedFamily{
-			{
-				query: promql.QJobAnnotations, dst: &v.JobAnnotations, scope: []string{"a"},
-				mode: legOptionalTracking, degraded: &v.JobAnnotationsDegraded,
-			},
-		})
-	require.NoError(t, err)
-	assert.True(t, v.JobAnnotationsDegraded)
-	assert.True(t, v.ScopeIssued[promql.QJobAnnotations])
-}
-
-// optionalQueryFatal fails an OPTIONAL leg whenever the CALLER's context is
-// already done — a build timeout or a disconnected client — even though the
-// error class would otherwise degrade.
-func TestIssueScoped_CallerCancellationFailsOptional(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	f := promqlfake.New(nil)
-	f.Fail = func(_, _ string) error {
-		cancel() // the caller went away mid-query
-		return errors.New("upstream 5xx")
-	}
-	v := &topologyVectors{}
-	var mu sync.Mutex
-	err := issueScopedFamilies(ctx, ctx, f, time.Minute, time.Unix(1, 0).UTC(),
-		Options{}, promql.Selector{}, v, &mu, []scopedFamily{
-			{query: promql.QReplicaSetAnnotations, dst: &v.ReplicaSetAnnotations, scope: []string{"a"}, mode: legOptional},
-		})
-	require.Error(t, err, "caller cancellation must still fail an optional leg")
+	require.Error(t, err)
+	qe, ok := errors.AsType[*QueryError](err)
+	require.True(t, ok, "the chunk error is named with its family")
+	assert.Equal(t, string(promql.QReplicaSetAnnotations), qe.Query)
+	assert.False(t, v.JobAnnotationsDegraded, "no wave here ever marks a family degraded")
 }
 
 // Two families with independent scopes and independent chunk counts issue and
@@ -127,10 +87,10 @@ func TestIssueScoped_HeterogeneousScopesPerFamily(t *testing.T) {
 	})
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	err := issueScopedFamilies(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+	err := issueScopedFamilies(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
 		Options{}, promql.Selector{}, v, &mu, []scopedFamily{
-			{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: []string{"orders"}, mode: legRequired},
-			{query: promql.QDaemonSetAnnotations, dst: &v.DaemonSetAnnotations, scope: nil, mode: legRequired},
+			{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: []string{"orders"}},
+			{query: promql.QDaemonSetAnnotations, dst: &v.DaemonSetAnnotations, scope: nil},
 		})
 	require.NoError(t, err)
 	assert.Len(t, v.StatefulSetAnnotations, 1)

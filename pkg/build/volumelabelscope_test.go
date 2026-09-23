@@ -759,49 +759,40 @@ func TestRootedVolumeLabels_SeriesTallyIsTheMergedCount(t *testing.T) {
 
 // ------------------------------------------------------------ degrade + signal
 
-func TestRootedVolumeLabels_ChunkFailuresDegrade(t *testing.T) {
+// Spec: "A failed restricted chunk fails the build". The rooted read only
+// runs on /v1/storage-graph, which fails closed on every family but ALERTS.
+func TestRootedVolumeLabels_ChunkFailuresFailTheBuild(t *testing.T) {
 	scope := vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil)
 	boom := errors.New("upstream said no")
 
-	t.Run("a failed phase-1 chunk costs only the claims it carried", func(t *testing.T) {
-		q := promqlfake.New(vlrMultiFiler())
-		q.Fail = func(name, query string) error {
-			if name == string(promql.QVolumeLabels) && strings.Contains(query, `aggr="aggr2"`) {
-				return boom
+	for _, tc := range []struct {
+		name string
+		hit  string
+	}{
+		{"a failed phase-1 chunk", `aggr="aggr2"`},
+		{"a failed phase-2 chunk", `volume=`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := promqlfake.New(vlrMultiFiler())
+			q.Fail = func(name, query string) error {
+				if name == string(promql.QVolumeLabels) && strings.Contains(query, tc.hit) {
+					return boom
+				}
+				return nil
 			}
-			return nil
-		}
-		g, err := New(q, Options{QoSScopeBatchBytes: 6}, nil, nil).buildStorage(
-			t.Context(), time.Minute, vlrEnd, vlrSel, storagePlan(scope.Roots))
-		require.NoError(t, err, "the family is OPTIONAL: a failed chunk never fails the build")
-
-		ids := vlrIDs(vlrBody(t, g, scope))
-		assert.True(t, ids["zone-a-prod-c1/uid-o0"], "the orders claim's chunk succeeded")
-		assert.False(t, ids["zone-a-prod-c1/uid-r0"], "the redis claim lived in the failed chunk")
-	})
-
-	t.Run("a failed phase-2 chunk degrades to the phase-1 candidate set", func(t *testing.T) {
-		q := promqlfake.New(vlrMultiFiler())
-		q.Fail = func(name, query string) error {
-			if name == string(promql.QVolumeLabels) && strings.Contains(query, `volume=`) {
-				return boom
-			}
-			return nil
-		}
-		g, err := New(q, Options{}, nil, nil).buildStorage(
-			t.Context(), time.Minute, vlrEnd, vlrSel, storagePlan(scope.Roots))
-		require.NoError(t, err)
-
-		// No claim here has a candidate off the rooted aggregates, so the phase-1
-		// set is already complete and the body matches the unrestricted one.
-		gu, _ := vlrBuild(t, vlrMultiFiler(), scope.Roots, Options{}, false)
-		assert.JSONEq(t, planBodyJSON(t, vlrBody(t, gu, scope)), planBodyJSON(t, vlrBody(t, g, scope)))
-	})
+			_, err := New(q, Options{QoSScopeBatchBytes: 6}, nil, nil).buildStorage(
+				t.Context(), time.Minute, vlrEnd, vlrSel, storagePlan(scope.Roots))
+			require.Error(t, err)
+			be, ok := errors.AsType[*Error](err)
+			require.True(t, ok)
+			assert.Equal(t, ReasonUpstream, be.Reason)
+			assert.Equal(t, string(promql.QVolumeLabels), be.Query)
+		})
+	}
 
 	t.Run("the caller going away still fails the build", func(t *testing.T) {
-		// Degrading is for UPSTREAM errors. When the caller itself is gone —
-		// a build timeout, a disconnected client — nobody is waiting for a
-		// result, and optionalQueryFatal must let that through.
+		// A caller that is gone — a build timeout, a disconnected client —
+		// still classifies as cancellation, not as an upstream failure.
 		ctx, cancel := context.WithCancel(t.Context())
 		q := promqlfake.New(vlrMultiFiler())
 		q.Fail = func(name, _ string) error {

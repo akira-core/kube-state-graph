@@ -146,6 +146,24 @@ type topologyPlan struct {
 	// restriction ignores them: an application root is workload-side, and the
 	// projection ANDs it with the storage roots.
 	applicationRoots []string
+	// failClosed makes a query error of every family but ALERTS fail the
+	// build, whatever error class /v1/graph gives that family
+	// (fail-storage-graph-on-any-leg-error). The storage body's subject IS the
+	// Harvest and kubelet data /v1/graph treats as optional decoration, so a
+	// silently missing family would render as a smaller, plausible, wrong
+	// estate. It governs the legs both plans share — the first wave and the
+	// scoped QoS read; every wave only a by-reference plan issues (pods,
+	// nodes, controllers, the application recovery, the rooted volume-label
+	// read) fails closed unconditionally.
+	failClosed bool
+}
+
+// failsClosed reports whether a query error of q must fail this build even
+// though its family's default class would degrade. ALERTS is the one
+// exception: it only feeds data.alerts and the status fold, and coupling the
+// storage view to the alert store's availability would buy nothing.
+func (p topologyPlan) failsClosed(q promql.Query) bool {
+	return p.failClosed && q != promql.QAlerts
 }
 
 // fullPlan is the /v1/graph read: every leg, every pod.
@@ -178,7 +196,7 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 	}
 	slices.Sort(nodeNames)
 	return topologyPlan{
-		skip: storageSkippedLegs, byReference: true, podRoots: names, nodeRoots: nodeNames,
+		skip: storageSkippedLegs, byReference: true, failClosed: true, podRoots: names, nodeRoots: nodeNames,
 		// sortedNames drops empty values, which is what keeps
 		// restrictsVolumeLabels and the renderer in agreement: the renderer
 		// normalises too, so a plan carrying only empty values would answer

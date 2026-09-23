@@ -160,8 +160,10 @@ absent from the store, or matched nothing in the window). A **query error**
 `kube_replicaset_annotations` and `kube_job_annotations` (cardinality
 accumulates with history, not live object count), `kube_pod_container_info`
 (cardinality multiplies with containers, image variants and pod churn),
-Harvest, kubelet, and the two RED series log-and-continue. Details in the
-catalog. `/v1/storage-graph` reads less: it never issues
+Harvest, kubelet, and the two RED series log-and-continue on `/v1/graph`.
+`/v1/storage-graph` fails closed instead: a query error of any family but
+`ALERTS` returns 502 `upstream` with `message: "upstream query failed:
+<family>"`. Details in the catalog. `/v1/storage-graph` reads less: it never issues
 `kube_pod_container_info` or the four Service / EndpointSlice families (its
 body carries no `data.containers` and no service node), and it reads pods,
 Kubernetes nodes and controllers **by reference**: `kube_pod_info` /

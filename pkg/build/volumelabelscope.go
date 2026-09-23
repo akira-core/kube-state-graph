@@ -205,22 +205,21 @@ func mergeVolumeLabels(base, extra model.Vector) model.Vector {
 // issueVolumeLabelsQueries issues each rendered query under the bare family
 // name and returns the results merged in QUERY order, never completion order.
 //
-// The family is OPTIONAL, so a failed query logs and contributes nothing — it
-// costs the aggregate edges of the claims whose volumes that query carried and
-// never the build. Only the CALLER going away fails the build, which is
-// optionalQueryFatal's rule for every optional leg.
+// A failed query fails the build, named with its family. This read runs only
+// on /v1/storage-graph, which fails closed (fail-storage-graph-on-any-leg-error):
+// a lost chunk would draw the rooted components with no path through the
+// claims it carried, indistinguishable from a filer that serves nothing.
 func issueVolumeLabelsQueries(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	end time.Time,
 	phase string,
 	rendered []string,
 ) (model.Vector, error) {
 	parts := make([]model.Vector, len(rendered))
-	// WithContext, so the one error this path can return — the CALLER went
-	// away — cancels the chunks still in flight instead of making the build
-	// wait out every remaining round-trip before it can report the timeout.
-	// Mirrors issueScopedFamilies (scopedread.go).
+	// WithContext, so the first failed chunk cancels the chunks still in flight
+	// instead of making the build wait out every remaining round-trip before it
+	// can report the failure. Mirrors issueScopedFamilies (scopedread.go).
 	wave, wctx := errgroup.WithContext(ctx)
 	wave.SetLimit(scopeConcurrency)
 	for i, query := range rendered {
@@ -237,15 +236,7 @@ func issueVolumeLabelsQueries(
 			}()
 			out, qerr := q.Instant(wctx, string(promql.QVolumeLabels), query, end)
 			if qerr != nil {
-				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
-					return cerr
-				}
-				slog.WarnContext(ctx, "optional rooted volume-label query failed; continuing with empty vector",
-					"query", string(promql.QVolumeLabels),
-					"phase", phase,
-					"chunk", i,
-					"error", qerr)
-				return nil
+				return wrapQueryError(promql.QVolumeLabels, qerr)
 			}
 			parts[i] = out
 			return nil
@@ -267,7 +258,7 @@ func issueVolumeLabelsQueries(
 // writes the result into the same topologyVectors slot the unrestricted leg
 // does — nothing downstream can tell which read produced it, which is the point.
 func readRootedVolumeLabels(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -314,7 +305,7 @@ func readRootedVolumeLabels(
 				"ontap_clusters", len(plan.volumeClusters),
 				"aggrs", len(plan.volumeAggrs),
 				"max_chunks", maxRootedVolumeLabelChunks)
-			out, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "unrestricted",
+			out, qerr := issueVolumeLabelsQueries(ctx, q, end, "unrestricted",
 				[]string{promql.Render(promql.QVolumeLabels, window, opts.LabelKeys, promql.Selector{})})
 			if qerr != nil {
 				return qerr
@@ -322,7 +313,7 @@ func readRootedVolumeLabels(
 			*dst = out
 			return nil
 		}
-		out, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "roots", rendered)
+		out, qerr := issueVolumeLabelsQueries(ctx, q, end, "roots", rendered)
 		if qerr != nil {
 			return qerr
 		}
@@ -345,7 +336,7 @@ func readRootedVolumeLabels(
 // candidate set — no worse than the whole-family failure the unrestricted read
 // already degrades to, at chunk granularity.
 func readTokenScopedVolumeLabels(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -440,7 +431,7 @@ func readTokenScopedVolumeLabels(
 		}
 		rendered = append(rendered, query)
 	}
-	extra, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "tokens", rendered)
+	extra, qerr := issueVolumeLabelsQueries(ctx, q, end, "tokens", rendered)
 	if qerr != nil {
 		return qerr
 	}

@@ -221,8 +221,9 @@ func TestReadScopedControllers_RequiredChunkFailsBuild(t *testing.T) {
 	require.Error(t, err, "kube_daemonset_annotations is required, exactly as its unscoped read is")
 }
 
-// Spec: "A degrading controller chunk degrades and suppresses the hop".
-func TestReadScopedControllers_JobAnnotationsChunkDegradesAndSuppressesHop(t *testing.T) {
+// Spec: "An annotation chunk failure fails the build" — the storage build
+// fails closed on kube_job_annotations, which /v1/graph degrades.
+func TestReadScopedControllers_JobAnnotationsChunkFailureFailsBuild(t *testing.T) {
 	const tracking = "annotation_argocd_argoproj_io_tracking_id"
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QPVCBindings: {planKSM("namespace", "shop", "pod", "job-0", "persistentvolumeclaim", "data-job-0")},
@@ -241,13 +242,12 @@ func TestReadScopedControllers_JobAnnotationsChunkDegradesAndSuppressesHop(t *te
 		}
 		return nil
 	}
-	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, graph.StorageRoots{})
-	require.NoError(t, err, "an optional-tracking degrade must not fail the build")
-
-	pod, ok := g.NodesByID["zone-a-prod-c1/uid-job0"].(*graph.PodNode)
+	_, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, graph.StorageRoots{})
+	require.Error(t, err)
+	be, ok := errors.AsType[*Error](err)
 	require.True(t, ok)
-	assert.Empty(t, pod.Application(), "the hop is suppressed for a build where kube_job_annotations degraded")
-	assert.Equal(t, &graph.Owner{Kind: "Job", Name: "nightly-28901"}, pod.Owner())
+	assert.Equal(t, ReasonUpstream, be.Reason)
+	assert.Equal(t, string(promql.QJobAnnotations), be.Query)
 }
 
 // Spec: "Accumulated Job history does not reach the storage build".

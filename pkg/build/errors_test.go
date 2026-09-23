@@ -104,3 +104,37 @@ func TestError_Unwrap_NilCause(t *testing.T) {
 		t.Errorf("Unwrap nil cause should return nil")
 	}
 }
+
+// A query error wrapped with its family keeps its classification and carries
+// the family onto the build error; an unwrapped error carries none.
+func TestClassifyReadError_CarriesQueryFamily(t *testing.T) {
+	t.Parallel()
+	span := trace.SpanFromContext(t.Context())
+	cases := []struct {
+		name      string
+		err       error
+		wantR     Reason
+		wantQuery string
+	}{
+		{"named upstream", fmt.Errorf("fan-out: %w", wrapQueryError("volume_labels", errors.New("503"))), ReasonUpstream, "volume_labels"},
+		{"named deadline", wrapQueryError("volume_labels", context.DeadlineExceeded), ReasonTimeout, ""},
+		{"named cancel", wrapQueryError("volume_labels", context.Canceled), ReasonCanceled, ""},
+		{"unnamed upstream", errors.New("503"), ReasonUpstream, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyReadError(span, "topology read failed", tc.err)
+			be, ok := errors.AsType[*Error](got)
+			if !ok {
+				t.Fatalf("not a build.Error: %v", got)
+			}
+			if be.Reason != tc.wantR || be.Query != tc.wantQuery {
+				t.Errorf("got (%q, %q) want (%q, %q)", be.Reason, be.Query, tc.wantR, tc.wantQuery)
+			}
+		})
+	}
+	if wrapQueryError("x", nil) != nil {
+		t.Error("wrapping a nil error must stay nil")
+	}
+}

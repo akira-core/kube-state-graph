@@ -124,7 +124,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Success		200				{object}	cytoscape.Body
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, invalid_scope, invalid_range)"
 //	@Failure		401				{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
-//	@Failure		502				{object}	errorBody	"Upstream VictoriaMetrics returned an error"
+//	@Failure		502				{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: <family>`)"
 //	@Failure		504				{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/storage-graph [get]

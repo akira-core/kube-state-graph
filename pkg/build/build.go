@@ -333,7 +333,11 @@ func classifyReadError(span trace.Span, what string, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return NewError(ReasonTimeout, "build timeout", err)
 	}
-	return NewError(ReasonUpstream, what, err)
+	be := &Error{Reason: ReasonUpstream, Message: what, Err: err}
+	if qe, ok := errors.AsType[*QueryError](err); ok {
+		be.Query = qe.Query
+	}
+	return be
 }
 
 func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*graph.Edge) {

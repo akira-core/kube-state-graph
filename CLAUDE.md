@@ -928,9 +928,10 @@ live under `openspec/specs/`.
     `scopeConcurrency` and merged **in chunk-index order, never completion
     order** — `sumQoSIO` adds float64s, so a timing-dependent merge would make
     the last bits of every I/O figure depend on which chunk answered first.
-    Each chunk degrades on its own (log-and-continue), so a failed chunk costs
-    I/O measurements only for the claims whose volumes it carried and never an
-    edge, aggregate, controller or `svm`. The `volume` alternation is derived
+    On `/v1/graph` each chunk degrades on its own (log-and-continue), so a failed
+    chunk costs I/O measurements only for the claims whose volumes it carried and
+    never an edge, aggregate, controller or `svm`; on `/v1/storage-graph` a failed
+    chunk fails the build. The `volume` alternation is derived
     from UPSTREAM DATA, not the request, so `queryDims` is unchanged and the
     Harvest family still renders no `az` / `env` / `cluster` / `namespace`
     matcher — but the claims that produced it were loaded under the request's
@@ -983,7 +984,14 @@ live under `openspec/specs/`.
   `svm` with no `aggr`. Both `GET /v1/graph` and `GET /v1/storage-graph` carry
   it, stamped once in the shared topology beside `svm` — on `/v1/graph` it
   restates the `pvc-to-netapp-aggr` edge already in the body.
-  All 20 Harvest/kubelet legs plus `ALERTS` are OPTIONAL (log-and-continue). **Two** coverage
+  All 20 Harvest/kubelet legs plus `ALERTS` are OPTIONAL (log-and-continue) on `/v1/graph`.
+  **`/v1/storage-graph` fails closed** (fail-storage-graph-on-any-leg-error): `storagePlan.failClosed`
+  makes every first-wave leg and every scoped QoS chunk required except `ALERTS`, and every wave
+  only a by-reference plan issues (pods, nodes, controllers, application recovery, rooted
+  `volume_labels`) is required unconditionally — `scopedFamily` has no error class any more.
+  A failed query is wrapped in `build.QueryError`; `build.Error.Query` carries the bare family
+  name and `mapBuildError` writes `upstream query failed: <family>` (never upstream text).
+  An empty vector still never fails a build. **Two** coverage
   warnings, each gated on its OWN family having been read:
   `slog.Warn("netapp_volume_join_miss", "count", n)` (hop-A miss or
   empty-`aggr`; under a restricted volume-label read counted only over claims

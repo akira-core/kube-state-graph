@@ -87,7 +87,7 @@ service-graph 系列**每次請求都完整讀取**：其 `cluster` label 常缺
 
 K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫入的 `cluster` 標籤。Harvest 的 `cluster` 是 **ONTAP** 叢集，不用來當 `?cluster=`。
 
-下表「必填？」指的是**空向量**會不會丟掉該功能。kube-state-metrics 19 條 abort-on-error 或 `traces_service_graph_request_total` 的 **query 錯誤**（逾時／5xx）會失敗整次建圖；`kube_replicaset_annotations` 與 `kube_job_annotations`（基數隨歷史累積、不是活物件數）、`kube_pod_container_info`（基數隨容器、image 變體與 pod 汰換倍增）、Harvest、kubelet 與兩條 RED 系列則 log-and-continue。細節見目錄。
+下表「必填？」指的是**空向量**會不會丟掉該功能。kube-state-metrics 19 條 abort-on-error 或 `traces_service_graph_request_total` 的 **query 錯誤**（逾時／5xx）會失敗整次建圖；`kube_replicaset_annotations` 與 `kube_job_annotations`（基數隨歷史累積、不是活物件數）、`kube_pod_container_info`（基數隨容器、image 變體與 pod 汰換倍增）、Harvest、kubelet 與兩條 RED 系列在 `/v1/graph` 上則 log-and-continue。`/v1/storage-graph` 則 fail closed：除 `ALERTS` 外任何 family 的 query 錯誤都回 502 `upstream`，`message` 為 `upstream query failed: <family>`。細節見目錄。
 
 ### 拓樸指標 — 由 [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics) 產出
 

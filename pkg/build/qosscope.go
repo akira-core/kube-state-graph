@@ -81,6 +81,7 @@ func readScopedQoS(
 	opts Options,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
+	failClosed bool,
 	prerequisites ...<-chan struct{},
 ) error {
 	for _, done := range prerequisites {
@@ -113,7 +114,7 @@ func readScopedQoS(
 	for ti, t := range targets {
 		for ci, chunk := range chunks {
 			wave.Go(func() error {
-				out, err := instantQoSChunk(ctx, callerCtx, q, t.query, window, end, chunk)
+				out, err := instantQoSChunk(ctx, callerCtx, q, t.query, window, end, chunk, failClosed)
 				if err != nil {
 					return err
 				}
@@ -139,9 +140,11 @@ func readScopedQoS(
 
 // instantQoSChunk issues one family's query for one chunk of the scope. It
 // mirrors fetchOptionalTracking's contract — swallow a query error, fail only
-// on caller cancellation, recover panics — and keeps the bare family name as
-// the query NAME, so self-metrics and span dimensions still carry one label
-// value per family however many chunks a build issues.
+// on caller cancellation, recover panics — unless failClosed, when a query
+// error fails the build (a /v1/storage-graph build; see topologyPlan). It
+// keeps the bare family name as the query NAME, so self-metrics and span
+// dimensions still carry one label value per family however many chunks a
+// build issues.
 func instantQoSChunk(
 	ctx, callerCtx context.Context,
 	q promql.Querier,
@@ -149,6 +152,7 @@ func instantQoSChunk(
 	window time.Duration,
 	end time.Time,
 	volumes []string,
+	failClosed bool,
 ) (out model.Vector, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -169,6 +173,9 @@ func instantQoSChunk(
 	}
 	res, qerr := q.Instant(ctx, string(name), rendered, end)
 	if qerr != nil {
+		if failClosed {
+			return nil, wrapQueryError(name, qerr)
+		}
 		if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
 			return nil, cerr
 		}

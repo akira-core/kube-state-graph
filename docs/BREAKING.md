@@ -4,6 +4,29 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
+## `/v1/storage-graph` fails on any upstream query error
+
+*storage-graph-api — Storage build fails closed on upstream query errors; Storage build reads only what the body draws; Application roots recover their pods before the pod read; Storage-side roots restrict the Harvest topology read. cluster-topology-source — Topology series consumed.*
+
+**What changed.** A `/v1/storage-graph` build used to degrade on a query error
+of any NetApp Harvest family, either kubelet volume-stats family,
+`kube_replicaset_annotations` or `kube_job_annotations`: the error was logged,
+the family read as empty, and the request returned 200 with a smaller body — a
+rooted filer with no path through it, or paths with no I/O. It now fails: the
+response is HTTP 502 with `reason: "upstream"` and
+`message: "upstream query failed: <family>"`. `ALERTS` is the one family that
+still degrades. An empty vector (a family not exported, an annotation not
+allowlisted) is not an error and still returns 200.
+
+`/v1/graph` keeps every error class. Its 502 `message` now also names the
+failed family; `reason` and status are unchanged, and the message still never
+carries an upstream URL, host or address.
+
+**Migration.** Frontends that treated a storage 200 with no flow as "no
+traffic" should surface the 502 message instead. Operators who relied on the
+storage view surviving a Harvest or kubelet store outage lose that: the view
+now reports the outage.
+
 ## Non-breaking: `/v1/storage-graph` accepts an `application=` root
 
 *storage-graph-api — Root selectors from either end of the flow; Roots are always materialised when the upstream knows them; Storage-reachability projection; Storage build reads only what it draws; Pod-only roots narrow the upstream read; Deterministic storage-graph body. cluster-topology-source — Application-rooted recovery reads of the owner and annotation families.*

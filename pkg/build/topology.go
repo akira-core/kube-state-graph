@@ -435,7 +435,7 @@ func readTopology(
 			}()
 			out, err := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
 			*dst = out
-			return err
+			return wrapQueryError(name, err)
 		}
 	}
 	// fetchOptionalTracking is the OPTIONAL-leg twin of fetch: a query error logs
@@ -506,8 +506,8 @@ func readTopology(
 			// Phase 1 of the rooted read: a first-wave leg, because its
 			// restriction comes from the request and nothing precedes it. It
 			// keeps this leg's OPTIONAL error class and its done-signal.
-			run = readRootedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v, l.dst)
-		case !l.optional:
+			run = readRootedVolumeLabels(ctx, q, window, end, opts, plan, &v, l.dst)
+		case !l.optional || plan.failsClosed(l.query):
 			run = fetch(l.query, l.dst)
 		case l.degraded != nil:
 			run = fetchOptionalTracking(l.query, l.dst, l.degraded)
@@ -552,13 +552,13 @@ func readTopology(
 	if restrictVolumeLabels {
 		finalDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readTokenScopedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v,
+			return readTokenScopedVolumeLabels(ctx, q, window, end, opts, plan, &v,
 				pvcInfoDone, volumeLabelsDone)
 		}, finalDone))
 		volumeLabelsFinal = finalDone
 	}
 	g.Go(func() error {
-		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu,
+		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu, plan.failClosed,
 			pvcInfoDone, volumeLabelsFinal)
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
@@ -576,7 +576,7 @@ func readTopology(
 		var recovered []string
 		if len(plan.applicationRoots) > 0 {
 			g.Go(signalWhenDone(func() error {
-				names, err := readScopedApplications(ctx, callerCtx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
+				names, err := readScopedApplications(ctx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
 				recovered = names
 				return err
 			}, appDone))
@@ -589,10 +589,10 @@ func readTopology(
 				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
 		}, podsDone))
 		g.Go(func() error {
-			return readScopedNodes(ctx, callerCtx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
+			return readScopedNodes(ctx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
 		})
 		g.Go(func() error {
-			return readScopedControllers(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
+			return readScopedControllers(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
 		})
 	}
 	if err := g.Wait(); err != nil {

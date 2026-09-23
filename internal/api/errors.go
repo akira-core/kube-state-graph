@@ -75,7 +75,7 @@ func (s *Server) mapBuildError(c *gin.Context, err error) {
 	case build.ReasonUpstream:
 		s.logger.ErrorContext(c.Request.Context(), "upstream query failed",
 			"err", err, "request_id", c.GetString("request_id"))
-		writeError(c, http.StatusBadGateway, "upstream", "upstream query failed")
+		writeError(c, http.StatusBadGateway, "upstream", upstreamMessage(err))
 	case build.ReasonCanceled:
 		writeError(c, statusClientClosedRequest, "canceled", "request canceled")
 	default:
@@ -83,6 +83,17 @@ func (s *Server) mapBuildError(c *gin.Context, err error) {
 			"err", err, "request_id", c.GetString("request_id"))
 		writeError(c, http.StatusInternalServerError, "internal", "internal error")
 	}
+}
+
+// upstreamMessage names the query family whose error failed the build, when
+// the build recorded one (fail-storage-graph-on-any-leg-error D2). The name is
+// a bare promql.Query constant — never text from the upstream error, which
+// can embed the internal VictoriaMetrics URL — so the redaction above holds.
+func upstreamMessage(err error) string {
+	if be, ok := errors.AsType[*build.Error](err); ok && be.Query != "" {
+		return "upstream query failed: " + be.Query
+	}
+	return "upstream query failed"
 }
 
 // timeoutMessage returns the build-authored static Message of a timeout error

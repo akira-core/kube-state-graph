@@ -108,8 +108,8 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                annotation_argocd_argoproj_io_tracking_id to the root
                Applications (`(?:app)(?::.*)?`), composed with the fixed `!=""`
                and the same request matchers as the by-reference reads.
-               Deployment / StatefulSet / DaemonSet / CronJob fail the build;
-               ReplicaSet / Job degrade and do NOT set JobAnnotationsDegraded.
+               Every family fails the build on a chunk error (the storage
+               build fails closed).
                Capped at 16 chunks per family; past that the family is read
                once unrestricted and filtered in the reader
                (application_root_restriction_unbounded). Stage 2: kube_replicaset_owner
@@ -148,16 +148,23 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                  kube_replicaset_owner row resolved a ReplicaSet up to),
                  kube_cronjob_annotations (direct CronJob owners plus every
                  owner_name a landed kube_job_owner row carries)
-               kube_replicaset_owner, kube_job_owner, kube_deployment_annotations,
-                 kube_statefulset_annotations, kube_daemonset_annotations and
-                 kube_cronjob_annotations FAIL the build on a chunk error;
-                 kube_replicaset_annotations degrades (log-and-continue);
-                 kube_job_annotations degrades AND suppresses the Job → CronJob
-                 hop for the whole build, exactly as its unscoped degrade does
+               every family FAILS the build on a chunk error, including
+                 kube_replicaset_annotations and kube_job_annotations (which
+                 degrade on /v1/graph); the Job → CronJob hop suppression is
+                 therefore unreachable on this endpoint
               ── wave 4 (QoS), gated on kube_persistentvolumeclaim_info
                  and volume_labels ────────────────────────────────────────
-               6 Harvest QoS workload legs, exactly as for /v1/graph
+               6 Harvest QoS workload legs, scoped exactly as for /v1/graph;
+                 a chunk error FAILS the build
 ```
+
+**The storage build fails closed.** On `/v1/storage-graph` a query error of any
+family — every Harvest leg, both kubelet volume-stats legs, every scoped
+chunk, every volume-label phase, every application-recovery stage — fails the
+build with HTTP 502 `reason: "upstream"` and `message: "upstream query failed:
+<family>"`. `ALERTS` is the one exception: it still logs, counts and continues.
+An empty vector is never a failure. The degrade column of the table below
+applies to `/v1/graph` only.
 
 No `up{}` probe and no service-graph read. A pod / node / controller name is
 unique per namespace (or per cluster, for nodes) only, so a by-reference scope
@@ -245,10 +252,9 @@ feature?". Query **errors** (timeout, 5xx, PromQL parse) are a separate axis:
 | Scoped `kube_pod_info` / `kube_pod_owner` chunks (`/v1/storage-graph` only) | **Fails the build** — a pod is topology, and a missing chunk would be a smaller, plausible, wrong body | n/a — an empty scope issues no query |
 | Scoped `kube_node_info` / `kube_node_status_addresses` / `kube_node_labels` / `kube_node_status_condition` chunks (`/v1/storage-graph` only) | **Fails the build** — a Kubernetes node is topology, same reasoning as a pod chunk | n/a — an empty scope (no scheduled pod, no `node=` root) issues no query |
 | Scoped `kube_replicaset_owner` / `kube_job_owner` / `kube_deployment_annotations` / `kube_statefulset_annotations` / `kube_daemonset_annotations` / `kube_cronjob_annotations` chunks (`/v1/storage-graph` only) | **Fails the build** — required exactly as their unscoped read is | n/a — an owner kind no loaded pod is owned by (or, for the two Stage-B families, no first-stage series resolved) issues no query |
-| Scoped `kube_replicaset_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue — degrades exactly as its unscoped read does | No Application for the ReplicaSets the failed chunk carried |
-| Scoped `kube_job_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue AND suppresses the Job → CronJob hop for the WHOLE build (any chunk degrading sets `JobAnnotationsDegraded` build-wide) — same rule as the unscoped degrade | No Application for the Jobs the failed chunk carried; additionally, build-wide, no Application for any Job-owned pod that could only resolve it through its CronJob (a Job carrying its own annotation in a successful chunk still resolves) |
+| Scoped `kube_replicaset_annotations` / `kube_job_annotations` chunks (`/v1/storage-graph` only) | **Fails the build** — the storage build fails closed on every family but `ALERTS` | No Application for the ReplicaSets / Jobs concerned |
 | `traces_service_graph_request_total` | **Fails the build** | No call edges; topology still returned |
-| 18 Harvest + 2 kubelet + `ALERTS` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` / no `data.alerts` |
+| 18 Harvest + 2 kubelet + `ALERTS` | On `/v1/graph`: log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`). On `/v1/storage-graph`: **fails the build** (502 naming the family), `ALERTS` excepted | No NetApp chain / no PVC `usage` / no `data.alerts` |
 | `traces_service_graph_request_failed_total` | Log-and-continue | Measured edges omit `error_rate` (never reports `0`) |
 | `traces_service_graph_request_server_seconds_bucket` | Log-and-continue | Measured edges omit `p90_server_ms` |
 | `up` | Warn; skip `outside_retention` classification | n/a |

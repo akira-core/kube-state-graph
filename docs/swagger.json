@@ -787,7 +787,7 @@
                                 }
                             }
                         },
-                        "description": "Upstream VictoriaMetrics returned an error"
+                        "description": "An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: \u003cfamily\u003e`)"
                     },
                     "504": {
                         "content": {

@@ -596,7 +596,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/internal_api.errorBody'
-          description: Upstream VictoriaMetrics returned an error
+          description: 'An upstream query of ANY family except ALERTS returned an
+            error — Harvest, kubelet and annotation families included; the message
+            names the family (`upstream query failed: <family>`)'
         "504":
           content:
             application/json:

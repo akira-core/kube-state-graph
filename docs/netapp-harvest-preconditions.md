@@ -228,9 +228,10 @@ Consequences worth knowing:
   wave, so it is not delayed by the slowest kube-state-metrics leg.
 - A scope larger than `--netapp-qos-scope-batch-bytes` is split across several
   queries per family, since upstream installations cap query length
-  (`-search.maxQueryLen`). Each chunk degrades on its own: a failed chunk costs
-  I/O measurements only for the claims whose volumes it carried, and never an
-  edge, aggregate, controller or `svm`.
+  (`-search.maxQueryLen`). On `/v1/graph` each chunk degrades on its own: a
+  failed chunk costs I/O measurements only for the claims whose volumes it
+  carried, and never an edge, aggregate, controller or `svm`. On
+  `/v1/storage-graph` a failed chunk fails the request.
 - The `volume` restriction is derived from upstream data, not from the request.
   It is not an `az` / `env` / `cluster` / `namespace` matcher — but the claims
   that produced it were themselves loaded under the request's selectors, so this
@@ -278,8 +279,12 @@ silently: no coverage signal fires, because hop B still matched and a missing
 ceiling is a legitimate reading. The same holds for the policy's identity label
 — a series carrying neither `name` nor `policy_group` cannot be keyed.
 
-All fifteen Harvest/kubelet legs are OPTIONAL: a query error logs and continues
-with an empty vector and never fails the build.
+All fifteen Harvest/kubelet legs are OPTIONAL on `/v1/graph`: a query error
+logs and continues with an empty vector and never fails that build. On
+`/v1/storage-graph` they fail closed — any query error returns 502 `upstream`
+naming the family — because a storage body with a silently missing Harvest leg
+reads as a filer that serves nothing. Absence (an empty vector) never fails
+either endpoint.
 
 ## Trident custom-resource-state config is removable
 
