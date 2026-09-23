@@ -88,7 +88,7 @@ func (r *Router) QueryLabels(ctx context.Context, req LabelQuery) ([]map[string]
 	if req.AZ != "" {
 		az = []string{req.AZ}
 	}
-	vec, err := r.querier(st, az).issue(ctx, fam, QueryNameLabelQuery, req.render(), req.At)
+	vec, err := r.querier(st, az, nil).issue(ctx, fam, QueryNameLabelQuery, req.render(), req.At)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,12 +60,12 @@ func TestRenderScoped(t *testing.T) {
 		assert.False(t, ok)
 	})
 
-	t.Run("only the reference-scoped families are scopeable", func(t *testing.T) {
-		for _, q := range ReferenceScopedQueries {
+	t.Run("only the reference- and claim-scoped families are scopeable", func(t *testing.T) {
+		for _, q := range slices.Concat(ReferenceScopedQueries, ClaimScopedQueries) {
 			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
 			assert.True(t, ok, string(q))
 		}
-		for _, q := range []Query{QPodContainerInfo, QPVCBindings, QQoSReadOps, QAlerts} {
+		for _, q := range []Query{QPodContainerInfo, QServiceInfo, QQoSReadOps, QAlerts} {
 			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
 			assert.False(t, ok, string(q))
 		}
@@ -95,7 +96,7 @@ func TestRenderScoped(t *testing.T) {
 	})
 
 	t.Run("a non-scopeable query still returns ok=false", func(t *testing.T) {
-		for _, q := range []Query{QPodContainerInfo, QPVCBindings, QQoSReadOps, QAlerts, QUpProbe} {
+		for _, q := range []Query{QPodContainerInfo, QServiceInfo, QQoSReadOps, QAlerts, QUpProbe} {
 			_, ok := RenderScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"a"})
 			assert.False(t, ok, string(q))
 		}
@@ -111,7 +112,7 @@ func TestRenderScoped(t *testing.T) {
 func TestRenderScoped_IsRenderPlusOneMatcher(t *testing.T) {
 	t.Parallel()
 	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
-	for _, q := range ReferenceScopedQueries {
+	for _, q := range slices.Concat(ReferenceScopedQueries, ClaimScopedQueries) {
 		label := scopedLabel[q]
 		for _, s := range []Selector{{}, sel} {
 			t.Run(string(q), func(t *testing.T) {
@@ -169,6 +170,34 @@ func TestQueryDims_ReferenceScopedLegsUnchanged(t *testing.T) {
 	assert.Len(t, want, len(ReferenceScopedQueries), "the pin must cover every scoped query")
 	for _, q := range ReferenceScopedQueries {
 		assert.Equal(t, want[q], queryDims[q], string(q))
+	}
+}
+
+// The five claim-keyed families a hub-mode storage build reads by reference:
+// each renders its fixed selector (none of the five has one), then the request
+// matchers, then the scope — on `volumename` for the claim-info family and on
+// `persistentvolumeclaim` for the other four.
+func TestRenderScoped_ClaimScopedQueries(t *testing.T) {
+	t.Parallel()
+	sel := Selector{Cluster: []string{"c1"}, Namespace: []string{"shop"}}
+	want := map[Query]string{
+		QPVCInfo:                    `last_over_time(kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",volumename=~"pvc-a|pvc-b"}[1m])`,
+		QPVCBindings:                `last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",persistentvolumeclaim=~"pvc-a|pvc-b"}[1m])`,
+		QPVCAnnotations:             `last_over_time(kube_persistentvolumeclaim_annotations{cluster="c1",namespace="shop",persistentvolumeclaim=~"pvc-a|pvc-b"}[1m])`,
+		QKubeletVolumeUsedBytes:     `last_over_time(kubelet_volume_stats_used_bytes{cluster="c1",namespace="shop",persistentvolumeclaim=~"pvc-a|pvc-b"}[1m])`,
+		QKubeletVolumeCapacityBytes: `last_over_time(kubelet_volume_stats_capacity_bytes{cluster="c1",namespace="shop",persistentvolumeclaim=~"pvc-a|pvc-b"}[1m])`,
+	}
+	require.Len(t, want, len(ClaimScopedQueries), "the pin must cover every claim-scoped query")
+	for _, q := range ClaimScopedQueries {
+		assert.Empty(t, fixedSelector[q], "%s carries no fixed selector today; a new one must precede the request matchers", q)
+		got, ok := RenderScoped(q, time.Minute, LabelKeys{}, sel, []string{"pvc-b", "pvc-a", "pvc-b"})
+		require.True(t, ok, string(q))
+		assert.Equal(t, want[q], got, string(q))
+	}
+	for _, q := range ClaimScopedQueries {
+		assert.NotContains(t, ReferenceScopedQueries, q,
+			"%s is by-reference only in hub mode, so it must not join the unconditional set", q)
+		assert.Equal(t, dimsNamespaced, queryDims[q], "%s keeps its request dimensions", q)
 	}
 }
 

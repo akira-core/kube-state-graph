@@ -69,6 +69,33 @@ func (b *Builder) querierFor(sel promql.Selector) promql.Querier {
 	return b.src.QuerierFor(sel)
 }
 
+// hubQuerierFor resolves the Querier of a hub-mode storage build: ONE routing
+// snapshot in which `az` selects the harvest backends and no other family's
+// (read-storage-roots-through-volume-hub D8). A source without the
+// promql.FamilyZoneQuerierSource upgrade falls back to QuerierFor — zone
+// routing on every family, so the relaxed matchers find claims only in the
+// stores the zone reaches — and a plain Querier to itself.
+func (b *Builder) hubQuerierFor(sel promql.Selector) promql.Querier {
+	if fz, ok := b.src.(promql.FamilyZoneQuerierSource); ok && fz != nil {
+		return fz.QuerierForFamilyZones(sel, promql.FamilyHarvest)
+	}
+	return b.querierFor(sel)
+}
+
+// hubSelector is the request selector a hub-mode storage build renders on
+// every kube-state-metrics, kubelet and ALERTS query: `cluster` and
+// `namespace` keep narrowing, `az` and `env` are dropped, because the claims on
+// a rooted filer live in whatever zone and environment uses it. Harvest
+// renders no request matcher in any build, so it is unaffected; `az` still
+// reaches it through backend selection (hubQuerierFor).
+//
+// Cluster identities are unaffected too: clusterResolver composes each series'
+// identity from that series' own az / env labels, so a cluster name reused
+// across zones stays two identities.
+func hubSelector(sel promql.Selector) promql.Selector {
+	return promql.Selector{Cluster: sel.Cluster, Namespace: sel.Namespace}
+}
+
 // Build runs all upstream queries for [end - window, end] and returns the
 // joined multi-cluster Graph.
 //
@@ -241,15 +268,19 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // uses none of it, and those three legs are the most expensive of the fan-out.
 //
 // It is a pure function of (window, end, Selector, roots), and roots reach
-// three reads. The pod names of pod=<ns>/<name> roots join the pod scope, and
+// several reads. The pod names of pod=<ns>/<name> roots join the pod scope, and
 // node=<name> roots join the node scope, because a root mounting no claim (or
 // naming a node no pod runs on) is drawable only if it is read; those can only
-// ADD a name to a scope, never narrow a read. The ontap_cluster= and aggr= roots
-// restrict the Harvest volume-label topology read to the rooted components
-// (scope-volume-labels-by-storage-root) — the one place a root NARROWS a read,
-// made output-preserving by recovering each matched claim's whole candidate set
-// in a second phase, and disabled by any svm= or node= root. Either way which
-// paths are drawn stays a projection concern (graph.ProjectStorage). This
+// ADD a name to a scope, never narrow a read. The ontap_cluster=, aggr= and
+// svm= roots restrict the Harvest volume-label topology read to the rooted
+// components (scope-volume-labels-by-storage-root) — made output-preserving by
+// re-reading each touched aggregate whole for its owner vote and each matched
+// claim's whole candidate set in a second phase — and put the build in hub
+// mode (read-storage-roots-through-volume-hub): the claim families are read
+// FROM the rooted rows, keyed by the PersistentVolume and claim names they
+// lead to, and every Kubernetes leg drops the az / env matchers so a filer
+// shared across zones is drawn with every claim on it. Either way which paths
+// are drawn stays a projection concern (graph.ProjectStorage). This
 // revises the storage-graph design's "roots never reach the build" stance
 // (harden-topology-read-cardinality D7): v1 has no result cache whose key it
 // would widen, and the alternative was reading the whole estate.
@@ -271,18 +302,28 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 }
 
 // buildStorage is BuildStorage under an explicit read plan.
+//
+// The plan is resolved here, before anything is dispatched, because the volume
+// hub decides two things the whole build shares: the request matchers of every
+// Kubernetes leg (hubSelector) and the routing snapshot they are dispatched
+// through (hubQuerierFor). Outside hub mode both are exactly Build's.
 func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
-	q := b.querierFor(sel)
+	plan = plan.resolveVolumeLabelRead(b.opts.volumeKey(), window, b.opts.qosScopeBatchBytes())
+	readSel, q := sel, b.querierFor(sel)
+	if plan.hub {
+		readSel, q = hubSelector(sel), b.hubQuerierFor(sel)
+	}
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
 			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
+			attribute.Bool("kube_state_graph.volume_hub", plan.hub),
 		),
 	)
 	defer span.End()
 
-	topology, err := readTopology(ctx, q, window, end, b.opts, sel, plan)
+	topology, err := readTopology(ctx, q, window, end, b.opts, readSel, plan)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
@@ -306,6 +347,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
+		"volume_hub", plan.hub,
 	)
 	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 

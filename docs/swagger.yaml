@@ -462,7 +462,9 @@ paths:
       description: |-
         Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
 
-        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). Without an `ontap_cluster` / `aggr` / `svm` root they pin one estate: every Kubernetes query is narrowed to that zone and environment, and `az` selects the Harvest store.
+
+        **Volume hub**: a request carrying an `ontap_cluster`, `aggr` or `svm` root reads the claims FROM the rooted filer, in every zone and environment. `az` still selects the Harvest store, but neither `az` nor `env` narrows the Kubernetes side, so a filer shared across zones or environments is drawn with every claim on it and `clusters` may list several zones' cluster identities. Claims are found through their PersistentVolume name as the FlexVol name embeds it (`pvc_<uid>`): a statically provisioned PV is not reached from a storage root. `cluster` / `namespace` still narrow.
 
         **Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
 
@@ -482,14 +484,17 @@ paths:
         required: true
         schema:
           type: string
-      - description: Availability zone (required, single-valued).
+      - description: Availability zone (required, single-valued). Selects the Harvest
+          store; narrows the Kubernetes side only when no ontap_cluster / aggr / svm
+          root is given.
         example: zone-a
         in: query
         name: az
         required: true
         schema:
           type: string
-      - description: Environment (required, single-valued).
+      - description: Environment (required, single-valued). Narrows the Kubernetes
+          side only when no ontap_cluster / aggr / svm root is given.
         example: prod
         in: query
         name: env

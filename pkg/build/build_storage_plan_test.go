@@ -824,3 +824,95 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 		})
 	}
 }
+
+// hubFirstWave are the thirteen families a hub-mode storage build's first wave
+// issues (read-storage-roots-through-volume-hub D9): storageUnrestrictedLegs
+// minus the five claim-keyed families, which leave for the hub's by-reference
+// reads. volume_labels here is phase 1.
+var hubFirstWave = slices.DeleteFunc(slices.Clone(storageUnrestrictedLegs), func(q promql.Query) bool {
+	return slices.Contains(promql.ClaimScopedQueries, q)
+})
+
+// The hub-mode fan-out pin: a per-family QUERY count, since volume_labels is
+// read up to three times (phase 1, owner completion, phase 2). The counts are
+// the ones docs/upstream-metrics.md documents.
+func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
+	require.Len(t, hubFirstWave, 13, "design D9: the hub's first wave")
+
+	vol := func(name, svm string) *model.Sample {
+		return &model.Sample{Metric: model.Metric{
+			"volume": model.LabelValue(name), "cluster": "ontap-prod", "node": "ontap-prod-01", "aggr": "aggr1", "svm": model.LabelValue(svm),
+		}, Value: 1}
+	}
+	ksm := func(pairs ...string) *model.Sample {
+		m := model.Metric{"cluster": "c", "namespace": "db"}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			m[model.LabelName(pairs[i])] = model.LabelValue(pairs[i+1])
+		}
+		return &model.Sample{Metric: m, Value: 1}
+	}
+	path := map[promql.Query]model.Vector{
+		promql.QVolumeLabels: {vol("trident_pvc_9f3a", "svm0")},
+		promql.QPVCInfo:      {ksm("persistentvolumeclaim", "data-db-0", "volumename", "pvc-9f3a")},
+		promql.QPVCBindings:  {ksm("pod", "db-0", "persistentvolumeclaim", "data-db-0")},
+		promql.QPodInfo:      {ksm("pod", "db-0", "uid", "u-db-0", "node", "n1")},
+		promql.QPodOwner:     {ksm("pod", "db-0", "owner_kind", "StatefulSet", "owner_name", "db", "owner_is_controller", "true")},
+	}
+	count := func(qs ...promql.Query) map[string]int {
+		m := map[string]int{}
+		for _, q := range hubFirstWave {
+			m[string(q)] = 1
+		}
+		for _, q := range qs {
+			m[string(q)]++
+		}
+		return m
+	}
+	fullPath := slices.Concat(
+		promql.ClaimScopedQueries, promql.PodScopedQueries, promql.NodeScopedQueries,
+		[]promql.Query{promql.QStatefulSetAnnotations}, promql.QoSWorkloadQueries,
+	)
+
+	cases := []struct {
+		name     string
+		fixtures map[promql.Query]model.Vector
+		roots    graph.StorageRoots
+		want     map[string]int
+	}{
+		{"aggregate root, no candidate", map[promql.Query]model.Vector{
+			promql.QVolumeLabels: {vol("vol0", "svm0")},
+		}, graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}}, count()},
+		{"aggregate root, a candidate naming no claim", map[promql.Query]model.Vector{
+			promql.QVolumeLabels: {vol("trident_pvc_gone", "svm0")},
+		}, graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}}, count(promql.QPVCInfo)},
+		{"aggregate root, one statefulset-owned pod on a matched volume", path,
+			graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}},
+			count(append(fullPath, promql.QVolumeLabels)...)}, // + phase 2
+		{"svm root, the same path", path,
+			graph.StorageRoots{SVMs: map[string]struct{}{"svm0": {}}},
+			count(append(fullPath, promql.QVolumeLabels, promql.QVolumeLabels)...)}, // + completion + phase 2
+		{"aggregate and svm roots on the same aggregate: nothing to complete", path,
+			graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}, SVMs: map[string]struct{}{"svm0": {}}},
+			count(append(fullPath, promql.QVolumeLabels, promql.QVolumeLabels)...)}, // + SVM group + phase 2
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := promqlfake.New(tc.fixtures)
+			tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{}, storagePlan(tc.roots))
+			require.NoError(t, err)
+			seen := map[string]int{}
+			for _, is := range f.Issued() {
+				seen[is.Name]++
+			}
+			assert.Equal(t, tc.want, seen)
+			for name := range tc.want {
+				assert.Contains(t, tp.RawSeriesCount, name, "%s tallied", name)
+			}
+			for _, q := range promql.ClaimScopedQueries {
+				if _, issued := tc.want[string(q)]; !issued {
+					assert.NotContains(t, tp.RawSeriesCount, string(q), "%s: not issued, so absent, never 0", q)
+				}
+			}
+		})
+	}
+}

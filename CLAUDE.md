@@ -129,10 +129,18 @@ Builder.BuildStorage(…, roots) ── readTopology under storagePlan: never is
                                   maximum when every kind is present. skips ReadServiceGraph;
                                   assembleStorageFlow, attachAlerts, attachStatus; no up{} probe. Roots reach
                                   the pod, node and volume_labels reads (revises storage D2) — plus, when the request roots at
-                                  ontap_cluster=/aggr= and at NO svm=/node=, the volume_labels leg itself is
-                                  read RESTRICTED in two phases (volumelabelscope.go): phase 1 the rooted
-                                  cluster AND aggr as one selector, phase 2 the matched claims' derived
-                                  tokens (`.*tok` in suffix mode) to restore each claim's whole candidate set
+                                  ontap_cluster=/aggr=/svm= (node=/pod=/application= compose), the build is in
+                                  HUB MODE (read-storage-roots-through-volume-hub; decided once, before launch,
+                                  by topologyPlan.resolveVolumeLabelRead): volume_labels read RESTRICTED
+                                  (volumelabelscope.go) — phase 1 an aggr group {cluster=~OC?,aggr=~A} and/or
+                                  an svm group {cluster=~OC?,svm=~S}, owner completion re-reading whole every
+                                  aggregate an svm row touched, phase 2 the matched claims' derived tokens —
+                                  and the five claim families read FROM phase 1 (claimscope.go):
+                                  kube_persistentvolumeclaim_info{volumename=~<pvc_ suffixes, _→->} then
+                                  bindings / pvc annotations / kubelet ×2 {persistentvolumeclaim=~<claims>}
+                                  filtered to the loaded (az, env, cluster, ns, claim) keys; every KSM /
+                                  kubelet / ALERTS query drops az/env (hubSelector) and routes to every
+                                  backend while harvest stays az-routed (QuerierForFamilyZones)
    ▼
 graph.ProjectStorage          ── reachability over storage-flow units + root-always
    ▼
@@ -804,10 +812,10 @@ live under `openspec/specs/`.
   label) follow the missing-UID fallback above; UIDs present but unknown
   to topology become synth pods with `cluster=""` (server-side cluster
   unknown).
-- **Two filter classes: selector-level and projection-level** (push-request-filters-upstream; supersedes the old "no filters pushed to PromQL" rule). **Selector-level** — `cluster`, `namespace`, `az`, `env` — are rendered into the upstream queries as label matchers by `promql.Render(q, window, keys, sel)`, so VictoriaMetrics narrows the build at the source. **Projection-level** — `edge_type`, `prune`, plus `cluster` / `namespace` re-applied as defence in depth — are applied over the built graph. Which dimension reaches which series is the hardcoded `promql.queryDims` table (a test parses `queries.go` and fails on a Query constant with no entry): pod/claim/Service/EndpointSlice KSM series + kubelet = all four; `kube_node_*` = az/env/cluster; **NetApp Harvest = NO request matcher** (its `cluster` label is the ONTAP cluster, not a Kubernetes one; it carries no namespace; and `az` reaches it only as backend ROUTING through the routing-only `dimAZRoute` bit — `dimsHarvest = dimAZRoute` — while `env` does not reach it at all; it is narrowed by reference through the loaded claims — and, for `volume_labels` alone under a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=`, by a ROOT-DERIVED scope, a different mechanism from a selector-level dimension exactly as the QoS `volume` alternation is: `queryDims` and `Selector.Reaches` are untouched); **the three `traces_service_graph_*` queries and `up` take NO request matcher**; `ALERTS` = az/env plus `namespace` in its **or-absent** form (`dimsAlerts = dimAZ | dimEnv | dimNamespaceOrAbsent` — never `cluster`, because an alert expression does not reliably preserve it; `namespace=~"shop|"` so the namespace-less node / controller / aggregate alerts still reach the nodes the request loads by reference). Rendering is a pure function of the sorted, de-duplicated value set (single value → `key="v"`, several → one anchored `key=~"a|b"` with `regexp.QuoteMeta` + string escaping), fixed dimension order `az, env, cluster, namespace`, and the `cluster` value `unknown` renders `cluster=~"unknown|"` — the literal PLUS the empty alternative, always the regex form — because `build.bucketCluster` puts an absent label AND a literal `unknown` in the SAME bucket, so the matcher must accept both (`promql.ClusterUnknownValue` is the one spelling shared by the query and parse layers). Each query's **fixed** selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on the six controller-annotation families, `alertstate="firing"` on `ALERTS`, the D30 sentinel, `edge_relation!="link"`) is a request-invariant metric-selection contract and is always rendered FIRST, composed with — never replaced by — the request matchers. Each mirrors a discard its Go reader already performs BEFORE keying or tallying the sample, so the pushdown is output-preserving down to the missing-cluster tally — pinned by `TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving` / `TestResolveApplications_TrackingIDPresenceIsOutputPreserving`; a matcher STRICTER than its reader would silently drop data. A zero `promql.Selector` adds no request matcher, so every query renders exactly its fixed form (`TestRender_EmptySelectorMatchesBaseline` diffs against `pkg/promql/testdata/render-baseline.txt`, which moves whenever a fixed selector does). The `az` / `env` label KEYS are operator-configurable (`--az-label` / `KSG_AZ_LABEL`, `--env-label` / `KSG_ENV_LABEL`, defaults `az` / `env`, validated as PromQL label names and required to differ); the request parameter names never change. **Operator precondition:** every kube-state-metrics and kubelet family must carry the configured labels — a family that does not vanishes under an `az` / `env` filter, and the connectivity prune can then empty the graph (a `selector_family_empty` Warn fires when KSM matched but a kubelet family that a LIVE dimension actually reaches returned nothing — `promql.Selector.Reaches(q)` reads `queryDims` backwards, and since Harvest renders no matcher it is never blamed). Harvest series need NO `az` / `env` label.
+- **Two filter classes: selector-level and projection-level** (push-request-filters-upstream; supersedes the old "no filters pushed to PromQL" rule). **Selector-level** — `cluster`, `namespace`, `az`, `env` — are rendered into the upstream queries as label matchers by `promql.Render(q, window, keys, sel)`, so VictoriaMetrics narrows the build at the source. **Projection-level** — `edge_type`, `prune`, plus `cluster` / `namespace` re-applied as defence in depth — are applied over the built graph. Which dimension reaches which series is the hardcoded `promql.queryDims` table (a test parses `queries.go` and fails on a Query constant with no entry): pod/claim/Service/EndpointSlice KSM series + kubelet = all four; `kube_node_*` = az/env/cluster; **NetApp Harvest = NO request matcher** (its `cluster` label is the ONTAP cluster, not a Kubernetes one; it carries no namespace; and `az` reaches it only as backend ROUTING through the routing-only `dimAZRoute` bit — `dimsHarvest = dimAZRoute` — while `env` does not reach it at all; it is narrowed by reference through the loaded claims — and, for `volume_labels` alone under a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=`, by a ROOT-DERIVED scope, a different mechanism from a selector-level dimension exactly as the QoS `volume` alternation is: `queryDims` and `Selector.Reaches` are untouched); **the three `traces_service_graph_*` queries and `up` take NO request matcher**; `ALERTS` = az/env plus `namespace` in its **or-absent** form (`dimsAlerts = dimAZ | dimEnv | dimNamespaceOrAbsent` — never `cluster`, because an alert expression does not reliably preserve it; `namespace=~"shop|"` so the namespace-less node / controller / aggregate alerts still reach the nodes the request loads by reference). Rendering is a pure function of the sorted, de-duplicated value set (single value → `key="v"`, several → one anchored `key=~"a|b"` with `regexp.QuoteMeta` + string escaping), fixed dimension order `az, env, cluster, namespace`, and the `cluster` value `unknown` renders `cluster=~"unknown|"` — the literal PLUS the empty alternative, always the regex form — because `build.bucketCluster` puts an absent label AND a literal `unknown` in the SAME bucket, so the matcher must accept both (`promql.ClusterUnknownValue` is the one spelling shared by the query and parse layers). Each query's **fixed** selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on the six controller-annotation families, `alertstate="firing"` on `ALERTS`, the D30 sentinel, `edge_relation!="link"`) is a request-invariant metric-selection contract and is always rendered FIRST, composed with — never replaced by — the request matchers. Each mirrors a discard its Go reader already performs BEFORE keying or tallying the sample, so the pushdown is output-preserving down to the missing-cluster tally — pinned by `TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving` / `TestResolveApplications_TrackingIDPresenceIsOutputPreserving`; a matcher STRICTER than its reader would silently drop data. A zero `promql.Selector` adds no request matcher, so every query renders exactly its fixed form (`TestRender_EmptySelectorMatchesBaseline` diffs against `pkg/promql/testdata/render-baseline.txt`, which moves whenever a fixed selector does). The `az` / `env` label KEYS are operator-configurable (`--az-label` / `KSG_AZ_LABEL`, `--env-label` / `KSG_ENV_LABEL`, defaults `az` / `env`, validated as PromQL label names and required to differ); the request parameter names never change. **Operator precondition:** every kube-state-metrics and kubelet family must carry the configured labels — a family that does not vanishes under an `az` / `env` filter, and the connectivity prune can then empty the graph (a `selector_family_empty` Warn fires when KSM matched but a kubelet family that a LIVE dimension actually reaches returned nothing — `promql.Selector.Reaches(q)` reads `queryDims` backwards, and since Harvest renders no matcher it is never blamed). Harvest series need NO `az` / `env` label. **Hub-mode storage builds are the one exception to the az/env rows of the table**: a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=` renders every KSM / kubelet / `ALERTS` query with `hubSelector(sel)` — `cluster` / `namespace` only — so a filer shared across zones draws every zone's claims (`queryDims` itself is unchanged).
 - **Filtered-build rules for the service graph** (design D5 / D6 of push-request-filters-upstream). Because the topology is narrowed while the service-graph series are read in full, a build with any selector-level dimension active applies two rules that are **inert when unfiltered** (`sgResolver.filtered`): (1) an endpoint whose non-empty pod UID names a pod the request did NOT load resolves exactly as if the UID were empty — the `"://"` ladder can still reach a LOADED Service, `server="unknown"` still goes through the peer ladder (which needs a real client pod, so an out-of-scope caller is dropped), any other non-empty label becomes `external/<label>` via the D27 fallback, and an empty label drops the side; **a filtered build NEVER synthesises a pod**; (2) a series is ADMITTED only when both sides resolved AND at least one resolved id names loaded topology (`podByID` or an already-materialised `services` entry) — otherwise a per-series **journal** rolls back every side effect (external / service / `service-selects-pod` / route-chain / ingress `role` / `extReasons`) and the series contributes nothing to `pairs`, the RED join or the link markers. This is what keeps the out-of-scope estate from rendering as an external-to-external web, and what makes an out-of-scope peer render as `external/<label>` instead of a ghost pod. **Consequence:** under `?cluster=` the cross-cluster partner is an `external` node, not a real pod — "Cross-cluster edge representation" now requires BOTH clusters loaded.
 - **An empty filtered result is a 200, not `outside_retention`.** The zero-pods + zero-nodes + healthy-`up{}` classification runs only when `sel.Active()` is false; a filtered build issues no `up{}` probe and returns an empty `elements` array with an empty `clusters` list. It also issues **no `traces_service_graph_*` queries at all** when the selector loaded neither pods nor services: admission (D6) requires a resolved endpoint in loaded topology and a service node can only come from `ServicesByNameNS`, so every series would be rejected — and those three queries are the one leg `queryDims` never narrows, so a mistyped `?namespace=` would otherwise scan the whole estate per request.
-- **Request surface is `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`** on `/v1/graph` — everything but `start` / `end` optional. `GET /v1/storage-graph` additionally **requires** single-valued `az` and `env` (`missing_az` / `missing_env`; a repeat is `invalid_scope`) and accepts optional repeatable roots `ontap_cluster`, `aggr`, `svm`, `pod=<ns>/<name>`, `application=<argo-app>`, `node` (matched against both ONTAP controller and Kubernetes node names); `prune` is ignored there. `name`, `root`, `depth`, `direction` and `edge_type` are **withdrawn** (BREAKING) and, like any unknown parameter, ignored without error — their VALUE is never inspected, so an unregistered `edge_type` is a 200, not the 400 it used to be. An old client receives the unanchored, unfiltered view. `GET /v1/clusters` is **removed** (BREAKING) together with the `cluster_discovery` query — the cluster list is the `clusters` field of any `/v1/graph` response. `graph.Scope` is `{Clusters, Namespaces, EdgeTypes, Inventory}`; `traverse` / `MaxTraversalDepth` / `Direction` / `Names` are gone. `graph.StorageScope` is `{Clusters, Namespaces, Roots}`.
+- **Request surface is `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`** on `/v1/graph` — everything but `start` / `end` optional. `GET /v1/storage-graph` additionally **requires** single-valued `az` and `env` (`missing_az` / `missing_env`; a repeat is `invalid_scope`) — which narrow its Kubernetes side only OUTSIDE hub mode; in hub mode `az` selects the harvest backends alone and `env` reaches nothing — and accepts optional repeatable roots `ontap_cluster`, `aggr`, `svm`, `pod=<ns>/<name>`, `application=<argo-app>`, `node` (matched against both ONTAP controller and Kubernetes node names); `prune` is ignored there. `name`, `root`, `depth`, `direction` and `edge_type` are **withdrawn** (BREAKING) and, like any unknown parameter, ignored without error — their VALUE is never inspected, so an unregistered `edge_type` is a 200, not the 400 it used to be. An old client receives the unanchored, unfiltered view. `GET /v1/clusters` is **removed** (BREAKING) together with the `cluster_discovery` query — the cluster list is the `clusters` field of any `/v1/graph` response. `graph.Scope` is `{Clusters, Namespaces, EdgeTypes, Inventory}`; `traverse` / `MaxTraversalDepth` / `Direction` / `Names` are gone. `graph.StorageScope` is `{Clusters, Namespaces, Roots}`.
 - **`graph.EdgeTypes` is the builder's declaration table, served to nobody.**
   A single in-code registry: adding an edge type = update both the builder and
   the registry in the same change. Its `MayCrossCluster` bit derives
@@ -867,37 +875,60 @@ live under `openspec/specs/`.
     `pvc-to-netapp-aggr` edge, the `netapp-aggr` / `netapp-node` entities, and
     the PVC `svm` label. An **info series**: its sample value is discarded, only
     its labels (`cluster` = ONTAP cluster, `node`, `aggr`, `svm`) are read.
-    **Rooted read** (scope-volume-labels-by-storage-root): a `/v1/storage-graph`
-    request rooted at `ontap_cluster=` and/or `aggr=` reads it restricted, in two
-    phases. Phase 1 is ONE selector, `{cluster=…,aggr=…}` — an AND, because the
-    projection makes an `aggr=` root name an aggregate only WITHIN the
-    `ontap_cluster=` values. Phase 2 re-reads `volume=~".*<token>"` (suffix mode;
-    the bare token in `exact`) for exactly the claims phase 1 matched, because
-    `pickAggr` / `pickSVM` are lexically-smallest over a claim's WHOLE candidate
-    set and a Trident clone or a same-named FlexVol on a second filer would
-    otherwise move a claim onto or off the rooted aggregate; the two are merged
-    de-duplicated by label-set fingerprint (a series both return must vote once in
-    `pickOwner`). It is the FORWARD derivation the join already computes — nothing
-    inverts a FlexVol name to a PV name. Phase 2 is NOT issued when phase 1
-    matched no claim, nor when phase 1 fell back. A restriction naming ONLY
-    ONTAP clusters gives phase 2 a `cluster!~"…"` for them — phase 1 read those
-    filers whole, so the rest is elsewhere. The restriction is CAPPED at
-    `maxRootedVolumeLabelChunks` (= `scopeConcurrency`) queries and falls back to
-    the unrestricted read past it: `?aggr=` is repeatable and the parser bounds
-    each value's LENGTH, never the count, so this is the one scope a client can
-    inflate. **An `svm=` or `node=` root anywhere in the request disables
-    the restriction** (the owner vote runs over every series of an aggregate, the
-    projection UNIONS `aggr=` with `svm=`, and `node=` also names a Kubernetes
-    node and is admitted as a root regardless of flow); `contains` / `regex`
-    match modes read unrestricted (`volumeModeTokenScope`, classified per mode);
-    `/v1/graph` never restricts (`fullPlan` answers false structurally). The one
-    body-changing corner: an aggregate or controller named by `volume_labels`
-    ALONE (no `aggr_*` / `node_*` series) outside the rooted components is not
-    materialised, which can change whether a `cluster`-less alert matches a unique
-    entity — the stock Harvest templates name every one, so it needs a non-stock
-    estate. Tests: `pkg/build/volumelabelscope_test.go` (parity across root
-    shapes, clone, cross-filer collision, takeover, opt-outs, chunking, degrade),
-    `pkg/promql/volumelabels_test.go`.
+    **Rooted read** (scope-volume-labels-by-storage-root,
+    read-storage-roots-through-volume-hub): a `/v1/storage-graph` request rooted
+    at `ontap_cluster=`, `aggr=` and/or `svm=` reads it restricted. Phase 1 is up
+    to two query GROUPS mirroring the projection, which UNIONS `aggr=` with
+    `svm=` and narrows both by `ontap_cluster=`: `{cluster=…,aggr=…}` and
+    `{cluster=…,svm=…}` (the cluster matcher an AND — an `aggr=`/`svm=` root
+    names a component only WITHIN the `ontap_cluster=` values; `{cluster=…}` alone
+    for a cluster-only request), merged in (group, chunk) order de-duplicated by
+    fingerprint. **Owner completion** then re-reads whole every
+    `(cluster, aggr)` an SVM-group row names, minus the aggregates an `aggr=`
+    root already read whole, because `pickOwner` votes over EVERY series of an
+    aggregate and an SVM group returns only its share (the takeover case). Phase 2
+    re-reads `volume=~".*<token>"` (suffix mode; the bare token in `exact`) for
+    exactly the claims phase 1 matched, because `pickAggr` / `pickSVM` are
+    lexically-smallest over a claim's WHOLE candidate set and a Trident clone or a
+    same-named FlexVol on a second filer would otherwise move a claim onto or off
+    the rooted aggregate. Completion and phase 2 are merged (fingerprint de-dup —
+    a series two reads return must vote once in `pickOwner`) only AFTER the hub's
+    claim read took its candidates from phase 1, so completion rows are never a
+    claim source. It is the FORWARD derivation the join already computes. Phase 2
+    is NOT issued when phase 1 matched no claim. A restriction naming ONLY ONTAP
+    clusters gives phase 2 a `cluster!~"…"` for them — phase 1 read those filers
+    whole. The restriction is CAPPED at `maxRootedVolumeLabelChunks`
+    (= `scopeConcurrency`) queries summed over both groups and falls back to the
+    unrestricted read past it — and with it to today's build (no hub): the root
+    parameters are repeatable and the parser bounds each value's LENGTH, never
+    the count, so this is the one scope a client can inflate. `pod=`,
+    `application=` and `node=` compose (the projection ANDs them with the
+    storage-exclusive roots); a request whose only storage-side root is `node=`
+    reads unrestricted. `contains` / `regex` match modes read unrestricted
+    (`volumeModeTokenScope`, classified per mode); `/v1/graph` never restricts
+    (`fullPlan` answers false structurally). The one body-changing corner: an
+    aggregate or controller named by `volume_labels` ALONE (no `aggr_*` /
+    `node_*` series) outside the rooted components is not materialised, which can
+    change whether a `cluster`-less alert matches a unique entity — the stock
+    Harvest templates name every one, so it needs a non-stock estate.
+    **A restricted read IS hub mode** (`topologyPlan.hub`, `claimscope.go`): the
+    claim families are read FROM phase 1 — `pvCandidates` turns every `pvc_`
+    boundary suffix of a rooted `volume` into a PV name (a generator, never a
+    judge; static PVs and custom volume-name prefixes are NOT reached from a
+    storage root), `kube_persistentvolumeclaim_info` is scoped on `volumename`,
+    the other four claim families on `persistentvolumeclaim` and then filtered to
+    the loaded `(az, env, cluster, namespace, claim)` keys, a scope past
+    `maxHubClaimChunks` is read once unrestricted and filtered, and
+    `storage_root_claim_miss` (`no_pv_candidate` / `no_claim`) reports a hub that
+    found nothing. `buildStorage` renders `hubSelector(sel)` (az/env cleared) on
+    every KSM / kubelet / ALERTS query and binds ONE routing snapshot through the
+    optional `promql.FamilyZoneQuerierSource` so harvest stays az-routed while
+    the Kubernetes families reach every backend — a hub body can span zones;
+    cluster identities stay per zone. Tests: `pkg/build/volumelabelscope_test.go`
+    (parity across root shapes, clone, cross-filer collision, takeover, owner
+    completion, chunking, degrade), `pkg/build/claimscope_test.go`,
+    `pkg/build/hubrouting_test.go`, `pkg/promql/volumelabels_test.go`,
+    `internal/integration` (`TestStorageGraphHubReadsEveryZone`).
   - **hop B `qos_{read,write}_{ops,latency,data}`** — the six measured I/O
     figures. **Volume granularity is a READER rule, not a matcher** (D11): the
     queries carry the `volume` scope and nothing else, and `sumQoSIO` skips
@@ -988,7 +1019,7 @@ live under `openspec/specs/`.
   **`/v1/storage-graph` fails closed** (fail-storage-graph-on-any-leg-error): `storagePlan.failClosed`
   makes every first-wave leg and every scoped QoS chunk required except `ALERTS`, and every wave
   only a by-reference plan issues (pods, nodes, controllers, application recovery, rooted
-  `volume_labels`) is required unconditionally — `scopedFamily` has no error class any more.
+  `volume_labels` incl. owner completion, the hub's claim-keyed reads) is required unconditionally — `scopedFamily` has no error class any more.
   A failed query is wrapped in `build.QueryError`; `build.Error.Query` carries the bare family
   name and `mapBuildError` writes `upstream query failed: <family>` (never upstream text).
   An empty vector still never fails a build. **Two** coverage
@@ -1006,7 +1037,8 @@ live under `openspec/specs/`.
   plan's parity pin and its by-reference fan-out pin: 18 legs with nothing
   named, growing per named pod/node/owner up to 38 with every controller kind
   present and a matched volume; an `application=` root adds 6 / 6+1+2 / 6+2+6
-  as in docs/upstream-metrics.md), `pkg/build/podscope_test.go`,
+  as in docs/upstream-metrics.md; hub mode 13 / 14 / 31 families, pinned by
+  `TestBuildStorage_FanOutLegCount_Hub`), `pkg/build/podscope_test.go`,
   `pkg/build/appscope_test.go`, `pkg/build/nodescope_test.go`,
   `pkg/build/controllerscope_test.go`, `pkg/build/scopedread_test.go`,
   `pkg/promql/scope_test.go`, `pkg/promql/appscope_test.go`,
@@ -1032,7 +1064,7 @@ live under `openspec/specs/`.
 - **K8s node `ready_status` attribute.** Each `type="node"` node may carry a typed, nullable `ready_status` attribute — `data.ready_status` (a string), serialised with `omitempty` and **never inside `labels`** — same precedent as `ipaddress` / `owner`. The value is one of `"Ready"`, `"NotReady"`, `"Unknown"`, derived from `kube_node_status_condition{condition="Ready"}` (a new topology query in the `ReadTopology` errgroup; the `condition="Ready"` selector is a fixed, **request-invariant metric-selection contract** — same class as the node-address `type` selector and the D30 sentinel — NOT a caller filter, and it is rendered ahead of any request-scoped matcher). The reader reads the `status` label of the **active** row (sample value `1`), matched **case-insensitively**: `true`→`Ready`, `false`→`NotReady`, `unknown`→`Unknown`. Status-label casing is NOT pinned by the KSM-shaped contract — stock kube-state-metrics lowercases it (`addConditionMetrics`→`strings.ToLower`), but an exporter that re-publishes the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown`; both resolve (the reader canonicalises to lowercase at the read site). **Absence is distinct from `"Unknown"`**: `data.ready_status` is omitted entirely when the metric is absent, the node has no `condition="Ready"` series, or no row is active — `"Unknown"` is reserved for the genuine Kubernetes state where the kubelet has stopped reporting; the two MUST NOT be conflated (no defaulting missing data to `"Unknown"`). Surfaced via `graph.GraphNode.ReadyStatus() string` (`""` for non-nodes and nodes with no Ready data), resolved in `pkg/build/topology.go` (`resolveNodeReadyStatus`, keyed `(cluster, node)` like the IP/label joins); on the defensive multi-active tie the lexically-smallest `status` wins (determinism). The metric is a KSM default and OPTIONAL (absence degrades gracefully, no build failure). No new node/edge type.
 - **Upstream backend routing (`add-multi-backend-query-routing`).** Every upstream call is dispatched through a `*promql.Router` over a validated, immutable `promql.Table` of named backends (URL + `families` + `zones` + resolved credentials). Full operator reference: `docs/upstream-backend-routing.md`.
   - **Caller-declared family (`Router.QueryLabels`).** An embedder names an arbitrary metric and supplies one of the six families; dispatch reuses Instant's Select / fan-out / merge / fail-closed core rather than a second policy. An unserved family is an error on this path (unlike the server's optional `alerts` Debug-empty).
-  - **The seam is an OPTIONAL upgrade interface, not a widened one** (D1). `Querier.Instant` carries the query name but not the `Selector`, and the selector's `az` is what picks a backend — so `promql.QuerierSource` (`QuerierFor(sel) Querier`) was added alongside `Querier`, and `build.New` type-asserts its argument for it. `*Router` satisfies BOTH. Nothing in `pkg/promql`, `pkg/build`, or `pkg/kubegraph` changed signature, so a plain `Querier` (a `*Client`, a mock, `graph-api-gateway`) behaves exactly as before. Same shape as `build.BuildScopedRouteResolver`.
+  - **The seam is an OPTIONAL upgrade interface, not a widened one** (D1). `Querier.Instant` carries the query name but not the `Selector`, and the selector's `az` is what picks a backend — so `promql.QuerierSource` (`QuerierFor(sel) Querier`) was added alongside `Querier`, and `build.New` type-asserts its argument for it. `*Router` satisfies BOTH. Nothing in `pkg/promql`, `pkg/build`, or `pkg/kubegraph` changed signature, so a plain `Querier` (a `*Client`, a mock, `graph-api-gateway`) behaves exactly as before. Same shape as `build.BuildScopedRouteResolver`. `promql.FamilyZoneQuerierSource` (`QuerierForFamilyZones(sel, zoned ...Family)`) is a further optional upgrade: ONE snapshot with `az` applied to the named families only — what a hub-mode storage build binds (`zoned = harvest`); without it the build falls back to `QuerierFor`.
   - **`Builder.Build` resolves the querier ONCE** (D2) and threads it through `ReadTopology`, `ReadServiceGraph` and the retention `up{}` probe. That is what makes "a reload does not disturb a build in flight" structural: the bound querier closes over one table snapshot, and the build cannot probe a different set of stores than it read from.
   - **`queryFamily` is a second hardcoded table beside `queryDims`** — six families (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`, `alerts`), exhaustive over the `Query` constants and guarded by `TestQueryFamily_EveryQueryListed`. `alerts` is the first **optional** family: a table serving it on no backend is valid. `Family.AcceptsAZ()` is **derived** from `queryDims` (true iff every query in the family carries `dimAZ`), so routing and matcher rendering read the same fact from the same place.
   - **Zone-routability is declared per query beside the matcher table** (D4): `Family.AcceptsAZ()` is true iff every query in the family carries `dimAZ` (matcher AND route — `ksm`, `kubelet`) or the routing-only `dimAZRoute` (route, NO matcher — `harvest`). `servicegraph` and `probe` are `dimsNone`, so a `?az=`-scoped request still reaches EVERY backend serving them; narrowing them would drop edges whose series live in another zone's store, and the connectivity prune would then delete the pods on both ends. Routing composes **with** the PromQL matcher, never instead of it — the rendered query string is identical across every backend it is issued to, and `env` / `cluster` / `namespace` never route. **Harvest routes WITHOUT a matcher**: the Harvest legs go to the zone's `harvest` backend(s) carrying no request matcher (the six QoS workload legs additionally carry a data-derived `volume` scope — see the storage-join bullet — which is not a request matcher), so a per-zone Harvest store is the zone boundary, Harvest series need no `az` / `env` label, `?env=` never touches Harvest, and a catch-all `harvest` backend under `?az=` (or any `?env=`) reads the whole estate narrowed by reference — a cross-zone FlexVol-name collision then resolves to the lexically-smallest `(ontap_cluster, aggr)`, exactly as an unfiltered build already does.

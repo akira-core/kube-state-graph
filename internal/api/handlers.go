@@ -101,7 +101,9 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Summary		Get storage-flow graph (Cytoscape.js)
 //	@Description	Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
 //	@Description
-//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). Without an `ontap_cluster` / `aggr` / `svm` root they pin one estate: every Kubernetes query is narrowed to that zone and environment, and `az` selects the Harvest store.
+//	@Description
+//	@Description	**Volume hub**: a request carrying an `ontap_cluster`, `aggr` or `svm` root reads the claims FROM the rooted filer, in every zone and environment. `az` still selects the Harvest store, but neither `az` nor `env` narrows the Kubernetes side, so a filer shared across zones or environments is drawn with every claim on it and `clusters` may list several zones' cluster identities. Claims are found through their PersistentVolume name as the FlexVol name embeds it (`pvc_<uid>`): a statically provisioned PV is not reached from a storage root. `cluster` / `namespace` still narrow.
 //	@Description
 //	@Description	**Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
 //	@Description
@@ -110,8 +112,8 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Produce		json
 //	@Param			start			query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
 //	@Param			end				query		string		true	"Window end. Must be > start."	example(2026-05-01T12:05:00Z)
-//	@Param			az				query		string		true	"Availability zone (required, single-valued)."	example(zone-a)
-//	@Param			env				query		string		true	"Environment (required, single-valued)."	example(prod)
+//	@Param			az				query		string		true	"Availability zone (required, single-valued). Selects the Harvest store; narrows the Kubernetes side only when no ontap_cluster / aggr / svm root is given."	example(zone-a)
+//	@Param			env				query		string		true	"Environment (required, single-valued). Narrows the Kubernetes side only when no ontap_cluster / aggr / svm root is given."	example(prod)
 //	@Param			cluster			query		[]string	false	"Restrict to listed Kubernetes clusters (repeatable, OR-combined)."	collectionFormat(multi)
 //	@Param			namespace		query		[]string	false	"Restrict to listed namespaces (repeatable, OR-combined)."	collectionFormat(multi)
 //	@Param			ontap_cluster	query		[]string	false	"Storage root: ONTAP cluster name."	collectionFormat(multi)

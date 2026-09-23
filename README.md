@@ -171,7 +171,14 @@ Kubernetes nodes and controllers **by reference**: `kube_pod_info` /
 the four `kube_node_*` families only for the Kubernetes nodes those pods are
 scheduled on or a `node=` root names; and the eight controller-owner /
 controller-annotation families only for the owner names those pods' resolved
-owners carry.
+owners carry. A request rooted at `ontap_cluster=`, `aggr=` or `svm=` is read
+through the **volume hub**: the claim families are read FROM the rooted
+`volume_labels` rows (a FlexVol name embedding `pvc_<uid>` names the PV
+`pvc-<uid>`), and every Kubernetes query drops the `az` / `env` matchers, so a
+filer shared across zones or environments is drawn with every claim on it
+(`az` still selects the Harvest store). A statically provisioned PV is not
+reached from a storage root — see
+[`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md).
 
 ### Topology metrics — produced by [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
 
@@ -208,7 +215,7 @@ external-label requirements are in `docs/kube-state-metrics-preconditions.md`.
 
 | Metric | Used for | Labels read | Required? |
 |---|---|---|---|
-| `volume_labels` | **Hop A — the whole storage topology.** PVC→aggregate join (a token derived from the PV name matched against `volume`), the `netapp-aggr` / `netapp-node` entities, and the PVC `svm` label. An info series: its value is ignored, only its labels are read. Read unfiltered — except by a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` (and no `svm=` / `node=`), which reads it restricted to those components | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume` | Optional (absent ⇒ no NetApp nodes / edges / `svm`, and no QoS query is issued) |
+| `volume_labels` | **Hop A — the whole storage topology.** PVC→aggregate join (a token derived from the PV name matched against `volume`), the `netapp-aggr` / `netapp-node` entities, and the PVC `svm` label. An info series: its value is ignored, only its labels are read. Read unfiltered — except by a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=`, which reads it restricted to those components (plus, for `svm=`, every aggregate the SVM touches, re-read whole for its owner vote) and reads the claims FROM those rows | `cluster` (ONTAP cluster), `node`, `aggr`, `svm`, `volume` | Optional (absent ⇒ no NetApp nodes / edges / `svm`, and no QoS query is issued) |
 | `qos_read_ops` / `qos_write_ops` / `qos_read_latency` / `qos_write_latency` / `qos_read_data` / `qos_write_data` | **Hop B — I/O** on `pvc-to-netapp-aggr` (`read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`). Read **verbatim** — Harvest already resolves ONTAP counters (ops/s, average µs, bytes/s); never wrapped in `rate()`. **Scoped** to the FlexVol names hop A matched and carrying no other matcher. A LUN workload carries its FlexVol's `volume` and is fetched — on a SAN backend it is the only series naming the QoS policy — then discarded by the reader before any sum, so it is never added on top | `cluster`, `svm`, `policy_group`, `lun`, `volume` | Optional (absent ⇒ edge with no `metrics`) |
 | `qos_policy_fixed_max_throughput_iops` / `qos_policy_fixed_max_throughput_mbps` | **Hop C — the declared ceiling** `max_iops` / `max_bytes_per_sec` on the same edge, joined on the `(cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. An unmatched or incomplete key is ignored, never widened to another policy group in the same SVM. The `mbps` figure is the one converted value (× 1048576 → bytes/s) so it shares the unit of `read_bytes_per_sec` | `cluster`, `svm`, `name` (or `policy_group`) | Optional (absent ⇒ no ceiling fields; never `0`) |
 | `aggr_new_status` | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | `cluster`, `node`, `aggr` | Optional |

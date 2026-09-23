@@ -67,6 +67,82 @@ func TestRenderVolumeLabelsRooted(t *testing.T) {
 	})
 }
 
+func TestRenderVolumeLabelsSVMRooted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("svm alone renders an svm matcher only", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsSVMRooted(5*time.Minute, nil, []string{"svm_shop"})
+		require.True(t, ok)
+		assert.Equal(t, `last_over_time(volume_labels{svm="svm_shop"}[5m])`, got)
+	})
+
+	t.Run("cluster and svm are AND-combined in one selector, cluster first", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsSVMRooted(time.Minute,
+			[]string{"ontap-b", "ontap-a"}, []string{"svm_b", "svm_a", "svm_a"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(volume_labels{cluster=~"ontap-a|ontap-b",svm=~"svm_a|svm_b"}[1m])`, got,
+			"sorted and de-duplicated, so the string is a pure function of the two value sets")
+	})
+
+	t.Run("a metacharacter matches itself literally", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsSVMRooted(time.Minute, []string{"ontap.prod"}, []string{"svm.a", "svm_b"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(volume_labels{cluster="ontap.prod",svm=~"svm\\.a|svm_b"}[1m])`, got,
+			"an equality needs no regex escape; an alternation is QuoteMeta'd and string-escaped")
+	})
+
+	t.Run("an empty svm set is not renderable, whatever the clusters", func(t *testing.T) {
+		_, ok := RenderVolumeLabelsSVMRooted(time.Minute, []string{"ontap-prod"}, nil)
+		assert.False(t, ok, "a cluster set alone is the cluster group's shape, not this one's")
+		_, ok = RenderVolumeLabelsSVMRooted(time.Minute, nil, []string{"", ""})
+		assert.False(t, ok)
+	})
+}
+
+func TestRenderVolumeLabelsOwnerCompletion(t *testing.T) {
+	t.Parallel()
+
+	t.Run("one cluster equality and the aggregate alternation", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsOwnerCompletion(5*time.Minute, "ontap-prod", []string{"aggr07", "aggr03", "aggr03"})
+		require.True(t, ok)
+		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr03|aggr07"}[5m])`, got)
+	})
+
+	t.Run("one aggregate renders an equality", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", []string{"aggr03"})
+		require.True(t, ok)
+		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr03"}[1m])`, got)
+	})
+
+	t.Run("escaping", func(t *testing.T) {
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, `on"tap`, []string{"aggr.1", "aggr_2"})
+		require.True(t, ok)
+		assert.Equal(t, `last_over_time(volume_labels{cluster="on\"tap",aggr=~"aggr\\.1|aggr_2"}[1m])`, got)
+	})
+
+	t.Run("an empty cluster is still an equality, never dropped", func(t *testing.T) {
+		// An aggregate name is unique only within its filer: dropping the matcher
+		// would read every filer's aggregate of that name.
+		got, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "", []string{"aggr1"})
+		require.True(t, ok)
+		assert.Equal(t, `last_over_time(volume_labels{cluster="",aggr="aggr1"}[1m])`, got)
+	})
+
+	t.Run("an empty aggregate set is not renderable", func(t *testing.T) {
+		_, ok := RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", nil)
+		assert.False(t, ok)
+		_, ok = RenderVolumeLabelsOwnerCompletion(time.Minute, "ontap-prod", []string{""})
+		assert.False(t, ok)
+	})
+
+	t.Run("the repeated cluster matcher's cost is its rendered length plus the comma", func(t *testing.T) {
+		assert.Equal(t, len(`cluster="ontap-prod"`)+1, OwnerCompletionClusterCost("ontap-prod"))
+		assert.Equal(t, len(`cluster="on\"tap"`)+1, OwnerCompletionClusterCost(`on"tap`))
+	})
+}
+
 func TestRenderVolumeLabelsTokenScoped(t *testing.T) {
 	t.Parallel()
 

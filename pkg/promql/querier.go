@@ -45,6 +45,28 @@ type QuerierSource interface {
 	QuerierFor(sel Selector) Querier
 }
 
+// FamilyZoneQuerierSource is the OPTIONAL upgrade of QuerierSource a build
+// type-asserts for when it must route some families by zone and others by
+// none (read-storage-roots-through-volume-hub D8): a hub-mode storage build
+// reads Harvest from the stores its `az` selects, and the kube-state-metrics,
+// kubelet and alerts families from every store serving them.
+//
+// Two QuerierFor calls — one with the zone, one without — would load two
+// routing snapshots and could straddle a reload, so a build could read from one
+// table and the other half from another. The bound Querier this returns closes
+// over ONE snapshot and makes the zone decision per family instead.
+//
+// A plain QuerierSource lacks it; a consumer then falls back to QuerierFor,
+// which routes every zone-routable family by `az`. Same shape as QuerierSource,
+// Prober, RouterMetrics and SeriesMetrics.
+type FamilyZoneQuerierSource interface {
+	QuerierSource
+	// QuerierForFamilyZones binds ONE routing snapshot. Families in zoned
+	// dispatch by sel.AZ exactly as QuerierFor does; every other family
+	// dispatches with no zone, to every backend serving it.
+	QuerierForFamilyZones(sel Selector, zoned ...Family) Querier
+}
+
 // Static adapts a plain Querier into a QuerierSource that ignores the selector
 // and always yields the same Querier. It is the single-upstream case expressed
 // in the routed vocabulary, so a consumer can hold a QuerierSource

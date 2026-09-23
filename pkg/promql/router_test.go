@@ -293,3 +293,70 @@ func TestStatic_IgnoresSelector(t *testing.T) {
 	assert.Same(t, Querier(f), src.QuerierFor(Selector{}))
 	assert.Same(t, Querier(f), src.QuerierFor(Selector{AZ: []string{"zone-a"}}))
 }
+
+// QuerierForFamilyZones routes the named families by zone and every other
+// family everywhere, from ONE bound querier (read-storage-roots-through-volume-hub
+// D8): a hub-mode storage build reads Harvest from its zone's store and the
+// Kubernetes families from every store.
+func TestRouter_QuerierForFamilyZones(t *testing.T) {
+	fa, fb := &fakeBackend{}, &fakeBackend{}
+	r := routerWithFakes(t, twoZoneTable(t), map[string]*fakeBackend{"zone-a": fa, "zone-b": fb}, nil)
+	var src QuerierSource = r
+	fz, ok := src.(FamilyZoneQuerierSource)
+	require.True(t, ok, "a *Router offers the upgrade")
+
+	bound := fz.QuerierForFamilyZones(Selector{AZ: []string{"zone-a"}}, FamilyHarvest)
+	cases := []struct {
+		query     Query
+		wantZoneB int
+	}{
+		{QVolumeLabels, 0},           // harvest: zone-a only
+		{QPodInfo, 1},                // ksm: everywhere
+		{QKubeletVolumeUsedBytes, 1}, // kubelet: everywhere
+		{QAlerts, 1},                 // alerts: everywhere
+	}
+	for _, tc := range cases {
+		beforeA, _ := fa.seen()
+		beforeB, _ := fb.seen()
+		_, err := bound.Instant(t.Context(), string(tc.query), "q", time.Unix(0, 0))
+		require.NoError(t, err)
+		afterA, _ := fa.seen()
+		afterB, _ := fb.seen()
+		assert.Equal(t, 1, afterA-beforeA, "%s: the zone's own backend always answers", tc.query)
+		assert.Equal(t, tc.wantZoneB, afterB-beforeB, "%s: the other zone's backend", tc.query)
+	}
+
+	t.Run("QuerierFor still routes every zone-routable family by zone", func(t *testing.T) {
+		_, beforeB := fb.seen()
+		_, err := r.QuerierFor(Selector{AZ: []string{"zone-a"}}).Instant(t.Context(), string(QPodInfo), "q", time.Unix(0, 0))
+		require.NoError(t, err)
+		_, afterB := fb.seen()
+		assert.Len(t, afterB, len(beforeB), "zone-b is not asked")
+	})
+}
+
+// Both dispatch decisions of a hub-mode build come from ONE snapshot: a reload
+// between two queries on the bound querier changes neither.
+func TestRouter_FamilyZoneQuerierIgnoresLaterSwap(t *testing.T) {
+	fakes := map[string]*fakeBackend{"zone-a": {}, "zone-b": {}, "zone-c": {}}
+	r := routerWithFakes(t, twoZoneTable(t), fakes, nil)
+
+	bound := r.QuerierForFamilyZones(Selector{AZ: []string{"zone-a"}}, FamilyHarvest)
+	_, err := bound.Instant(t.Context(), string(QVolumeLabels), "q", time.Unix(0, 0))
+	require.NoError(t, err)
+
+	next, err := NewTable([]Backend{
+		be("zone-a", "http://vm-a:8428", allFamilies(), "zone-a"),
+		be("zone-b", "http://vm-b:8428", allFamilies(), "zone-b"),
+		be("zone-c", "http://vm-c:8428", allFamilies(), "zone-c"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.Swap(next))
+
+	_, err = bound.Instant(t.Context(), string(QPodInfo), "q", time.Unix(0, 0))
+	require.NoError(t, err)
+	callsC, _ := fakes["zone-c"].seen()
+	assert.Zero(t, callsC, "a build in flight keeps the table it started with, for every family")
+	callsB, _ := fakes["zone-b"].seen()
+	assert.Equal(t, 1, callsB, "the un-zoned family still reached every backend of the bound table")
+}

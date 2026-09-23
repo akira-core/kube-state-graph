@@ -3,6 +3,7 @@ package build
 import (
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/prometheus/common/model"
 
@@ -128,18 +129,15 @@ type topologyPlan struct {
 	// node families are read for it, so the roots must reach the node scope
 	// exactly as podRoots reaches the pod scope.
 	nodeRoots []string
-	// volumeClusters and volumeAggrs are the request's ontap_cluster= and
-	// aggr= roots, sorted and de-duplicated: the two storage-side roots the
-	// Harvest volume-label topology read may be restricted by
-	// (scope-volume-labels-by-storage-root). They are values, not a decision —
-	// restrictsVolumeLabels is the decision.
+	// volumeClusters, volumeAggrs and volumeSVMs are the request's
+	// ontap_cluster=, aggr= and svm= roots, sorted and de-duplicated: the three
+	// storage-exclusive roots the Harvest volume-label topology read is
+	// restricted by (scope-volume-labels-by-storage-root,
+	// read-storage-roots-through-volume-hub). They are values, not a decision —
+	// restrictsVolumeLabels and resolveVolumeLabelRead are the decision.
 	volumeClusters []string
 	volumeAggrs    []string
-	// svmRoot records that the request carries an svm= root. svm= is never
-	// pushed down (the aggregate owner vote runs over every series of an
-	// aggregate) and, because the projection UNIONS it with aggr=, its mere
-	// presence disables the restriction for the whole request.
-	svmRoot bool
+	volumeSVMs     []string
 	// applicationRoots are the request's application=<name> values, sorted.
 	// Non-empty launches the recovery wave and narrows the pod scope to the
 	// pods related to those Applications (see appscope.go). The volume-label
@@ -156,6 +154,30 @@ type topologyPlan struct {
 	// nodes, controllers, the application recovery, the rooted volume-label
 	// read) fails closed unconditionally.
 	failClosed bool
+
+	// The fields below are filled by resolveVolumeLabelRead, once per build,
+	// and are zero on an unresolved plan.
+	//
+	// hub is the volume-hub decision (read-storage-roots-through-volume-hub
+	// D1): the volume-label read is restricted to the rooted components AND
+	// its phase 1 is bounded and renderable. It is the same fact as "the
+	// volume-label read is restricted" — the predicate that allows a
+	// restriction and the one that engages the hub are one predicate — so a
+	// build that falls back to the unrestricted read is exactly today's build,
+	// claim families and request matchers included.
+	//
+	// It is decided BEFORE the fan-out launches, not when phase 1 returns:
+	// phase 1's shape is a pure function of the roots and the byte budget, and
+	// the decision also picks the request matchers and the backend routing of
+	// every Kubernetes leg, which must be known when the first of them starts.
+	hub bool
+	// phaseOne is hub's phase-1 read, rendered, in (group, chunk) order.
+	phaseOne []rootedVolumeLabelsQuery
+	// phaseOneUnbounded records that the plan asked for a restriction and
+	// phase 1 did not yield a bounded, renderable one — the one case the build
+	// logs, because the request's roots were not honoured by the read.
+	phaseOneUnbounded bool
+	resolved          bool
 }
 
 // failsClosed reports whether a query error of q must fail this build even
@@ -205,40 +227,84 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 		// engine and StorageRoots is an exported map an embedder fills itself.
 		volumeClusters:   sortedNames(slices.Collect(maps.Keys(roots.ONTAPClusters))),
 		volumeAggrs:      sortedNames(slices.Collect(maps.Keys(roots.Aggrs))),
-		svmRoot:          len(roots.SVMs) > 0,
+		volumeSVMs:       sortedNames(slices.Collect(maps.Keys(roots.SVMs))),
 		applicationRoots: sortedNames(slices.Collect(maps.Keys(roots.Applications))),
 	}
 }
 
 // restrictsVolumeLabels reports whether this build reads the Harvest
-// volume-label topology family restricted to the rooted components, in two
-// phases (see volumelabelscope.go), instead of whole.
+// volume-label topology family restricted to the rooted components, in phases
+// (see volumelabelscope.go), instead of whole.
 //
-// All four must hold:
+// All three must hold:
 //
 //   - the plan is by-reference — only /v1/storage-graph carries roots, so
 //     fullPlan answers false structurally rather than by having none;
-//   - the request roots at an ONTAP cluster or an aggregate;
-//   - it roots at NO SVM and NO node. The projection UNIONS aggr= with svm=, so
-//     a restriction by aggregate alone would drop units reached only through
-//     the SVM; svm= itself cannot be pushed because the aggregate owner vote
-//     runs over every series of the aggregate; and node= names a Kubernetes
-//     node as well and is admitted as a root whether or not any path reaches it;
-//   - the configured match mode renders as an alternation branch, because the
-//     second phase restricts on the claims' derived tokens.
+//   - the request roots at an ONTAP cluster, an aggregate or an SVM — a
+//     storage-EXCLUSIVE root. The projection unions aggr= with svm=, so phase 1
+//     issues one query group per root kind; an SVM group is followed by an
+//     owner-completion read, because the aggregate owner vote runs over every
+//     series of the aggregate;
+//   - the configured match mode renders as an alternation branch, because
+//     phase 2 restricts on the claims' derived tokens.
 //
-// pod= composes freely: the projection ANDs the workload roots with the storage
-// roots, so every retained path is one the restriction keeps.
+// pod=, application= and node= compose freely: the projection ANDs each of
+// them with the storage-exclusive roots, so every retained path is one the
+// restriction keeps. A node= root naming an ONTAP controller is drawn from the
+// unrestricted controller and aggregate families; one naming a Kubernetes node
+// still enters the node scope. A request whose only storage-side root is node=
+// reads the family whole: a path retained through a Kubernetes node is found
+// from its pods, not from the filer.
 func (p topologyPlan) restrictsVolumeLabels(rw *VolumeKeyRewriter) bool {
 	return p.byReference &&
-		len(p.volumeClusters)+len(p.volumeAggrs) > 0 &&
-		!p.svmRoot && len(p.nodeRoots) == 0 &&
+		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs) > 0 &&
 		rw.tokenScope() != tokenScopeNone
 }
 
+// resolveVolumeLabelRead decides the volume hub for this build and renders its
+// phase-1 read. It is a pure function of the plan, the match mode, the window
+// and the byte budget, and it is idempotent: a resolved plan is returned as is,
+// so the storage build can resolve once to pick its request matchers and
+// routing and hand the resolved plan to the read.
+func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.Duration, budget int) topologyPlan {
+	if p.resolved {
+		return p
+	}
+	p.resolved = true
+	if !p.restrictsVolumeLabels(rw) {
+		return p
+	}
+	queries, ok := rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, budget)
+	for i := range queries {
+		if !ok {
+			break
+		}
+		queries[i].rendered, ok = queries[i].render(window)
+	}
+	if !ok {
+		// Too many chunks, or a value set that normalised away. The build reads
+		// the family as it was read before the restriction existed — one query,
+		// the same body, and a bound on what one request can ask for — and
+		// with it every claim family, under the request's own matchers.
+		p.phaseOneUnbounded = true
+		return p
+	}
+	p.hub = true
+	p.phaseOne = queries
+	return p
+}
+
 // issuesFirstWave reports whether the plan launches q in the first wave.
+//
+// A hub-mode plan also withholds the five claim-keyed families: they are read
+// by reference from the rooted volume-label rows (claimscope.go). The plan is
+// resolved before the fan-out launches, so a build whose phase 1 fell back to
+// the unrestricted read issues them here, first wave, exactly as before.
 func (p topologyPlan) issuesFirstWave(q promql.Query) bool {
 	if p.skip[q] {
+		return false
+	}
+	if p.hub && slices.Contains(promql.ClaimScopedQueries, q) {
 		return false
 	}
 	return !p.byReference || !slices.Contains(promql.ReferenceScopedQueries, q)
@@ -255,7 +321,7 @@ func tallySeries(legs []topologyLeg, plan topologyPlan, v *topologyVectors) map[
 			raw[string(l.query)] = len(*l.dst)
 		}
 	}
-	for _, targets := range [][]scopedTarget{qosTargets(v), podTargets(v), nodeTargets(v), controllerTargets(v)} {
+	for _, targets := range [][]scopedTarget{qosTargets(v), podTargets(v), nodeTargets(v), controllerTargets(v), claimTargets(v)} {
 		for _, t := range targets {
 			extra, hasExtra := v.ExtraSeriesCount[t.query]
 			if !v.ScopeIssued[t.query] && !hasExtra {

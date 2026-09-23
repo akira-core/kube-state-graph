@@ -38,8 +38,28 @@ var ControllerScopedQueries = []Query{
 // ReferenceScopedQueries is the complete set of families a by-reference
 // topology plan withholds from its first wave: pods, the Kubernetes nodes
 // they run on, and their resolved controllers. Every other topology leg is
-// read under the request's selector alone.
+// read under the request's selector alone — except ClaimScopedQueries, which a
+// hub-mode storage build ALSO withholds.
 var ReferenceScopedQueries = slices.Concat(PodScopedQueries, NodeScopedQueries, ControllerScopedQueries)
+
+// VolumeNameLabel is the kube_persistentvolumeclaim_info label naming the
+// PersistentVolume a claim is bound to.
+const VolumeNameLabel = "volumename"
+
+// ClaimLabel is the label kube-state-metrics identifies a claim by on every
+// claim-keyed family, and the one the kubelet volume-stats pair carries.
+const ClaimLabel = "persistentvolumeclaim"
+
+// ClaimScopedQueries are the five claim-keyed families a hub-mode
+// /v1/storage-graph build reads BY REFERENCE instead of in its first wave
+// (read-storage-roots-through-volume-hub): kube_persistentvolumeclaim_info
+// restricted on `volumename` to the PersistentVolume names the rooted Harvest
+// rows yield, and the other four restricted on `persistentvolumeclaim` to the
+// claims that read returned. Outside hub mode they stay first-wave legs, which
+// is why they are not part of ReferenceScopedQueries.
+var ClaimScopedQueries = []Query{
+	QPVCInfo, QPVCBindings, QPVCAnnotations, QKubeletVolumeUsedBytes, QKubeletVolumeCapacityBytes,
+}
 
 // scopedLabel names, per scopeable query, the label a data-derived scope
 // restricts. The label is part of the table rather than a caller argument so a
@@ -62,6 +82,15 @@ var scopedLabel = map[Query]string{
 	QStatefulSetAnnotations: "statefulset",
 	QDaemonSetAnnotations:   "daemonset",
 	QCronJobAnnotations:     "cronjob",
+
+	// The claim-binding family is scoped on `persistentvolumeclaim` only. An
+	// exporter labelling it with `claim_name` alone is outside the documented
+	// label contract, and a hub-mode build draws no path for it.
+	QPVCInfo:                    VolumeNameLabel,
+	QPVCBindings:                ClaimLabel,
+	QPVCAnnotations:             ClaimLabel,
+	QKubeletVolumeUsedBytes:     ClaimLabel,
+	QKubeletVolumeCapacityBytes: ClaimLabel,
 }
 
 // RenderScoped renders q restricted to a known set of label values, composed

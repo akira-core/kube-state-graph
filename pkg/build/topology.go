@@ -89,10 +89,11 @@ type Topology struct {
 	// aggregate, controller and policy Harvest families are NEVER narrowed by a
 	// root: they are what draws a rooted component with no volume on it. Roots
 	// reach the pod scope (readScopedPods), the node scope (readScopedNodes) and
-	// — for an ontap_cluster= / aggr= root with no svm= / node= root — the
-	// volume_labels leg itself (readRootedVolumeLabels), which is safe because
-	// that leg is restricted to exactly the components the root names and each
-	// matched claim's whole candidate set is recovered in a second phase.
+	// — for an ontap_cluster= / aggr= / svm= root — the volume_labels leg itself
+	// (readRootedVolumeLabels), which is safe because that leg is restricted to
+	// exactly the components the roots name, every aggregate an svm= root
+	// touches is re-read whole for its owner vote, and each matched claim's
+	// whole candidate set is recovered in a second phase.
 	//
 	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
 	// not by the Kubernetes estate, and a flowless entity costs nothing at
@@ -396,12 +397,23 @@ func readTopology(
 	// The parse must derive claim tokens exactly as the scope computation below
 	// did, or a claim could be fetched for and then not joined.
 	v.VolumeKey = opts.volumeKey()
-	// Whether this build reads the volume-label family restricted to the rooted
-	// components. A plan property AND a configuration property (the match
-	// mode), so it is decided once, here, and both the launch and the parse read
-	// the same answer.
-	restrictVolumeLabels := plan.restrictsVolumeLabels(v.VolumeKey)
-	v.VolumeLabelsRestricted = restrictVolumeLabels
+	// Whether this build is in hub mode: the volume-label family read
+	// restricted to the rooted components, and the claim families read FROM
+	// those rows. A plan property AND a configuration property (the match mode,
+	// the byte budget), so it is decided once, before anything launches, and
+	// the launch, the waves and the parse all read the same answer. A storage
+	// build has usually resolved it already, to pick its request matchers and
+	// routing; resolving is idempotent.
+	plan = plan.resolveVolumeLabelRead(v.VolumeKey, window, opts.qosScopeBatchBytes())
+	if plan.phaseOneUnbounded {
+		slog.WarnContext(ctx, "storage roots did not yield a bounded volume-label restriction; reading the family unrestricted",
+			"query", string(promql.QVolumeLabels),
+			"ontap_clusters", len(plan.volumeClusters),
+			"aggrs", len(plan.volumeAggrs),
+			"svms", len(plan.volumeSVMs),
+			"max_chunks", maxRootedVolumeLabelChunks)
+	}
+	v.VolumeLabelsRestricted = plan.hub
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -495,6 +507,17 @@ func readTopology(
 		promql.QPVCBindings:    bindingsDone,
 		promql.QPVCAnnotations: pvcAnnotationsDone,
 	}
+	if plan.hub {
+		// The claim families are not first-wave legs in hub mode: the hub's
+		// claim-keyed reads below close these three channels when they return,
+		// and closing them here as well would panic.
+		delete(signals, promql.QPVCInfo)
+		delete(signals, promql.QPVCBindings)
+		delete(signals, promql.QPVCAnnotations)
+	}
+	// svmRows are phase 1's SVM-group rows, kept apart for owner completion.
+	// Written by the phase-1 leg before volumeLabelsDone closes.
+	var svmRows model.Vector
 	legs := topologyLegs(&v)
 	for _, l := range legs {
 		if !plan.issuesFirstWave(l.query) {
@@ -502,11 +525,12 @@ func readTopology(
 		}
 		var run func() error
 		switch {
-		case l.query == promql.QVolumeLabels && restrictVolumeLabels:
+		case l.query == promql.QVolumeLabels && plan.hub:
 			// Phase 1 of the rooted read: a first-wave leg, because its
 			// restriction comes from the request and nothing precedes it. It
-			// keeps this leg's OPTIONAL error class and its done-signal.
-			run = readRootedVolumeLabels(ctx, q, window, end, opts, plan, &v, l.dst)
+			// keeps this leg's done-signal, which now also gates the hub's claim
+			// read and owner completion.
+			run = readRootedVolumeLabels(ctx, q, end, plan.phaseOne, l.dst, &svmRows)
 		case !l.optional || plan.failsClosed(l.query):
 			run = fetch(l.query, l.dst)
 		case l.degraded != nil:
@@ -544,16 +568,29 @@ func readTopology(
 	// the FlexVol names those claims actually matched.
 	//
 	// Under a rooted volume-label read the QoS scope must be computed over the
-	// MERGED result, so it waits on phase 2 instead of phase 1: the candidate
-	// set the parse sees and the volume scope the QoS wave reads must be the
-	// same set. Phase 2 waits on phase 1 and the claim-info family, then
-	// closes volumeLabelsFinal on every return path.
+	// MERGED result, so it waits on the tail (owner completion and phase 2)
+	// instead of phase 1: the candidate set the parse sees and the volume scope
+	// the QoS wave reads must be the same set.
+	//
+	// The hub's claim chain runs beside that tail (claimscope.go): the
+	// claim-info read waits on phase 1 and closes pvcInfoDone; the claim-name
+	// read waits on it and closes bindingsDone and pvcAnnotationsDone — the
+	// three channels the first wave closes outside hub mode. Every one closes
+	// on every return path, so a failed leg empties the scopes downstream of it
+	// instead of blocking them.
 	volumeLabelsFinal := volumeLabelsDone
-	if restrictVolumeLabels {
+	if plan.hub {
+		var cov hubCoverage
+		g.Go(signalWhenDone(func() error {
+			return readHubClaimInfo(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, volumeLabelsDone)
+		}, pvcInfoDone))
+		g.Go(signalWhenDone(signalWhenDone(func() error {
+			return readHubClaimFamilies(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, pvcInfoDone)
+		}, bindingsDone), pvcAnnotationsDone))
 		finalDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readTokenScopedVolumeLabels(ctx, q, window, end, opts, plan, &v,
-				pvcInfoDone, volumeLabelsDone)
+			return readVolumeLabelsTail(ctx, q, window, end, opts, plan, &v, &svmRows,
+				volumeLabelsDone, pvcInfoDone)
 		}, finalDone))
 		volumeLabelsFinal = finalDone
 	}

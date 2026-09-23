@@ -17,6 +17,7 @@ const (
 	// restriction has to measure the rendered cost of this exact matcher.
 	VolumeLabelsClusterLabel = "cluster"
 	volumeLabelsAggrLabel    = "aggr"
+	volumeLabelsSVMLabel     = "svm"
 )
 
 // RenderVolumeLabelsRooted renders the volume-label topology family restricted
@@ -49,6 +50,69 @@ func RenderVolumeLabelsRooted(window time.Duration, clusters, aggrs []string) (s
 	}
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
+}
+
+// RenderVolumeLabelsSVMRooted renders the volume-label topology family
+// restricted to the SVMs a /v1/storage-graph request roots at, narrowed by its
+// ONTAP-cluster roots when it carries any:
+//
+//	last_over_time(volume_labels{cluster="ontap-prod",svm=~"svm_a|svm_b"}[5m])
+//
+// It is the SVM group of phase 1, issued beside RenderVolumeLabelsRooted's
+// aggregate group when a request carries both roots: the projection UNIONS
+// `aggr=` with `svm=` and narrows both by `ontap_cluster=`, so the two groups
+// mirror it exactly. An SVM restriction returns only that SVM's volumes on each
+// aggregate it touches, which is why the build follows it with an
+// owner-completion read (RenderVolumeLabelsOwnerCompletion).
+//
+// ok is false when svms holds no non-empty value — an ONTAP-cluster set alone
+// is RenderVolumeLabelsRooted's shape, never this one's.
+func RenderVolumeLabelsSVMRooted(window time.Duration, clusters, svms []string) (string, bool) {
+	if len(normaliseValues(svms)) == 0 {
+		return "", false
+	}
+	var matchers []string
+	matchers = appendMatcher(matchers, VolumeLabelsClusterLabel, clusters)
+	matchers = appendMatcher(matchers, volumeLabelsSVMLabel, svms)
+	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
+		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
+}
+
+// RenderVolumeLabelsOwnerCompletion renders the volume-label family restricted
+// to a set of aggregates of ONE ONTAP cluster:
+//
+//	last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr03|aggr07"}[5m])
+//
+// It is the owner-completion read. The owning controller of an aggregate is a
+// vote over EVERY volume-label series of that aggregate, and an SVM-restricted
+// phase-1 query returns only the rooted SVM's share of each aggregate it
+// touches; this re-reads those aggregates whole so the vote runs over the same
+// population an unrestricted read gives it.
+//
+// The cluster is always rendered as an exact equality — even an empty one,
+// which matches a series carrying no `cluster` label — because an aggregate
+// name is unique only within its filer, and dropping the matcher would read
+// every filer's aggregate of that name.
+//
+// ok is false when aggrs holds no non-empty value.
+func RenderVolumeLabelsOwnerCompletion(window time.Duration, cluster string, aggrs []string) (string, bool) {
+	vals := normaliseValues(aggrs)
+	if len(vals) == 0 {
+		return "", false
+	}
+	matchers := []string{VolumeLabelsClusterLabel + `="` + escapeLiteral(cluster) + `"`}
+	matchers = appendMatcher(matchers, volumeLabelsAggrLabel, vals)
+	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
+		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
+}
+
+// OwnerCompletionClusterCost is the rendered byte length of the cluster
+// equality RenderVolumeLabelsOwnerCompletion repeats in every chunk of one
+// cluster's aggregate set, the separating comma included. A caller chunking the
+// aggregates takes it off the budget first, exactly as the phase-1 read charges
+// its repeated cluster alternation.
+func OwnerCompletionClusterCost(cluster string) int {
+	return len(VolumeLabelsClusterLabel+`="`+escapeLiteral(cluster)+`"`) + 1
 }
 
 // VolumeTokenBranchOverhead is the fixed per-token cost, in rendered bytes, of a

@@ -84,9 +84,9 @@ None.
 ### Modified Capabilities
 
 - `storage-graph-api`: **Storage-flow graph endpoint** — `az` / `env` stop
-  bounding the Kubernetes side in hub mode. **Storage build reads only what it
+  bounding the Kubernetes side in hub mode. **Storage build reads only what the body
   draws** — the five claim-keyed families leave the unrestricted class in hub mode.
-  **Storage-side roots narrow the Harvest topology read** — `svm=` is restricted
+  **Storage-side roots restrict the Harvest topology read** (replaced by **Storage-side roots narrow the Harvest topology read per component**) — `svm=` is restricted
   with owner completion, `node=` no longer disables the restriction beside a
   storage-exclusive root. New requirement **Storage-side roots read the claim chain
   through the volume hub** — extraction, claim-keyed scopes, selector relaxation,

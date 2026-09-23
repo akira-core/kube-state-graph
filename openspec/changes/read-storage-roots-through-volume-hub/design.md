@@ -71,6 +71,15 @@ Hub mode is on iff ALL hold:
 When any fails the build is exactly today's (unrestricted Harvest topology read,
 first-wave claim families under `az` / `env`).
 
+The decision is taken ONCE, before the fan-out launches
+(`topologyPlan.resolveVolumeLabelRead`), not when phase 1 returns: condition 4
+is a pure function of the roots, the match mode and the byte budget, and the
+decision also picks the request matchers (D7) and the routing snapshot (D8) of
+every Kubernetes leg, which must be known before the first of them starts. A
+build whose phase 1 would be unbounded therefore never withholds the claim
+families at all — it issues them first-wave under the original selector, which
+is exactly "today's build".
+
 `node=` is no longer a disqualifier. The projection ANDs `node=` with the
 storage-exclusive roots, so every retained unit already intersects a
 storage-exclusive root and is reachable from the hub; a `node=` root naming an
@@ -160,8 +169,13 @@ return same-named claims from other namespaces or clusters. Rows of those four
 families are filtered in the reader to the `(cluster, namespace, claim)` keys the
 loaded `kube_persistentvolumeclaim_info` rows name, BEFORE the pod scope is
 computed and before the parse — so a same-named claim neither loads pods nor
-creates a PVC node. (`cluster` here is the raw label, as `podScopeUnderApp`
-already compares it.)
+creates a PVC node. `cluster` here is the claim's cluster IDENTITY as raw labels
+— the `(az, env, cluster)` triple, read under the configured label keys —
+because a hub read spans zones and one raw cluster name reused in two zones is
+two clusters; `podScopeUnderApp`, which only ever sees one zone, compares the
+raw `cluster` alone. The bindings are keyed on `persistentvolumeclaim` only,
+never on `claim_name`, so the filter admits exactly what the restriction can —
+which is also what keeps the D6 fallback's body identical to the chunked one.
 
 An empty scope issues nothing: no candidate ⇒ no claim query; no claim ⇒ no
 binding / annotation / kubelet query, no pod, node or controller query. The body

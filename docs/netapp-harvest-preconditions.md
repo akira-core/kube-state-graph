@@ -121,6 +121,37 @@ build where hop A matched nothing issues no hop-B query at all.
    QoS workloads that measure the edge, and the `(ontap_cluster, svm)` pair the
    throughput ceiling is keyed on all come from that filer's series alone.
 
+## Storage-rooted requests read claims FROM the FlexVol name (hub mode)
+
+A `/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=`
+does not scan the zone's claims: it reads the rooted `volume_labels` rows first
+and derives candidate PersistentVolume names from their `volume` label — every
+suffix that starts with `pvc_` at the start of the name or right after a `_`,
+with `_` rewritten to `-` (`trident_pvc_ab12_cd34` → `pvc-ab12-cd34`). Only
+claims bound to a candidate PV are read, in every zone and environment the
+routing table reaches (the request's `az` still selects the Harvest store). The
+configured derivation above still decides every pick; extraction only decides
+which claims are loaded. That adds a precondition the forward join does not
+have:
+
+- **The FlexVol name must embed the PV name `pvc-<uid>` as `pvc_<uid>`.**
+  Trident's default naming (`<storagePrefix>_pvc_<uid>`) and an empty storage
+  prefix both do. A statically provisioned PV (any PV not named `pvc-…`), a
+  provisioner configured with a custom volume-name prefix, or a Trident
+  `nameTemplate` that drops the PV name is NOT found from a storage root, even
+  when the forward join would match it: such a claim draws no path in a
+  storage-rooted body. `/v1/graph`, rootless storage requests and requests
+  rooted only at `pod=`, `application=` or `node=` still join it. Size the gap
+  with `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
+- **The claim-binding family must carry `persistentvolumeclaim`.** Hub mode
+  scopes `kube_pod_spec_volumes_persistentvolumeclaims_info` on that label; an
+  exporter labelling the binding with `claim_name` only (outside the documented
+  label contract) draws no path from a storage root.
+
+The operator-configured rewrite rules and match mode do not change the
+extraction: an ordered list of regexps cannot be inverted, so a custom rule set
+can make a storage-rooted request find fewer claims, never attach a wrong one.
+
 ## Zone and environment labels are NOT required on Harvest
 
 The `az` / `env` request filters are pushed down as PromQL matchers on the
@@ -132,12 +163,12 @@ is therefore unnecessary; a deployment that already does so keeps working
 unchanged, since the labels are simply not read. `?env=` has no effect on the
 Harvest legs at all.
 
-Two coverage signals, each gated on its OWN family being present:
+Three coverage signals, each gated on its OWN family being present:
 
 - `slog.Warn("netapp_volume_join_miss", "count", n)` — claims with no hop-A
   match, or only empty-`aggr` matches, **iff** at least one `volume_labels`
   series was read. Under a `/v1/storage-graph` request rooted at
-  `ontap_cluster=` / `aggr=` the read is restricted to the rooted components, so
+  `ontap_cluster=` / `aggr=` / `svm=` the read is restricted to the rooted components, so
   the count is taken over the claims that MATCHED a series: a FlexGroup still
   reports, while a claim with no candidate at all is one the request did not ask
   about and is not counted. A derivation that fits NO claim therefore reports
@@ -148,6 +179,15 @@ Two coverage signals, each gated on its OWN family being present:
   read. Under the scoped read that means "at least one issued chunk of at least
   one QoS family returned series"; a build that issued no QoS query at all is
   silent.
+- `slog.Warn("storage_root_claim_miss", "reason", r, …)` — a storage-rooted
+  request (hub mode, above) whose rooted rows led to no claim.
+  `reason="no_pv_candidate"` (with `volumes`) means rooted volumes were read
+  and none embeds `pvc_` — the FlexVol naming does not carry the PV name.
+  `reason="no_claim"` (with `candidates`) means candidates were derived and no
+  claim is bound to any of them in the stores the build reaches — PVs renamed,
+  or claims in a store the routing table does not serve for the `ksm` family.
+  Root volumes (`vol0`, `<svm>_root`) never yield a candidate and never fire it
+  on their own. Neither changes the response status.
 
 So a deployment running the volume template without the QoS template gets its
 topology graph and no spurious I/O warning, and a non-NetApp deployment (neither
@@ -172,7 +212,7 @@ template name.
 
 | Series | Hop | Template (Harvest v26.08.0) | Role |
 |---|---|---|---|
-| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=`, then re-read for the matched claims' tokens) |
+| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=` / `svm=`, every aggregate an SVM root touched re-read whole for its owner vote, then re-read for the matched claims' tokens) |
 | `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | `conf/restperf/9.12.0/workload.yaml` (`object: qos`; counters `read_ops`, `write_ops`, `read_latency`, `write_latency`, `read_data`, `write_data`; `instance_keys` include `lun`, `policy_group`, `svm`, `volume`) | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
 | `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | `conf/rest/9.12.0/aggr.yaml` (`object: aggr`; `space.block_storage.used => space_used`, `space.block_storage.size => space_total`; `new_status` from the LabelAgent `value_to_num` mapping of `state`) | Aggregate health / usage |
