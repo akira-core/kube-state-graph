@@ -110,10 +110,10 @@ build where hop A matched nothing issues no hop-B query at all.
    volume, so hop B can miss where hop A hit. The claim keeps its edge,
    aggregate, controller and `svm` and simply carries no `metrics` key.
 5. **A FlexVol name matched from two zones or environments.** The Harvest legs
-   carry no `az` / `env` matcher (see below), so whenever one build reads more
-   than one zone's Harvest series — an unfiltered request, a catch-all
-   `harvest` backend, or any `?env=` request — two filers whose volume names
-   both match one claim's token are both candidates, and the claim joins the
+   carry the request's `az` / `env` matchers (see below), so only a build that
+   reads several zones' Harvest series — an unfiltered request — can see two
+   filers whose volume names both match one claim's token. Both are then
+   candidates, and the claim joins the
    lexically-smallest `(ontap_cluster, aggr)` with no warning. FlexVol names
    derived from Kubernetes PV names (`pvc-<uuid>`) do not collide; a
    hand-chosen naming scheme that does is the operator's risk. Everything the
@@ -121,23 +121,77 @@ build where hop A matched nothing issues no hop-B query at all.
    QoS workloads that measure the edge, and the `(ontap_cluster, svm)` pair the
    throughput ceiling is keyed on all come from that filer's series alone.
 
-## Zone and environment labels are NOT required on Harvest
+## Storage-rooted requests read claims FROM the FlexVol name (hub mode)
 
-The `az` / `env` request filters are pushed down as PromQL matchers on the
-kube-state-metrics and kubelet families only. The Harvest family is **routed**
-by zone instead — `?az=` selects which `harvest` backend of the routing table is
-asked (see `upstream-backend-routing.md`) and the query it receives carries no
-request matcher. Stamping the configured `az` / `env` labels onto Harvest series
-is therefore unnecessary; a deployment that already does so keeps working
-unchanged, since the labels are simply not read. `?env=` has no effect on the
-Harvest legs at all.
+A `/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=`
+does not scan the zone's claims: it reads the rooted `volume_labels` rows first
+and derives candidate PersistentVolume names from their `volume` label — every
+suffix that starts with `pvc_` at the start of the name or right after a `_`,
+with `_` rewritten to `-` (`trident_pvc_ab12_cd34` → `pvc-ab12-cd34`). Only
+claims bound to a candidate PV are read, under the request's `az` / `env`
+matchers and from the backends its `az` selects — a filer shared across zones
+is drawn with the requested zone's claims only. The
+configured derivation above still decides every pick; extraction only decides
+which claims are loaded. That adds a precondition the forward join does not
+have:
 
-Two coverage signals, each gated on its OWN family being present:
+- **The FlexVol name must embed the PV name `pvc-<uid>` as `pvc_<uid>`.**
+  Trident's default naming (`<storagePrefix>_pvc_<uid>`) and an empty storage
+  prefix both do. A statically provisioned PV (any PV not named `pvc-…`), a
+  provisioner configured with a custom volume-name prefix, or a Trident
+  `nameTemplate` that drops the PV name is NOT found from a storage root, even
+  when the forward join would match it: such a claim draws no path in a
+  storage-rooted body. `/v1/graph`, rootless storage requests and requests
+  rooted only at `pod=`, `application=` or `node=` still join it. Size the gap
+  with `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
+- **The claim-binding family must carry `persistentvolumeclaim`.** Hub mode
+  scopes `kube_pod_spec_volumes_persistentvolumeclaims_info` on that label; an
+  exporter labelling the binding with `claim_name` only (outside the documented
+  label contract) draws no path from a storage root.
+
+The operator-configured rewrite rules and match mode do not change the
+extraction: an ordered list of regexps cannot be inverted, so a custom rule set
+can make a storage-rooted request find fewer claims, never attach a wrong one.
+
+## Zone and environment labels are REQUIRED on Harvest
+
+Every Harvest series MUST carry the configured `az` / `env` labels (default
+`az` / `env`, see `--az-label` / `--env-label`) — the same two labels
+kube-state-metrics carries. The `az` / `env` request filters are pushed down as
+PromQL matchers on every Harvest query exactly as on the kube-state-metrics and
+kubelet families, and `?az=` also selects which `harvest` backend of the
+routing table is asked (see `upstream-backend-routing.md`). A request therefore
+reads only its own zone's and environment's filers, even from a catch-all
+`harvest` backend or a store holding several environments. `cluster` and
+`namespace` never reach Harvest.
+
+A Harvest series WITHOUT the labels matches nothing under any `az` / `env`
+filter — and `/v1/storage-graph` always carries both — so its filer drops out
+of every filtered body with no error. No warning can flag it: an empty Harvest
+read is also what a deployment without NetApp storage returns. Stamp the labels
+in Harvest's own configuration (per-poller `labels`) or in the collector that
+ships the series. To find unlabelled series:
+
+```promql
+count by (__name__) ({__name__=~"volume_labels|aggr_.*|node_.*|qos_.*", az=""})
+```
+
+The labels also scope alert matching. Each ONTAP cluster collects the `az` / `env` pairs carried by its
+entity-naming series (`volume_labels`, `aggr_*`, `node_*`, `system_node_*` — not
+the QoS families), and an alert naming that filer's aggregate or controller
+attaches only when its own `az` / `env` pair is one of them. This keeps another
+zone's alert about an identically named filer off this one, which matters
+whenever one build holds several zones' filers or alerts — an unfiltered
+`/v1/graph`, or a catch-all alerting or Harvest backend. A filer whose series carry no pair, or an alert without one, matches on
+the ONTAP cluster name alone, exactly as before. Only series carrying BOTH
+labels count; a half-stamped series is ignored.
+
+Three coverage signals, each gated on its OWN family being present:
 
 - `slog.Warn("netapp_volume_join_miss", "count", n)` — claims with no hop-A
   match, or only empty-`aggr` matches, **iff** at least one `volume_labels`
   series was read. Under a `/v1/storage-graph` request rooted at
-  `ontap_cluster=` / `aggr=` the read is restricted to the rooted components, so
+  `ontap_cluster=` / `aggr=` / `svm=` the read is restricted to the rooted components, so
   the count is taken over the claims that MATCHED a series: a FlexGroup still
   reports, while a claim with no candidate at all is one the request did not ask
   about and is not counted. A derivation that fits NO claim therefore reports
@@ -148,6 +202,15 @@ Two coverage signals, each gated on its OWN family being present:
   read. Under the scoped read that means "at least one issued chunk of at least
   one QoS family returned series"; a build that issued no QoS query at all is
   silent.
+- `slog.Warn("storage_root_claim_miss", "reason", r, …)` — a storage-rooted
+  request (hub mode, above) whose rooted rows led to no claim.
+  `reason="no_pv_candidate"` (with `volumes`) means rooted volumes were read
+  and none embeds `pvc_` — the FlexVol naming does not carry the PV name.
+  `reason="no_claim"` (with `candidates`) means candidates were derived and no
+  claim is bound to any of them in the stores the build reaches — PVs renamed,
+  or claims in a store the routing table does not serve for the `ksm` family.
+  Root volumes (`vol0`, `<svm>_root`) never yield a candidate and never fire it
+  on their own. Neither changes the response status.
 
 So a deployment running the volume template without the QoS template gets its
 topology graph and no spurious I/O warning, and a non-NetApp deployment (neither
@@ -172,7 +235,7 @@ template name.
 
 | Series | Hop | Template (Harvest v26.08.0) | Role |
 |---|---|---|---|
-| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=`, then re-read for the matched claims' tokens) |
+| `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=` / `svm=`, every aggregate an SVM root touched re-read whole for its owner vote, then re-read for the matched claims' tokens) |
 | `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | `conf/restperf/9.12.0/workload.yaml` (`object: qos`; counters `read_ops`, `write_ops`, `read_latency`, `write_latency`, `read_data`, `write_data`; `instance_keys` include `lun`, `policy_group`, `svm`, `volume`) | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
 | `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | `conf/rest/9.12.0/aggr.yaml` (`object: aggr`; `space.block_storage.used => space_used`, `space.block_storage.size => space_total`; `new_status` from the LabelAgent `value_to_num` mapping of `state`) | Aggregate health / usage |
@@ -228,9 +291,10 @@ Consequences worth knowing:
   wave, so it is not delayed by the slowest kube-state-metrics leg.
 - A scope larger than `--netapp-qos-scope-batch-bytes` is split across several
   queries per family, since upstream installations cap query length
-  (`-search.maxQueryLen`). Each chunk degrades on its own: a failed chunk costs
-  I/O measurements only for the claims whose volumes it carried, and never an
-  edge, aggregate, controller or `svm`.
+  (`-search.maxQueryLen`). On `/v1/graph` each chunk degrades on its own: a
+  failed chunk costs I/O measurements only for the claims whose volumes it
+  carried, and never an edge, aggregate, controller or `svm`. On
+  `/v1/storage-graph` a failed chunk fails the request.
 - The `volume` restriction is derived from upstream data, not from the request.
   It is not an `az` / `env` / `cluster` / `namespace` matcher — but the claims
   that produced it were themselves loaded under the request's selectors, so this
@@ -278,8 +342,12 @@ silently: no coverage signal fires, because hop B still matched and a missing
 ceiling is a legitimate reading. The same holds for the policy's identity label
 — a series carrying neither `name` nor `policy_group` cannot be keyed.
 
-All fifteen Harvest/kubelet legs are OPTIONAL: a query error logs and continues
-with an empty vector and never fails the build.
+All fifteen Harvest/kubelet legs are OPTIONAL on `/v1/graph`: a query error
+logs and continues with an empty vector and never fails that build. On
+`/v1/storage-graph` they fail closed — any query error returns 502 `upstream`
+naming the family — because a storage body with a silently missing Harvest leg
+reads as a filer that serves nothing. Absence (an empty vector) never fails
+either endpoint.
 
 ## Trident custom-resource-state config is removable
 

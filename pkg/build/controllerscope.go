@@ -128,7 +128,7 @@ func cronJobScope(direct []string, jobOwner model.Vector) []string {
 // It waits on the pod wave alone (podsDone), for the same happens-before
 // reason readScopedNodes does.
 func readScopedControllers(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -147,26 +147,26 @@ func readScopedControllers(
 	byKind := controllerScope(v.PodOwner)
 
 	stageA := []scopedFamily{
-		{query: promql.QReplicaSetOwner, dst: &v.ReplicaSetOwner, scope: byKind["ReplicaSet"], mode: legRequired},
-		{query: promql.QReplicaSetAnnotations, dst: &v.ReplicaSetAnnotations, scope: byKind["ReplicaSet"], mode: legOptional},
-		{query: promql.QJobOwner, dst: &v.JobOwner, scope: byKind["Job"], mode: legRequired},
-		{query: promql.QJobAnnotations, dst: &v.JobAnnotations, scope: byKind["Job"], mode: legOptionalTracking, degraded: &v.JobAnnotationsDegraded},
-		{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: byKind["StatefulSet"], mode: legRequired},
-		{query: promql.QDaemonSetAnnotations, dst: &v.DaemonSetAnnotations, scope: byKind["DaemonSet"], mode: legRequired},
+		{query: promql.QReplicaSetOwner, dst: &v.ReplicaSetOwner, scope: byKind["ReplicaSet"]},
+		{query: promql.QReplicaSetAnnotations, dst: &v.ReplicaSetAnnotations, scope: byKind["ReplicaSet"]},
+		{query: promql.QJobOwner, dst: &v.JobOwner, scope: byKind["Job"]},
+		{query: promql.QJobAnnotations, dst: &v.JobAnnotations, scope: byKind["Job"]},
+		{query: promql.QStatefulSetAnnotations, dst: &v.StatefulSetAnnotations, scope: byKind["StatefulSet"]},
+		{query: promql.QDaemonSetAnnotations, dst: &v.DaemonSetAnnotations, scope: byKind["DaemonSet"]},
 	}
-	if err := issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, stageA); err != nil {
+	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stageA); err != nil {
 		return err
 	}
 
 	stageB := []scopedFamily{
 		{
 			query: promql.QDeploymentAnnotations, dst: &v.DeploymentAnnotations,
-			scope: deploymentScope(byKind["Deployment"], v.ReplicaSetOwner), mode: legRequired,
+			scope: deploymentScope(byKind["Deployment"], v.ReplicaSetOwner),
 		},
 		{
 			query: promql.QCronJobAnnotations, dst: &v.CronJobAnnotations,
-			scope: cronJobScope(byKind["CronJob"], v.JobOwner), mode: legRequired,
+			scope: cronJobScope(byKind["CronJob"], v.JobOwner),
 		},
 	}
-	return issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, stageB)
+	return issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stageB)
 }

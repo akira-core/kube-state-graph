@@ -74,12 +74,21 @@ func identityResolver(t *testing.T) *clusterResolver {
 	return r
 }
 
-// resolveOver runs the matcher over the shared estate.
+// resolveOver runs the matcher over the shared estate. The Harvest side of the
+// estate carries no az / env pair, so no ONTAP cluster has a zone.
 func resolveOver(t *testing.T, nodes []graph.GraphNode, samples ...model.Sample) (
 	map[string][]graph.Alert, int, int,
 ) {
 	t.Helper()
-	return resolveAlerts(sampleVec(samples...), newAlertIndex(nodes), identityResolver(t))
+	return resolveZoned(nodes, identityResolver(t), nil, samples...)
+}
+
+// resolveZoned runs the matcher with an explicit resolver and ONTAP zone sets;
+// the index and the matcher share the resolver, as they do in attachAlerts.
+func resolveZoned(nodes []graph.GraphNode, r *clusterResolver, ontapZones map[string][]alertZone,
+	samples ...model.Sample,
+) (map[string][]graph.Alert, int, int) {
+	return resolveAlerts(sampleVec(samples...), newAlertIndex(nodes, r, ontapZones), r)
 }
 
 // --- kind 1: pods ---------------------------------------------------------
@@ -205,7 +214,7 @@ func TestResolveAlerts_NodeShapedAmbiguousAcrossKinds(t *testing.T) {
 	// Kubernetes side and equals the ONTAP cluster name on the other.
 	byNode, unmatched, ambiguous := resolveAlerts(
 		sampleVec(alertSample("Something", "warning", map[string]string{"cluster": "x", "node": "n1"})),
-		newAlertIndex(nodes), newClusterResolver(promql.LabelKeys{}))
+		newAlertIndex(nodes, nil, nil), newClusterResolver(promql.LabelKeys{}))
 
 	assert.Empty(t, byNode, "attached to neither kind")
 	assert.Zero(t, unmatched, "an ambiguous alert is counted ambiguous, not unmatched")
@@ -415,10 +424,233 @@ func TestResolveAlerts_SynthPodContributesNothing(t *testing.T) {
 }
 
 func TestResolveAlerts_EmptyVector(t *testing.T) {
-	byNode, unmatched, ambiguous := resolveAlerts(nil, newAlertIndex(alertEstate()), nil)
+	byNode, unmatched, ambiguous := resolveAlerts(nil, newAlertIndex(alertEstate(), nil, nil), nil)
 	assert.Nil(t, byNode)
 	assert.Zero(t, unmatched)
 	assert.Zero(t, ambiguous)
+}
+
+// --- zone agreement (read-storage-roots-through-volume-hub D11) -----------
+
+// zoneResolver has composed c1 in BOTH zones, so each identity's zone is known
+// to the index — the state a hub build that read two zones' kube-state-metrics
+// is in.
+func zoneResolver(t *testing.T) *clusterResolver {
+	t.Helper()
+	r := newClusterResolver(promql.LabelKeys{})
+	r.observe(model.Metric{"az": "zone-a", "env": "prod", "cluster": "c1"})
+	r.observe(model.Metric{"az": "zone-b", "env": "prod", "cluster": "c1"})
+	return r
+}
+
+// ontapProdInZoneA is the zone set the topology read collects when every
+// Harvest series naming ontap-prod carries az=zone-a, env=prod.
+func ontapProdInZoneA() map[string][]alertZone {
+	return map[string][]alertZone{"ontap-prod": {{az: "zone-a", env: "prod"}}}
+}
+
+// Spec: "Aggregate alert from its own zone attached", "Aggregate alert from
+// another zone not attached", "Controller alert from another zone not
+// attached", "Harvest without a zone falls back to the label comparison".
+// The NetApp kinds compare the raw ONTAP cluster name, which composes with no
+// zone, so the zone set is the only thing that tells two zones' filers apart.
+func TestResolveAlerts_NetAppZoneAgreement(t *testing.T) {
+	aggrID := graph.NetAppAggrID("ontap-prod", "aggr1")
+	ctrlID := graph.NetAppNodeID("ontap-prod", "ontap-prod-01")
+	cases := map[string]struct {
+		zones     map[string][]alertZone
+		labels    map[string]string
+		want      string
+		unmatched int
+	}{
+		"aggregate, own zone": {
+			zones:  ontapProdInZoneA(),
+			labels: map[string]string{"az": "zone-a", "env": "prod", "cluster": "ontap-prod", "aggr": "aggr1"},
+			want:   aggrID,
+		},
+		"aggregate, other zone": {
+			zones:     ontapProdInZoneA(),
+			labels:    map[string]string{"az": "zone-b", "env": "prod", "cluster": "ontap-prod", "aggr": "aggr1"},
+			unmatched: 1,
+		},
+		"aggregate, other environment": {
+			zones:     ontapProdInZoneA(),
+			labels:    map[string]string{"az": "zone-a", "env": "dev", "cluster": "ontap-prod", "aggr": "aggr1"},
+			unmatched: 1,
+		},
+		"controller, own zone": {
+			zones:  ontapProdInZoneA(),
+			labels: map[string]string{"az": "zone-a", "env": "prod", "cluster": "ontap-prod", "node": "ontap-prod-01"},
+			want:   ctrlID,
+		},
+		"controller, other zone": {
+			zones:     ontapProdInZoneA(),
+			labels:    map[string]string{"az": "zone-b", "env": "prod", "cluster": "ontap-prod", "node": "ontap-prod-01"},
+			unmatched: 1,
+		},
+		"unstamped Harvest falls back to the label comparison": {
+			zones:  nil,
+			labels: map[string]string{"az": "zone-b", "env": "prod", "cluster": "ontap-prod", "aggr": "aggr1"},
+			want:   aggrID,
+		},
+		"an alert with no pair is never excluded": {
+			zones:  ontapProdInZoneA(),
+			labels: map[string]string{"cluster": "ontap-prod", "aggr": "aggr1"},
+			want:   aggrID,
+		},
+		"half a pair is no zone": {
+			zones:  ontapProdInZoneA(),
+			labels: map[string]string{"az": "zone-b", "cluster": "ontap-prod", "aggr": "aggr1"},
+			want:   aggrID,
+		},
+		"a filer seen under several pairs admits each": {
+			zones: map[string][]alertZone{"ontap-prod": {
+				{az: "zone-a", env: "prod"}, {az: "zone-b", env: "prod"},
+			}},
+			labels: map[string]string{"az": "zone-b", "env": "prod", "cluster": "ontap-prod", "aggr": "aggr1"},
+			want:   aggrID,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			byNode, unmatched, ambiguous := resolveZoned(alertEstate(), zoneResolver(t), tc.zones,
+				alertSample("Something", "warning", tc.labels))
+
+			assert.Zero(t, ambiguous)
+			assert.Equal(t, tc.unmatched, unmatched)
+			if tc.want == "" {
+				assert.Empty(t, byNode)
+				return
+			}
+			require.Len(t, byNode, 1)
+			assert.Contains(t, byNode, tc.want)
+		})
+	}
+}
+
+// Spec: "Missing cluster disambiguated by zone". Before the relaxed hub read a
+// request-zone pod was the only shop/orders-0 the build loaded; once another
+// zone's same-named pod is loaded too, the alert's own zone is what keeps it
+// unique.
+func TestResolveAlerts_MissingClusterDisambiguatedByZone(t *testing.T) {
+	zoneB := graph.PodID("zone-b-prod-c1", "uid-2")
+	nodes := append(alertEstate(), &graph.PodNode{
+		IDValue:     zoneB,
+		NameValue:   "orders-0",
+		LabelsValue: map[string]string{"cluster": "zone-b-prod-c1", "namespace": "shop"},
+	})
+
+	t.Run("the alert's zone picks one", func(t *testing.T) {
+		byNode, unmatched, ambiguous := resolveZoned(nodes, zoneResolver(t), nil,
+			alertSample("KubePodCrashLooping", "warning", map[string]string{
+				"az": "zone-b", "env": "prod", "namespace": "shop", "pod": "orders-0",
+			}))
+		assert.Zero(t, unmatched)
+		assert.Zero(t, ambiguous)
+		require.Len(t, byNode, 1)
+		assert.Contains(t, byNode, zoneB)
+	})
+
+	t.Run("no pair stays ambiguous", func(t *testing.T) {
+		byNode, _, ambiguous := resolveZoned(nodes, zoneResolver(t), nil,
+			alertSample("KubePodCrashLooping", "warning", map[string]string{
+				"namespace": "shop", "pod": "orders-0",
+			}))
+		assert.Empty(t, byNode)
+		assert.Equal(t, 1, ambiguous)
+	})
+
+	t.Run("a candidate of unknown zone is kept", func(t *testing.T) {
+		// A resolver that composed nothing leaves both identities zoneless, so
+		// neither can be excluded and the pair cannot break the tie.
+		byNode, _, ambiguous := resolveZoned(nodes, newClusterResolver(promql.LabelKeys{}), nil,
+			alertSample("KubePodCrashLooping", "warning", map[string]string{
+				"az": "zone-b", "env": "prod", "namespace": "shop", "pod": "orders-0",
+			}))
+		assert.Empty(t, byNode)
+		assert.Equal(t, 1, ambiguous)
+	})
+}
+
+// Spec: "Missing cluster, only another zone holds the object". The candidate
+// is removed before uniqueness, so the alert is unmatched rather than landing
+// on the one object it does not describe.
+func TestResolveAlerts_MissingClusterOtherZoneOnly(t *testing.T) {
+	t.Run("aggregate", func(t *testing.T) {
+		byNode, unmatched, ambiguous := resolveZoned(alertEstate(), zoneResolver(t), ontapProdInZoneA(),
+			alertSample("AggrFilling", "warning", map[string]string{"az": "zone-b", "env": "prod", "aggr": "aggr1"}))
+		assert.Empty(t, byNode)
+		assert.Equal(t, 1, unmatched)
+		assert.Zero(t, ambiguous)
+	})
+
+	t.Run("node-shaped union, one kind per zone", func(t *testing.T) {
+		// worker-1 is a zone-a Kubernetes node; a zone-b ONTAP controller of
+		// the same name makes the bare-name union two candidates, and the pair
+		// keeps only the controller.
+		ctrl := graph.NetAppNodeID("ontap-lab", "worker-1")
+		nodes := append(alertEstate(), &graph.NetAppNode{
+			IDValue: ctrl, NameValue: "worker-1",
+			LabelsValue: map[string]string{"ontap_cluster": "ontap-lab"},
+		})
+		zones := map[string][]alertZone{"ontap-lab": {{az: "zone-b", env: "prod"}}}
+		byNode, unmatched, ambiguous := resolveZoned(nodes, zoneResolver(t), zones,
+			alertSample("Something", "warning", map[string]string{"az": "zone-b", "env": "prod", "node": "worker-1"}))
+		assert.Zero(t, unmatched)
+		assert.Zero(t, ambiguous)
+		require.Len(t, byNode, 1)
+		assert.Contains(t, byNode, ctrl)
+	})
+}
+
+// The pair is read through the configured label keys — the same ones the
+// identity ladder composes with — never a hardcoded az / env.
+func TestResolveAlerts_ZoneReadThroughConfiguredKeys(t *testing.T) {
+	r := newClusterResolver(promql.LabelKeys{AZ: "zone", Env: "stage"})
+	byNode, unmatched, _ := resolveZoned(alertEstate(), r, ontapProdInZoneA(),
+		alertSample("AggrFilling", "warning", map[string]string{
+			"zone": "zone-b", "stage": "prod", "az": "zone-a", "env": "prod",
+			"cluster": "ontap-prod", "aggr": "aggr1",
+		}))
+	assert.Empty(t, byNode, "the configured keys say zone-b, whatever `az` says")
+	assert.Equal(t, 1, unmatched)
+}
+
+// ontapZonesOf collects the zone set of every ONTAP cluster from the
+// entity-naming Harvest families, counting only series carrying the full pair.
+func TestOntapZonesOf(t *testing.T) {
+	// Built bare rather than through planHarvest, whose fixture zone would
+	// stamp the half-stamped and unstamped cases.
+	h := func(pairs ...string) model.Sample {
+		m := model.Metric{}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			m[model.LabelName(pairs[i])] = model.LabelValue(pairs[i+1])
+		}
+		return model.Sample{Metric: m, Value: 1}
+	}
+	v := topologyVectors{
+		VolumeLabels: sampleVec(
+			h("cluster", "ontap-prod", "volume", "v1", "az", "zone-a", "env", "prod"),
+			h("cluster", "", "volume", "v2", "az", "zone-c", "env", "prod"),
+		),
+		AggrStatus: sampleVec(
+			h("cluster", "ontap-prod", "aggr", "aggr1", "az", "zone-a", "env", "prod"),
+			h("cluster", "ontap-half", "aggr", "aggr1", "az", "zone-a"),
+		),
+		AggrSpaceUsed:          sampleVec(h("cluster", "ontap-bare", "aggr", "aggr1")),
+		NetAppNodeStatus:       sampleVec(h("cluster", "ontap-lab", "node", "n1", "az", "zone-b", "env", "prod")),
+		NetAppNodeTotalLatency: sampleVec(h("cluster", "ontap-lab", "node", "n1", "az", "zone-a", "env", "prod")),
+		// A QoS family names no entity: its pair is not a statement about the
+		// filer's zone.
+		QoSReadOps: sampleVec(h("cluster", "ontap-qos", "volume", "v1", "az", "zone-a", "env", "prod")),
+	}
+
+	assert.Equal(t, map[string][]alertZone{
+		"ontap-prod": {{az: "zone-a", env: "prod"}},
+		"ontap-lab":  {{az: "zone-a", env: "prod"}, {az: "zone-b", env: "prod"}},
+	}, ontapZonesOf(v, promql.LabelKeys{}), "sorted, de-duplicated; half-stamped, bare, cluster-less and QoS series count for nothing")
+
+	assert.Nil(t, ontapZonesOf(topologyVectors{}, promql.LabelKeys{}))
 }
 
 // --- attachment and observability -----------------------------------------

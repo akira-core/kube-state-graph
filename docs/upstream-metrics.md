@@ -86,8 +86,9 @@ build's own earlier waves already named, never to the whole estate.
 ```
 GET /v1/storage-graph?start=&end=&az=&env=&…
         │
-        └─ ReadTopology (storage plan) — 18 queries in parallel, then up to
-           20 more across three by-reference waves
+        └─ ReadTopology (storage plan) — 18 queries in parallel (13 in hub
+           mode), then up to 20 more across three by-reference waves (plus the
+           hub's claim-keyed reads in hub mode)
               never issued: kube_pod_container_info, kube_service_info,
                 kube_endpointslice_endpoints, kube_endpointslice_labels,
                 kube_service_annotations (the body carries no containers
@@ -97,10 +98,11 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                 computed from), kube_persistentvolumeclaim_info,
                 kube_persistentvolumeclaim_annotations, the two kubelet
                 families, every NetApp Harvest inventory leg (a storage root
-                must be drawable with no claim), and ALERTS — except that
-                volume_labels is read RESTRICTED when the request roots at an
-                ontap_cluster= or aggr= (see "Storage-side roots narrow the
-                volume-label read" below)
+                must be drawable with no claim), and ALERTS — except in HUB
+                MODE (a request rooted at ontap_cluster=, aggr= or svm=; see
+                "Storage-side roots read the claim chain through the volume
+                hub" below), where volume_labels is read RESTRICTED and the
+                five claim families leave the first wave: 13 legs
               ── recovery, only when the request carries application=;
                  starts with the first wave (request-derived) ─────────────
                three stages, each waiting on the previous. Stage 1: the six
@@ -108,8 +110,8 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                annotation_argocd_argoproj_io_tracking_id to the root
                Applications (`(?:app)(?::.*)?`), composed with the fixed `!=""`
                and the same request matchers as the by-reference reads.
-               Deployment / StatefulSet / DaemonSet / CronJob fail the build;
-               ReplicaSet / Job degrade and do NOT set JobAnnotationsDegraded.
+               Every family fails the build on a chunk error (the storage
+               build fails closed).
                Capped at 16 chunks per family; past that the family is read
                once unrestricted and filtered in the reader
                (application_root_restriction_unbounded). Stage 2: kube_replicaset_owner
@@ -148,23 +150,48 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                  kube_replicaset_owner row resolved a ReplicaSet up to),
                  kube_cronjob_annotations (direct CronJob owners plus every
                  owner_name a landed kube_job_owner row carries)
-               kube_replicaset_owner, kube_job_owner, kube_deployment_annotations,
-                 kube_statefulset_annotations, kube_daemonset_annotations and
-                 kube_cronjob_annotations FAIL the build on a chunk error;
-                 kube_replicaset_annotations degrades (log-and-continue);
-                 kube_job_annotations degrades AND suppresses the Job → CronJob
-                 hop for the whole build, exactly as its unscoped degrade does
+               every family FAILS the build on a chunk error, including
+                 kube_replicaset_annotations and kube_job_annotations (which
+                 degrade on /v1/graph); the Job → CronJob hop suppression is
+                 therefore unreachable on this endpoint
               ── wave 4 (QoS), gated on kube_persistentvolumeclaim_info
                  and volume_labels ────────────────────────────────────────
-               6 Harvest QoS workload legs, exactly as for /v1/graph
+               6 Harvest QoS workload legs, scoped exactly as for /v1/graph;
+                 a chunk error FAILS the build
 ```
+
+In hub mode the claim families become waves of their own, read FROM the rooted
+volume-label rows, and the waves above hang off them (read-storage-roots-through-volume-hub
+D9 — the Harvest tail is unchanged):
+
+```
+ L1  volume_labels phase 1 (aggr / svm groups)   aggr_* node_* qos_policy_* ALERTS   app recovery st.1
+ L2  kube_persistentvolumeclaim_info{volumename}  owner completion (svm= only)        app recovery st.2
+ L3  bindings / pvc_annotations / kubelet ×2 {persistentvolumeclaim}   phase 2 {volume=~tok}   st.3
+ L4  pods                                          QoS ×6
+ L5  kube_node_* ×4      controllers stage A
+ L6                      controllers stage B
+```
+
+Critical path: 6 round-trips in hub mode (4 for an unrooted request). Every
+query of a hub build carries the request's matchers and is routed by the
+request's `az` exactly as outside hub mode — no query reaches a store of another
+zone.
+
+**The storage build fails closed.** On `/v1/storage-graph` a query error of any
+family — every Harvest leg, both kubelet volume-stats legs, every scoped
+chunk, every volume-label phase, every application-recovery stage — fails the
+build with HTTP 502 `reason: "upstream"` and `message: "upstream query failed:
+<family>"`. `ALERTS` is the one exception: it still logs, counts and continues.
+An empty vector is never a failure. The degrade column of the table below
+applies to `/v1/graph` only.
 
 No `up{}` probe and no service-graph read. A pod / node / controller name is
 unique per namespace (or per cluster, for nodes) only, so a by-reference scope
 may admit a same-named object from another namespace or cluster; it is
 consulted by no loaded pod and the body is unchanged.
 
-**Fan-out per build** (design.md D6 / D11): the 18 unrestricted legs, plus 2 when the
+**Fan-out per build, outside hub mode** (design.md D6 / D11): the 18 unrestricted legs, plus 2 when the
 pod scope is non-empty, plus 4 when any loaded pod is scheduled or a `node=`
 root exists, plus 2 (owner + annotations) for each of ReplicaSet / Job that
 owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
@@ -182,6 +209,22 @@ bindings still require:
 | one CronJob-managed claimless pod | 6 + 1 (`kube_job_owner`) + 2 (`kube_pod_owner` for Job and the direct CronJob arm) | pods 2, nodes 4, controllers 3 |
 | every kind present, matched volume | 6 + 2 + 6 | the 38-leg forward maximum |
 
+**Fan-out per build, in hub mode**: 13 first-wave families (the 18 above minus
+the five claim families), plus 1 (`kube_persistentvolumeclaim_info`) when the
+rooted rows yield a PV candidate, plus 4 (bindings, claim annotations, kubelet
+×2) when a candidate names a claim, plus the pod / node / controller / QoS
+additions above for what those claims lead to. `volume_labels` is issued once
+per phase-1 chunk, plus once per owner-completion chunk (only with `svm=`, and
+only for aggregates no `aggr=` root read whole), plus once per phase-2 chunk
+when a claim matched. `TestBuildStorage_FanOutLegCount_Hub` pins:
+
+| Request | Families | `volume_labels` queries |
+|---|---|---|
+| `aggr=`, no rooted volume embeds `pvc_` | 13 | 1 |
+| `aggr=`, a candidate naming no claim | 14 | 1 |
+| `aggr=`, one StatefulSet-owned pod on a matched volume | 31 | 2 (phase 1, phase 2) |
+| `svm=`, the same path | 31 | 3 (phase 1, owner completion, phase 2) |
+
 **Pod-only roots narrow every namespaced leg.** When every root is a
 `pod=<ns>/<name>` root and the request carries no `namespace`, the parser adds
 the roots' namespaces as the `namespace` selector — output-preserving, since a
@@ -190,47 +233,72 @@ pod-rooted body draws nothing outside them. Any storage-side, `node` or
 
 **Storage-side roots narrow the volume-label read.** `volume_labels` is the
 largest leg of a NetApp estate and no request dimension narrows it, so a request
-rooted at `?ontap_cluster=` and/or `?aggr=` restricts it to the rooted
-components, in two phases:
+rooted at `?ontap_cluster=`, `?aggr=` and/or `?svm=` restricts it to the rooted
+components, in phases:
 
-1. **Phase 1 — the roots.** One first-wave query,
-   `volume_labels{cluster=~"…",aggr=~"…"}`, the two matchers AND-combined —
-   exactly how the projection combines them (an `aggr=` root names an aggregate
-   only *within* the `ontap_cluster=` values). Chunked by the same byte budget,
-   charging the repeated matcher at its rendered length. **Capped:** these are
-   repeatable parameters whose count nothing bounds, so a restriction that would
-   take more than sixteen queries is not applied at all — the leg reads
-   unrestricted, logs that it did, and the body is unchanged.
-2. **Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked
+1. **Phase 1 — the roots.** First-wave queries in up to two groups, mirroring
+   how the projection combines the roots (it UNIONS `aggr=` with `svm=` and
+   narrows both by `ontap_cluster=`): an aggregate group
+   `volume_labels{cluster=~"…",aggr=~"…"}` and an SVM group
+   `volume_labels{cluster=~"…",svm=~"…"}`, the cluster matcher present only
+   when the request carries `ontap_cluster=` (a request rooted at ONTAP
+   clusters alone issues `volume_labels{cluster=~"…"}`). Each group is chunked
+   by the same byte budget, charging the repeated matcher at its rendered
+   length; the groups' results are merged de-duplicated by label set.
+   **Capped:** these are repeatable parameters whose count nothing bounds, so a
+   restriction that would take more than sixteen queries in total is not
+   applied at all — the leg reads unrestricted, logs that it did, the build is
+   not in hub mode, and the body is unchanged.
+2. **Owner completion — SVM roots only.** An aggregate's owning controller is a
+   vote over every one of its series, and an SVM group returns only the SVM's
+   share of each aggregate it touches. After phase 1 the family is re-read
+   whole for every `(ONTAP cluster, aggregate)` an SVM-group row names, minus
+   the aggregates an `aggr=` root already read whole —
+   `volume_labels{cluster="…",aggr=~"…"}`, one chunked query per ONTAP cluster.
+   Its rows feed the owner vote and the inventory, never the hub's claim read.
+   Once phase 2 (below) has returned, the same read runs again for every
+   aggregate phase 2 ALONE named: the aggregate and SVM picks are separate, so
+   a claim retained through its rooted SVM can land on a clone's aggregate. It
+   usually issues nothing.
+3. **Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked
    lexically-smallest over its *whole* candidate set, so a Trident clone or a
    same-named FlexVol on a second filer could otherwise move a claim onto or off
    the rooted aggregate. After phase 1, and once `kube_persistentvolumeclaim_info`
    has landed, the family is read again restricted on `volume` to the derived
    tokens of exactly the claims phase 1 matched (`volume=~".*<token>"` in the
-   default `suffix` mode, `volume=~"<token>"` in `exact`) and merged into phase
-   1's vector. This is the *forward* derivation the join already computes — no
-   FlexVol name is ever inverted back to a PV name. It is **not issued** when
-   phase 1 matched no claim, nor when phase 1 fell back to the unrestricted
-   read; a rooted component with no claim is still drawn from the unrestricted
-   aggregate / controller / policy families. When the restriction names ONLY
-   ONTAP clusters, phase 2 additionally carries `cluster!~"…"` for them: phase 1
-   read those filers whole, so the only candidates left to find are elsewhere,
-   and without the exclusion phase 2 re-scans a family it already has with a
-   regex no index can serve.
+   default `suffix` mode, `volume=~"<token>"` in `exact`). This is the
+   *forward* derivation the join already computes. It is **not issued** when
+   phase 1 matched no claim; a rooted component with no claim is still drawn
+   from the unrestricted aggregate / controller / policy families. When the
+   restriction names ONLY ONTAP clusters, phase 2 additionally carries
+   `cluster!~"…"` for them: phase 1 read those filers whole.
 
-Only `ontap_cluster=` and `aggr=` restrict, and only when the request carries
-**no `svm=` and no `node=` root**: the aggregate's owning controller is a vote
-over every one of its series (a subset can elect a different controller), the
-projection *unions* `aggr=` with `svm=`, and `node=` also names a Kubernetes
-node. `pod=` composes freely. The `contains` and `regex` volume-match modes read
-unrestricted. The QoS wave then scopes over the *merged* result, and its `volume`
-set shrinks with it. `/v1/graph` carries no roots and never restricts.
+The three are merged, de-duplicated by label set, before the QoS wave and the
+parse. `pod=`, `application=` and `node=` compose freely — the projection ANDs
+each with the storage-exclusive roots. A request whose only storage-side root is
+`node=` reads unrestricted (a path through a Kubernetes node is found from its
+pods, not from the filer). The `contains` and `regex` volume-match modes read
+unrestricted. `/v1/graph` carries no roots and never restricts.
 
-The fan-out above counts unchanged (the leg is still one first-wave leg); a
-restricted build swaps its one bare `volume_labels` query for one or more
-chunked phase-1 queries plus, when a claim matched, one or more phase-2 queries.
-The one extra sequential Harvest hop is the price; it is worth paying where an
-upstream series limit binds, and an unrooted request never pays it.
+**Storage-side roots read the claim chain through the volume hub.** A
+restricted read IS hub mode. Every suffix of a phase-1 `volume` value that
+starts with `pvc_` at the start of the name or right after a `_` yields a
+candidate PV name (`_` → `-`); `kube_persistentvolumeclaim_info` is read
+restricted to `volumename=~"<candidates>"`, and the claim-binding family,
+`kube_persistentvolumeclaim_annotations` and the two kubelet families
+restricted to `persistentvolumeclaim=~"<claims>"`, their rows then kept only
+when `(zone, environment, cluster, namespace, claim)` names a loaded claim.
+Extraction is a candidate generator, never a judge: a candidate naming no PV
+loads nothing, and the forward join still decides every pick. No candidate
+issues no claim query; no claim issues no binding, pod, node or controller
+query. A claim scope that would take more than sixteen chunks is read once
+unrestricted and filtered in the reader, with the same body. Two aggregated
+warnings report the whole-hub misses: `storage_root_claim_miss` with
+`reason="no_pv_candidate"` (rooted volumes, no `pvc_` in any name) and
+`reason="no_claim"` (candidates that named no claim the build can reach); a
+Debug line `storage graph volume hub` logs volumes / candidates / claims /
+bindings on every hub build. A statically provisioned PV is not reached from a
+storage root — see [netapp-harvest-preconditions.md](netapp-harvest-preconditions.md).
 
 ## Query error vs empty vector
 
@@ -245,10 +313,9 @@ feature?". Query **errors** (timeout, 5xx, PromQL parse) are a separate axis:
 | Scoped `kube_pod_info` / `kube_pod_owner` chunks (`/v1/storage-graph` only) | **Fails the build** — a pod is topology, and a missing chunk would be a smaller, plausible, wrong body | n/a — an empty scope issues no query |
 | Scoped `kube_node_info` / `kube_node_status_addresses` / `kube_node_labels` / `kube_node_status_condition` chunks (`/v1/storage-graph` only) | **Fails the build** — a Kubernetes node is topology, same reasoning as a pod chunk | n/a — an empty scope (no scheduled pod, no `node=` root) issues no query |
 | Scoped `kube_replicaset_owner` / `kube_job_owner` / `kube_deployment_annotations` / `kube_statefulset_annotations` / `kube_daemonset_annotations` / `kube_cronjob_annotations` chunks (`/v1/storage-graph` only) | **Fails the build** — required exactly as their unscoped read is | n/a — an owner kind no loaded pod is owned by (or, for the two Stage-B families, no first-stage series resolved) issues no query |
-| Scoped `kube_replicaset_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue — degrades exactly as its unscoped read does | No Application for the ReplicaSets the failed chunk carried |
-| Scoped `kube_job_annotations` chunk (`/v1/storage-graph` only) | Log-and-continue AND suppresses the Job → CronJob hop for the WHOLE build (any chunk degrading sets `JobAnnotationsDegraded` build-wide) — same rule as the unscoped degrade | No Application for the Jobs the failed chunk carried; additionally, build-wide, no Application for any Job-owned pod that could only resolve it through its CronJob (a Job carrying its own annotation in a successful chunk still resolves) |
+| Scoped `kube_replicaset_annotations` / `kube_job_annotations` chunks (`/v1/storage-graph` only) | **Fails the build** — the storage build fails closed on every family but `ALERTS` | No Application for the ReplicaSets / Jobs concerned |
 | `traces_service_graph_request_total` | **Fails the build** | No call edges; topology still returned |
-| 18 Harvest + 2 kubelet + `ALERTS` | Log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`) | No NetApp chain / no PVC `usage` / no `data.alerts` |
+| 18 Harvest + 2 kubelet + `ALERTS` | On `/v1/graph`: log-and-continue; empty vector — **except** a failure caused by the CALLER's own context (build timeout / client disconnect), which still fails the request (`optionalQueryFatal`). On `/v1/storage-graph`: **fails the build** (502 naming the family), `ALERTS` excepted | No NetApp chain / no PVC `usage` / no `data.alerts` |
 | `traces_service_graph_request_failed_total` | Log-and-continue | Measured edges omit `error_rate` (never reports `0`) |
 | `traces_service_graph_request_server_seconds_bucket` | Log-and-continue | Measured edges omit `p90_server_ms` |
 | `up` | Warn; skip `outside_retention` classification | n/a |
@@ -284,7 +351,7 @@ hardcoded (`pkg/promql/queryDims`):
 |---|---|---|---|---|
 | namespaced KSM (pod / owner / claim / Service / EndpointSlice / ReplicaSet — every `kube_*` series except the `kube_node_*` family) + kubelet volume stats | yes | yes | yes | yes |
 | `kube_node_*` | yes | yes | yes | no (nodes have no namespace; they follow **by reference** from scheduled pods) |
-| NetApp Harvest | **no** matcher — `?az=` only *routes* the leg to a zone's `harvest` backend | no | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
+| NetApp Harvest | yes (also routes) | yes | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
 | `ALERTS` | yes (also routes) | yes | **no** — an alert expression does not reliably keep `cluster`; matching uses the label through the identity ladder when present, else unique-in-estate | yes |
 | `traces_service_graph_*`, `up` | no | no | no | no |
 
@@ -293,10 +360,9 @@ topology family that a live dimension actually reaches must carry those labels;
 a family that does not matches nothing, and the default connectivity prune can
 then empty the graph. A `selector_family_empty` warning fires when KSM matched
 but a kubelet family that the selector *can* narrow returned nothing. Harvest
-is never in that set: its Harvest legs carry no request matcher at all, so
-Harvest series need no `az` / `env` label — `?az=` selects which `harvest`
-backend is asked (see `upstream-backend-routing.md`) and `?env=` does not reach
-the family.
+carries `az` / `env` and needs both labels, but is never named by that warning:
+an empty Harvest read is also what a deployment without NetApp storage returns
+(see `netapp-harvest-preconditions.md`).
 
 The `cluster` value `unknown` is rendered `cluster=~"unknown|"` (literal plus
 the empty alternative) because an absent `cluster` label and a literal
@@ -362,9 +428,11 @@ Helm values are in
 ## NetApp Harvest (18)
 
 All 18 are OPTIONAL (log-and-continue). Harvest `cluster` is the ONTAP cluster
-and is **never** used as a Kubernetes `?cluster=` matcher. The family carries no
-`?az=` / `?env=` matcher either: `?az=` routes the legs to a zone's `harvest`
-backend and the query string stays unfiltered.
+and is **never** used as a Kubernetes `?cluster=` matcher. The family carries the
+`?az=` / `?env=` matchers on every query — the unrestricted legs and every
+restricted `volume_labels` / `qos_*` read, ahead of the restriction — and
+`?az=` also routes it to the zone's `harvest` backend. Every Harvest series must
+carry both labels.
 
 The storage join is three independently-degrading hops. Hops A and B are keyed
 by the STOCK Harvest `volume` label (the ONTAP FlexVol name), matched against a
@@ -492,6 +560,19 @@ ambiguous and attached to neither — a Kubernetes cluster and an ONTAP cluster
 that share a raw name cannot be disambiguated from labels alone. Missing
 `cluster` succeeds only when exactly one node of the eligible kind(s) matches.
 
+**Zone agreement.** When an alert carries both configured `az` / `env` labels,
+a candidate whose zone is known and different never matches it. A Kubernetes
+object's zone is the pair its cluster identity was composed from; a NetApp
+controller's or aggregate's is every pair its ONTAP cluster's entity-naming
+Harvest series carried (`volume_labels`, `aggr_*`, `node_*`, `system_node_*`).
+The check applies to the cluster-qualified aggregate and controller lookups
+(a cluster-qualified Kubernetes lookup is already zone-exact through the
+identity) and removes other-zone candidates BEFORE the missing-`cluster`
+uniqueness test, so a same-named object in another zone neither absorbs an
+alert nor makes it ambiguous. An unknown zone on either side never excludes.
+It matters wherever one build holds several zones' objects or alerts — an
+unfiltered `/v1/graph`, or a catch-all alerting or Harvest backend.
+
 Operator precondition: the alerting store MUST stamp the same `az` / `env`
 external labels as kube-state-metrics, or its alerts vanish under those
 filters. `FamilyAlerts` is excluded from the `selector_family_empty` Warn — an
@@ -571,3 +652,5 @@ named, growing by exactly what the loaded pods, nodes and resolved owners name
 (design.md D6) — 22 with a `node=` root alone, 25 / 27 / 27 with one
 StatefulSet-, Deployment- or CronJob-owned pod, and 32 with every controller
 kind present, 38 with one matched FlexVol added.
+`TestBuildStorage_FanOutLegCount_Hub` pins hub mode: 13 families with no
+candidate, 14 with a candidate naming no claim, 31 for one claim's full path.

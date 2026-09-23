@@ -89,10 +89,11 @@ type Topology struct {
 	// aggregate, controller and policy Harvest families are NEVER narrowed by a
 	// root: they are what draws a rooted component with no volume on it. Roots
 	// reach the pod scope (readScopedPods), the node scope (readScopedNodes) and
-	// — for an ontap_cluster= / aggr= root with no svm= / node= root — the
-	// volume_labels leg itself (readRootedVolumeLabels), which is safe because
-	// that leg is restricted to exactly the components the root names and each
-	// matched claim's whole candidate set is recovered in a second phase.
+	// — for an ontap_cluster= / aggr= / svm= root — the volume_labels leg itself
+	// (readRootedVolumeLabels), which is safe because that leg is restricted to
+	// exactly the components the roots name, every aggregate an svm= root
+	// touches is re-read whole for its owner vote, and each matched claim's
+	// whole candidate set is recovered in a second phase.
 	//
 	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
 	// not by the Kubernetes estate, and a flowless entity costs nothing at
@@ -190,6 +191,12 @@ type Topology struct {
 	// store's cluster names through the SAME table — a second resolver could
 	// hold a different one and the two would silently disagree.
 	clusters *clusterResolver
+
+	// ontapZones is the `az` / `env` zone set of every ONTAP cluster the
+	// Harvest read named, for the zone-agreeing alert match
+	// (read-storage-roots-through-volume-hub D11). Nil when no Harvest series
+	// carried the pair, which leaves NetApp alerts matching by label alone.
+	ontapZones map[string][]alertZone
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It
@@ -396,12 +403,23 @@ func readTopology(
 	// The parse must derive claim tokens exactly as the scope computation below
 	// did, or a claim could be fetched for and then not joined.
 	v.VolumeKey = opts.volumeKey()
-	// Whether this build reads the volume-label family restricted to the rooted
-	// components. A plan property AND a configuration property (the match
-	// mode), so it is decided once, here, and both the launch and the parse read
-	// the same answer.
-	restrictVolumeLabels := plan.restrictsVolumeLabels(v.VolumeKey)
-	v.VolumeLabelsRestricted = restrictVolumeLabels
+	// Whether this build is in hub mode: the volume-label family read
+	// restricted to the rooted components, and the claim families read FROM
+	// those rows. A plan property AND a configuration property (the match mode,
+	// the byte budget), so it is decided once, before anything launches, and
+	// the launch, the waves and the parse all read the same answer. A storage
+	// build has usually resolved it already, to pick its request matchers and
+	// routing; resolving is idempotent.
+	plan = plan.resolveVolumeLabelRead(v.VolumeKey, window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if plan.phaseOneUnbounded {
+		slog.WarnContext(ctx, "storage roots did not yield a bounded volume-label restriction; reading the family unrestricted",
+			"query", string(promql.QVolumeLabels),
+			"ontap_clusters", len(plan.volumeClusters),
+			"aggrs", len(plan.volumeAggrs),
+			"svms", len(plan.volumeSVMs),
+			"max_chunks", maxRootedVolumeLabelChunks)
+	}
+	v.VolumeLabelsRestricted = plan.hub
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -435,7 +453,7 @@ func readTopology(
 			}()
 			out, err := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
 			*dst = out
-			return err
+			return wrapQueryError(name, err)
 		}
 	}
 	// fetchOptionalTracking is the OPTIONAL-leg twin of fetch: a query error logs
@@ -495,6 +513,17 @@ func readTopology(
 		promql.QPVCBindings:    bindingsDone,
 		promql.QPVCAnnotations: pvcAnnotationsDone,
 	}
+	if plan.hub {
+		// The claim families are not first-wave legs in hub mode: the hub's
+		// claim-keyed reads below close these three channels when they return,
+		// and closing them here as well would panic.
+		delete(signals, promql.QPVCInfo)
+		delete(signals, promql.QPVCBindings)
+		delete(signals, promql.QPVCAnnotations)
+	}
+	// svmRows are phase 1's SVM-group rows, kept apart for owner completion.
+	// Written by the phase-1 leg before volumeLabelsDone closes.
+	var svmRows model.Vector
 	legs := topologyLegs(&v)
 	for _, l := range legs {
 		if !plan.issuesFirstWave(l.query) {
@@ -502,12 +531,13 @@ func readTopology(
 		}
 		var run func() error
 		switch {
-		case l.query == promql.QVolumeLabels && restrictVolumeLabels:
+		case l.query == promql.QVolumeLabels && plan.hub:
 			// Phase 1 of the rooted read: a first-wave leg, because its
 			// restriction comes from the request and nothing precedes it. It
-			// keeps this leg's OPTIONAL error class and its done-signal.
-			run = readRootedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v, l.dst)
-		case !l.optional:
+			// keeps this leg's done-signal, which now also gates the hub's claim
+			// read and owner completion.
+			run = readRootedVolumeLabels(ctx, q, end, plan.phaseOne, l.dst, &svmRows)
+		case !l.optional || plan.failsClosed(l.query):
 			run = fetch(l.query, l.dst)
 		case l.degraded != nil:
 			run = fetchOptionalTracking(l.query, l.dst, l.degraded)
@@ -544,21 +574,34 @@ func readTopology(
 	// the FlexVol names those claims actually matched.
 	//
 	// Under a rooted volume-label read the QoS scope must be computed over the
-	// MERGED result, so it waits on phase 2 instead of phase 1: the candidate
-	// set the parse sees and the volume scope the QoS wave reads must be the
-	// same set. Phase 2 waits on phase 1 and the claim-info family, then
-	// closes volumeLabelsFinal on every return path.
+	// MERGED result, so it waits on the tail (owner completion and phase 2)
+	// instead of phase 1: the candidate set the parse sees and the volume scope
+	// the QoS wave reads must be the same set.
+	//
+	// The hub's claim chain runs beside that tail (claimscope.go): the
+	// claim-info read waits on phase 1 and closes pvcInfoDone; the claim-name
+	// read waits on it and closes bindingsDone and pvcAnnotationsDone — the
+	// three channels the first wave closes outside hub mode. Every one closes
+	// on every return path, so a failed leg empties the scopes downstream of it
+	// instead of blocking them.
 	volumeLabelsFinal := volumeLabelsDone
-	if restrictVolumeLabels {
+	if plan.hub {
+		var cov hubCoverage
+		g.Go(signalWhenDone(func() error {
+			return readHubClaimInfo(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, volumeLabelsDone)
+		}, pvcInfoDone))
+		g.Go(signalWhenDone(signalWhenDone(func() error {
+			return readHubClaimFamilies(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, pvcInfoDone)
+		}, bindingsDone), pvcAnnotationsDone))
 		finalDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readTokenScopedVolumeLabels(ctx, callerCtx, q, window, end, opts, plan, &v,
-				pvcInfoDone, volumeLabelsDone)
+			return readVolumeLabelsTail(ctx, q, window, end, opts, sel, plan, &v, &svmRows,
+				volumeLabelsDone, pvcInfoDone)
 		}, finalDone))
 		volumeLabelsFinal = finalDone
 	}
 	g.Go(func() error {
-		return readScopedQoS(ctx, callerCtx, q, window, end, opts, &v, &scopeMu,
+		return readScopedQoS(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, plan.failClosed,
 			pvcInfoDone, volumeLabelsFinal)
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
@@ -576,7 +619,7 @@ func readTopology(
 		var recovered []string
 		if len(plan.applicationRoots) > 0 {
 			g.Go(signalWhenDone(func() error {
-				names, err := readScopedApplications(ctx, callerCtx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
+				names, err := readScopedApplications(ctx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
 				recovered = names
 				return err
 			}, appDone))
@@ -589,10 +632,10 @@ func readTopology(
 				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
 		}, podsDone))
 		g.Go(func() error {
-			return readScopedNodes(ctx, callerCtx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
+			return readScopedNodes(ctx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
 		})
 		g.Go(func() error {
-			return readScopedControllers(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
+			return readScopedControllers(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -615,12 +658,13 @@ func readTopology(
 // selector demonstrably matches the deployment's labelling, yet a kubelet
 // family came back empty. A family is reported ONLY when a dimension the
 // request actually carries reaches it (promql.Selector.Reaches). In practice
-// that is the kubelet pair alone: the Harvest families render NO request
-// matcher (az only routes them to a backend, env is inert), so Reaches is
-// false for every dimension and an empty volume_labels can never be the
-// request's doing — reporting it would fire this Warn on every filtered
-// request of every non-NetApp deployment. QVolumeLabels stays in the list so
-// the contract is enforced by the table rather than by omission.
+// that is the kubelet pair alone. The Harvest families DO carry az / env now
+// (read-storage-roots-through-volume-hub D13), so Reaches is true for them,
+// but an empty volume_labels is also the ordinary state of a deployment with
+// no NetApp storage — reporting it would fire this Warn on every filtered
+// request of every such deployment, and nothing in the build can tell the
+// two apart. They are excluded by an explicit rule below; QVolumeLabels stays
+// in the list so the exclusion is a rule rather than an omission.
 //
 // An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
 // on a DIFFERENT axis, and it needs its own rule because Reaches cannot
@@ -643,10 +687,14 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
 		promql.QAlerts,
 	} {
-		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
+		if fam, ok := promql.FamilyOf(q); ok && (fam.Optional() || fam == promql.FamilyHarvest) {
 			continue
 		}
-		if raw[string(q)] == 0 && sel.Reaches(q) {
+		// Present-and-zero only: a family absent from the tally was never
+		// issued (a hub-mode claim family whose claim scope came out empty),
+		// so it returned nothing because nothing asked, not because a label
+		// is missing.
+		if n, issued := raw[string(q)]; issued && n == 0 && sel.Reaches(q) {
 			empty = append(empty, string(q))
 		}
 	}
@@ -1183,6 +1231,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		ClustersObserved:    clusterList,
 		ClusterIdentities:   mc.snapshot(),
 		clusters:            mc,
+		ontapZones:          ontapZonesOf(v, mc.keys),
 	}
 }
 

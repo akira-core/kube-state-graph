@@ -456,9 +456,9 @@ func TestReadTopology_ControllerLegFailureDoesNotFailBuild(t *testing.T) {
 	}
 }
 
-// The five legs carry NO request matcher — Harvest is zone-ROUTED, and its
-// `cluster` label is the ONTAP cluster, not a Kubernetes one.
-func TestReadTopology_ControllerLegsCarryNoRequestMatcher(t *testing.T) {
+// The five legs carry az / env and nothing else — Harvest's `cluster` label is
+// the ONTAP cluster, not a Kubernetes one, and it carries no namespace.
+func TestReadTopology_ControllerLegsCarryZoneOnly(t *testing.T) {
 	sel := promql.Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"},
 		Cluster: []string{"c1"}, Namespace: []string{"shop"},
@@ -471,7 +471,7 @@ func TestReadTopology_ControllerLegsCarryNoRequestMatcher(t *testing.T) {
 		promql.QNetAppNodeTotalData,
 	} {
 		got := promql.Render(name, time.Minute, promql.LabelKeys{}, sel)
-		assert.Equalf(t, "last_over_time("+string(name)+"[1m])", got,
-			"%s must render exactly as an unfiltered build renders it", name)
+		assert.Equalf(t, "last_over_time("+string(name)+`{az="zone-a",env="prod"}[1m])`, got,
+			"%s carries the request's az / env only", name)
 	}
 }

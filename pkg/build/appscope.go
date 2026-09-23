@@ -35,23 +35,23 @@ func applicationRootChunks(values []string, budget int) [][]string {
 
 type annotationRecovery struct {
 	query promql.Query
-	mode  legMode
 	kind  string
 	label model.LabelName
 }
 
-// annotationRecoveryFamilies is stage 1, in the forward wave's error-class
-// order: the four live-object families fail the build, the two history-accumulating
-// families degrade. Degrading here does NOT set JobAnnotationsDegraded — that
-// flag belongs to the by-reference read of the family, which is a separate wave.
+// annotationRecoveryFamilies is stage 1. Every family fails the build on a
+// query error — the history-accumulating two included — because the
+// recovery runs only on /v1/storage-graph, which fails closed
+// (fail-storage-graph-on-any-leg-error): a lost chunk would silently drop the
+// pods of the Applications it carried.
 func annotationRecoveryFamilies() []annotationRecovery {
 	return []annotationRecovery{
-		{promql.QDeploymentAnnotations, legRequired, "Deployment", "deployment"},
-		{promql.QStatefulSetAnnotations, legRequired, "StatefulSet", "statefulset"},
-		{promql.QDaemonSetAnnotations, legRequired, "DaemonSet", "daemonset"},
-		{promql.QCronJobAnnotations, legRequired, "CronJob", "cronjob"},
-		{promql.QReplicaSetAnnotations, legOptional, "ReplicaSet", "replicaset"},
-		{promql.QJobAnnotations, legOptional, "Job", "job_name"},
+		{promql.QDeploymentAnnotations, "Deployment", "deployment"},
+		{promql.QStatefulSetAnnotations, "StatefulSet", "statefulset"},
+		{promql.QDaemonSetAnnotations, "DaemonSet", "daemonset"},
+		{promql.QCronJobAnnotations, "CronJob", "cronjob"},
+		{promql.QReplicaSetAnnotations, "ReplicaSet", "replicaset"},
+		{promql.QJobAnnotations, "Job", "job_name"},
 	}
 }
 
@@ -60,7 +60,7 @@ func annotationRecoveryFamilies() []annotationRecovery {
 // read by the existing by-reference waves, and the projection decides which
 // of them are roots. An empty root set returns no names and issues nothing.
 func readScopedApplications(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -89,7 +89,7 @@ func readScopedApplications(
 				"query", string(f.query),
 				"chunks", len(chunks),
 			)
-			vec, err := issueUnrestricted(ctx, callerCtx, q, f.query, window, end, keys, sel, f.mode)
+			vec, err := issueUnrestricted(ctx, q, f.query, window, end, keys, sel)
 			if err != nil {
 				return nil, err
 			}
@@ -104,14 +104,13 @@ func readScopedApplications(
 				query:         f.query,
 				dst:           &dsts[i],
 				scope:         roots,
-				mode:          f.mode,
 				budgetReserve: promql.TrackingIDWrapperCost,
 				render: func(chunk []string) (string, bool) {
 					return promql.RenderTrackingIDScoped(f.query, window, keys, sel, chunk)
 				},
 			}
 		}
-		if err := issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
+		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
 			return nil, err
 		}
 		for i, f := range families {
@@ -127,7 +126,6 @@ func readScopedApplications(
 			query: promql.QReplicaSetOwner,
 			dst:   &rsVec,
 			scope: deps,
-			mode:  legRequired,
 			render: func(chunk []string) (string, bool) {
 				return promql.RenderOwnerScoped(promql.QReplicaSetOwner, window, keys, sel, "Deployment", chunk)
 			},
@@ -138,14 +136,13 @@ func readScopedApplications(
 			query: promql.QJobOwner,
 			dst:   &jobVec,
 			scope: cjs,
-			mode:  legRequired,
 			render: func(chunk []string) (string, bool) {
 				return promql.RenderOwnerScoped(promql.QJobOwner, window, keys, sel, "CronJob", chunk)
 			},
 		})
 	}
 	if len(stage2) > 0 {
-		if err := issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, stage2); err != nil {
+		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stage2); err != nil {
 			return nil, err
 		}
 		for _, fam := range stage2 {
@@ -178,7 +175,6 @@ func readScopedApplications(
 			query: promql.QPodOwner,
 			dst:   dst,
 			scope: names,
-			mode:  legRequired,
 			render: func(chunk []string) (string, bool) {
 				return promql.RenderOwnerScoped(promql.QPodOwner, window, keys, sel, kind, chunk)
 			},
@@ -187,7 +183,7 @@ func readScopedApplications(
 	if len(stage3) == 0 {
 		return nil, nil
 	}
-	if err := issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, stage3); err != nil {
+	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stage3); err != nil {
 		return nil, err
 	}
 	var pods []string
@@ -233,17 +229,17 @@ func filteredNames(vec model.Vector, label model.LabelName, keep func(model.Metr
 }
 
 // issueUnrestricted reads one family with its fixed selector and the request
-// matchers only — the /v1/graph shape — honouring mode's error class. It is
-// the stage-1 fallback when the root set does not yield a bounded restriction.
+// matchers only — the /v1/graph shape. It is the stage-1 fallback when the
+// root set does not yield a bounded restriction, and like every recovery read
+// it fails the build on a query error.
 func issueUnrestricted(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	name promql.Query,
 	window time.Duration,
 	end time.Time,
 	keys promql.LabelKeys,
 	sel promql.Selector,
-	mode legMode,
 ) (out model.Vector, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -256,19 +252,10 @@ func issueUnrestricted(
 		}
 	}()
 	res, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
-	if qerr == nil {
-		return res, nil
+	if qerr != nil {
+		return nil, wrapQueryError(name, qerr)
 	}
-	if mode == legRequired {
-		return nil, qerr
-	}
-	if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
-		return nil, cerr
-	}
-	slog.WarnContext(ctx, "optional scoped topology query failed; continuing with empty vector",
-		"query", string(name),
-		"error", qerr)
-	return nil, nil
+	return res, nil
 }
 
 // storageClaimKey is one claim as the binding and annotation readers name it.

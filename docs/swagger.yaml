@@ -445,7 +445,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/internal_api.errorBody'
-          description: Upstream VictoriaMetrics returned an error (RFC 9110 §15.6.3)
+          description: 'A required upstream query returned an error (RFC 9110 §15.6.3);
+            the message names the family (`upstream query failed: <family>`). Optional
+            families — Harvest, kubelet, ALERTS and the degrading annotation / container
+            families — log and continue instead'
         "504":
           content:
             application/json:
@@ -462,7 +465,9 @@ paths:
       description: |-
         Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
 
-        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.
+
+        **Volume hub**: a request carrying an `ontap_cluster`, `aggr` or `svm` root reads the claims FROM the rooted filer — the claims bound to the PersistentVolumes its FlexVol names embed (`pvc_<uid>`) — within the requested zone and environment, from the same backends and under the same `az` / `env` matchers as any other storage request. A filer shared across zones is drawn with the requested zone's claims only. A statically provisioned PV is not reached from a storage root. `cluster` / `namespace` still narrow.
 
         **Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
 
@@ -482,14 +487,16 @@ paths:
         required: true
         schema:
           type: string
-      - description: Availability zone (required, single-valued).
+      - description: Availability zone (required, single-valued). Narrows every Kubernetes
+          and ALERTS query and selects the backends every query is sent to.
         example: zone-a
         in: query
         name: az
         required: true
         schema:
           type: string
-      - description: Environment (required, single-valued).
+      - description: Environment (required, single-valued). Narrows every Kubernetes
+          and ALERTS query.
         example: prod
         in: query
         name: env
@@ -596,7 +603,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/internal_api.errorBody'
-          description: Upstream VictoriaMetrics returned an error
+          description: 'An upstream query of ANY family except ALERTS returned an
+            error — Harvest, kubelet and annotation families included; the message
+            names the family (`upstream query failed: <family>`)'
         "504":
           content:
             application/json:

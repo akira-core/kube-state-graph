@@ -14,27 +14,17 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// legMode is the error class a by-reference family's chunk carries, mirroring
-// the first wave's fetch / fetchOptional / fetchOptionalTracking split
-// (topology.go): legRequired fails the build on any chunk error, exactly as
-// the family's unscoped read would; legOptional logs and continues, costing
-// only that chunk's contribution; legOptionalTracking does the same and ALSO
-// sets a shared flag when any chunk of the family degraded, for the one
-// family (kube_job_annotations) a downstream reader infers something from the
-// absence of.
-type legMode int
-
-const (
-	legRequired legMode = iota
-	legOptional
-	legOptionalTracking
-)
-
 // scopedFamily is one family a by-reference wave issues: its own scope
 // (independent of every other family's — the controller wave's eight
-// families are each scoped on a DIFFERENT set of names), the slot its merged
-// vector lands in, its error class, and — for legOptionalTracking only — the
-// flag to set when any chunk of it degraded.
+// families are each scoped on a DIFFERENT set of names) and the slot its
+// merged vector lands in.
+//
+// There is no per-family error class. Only a by-reference plan — the
+// /v1/storage-graph read — issues these waves, and that endpoint fails
+// closed on every query error but ALERTS (fail-storage-graph-on-any-leg-error),
+// so a chunk error of ANY family here fails the build — including
+// kube_replicaset_annotations and kube_job_annotations, which /v1/graph's
+// first wave reads as degrading families.
 //
 // render, when non-nil, replaces promql.RenderScoped for this family's
 // chunks. nil keeps today's identity-label scope. budgetOverhead is the
@@ -46,8 +36,6 @@ type scopedFamily struct {
 	query          promql.Query
 	dst            *model.Vector
 	scope          []string
-	mode           legMode
-	degraded       *bool
 	render         func(chunk []string) (string, bool)
 	budgetOverhead int
 	budgetReserve  int
@@ -64,12 +52,10 @@ type scopedFamily struct {
 // topologyVectors) and v.ScopeIssued gains no entry for it — the same
 // "absent means never read" contract every other second wave keeps.
 //
-// It returns the first legRequired-mode chunk error (fail closed, exactly as
-// an unscoped read of that family would fail the build); a legOptional or
-// legOptionalTracking chunk error is logged and costs only that chunk's
-// contribution to the merged vector.
+// It returns the first chunk error, named with its family (fail closed: a
+// missing chunk would be a smaller, plausible, wrong body with no signal).
 func issueScopedFamilies(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -92,11 +78,8 @@ func issueScopedFamilies(
 	}
 
 	parts := make([][]model.Vector, len(families))
-	degradedChunks := make([][]bool, len(families))
 	for fi := range families {
-		n := len(chunksByFamily[fi])
-		parts[fi] = make([]model.Vector, n)
-		degradedChunks[fi] = make([]bool, n)
+		parts[fi] = make([]model.Vector, len(chunksByFamily[fi]))
 	}
 
 	wave, wctx := errgroup.WithContext(ctx)
@@ -104,12 +87,11 @@ func issueScopedFamilies(
 	for fi, fam := range families {
 		for ci, chunk := range chunksByFamily[fi] {
 			wave.Go(func() error {
-				out, degraded, err := issueScopedChunk(wctx, callerCtx, q, fam.query, window, end, opts.LabelKeys, sel, chunk, fam.mode, fam.render)
+				out, err := issueScopedChunk(wctx, q, fam.query, window, end, opts.LabelKeys, sel, chunk, fam.render)
 				if err != nil {
 					return err
 				}
 				parts[fi][ci] = out
-				degradedChunks[fi][ci] = degraded
 				return nil
 			})
 		}
@@ -123,26 +105,21 @@ func issueScopedFamilies(
 			continue // empty scope: not issued, not tallied
 		}
 		var merged model.Vector
-		anyDegraded := false
-		for ci, part := range parts[fi] {
+		for _, part := range parts[fi] {
 			merged = append(merged, part...)
-			anyDegraded = anyDegraded || degradedChunks[fi][ci]
 		}
 		*fam.dst = merged
 		markScopeIssued(v, scopeMu, fam.query)
-		if anyDegraded && fam.mode == legOptionalTracking && fam.degraded != nil {
-			*fam.degraded = true
-		}
 	}
 	return nil
 }
 
 // issueScopedChunk issues one family's query for one chunk of its scope,
-// under the bare family name, honouring mode's error class. It recovers its
-// own panics for the reason fetch does: errgroup does not propagate them, and
-// an unrecovered panic here would kill the process.
+// under the bare family name; a query error is returned named with its
+// family. It recovers its own panics for the reason fetch does: errgroup does
+// not propagate them, and an unrecovered panic here would kill the process.
 func issueScopedChunk(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	name promql.Query,
 	window time.Duration,
@@ -150,9 +127,8 @@ func issueScopedChunk(
 	keys promql.LabelKeys,
 	sel promql.Selector,
 	values []string,
-	mode legMode,
 	render func(chunk []string) (string, bool),
-) (out model.Vector, degraded bool, err error) {
+) (out model.Vector, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			slog.ErrorContext(ctx, "panic in scoped topology query",
@@ -160,7 +136,7 @@ func issueScopedChunk(
 				"panic", fmt.Sprint(rec),
 				"stack", string(debug.Stack()),
 			)
-			out, degraded, err = nil, false, fmt.Errorf("panic in %s query: %v", name, rec)
+			out, err = nil, fmt.Errorf("panic in %s query: %v", name, rec)
 		}
 	}()
 
@@ -177,21 +153,11 @@ func issueScopedChunk(
 		// Unreachable for a non-empty chunk of a scopeable family. Failing is
 		// the only honest answer: an unscoped fallback would read the whole
 		// estate, and an empty vector would silently draw nothing.
-		return nil, false, fmt.Errorf("%s: no scoped rendering for %d values", name, len(values))
+		return nil, fmt.Errorf("%s: no scoped rendering for %d values", name, len(values))
 	}
 	res, qerr := q.Instant(ctx, string(name), rendered, end)
-	if qerr == nil {
-		return res, false, nil
+	if qerr != nil {
+		return nil, wrapQueryError(name, qerr)
 	}
-	if mode == legRequired {
-		return nil, false, qerr
-	}
-	if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
-		return nil, false, cerr
-	}
-	slog.WarnContext(ctx, "optional scoped topology query failed; continuing with empty vector",
-		"query", string(name),
-		"values", len(values),
-		"error", qerr)
-	return nil, true, nil
+	return res, nil
 }

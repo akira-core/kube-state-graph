@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"slices"
 	"time"
@@ -14,17 +15,29 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The rooted Harvest volume-label read (scope-volume-labels-by-storage-root).
+// The rooted Harvest volume-label read (scope-volume-labels-by-storage-root,
+// read-storage-roots-through-volume-hub).
 //
-// A /v1/storage-graph request rooted at an ONTAP cluster or an aggregate used to
-// read the whole filer's volume-label family and discard nearly all of it at
-// projection. Under a restriction the build reads it in two phases:
+// A /v1/storage-graph request rooted at an ONTAP cluster, an aggregate or an SVM
+// used to read the whole filer's volume-label family and discard nearly all of
+// it at projection. Under a restriction — which is also what puts the build in
+// hub mode (topologyPlan.hub) — the build reads it in phases:
 //
-//	phase 1  the family restricted to the rooted components (cluster= / aggr=),
-//	         a first-wave leg because the restriction comes from the request
-//	phase 2  the family restricted on `volume` to the derived tokens of exactly
-//	         the claims phase 1 matched, waiting on phase 1 and the claim-info
-//	         family; merged into phase 1's vector before anything else reads it
+//	phase 1           the family restricted to the rooted components: an
+//	                  aggregate group {cluster=~OC?, aggr=~A} (or {cluster=~OC}
+//	                  alone), an SVM group {cluster=~OC?, svm=~S}, or both —
+//	                  a first-wave leg, because the restriction comes from the
+//	                  request
+//	owner completion  every aggregate an SVM-group row names, re-read whole,
+//	                  waiting on phase 1 alone (below)
+//	phase 2           the family restricted on `volume` to the derived tokens
+//	                  of exactly the claims phase 1 matched, waiting on phase 1
+//	                  and the claim-info family
+//
+// and merges the three, de-duplicated by label set, before anything but the
+// hub's own claim read consumes the family. The claim read (claimscope.go)
+// reads phase 1 ALONE: the rooted rows name the claims, and completion or
+// phase-2 rows are never a source of claims.
 //
 // Phase 2 exists for correctness, not speed. pickAggr and pickSVM are
 // lexically-smallest over a claim's WHOLE candidate set, so a phase-1-only read
@@ -33,8 +46,7 @@ import (
 // matches the claim's token, or the same name on a second filer. Phase 2
 // restores every matched claim's full candidate set, in the FORWARD direction of
 // the configured derivation: the token is what the build already computed from a
-// PersistentVolume name it holds, so nothing here recovers a PV name from a
-// FlexVol name.
+// PersistentVolume name it holds.
 //
 // Why phase 1's matched set is sufficient: a claim can only be retained by a
 // storage-side root if its picked aggregate or SVM is a rooted id, which needs at
@@ -43,34 +55,70 @@ import (
 // ANY claim's token is in phase 1, so the claims with a rooted candidate are
 // exactly the claims phase 1 matched.
 //
-// What that argument does NOT cover, and why the body is still safe: the
-// aggregate OWNER vote (netapp.go pickOwner) reads every series of an aggregate
-// that reached the merged vector, so an aggregate seen only through phase 2 — a
-// clone's aggregate, say — votes over the one or two of its volumes a claim's
-// token happened to match, and can elect a different controller than the whole
-// filer would. Such an aggregate is never DRAWN: it is not a root, and the unit
-// whose claim reached it does not intersect the rooted ids, so ProjectStorage
-// drops it and pullNetAppParents never reaches its controller. That invariant
-// lives in pkg/graph, not here, so widening resolveStorageRoots would start
-// drawing a controller chosen from a partial vote —
-// TestRootedVolumeLabels_PhaseTwoOnlyAggregateIsNeverDrawn pins it. The rooted
-// aggregates themselves are unaffected: phase 1 reads every one of their series,
-// which is exactly why an `svm=` or `node=` root disables the restriction
-// instead of narrowing it.
+// Owner completion exists for the aggregate OWNER vote (netapp.go pickOwner),
+// which reads every series of an aggregate that reached the merged vector. An
+// aggregate group reads each of its aggregates whole; an SVM group reads only
+// the SVM's share of every aggregate it touches, so the build re-reads those
+// aggregates whole — except the ones an aggregate group of the same request
+// already read whole. The rooted aggregates, and every aggregate an SVM root
+// reaches, therefore vote over the same population an unrestricted read gives
+// them, which is what keeps the takeover case (the series of one aggregate
+// naming two controllers) byte-identical.
+//
+// An aggregate seen only through phase 2 — a clone's aggregate, say — votes
+// over the one or two of its volumes a claim's token happened to match, and can
+// elect a different controller than the whole filer would. Under ontap_cluster=
+// and aggr= roots alone such an aggregate is never DRAWN: it is not a root, and
+// the unit whose claim reached it does not intersect the rooted ids, so
+// ProjectStorage drops it and pullNetAppParents never reaches its controller —
+// TestRootedVolumeLabels_PhaseTwoOnlyAggregateIsNeverDrawn pins it. An svm=
+// root breaks that argument: pickAggr and pickSVM are separate picks over the
+// claim's candidates, so a claim can land on a phase-2-only aggregate while its
+// SVM is the rooted one, and the unit is retained through the SVM. Under an
+// svm= root the build therefore completes the aggregates phase 2 alone named
+// as well, after phase 2 returns (readVolumeLabelsTail) —
+// TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates pins it.
+
+// phaseOneGroup names which phase-1 query group a rendered query belongs to.
+// Owner completion reads the SVM group's rows alone.
+type phaseOneGroup int
+
+const (
+	// groupAggr is {cluster=~OC?, aggr=~A}, or {cluster=~OC} for a request
+	// rooted at ONTAP clusters alone. Every aggregate it names is read whole.
+	groupAggr phaseOneGroup = iota
+	// groupSVM is {cluster=~OC?, svm=~S}: each SVM's share of every aggregate
+	// it touches.
+	groupSVM
+)
 
 // rootedVolumeLabelsQuery is one rendered phase-1 query, kept beside the value
 // sets it was rendered from so a test can assert on what each chunk carries.
 type rootedVolumeLabelsQuery struct {
+	group    phaseOneGroup
 	clusters []string
 	aggrs    []string
+	svms     []string
+	rendered string
+}
+
+// render is the query's PromQL. ok is false when its value sets normalise
+// away, which only an embedder filling StorageRoots directly can produce.
+func (r rootedVolumeLabelsQuery) render(window time.Duration, keys promql.LabelKeys, sel promql.Selector) (string, bool) {
+	if r.group == groupSVM {
+		return promql.RenderVolumeLabelsSVMRooted(window, keys, sel, r.clusters, r.svms)
+	}
+	return promql.RenderVolumeLabelsRooted(window, keys, sel, r.clusters, r.aggrs)
 }
 
 // maxRootedVolumeLabelChunks bounds how many queries the phase-1 restriction may
-// become. Past it the build reads the family UNRESTRICTED instead.
+// become, summed over its aggregate and SVM groups. Past it the build reads the
+// family UNRESTRICTED instead — and, since the restriction is what engages the
+// volume hub, reads every claim family as it did before the hub existed.
 //
 // This is the one scope in the package derived from the REQUEST rather than from
-// upstream data, and `?aggr=` / `?ontap_cluster=` are repeatable with no cap on
-// how many values a client may send (the request parser bounds each value's
+// upstream data, and `?aggr=` / `?svm=` / `?ontap_cluster=` are repeatable with
+// no cap on how many values a client may send (the request parser bounds each value's
 // length, never the count). Without a ceiling, one request naming thousands of
 // aggregates would turn a single `last_over_time(volume_labels[w])` into
 // thousands of queries, each still carrying the whole repeated cluster
@@ -84,14 +132,18 @@ type rootedVolumeLabelsQuery struct {
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
 // rootedVolumeLabelsChunks splits the phase-1 restriction across as many
-// queries as the byte budget requires. ok is false when that would take more
-// than maxRootedVolumeLabelChunks queries; the caller then reads unrestricted.
+// queries as the byte budget requires, in (group, chunk) order: the aggregate
+// group's chunks first, then the SVM group's. ok is false when that would take
+// more than maxRootedVolumeLabelChunks queries IN TOTAL across both groups; the
+// caller then reads unrestricted.
 //
-// The LARGER alternation is chunked — `aggr` when the request names any, else
-// `cluster` — and the other is repeated verbatim in every chunk. The two
-// matchers are AND-combined, so a union over disjoint chunks of one of them is
-// exactly the unchunked selection; and disjoint chunks return disjoint series,
-// so no cross-chunk de-duplication is needed.
+// Each group chunks ITS alternation — `aggr` for the aggregate group, `svm` for
+// the SVM group, `cluster` for a request rooted at ONTAP clusters alone — and
+// repeats the `cluster` alternation verbatim in every chunk. The matchers of
+// one query are AND-combined, so a union over disjoint chunks of one of them is
+// exactly the unchunked selection; and disjoint chunks of one group return
+// disjoint series. The two groups DO overlap — a volume of a rooted SVM on a
+// rooted aggregate is returned by both — which the caller's merge removes.
 //
 // The repeated alternation is not counted by ChunkScope, so its RENDERED length
 // — escaping, the `=~"…"` wrapper and the separating comma included — is taken
@@ -102,29 +154,29 @@ const maxRootedVolumeLabelChunks = scopeConcurrency
 // pathological cluster set from producing a non-positive budget, which
 // ChunkScope would read as "no limit"; the chunk cap above is what actually
 // catches that case.
-func rootedVolumeLabelsChunks(clusters, aggrs []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
-	var chunks [][]string
-	fixedClusters := clusters
+func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
+	fixed := promql.MatcherCost(promql.VolumeLabelsClusterLabel, clusters)
+	if fixed > 0 {
+		fixed++ // the comma joining it to the chunked matcher
+	}
+	var out []rootedVolumeLabelsQuery
 	if len(aggrs) > 0 {
-		fixed := promql.MatcherCost(promql.VolumeLabelsClusterLabel, clusters)
-		if fixed > 0 {
-			fixed++ // the comma joining it to the chunked matcher
+		for _, chunk := range promql.ChunkScope(aggrs, max(budget-fixed, 1)) {
+			out = append(out, rootedVolumeLabelsQuery{group: groupAggr, clusters: clusters, aggrs: chunk})
 		}
-		chunks = promql.ChunkScope(aggrs, max(budget-fixed, 1))
-	} else {
-		chunks = promql.ChunkScope(clusters, budget)
-		fixedClusters = nil
 	}
-	if len(chunks) > maxRootedVolumeLabelChunks {
+	if len(svms) > 0 {
+		for _, chunk := range promql.ChunkScope(svms, max(budget-fixed, 1)) {
+			out = append(out, rootedVolumeLabelsQuery{group: groupSVM, clusters: clusters, svms: chunk})
+		}
+	}
+	if len(aggrs) == 0 && len(svms) == 0 {
+		for _, chunk := range promql.ChunkScope(clusters, budget) {
+			out = append(out, rootedVolumeLabelsQuery{group: groupAggr, clusters: chunk})
+		}
+	}
+	if len(out) > maxRootedVolumeLabelChunks {
 		return nil, false
-	}
-	out := make([]rootedVolumeLabelsQuery, 0, len(chunks))
-	for _, chunk := range chunks {
-		if len(aggrs) > 0 {
-			out = append(out, rootedVolumeLabelsQuery{clusters: fixedClusters, aggrs: chunk})
-			continue
-		}
-		out = append(out, rootedVolumeLabelsQuery{clusters: chunk})
 	}
 	return out, true
 }
@@ -204,23 +256,42 @@ func mergeVolumeLabels(base, extra model.Vector) model.Vector {
 
 // issueVolumeLabelsQueries issues each rendered query under the bare family
 // name and returns the results merged in QUERY order, never completion order.
-//
-// The family is OPTIONAL, so a failed query logs and contributes nothing — it
-// costs the aggregate edges of the claims whose volumes that query carried and
-// never the build. Only the CALLER going away fails the build, which is
-// optionalQueryFatal's rule for every optional leg.
 func issueVolumeLabelsQueries(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	end time.Time,
 	phase string,
 	rendered []string,
 ) (model.Vector, error) {
+	parts, err := issueVolumeLabelsParts(ctx, q, end, phase, rendered)
+	if err != nil {
+		return nil, err
+	}
+	var merged model.Vector
+	for _, part := range parts {
+		merged = append(merged, part...)
+	}
+	return merged, nil
+}
+
+// issueVolumeLabelsParts issues each rendered query under the bare family name
+// and returns one result per query, in query order.
+//
+// A failed query fails the build, named with its family. This read runs only
+// on /v1/storage-graph, which fails closed (fail-storage-graph-on-any-leg-error):
+// a lost chunk would draw the rooted components with no path through the
+// claims it carried, indistinguishable from a filer that serves nothing.
+func issueVolumeLabelsParts(
+	ctx context.Context,
+	q promql.Querier,
+	end time.Time,
+	phase string,
+	rendered []string,
+) ([]model.Vector, error) {
 	parts := make([]model.Vector, len(rendered))
-	// WithContext, so the one error this path can return — the CALLER went
-	// away — cancels the chunks still in flight instead of making the build
-	// wait out every remaining round-trip before it can report the timeout.
-	// Mirrors issueScopedFamilies (scopedread.go).
+	// WithContext, so the first failed chunk cancels the chunks still in flight
+	// instead of making the build wait out every remaining round-trip before it
+	// can report the failure. Mirrors issueScopedFamilies (scopedread.go).
 	wave, wctx := errgroup.WithContext(ctx)
 	wave.SetLimit(scopeConcurrency)
 	for i, query := range rendered {
@@ -237,15 +308,7 @@ func issueVolumeLabelsQueries(
 			}()
 			out, qerr := q.Instant(wctx, string(promql.QVolumeLabels), query, end)
 			if qerr != nil {
-				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
-					return cerr
-				}
-				slog.WarnContext(ctx, "optional rooted volume-label query failed; continuing with empty vector",
-					"query", string(promql.QVolumeLabels),
-					"phase", phase,
-					"chunk", i,
-					"error", qerr)
-				return nil
+				return wrapQueryError(promql.QVolumeLabels, qerr)
 			}
 			parts[i] = out
 			return nil
@@ -254,160 +317,183 @@ func issueVolumeLabelsQueries(
 	if err := wave.Wait(); err != nil {
 		return nil, err
 	}
-	var merged model.Vector
-	for _, part := range parts {
-		merged = append(merged, part...)
-	}
-	return merged, nil
+	return parts, nil
 }
 
 // readRootedVolumeLabels is phase 1: the volume-label family restricted to the
-// request's rooted ONTAP clusters and aggregates. It returns the leg's run
-// function so the launch loop can slot it in where fetchOptional stood, and
-// writes the result into the same topologyVectors slot the unrestricted leg
-// does — nothing downstream can tell which read produced it, which is the point.
+// request's rooted components, one query per chunk of the resolved plan's
+// groups. It returns the leg's run function so the launch loop can slot it in
+// where the unrestricted fetch stood, and writes the merged result into the
+// same topologyVectors slot the unrestricted leg does. The SVM group's rows are
+// also kept apart in svmRows, for owner completion.
+//
+// The merge runs in (group, chunk) order and de-duplicates by label set: a
+// volume of a rooted SVM on a rooted aggregate is returned by both groups, and
+// an undeduplicated series would vote twice in pickOwner.
 func readRootedVolumeLabels(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
-	window time.Duration,
 	end time.Time,
-	opts Options,
-	plan topologyPlan,
-	v *topologyVectors,
+	queries []rootedVolumeLabelsQuery,
 	dst *model.Vector,
+	svmRows *model.Vector,
 ) func() error {
 	return func() (err error) {
-		// The same guard fetch / fetchOptional put on this leg. errgroup does
-		// not propagate a goroutine panic to Wait, so an unrecovered one here
-		// kills the process rather than becoming a sanitised 500 — and unlike
-		// those wrappers this closure runs chunking and rendering of its own
-		// before any per-query recover is in scope.
-		defer func() {
-			if rec := recover(); rec != nil {
-				slog.ErrorContext(ctx, "panic in rooted volume-label query",
-					"query", string(promql.QVolumeLabels),
-					"panic", fmt.Sprint(rec),
-					"stack", string(debug.Stack()),
-				)
-				err = fmt.Errorf("panic in %s query: %v", promql.QVolumeLabels, rec)
-			}
-		}()
+		// The same guard fetch puts on this leg. errgroup does not propagate a
+		// goroutine panic to Wait, so an unrecovered one here kills the process
+		// rather than becoming a sanitised 500.
+		defer recoverScopedPanic(ctx, promql.QVolumeLabels, &err)
 
-		chunks, ok := rootedVolumeLabelsChunks(plan.volumeClusters, plan.volumeAggrs, opts.qosScopeBatchBytes())
-		rendered := make([]string, 0, len(chunks))
-		for _, c := range chunks {
-			query, rok := promql.RenderVolumeLabelsRooted(window, c.clusters, c.aggrs)
-			if !rok {
-				ok = false // an un-renderable restriction reads unrestricted
-				break
-			}
-			rendered = append(rendered, query)
+		rendered := make([]string, len(queries))
+		for i, r := range queries {
+			rendered[i] = r.rendered
 		}
-		if !ok {
-			// Too many chunks, or a value set that normalised away. Read the
-			// family as it was read before the restriction existed: one query,
-			// the same body, and a bound on what one request can ask for.
-			// NEVER an empty vector — that would silently draw no storage.
-			v.VolumeLabelsRestricted = false
-			slog.WarnContext(ctx, "storage roots did not yield a bounded volume-label restriction; reading the family unrestricted",
-				"query", string(promql.QVolumeLabels),
-				"ontap_clusters", len(plan.volumeClusters),
-				"aggrs", len(plan.volumeAggrs),
-				"max_chunks", maxRootedVolumeLabelChunks)
-			out, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "unrestricted",
-				[]string{promql.Render(promql.QVolumeLabels, window, opts.LabelKeys, promql.Selector{})})
-			if qerr != nil {
-				return qerr
-			}
-			*dst = out
-			return nil
-		}
-		out, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "roots", rendered)
+		parts, qerr := issueVolumeLabelsParts(ctx, q, end, "roots", rendered)
 		if qerr != nil {
 			return qerr
 		}
-		*dst = out
+		var aggrRows, svmGroup model.Vector
+		for i, part := range parts {
+			if queries[i].group == groupSVM {
+				svmGroup = append(svmGroup, part...)
+				continue
+			}
+			aggrRows = append(aggrRows, part...)
+		}
+		*svmRows = svmGroup
+		*dst = mergeVolumeLabels(aggrRows, svmGroup)
 		return nil
 	}
 }
 
-// readTokenScopedVolumeLabels is phase 2: it re-reads the family restricted on
-// `volume` to the derived tokens of the claims phase 1 matched, and merges the
-// result into v.VolumeLabels.
+// ownerCompletionTargets is the owner-completion scope: every (ONTAP cluster,
+// aggregate) pair an SVM-group row names, minus the aggregates an aggregate
+// group of the same request already read whole — an aggregate named by an
+// aggr= root, on a filer inside the ontap_cluster= roots (any filer, when there
+// are none). Keyed by ONTAP cluster, each aggregate set sorted.
 //
-// It waits on the claim-info family and on phase 1, and on nothing else. It is
-// NOT issued when no claim matched: phase 1 then drew no edge for a candidate
-// set to be recovered for, and a rooted component with no claim is still drawn
-// from the aggregate, controller and policy families, which are unrestricted.
+// A row with an empty `aggr` (a FlexGroup) names no aggregate and completes
+// nothing: there is no single aggregate whose vote it could skew. Nor does a
+// row with an empty ONTAP `cluster`: the join never keys an aggregate without
+// one (pickAggr and the owner index both skip it), so no vote could move.
+func ownerCompletionTargets(svmRows model.Vector, plan topologyPlan) map[string][]string {
+	readWhole := func(cluster, aggr string) bool {
+		if !slices.Contains(plan.volumeAggrs, aggr) {
+			return false
+		}
+		return len(plan.volumeClusters) == 0 || slices.Contains(plan.volumeClusters, cluster)
+	}
+	out := map[string][]string{}
+	for _, s := range svmRows {
+		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
+		aggr := string(s.Metric["aggr"])
+		if aggr == "" || cluster == "" || readWhole(cluster, aggr) {
+			continue
+		}
+		out[cluster] = append(out[cluster], aggr)
+	}
+	for c, aggrs := range out {
+		slices.Sort(aggrs)
+		out[c] = slices.Compact(aggrs)
+	}
+	return out
+}
+
+// withoutTargets returns the completion targets of want that done does not
+// already hold, keyed and sorted as ownerCompletionTargets keys them. A cluster
+// left with no aggregate is dropped.
+func withoutTargets(want, done map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for c, aggrs := range want {
+		rest := slices.DeleteFunc(slices.Clone(aggrs), func(a string) bool {
+			return slices.Contains(done[c], a)
+		})
+		if len(rest) > 0 {
+			out[c] = rest
+		}
+	}
+	return out
+}
+
+// readOwnerCompletion re-reads, whole, every target aggregate, one chunked
+// query per ONTAP cluster, so the owning-controller vote runs over the
+// aggregate's full population. The targets are ownerCompletionTargets of the
+// SVM group's rows — and, under an svm= root, of the phase-2 rows that named an
+// aggregate no earlier read covered (readVolumeLabelsTail).
 //
-// Like every leg of this family it degrades on a query error rather than
-// failing the build. A failed chunk can leave a pick over an incomplete
-// candidate set — no worse than the whole-family failure the unrestricted read
-// already degrades to, at chunk granularity.
-func readTokenScopedVolumeLabels(
-	ctx, callerCtx context.Context,
+// Its rows feed the owner vote and the storage inventory only: they are merged
+// into the family AFTER the hub's claim read has taken its candidates from
+// phase 1, so a claim on another SVM of a touched aggregate — on no rooted
+// component — is never loaded through them. No target issues nothing.
+func readOwnerCompletion(
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
 	opts Options,
+	sel promql.Selector,
+	targets map[string][]string,
+) (model.Vector, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	clusters := slices.Sorted(maps.Keys(targets))
+	request := promql.RequestMatcherCost(promql.QVolumeLabels, opts.LabelKeys, sel)
+	var rendered []string
+	for _, c := range clusters {
+		budget := max(opts.qosScopeBatchBytes()-request-promql.OwnerCompletionClusterCost(c), 1)
+		for _, chunk := range promql.ChunkScope(targets[c], budget) {
+			query, ok := promql.RenderVolumeLabelsOwnerCompletion(window, opts.LabelKeys, sel, c, chunk)
+			if !ok {
+				continue // unreachable: targets hold no empty aggregate
+			}
+			rendered = append(rendered, query)
+		}
+	}
+	return issueVolumeLabelsQueries(ctx, q, end, "owner_completion", rendered)
+}
+
+// readTokenScopedVolumeLabels is phase 2: it re-reads the family restricted on
+// `volume` to the derived tokens of the claims phase 1 matched, and returns
+// the rows for the caller to merge. v.VolumeLabels MUST still hold phase 1
+// alone, and v.PVCInfo MUST have landed.
+//
+// Nothing is issued when no claim matched: phase 1 then drew no edge for a
+// candidate set to be recovered for, and a rooted component with no claim is
+// still drawn from the aggregate, controller and policy families, which are
+// unrestricted.
+//
+// A failed chunk fails the build (fail-storage-graph-on-any-leg-error).
+func readTokenScopedVolumeLabels(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
 	plan topologyPlan,
 	v *topologyVectors,
-	prerequisites ...<-chan struct{},
-) (err error) {
-	// Same reason as phase 1: matchedClaimTokens and the chunking below run
-	// outside any per-query recover, in an errgroup goroutine whose panic
-	// would otherwise take the process down.
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.ErrorContext(ctx, "panic in token-scoped volume-label query",
-				"query", string(promql.QVolumeLabels),
-				"panic", fmt.Sprint(rec),
-				"stack", string(debug.Stack()),
-			)
-			err = fmt.Errorf("panic in %s query: %v", promql.QVolumeLabels, rec)
-		}
-	}()
-
-	for _, done := range prerequisites {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			// A sibling leg failed (or the caller went away). The group already
-			// carries that error; adding another would only mask it.
-			return nil
-		}
-	}
-
-	// Phase 1 may have fallen back to the unrestricted read (an unbounded root
-	// set). Every candidate of every claim is then already in hand, so phase 2
-	// could only re-fetch what the merge would discard. The flag is written
-	// before phase 1 returns and read after its done-channel closes, which is
-	// what orders the two.
-	if !v.VolumeLabelsRestricted {
-		return nil
-	}
+) (model.Vector, error) {
 	// The FIELD, not opts.volumeKey(): readTopology stores the rewriter once so
 	// the parse and every scope derive a claim's token identically, and
 	// re-resolving it here would recompile every rewrite rule's regexp.
 	//
-	// Read as a field and never through v.volumeKey(). That method has a VALUE
-	// receiver, so calling it on the shared *topologyVectors copies the whole
-	// struct — every model.Vector slot the sibling first-wave legs are still
-	// writing — which is a data race the detector catches. Nothing in the
-	// fan-out may take a copy of this struct; that is why readScopedQoS reaches
-	// for opts.volumeKey() instead. VolumeKey itself is written once, before
-	// the errgroup starts, so reading the one field is safe.
+	// Read as a field and never through a value-receiver method: that would
+	// copy the whole shared *topologyVectors — every model.Vector slot the
+	// sibling legs are still writing — which is a data race the detector
+	// catches. VolumeKey itself is written once, before the errgroup starts, so
+	// reading the one field is safe.
 	rw := v.VolumeKey
 	if rw == nil {
 		rw = defaultVolumeKeyRewriter()
 	}
 	kind := rw.tokenScope()
 	if kind == tokenScopeNone {
-		return nil // unreachable under the predicate; never guess a branch shape
+		return nil, nil // unreachable under the predicate; never guess a branch shape
 	}
 	tokens := matchedClaimTokens(v.PVCInfo, v.VolumeLabels, rw)
 	if len(tokens) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	suffix := kind == tokenScopeSuffix
@@ -419,31 +505,105 @@ func readTokenScopedVolumeLabels(
 	// candidate on them is already in hand and the only ones left to recover
 	// are elsewhere. Excluding them turns phase 2 from a second full-family
 	// regex scan into the narrow cross-filer lookup it exists to be. It is
-	// only sound with no aggregate root: phase 1 then read part of a cluster,
-	// and a candidate on another aggregate of the same cluster is exactly what
-	// phase 2 must still find.
+	// only sound with no aggregate and no SVM root: phase 1 then read part of a
+	// cluster, and a candidate on another aggregate or SVM of the same cluster
+	// is exactly what phase 2 must still find.
 	var excludeClusters []string
-	if len(plan.volumeAggrs) == 0 {
+	if len(plan.volumeAggrs) == 0 && len(plan.volumeSVMs) == 0 {
 		excludeClusters = plan.volumeClusters
 	}
 	chunks := promql.ChunkScopeWithOverhead(tokens, opts.qosScopeBatchBytes(), overhead)
 	rendered := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		query, ok := promql.RenderVolumeLabelsTokenScoped(window, chunk, suffix, excludeClusters)
+		query, ok := promql.RenderVolumeLabelsTokenScoped(window, opts.LabelKeys, sel, chunk, suffix, excludeClusters)
 		if !ok {
-			// Unreachable for a non-empty chunk. Degrading is the honest
-			// answer for this OPTIONAL family: the candidate set stays
-			// phase 1's, which is what a failed phase-2 chunk already leaves.
-			slog.WarnContext(ctx, "no token-scoped rendering for the volume-label read; keeping the rooted candidate set",
-				"query", string(promql.QVolumeLabels), "tokens", len(chunk))
-			return nil
+			// Unreachable for a non-empty chunk. Failing is the only honest
+			// answer under a fail-closed read: an incomplete candidate set
+			// could move a pick.
+			return nil, fmt.Errorf("%s: no token-scoped rendering for %d tokens", promql.QVolumeLabels, len(chunk))
 		}
 		rendered = append(rendered, query)
 	}
-	extra, qerr := issueVolumeLabelsQueries(ctx, callerCtx, q, end, "tokens", rendered)
-	if qerr != nil {
-		return qerr
+	return issueVolumeLabelsQueries(ctx, q, end, "tokens", rendered)
+}
+
+// readVolumeLabelsTail runs the rest of the hub's volume-label read after phase
+// 1 — owner completion (waiting on phase 1 alone) beside phase 2 (waiting on
+// the claim-info family too) — and merges both into v.VolumeLabels, in the
+// order phase 1, completion, phase 2, de-duplicated by label set. The QoS wave
+// and the parse read the merged result; the caller closes their done-channel
+// when this returns.
+//
+// Under an svm= root it then completes the aggregates phase 2 ALONE named —
+// neither read whole by an aggregate group nor completed above — and merges
+// those rows last. A claim retained through its rooted SVM can land on such an
+// aggregate (pickAggr and pickSVM are separate picks), so its owner vote must
+// run over the whole aggregate too. In the common case phase 2 re-reads only
+// series phase 1 already holds and this issues nothing.
+//
+// The merge writes v.VolumeLabels, which the hub's claim-info read reads, so it
+// happens only once pvcInfoDone has been OBSERVED closed — phase 2 waits on it
+// — and never on a path where the build is already failing.
+func readVolumeLabelsTail(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	plan topologyPlan,
+	v *topologyVectors,
+	svmRows *model.Vector,
+	phaseOneDone, pvcInfoDone <-chan struct{},
+) (err error) {
+	// The target computation, matchedClaimTokens and the chunking run outside
+	// any per-query recover, in errgroup goroutines whose panic would
+	// otherwise take the process down. The nested goroutines below carry their
+	// own guard: a recover only catches a panic of its own goroutine.
+	defer recoverScopedPanic(ctx, promql.QVolumeLabels, &err)
+	select {
+	case <-phaseOneDone:
+	case <-ctx.Done():
+		// A sibling leg failed (or the caller went away). The group already
+		// carries that error; adding another would only mask it.
+		return nil
 	}
-	v.VolumeLabels = mergeVolumeLabels(v.VolumeLabels, extra)
+
+	completed := ownerCompletionTargets(*svmRows, plan)
+	var completion, phaseTwo model.Vector
+	tail, tctx := errgroup.WithContext(ctx)
+	tail.Go(func() (err error) {
+		defer recoverScopedPanic(tctx, promql.QVolumeLabels, &err)
+		completion, err = readOwnerCompletion(tctx, q, window, end, opts, sel, completed)
+		return err
+	})
+	tail.Go(func() (err error) {
+		defer recoverScopedPanic(tctx, promql.QVolumeLabels, &err)
+		select {
+		case <-pvcInfoDone:
+		case <-tctx.Done():
+			return nil
+		}
+		phaseTwo, err = readTokenScopedVolumeLabels(tctx, q, window, end, opts, sel, plan, v)
+		return err
+	})
+	if err := tail.Wait(); err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		// Phase 2 may have left on the cancellation rather than on pvcInfoDone,
+		// so the claim-info read may still be reading v.VolumeLabels. The build
+		// is failing anyway; do not write.
+		return nil
+	}
+	var late model.Vector
+	if len(plan.volumeSVMs) > 0 {
+		late, err = readOwnerCompletion(ctx, q, window, end, opts, sel,
+			withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed))
+		if err != nil {
+			return err
+		}
+	}
+	v.VolumeLabels = mergeVolumeLabels(mergeVolumeLabels(mergeVolumeLabels(v.VolumeLabels, completion), phaseTwo), late)
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,7 +178,7 @@ kube_node_info{cluster="mb-alpha",node="mb-worker-0",az="zone-a"} 1 %[1]d
 kube_node_info{cluster="mb-alpha",node="mb-worker-1",az="zone-b"} 1 %[1]d
 kube_persistentvolumeclaim_info{cluster="mb-alpha",namespace="db",persistentvolumeclaim="mb-data",storageclass="netapp-nas",volumename="pvc-mb-9f3a",az="zone-a"} 1 %[1]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="mb-alpha",namespace="db",pod="mongo-0",volume="data",persistentvolumeclaim="mb-data",az="zone-a"} 1 %[1]d
-volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb-shadow",node="ontap-node-9",aggr="aggr-shadow",svm="svm-mb",az="zone-a",env="prod"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -186,7 +187,7 @@ traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb
 	// service-graph counter. Both containers serve the service-graph family,
 	// so the fan-out sees the series twice and must collapse it.
 	s.ingestInto(s.secondURL, fmt.Sprintf(`
-volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb"} 1 %[1]d
+volume_labels{volume="trident_pvc_mb_9f3a",cluster="ontap-mb",node="ontap-node-1",aggr="aggr-mb",svm="svm-mb",az="zone-b",env="prod"} 1 %[1]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} 0 %[2]d
 traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb-alpha",client_k8s_pod_uid="mb-uid-1",server_k8s_pod_uid="mb-uid-2",client_k8s_namespace_name="db",server_k8s_namespace_name="db"} %[3]g %[1]d
 `, t1, t0, mbRate*mbCounterStep))
@@ -333,11 +334,11 @@ func (s *MultiBackendSuite) TestZoneRoutingSelectsTheBackend() {
 	})
 	s.True(hasPod(zoneA, "mb-alpha/mb-uid-1"), "the zone-a pod is served by the zone-a store")
 
-	// Harvest is zone-routed WITHOUT a matcher. Neither store's volume_labels
-	// carries an az label, both hold the claim's PV name, and only the zone-a
-	// store's copy may join: routing alone keeps the zone-b series out.
+	// Harvest is zone-routed AND matched. Both stores hold the claim's PV
+	// name, each stamped with its own zone, and only the zone-a store's copy
+	// may join.
 	s.Equal([]string{"netapp/ontap-mb-shadow/aggr/aggr-shadow"}, storageTargets(zoneA),
-		"the zone-a claim joins the zone-a store's Harvest series, which carries no az label")
+		"the zone-a claim joins the zone-a store's Harvest series")
 	s.NotContains(nodeIDs(zoneA), "netapp/ontap-mb/aggr/aggr-mb",
 		"the zone-b store's colliding volume_labels is not loaded under ?az=zone-a")
 
@@ -518,4 +519,83 @@ func hasPod(body cytoscape.Body, id string) bool {
 		}
 	}
 	return false
+}
+
+// hubNow dates the volume-hub fixtures two hours after fixedNow, so no other
+// test of this suite — every one of which reads [fixedNow-5m, fixedNow] — can
+// see them, and they can see none of the suite's own.
+var hubNow = fixedNow.Add(2 * time.Hour)
+
+// TestStorageGraphHubStaysInTheRequestZone (read-storage-roots-through-volume-hub
+// task 8.5): two Kubernetes zones behind the routing table, each in its own
+// installation, running a cluster of the SAME raw name, and one zoned Harvest
+// store per zone. A zone-a request rooted at a filer that also serves a zone-b
+// claim draws zone-a's claim only: zone-b's kube-state-metrics store is not
+// asked, and neither is zone-b's Harvest store — which holds a
+// lexically-smaller filer with a FlexVol of the same name, so a query reaching
+// it would move the zone-a claim's pick there and the rooted body would lose
+// its path.
+func (s *MultiBackendSuite) TestStorageGraphHubStaysInTheRequestZone() {
+	t1 := hubNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`
+kube_pod_info{cluster="hub-c1",namespace="shop",pod="a-0",uid="hub-uid-a0",node="hub-worker-a",az="zone-a",env="prod"} 1 %[1]d
+kube_node_info{cluster="hub-c1",node="hub-worker-a",az="zone-a",env="prod"} 1 %[1]d
+kube_persistentvolumeclaim_info{cluster="hub-c1",namespace="shop",persistentvolumeclaim="a-data",storageclass="netapp-nas",volumename="pvc-hub-aaaa",az="zone-a",env="prod"} 1 %[1]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="hub-c1",namespace="shop",pod="a-0",volume="data",persistentvolumeclaim="a-data",az="zone-a",env="prod"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_aaaa",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub",az="zone-a",env="prod"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",svm="svm-hub",az="zone-a",env="prod"} 1 %[1]d
+aggr_new_status{cluster="ontap-hub",node="ontap-hub-01",aggr="aggr-hub",az="zone-a",env="prod"} 1 %[1]d
+node_new_status{cluster="ontap-hub",node="ontap-hub-01",az="zone-a",env="prod"} 1 %[1]d
+`, t1))
+	s.ingestInto(s.secondURL, fmt.Sprintf(`
+kube_pod_info{cluster="hub-c1",namespace="shop",pod="b-0",uid="hub-uid-b0",node="hub-worker-b",az="zone-b",env="dev"} 1 %[1]d
+kube_node_info{cluster="hub-c1",node="hub-worker-b",az="zone-b",env="dev"} 1 %[1]d
+kube_persistentvolumeclaim_info{cluster="hub-c1",namespace="shop",persistentvolumeclaim="b-data",storageclass="netapp-nas",volumename="pvc-hub-bbbb",az="zone-b",env="dev"} 1 %[1]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="hub-c1",namespace="shop",pod="b-0",volume="data",persistentvolumeclaim="b-data",az="zone-b",env="dev"} 1 %[1]d
+volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="ontap-zb-01",aggr="aggr-zb",svm="svm-zb",az="zone-b",env="dev"} 1 %[1]d
+`, t1))
+	s.Require().True(s.WaitForSeries(`volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-hub"}`, hubNow, 30*time.Second))
+	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{persistentvolumeclaim="a-data"}`, hubNow, 30*time.Second))
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `kube_pod_spec_volumes_persistentvolumeclaims_info{persistentvolumeclaim="b-data"}`, hubNow, 30*time.Second))
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{cluster="ontap-aaa-zoneb"}`, hubNow, 30*time.Second))
+
+	k8s := []promql.Family{promql.FamilyKSM, promql.FamilyKubelet}
+	srv := s.startRoutedAPI([]promql.Backend{
+		promql.NewBackend("k8s-a", s.VMURL(),
+			slices.Concat(k8s, []promql.Family{promql.FamilyServiceGraph, promql.FamilyProbe}), []string{"zone-a"}, "", ""),
+		promql.NewBackend("k8s-b", s.secondURL, k8s, []string{"zone-b"}, "", ""),
+		promql.NewBackend("netapp-a", s.VMURL(), []promql.Family{promql.FamilyHarvest}, []string{"zone-a"}, "", ""),
+		promql.NewBackend("netapp-b", s.secondURL, []promql.Family{promql.FamilyHarvest}, []string{"zone-b"}, "", ""),
+	})
+
+	q := url.Values{}
+	q.Set("start", strconv.FormatInt(hubNow.Add(-5*time.Minute).Unix(), 10))
+	q.Set("end", strconv.FormatInt(hubNow.Unix(), 10))
+	q.Set("az", "zone-a")
+	q.Set("env", "prod")
+	q.Set("ontap_cluster", "ontap-hub")
+	resp := s.httpGet(srv.URL + "/v1/storage-graph?" + q.Encode())
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+
+	ids := nodeIDs(body)
+	s.Contains(ids, "zone-a-prod-hub-c1/hub-uid-a0", "zone-a's pod on the rooted filer is drawn")
+	s.Contains(ids, "zone-a-prod-hub-c1/shop/a-data", "with its claim")
+	s.Contains(ids, "netapp/ontap-hub/aggr/aggr-hub")
+	s.NotContains(ids, "zone-b-dev-hub-c1/hub-uid-b0", "zone-b's store is not asked, so its pod is not drawn")
+	s.NotContains(ids, "zone-b-dev-hub-c1/shop/b-data")
+	s.NotContains(ids, "netapp/ontap-aaa-zoneb/aggr/aggr-zb", "zone-b's Harvest store is never asked")
+	s.Equal([]string{"zone-a-prod-hub-c1"}, body.Clusters, "the body holds the request's zone only")
+
+	var flows int
+	for _, e := range body.Elements.Edges {
+		s.False(strings.HasPrefix(e.Data.Source, "zone-b-") || strings.HasPrefix(e.Data.Target, "zone-b-"),
+			"no edge touches zone-b: %s -> %s", e.Data.Source, e.Data.Target)
+		if e.Data.Type == string(graph.EdgeTypeStorageFlow) && strings.HasPrefix(e.Data.Target, "zone-a-prod-hub-c1/") {
+			flows++
+		}
+	}
+	s.Positive(flows, "the zone-a claim's path is drawn end to end")
 }

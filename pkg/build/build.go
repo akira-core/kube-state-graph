@@ -241,15 +241,20 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // uses none of it, and those three legs are the most expensive of the fan-out.
 //
 // It is a pure function of (window, end, Selector, roots), and roots reach
-// three reads. The pod names of pod=<ns>/<name> roots join the pod scope, and
+// several reads. The pod names of pod=<ns>/<name> roots join the pod scope, and
 // node=<name> roots join the node scope, because a root mounting no claim (or
 // naming a node no pod runs on) is drawable only if it is read; those can only
-// ADD a name to a scope, never narrow a read. The ontap_cluster= and aggr= roots
-// restrict the Harvest volume-label topology read to the rooted components
-// (scope-volume-labels-by-storage-root) — the one place a root NARROWS a read,
-// made output-preserving by recovering each matched claim's whole candidate set
-// in a second phase, and disabled by any svm= or node= root. Either way which
-// paths are drawn stays a projection concern (graph.ProjectStorage). This
+// ADD a name to a scope, never narrow a read. The ontap_cluster=, aggr= and
+// svm= roots restrict the Harvest volume-label topology read to the rooted
+// components (scope-volume-labels-by-storage-root) — made output-preserving by
+// re-reading each touched aggregate whole for its owner vote and each matched
+// claim's whole candidate set in a second phase — and put the build in hub
+// mode (read-storage-roots-through-volume-hub): the claim families are read
+// FROM the rooted rows, keyed by the PersistentVolume and claim names they
+// lead to, under the same az / env matchers and the same zone routing as every
+// other storage build — a filer shared across zones is drawn with the claims
+// of the requested zone only. Either way which paths
+// are drawn stays a projection concern (graph.ProjectStorage). This
 // revises the storage-graph design's "roots never reach the build" stance
 // (harden-topology-read-cardinality D7): v1 has no result cache whose key it
 // would widen, and the alternative was reading the whole estate.
@@ -271,13 +276,22 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 }
 
 // buildStorage is BuildStorage under an explicit read plan.
+//
+// The plan is resolved here, before anything is dispatched, because the volume
+// hub changes WHICH families the build reads and how they are scoped — never
+// where they are read from. Every leg, in hub mode or not, renders the
+// request's full selector and is dispatched through the one querier its `az`
+// binds, so no query reaches a store of another zone and no series of another
+// zone or environment reaches the body.
 func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
+	plan = plan.resolveVolumeLabelRead(b.opts.volumeKey(), window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
 	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
 			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
+			attribute.Bool("kube_state_graph.volume_hub", plan.hub),
 		),
 	)
 	defer span.End()
@@ -306,6 +320,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
+		"volume_hub", plan.hub,
 	)
 	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 
@@ -333,7 +348,11 @@ func classifyReadError(span trace.Span, what string, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return NewError(ReasonTimeout, "build timeout", err)
 	}
-	return NewError(ReasonUpstream, what, err)
+	be := &Error{Reason: ReasonUpstream, Message: what, Err: err}
+	if qe, ok := errors.AsType[*QueryError](err); ok {
+		be.Query = qe.Query
+	}
+	return be
 }
 
 func assemble(topology Topology, sg ServiceGraphResult) ([]graph.GraphNode, []*graph.Edge) {

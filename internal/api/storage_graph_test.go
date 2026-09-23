@@ -113,8 +113,8 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 		assert.NotContains(t, seen, skipped, "the storage body cannot carry %s, so it is never read", skipped)
 	}
 	assert.Equal(t,
-		`last_over_time(volume_labels[1h])`,
-		seen["volume_labels"], "Harvest takes no request matcher — az only routes it")
+		`last_over_time(volume_labels{az="zone-a",env="prod"}[1h])`,
+		seen["volume_labels"], "Harvest takes az / env only")
 	assert.Equal(t,
 		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
 		seen["ALERTS"], "ALERTS takes az/env and namespace-or-absent, never cluster")
@@ -151,7 +151,7 @@ func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 	assert.Equal(t,
 		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"platform|shop|"}[1h])`,
 		seen["ALERTS"])
-	assert.Equal(t, `last_over_time(volume_labels[1h])`, seen["volume_labels"])
+	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod"}[1h])`, seen["volume_labels"])
 	assert.Equal(t,
 		`last_over_time(kube_statefulset_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",env="prod",namespace=~"platform|shop",statefulset="orders"}[1h])`,
 		seen["kube_statefulset_annotations"],

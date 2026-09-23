@@ -121,7 +121,7 @@ func scopedQoSVectors(t *testing.T, q promql.Querier, opts Options, v *topologyV
 	}
 	var mu sync.Mutex
 	require.NoError(t, readScopedQoS(ctx, ctx, q, time.Minute, time.Unix(1, 0).UTC(),
-		opts, v, &mu, done(), done()))
+		opts, promql.Selector{}, v, &mu, false, done(), done()))
 }
 
 // The QoS read waits for the two legs its scope is computed from, and the query
@@ -265,6 +265,31 @@ func TestReadScopedQoS_FailedChunkDegradesOnlyItsOwnClaims(t *testing.T) {
 	assert.Equal(t, model.LabelValue("trident_pvc_aaaaaaaa"), v.QoSReadOps[0].Metric["volume"])
 	assert.InDelta(t, 10.0, float64(v.QoSReadOps[0].Value), 1e-12,
 		"the surviving claim keeps its measurement")
+}
+
+// Under a fail-closed plan (/v1/storage-graph) the same chunk failure fails
+// the read and names its family, instead of costing one claim its I/O.
+func TestReadScopedQoS_FailClosedChunkFailsTheRead(t *testing.T) {
+	f := newScopeFake()
+	f.claims = model.Vector{claimSample("db", "a", "pvc-aaaaaaaa"), claimSample("db", "b", "pvc-bbbbbbbb")}
+	f.volumes = model.Vector{volSample("trident_pvc_aaaaaaaa", "aggr1"), volSample("trident_pvc_bbbbbbbb", "aggr1")}
+	f.readOps = map[string]float64{"trident_pvc_aaaaaaaa": 10, "trident_pvc_bbbbbbbb": 20}
+	f.failVolume = "trident_pvc_bbbbbbbb"
+
+	var v topologyVectors
+	v.PVCInfo, v.VolumeLabels = f.claims, f.volumes
+	done := make(chan struct{})
+	close(done)
+	var mu sync.Mutex
+	err := readScopedQoS(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+		Options{QoSScopeBatchBytes: 21}, promql.Selector{}, &v, &mu, true, done, done)
+	require.Error(t, err)
+	qe, ok := errors.AsType[*QueryError](err)
+	require.True(t, ok)
+	assert.Contains(t, []string{
+		string(promql.QQoSReadOps), string(promql.QQoSWriteOps), string(promql.QQoSReadLatency),
+		string(promql.QQoSWriteLatency), string(promql.QQoSReadData), string(promql.QQoSWriteData),
+	}, qe.Query)
 }
 
 // The topology read still fails when a REQUIRED leg fails, even though the

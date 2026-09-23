@@ -105,12 +105,12 @@ func TestGraph_SelectorQueriesCaptured(t *testing.T) {
 		`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",env="prod",cluster="cluster-alpha"}[1h])`,
 		seen["kube_node_status_addresses"], "the fixed selector stays ahead of the request matchers")
 	assert.Equal(t,
-		`last_over_time(volume_labels[1h])`,
-		seen["volume_labels"], "Harvest takes no request matcher — az only routes it, env is inert")
+		`last_over_time(volume_labels{az="zone-a",env="prod"}[1h])`,
+		seen["volume_labels"], "Harvest takes az / env only — never cluster or namespace")
 	assert.Equal(t,
-		`last_over_time(qos_read_ops{volume="trident_pvc_9f3a"}[1h])`,
+		`last_over_time(qos_read_ops{az="zone-a",env="prod",volume="trident_pvc_9f3a"}[1h])`,
 		seen["qos_read_ops"],
-		"the QoS scope is derived from the matched FlexVol names, never from the request: still no az / env / cluster / namespace matcher")
+		"the QoS scope, derived from the matched FlexVol names, follows the request's az / env; no cluster / namespace")
 	assert.Equal(t,
 		`last_over_time(kubelet_volume_stats_used_bytes{az="zone-a",env="prod",cluster="cluster-alpha",namespace="shop"}[1h])`,
 		seen["kubelet_volume_stats_used_bytes"])

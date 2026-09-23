@@ -79,7 +79,7 @@ func TestQuerier_SuffixTokenAlternation(t *testing.T) {
 			vol("trident_pvc_a_clone"), vol("trident_pvc_c"),
 		},
 	})
-	q, ok := promql.RenderVolumeLabelsTokenScoped(time.Minute, []string{"pvc_a", "pvc_b"}, true, nil)
+	q, ok := promql.RenderVolumeLabelsTokenScoped(time.Minute, promql.LabelKeys{}, promql.Selector{}, []string{"pvc_a", "pvc_b"}, true, nil)
 	require.True(t, ok)
 
 	got, err := f.Instant(t.Context(), string(promql.QVolumeLabels), q, time.Unix(1, 0))
@@ -95,7 +95,7 @@ func TestQuerier_SuffixTokenAlternation(t *testing.T) {
 		"the prefix is a wildcard, not an escaped literal, so it survives the escape inversion verbatim")
 
 	// The rooted phase-1 selector: cluster AND aggr in one selector.
-	rooted, ok := promql.RenderVolumeLabelsRooted(time.Minute, []string{"ontap-prod"}, []string{"aggr1"})
+	rooted, ok := promql.RenderVolumeLabelsRooted(time.Minute, promql.LabelKeys{}, promql.Selector{}, []string{"ontap-prod"}, []string{"aggr1"})
 	require.True(t, ok)
 	f2 := New(map[promql.Query]model.Vector{
 		promql.QVolumeLabels: {

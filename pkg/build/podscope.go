@@ -54,7 +54,7 @@ func podScope(bindings model.Vector, roots []string) []string {
 // could be bound or is a root, so no pod could be drawn. That mirrors the QoS
 // read's empty-scope rule.
 //
-// Unlike a QoS chunk, a pod chunk FAILS CLOSED (legRequired). A pod is
+// Unlike a /v1/graph QoS chunk, a pod chunk FAILS CLOSED. A pod is
 // topology, not a measurement: a missing chunk would be a smaller, plausible,
 // wrong body with no signal — the partial fan-out that backend routing D6
 // forbids — so the first chunk error fails the build exactly as an unscoped
@@ -113,7 +113,7 @@ func readScopedPods(
 	}
 	families := make([]scopedFamily, 0, len(promql.PodScopedQueries))
 	for _, t := range podTargets(v) {
-		families = append(families, scopedFamily{query: t.query, dst: t.dst, scope: scope, mode: legRequired})
+		families = append(families, scopedFamily{query: t.query, dst: t.dst, scope: scope})
 	}
-	return issueScopedFamilies(ctx, ctx, q, window, end, opts, sel, v, scopeMu, families)
+	return issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, families)
 }

@@ -214,10 +214,10 @@ upstream as **raw** label matchers (`az="…"`, `env="…"`, configurable per ke
   nothing under those filters, and since the default projection keeps only
   connectivity-connected workload, one missing label can empty a filtered graph
   rather than thin it. The build logs `selector_family_empty` (Warn) when KSM
-  matched but kubelet returned nothing. Harvest is **not** in this set: its
-  legs carry no `az` / `env` matcher (`?az=` routes them to a backend instead —
-  see `upstream-backend-routing.md`), so Harvest series need no such label and
-  are never named by that Warn.
+  matched but kubelet returned nothing. Harvest carries the same two matchers
+  and needs the same two labels (see `netapp-harvest-preconditions.md`), but is
+  never named by that Warn: an empty Harvest read is also what a deployment
+  without NetApp storage returns.
 
 **The two labels also define cluster IDENTITY**, not just the filters. A
 Kubernetes cluster is `<az>-<env>-<cluster>`, because the raw name is reused

@@ -23,8 +23,10 @@ func nsKSM(pairs ...string) *model.Sample {
 	return &model.Sample{Metric: m, Value: 1}
 }
 
+// nsHarvest is one Harvest series stamped with the fixture zone every Harvest
+// series must carry; a pair overrides it.
 func nsHarvest(pairs ...string) *model.Sample {
-	m := model.Metric{}
+	m := model.Metric{"az": "zone-a", "env": "prod"}
 	for i := 0; i+1 < len(pairs); i += 2 {
 		m[model.LabelName(pairs[i])] = model.LabelValue(pairs[i+1])
 	}

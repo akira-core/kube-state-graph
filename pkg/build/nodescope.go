@@ -51,11 +51,11 @@ func nodeScope(pods model.Vector, roots []string) []string {
 //
 // An empty scope issues no query at all: no pod is scheduled and no node
 // root was given, so no Kubernetes-node entity could be drawn. Every family
-// is legRequired — a K8s node is topology, not a measurement, so a missing
+// fails closed — a K8s node is topology, not a measurement, so a missing
 // chunk would be a smaller, plausible, wrong body with no signal, exactly
 // like a pod chunk.
 func readScopedNodes(
-	ctx, callerCtx context.Context,
+	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
@@ -80,7 +80,7 @@ func readScopedNodes(
 	}
 	families := make([]scopedFamily, 0, len(promql.NodeScopedQueries))
 	for _, t := range nodeTargets(v) {
-		families = append(families, scopedFamily{query: t.query, dst: t.dst, scope: scope, mode: legRequired})
+		families = append(families, scopedFamily{query: t.query, dst: t.dst, scope: scope})
 	}
-	return issueScopedFamilies(ctx, callerCtx, q, window, end, opts, sel, v, scopeMu, families)
+	return issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, families)
 }

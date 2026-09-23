@@ -24,7 +24,7 @@ func recoverNames(t *testing.T, f promql.Querier, opts Options, sel promql.Selec
 	t.Helper()
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	names, err := readScopedApplications(t.Context(), t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
+	names, err := readScopedApplications(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
 	return names, v, err
 }
 
@@ -220,16 +220,13 @@ func TestReadScopedApplications_NamespaceFilterNarrows(t *testing.T) {
 	}
 }
 
-func TestReadScopedApplications_DegradingFamilyDegradesAlone(t *testing.T) {
+// Spec: "A stage-1 annotation chunk failure fails the build" — the recovery
+// runs only on /v1/storage-graph, which fails closed on the two families
+// /v1/graph degrades.
+func TestReadScopedApplications_DegradingFamilyFailsClosed(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QDeploymentAnnotations: {
 			planKSM("namespace", "shop", "deployment", "web", trackingLabel, "checkout:apps/Deployment:shop/web"),
-		},
-		promql.QReplicaSetOwner: {
-			planKSM("namespace", "shop", "replicaset", "web-7d9f", "owner_kind", "Deployment", "owner_name", "web"),
-		},
-		promql.QPodOwner: {
-			planKSM("namespace", "shop", "pod", "web-7d9f-abc", "owner_kind", "ReplicaSet", "owner_name", "web-7d9f", "owner_is_controller", "true"),
 		},
 		promql.QJobAnnotations: {
 			planKSM("namespace", "shop", "job_name", "batch-1", trackingLabel, "checkout:batch/Job:shop/batch-1"),
@@ -241,10 +238,11 @@ func TestReadScopedApplications_DegradingFamilyDegradesAlone(t *testing.T) {
 		}
 		return nil
 	}
-	names, v, err := recoverNames(t, f, Options{}, promql.Selector{}, []string{"checkout"})
-	require.NoError(t, err)
-	assert.False(t, v.JobAnnotationsDegraded, "a stage-1 degrade does not suppress the forward CronJob hop")
-	assert.Equal(t, []string{"web-7d9f-abc"}, names)
+	_, _, err := recoverNames(t, f, Options{}, promql.Selector{}, []string{"checkout"})
+	require.Error(t, err)
+	qe, ok := errors.AsType[*QueryError](err)
+	require.True(t, ok)
+	assert.Equal(t, string(promql.QJobAnnotations), qe.Query)
 }
 
 func TestReadScopedApplications_RequiredStageFails(t *testing.T) {

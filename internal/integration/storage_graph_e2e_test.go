@@ -31,16 +31,16 @@ kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumecl
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="rwx-0",persistentvolumeclaim="shared-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="rwx-1",persistentvolumeclaim="shared-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="catalog-0",persistentvolumeclaim="catalog-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_shop",volume="trident_pvc_catalog",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_other",volume="trident_pvc_other",test=%[1]q} 1 %[2]d
-qos_read_ops{cluster="ontap-prod",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 300 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm_idle",volume="vol_unclaimed",test=%[1]q} 1 %[2]d
-aggr_new_status{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",test=%[1]q} 1 %[2]d
-node_new_status{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 0 %[2]d
-node_labels{cluster="ontap-prod",node="ontap-prod-01",model="AFF-A400",version="9.14.1",vendor="NetApp",test=%[1]q} 1 %[2]d
-node_cpu_busy{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 72.5 %[2]d
-node_total_ops{cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 18500 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_shop",volume="trident_pvc_catalog",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-02",aggr="aggr2",svm="svm_other",volume="trident_pvc_other",test=%[1]q} 1 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-prod",svm="svm_shop",volume="trident_pvc_shared",test=%[1]q} 300 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm_idle",volume="vol_unclaimed",test=%[1]q} 1 %[2]d
+aggr_new_status{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",test=%[1]q} 1 %[2]d
+node_new_status{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 0 %[2]d
+node_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-01",model="AFF-A400",version="9.14.1",vendor="NetApp",test=%[1]q} 1 %[2]d
+node_cpu_busy{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 72.5 %[2]d
+node_total_ops{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-01",test=%[1]q} 18500 %[2]d
 ALERTS{alertname="KubePodObserved",alertstate="firing",severity="info",cluster="c1",namespace="shop",pod="rwx-0",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical",cluster="ontap-prod",aggr="aggr1",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 `, disc, t1))
@@ -169,15 +169,15 @@ kube_pod_info{cluster="c1",namespace="rvshop",pod="rv-0",uid="uid-rv-0",node="wo
 kube_node_info{cluster="c1",node="worker-rv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="c1",namespace="rvshop",persistentvolumeclaim="rv-data",storageclass="netapp-nas",volumename="pvc-rv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="rvshop",pod="rv-0",persistentvolumeclaim="rv-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="rv_unrelated",test=%[1]q} 1 %[2]d
-qos_read_ops{cluster="ontap-rv",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 300 %[2]d
-qos_read_ops{cluster="ontap-rv",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 50 %[2]d
-aggr_new_status{cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",test=%[1]q} 1 %[2]d
-aggr_new_status{cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",test=%[1]q} 1 %[2]d
-node_new_status{cluster="ontap-rv",node="rv-ctl-09",test=%[1]q} 1 %[2]d
-node_new_status{cluster="ontap-rv",node="rv-ctl-00",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",svm="rv_svm",volume="rv_unrelated",test=%[1]q} 1 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-rv",svm="rv_svm",volume="trident_pvc_rv",test=%[1]q} 300 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-rv",svm="rv_svm",volume="snap_trident_pvc_rv",test=%[1]q} 50 %[2]d
+aggr_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-09",aggr="rv-aggr9",test=%[1]q} 1 %[2]d
+aggr_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",aggr="rv-aggr0",test=%[1]q} 1 %[2]d
+node_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-09",test=%[1]q} 1 %[2]d
+node_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",test=%[1]q} 1 %[2]d
 `, disc, t1))
 	for _, series := range []string{
 		`volume_labels{volume="snap_trident_pvc_rv",test=` + strconv.Quote(disc) + `}`,
@@ -316,7 +316,7 @@ kube_pod_owner{cluster="c1",namespace="shop",pod="approot-orders-0",owner_kind="
 kube_pod_info{cluster="c1",namespace="shop",pod="approot-orders-0",uid="uid-approot-orders",node="worker-approot",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="approot-orders-0",persistentvolumeclaim="approot-data",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="approot-data",volumename="pvc-approot",storageclass="netapp-nas",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
-volume_labels{cluster="ontap-prod",node="ontap-prod-approot",aggr="aggr-approot",svm="svm_approot",volume="trident_pvc_approot",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-prod-approot",aggr="aggr-approot",svm="svm_approot",volume="trident_pvc_approot",test=%[1]q} 1 %[2]d
 kube_node_info{cluster="c1",node="worker-approot",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
 `, disc, t1, app))
 	s.Require().True(

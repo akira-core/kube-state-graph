@@ -15,7 +15,14 @@ import (
 // az- or env-scoped request can never be the request's doing and must not be
 // named — while the kubelet family, which DOES carry the matcher, still is.
 func TestWarnSelectorFamilyEmpty_NeverBlamesHarvest(t *testing.T) {
-	raw := map[string]int{string(promql.QPodInfo): 1} // KSM matched, every other family empty
+	// KSM matched, every other family issued and empty. tallySeries reports an
+	// issued family that matched nothing as a present 0.
+	raw := map[string]int{
+		string(promql.QPodInfo):                    1,
+		string(promql.QKubeletVolumeUsedBytes):     0,
+		string(promql.QKubeletVolumeCapacityBytes): 0,
+		string(promql.QVolumeLabels):               0,
+	}
 
 	for name, sel := range map[string]promql.Selector{
 		"az":  {AZ: []string{"zone-a"}},
@@ -32,6 +39,16 @@ func TestWarnSelectorFamilyEmpty_NeverBlamesHarvest(t *testing.T) {
 				"Harvest carries no matcher under %s, so its emptiness is not the request's doing", name)
 		})
 	}
+}
+
+// A family absent from the tally was never issued — a hub-mode storage build
+// whose claim scope came out empty reads no kubelet family at all — so its
+// emptiness says nothing about the request's labels.
+func TestWarnSelectorFamilyEmpty_NeverBlamesAnUnissuedFamily(t *testing.T) {
+	raw := map[string]int{string(promql.QPodInfo): 1}
+	buf := captureLogs(t)
+	warnSelectorFamilyEmpty(t.Context(), promql.Selector{Namespace: []string{"shop"}}, promql.LabelKeys{}, raw)
+	assert.Empty(t, buf.String())
 }
 
 // TestWarnSelectorFamilyEmpty_NeverBlamesAlerts pins the OTHER exclusion, on a

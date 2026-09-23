@@ -72,7 +72,7 @@ import (
 //	@Success		200			{object}	cytoscape.Body
 //	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, invalid_range, invalid_scope, outside_retention)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
-//	@Failure		502			{object}	errorBody	"Upstream VictoriaMetrics returned an error (RFC 9110 §15.6.3)"
+//	@Failure		502			{object}	errorBody	"A required upstream query returned an error (RFC 9110 §15.6.3); the message names the family (`upstream query failed: <family>`). Optional families — Harvest, kubelet, ALERTS and the degrading annotation / container families — log and continue instead"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout (RFC 9110 §15.6.5)"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/graph [get]
@@ -101,7 +101,9 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Summary		Get storage-flow graph (Cytoscape.js)
 //	@Description	Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
 //	@Description
-//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate so a filer shared across zones is never merged.
+//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.
+//	@Description
+//	@Description	**Volume hub**: a request carrying an `ontap_cluster`, `aggr` or `svm` root reads the claims FROM the rooted filer — the claims bound to the PersistentVolumes its FlexVol names embed (`pvc_<uid>`) — within the requested zone and environment, from the same backends and under the same `az` / `env` matchers as any other storage request. A filer shared across zones is drawn with the requested zone's claims only. A statically provisioned PV is not reached from a storage root. `cluster` / `namespace` still narrow.
 //	@Description
 //	@Description	**Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
 //	@Description
@@ -110,8 +112,8 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Produce		json
 //	@Param			start			query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
 //	@Param			end				query		string		true	"Window end. Must be > start."	example(2026-05-01T12:05:00Z)
-//	@Param			az				query		string		true	"Availability zone (required, single-valued)."	example(zone-a)
-//	@Param			env				query		string		true	"Environment (required, single-valued)."	example(prod)
+//	@Param			az				query		string		true	"Availability zone (required, single-valued). Narrows every Kubernetes and ALERTS query and selects the backends every query is sent to."	example(zone-a)
+//	@Param			env				query		string		true	"Environment (required, single-valued). Narrows every Kubernetes and ALERTS query."	example(prod)
 //	@Param			cluster			query		[]string	false	"Restrict to listed Kubernetes clusters (repeatable, OR-combined)."	collectionFormat(multi)
 //	@Param			namespace		query		[]string	false	"Restrict to listed namespaces (repeatable, OR-combined)."	collectionFormat(multi)
 //	@Param			ontap_cluster	query		[]string	false	"Storage root: ONTAP cluster name."	collectionFormat(multi)
@@ -124,7 +126,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Success		200				{object}	cytoscape.Body
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, invalid_scope, invalid_range)"
 //	@Failure		401				{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
-//	@Failure		502				{object}	errorBody	"Upstream VictoriaMetrics returned an error"
+//	@Failure		502				{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: <family>`)"
 //	@Failure		504				{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/storage-graph [get]
