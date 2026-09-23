@@ -560,6 +560,19 @@ ambiguous and attached to neither — a Kubernetes cluster and an ONTAP cluster
 that share a raw name cannot be disambiguated from labels alone. Missing
 `cluster` succeeds only when exactly one node of the eligible kind(s) matches.
 
+**Zone agreement.** When an alert carries both configured `az` / `env` labels,
+a candidate whose zone is known and different never matches it. A Kubernetes
+object's zone is the pair its cluster identity was composed from; a NetApp
+controller's or aggregate's is every pair its ONTAP cluster's entity-naming
+Harvest series carried (`volume_labels`, `aggr_*`, `node_*`, `system_node_*`).
+The check applies to the cluster-qualified aggregate and controller lookups
+(a cluster-qualified Kubernetes lookup is already zone-exact through the
+identity) and removes other-zone candidates BEFORE the missing-`cluster`
+uniqueness test, so a same-named object in another zone neither absorbs an
+alert nor makes it ambiguous. An unknown zone on either side never excludes.
+It matters most in a hub-mode storage build, whose `ALERTS` read spans every
+zone while its Harvest read stays in the requested one.
+
 Operator precondition: the alerting store MUST stamp the same `az` / `env`
 external labels as kube-state-metrics, or its alerts vanish under those
 filters. `FamilyAlerts` is excluded from the `selector_family_empty` Warn — an

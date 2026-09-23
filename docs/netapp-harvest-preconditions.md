@@ -159,9 +159,20 @@ kube-state-metrics and kubelet families only. The Harvest family is **routed**
 by zone instead — `?az=` selects which `harvest` backend of the routing table is
 asked (see `upstream-backend-routing.md`) and the query it receives carries no
 request matcher. Stamping the configured `az` / `env` labels onto Harvest series
-is therefore unnecessary; a deployment that already does so keeps working
-unchanged, since the labels are simply not read. `?env=` has no effect on the
+is therefore unnecessary for the graph itself. `?env=` has no effect on the
 Harvest legs at all.
+
+When the labels ARE present, the build reads them for one purpose: matching
+alerts. Each ONTAP cluster collects the `az` / `env` pairs carried by its
+entity-naming series (`volume_labels`, `aggr_*`, `node_*`, `system_node_*` — not
+the QoS families), and an alert naming that filer's aggregate or controller
+attaches only when its own `az` / `env` pair is one of them. This keeps another
+zone's alert about an identically named filer off this one, which matters
+whenever a build reads alerts from zones whose Harvest stores it did not read —
+every `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=`
+does. A filer whose series carry no pair, or an alert without one, matches on
+the ONTAP cluster name alone, exactly as before. Only series carrying BOTH
+labels count; a half-stamped series is ignored.
 
 Three coverage signals, each gated on its OWN family being present:
 

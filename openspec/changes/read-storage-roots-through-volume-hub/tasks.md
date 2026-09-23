@@ -62,3 +62,11 @@
 ## 10. Gate
 
 - [x] 10.1 Run `make lint vet test` and `openspec validate read-storage-roots-through-volume-hub --strict`; both clean
+
+## 11. Zone-agreeing alert match (D11)
+
+- [x] 11.1 Collect, per ONTAP cluster, the `(az, env)` pairs carried by the entity-naming Harvest series (`volume_labels`, `aggr_*`, the controller families), counting only series with both configured labels; carry the result on `Topology` beside the cluster resolver; verify a `pkg/build` case for a stamped filer, an unstamped filer (empty set) and a half-stamped series (not counted)
+- [x] 11.2 Carry a zone per alert-index candidate — the ONTAP zone set for controllers and aggregates, the composed identity's components for pods, claims and Kubernetes nodes — and read the alert's pair through the configured `LabelKeys`
+- [x] 11.3 Reject a cluster-qualified aggregate or controller candidate whose known zone set lacks the alert's pair; filter every kind's no-`cluster` candidates to unknown-or-agreeing zones before `matchUnique`; verify `alerts_test.go` cases for every new `alert-overlay` scenario (own zone attached, other zone unmatched for aggregate and controller, unstamped Harvest falls back, no-`cluster` disambiguated by zone, no-`cluster` other-zone-only unmatched) and that every existing case is unchanged
+- [x] 11.4 Add a hub-mode build case where a zone-b alert names the rooted zone-a filer's aggregate and a zone-a alert names it too; verify only the zone-a alert is on the aggregate and its `data.status` folds from it alone
+- [x] 11.5 Update `CLAUDE.md` (alert overlay + Harvest precondition) and `docs/netapp-harvest-preconditions.md`; run `make lint vet test` and `openspec validate read-storage-roots-through-volume-hub --strict`

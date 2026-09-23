@@ -31,6 +31,11 @@ Three things a client can see:
   can now carry several zones' cluster identities — read `clusters[]` /
   `labels.cluster` rather than assuming the request's zone. `cluster` and
   `namespace` still narrow; `az` and `env` stay required and single-valued.
+  Alerts from every zone reach the overlay, but one attaches only to a node of
+  its own zone: a Kubernetes object through its cluster identity, a NetApp
+  aggregate or controller through the `az` / `env` its Harvest series carry.
+  The rule applies on every endpoint; it only changes a body where an alert's
+  `az` / `env` disagreed with its target's — which, before, attached it anyway.
 - **Statically provisioned PVs are not reached from a storage root.** A claim
   bound to a PV whose name embeds no `pvc_` (a static PV, a provisioner with a
   custom volume-name prefix or a Trident `nameTemplate`) draws no path in a

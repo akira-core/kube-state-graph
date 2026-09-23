@@ -67,6 +67,13 @@ directly, and the claim chain can be read forward from them, in every zone.
 8. **Hub coverage signal.** A new aggregated warning reports when the rooted
    Harvest rows yielded no PV candidate, or candidates that named no claim — the
    case that is silent today.
+9. **Alert matching agrees on zone.** Because hub mode reads every zone's
+   `ALERTS`, an alert's `az` / `env` pair must agree with the zone of the node it
+   attaches to. NetApp controllers and aggregates take their zone from the
+   `az` / `env` their Harvest series carry, Kubernetes objects from their cluster
+   identity; a known, different zone never matches, and an unknown one falls back
+   to today's label comparison. Also fixes a no-`cluster` alert on a request-zone
+   pod turning ambiguous once another zone's same-named pod is loaded.
 
 **Sequencing.** This change goes AFTER `fail-storage-graph-on-any-leg-error`.
 That change renames three `storage-graph-api` requirements this change modifies
@@ -96,6 +103,8 @@ None.
   and **Application-rooted recovery reads of the owner and annotation families** —
   hub mode drops the `az` / `env` matchers and `az` routing on the Kubernetes
   families, and reads the claim families by reference.
+- `alert-overlay`: **Label-set matching to graph nodes** — a zone-agreement rule
+  over the alert's `az` / `env` and the candidate node's zone.
 - `netapp-storage-graph`: **Harvest legs under request-scoped selectors** — the
   "narrowed by reference through the loaded claims" statement gains the hub-mode
   direction (claims loaded FROM the rooted Harvest rows), and the `volume_labels`
@@ -112,6 +121,8 @@ None.
 - `pkg/build/topology.go` — wave wiring: claim families gated on phase 1, pods
   gated on the claim families.
 - `pkg/build/build.go` — relaxed selector and routing in hub mode.
+- `pkg/build/alerts.go`, `pkg/build/netapp.go` — per-ONTAP-cluster zone sets and
+  the zone-agreeing alert match.
 - `pkg/promql` — `scopedLabel` entries for the five claim-keyed families; an
   SVM-rooted and an aggregate-completion renderer for `volume_labels`; an optional
   querier-source upgrade that binds ONE routing snapshot with `az` applied to the

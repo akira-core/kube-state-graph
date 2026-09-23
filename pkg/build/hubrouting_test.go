@@ -32,21 +32,33 @@ type hubZonesFixture struct {
 
 func newHubZonesFixture(t *testing.T) hubZonesFixture {
 	t.Helper()
+	k8sA, k8sB, netappA, netappB := hubZonesStores()
+	return newHubZonesFixtureFrom(t, k8sA, k8sB, netappA, netappB)
+}
+
+// hubZonesStores is the per-backend content of hubZonesFixture, returned
+// separately so a case can add series to one store before the fakes are built.
+func hubZonesStores() (k8sA, k8sB, netappA, netappB map[promql.Query]model.Vector) {
 	ontapProd := []vlrVol{
 		{"trident_pvc_aaaa", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 300},
 		{"trident_pvc_bbbb", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 200},
 	}
-	f := hubZonesFixture{
-		k8sA: promqlfake.New(hubEstate(nil, []hubClaim{
+	return hubEstate(nil, []hubClaim{
 			{ns: "shop", claim: "orders-data", pv: "pvc-aaaa", pods: []string{"orders-0"}},
-		})),
-		k8sB: promqlfake.New(hubEstate(nil, []hubClaim{
+		}), hubEstate(nil, []hubClaim{
 			{ns: "shop", claim: "orders-data", pv: "pvc-bbbb", pods: []string{"orders-0"}, az: "zone-b"},
-		})),
-		netappA: promqlfake.New(vlrHarvest(ontapProd)),
-		netappB: promqlfake.New(vlrHarvest([]vlrVol{
+		}), vlrHarvest(ontapProd), vlrHarvest([]vlrVol{
 			{"trident_pvc_cccc", "ontap-lab", "ontap-lab-01", "aggr1", "svm_lab", 5},
-		})),
+		})
+}
+
+func newHubZonesFixtureFrom(t *testing.T, k8sA, k8sB, netappA, netappB map[promql.Query]model.Vector) hubZonesFixture {
+	t.Helper()
+	f := hubZonesFixture{
+		k8sA:    promqlfake.New(k8sA),
+		k8sB:    promqlfake.New(k8sB),
+		netappA: promqlfake.New(netappA),
+		netappB: promqlfake.New(netappB),
 	}
 	k8s := []promql.Family{promql.FamilyKSM, promql.FamilyKubelet, promql.FamilyServiceGraph, promql.FamilyProbe, promql.FamilyAlerts}
 	tbl, err := promql.NewTable([]promql.Backend{
@@ -102,6 +114,50 @@ func TestBuildStorage_HubReadsClaimsInEveryZone(t *testing.T) {
 	// Task 6.3: a raw cluster name reused across zones stays two identities.
 	assert.Equal(t, []string{"zone-a-prod-c1", "zone-b-prod-c1"}, body.Clusters)
 	require.NotEmpty(t, vlrPaths(body))
+}
+
+// withZone returns a copy of a store whose every series also carries the
+// given az / env pair — a Harvest store stamped the way this estate's
+// collectors stamp every family.
+func withZone(store map[promql.Query]model.Vector, az, env string) map[promql.Query]model.Vector {
+	out := make(map[promql.Query]model.Vector, len(store))
+	for q, vec := range store {
+		cp := make(model.Vector, 0, len(vec))
+		for _, s := range vec {
+			m := s.Metric.Clone()
+			m["az"], m["env"] = model.LabelValue(az), model.LabelValue(env)
+			cp = append(cp, &model.Sample{Metric: m, Value: s.Value, Timestamp: s.Timestamp})
+		}
+		out[q] = cp
+	}
+	return out
+}
+
+// Task 11.4 / design D11: the relaxed hub read reaches zone-b's alert store,
+// which holds an alert naming ontap-prod / aggr1 for zone-b's own
+// (identically named) filer. Only the zone-a alert may reach the rooted
+// zone-a aggregate, so its status folds from the warning alone.
+func TestBuildStorage_HubAlertsAgreeOnZone(t *testing.T) {
+	k8sA, k8sB, netappA, netappB := hubZonesStores()
+	alert := func(name, severity, az string) *model.Sample {
+		return planHarvest("alertname", name, "alertstate", graph.AlertStateFiring, "severity", severity,
+			"az", az, "env", "prod", "cluster", "ontap-prod", "aggr", "aggr1")
+	}
+	k8sA[promql.QAlerts] = model.Vector{alert("AggrFillingA", "warning", "zone-a")}
+	k8sB[promql.QAlerts] = model.Vector{alert("AggrFillingB", "critical", "zone-b")}
+	f := newHubZonesFixtureFrom(t, k8sA, k8sB, withZone(netappA, "zone-a", "prod"), netappB)
+
+	scope := vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil)
+	g, err := New(f.router, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.NoError(t, err)
+	require.NotEmpty(t, f.k8sB.QueriesFor(promql.QAlerts), "the relaxed read does reach zone-b's alerts")
+
+	aggr, ok := g.NodesByID[graph.NetAppAggrID("ontap-prod", "aggr1")]
+	require.True(t, ok)
+	assert.Equal(t,
+		[]graph.Alert{{Name: "AggrFillingA", State: graph.AlertStateFiring, Severity: "warning"}},
+		aggr.Alerts(), "the zone-b alert names another zone's filer and stays off")
+	assert.Equal(t, graph.StatusWarning, aggr.Status())
 }
 
 // Task 8.2: the pre-change read — the same request with the storage roots

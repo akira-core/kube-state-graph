@@ -279,6 +279,61 @@ failures that are silent today:
 Counts of volumes, candidates, claims and bindings are also logged at Debug on
 every hub build.
 
+### D11 — Alert matching agrees on zone
+
+D7 drops `az` / `env` from `ALERTS`, so a hub build reads every zone's firing
+alerts while its Harvest read stays in the requested zone (D8). The Kubernetes
+kinds were already safe: a cluster-qualified alert resolves through
+`clusterResolver.identify`, which composes the identity from the ALERT's own
+`az` / `env`, so a zone-b alert cannot find a zone-a pod. The NetApp kinds were
+not — `matchAggr` and the controller side of `matchNodeShaped` compare the raw
+`cluster` label against `ontap_cluster` alone, so a zone-b alert about an
+equally named filer's `aggr1` landed on the zone-a aggregate and moved its
+`data.status`.
+
+The fix uses a fact the build already reads and throws away: every Harvest
+series this estate carries is stamped with `az` / `env` beside the ONTAP
+`cluster`. The topology read collects, per ONTAP cluster, the set of
+`(az, env)` pairs its entity-naming series (`volume_labels`, `aggr_*`, the
+controller families) carry — only series carrying BOTH configured labels count,
+mirroring the identity ladder's compose step. The alert index then carries a
+zone per candidate: the zone set of its ONTAP cluster for controllers and
+aggregates, the components of its composed identity for pods, claims and
+Kubernetes nodes. `resolveOneAlert` reads the alert's pair with the same
+configured `LabelKeys` and:
+
+- rejects a cluster-qualified NetApp candidate whose zone set is known and lacks
+  the pair (the Kubernetes candidates need no check there — see above);
+- filters the no-`cluster` uniqueness candidates of every kind to those whose
+  zone is unknown or agrees, BEFORE `matchUnique`, so a same-named object in
+  another zone neither absorbs the alert nor makes it ambiguous. This also
+  covers the Kubernetes regression the relaxed read introduced: a request-zone
+  pod whose alert carries no `cluster` stayed unique in a single-zone build and
+  turned ambiguous once hub mode loaded another zone's same-named pod.
+
+Unknown never excludes: an alert with no pair, or a candidate whose series
+carried none, falls back to the label comparison. That keeps the
+"Harvest series need not carry `az` / `env`" precondition of
+`netapp-storage-graph` intact — the pair SCOPES matching when present and is
+never required. The zones are keyed by ONTAP cluster rather than per entity
+because a filer lives in one zone; a set rather than a single pair keeps an
+estate that reuses a filer name across zones (whose ids already merge today)
+no worse than before — the alert matches iff one of the merged filers shares its
+zone.
+
+Alternatives rejected:
+
+- **Filter NetApp matches on the REQUEST's `az` / `env` in hub mode.** Correct
+  only while the Harvest backends are zone-declared; a catch-all Harvest backend
+  returns every zone's filers and the filter would drop their alerts. It also
+  leaves the no-`cluster` Kubernetes regression in place.
+- **Compose a NetApp identity `<az>-<env>-<ontap_cluster>` into the node ids.**
+  Solves cross-zone filer-name reuse too, but moves every NetApp id, the PVC
+  `labels.aggr` value and every golden, for an estate where filer names do not
+  repeat. Deferred until one does.
+- **Add `labels.az` / `labels.env` to nodes.** A wire change the matcher does
+  not need; the zone lives in the build-internal index only.
+
 ## Risks / Trade-offs
 
 - [Static PVs are not found from a storage root] → Documented limitation in
@@ -296,7 +351,16 @@ every hub build.
 - [One extra sequential round-trip] → Accepted; the Kubernetes waves shrink from
   zone-wide to claim-proportional.
 - [Relaxed `ALERTS` reads every zone's firing alerts] → Firing-only, small; alerts
-  still attach only to loaded entities.
+  still attach only to loaded entities, and D11 keeps another zone's alert off a
+  same-named NetApp entity or no-`cluster` Kubernetes object. The overlay now
+  depends on every zone's alert store; `ALERTS` stays optional, so an outage
+  there degrades the overlay rather than failing the build.
+- [Hub mode's Kubernetes reads fan out to every zone's backend and fail closed]
+  → A storage-rooted request now fails when ANY zone's kube-state-metrics or
+  kubelet store is down, not only the requested zone's. Accepted: a partial
+  fan-out would draw a plausible, smaller, wrong body — the routing D6 rule.
+  The 502 names the failing family; the backend shows in
+  `kube_state_graph_backend_query_failures_total{backend}`.
 - [An embedder's `QuerierSource` lacks the upgrade] → Falls back to zone routing
   everywhere; body correct for the zone, cross-zone discovery lost.
 - [Claim-binding exporter labels only `claim_name`] → Out of the documented

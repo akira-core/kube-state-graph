@@ -191,6 +191,12 @@ type Topology struct {
 	// store's cluster names through the SAME table — a second resolver could
 	// hold a different one and the two would silently disagree.
 	clusters *clusterResolver
+
+	// ontapZones is the `az` / `env` zone set of every ONTAP cluster the
+	// Harvest read named, for the zone-agreeing alert match
+	// (read-storage-roots-through-volume-hub D11). Nil when no Harvest series
+	// carried the pair, which leaves NetApp alerts matching by label alone.
+	ontapZones map[string][]alertZone
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It
@@ -1224,6 +1230,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		ClustersObserved:    clusterList,
 		ClusterIdentities:   mc.snapshot(),
 		clusters:            mc,
+		ontapZones:          ontapZonesOf(v, mc.keys),
 	}
 }
 
