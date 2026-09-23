@@ -122,6 +122,16 @@ component, so it cannot be retained.
 Completion waits on phase 1 alone and runs in parallel with the claim chain; the
 parse waits on it.
 
+Phase-2-only aggregates need the same treatment under an `svm=` root.
+`pickAggr` and `pickSVM` are separate picks, so a claim with a rooted-SVM
+candidate on `aggr9` and a clone on another SVM's `aggr0` picks `aggr0` while
+its SVM stays the rooted one: the unit is retained and draws `aggr0` with an
+owner voted over the clone alone. After phase 2 returns, the build therefore
+completes every aggregate a phase-2 row names that no earlier read covered. It
+usually issues nothing (phase 2 mostly re-reads phase-1 series); `aggr=` and
+`ontap_cluster=` roots never need it, because a unit they retain is on a
+rooted aggregate or filer that phase 1 read whole.
+
 *Alternatives rejected:* owner from the `aggr_*` gauge `node` (changes owner
 semantics during HA takeover, moves goldens); skipping completion (vote drift on
 exactly the takeover case the vote exists for).

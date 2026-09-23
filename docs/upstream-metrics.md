@@ -257,6 +257,10 @@ components, in phases:
    the aggregates an `aggr=` root already read whole —
    `volume_labels{cluster="…",aggr=~"…"}`, one chunked query per ONTAP cluster.
    Its rows feed the owner vote and the inventory, never the hub's claim read.
+   Once phase 2 (below) has returned, the same read runs again for every
+   aggregate phase 2 ALONE named: the aggregate and SVM picks are separate, so
+   a claim retained through its rooted SVM can land on a clone's aggregate. It
+   usually issues nothing.
 3. **Phase 2 — candidate recovery.** A claim's aggregate and SVM are picked
    lexically-smallest over its *whole* candidate set, so a Trident clone or a
    same-named FlexVol on a second filer could otherwise move a claim onto or off

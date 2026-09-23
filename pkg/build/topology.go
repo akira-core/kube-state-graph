@@ -683,7 +683,11 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
 			continue
 		}
-		if raw[string(q)] == 0 && sel.Reaches(q) {
+		// Present-and-zero only: a family absent from the tally was never
+		// issued (a hub-mode claim family whose claim scope came out empty),
+		// so it returned nothing because nothing asked, not because a label
+		// is missing.
+		if n, issued := raw[string(q)]; issued && n == 0 && sel.Reaches(q) {
 			empty = append(empty, string(q))
 		}
 	}

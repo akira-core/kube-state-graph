@@ -157,9 +157,13 @@ func issueClaimKeyed(
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		return issueScopedFamilies(gctx, q, window, end, opts, sel, v, scopeMu, scoped)
-	})
+	if len(scoped) > 0 {
+		g.Go(func() (err error) {
+			// Chunking runs here, outside issueScopedChunk's per-query recover.
+			defer recoverScopedPanic(gctx, scoped[0].query, &err)
+			return issueScopedFamilies(gctx, q, window, end, opts, sel, v, scopeMu, scoped)
+		})
+	}
 	for _, f := range wide {
 		g.Go(func() error {
 			out, err := issueUnrestricted(gctx, q, f.query, window, end, opts.LabelKeys, sel)
@@ -259,9 +263,17 @@ func readHubClaimInfo(
 		return err
 	}
 	if len(v.PVCInfo) == 0 {
-		slog.WarnContext(ctx, "storage_root_claim_miss",
+		// Under a cluster= / namespace= filter an empty claim read is the
+		// filter's ordinary outcome — the rooted filer serves other namespaces
+		// — not a whole-hub miss, so it is not worth an operator's attention.
+		level := slog.LevelWarn
+		if sel.Active() {
+			level = slog.LevelDebug
+		}
+		slog.Log(ctx, level, "storage_root_claim_miss",
 			"reason", "no_claim",
-			"candidates", len(cands))
+			"candidates", len(cands),
+			"selector_active", sel.Active())
 	}
 	return nil
 }
@@ -270,7 +282,10 @@ func readHubClaimInfo(
 // environment labels are part of it because a hub-mode read spans every zone
 // and environment: a claim name is unique only per namespace, and a raw
 // cluster name is reused across zones, so (az, env, cluster) is the claim's
-// cluster identity — the key every structure of the parse is built on.
+// cluster identity — the key every structure of the parse is built on. The
+// cluster is bucketed exactly as the parse buckets it (bucketCluster): an
+// absent label and a literal `unknown` are one cluster there, so they must be
+// one here, or the filter would drop a row the parse joins.
 type hubClaimKey struct {
 	az, env, cluster, namespace, claim string
 }
@@ -279,7 +294,7 @@ func hubClaimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) hubClaim
 	return hubClaimKey{
 		az:        string(m[model.LabelName(keys.AZ)]),
 		env:       string(m[model.LabelName(keys.Env)]),
-		cluster:   string(m["cluster"]),
+		cluster:   bucketCluster(string(m["cluster"])),
 		namespace: string(m["namespace"]),
 		claim:     claim,
 	}
@@ -352,13 +367,14 @@ func readHubClaimFamilies(
 	return issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams)
 }
 
-// recoverScopedPanic converts a panic in a hub read into the build's error,
-// for the reason fetch recovers its own: errgroup does not propagate a
-// goroutine panic to Wait, and scope computation runs outside any per-query
-// recover.
+// recoverScopedPanic converts a panic in a hub or rooted volume-label read into
+// the build's error, for the reason fetch recovers its own: errgroup does not
+// propagate a goroutine panic to Wait, and scope computation runs outside any
+// per-query recover. Defer it in EVERY goroutine that computes a scope: a
+// recover only catches a panic raised on its own goroutine.
 func recoverScopedPanic(ctx context.Context, name promql.Query, err *error) {
 	if rec := recover(); rec != nil {
-		slog.ErrorContext(ctx, "panic in hub claim query",
+		slog.ErrorContext(ctx, "panic in scoped topology read",
 			"query", string(name),
 			"panic", fmt.Sprint(rec),
 			"stack", string(debug.Stack()),

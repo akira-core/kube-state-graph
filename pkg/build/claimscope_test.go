@@ -222,7 +222,21 @@ func TestVolumeHub_CandidatesNamingNoClaim(t *testing.T) {
 	miss := claimMisses(recs)
 	require.Len(t, miss, 1)
 	assert.Equal(t, "no_claim", miss[0]["reason"])
+	assert.Equal(t, "WARN", miss[0]["level"])
 	assert.InDelta(t, 1.0, miss[0]["candidates"], 1e-9)
+
+	t.Run("a namespace filter excluding every claim is not a hub miss", func(t *testing.T) {
+		vols, claims := hubBase()
+		sel := promql.Selector{AZ: vlrSel.AZ, Env: vlrSel.Env, Namespace: []string{"elsewhere"}}
+		recs := captureDebugRecords(t, func() {
+			_, err := New(promqlfake.New(hubEstate(vols, claims)), Options{}, nil, nil).
+				BuildStorage(t.Context(), time.Minute, vlrEnd, sel, scope.Roots)
+			require.NoError(t, err)
+		})
+		miss := claimMisses(recs)
+		require.Len(t, miss, 1)
+		assert.Equal(t, "DEBUG", miss[0]["level"], "the filter's ordinary outcome stays out of Warn")
+	})
 }
 
 // Spec: "Root volumes produce no candidate" — and no coverage warning on their

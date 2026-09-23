@@ -65,15 +65,19 @@ import (
 // them, which is what keeps the takeover case (the series of one aggregate
 // naming two controllers) byte-identical.
 //
-// What that does NOT cover, and why the body is still safe: an aggregate seen
-// only through phase 2 — a clone's aggregate, say — votes over the one or two
-// of its volumes a claim's token happened to match, and can elect a different
-// controller than the whole filer would. Such an aggregate is never DRAWN: it
-// is not a root, and the unit whose claim reached it does not intersect the
-// rooted ids, so ProjectStorage drops it and pullNetAppParents never reaches
-// its controller. That invariant lives in pkg/graph, not here, so widening
-// resolveStorageRoots would start drawing a controller chosen from a partial
-// vote — TestRootedVolumeLabels_PhaseTwoOnlyAggregateIsNeverDrawn pins it.
+// An aggregate seen only through phase 2 — a clone's aggregate, say — votes
+// over the one or two of its volumes a claim's token happened to match, and can
+// elect a different controller than the whole filer would. Under ontap_cluster=
+// and aggr= roots alone such an aggregate is never DRAWN: it is not a root, and
+// the unit whose claim reached it does not intersect the rooted ids, so
+// ProjectStorage drops it and pullNetAppParents never reaches its controller —
+// TestRootedVolumeLabels_PhaseTwoOnlyAggregateIsNeverDrawn pins it. An svm=
+// root breaks that argument: pickAggr and pickSVM are separate picks over the
+// claim's candidates, so a claim can land on a phase-2-only aggregate while its
+// SVM is the rooted one, and the unit is retained through the SVM. Under an
+// svm= root the build therefore completes the aggregates phase 2 alone named
+// as well, after phase 2 returns (readVolumeLabelsTail) —
+// TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates pins it.
 
 // phaseOneGroup names which phase-1 query group a rendered query belongs to.
 // Owner completion reads the SVM group's rows alone.
@@ -338,16 +342,7 @@ func readRootedVolumeLabels(
 		// The same guard fetch puts on this leg. errgroup does not propagate a
 		// goroutine panic to Wait, so an unrecovered one here kills the process
 		// rather than becoming a sanitised 500.
-		defer func() {
-			if rec := recover(); rec != nil {
-				slog.ErrorContext(ctx, "panic in rooted volume-label query",
-					"query", string(promql.QVolumeLabels),
-					"panic", fmt.Sprint(rec),
-					"stack", string(debug.Stack()),
-				)
-				err = fmt.Errorf("panic in %s query: %v", promql.QVolumeLabels, rec)
-			}
-		}()
+		defer recoverScopedPanic(ctx, promql.QVolumeLabels, &err)
 
 		rendered := make([]string, len(queries))
 		for i, r := range queries {
@@ -378,7 +373,9 @@ func readRootedVolumeLabels(
 // are none). Keyed by ONTAP cluster, each aggregate set sorted.
 //
 // A row with an empty `aggr` (a FlexGroup) names no aggregate and completes
-// nothing: there is no single aggregate whose vote it could skew.
+// nothing: there is no single aggregate whose vote it could skew. Nor does a
+// row with an empty ONTAP `cluster`: the join never keys an aggregate without
+// one (pickAggr and the owner index both skip it), so no vote could move.
 func ownerCompletionTargets(svmRows model.Vector, plan topologyPlan) map[string][]string {
 	readWhole := func(cluster, aggr string) bool {
 		if !slices.Contains(plan.volumeAggrs, aggr) {
@@ -390,7 +387,7 @@ func ownerCompletionTargets(svmRows model.Vector, plan topologyPlan) map[string]
 	for _, s := range svmRows {
 		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
 		aggr := string(s.Metric["aggr"])
-		if aggr == "" || readWhole(cluster, aggr) {
+		if aggr == "" || cluster == "" || readWhole(cluster, aggr) {
 			continue
 		}
 		out[cluster] = append(out[cluster], aggr)
@@ -402,25 +399,40 @@ func ownerCompletionTargets(svmRows model.Vector, plan topologyPlan) map[string]
 	return out
 }
 
-// readOwnerCompletion re-reads, whole, every aggregate the SVM group touched
-// but no aggregate group read whole, one chunked query per ONTAP cluster, so
-// the owning-controller vote runs over the aggregate's full population.
+// withoutTargets returns the completion targets of want that done does not
+// already hold, keyed and sorted as ownerCompletionTargets keys them. A cluster
+// left with no aggregate is dropped.
+func withoutTargets(want, done map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for c, aggrs := range want {
+		rest := slices.DeleteFunc(slices.Clone(aggrs), func(a string) bool {
+			return slices.Contains(done[c], a)
+		})
+		if len(rest) > 0 {
+			out[c] = rest
+		}
+	}
+	return out
+}
+
+// readOwnerCompletion re-reads, whole, every target aggregate, one chunked
+// query per ONTAP cluster, so the owning-controller vote runs over the
+// aggregate's full population. The targets are ownerCompletionTargets of the
+// SVM group's rows — and, under an svm= root, of the phase-2 rows that named an
+// aggregate no earlier read covered (readVolumeLabelsTail).
 //
 // Its rows feed the owner vote and the storage inventory only: they are merged
 // into the family AFTER the hub's claim read has taken its candidates from
 // phase 1, so a claim on another SVM of a touched aggregate — on no rooted
-// component — is never loaded through them. A request with no svm= root, or
-// whose SVM rows name only aggregates already read whole, issues nothing.
+// component — is never loaded through them. No target issues nothing.
 func readOwnerCompletion(
 	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
 	end time.Time,
 	opts Options,
-	plan topologyPlan,
-	svmRows model.Vector,
+	targets map[string][]string,
 ) (model.Vector, error) {
-	targets := ownerCompletionTargets(svmRows, plan)
 	if len(targets) == 0 {
 		return nil, nil
 	}
@@ -519,6 +531,13 @@ func readTokenScopedVolumeLabels(
 // and the parse read the merged result; the caller closes their done-channel
 // when this returns.
 //
+// Under an svm= root it then completes the aggregates phase 2 ALONE named —
+// neither read whole by an aggregate group nor completed above — and merges
+// those rows last. A claim retained through its rooted SVM can land on such an
+// aggregate (pickAggr and pickSVM are separate picks), so its owner vote must
+// run over the whole aggregate too. In the common case phase 2 re-reads only
+// series phase 1 already holds and this issues nothing.
+//
 // The merge writes v.VolumeLabels, which the hub's claim-info read reads, so it
 // happens only once pvcInfoDone has been OBSERVED closed — phase 2 waits on it
 // — and never on a path where the build is already failing.
@@ -533,19 +552,11 @@ func readVolumeLabelsTail(
 	svmRows *model.Vector,
 	phaseOneDone, pvcInfoDone <-chan struct{},
 ) (err error) {
-	// matchedClaimTokens, the target computation and the chunking run outside
-	// any per-query recover, in an errgroup goroutine whose panic would
-	// otherwise take the process down.
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.ErrorContext(ctx, "panic in volume-label tail read",
-				"query", string(promql.QVolumeLabels),
-				"panic", fmt.Sprint(rec),
-				"stack", string(debug.Stack()),
-			)
-			err = fmt.Errorf("panic in %s query: %v", promql.QVolumeLabels, rec)
-		}
-	}()
+	// The target computation, matchedClaimTokens and the chunking run outside
+	// any per-query recover, in errgroup goroutines whose panic would
+	// otherwise take the process down. The nested goroutines below carry their
+	// own guard: a recover only catches a panic of its own goroutine.
+	defer recoverScopedPanic(ctx, promql.QVolumeLabels, &err)
 	select {
 	case <-phaseOneDone:
 	case <-ctx.Done():
@@ -554,13 +565,16 @@ func readVolumeLabelsTail(
 		return nil
 	}
 
+	completed := ownerCompletionTargets(*svmRows, plan)
 	var completion, phaseTwo model.Vector
 	tail, tctx := errgroup.WithContext(ctx)
 	tail.Go(func() (err error) {
-		completion, err = readOwnerCompletion(tctx, q, window, end, opts, plan, *svmRows)
+		defer recoverScopedPanic(tctx, promql.QVolumeLabels, &err)
+		completion, err = readOwnerCompletion(tctx, q, window, end, opts, completed)
 		return err
 	})
 	tail.Go(func() (err error) {
+		defer recoverScopedPanic(tctx, promql.QVolumeLabels, &err)
 		select {
 		case <-pvcInfoDone:
 		case <-tctx.Done():
@@ -578,6 +592,14 @@ func readVolumeLabelsTail(
 		// is failing anyway; do not write.
 		return nil
 	}
-	v.VolumeLabels = mergeVolumeLabels(mergeVolumeLabels(v.VolumeLabels, completion), phaseTwo)
+	var late model.Vector
+	if len(plan.volumeSVMs) > 0 {
+		late, err = readOwnerCompletion(ctx, q, window, end, opts,
+			withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed))
+		if err != nil {
+			return err
+		}
+	}
+	v.VolumeLabels = mergeVolumeLabels(mergeVolumeLabels(mergeVolumeLabels(v.VolumeLabels, completion), phaseTwo), late)
 	return nil
 }

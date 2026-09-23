@@ -891,7 +891,10 @@ live under `openspec/specs/`.
     exactly the claims phase 1 matched, because `pickAggr` / `pickSVM` are
     lexically-smallest over a claim's WHOLE candidate set and a Trident clone or a
     same-named FlexVol on a second filer would otherwise move a claim onto or off
-    the rooted aggregate. Completion and phase 2 are merged (fingerprint de-dup —
+    the rooted aggregate. Under an `svm=` root, every aggregate phase 2 ALONE
+    named is completed too, after phase 2: the two picks are separate, so a
+    claim retained through its rooted SVM can land on such an aggregate and draw
+    its controller. Completion and phase 2 are merged (fingerprint de-dup —
     a series two reads return must vote once in `pickOwner`) only AFTER the hub's
     claim read took its candidates from phase 1, so completion rows are never a
     claim source. It is the FORWARD derivation the join already computes. Phase 2

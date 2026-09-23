@@ -1134,6 +1134,46 @@ func TestRootedVolumeLabels_OwnerCompletionPreservesTheTakeoverVote(t *testing.T
 	})
 }
 
+// pickAggr and pickSVM are separate picks, so under an svm= root a claim can
+// land on an aggregate only phase 2 saw — a clone's, on another SVM — while its
+// SVM is the rooted one. The unit is retained through the SVM and draws that
+// aggregate and its controller, so the aggregate's owner vote must run over
+// its whole population, exactly as an unrestricted read gives it.
+func TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates(t *testing.T) {
+	fx := vlrEstate(vlrHarvest([]vlrVol{
+		{"trident_pvc_orders", "ontap-prod", "ontap-prod-09", "aggr9", "svm_shop", 300},
+		{"snap_trident_pvc_orders", "ontap-prod", "ontap-prod-05", "aggr0", "svm_zzz", 50},
+		{"prod_unrelated_1", "ontap-prod", "ontap-prod-01", "aggr0", "svm_zzz", 7},
+	}))
+	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	restricted, _, body := vlrParity(t, fx, scope, Options{})
+
+	ids := vlrIDs(body)
+	assert.True(t, ids["netapp/ontap-prod/aggr/aggr0"], "the claim picks aggr0 and is retained through svm_shop")
+	assert.True(t, ids["netapp/ontap-prod/ontap-prod-01"], "aggr0's owner is voted over every aggr0 series")
+	assert.False(t, ids["netapp/ontap-prod/ontap-prod-05"], "not over the clone alone")
+	assert.Equal(t, []string{
+		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr9"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr0"}[1m])`,
+	}, completionQueries(restricted), "aggr9 completed after phase 1, aggr0 after phase 2")
+
+	t.Run("no svm root, no phase-2 completion", func(t *testing.T) {
+		restricted, _, _ := vlrParity(t, fx, vlrScope(t, nil, nil, []string{"aggr9"}, nil, nil), Options{})
+		assert.Empty(t, completionQueries(restricted),
+			"an aggregate root never retains a unit through a phase-2-only aggregate")
+	})
+}
+
+func TestWithoutTargets(t *testing.T) {
+	got := withoutTargets(
+		map[string][]string{"ontap-prod": {"aggr0", "aggr3", "aggr9"}, "ontap-lab": {"aggr1"}},
+		map[string][]string{"ontap-prod": {"aggr3", "aggr9"}, "ontap-lab": {"aggr1"}},
+	)
+	assert.Equal(t, map[string][]string{"ontap-prod": {"aggr0"}}, got,
+		"a cluster left with nothing to complete is dropped")
+	assert.Empty(t, withoutTargets(nil, map[string][]string{"ontap-prod": {"aggr0"}}))
+}
+
 func TestRootedVolumeLabels_NoSVMRootIssuesNoCompletion(t *testing.T) {
 	scope := vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil)
 	restricted, _, _ := vlrParity(t, vlrMultiFiler(), scope, Options{})
