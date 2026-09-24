@@ -28,8 +28,8 @@ const (
 type CacheMetrics interface {
 	IncCacheHit()
 	IncCacheMiss()
-	// IncCacheCoalesced counts a caller that waited on another caller's
-	// in-flight upstream query instead of issuing its own.
+	// IncCacheCoalesced counts a caller that missed and was answered by
+	// another caller's upstream query instead of issuing its own.
 	IncCacheCoalesced()
 	IncCacheEviction()
 	// SetCacheSeries records the series currently resident in the cache.

@@ -141,6 +141,14 @@ the waiters' own; a waiter whose own `ctx` is still live and who receives
 `context.Canceled`/`DeadlineExceeded` from the shared call retries once as a
 new leader. One retry is enough: the retry's leader is the waiter itself.
 
+The cache lookup and the group join are two steps, and a flight can complete —
+put its entry, then leave the group — between them; a caller arriving in that
+window would start a second flight for a key that is already cached. So the
+shared call re-reads the cache before fetching: a flight puts before the group
+forgets its key, so the re-read sees the entry and no second upstream query is
+issued. A caller served that way is counted as coalesced, not as a hit — its
+miss was already counted and another caller's query answered it.
+
 Rejected: running the shared call under `context.WithoutCancel` plus a fixed
 timeout — it would let an abandoned query keep a slot after every caller left,
 which is exactly the load this change exists to remove.
@@ -237,6 +245,8 @@ custom factory's querier simply ignores it.
 - [A reader mutating a shared cached sample corrupts later bodies] → D5 audit +
   race-mode regression test; golden tests run with the cache enabled.
 - [Coalesced waiter inherits a leader's cancellation] → one-shot retry (D6).
+- [A flight completes between a caller's lookup and its join] → the shared
+  call re-reads the cache before fetching (D6).
 - [Timeouts rise instead of 503s when the store is slow] → intended: a queued
   query that cannot finish within `--build-timeout` fails as `504 timeout`,
   which is the correct signal; slot-wait histogram shows where time went.

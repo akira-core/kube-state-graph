@@ -177,9 +177,17 @@ func (g *guard) instant(ctx context.Context, backend, name, query string, ts tim
 	// Two attempts: a waiter whose shared call died of the LEADER's context
 	// (not its own) retries once, becoming the leader itself.
 	for attempt := 0; ; attempt++ {
-		var mine atomic.Bool
+		var mine, reused atomic.Bool
 		ch := g.flight.DoChan(flightKey, func() (any, error) {
 			mine.Store(true)
+			// A flight that completed between our lookup and this join has
+			// already been forgotten by the group but left its entry behind:
+			// a flight puts before the group forgets its key, so this lookup
+			// sees it and no second upstream query is issued.
+			if v, ok := g.cache.get(key); ok {
+				reused.Store(true)
+				return v, nil
+			}
 			v, err := g.fetch(ctx, backend, name, query, ts)
 			if err == nil {
 				g.cache.put(key, v)
@@ -197,7 +205,7 @@ func (g *guard) instant(ctx context.Context, backend, name, query string, ts tim
 				}
 				return nil, r.Err
 			}
-			if !led {
+			if !led || reused.Load() {
 				g.cm.IncCacheCoalesced()
 			}
 			v, _ := r.Val.(model.Vector)

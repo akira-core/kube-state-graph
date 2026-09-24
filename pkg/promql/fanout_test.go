@@ -303,6 +303,7 @@ func (p *plainMetrics) IncQueryFailure(string)               { p.failures++ }
 
 type routerMetricsRecorder struct {
 	plainMetrics
+	mu             sync.Mutex // fan-out legs fail concurrently
 	backends       []string
 	backendFails   []string
 	reloadOutcomes []string
@@ -310,6 +311,8 @@ type routerMetricsRecorder struct {
 
 func (r *routerMetricsRecorder) SetBackends(names []string) { r.backends = names }
 func (r *routerMetricsRecorder) IncBackendQueryFailure(b string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.backendFails = append(r.backendFails, b)
 }
 func (r *routerMetricsRecorder) IncBackendConfigReload(result string) {
@@ -339,6 +342,37 @@ func TestRouterMetrics_UpgradeRecorded(t *testing.T) {
 	_, err := r.QuerierFor(Selector{}).Instant(t.Context(), string(QPodInfo), "q", time.Unix(0, 0))
 	require.Error(t, err)
 	assert.Equal(t, []string{"zone-b"}, m.backendFails)
+}
+
+// A backend whose query was cancelled only because a SIBLING failed is not a
+// failing backend: the counter exists to point at the store that broke, so
+// only zone-b is counted. A deadline on the caller's own context still counts
+// every backend it cut off.
+func TestRouterMetrics_SiblingCancellationIsNotABackendFailure(t *testing.T) {
+	t.Run("sibling failed", func(t *testing.T) {
+		m := &routerMetricsRecorder{}
+		r := routerWithFakes(t, twoZoneTable(t), map[string]*fakeBackend{
+			"zone-a": {delay: time.Minute},
+			"zone-b": {err: errors.New("boom")},
+		}, m)
+
+		_, err := r.QuerierFor(Selector{}).Instant(t.Context(), string(QPodInfo), "q", time.Unix(0, 0))
+		require.ErrorContains(t, err, `backend "zone-b"`)
+		assert.Equal(t, []string{"zone-b"}, m.backendFails)
+	})
+	t.Run("caller deadline", func(t *testing.T) {
+		m := &routerMetricsRecorder{}
+		r := routerWithFakes(t, twoZoneTable(t), map[string]*fakeBackend{
+			"zone-a": {delay: time.Minute},
+			"zone-b": {delay: time.Minute},
+		}, m)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
+		_, err := r.QuerierFor(Selector{}).Instant(ctx, string(QPodInfo), "q", time.Unix(0, 0))
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.ElementsMatch(t, []string{"zone-a", "zone-b"}, m.backendFails)
+	})
 }
 
 func TestRouterMetricsOf_NilMetrics(t *testing.T) {

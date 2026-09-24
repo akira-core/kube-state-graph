@@ -207,7 +207,7 @@ backend the new table no longer declares has its idle connections released.
 |---|---|---|
 | `kube_state_graph_upstream_backends` | gauge | Backends in the live routing table |
 | `kube_state_graph_backend_config_reload_total{result}` | counter | Reload attempts by `ok` / `error` / `unchanged` |
-| `kube_state_graph_backend_query_failures_total{backend}` | counter | Upstream query failures per backend |
+| `kube_state_graph_backend_query_failures_total{backend}` | counter | Upstream query failures per backend. A leg cancelled only because a sibling backend failed is not counted; a deadline on the request itself counts every backend it cut off |
 | `kube_state_graph_upstream_query_result_series{query}` | histogram | Series returned per successful upstream query (buckets 1024 … 1048576). A routed query contributes one observation per backend it reaches; it carries no `backend` label |
 
 `kube_state_graph_upstream_query_duration_seconds` and
@@ -260,7 +260,7 @@ Setting any of the three to `0` disables that control.
 | `kube_state_graph_upstream_inflight{backend}` | gauge | Queries in flight, by the backend name they were routed through |
 | `kube_state_graph_upstream_slot_wait_seconds{backend}` | histogram | Time spent waiting for a slot |
 | `kube_state_graph_query_cache_hits_total` / `_misses_total` | counter | Cache lookups |
-| `kube_state_graph_query_cache_coalesced_total` | counter | Misses that waited on an identical in-flight query |
+| `kube_state_graph_query_cache_coalesced_total` | counter | Misses answered by another caller's identical query instead of their own |
 | `kube_state_graph_query_cache_evictions_total` | counter | Entries evicted to fit the budget |
 | `kube_state_graph_query_cache_series` | gauge | Series resident in the cache |
 

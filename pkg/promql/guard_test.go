@@ -315,6 +315,60 @@ func TestGuard_ExpiredEntryRefetched(t *testing.T) {
 	assert.Equal(t, 2, calls)
 }
 
+// missGateMetrics holds the FIRST cache miss — reported between the guard's
+// cache lookup and its coalescing join — until release is closed, so a test can
+// run another caller's whole flight inside that window.
+type missGateMetrics struct {
+	*recordingMetrics
+	first   atomic.Bool
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (m *missGateMetrics) IncCacheMiss() {
+	m.recordingMetrics.IncCacheMiss()
+	if m.first.CompareAndSwap(false, true) {
+		close(m.held)
+		<-m.release
+	}
+}
+
+// A caller that missed the cache while no entry existed, and reaches the
+// coalescing group only after another caller's flight for the key completed
+// and was forgotten, is served from the entry that flight left behind — never
+// a second upstream query for the key.
+func TestGuard_MissThatOutlivesTheFlightIsServedFromTheCache(t *testing.T) {
+	var calls atomic.Int64
+	inner := querierFunc(func(context.Context, string, string, time.Time) (model.Vector, error) {
+		calls.Add(1)
+		return vecN(2), nil
+	})
+	m := &missGateMetrics{recordingMetrics: newRecordingMetrics(), held: make(chan struct{}), release: make(chan struct{})}
+	q := Guard(inner, WithGuardMetrics(m))
+
+	late := make(chan model.Vector, 1)
+	go func() {
+		v, err := q.Instant(t.Context(), string(QPodInfo), "kube_pod_info", ts0)
+		assert.NoError(t, err)
+		late <- v
+	}()
+	<-m.held // the late caller has missed and not yet joined a flight
+
+	v, err := q.Instant(t.Context(), string(QPodInfo), "kube_pod_info", ts0)
+	require.NoError(t, err)
+	require.Len(t, v, 2)
+	require.EqualValues(t, 1, calls.Load())
+
+	close(m.release)
+	assert.Len(t, <-late, 2)
+	assert.EqualValues(t, 1, calls.Load(), "the late miss reuses the completed flight's entry")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 2, m.misses)
+	assert.Equal(t, 0, m.hits)
+	assert.Equal(t, 1, m.coalesced, "served by another caller's upstream query")
+}
+
 // querierFunc adapts a function to Querier (test-only).
 type querierFunc func(ctx context.Context, name, query string, ts time.Time) (model.Vector, error)
 
