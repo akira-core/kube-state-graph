@@ -155,3 +155,45 @@ func TestBackendClientOptions_NoCredentialsAttachesNoAuth(t *testing.T) {
 	assert.NotEmpty(t, got.Header.Get("Authorization"),
 		"the authenticated chain is the contrast: credentials reach the wire only when configured")
 }
+
+func findQuerySpan(t *testing.T, exp *tracetest.InMemoryExporter) tracetest.SpanStub {
+	t.Helper()
+	for _, s := range exp.GetSpans() {
+		if s.Name == "prometheus.query" {
+			return s
+		}
+	}
+	t.Fatal("no prometheus.query span")
+	return tracetest.SpanStub{}
+}
+
+func spanInt(s tracetest.SpanStub, key string) (int64, bool) {
+	for _, kv := range s.Attributes {
+		if string(kv.Key) == key {
+			return kv.Value.AsInt64(), true
+		}
+	}
+	return 0, false
+}
+
+// A query that queued behind its store's concurrency limit carries the wait on
+// its span; one that did not queue carries no such attribute.
+func TestClient_SpanCarriesSlotWaitOnlyWhenQueued(t *testing.T) {
+	c, err := New(closedPortURL, nil)
+	require.NoError(t, err)
+
+	t.Run("queued", func(t *testing.T) {
+		exp := installTestTracer(t)
+		ctx := withSlotWait(t.Context(), 1500*time.Millisecond)
+		_, _ = c.Instant(ctx, string(QPodInfo), "kube_pod_info", time.Unix(0, 0))
+		ms, ok := spanInt(findQuerySpan(t, exp), "kube_state_graph.slot_wait_ms")
+		require.True(t, ok)
+		assert.EqualValues(t, 1500, ms)
+	})
+	t.Run("not queued", func(t *testing.T) {
+		exp := installTestTracer(t)
+		_, _ = c.Instant(t.Context(), string(QPodInfo), "kube_pod_info", time.Unix(0, 0))
+		_, ok := spanInt(findQuerySpan(t, exp), "kube_state_graph.slot_wait_ms")
+		assert.False(t, ok)
+	})
+}

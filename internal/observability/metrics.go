@@ -33,6 +33,16 @@ type Metrics struct {
 	UpstreamBackends   prometheus.Gauge
 	BackendReload      *prometheus.CounterVec
 	BackendQueryFailed *prometheus.CounterVec
+
+	// Per-store concurrency limit and query-result cache. New names, so no
+	// established self-metric gains a label.
+	UpstreamInflight  *prometheus.GaugeVec
+	UpstreamSlotWait  *prometheus.HistogramVec
+	QueryCacheHits    prometheus.Counter
+	QueryCacheMisses  prometheus.Counter
+	QueryCacheShared  prometheus.Counter
+	QueryCacheEvicted prometheus.Counter
+	QueryCacheSeries  prometheus.Gauge
 }
 
 // NewMetrics registers and returns a fresh Metrics bundle.
@@ -105,6 +115,35 @@ func NewMetrics() *Metrics {
 			Name: "kube_state_graph_backend_query_failures_total",
 			Help: "Upstream PromQL query failures by backend.",
 		}, []string{"backend"}),
+		UpstreamInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "kube_state_graph_upstream_inflight",
+			Help: "Upstream PromQL queries currently in flight, by the backend they were routed through.",
+		}, []string{"backend"}),
+		UpstreamSlotWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "kube_state_graph_upstream_slot_wait_seconds",
+			Help:    "Time an upstream query waited for its backend store's concurrency slot.",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		}, []string{"backend"}),
+		QueryCacheHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kube_state_graph_query_cache_hits_total",
+			Help: "Upstream queries answered from the in-process query-result cache.",
+		}),
+		QueryCacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kube_state_graph_query_cache_misses_total",
+			Help: "Upstream queries not found in the query-result cache.",
+		}),
+		QueryCacheShared: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kube_state_graph_query_cache_coalesced_total",
+			Help: "Cache misses that waited on an identical in-flight upstream query instead of issuing their own.",
+		}),
+		QueryCacheEvicted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kube_state_graph_query_cache_evictions_total",
+			Help: "Query-result cache entries evicted to fit the series budget.",
+		}),
+		QueryCacheSeries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kube_state_graph_query_cache_series",
+			Help: "Series currently resident in the query-result cache.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -123,6 +162,13 @@ func NewMetrics() *Metrics {
 		m.UpstreamBackends,
 		m.BackendReload,
 		m.BackendQueryFailed,
+		m.UpstreamInflight,
+		m.UpstreamSlotWait,
+		m.QueryCacheHits,
+		m.QueryCacheMisses,
+		m.QueryCacheShared,
+		m.QueryCacheEvicted,
+		m.QueryCacheSeries,
 	)
 	// The reload results are a closed set, so every one is materialised at
 	// zero: a reload counter that appears only after the first failure gives

@@ -4,6 +4,39 @@ A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
 reads pods by reference. `/v1/graph` bodies are unchanged; one of their legs
 now degrades instead of failing the build.
 
+
+## Upstream queries are limited, cached and end-aligned by default
+
+*upstream-backend-routing — Per-backend-store concurrency limit; Embedded engine enables limit, cache and alignment by default. upstream-query-cache (new). graph-api — Time-window passthrough; Deterministic response body. storage-graph-api — Storage-graph end-time alignment.*
+
+**What changed.** Three load controls are on by default, for the server and
+for an embedder of `pkg/kubegraph` / `pkg/promql` alike:
+
+- **End alignment** (`--end-align=30s`). `/v1/graph` and `/v1/storage-graph`
+  floor `end` to a 30-second grid (Unix-epoch anchored) and shift `start` by
+  the same amount, so the window LENGTH is unchanged. Upstream PromQL is no
+  longer evaluated at the caller's exact `end`: a body may describe data up to
+  one grid step older than requested. Validation still runs on the caller's
+  values, so no request newly fails.
+- **Query-result cache** (`--query-cache-max-series=100000`,
+  `--query-cache-ttl=60s`). An identical upstream query at the same instant is
+  answered in process for up to the TTL. Bodies are byte-identical to an
+  uncached build over the same upstream data; data written for an
+  already-queried instant after the first read is not seen until the entry
+  expires.
+- **Per-store concurrency limit** (`--upstream-max-concurrency=32`). Excess
+  queries queue in the server instead of overflowing VictoriaMetrics' own
+  search queue. An overloaded upstream now surfaces as `504 timeout` more
+  often and as `502 upstream` (a VictoriaMetrics `503`) less often.
+
+**Restoring the previous behaviour.** Operators:
+`--end-align=0 --query-cache-max-series=0 --upstream-max-concurrency=0`
+(or `KSG_END_ALIGN=0`, `KSG_QUERY_CACHE_MAX_SERIES=0`,
+`KSG_UPSTREAM_MAX_CONCURRENCY=0`). Embedders:
+`promql.NewRouter(t, m, f, promql.WithMaxConcurrency(0), promql.WithQueryCache(0, 0))`
+and `kubegraph.Options{EndAlign: -1}` — plus `MaxConcurrency: -1,
+QueryCacheMaxSeries: -1` when handing `kubegraph.New` a plain `Querier`.
+`pkg/build.New` is unchanged and unguarded.
 ## `/v1/storage-graph` reads a rooted filer's claims through the volume hub
 
 *storage-graph-api — Storage-side roots read the claim chain through the volume hub; Storage-side roots narrow the Harvest topology read per component; Storage build reads only what it draws. cluster-topology-source — Topology series consumed. netapp-storage-graph — Harvest legs under request-scoped selectors. alert-overlay — Label-set matching to graph nodes.*

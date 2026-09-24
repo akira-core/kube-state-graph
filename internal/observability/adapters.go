@@ -77,3 +77,23 @@ func (m *Metrics) IncBackendQueryFailure(backend string) {
 func (m *Metrics) IncBackendConfigReload(result string) {
 	m.BackendReload.WithLabelValues(result).Inc()
 }
+
+// AddInflight moves the per-backend in-flight gauge. Satisfies
+// pkg/promql.LimiterMetrics.
+func (m *Metrics) AddInflight(backend string, delta int) {
+	m.UpstreamInflight.WithLabelValues(backend).Add(float64(delta))
+}
+
+// ObserveSlotWait records a query's wait for its store's concurrency slot.
+// Satisfies pkg/promql.LimiterMetrics.
+func (m *Metrics) ObserveSlotWait(backend string, seconds float64) {
+	m.UpstreamSlotWait.WithLabelValues(backend).Observe(seconds)
+}
+
+// IncCacheHit / IncCacheMiss / IncCacheCoalesced / IncCacheEviction /
+// SetCacheSeries satisfy pkg/promql.CacheMetrics.
+func (m *Metrics) IncCacheHit()         { m.QueryCacheHits.Inc() }
+func (m *Metrics) IncCacheMiss()        { m.QueryCacheMisses.Inc() }
+func (m *Metrics) IncCacheCoalesced()   { m.QueryCacheShared.Inc() }
+func (m *Metrics) IncCacheEviction()    { m.QueryCacheEvicted.Inc() }
+func (m *Metrics) SetCacheSeries(n int) { m.QueryCacheSeries.Set(float64(n)) }

@@ -22,10 +22,21 @@ func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, looku
 		return nil, err
 	}
 	logUnservedFamilies(table, logger)
-	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m))
+	// Values are passed explicitly — config.Defaults() already carries the
+	// library defaults — so an operator's 0 disables rather than defaulting.
+	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m),
+		promql.WithMaxConcurrency(cfg.UpstreamMaxConcurrency),
+		promql.WithQueryCache(cfg.QueryCacheMaxSeries, cfg.QueryCacheTTL),
+	)
 	if err != nil {
 		return nil, err
 	}
+	logger.Info("upstream load controls",
+		"max_concurrency_per_store", cfg.UpstreamMaxConcurrency,
+		"query_cache_max_series", cfg.QueryCacheMaxSeries,
+		"query_cache_ttl", cfg.QueryCacheTTL,
+		"end_align", cfg.EndAlign,
+	)
 	return r, nil
 }
 

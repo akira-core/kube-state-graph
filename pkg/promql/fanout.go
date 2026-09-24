@@ -189,7 +189,7 @@ func (f *fanoutQuerier) issue(ctx context.Context, fam Family, name, query strin
 			if !ok {
 				return fmt.Errorf("prom query %s: backend %q has no client", name, b.Name())
 			}
-			out, err := q.Instant(gctx, name, query, ts)
+			out, err := instantVia(gctx, q, b.Name(), name, query, ts)
 			if err != nil {
 				routerMetricsOf(f.metrics).IncBackendQueryFailure(b.Name())
 				// Naming the backend is the whole point: with six upstreams,

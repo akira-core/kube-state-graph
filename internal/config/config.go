@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
@@ -110,6 +111,22 @@ type Config struct {
 	// process lifetime. Mirrors APIKeysReloadInterval, the existing
 	// mounted-file hot-reload precedent.
 	BackendsReloadInterval time.Duration
+	// UpstreamMaxConcurrency bounds the upstream queries in flight to each
+	// backend store, process-wide (--upstream-max-concurrency /
+	// KSG_UPSTREAM_MAX_CONCURRENCY). A query finding its store saturated
+	// waits for a slot until its build deadline. 0 disables the bound.
+	UpstreamMaxConcurrency int
+	// QueryCacheMaxSeries is the upstream query-result cache's total
+	// resident-series budget (--query-cache-max-series /
+	// KSG_QUERY_CACHE_MAX_SERIES). 0 disables the cache.
+	QueryCacheMaxSeries int
+	// QueryCacheTTL is how long a cached upstream result may be served
+	// (--query-cache-ttl / KSG_QUERY_CACHE_TTL).
+	QueryCacheTTL time.Duration
+	// EndAlign is the grid a graph request's end is floored to, start shifted
+	// by the same amount (--end-align / KSG_END_ALIGN). 0 passes start/end
+	// through verbatim.
+	EndAlign time.Duration
 }
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
@@ -146,6 +163,12 @@ func Defaults() Config {
 		// Matches APIKeysReloadInterval: the same mounted-file cadence, so an
 		// operator reasons about one reload period, not two.
 		BackendsReloadInterval: 30 * time.Second,
+		// The library's exported defaults, so the server and an embedder that
+		// writes no option run with identical limits.
+		UpstreamMaxConcurrency: promql.DefaultMaxConcurrency,
+		QueryCacheMaxSeries:    promql.DefaultQueryCacheMaxSeries,
+		QueryCacheTTL:          promql.DefaultQueryCacheTTL,
+		EndAlign:               kubegraph.DefaultEndAlign,
 	}
 }
 
@@ -173,6 +196,10 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.StringVar(&cfg.NetAppVolumeMatchMode, "netapp-volume-match-mode", cfg.NetAppVolumeMatchMode, "How the derived token is matched against the stock Harvest `volume` label: exact, suffix, contains or regex.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries.")
+	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
+	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
+	fs.DurationVar(&cfg.QueryCacheTTL, "query-cache-ttl", cfg.QueryCacheTTL, "How long a cached upstream query result may be served.")
+	fs.DurationVar(&cfg.EndAlign, "end-align", cfg.EndAlign, "Grid a graph request's end is floored to (start shifted by the same amount, window length kept), so requests within one step share cached upstream results. 0 passes start/end through verbatim.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
@@ -252,6 +279,18 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	if err := getInt("KSG_NETAPP_QOS_SCOPE_BATCH_BYTES", &cfg.NetAppQoSScopeBatchBytes); err != nil {
 		return err
 	}
+	if err := getInt("KSG_UPSTREAM_MAX_CONCURRENCY", &cfg.UpstreamMaxConcurrency); err != nil {
+		return err
+	}
+	if err := getInt("KSG_QUERY_CACHE_MAX_SERIES", &cfg.QueryCacheMaxSeries); err != nil {
+		return err
+	}
+	if err := getDur("KSG_QUERY_CACHE_TTL", &cfg.QueryCacheTTL); err != nil {
+		return err
+	}
+	if err := getDur("KSG_END_ALIGN", &cfg.EndAlign); err != nil {
+		return err
+	}
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
 	// Env-only by design — no matching flags are registered in Parse
 	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
@@ -297,6 +336,18 @@ func (c Config) Validate() error {
 	}
 	if c.BuildTimeout <= 0 {
 		return errors.New("build-timeout must be positive")
+	}
+	if c.UpstreamMaxConcurrency < 0 {
+		return errors.New("upstream-max-concurrency must not be negative (0 disables the bound)")
+	}
+	if c.QueryCacheMaxSeries < 0 {
+		return errors.New("query-cache-max-series must not be negative (0 disables the cache)")
+	}
+	if c.QueryCacheMaxSeries > 0 && c.QueryCacheTTL <= 0 {
+		return errors.New("query-cache-ttl must be positive when the query cache is enabled")
+	}
+	if c.EndAlign < 0 {
+		return errors.New("end-align must not be negative (0 disables alignment)")
 	}
 	if c.APITimeout <= 0 {
 		return errors.New("api-timeout must be positive")
