@@ -81,6 +81,13 @@ type routerState struct {
 type Router struct {
 	factory ClientFactory
 	metrics Metrics
+	guard   guardConfig
+	// cache is the one query-result cache every store's guard shares, so the
+	// series budget is global to the Router. nil ⇒ caching disabled.
+	cache *queryCache
+	// nextStore numbers store identities for cache keys; guarded by mu (and
+	// by construction in NewRouter).
+	nextStore uint64
 
 	state atomic.Pointer[routerState]
 	// mu serialises Swap so two concurrent reloads cannot interleave client
@@ -95,14 +102,25 @@ var (
 
 // NewRouter constructs a Router serving table t. factory may be nil, in which
 // case DefaultClientFactory(m) is used.
-func NewRouter(t *Table, m Metrics, factory ClientFactory) (*Router, error) {
+//
+// Every store the table names is fronted by a concurrency limit and a shared
+// query-result cache. With no opts both are ON at DefaultMaxConcurrency and
+// DefaultQueryCacheMaxSeries / DefaultQueryCacheTTL; WithMaxConcurrency(0) and
+// WithQueryCache(0, 0) disable them.
+func NewRouter(t *Table, m Metrics, factory ClientFactory, opts ...RouterOption) (*Router, error) {
 	if t == nil || t.Len() == 0 {
 		return nil, fmt.Errorf("router: nil or empty routing table")
 	}
 	if factory == nil {
 		factory = DefaultClientFactory(m)
 	}
-	r := &Router{factory: factory, metrics: m}
+	cfg := newGuardConfig(opts)
+	r := &Router{
+		factory: factory,
+		metrics: m,
+		guard:   cfg,
+		cache:   newQueryCache(cfg.cacheMaxSeries, cfg.cacheTTL, cacheMetricsOf(m), cfg.now),
+	}
 	st, err := r.buildState(t, nil)
 	if err != nil {
 		return nil, err
@@ -191,6 +209,10 @@ func (r *Router) buildState(t *Table, prev *routerState) (*routerState, error) {
 			return nil, fmt.Errorf("backend %q: %w", b.Name(), err)
 		}
 		fresh = append(fresh, q)
+		// A store's guard is created with its client and carried with it
+		// across reloads, so its in-flight bound and cache identity persist.
+		r.nextStore++
+		q = newGuard(q, r.nextStore, r.guard.maxConcurrency, r.cache, r.metrics)
 		st.byKey[key] = q
 		st.clients[b.Name()] = q
 	}

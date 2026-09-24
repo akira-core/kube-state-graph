@@ -207,7 +207,7 @@ backend the new table no longer declares has its idle connections released.
 |---|---|---|
 | `kube_state_graph_upstream_backends` | gauge | Backends in the live routing table |
 | `kube_state_graph_backend_config_reload_total{result}` | counter | Reload attempts by `ok` / `error` / `unchanged` |
-| `kube_state_graph_backend_query_failures_total{backend}` | counter | Upstream query failures per backend |
+| `kube_state_graph_backend_query_failures_total{backend}` | counter | Upstream query failures per backend. A leg cancelled only because a sibling backend failed is not counted; a deadline on the request itself counts every backend it cut off |
 | `kube_state_graph_upstream_query_result_series{query}` | histogram | Series returned per successful upstream query (buckets 1024 … 1048576). A routed query contributes one observation per backend it reaches; it carries no `backend` label |
 
 `kube_state_graph_upstream_query_duration_seconds` and
@@ -218,6 +218,55 @@ self-metric would break every dashboard and recording rule built on it.
 Every upstream query span (`prometheus.query`) carries
 `kube_state_graph.backend` when routing is configured; the attribute is omitted
 entirely in a single-upstream deployment.
+
+## Concurrency limit and query cache
+
+Every backend **store** — a distinct `(url, credentials)` pair, so two table
+entries naming the same VictoriaMetrics share one — is fronted by a guard
+applied in this order:
+
+1. **Query-result cache.** A successful result is kept under
+   `(store, rendered query, evaluation instant)`; an identical query at the
+   same instant is answered in process. Bounded by total resident series
+   (`--query-cache-max-series`, default 100000, least-recently-used eviction)
+   and per-entry age (`--query-cache-ttl`, default 60s). Errors are never
+   cached; an empty result is. Concurrent misses on one key issue ONE upstream
+   query and every caller receives its result.
+2. **Concurrency slot.** At most `--upstream-max-concurrency` (default 32)
+   queries are in flight to the store at once, across every request the
+   process serves. A query finding the store saturated WAITS (first come,
+   first served) until its build deadline; a deadline that expires while
+   waiting is the ordinary `504 timeout`. A cache hit or a coalesced wait holds
+   no slot, and one saturated store never delays a query to another.
+
+The guard survives a routing-table reload for every store the reload keeps.
+Readiness and the outside-retention `up{}` probe bypass both steps: they must
+observe the live upstream and must never queue behind builds.
+
+With `--end-align` (default 30s) a request's `end` is floored to the grid and
+`start` shifted by the same amount, so requests issued within one step render
+identical queries at one instant and share cache entries.
+
+**Sizing.** The limit is per replica. Keep
+`--upstream-max-concurrency × replicas` at or below each vmselect's
+`-search.maxConcurrentRequests`; above it VictoriaMetrics queues the excess
+itself and answers `503` once `-search.maxQueueDuration` passes. Budget roughly
+1–2 KB of memory per cached series.
+
+Setting any of the three to `0` disables that control.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `kube_state_graph_upstream_inflight{backend}` | gauge | Queries in flight, by the backend name they were routed through |
+| `kube_state_graph_upstream_slot_wait_seconds{backend}` | histogram | Time spent waiting for a slot |
+| `kube_state_graph_query_cache_hits_total` / `_misses_total` | counter | Cache lookups |
+| `kube_state_graph_query_cache_coalesced_total` | counter | Misses answered by another caller's identical query instead of their own |
+| `kube_state_graph_query_cache_evictions_total` | counter | Entries evicted to fit the budget |
+| `kube_state_graph_query_cache_series` | gauge | Series resident in the cache |
+
+A query that waited carries `kube_state_graph.slot_wait_ms` on its
+`prometheus.query` span. A cache hit issues no upstream query and so records no
+`kube_state_graph_upstream_query_*` observation.
 
 ## Embedding the engine
 
@@ -250,6 +299,23 @@ engine := kubegraph.NewRouted(router, kubegraph.Options{APITimeout: 30 * time.Se
 // `az` selects the backend per request, exactly as ?az= does over HTTP.
 g, err := engine.Build(ctx, window, end, promql.Selector{AZ: []string{"zone-a"}})
 ```
+
+**The load controls are ON by default for an embedder too**, with the same
+values as the server (exported as `promql.DefaultMaxConcurrency`,
+`promql.DefaultQueryCacheMaxSeries`, `promql.DefaultQueryCacheTTL`,
+`kubegraph.DefaultEndAlign`):
+
+- `promql.NewRouter` with no option guards every store. Pass
+  `promql.WithMaxConcurrency(n)` / `promql.WithQueryCache(maxSeries, ttl)` to
+  change them, `0` to disable.
+- `kubegraph.New` / `NewRouted` align `end` in `BuildFromValues` /
+  `BuildStorageFromValues`. `kubegraph.New` handed a plain `Querier` (not a
+  Router) wraps it in `promql.Guard` with the default limit and cache. The
+  `Options` fields `EndAlign`, `MaxConcurrency`, `QueryCacheMaxSeries` and
+  `QueryCacheTTL` read **zero as the default, negative as disabled**; the last
+  three are ignored for a Router, which carries its own guard.
+- `pkg/build.New` is the unguarded low-level constructor; nothing is added
+  behind it.
 
 ### Label query
 

@@ -154,6 +154,11 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 	if c.backend != "" {
 		attrs = append(attrs, attribute.String("kube_state_graph.backend", c.backend))
 	}
+	if wait := slotWaitFrom(ctx); wait > 0 {
+		// Set only when the query queued behind its store's concurrency limit
+		// (see guard), so an unqueued query's span is unchanged.
+		attrs = append(attrs, attribute.Int64("kube_state_graph.slot_wait_ms", wait.Milliseconds()))
+	}
 	ctx, span := tracer.Start(ctx, "prometheus.query",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),

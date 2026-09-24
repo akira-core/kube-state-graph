@@ -679,3 +679,12 @@ When phase 1 matched no claim, phase 2 SHALL NOT be issued.
 
 - **WHEN** one phase-1 or phase-2 chunk fails with an upstream error while every other query succeeds
 - **THEN** the build returns an error, the request is mapped as an upstream failure naming `volume_labels`, the failure is counted on `kube_state_graph_upstream_query_failures_total{query="volume_labels"}`, and no body is returned
+
+### Requirement: Storage-graph end-time alignment
+
+`GET /v1/storage-graph` SHALL apply the same end-time alignment as `GET /v1/graph` ("Time-window passthrough" in the `graph-api` capability): with a non-zero `--end-align` grid, `end` is floored to the grid and `start` shifted by the same amount before any upstream query is rendered, and the alignment SHALL happen after `start` / `end` validation, so validation errors are unchanged.
+
+#### Scenario: Storage request aligned like a graph request
+
+- **WHEN** `--end-align=30s` and a client sends `GET /v1/storage-graph?start=2026-05-01T12:00:10Z&end=2026-05-01T12:05:10Z&az=zone-a&env=prod`
+- **THEN** every upstream query is evaluated at `2026-05-01T12:05:00Z` over a 5m window

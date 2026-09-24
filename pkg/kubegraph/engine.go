@@ -41,30 +41,69 @@ type Options struct {
 	// LabelKeys names the upstream labels the request's `az` / `env` filter
 	// dimensions are matched against. Zero value ⇒ the defaults (`az`, `env`).
 	LabelKeys promql.LabelKeys
+
+	// The four knobs below follow one convention: zero ⇒ the exported default
+	// (so an embedder writing no option gets what the server runs with),
+	// negative ⇒ disabled, positive ⇒ that value.
+
+	// EndAlign is the grid BuildFromValues / BuildStorageFromValues floor a
+	// request's end to (see AlignWindow). Default DefaultEndAlign.
+	EndAlign time.Duration
+	// MaxConcurrency bounds upstream queries in flight when New is handed a
+	// plain Querier. Default promql.DefaultMaxConcurrency. Ignored for a
+	// *promql.Router, which carries its own limit (set at promql.NewRouter).
+	MaxConcurrency int
+	// QueryCacheMaxSeries sizes the query-result cache when New is handed a
+	// plain Querier. Default promql.DefaultQueryCacheMaxSeries. Ignored for a
+	// *promql.Router.
+	QueryCacheMaxSeries int
+	// QueryCacheTTL is the cache entry lifetime when New is handed a plain
+	// Querier. Default promql.DefaultQueryCacheTTL. Ignored for a
+	// *promql.Router.
+	QueryCacheTTL time.Duration
 }
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
 // pipeline as a single call. Construct one per upstream Querier.
 type Engine struct {
-	builder *build.Builder
-	q       promql.Querier
-	clk     clock.Clock
+	builder  *build.Builder
+	q        promql.Querier // unguarded: Probe must observe the live upstream
+	clk      clock.Clock
+	endAlign time.Duration
 }
 
 // New constructs an Engine querying through q. The caller owns q (typically a
 // *promql.Client built from a VictoriaMetrics URL, or any Querier).
+//
+// A plain Querier is wrapped in promql.Guard — a per-store concurrency limit
+// and query-result cache, ON by default (see Options). A promql.QuerierSource
+// (a *promql.Router) is used as-is: it already guards each of its stores, and
+// wrapping it would hide the zone routing the builder type-asserts for.
 func New(q promql.Querier, opts Options) *Engine {
 	clk := opts.Clock
 	if clk == nil {
 		clk = clock.System{}
 	}
-	b := build.New(q, build.Options{
+	bq := q
+	if _, routed := q.(promql.QuerierSource); !routed {
+		// The server's recorder satisfies promql.Metrics as well; an
+		// embedder's may not, which leaves the guard's observations no-op.
+		m, _ := opts.Metrics.(promql.Metrics)
+		bq = promql.Guard(q,
+			promql.WithMaxConcurrency(resolveInt(opts.MaxConcurrency, promql.DefaultMaxConcurrency)),
+			promql.WithQueryCache(
+				resolveInt(opts.QueryCacheMaxSeries, promql.DefaultQueryCacheMaxSeries),
+				resolveDuration(opts.QueryCacheTTL, promql.DefaultQueryCacheTTL)),
+			promql.WithGuardMetrics(m),
+		)
+	}
+	b := build.New(bq, build.Options{
 		APITimeout:          opts.APITimeout,
 		RouteResolver:       opts.RouteResolver,
 		RouteResolveTimeout: opts.RouteResolveTimeout,
 		LabelKeys:           opts.LabelKeys,
 	}, opts.Metrics, clk)
-	return &Engine{builder: b, q: q, clk: clk}
+	return &Engine{builder: b, q: q, clk: clk, endAlign: resolveDuration(opts.EndAlign, DefaultEndAlign)}
 }
 
 // NewRouted constructs an Engine dispatching through a routing table, so a
@@ -109,7 +148,8 @@ func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.B
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	g, err := e.builder.Build(ctx, req.End.Sub(req.Start), req.End, req.Selector)
+	start, end := AlignWindow(req.Start, req.End, e.endAlign)
+	g, err := e.builder.Build(ctx, end.Sub(start), end, req.Selector)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
@@ -137,7 +177,8 @@ func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cyto
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
-	g, err := e.builder.BuildStorage(ctx, req.End.Sub(req.Start), req.End, req.Selector, req.Scope.Roots)
+	start, end := AlignWindow(req.Start, req.End, e.endAlign)
+	g, err := e.builder.BuildStorage(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}

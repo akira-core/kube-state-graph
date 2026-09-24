@@ -314,7 +314,7 @@ paths:
       description: |-
         Returns the joined multi-cluster pod / node / PVC graph for the supplied `[start, end]` window in Cytoscape.js JSON shape (`{ elements: { nodes:[…], edges:[…] } }`).
 
-        **Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced; the pair is passed through to upstream PromQL verbatim. Bounded query cost is delegated to upstream VictoriaMetrics search limits. Each request triggers a fresh fan-out — there is no in-process result cache.
+        **Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced, on the values as sent. The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits.
 
         **Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 
@@ -354,7 +354,8 @@ paths:
         required: true
         schema:
           type: string
-      - description: Window end. RFC 3339 or Unix seconds. Must be > start.
+      - description: Window end. RFC 3339 or Unix seconds. Must be > start. Floored
+          to the server's --end-align grid (default 30s), start shifted equally.
         example: "2026-05-05T12:00:00Z"
         in: query
         name: end
@@ -480,7 +481,8 @@ paths:
         required: true
         schema:
           type: string
-      - description: Window end. Must be > start.
+      - description: Window end. Must be > start. Floored to the server's --end-align
+          grid, start shifted equally.
         example: "2026-05-01T12:05:00Z"
         in: query
         name: end

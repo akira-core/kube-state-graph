@@ -59,6 +59,14 @@ func (noopRouterMetrics) SetBackends([]string)          {}
 func (noopRouterMetrics) IncBackendQueryFailure(string) {}
 func (noopRouterMetrics) IncBackendConfigReload(string) {}
 
+// siblingCancelled reports whether a fan-out leg's err is only the group
+// cancellation another leg's failure caused: a context error while the group
+// context has ended and the caller's has not. A deadline on the caller's own
+// context is not one — it cut every leg off and each still counts.
+func siblingCancelled(ctx, gctx context.Context, err error) bool {
+	return ctx.Err() == nil && gctx.Err() != nil && isContextErr(err)
+}
+
 // mergeVectors folds the per-backend results of one fan-out into a single
 // vector.
 //
@@ -189,9 +197,13 @@ func (f *fanoutQuerier) issue(ctx context.Context, fam Family, name, query strin
 			if !ok {
 				return fmt.Errorf("prom query %s: backend %q has no client", name, b.Name())
 			}
-			out, err := q.Instant(gctx, name, query, ts)
+			out, err := instantVia(gctx, q, b.Name(), name, query, ts)
 			if err != nil {
-				routerMetricsOf(f.metrics).IncBackendQueryFailure(b.Name())
+				// gctx ends while ctx lives only because a sibling failed; that
+				// sibling is the failing backend and is counted on its own.
+				if !siblingCancelled(ctx, gctx, err) {
+					routerMetricsOf(f.metrics).IncBackendQueryFailure(b.Name())
+				}
 				// Naming the backend is the whole point: with six upstreams,
 				// "upstream unreachable" is not actionable.
 				return fmt.Errorf("backend %q: %w", b.Name(), err)

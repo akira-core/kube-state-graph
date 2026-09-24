@@ -28,7 +28,7 @@ import (
 //	@Summary		Get multi-cluster graph (Cytoscape.js)
 //	@Description	Returns the joined multi-cluster pod / node / PVC graph for the supplied `[start, end]` window in Cytoscape.js JSON shape (`{ elements: { nodes:[…], edges:[…] } }`).
 //	@Description
-//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced; the pair is passed through to upstream PromQL verbatim. Bounded query cost is delegated to upstream VictoriaMetrics search limits. Each request triggers a fresh fan-out — there is no in-process result cache.
+//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced, on the values as sent. The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits.
 //	@Description
 //	@Description	**Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 //	@Description
@@ -62,7 +62,7 @@ import (
 //	@Tags			graph
 //	@Produce		json
 //	@Param			start		query		string		true	"Window start. RFC 3339 (`2026-05-05T11:00:00Z`) or Unix seconds (`1746442800`)."	example(2026-05-05T11:00:00Z)
-//	@Param			end			query		string		true	"Window end. RFC 3339 or Unix seconds. Must be > start."	example(2026-05-05T12:00:00Z)
+//	@Param			end			query		string		true	"Window end. RFC 3339 or Unix seconds. Must be > start. Floored to the server's --end-align grid (default 30s), start shifted equally."	example(2026-05-05T12:00:00Z)
 //	@Param			cluster		query		[]string	false	"Restrict to listed clusters (repeatable, OR-combined). Pushed into every cluster-labelled upstream query. The value `unknown` addresses series carrying no `cluster` label."	collectionFormat(multi)	example(prod-eu)
 //	@Param			namespace	query		[]string	false	"Restrict to listed Kubernetes namespaces (repeatable, OR-combined). Pushed into every namespace-labelled upstream query; nodes and NetApp aggregates follow by reference."	collectionFormat(multi)	example(payments)
 //	@Param			az			query		[]string	false	"Restrict to listed availability zones (repeatable, OR-combined). Pushed into every topology query as a matcher on the deployment's configured zone label (default `az`, see --az-label)."	collectionFormat(multi)	example(eu-west-1a)
@@ -111,7 +111,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Tags			graph
 //	@Produce		json
 //	@Param			start			query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
-//	@Param			end				query		string		true	"Window end. Must be > start."	example(2026-05-01T12:05:00Z)
+//	@Param			end				query		string		true	"Window end. Must be > start. Floored to the server's --end-align grid, start shifted equally."	example(2026-05-01T12:05:00Z)
 //	@Param			az				query		string		true	"Availability zone (required, single-valued). Narrows every Kubernetes and ALERTS query and selects the backends every query is sent to."	example(zone-a)
 //	@Param			env				query		string		true	"Environment (required, single-valued). Narrows every Kubernetes and ALERTS query."	example(prod)
 //	@Param			cluster			query		[]string	false	"Restrict to listed Kubernetes clusters (repeatable, OR-combined)."	collectionFormat(multi)
@@ -192,7 +192,12 @@ type buildFunc func(ctx context.Context, window time.Duration, end time.Time, se
 // runBuild wraps a build in a per-request build-timeout context. On
 // context.DeadlineExceeded the error is normalised to ReasonTimeout (504) so
 // the handler-side mapBuildError surfaces the RFC 9110 §15.6.5 status.
+//
+// start/end arrive already validated; they are aligned to --end-align HERE, the
+// one point both graph endpoints pass through, so validation errors always
+// name the caller's own values and the two endpoints cannot align differently.
 func (s *Server) runBuild(ctx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
+	start, end = kubegraph.AlignWindow(start, end, s.cfg.EndAlign)
 	buildCtx, cancel := context.WithTimeoutCause(ctx, s.cfg.BuildTimeout, errBuildTimeout)
 	defer cancel()
 

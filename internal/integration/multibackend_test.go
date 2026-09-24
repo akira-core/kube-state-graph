@@ -210,6 +210,13 @@ traces_service_graph_request_total{client="mongo-0",server="mongo-1",cluster="mb
 // how cmd/kube-state-graph wires it.
 func (s *MultiBackendSuite) startRoutedAPI(backends []promql.Backend) *httptest.Server {
 	s.T().Helper()
+	return s.startRoutedAPIWith(backends, nil)
+}
+
+// startRoutedAPIWith is startRoutedAPI with each backend's real client passed
+// through wrap (nil ⇒ unwrapped) and the Router built with opts.
+func (s *MultiBackendSuite) startRoutedAPIWith(backends []promql.Backend, wrap func(promql.Backend, promql.Querier) promql.Querier, opts ...promql.RouterOption) *httptest.Server {
+	s.T().Helper()
 	cfg := config.Defaults()
 	cfg.PromURL = s.VMURL()
 	cfg.LogLevel = "error"
@@ -220,7 +227,18 @@ func (s *MultiBackendSuite) startRoutedAPI(backends []promql.Backend) *httptest.
 
 	logger := observability.NewLogger(cfg.LogLevel)
 	metrics := observability.NewMetrics()
-	router, err := promql.NewRouter(table, metrics, promql.DefaultClientFactory(metrics))
+	factory := promql.DefaultClientFactory(metrics)
+	if wrap != nil {
+		base := factory
+		factory = func(b promql.Backend) (promql.Querier, error) {
+			q, err := base(b)
+			if err != nil {
+				return nil, err
+			}
+			return wrap(b, q), nil
+		}
+	}
+	router, err := promql.NewRouter(table, metrics, factory, opts...)
 	s.Require().NoError(err)
 
 	builder := build.New(router, build.Options{
