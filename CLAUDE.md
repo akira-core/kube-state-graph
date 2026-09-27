@@ -920,8 +920,8 @@ live under `openspec/specs/`.
     `maxHubClaimChunks` is read once unrestricted and filtered, and
     `storage_root_claim_miss` (`no_pv_candidate` / `no_claim`) reports a hub that
     found nothing (`no_claim` drops to Debug under a `cluster=` / `namespace=`
-    filter). **Hub mode stays in the request's zone** (D7, revised before
-    release): `buildStorage` renders the request's FULL selector and binds
+    filter). **Hub mode stays in the request's zone**
+    (D7): `buildStorage` renders the request's FULL selector and binds
     `QuerierFor(sel)` in every mode, so no query reaches another zone's store
     and a filer shared across zones draws the requested zone's claims only —
     operators require that a request queries only its own az / env backends. Do
@@ -1163,12 +1163,12 @@ NetApp controllers, and aggregates, and `""` for services, externals, and SVMs.
 Boundary rule: **unit tests must not contact a real upstream service**. Anything
 that needs a TCP socket fronting upstream is integration. Unit tests substitute
 upstream behind small interfaces (`promql.Querier`, `auth.Validator`,
-`clock.Clock`) using mockery-generated mocks under `pkg/{clock,promql}/mocks/`
-and `internal/auth/mocks/`.
+`clock.Clock`, …) using the mockery-generated mocks in each interface's
+`<pkg>/mocks/` — `.mockery.yaml` is the list.
 
 | Layer | Where | Real I/O? |
 |---|---|---|
-| Unit | `pkg/{graph,build,promql,clock,cytoscape,kubegraph}/*_test.go` + `internal/{config,auth,telemetry}/*_test.go` | None — pure functions: parsers, joins, projection, edge IDs, request parsing, serialiser, KeySet, Clock. |
+| Unit | `pkg/{graph,build,promql,clock,cytoscape,kubegraph}/*_test.go` + `pkg/route/...` (except `oracle_test.go`, `-tags oracle`) + `internal/{config,auth,telemetry}/*_test.go` | None — pure functions: parsers, joins, projection, edge IDs, request parsing, serialiser, KeySet, Clock. |
 | Component | `internal/api/*_test.go` | None — gin handlers driven via a `MockQuerier` injected through `promql.Querier`; `httptest.NewServer` only wraps the server-under-test, never fakes upstream. Test helpers in `internal/api/helpers_test.go` (`newServerWithMocks`, `newMockQuerier`, `newErrQuerier`, `vec`). |
 | Golden | `internal/api/golden_test.go` + `testdata/golden/*.json` | None. Wire-format snapshots; run with `-update` to refresh. |
 | Property | `pkg/graph/property_test.go` | None. Random multi-cluster graphs → invariants (orphan edges, pruned ⊆ inventory, ID uniqueness). |
@@ -1195,15 +1195,19 @@ openspec list                                       # all active changes
 openspec status --change "<name>"                   # artifact progress + tasks
 openspec validate "<name>"                          # checks structure
 openspec instructions <artifact> --change "<name>" --json   # what to write
-openspec verify "<name>"                            # before archive
 openspec archive "<name>"                           # promote to openspec/specs/
 ```
+
+Before archiving, check the implementation against the change with the
+`/opsx:verify` skill; the CLI has no `verify` subcommand.
 
 The v1 implementation change **`add-k8s-pod-graph-api`** is archived under
 `openspec/changes/archive/2026-06-06-add-k8s-pod-graph-api/`; its capability
 specs were promoted to `openspec/specs/`. When making non-trivial behaviour
-changes, start a new change and update the relevant promoted spec
-(`openspec/specs/<capability>/spec.md`) before touching code.
+changes, start a new change and write its delta specs under
+`openspec/changes/<name>/specs/<capability>/spec.md` before touching code;
+`openspec archive` (or `/opsx:sync`) promotes them into
+`openspec/specs/<capability>/spec.md`.
 
 ## Repository conventions
 
