@@ -690,7 +690,7 @@ func readTopology(
 	}
 	if plan.tracksByReference() {
 		g.Go(func() error {
-			return readReachedHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, volumeLabelsFinal, flowlessDone)
+			return readReachedHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone, volumeLabelsFinal, flowlessDone)
 		})
 	}
 	if plan.byReference {

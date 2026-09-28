@@ -126,6 +126,12 @@ func readWorkloadVolumeLabels(
 // fixed-policy families for the components the merged volume-label rows name,
 // plus whatever a flowless root read did not already cover. It waits until
 // that root read has finished writing the same vectors.
+//
+// It waits on pvcInfoDone itself rather than trusting volumeLabelsFinal to
+// imply it. The tail that closes volumeLabelsFinal waits for the claim read
+// only on its success path: a failed owner completion returns at once, and
+// signalWhenDone closes the channel before the errgroup cancels the context,
+// so the claim read can still be writing v.PVCInfo when this reader starts.
 func readReachedHarvest(
 	ctx context.Context,
 	q promql.Querier,
@@ -136,10 +142,10 @@ func readReachedHarvest(
 	plan topologyPlan,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
-	volumeLabelsFinal, flowlessDone <-chan struct{},
+	pvcInfoDone, volumeLabelsFinal, flowlessDone <-chan struct{},
 ) (err error) {
 	defer recoverScopedPanic(ctx, promql.QAggrStatus, &err)
-	if !waitSignal(ctx, volumeLabelsFinal) || !waitSignal(ctx, flowlessDone) {
+	if !waitSignal(ctx, pvcInfoDone) || !waitSignal(ctx, volumeLabelsFinal) || !waitSignal(ctx, flowlessDone) {
 		return nil
 	}
 	alreadyControllers := controllersAlreadyRead(plan, v)
