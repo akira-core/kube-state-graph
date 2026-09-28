@@ -56,6 +56,13 @@ Each active alert SHALL be matched to at most one graph node by its label set, c
 
 When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be resolved through the same cluster-identity ladder as every Kubernetes series (compose, else adopt, else verbatim) and the match restricted to that identity; for kind 3 the raw label must name the ONTAP cluster; for kind 4, if the resolved identity holds a Kubernetes node of that name the alert matches the Kubernetes node, if the raw label equals an ONTAP cluster known to the Harvest join that holds a controller of that name it matches the controller, and if BOTH hold the alert SHALL be counted ambiguous and attached to neither. When the alert carries NO `cluster` label, the match SHALL succeed only if exactly one node of the eligible kind(s) in the loaded estate carries the remaining labels; several candidates SHALL be counted ambiguous and attached to none. Only pods, Kubernetes nodes, claims, NetApp controllers and NetApp aggregates SHALL ever carry alerts; a pod is matched by name against the pods loaded in the window, so an alert for a pod the build did not load is unmatched.
 
+**Zone agreement.** An alert's **zone** is the pair of its configured `az` and `env` label values, and exists only when both are non-empty. A pod's, claim's or Kubernetes node's zone is the `az` / `env` its cluster identity was composed from, and is unknown when the identity composed from no pair. A NetApp controller's or aggregate's **zone set** is every `az` / `env` pair carried by a Harvest series this build read that names its ONTAP cluster — `volume_labels`, the `aggr_*` gauges and the controller families — counting only series that carry both labels; it is empty (unknown) when no such series carried the pair. A candidate whose zone is KNOWN and does not agree with the alert's zone SHALL NOT match that alert:
+
+- on the cluster-qualified path of kind 3 and of kind 4's controller side, a candidate whose zone set does not contain the alert's zone is not a match (the Kubernetes candidates of kinds 1, 2 and 4 are already zone-exact there, because the identity they are keyed on is composed from the alert's own `az` / `env`);
+- on the no-`cluster` path, every candidate whose zone is known and different is removed BEFORE uniqueness is tested, so a same-named object in another zone neither absorbs the alert nor makes it ambiguous.
+
+An alert with no zone, and a candidate whose zone is unknown, SHALL never be excluded by this rule — matching then reduces to the label comparison above, which is what an estate whose Harvest series carry no `az` / `env` pair observes. The rule applies on every build path; it matters wherever one build holds same-named objects or alerts from several zones — an unfiltered `GET /v1/graph`, or a build whose alerting or Harvest backend is a catch-all.
+
 #### Scenario: Pod alert attached
 
 - **WHEN** an active alert carries `{cluster="c1", namespace="shop", pod="orders-0"}` and the build loaded that pod under identity `zone-a-prod-c1`
@@ -115,6 +122,36 @@ When the alert carries a non-empty `cluster` label: for kinds 1–2 it SHALL be 
 
 - **WHEN** an active alert carries only `{cluster="c1", alertname="TargetDown"}`
 - **THEN** no node carries it and it is counted unmatched
+
+#### Scenario: Aggregate alert from its own zone attached
+
+- **WHEN** the Harvest series naming ONTAP cluster `ontap-prod` carry `<az-key>="zone-a"`, `<env-key>="prod"` and an active alert carries `{<az-key>="zone-a", <env-key>="prod", cluster="ontap-prod", aggr="aggr1"}`
+- **THEN** `netapp/ontap-prod/aggr/aggr1` carries the alert
+
+#### Scenario: Aggregate alert from another zone not attached
+
+- **WHEN** the Harvest series naming ONTAP cluster `ontap-prod` carry `<az-key>="zone-a"`, `<env-key>="prod"` and an active alert carries `{<az-key>="zone-b", <env-key>="prod", cluster="ontap-prod", aggr="aggr1"}`
+- **THEN** no node carries the alert and it is counted unmatched
+
+#### Scenario: Controller alert from another zone not attached
+
+- **WHEN** the Harvest series naming ONTAP cluster `ontap-prod` carry `<az-key>="zone-a"`, `<env-key>="prod"`, no Kubernetes identity has raw name `ontap-prod`, and an active alert carries `{<az-key>="zone-b", <env-key>="prod", cluster="ontap-prod", node="ontap-prod-01"}`
+- **THEN** no node carries the alert and it is counted unmatched
+
+#### Scenario: Harvest without a zone falls back to the label comparison
+
+- **WHEN** no Harvest series naming ONTAP cluster `ontap-prod` carries both `<az-key>` and `<env-key>`, and an active alert carries `{<az-key>="zone-b", <env-key>="prod", cluster="ontap-prod", aggr="aggr1"}`
+- **THEN** `netapp/ontap-prod/aggr/aggr1` carries the alert
+
+#### Scenario: Missing cluster disambiguated by zone
+
+- **WHEN** an active alert carries `{<az-key>="zone-a", <env-key>="prod", namespace="shop", pod="orders-0"}` with no `cluster` label, and the build loaded pod `shop/orders-0` under identity `zone-a-prod-c1` and another under `zone-b-prod-c1`
+- **THEN** only the `zone-a-prod-c1` pod carries the alert and it is counted neither unmatched nor ambiguous
+
+#### Scenario: Missing cluster, only another zone holds the object
+
+- **WHEN** an active alert carries `{<az-key>="zone-b", <env-key>="prod", aggr="aggr1"}` with no `cluster` label, and the only loaded `aggr1` is on an ONTAP cluster whose Harvest series carry only `<az-key>="zone-a"`, `<env-key>="prod"`
+- **THEN** no node carries the alert and it is counted unmatched
 
 ### Requirement: Node `alerts` attribute
 
