@@ -86,9 +86,9 @@ build's own earlier waves already named, never to the whole estate.
 ```
 GET /v1/storage-graph?start=&end=&az=&env=&…
         │
-        └─ ReadTopology (storage plan) — 18 queries in parallel (13 in hub
-           mode), then up to 20 more across three by-reference waves (plus the
-           hub's claim-keyed reads in hub mode)
+        └─ ReadTopology (storage plan) — ALERTS in the first wave, then a
+           per-kind seed and one shared expansion (claim side, mounter /
+           candidate / owner completion, Harvest by the reached components)
               never issued: kube_pod_container_info, kube_service_info,
                 kube_endpointslice_endpoints, kube_endpointslice_labels,
                 kube_service_annotations (the body carries no containers
@@ -160,9 +160,9 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                  a chunk error FAILS the build
 ```
 
-In hub mode the claim families become waves of their own, read FROM the rooted
-volume-label rows, and the waves above hang off them (read-storage-roots-through-volume-hub
-D9 — the Harvest tail is unchanged):
+Every storage build is a seed plus an expansion. The claim families are read
+FROM the seed (a Harvest seed's volume-label rows, or a workload seed's
+bindings), and the waves above hang off that claim set:
 
 ```
  L1  volume_labels phase 1 (aggr / svm groups)   aggr_* node_* qos_policy_* ALERTS   app recovery st.1
@@ -173,10 +173,10 @@ D9 — the Harvest tail is unchanged):
  L6                      controllers stage B
 ```
 
-Critical path: 6 round-trips in hub mode (4 for an unrooted request). Every
-query of a hub build carries the request's matchers and is routed by the
-request's `az` exactly as outside hub mode — no query reaches a store of another
-zone.
+Critical path: the seed, then claim expansion, then the pod / node / controller
+waves. Every query carries the request's matchers and is routed by the
+request's `az` — no query reaches a store of another zone. `ALERTS` is the one
+family read across the requested zone.
 
 **The storage build fails closed.** On `/v1/storage-graph` a query error of any
 family — every Harvest leg, both kubelet volume-stats legs, every scoped
@@ -191,7 +191,7 @@ unique per namespace (or per cluster, for nodes) only, so a by-reference scope
 may admit a same-named object from another namespace or cluster; it is
 consulted by no loaded pod and the body is unchanged.
 
-**Fan-out per build, outside hub mode** (design.md D6 / D11): the 18 unrestricted legs, plus 2 when the
+**Fan-out per build** (design.md D6 / D11). A storage request's first wave is `ALERTS` alone; everything else is the seed and the expansion. The historical unscoped inventory — 18 legs, plus 2 when the
 pod scope is non-empty, plus 4 when any loaded pod is scheduled or a `node=`
 root exists, plus 2 (owner + annotations) for each of ReplicaSet / Job that
 owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
@@ -209,7 +209,7 @@ bindings still require:
 | one CronJob-managed claimless pod | 6 + 1 (`kube_job_owner`) + 2 (`kube_pod_owner` for Job and the direct CronJob arm) | pods 2, nodes 4, controllers 3 |
 | every kind present, matched volume | 6 + 2 + 6 | the 38-leg forward maximum |
 
-**Fan-out per build, in hub mode**: 13 first-wave families (the 18 above minus
+**Fan-out per build, storage seed**: the gauge families of a flowless root plus `volume_labels`, not the old 13 first-wave families (the 18 above minus
 the five claim families), plus 1 (`kube_persistentvolumeclaim_info`) when the
 rooted rows yield a PV candidate, plus 4 (bindings, claim annotations, kubelet
 ×2) when a candidate names a claim, plus the pod / node / controller / QoS
@@ -225,11 +225,10 @@ when a claim matched. `TestBuildStorage_FanOutLegCount_Hub` pins:
 | `aggr=`, one StatefulSet-owned pod on a matched volume | 31 | 2 (phase 1, phase 2) |
 | `svm=`, the same path | 31 | 3 (phase 1, owner completion, phase 2) |
 
-**Pod-only roots narrow every namespaced leg.** When every root is a
-`pod=<ns>/<name>` root and the request carries no `namespace`, the parser adds
-the roots' namespaces as the `namespace` selector — output-preserving, since a
-pod-rooted body draws nothing outside them. Any storage-side, `node` or
-`application` root suppresses this, and an explicit `namespace` always wins.
+**A pod root is keyed by `<namespace>/<pod>`.** The seed reads claim bindings
+restricted on those namespaces and pod names and keeps only the root refs. The
+parser does not add the roots' namespaces to the request selector. An explicit
+`namespace` still narrows every namespaced family.
 
 **Storage-side roots narrow the volume-label read.** `volume_labels` is the
 largest leg of a NetApp estate and no request dimension narrows it, so a request
@@ -246,16 +245,15 @@ components, in phases:
    by the same byte budget, charging the repeated matcher at its rendered
    length; the groups' results are merged de-duplicated by label set.
    **Capped:** these are repeatable parameters whose count nothing bounds, so a
-   restriction that would take more than sixteen queries in total is not
-   applied at all — the leg reads unrestricted, logs that it did, the build is
-   not in hub mode, and the body is unchanged.
+   restriction that would take more than sixteen queries in total is rejected
+   as `invalid_scope` before any query, and no body is returned.
 2. **Owner completion — SVM roots only.** An aggregate's owning controller is a
    vote over every one of its series, and an SVM group returns only the SVM's
    share of each aggregate it touches. After phase 1 the family is re-read
    whole for every `(ONTAP cluster, aggregate)` an SVM-group row names, minus
    the aggregates an `aggr=` root already read whole —
    `volume_labels{cluster="…",aggr=~"…"}`, one chunked query per ONTAP cluster.
-   Its rows feed the owner vote and the inventory, never the hub's claim read.
+   Its rows feed the owner vote and the inventory, never the seed's claim read.
    Once phase 2 (below) has returned, the same read runs again for every
    aggregate phase 2 ALONE named: the aggregate and SVM picks are separate, so
    a claim retained through its rooted SVM can land on a clone's aggregate. It
@@ -265,8 +263,7 @@ components, in phases:
    same-named FlexVol on a second filer could otherwise move a claim onto or off
    the rooted aggregate. After phase 1, and once `kube_persistentvolumeclaim_info`
    has landed, the family is read again restricted on `volume` to the derived
-   tokens of exactly the claims phase 1 matched (`volume=~".*<token>"` in the
-   default `suffix` mode, `volume=~"<token>"` in `exact`). This is the
+   tokens of exactly the claims phase 1 matched (`volume=~".*<token>"`). This is the
    *forward* derivation the join already computes. It is **not issued** when
    phase 1 matched no claim; a rooted component with no claim is still drawn
    from the unrestricted aggregate / controller / policy families. When the
@@ -277,11 +274,9 @@ The three are merged, de-duplicated by label set, before the QoS wave and the
 parse. `pod=`, `application=` and `node=` compose freely — the projection ANDs
 each with the storage-exclusive roots. A request whose only storage-side root is
 `node=` reads unrestricted (a path through a Kubernetes node is found from its
-pods, not from the filer). The `contains` and `regex` volume-match modes read
-unrestricted. `/v1/graph` carries no roots and never restricts.
+pods, not from the filer). `/v1/graph` carries no roots and never restricts.
 
-**Storage-side roots read the claim chain through the volume hub.** A
-restricted read IS hub mode. Every suffix of a phase-1 `volume` value that
+**Storage-side roots read the claim chain from the seed.** Every suffix of a phase-1 `volume` value that
 starts with `pvc_` at the start of the name or right after a `_` yields a
 candidate PV name (`_` → `-`); `kube_persistentvolumeclaim_info` is read
 restricted to `volumename=~"<candidates>"`, and the claim-binding family,
@@ -652,5 +647,5 @@ named, growing by exactly what the loaded pods, nodes and resolved owners name
 (design.md D6) — 22 with a `node=` root alone, 25 / 27 / 27 with one
 StatefulSet-, Deployment- or CronJob-owned pod, and 32 with every controller
 kind present, 38 with one matched FlexVol added.
-`TestBuildStorage_FanOutLegCount_Hub` pins hub mode: 13 families with no
+`TestBuildStorage_FanOutLegCount_Hub` pins a storage seed: families with no
 candidate, 14 with a candidate naming no claim, 31 for one claim's full path.

@@ -466,11 +466,9 @@ paths:
       description: |-
         Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.
 
-        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated). They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.
+        **Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.
 
-        **Volume hub**: a request carrying an `ontap_cluster`, `aggr` or `svm` root reads the claims FROM the rooted filer — the claims bound to the PersistentVolumes its FlexVol names embed (`pvc_<uid>`) — within the requested zone and environment, from the same backends and under the same `az` / `env` matchers as any other storage request. A filer shared across zones is drawn with the requested zone's claims only. A statically provisioned PV is not reached from a storage root. `cluster` / `namespace` still narrow.
-
-        **Roots** (optional, repeatable; OR within a name, AND across storage vs workload sides): `ontap_cluster`, `aggr`, `svm`, `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it), `node` (matched against both the ONTAP controller name and the Kubernetes node name). An empty root list returns every complete path in the selected estate. A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing.
+        **Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (that name on every filer — `ontap_cluster` does not qualify them), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=<namespace>/<name>`, `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own.
 
         `cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
       parameters:
@@ -521,7 +519,8 @@ paths:
             type: string
           type: array
         style: form
-      - description: 'Storage root: ONTAP cluster name.'
+      - description: 'Root kind: ONTAP cluster name. Every controller, aggregate and
+          SVM in it is a root. Not combinable with another root kind.'
         in: query
         name: ontap_cluster
         schema:
@@ -529,8 +528,17 @@ paths:
             type: string
           type: array
         style: form
-      - description: Root matched against both ONTAP controller and Kubernetes node
-          names.
+      - description: 'Root kind: ONTAP controller name. Retains the claims on the
+          aggregates that controller owns.'
+        in: query
+        name: ontap_node
+        schema:
+          items:
+            type: string
+          type: array
+        style: form
+      - description: 'Root kind: Kubernetes node name only. An ONTAP controller name
+          is ontap_node and draws nothing here.'
         in: query
         name: node
         schema:
@@ -538,7 +546,7 @@ paths:
             type: string
           type: array
         style: form
-      - description: 'Storage root: ONTAP aggregate name.'
+      - description: 'Root kind: ONTAP aggregate name, on every filer of the zone.'
         in: query
         name: aggr
         schema:
@@ -546,7 +554,7 @@ paths:
             type: string
           type: array
         style: form
-      - description: 'Storage root: SVM name.'
+      - description: 'Root kind: SVM name, on every filer of the zone.'
         in: query
         name: svm
         schema:
@@ -554,7 +562,7 @@ paths:
             type: string
           type: array
         style: form
-      - description: 'Workload root: `<namespace>/<pod-name>`.'
+      - description: 'Root kind: `<namespace>/<pod-name>`.'
         example: shop/orders-0
         in: query
         name: pod
@@ -563,10 +571,9 @@ paths:
             type: string
           type: array
         style: form
-      - description: 'Workload root: ArgoCD Application name, as `data.application`
-          carries it (the tracking-id segment before the first `:`); matches a path
-          whose pod or claim carries it; every pod resolving it is drawn even with
-          no claim'
+      - description: 'Root kind: ArgoCD Application name, as `data.application` carries
+          it (the tracking-id segment before the first `:`); matches a path whose
+          pod or claim carries it; every pod resolving it is drawn even with no claim'
         example: checkout
         in: query
         name: application
@@ -593,7 +600,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/internal_api.errorBody'
           description: Invalid parameters (missing/invalid start|end, missing_az,
-            missing_env, invalid_scope, invalid_range)
+            missing_env, missing_root, invalid_scope, invalid_range)
         "401":
           content:
             application/json:

@@ -1,3 +1,55 @@
+# BREAKING — a storage-graph request carries exactly one root kind
+
+`GET /v1/storage-graph` no longer serves the whole selected estate and no
+longer combines root kinds.
+
+- A request with no root is **400 `missing_root`**. A bare `?aggr=` (every
+  value empty) is the same.
+- Two or more root kinds — `aggr=` with `pod=`, or `ontap_cluster=` beside
+  `aggr=` / `svm=` — are **400 `invalid_scope`**, and the message names the
+  parameters. `ontap_cluster=` is its own root (every controller, aggregate
+  and SVM of that filer). A bare `aggr=` or `svm=` matches that name on every
+  filer of the zone.
+- `node=` names a **Kubernetes node only**. An ONTAP controller is
+  `ontap_node=`. A client that still sends a controller name as `node=`
+  receives an **empty 200**.
+- `graph.StorageRoots` is one kind plus its values (`Pods` as `PodRef` when
+  the kind is `pod`). `kubegraph.Engine.BuildStorage` /
+  `BuildStorageFromValues` and `build.Builder.BuildStorage` take that shape.
+  `graph.NewStorageScope` is `(clusters, namespaces, kind, values)`.
+
+`cluster=` and `namespace=` stay optional filters and combine with any one
+root kind. `az` and `env` stay required and single-valued, and are checked
+before the root.
+
+---
+
+# BREAKING — the volume comparison is suffix-only
+
+The claim-to-FlexVol join always requires the Harvest `volume` value to end
+with the derived token, on both `GET /v1/graph` and `GET /v1/storage-graph`.
+`exact`, `contains` and `regex` are gone. The flag `--netapp-volume-match-mode`
+and the variable `KSG_NETAPP_VOLUME_MATCH_MODE` are deleted: passing the flag
+fails startup as an unknown flag, and the variable is not read. The rewrite
+rules (`--netapp-volume-key-rewrite`) stay.
+
+No known deployment set a comparison other than the default suffix. Migration
+for a deployment that did:
+
+- **exact** — no body change. A FlexVol named exactly the token also ends with
+  it, including a backend whose storage prefix is empty.
+- **contains** — a clone or snapshot whose name extends past the token
+  (`trident_pvc_x_clone`) no longer attributes its aggregate or its I/O to the
+  claim. That rejection is the point of the suffix comparison.
+- **regex** — express the naming through `--netapp-volume-key-rewrite` so the
+  derived token is a suffix of the FlexVol name, or the claim stops joining.
+
+`build.VolumeMatchMode` and its constants are removed, and
+`build.NewVolumeKeyRewriter` no longer takes a comparison argument. An
+embedder passes the rewrite rules alone.
+
+---
+
 # BREAKING changes — harden the topology read against upstream series limits
 
 A `/v1/storage-graph` build no longer reads what its body cannot carry, and it
@@ -52,7 +104,7 @@ is read restricted to those names, and the claim-binding family,
 families restricted to the claims that read returned. The pod, Kubernetes-node
 and controller reads follow from there as before. Which aggregate, SVM and
 controller a claim lands on is still decided by the configured forward
-derivation alone. Hub mode reads from the same backends, under the same `az` /
+derivation alone. The storage seed reads from the same backends, under the same `az` /
 `env` / `cluster` / `namespace` matchers, as every other storage request: a
 filer shared across zones is drawn with the requested zone's claims only, and
 the body describes one zone and environment, as before.
@@ -69,7 +121,7 @@ Three things a client can see:
 - **Statically provisioned PVs are not reached from a storage root.** A claim
   bound to a PV whose name embeds no `pvc_` (a static PV, a provisioner with a
   custom volume-name prefix or a Trident `nameTemplate`) draws no path in a
-  hub-mode body, even though the forward join would match it. `/v1/graph`,
+  storage-graph body, even though the forward join would match it. `/v1/graph`,
   rootless storage requests and requests rooted only at `pod=`,
   `application=` or `node=` still join it. Size it with
   `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
@@ -215,8 +267,8 @@ What operators may notice:
   restriction`, and returns the same body.
 - `--netapp-qos-scope-batch-bytes` now also bounds the rooted read's
   alternations, and phase 1 charges its repeated matcher at rendered length.
-- An `svm=` or `node=` root, the `contains` / `regex` volume-match modes, and
-  `/v1/graph` all read `volume_labels` exactly as before.
+- An `svm=` or `node=` root and `/v1/graph` read `volume_labels` exactly as
+  before this restriction.
 
 One body-changing corner is documented, not hidden: an aggregate or controller
 named by `volume_labels` alone — no `aggr_*` / `node_*` series — outside the
@@ -501,8 +553,7 @@ name is rewritten into a match token and matched against `volume`.
 2. Read `netapp_volume_join_miss` from the build logs. Zero means the derivation
    covers the estate.
 3. If non-zero, compare `count by (volume) (volume_labels)` with a claim's
-   `volumename` and set `--netapp-volume-key-rewrite` /
-   `--netapp-volume-match-mode` accordingly.
+   `volumename` and set `--netapp-volume-key-rewrite` accordingly.
    [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md) has the
    full table.
 4. Once step 2 reports zero, the `volume_name` relabel rule may be deleted.
@@ -535,10 +586,11 @@ resolves no storage chain at all.
   `LabelKeys` alongside the new `VolumeKey` and `QoSScopeBatchBytes` fields. A
   zero `Options` behaves exactly as `promql.LabelKeys{}` did.
 - **New configuration**: `--netapp-volume-key-rewrite` /
-  `KSG_NETAPP_VOLUME_KEY_REWRITE`, `--netapp-volume-match-mode` /
-  `KSG_NETAPP_VOLUME_MATCH_MODE`, `--netapp-qos-scope-batch-bytes` /
-  `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES`. An uncompilable rewrite pattern or an
-  unknown match mode is a startup failure, never a silent fallback.
+  `KSG_NETAPP_VOLUME_KEY_REWRITE`, `--netapp-qos-scope-batch-bytes` /
+  `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES`. An uncompilable rewrite pattern is a
+  startup failure, never a silent fallback. The comparison is always a suffix;
+  the flag that used to select another comparison has since been deleted (see
+  the section above).
 - The `/v1/edge-types` **description** of `pvc-to-netapp-aggr` now says
   derive-then-match. The edge `id`, `type`, endpoints and `data.metrics` fields
   are unchanged.
