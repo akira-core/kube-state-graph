@@ -24,54 +24,88 @@ func recoverNames(t *testing.T, f promql.Querier, opts Options, sel promql.Selec
 	t.Helper()
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	names, err := readScopedApplications(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
+	keys, err := readScopedApplications(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		names = append(names, k.pod)
+	}
 	return names, v, err
 }
 
-func TestPodScopeUnderApp(t *testing.T) {
-	bind := func(cluster, ns, pod, claim string) *model.Sample {
-		return &model.Sample{Metric: model.Metric{
-			"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
-			"pod": model.LabelValue(pod), "persistentvolumeclaim": model.LabelValue(claim),
-		}, Value: 1}
+// Spec: "Only the recovered pods' bindings are read" and "A claim annotated
+// with the Application is tracked without its pods".
+func TestApplicationSeed_TracksRecoveredPodsAndAnnotatedClaims(t *testing.T) {
+	const tracking = trackingLabel
+	f := promqlfake.New(map[promql.Query]model.Vector{
+		promql.QDeploymentAnnotations: {
+			planKSM("namespace", "shop", "deployment", "web", tracking, "checkout:apps/Deployment:shop/web"),
+		},
+		promql.QReplicaSetOwner: {
+			planKSM("namespace", "shop", "replicaset", "web-1", "owner_kind", "Deployment", "owner_name", "web"),
+		},
+		promql.QPodOwner: {
+			planKSM("namespace", "shop", "pod", "orders-0", "owner_kind", "ReplicaSet", "owner_name", "web-1", "owner_is_controller", "true"),
+		},
+		promql.QPVCAnnotations: {
+			planKSM("namespace", "shop", "persistentvolumeclaim", "ledger-data", tracking, "billing:apps/PersistentVolumeClaim:shop/ledger-data"),
+		},
+		promql.QPVCBindings: {
+			planKSM("namespace", "shop", "pod", "orders-0", "persistentvolumeclaim", "orders-data"),
+			planKSM("namespace", "shop", "pod", "report-0", "persistentvolumeclaim", "orders-data"),
+			planKSM("namespace", "shop", "pod", "catalog-0", "persistentvolumeclaim", "catalog-data"),
+			planKSM("namespace", "shop", "pod", "ledger-0", "persistentvolumeclaim", "ledger-data"),
+		},
+	})
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"checkout"})
+	require.NoError(t, err)
+	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.NoError(t, err)
+
+	var byPod string
+	for _, query := range f.QueriesFor(promql.QPVCBindings) {
+		if strings.Contains(query, `pod=`) {
+			byPod = query
+		}
+		assert.NotContains(t, query, "catalog-0")
+		assert.NotContains(t, query, "ledger-0")
+		assert.NotContains(t, query, "catalog-data")
+		assert.NotContains(t, query, "ledger-data")
 	}
-	ann := func(cluster, ns, claim, app string) *model.Sample {
-		return &model.Sample{Metric: model.Metric{
-			"cluster": model.LabelValue(cluster), "namespace": model.LabelValue(ns),
-			"persistentvolumeclaim": model.LabelValue(claim),
-			trackingLabel:           model.LabelValue(app + ":apps/PersistentVolumeClaim:" + ns + "/" + claim),
-		}, Value: 1}
+	assert.Contains(t, byPod, `pod="orders-0"`)
+	assert.Contains(t, strings.Join(f.QueriesFor(promql.QPodInfo), "\n"), "orders-0")
+	assert.Contains(t, strings.Join(f.QueriesFor(promql.QPodInfo), "\n"), "report-0", "the other mounter of the recovered pod's claim")
+	assert.NotContains(t, strings.Join(f.QueriesFor(promql.QPodInfo), "\n"), "catalog-0")
+}
+
+// Spec: "A claim annotated with the Application is tracked without its pods".
+func TestApplicationSeed_AnnotatedClaimLoadsItsMounter(t *testing.T) {
+	const tracking = trackingLabel
+	f := promqlfake.New(map[promql.Query]model.Vector{
+		promql.QPVCAnnotations: {
+			planKSM("namespace", "shop", "persistentvolumeclaim", "ledger-data", tracking, "billing:apps/PersistentVolumeClaim:shop/ledger-data"),
+		},
+		promql.QPVCBindings: {
+			planKSM("namespace", "shop", "pod", "ledger-0", "persistentvolumeclaim", "ledger-data"),
+		},
+		promql.QPodInfo: {
+			planKSM("namespace", "shop", "pod", "ledger-0", "uid", "uid-l", "node", "worker-1"),
+		},
+	})
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"billing"})
+	require.NoError(t, err)
+	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.NoError(t, err)
+
+	anns := f.QueriesFor(promql.QPVCAnnotations)
+	require.Len(t, anns, 2, "tracking-id recovery, then the claim-name read")
+	assert.Contains(t, anns[0], `annotation_argocd_argoproj_io_tracking_id=~"(?:billing)(?::.*)?"`)
+	assert.Contains(t, anns[1], `persistentvolumeclaim="ledger-data"`)
+	for _, query := range f.QueriesFor(promql.QPodOwner) {
+		assert.NotContains(t, query, `owner_kind=`, "no controller carries billing, so stage 3 does not run")
 	}
-	bindings := model.Vector{
-		bind("c1", "shop", "orders-0", "orders-data"),
-		bind("c1", "shop", "catalog-0", "catalog-data"),
-		bind("c1", "shop", "ledger-0", "ledger-data"),
-		bind("c1", "shop", "report-0", "shared-data"),
-		bind("c1", "shop", "orders-0", "shared-data"),
-		bind("c1", "platform", "other-0", "orders-data"),
-		bind("c1", "shop", "root-mate", "root-data"),
-		bind("c1", "shop", "web-0", "root-data"),
-	}
-	annotations := model.Vector{ann("c1", "shop", "ledger-data", "billing")}
-
-	// Unrelated catalog-0 is excluded; orders-0's co-mounter report-0 is kept;
-	// the own-annotated ledger claim pulls ledger-0; platform's same-named
-	// claim does not.
-	got := podScopeUnderApp(bindings, annotations, []string{"orders-0"}, nil, []string{"checkout"})
-	assert.Equal(t, []string{"orders-0", "report-0"}, got, "catalog-0 is unrelated; ledger-data is annotated billing, not checkout")
-
-	// A pod= root pulls its co-mounters the same way.
-	rooted := podScopeUnderApp(bindings, nil, nil, []string{"web-0"}, []string{"checkout"})
-	assert.Equal(t, []string{"root-mate", "web-0"}, rooted)
-
-	// Own-annotated claim with no recovered pod.
-	own := podScopeUnderApp(bindings, annotations, nil, nil, []string{"billing"})
-	assert.Equal(t, []string{"ledger-0"}, own)
-
-	// Input order does not change the scope.
-	reversed := model.Vector{bindings[7], bindings[1], bindings[5], bindings[0], bindings[3], bindings[2], bindings[4], bindings[6]}
-	assert.Equal(t, got, podScopeUnderApp(reversed, annotations, []string{"orders-0"}, nil, []string{"checkout"}))
-	assert.Empty(t, podScopeUnderApp(nil, nil, nil, nil, []string{"checkout"}))
+	joined := strings.Join(f.QueriesFor(promql.QPVCBindings), "\n")
+	assert.Contains(t, joined, `persistentvolumeclaim="ledger-data"`)
+	assert.Contains(t, strings.Join(f.QueriesFor(promql.QPodInfo), "\n"), "ledger-0")
 }
 
 func TestTallySeries_AddsExtraSeries(t *testing.T) {
@@ -155,7 +189,7 @@ func TestReadScopedApplications_CronJobManagedPod(t *testing.T) {
 	assert.Contains(t, f.ScopeValues(promql.QPodOwner, "owner_kind"), []string{"CronJob"}, "a pod directly owned by the CronJob is a candidate too")
 	assert.Contains(t, f.ScopeValues(promql.QPodOwner, "owner_name"), []string{"nightly-28901"})
 
-	scope := graph.StorageScope{Roots: graph.StorageRoots{Applications: map[string]struct{}{"reports": {}}}}
+	scope := graph.StorageScope{Roots: graph.StorageRoots{Kind: graph.StorageRootApplication, Names: []string{"reports"}}}
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), promql.Selector{}, scope.Roots)
 	require.NoError(t, err)
 	body := cytoscape.Serialise(g, graph.ProjectStorage(g, scope))
@@ -194,6 +228,9 @@ func TestReadScopedApplications_NoControllerMatches(t *testing.T) {
 	assert.Empty(t, f.QueriesFor(promql.QReplicaSetOwner))
 	assert.Empty(t, f.QueriesFor(promql.QJobOwner))
 	assert.Empty(t, f.QueriesFor(promql.QPodOwner))
+	assert.Empty(t, f.QueriesFor(promql.QPVCBindings), "nothing recovered and no annotated claim: no binding query")
+	require.Len(t, f.QueriesFor(promql.QPVCAnnotations), 1)
+	assert.Contains(t, f.QueriesFor(promql.QPVCAnnotations)[0], trackingLabel+`=~`)
 }
 
 func TestReadScopedApplications_NamespaceFilterNarrows(t *testing.T) {
@@ -330,59 +367,23 @@ func TestReadScopedApplications_ValueOrderIsIrrelevant(t *testing.T) {
 	assert.ElementsMatch(t, render([]string{"b", "a"}), render([]string{"a", "b", "a"}))
 }
 
-func TestReadScopedApplications_UnboundedRootSetReadsUnrestricted(t *testing.T) {
-	const keep = "keep"
-	apps := make([]string, 0, maxApplicationRootChunks+2)
-	apps = append(apps, keep)
-	for i := range maxApplicationRootChunks + 1 {
-		apps = append(apps, "app-"+strings.Repeat("n", 8)+string(rune('a'+i%26))+string(rune('0'+i%10)))
+func TestReadScopedApplications_OverCapRejected(t *testing.T) {
+	apps := make([]string, maxApplicationRootChunks+1)
+	for i := range apps {
+		apps[i] = "app" + strings.Repeat("x", 3) + itoa(i)
 	}
-	// Distinct, stable names: the chunker counts values, not their spelling.
-	apps = apps[:1]
-	for i := range maxApplicationRootChunks + 1 {
-		apps = append(apps, "app"+strings.Repeat("x", 3)+itoa(i))
-	}
-	fixtures := map[promql.Query]model.Vector{
-		promql.QDeploymentAnnotations: {
-			planKSM("namespace", "shop", "deployment", "web", trackingLabel, keep+":apps/Deployment:shop/web"),
-			planKSM("namespace", "shop", "deployment", "other", trackingLabel, "other:apps/Deployment:shop/other"),
-		},
-		promql.QReplicaSetOwner: {
-			planKSM("namespace", "shop", "replicaset", "web-1", "owner_kind", "Deployment", "owner_name", "web"),
-		},
-		promql.QPodOwner: {
-			planKSM("namespace", "shop", "pod", "web-1-pod", "owner_kind", "ReplicaSet", "owner_name", "web-1", "owner_is_controller", "true"),
-		},
-	}
-	wide, _, err := recoverNames(t, promqlfake.New(fixtures), Options{}, promql.Selector{}, apps)
+	q := promqlfake.New(nil)
+	_, _, err := recoverNames(t, q, Options{QoSScopeBatchBytes: 1}, promql.Selector{}, apps)
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, q.Issued(), "the cap is rejected before any query")
+
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, apps)
 	require.NoError(t, err)
-
-	narrowQ := promqlfake.New(fixtures)
-	var narrow []string
-	recs := captureDebugRecords(t, func() {
-		var recErr error
-		narrow, _, recErr = recoverNames(t, narrowQ, Options{QoSScopeBatchBytes: 1}, promql.Selector{}, apps)
-		require.NoError(t, recErr)
-	})
-	assert.Equal(t, wide, narrow)
-	assert.Equal(t, []string{"web-1-pod"}, narrow)
-
-	for _, q := range []promql.Query{
-		promql.QDeploymentAnnotations, promql.QStatefulSetAnnotations, promql.QDaemonSetAnnotations,
-		promql.QCronJobAnnotations, promql.QReplicaSetAnnotations, promql.QJobAnnotations,
-	} {
-		got := narrowQ.QueriesFor(q)
-		require.Len(t, got, 1, "unbounded stage 1 issues the family once")
-		assert.NotContains(t, got[0], "(?:", "the fallback is the unrestricted rendering")
-		assert.Contains(t, got[0], trackingLabel+`!=""`)
-	}
-	logged := false
-	for _, rec := range recs {
-		if rec["msg"] == "application_root_restriction_unbounded" {
-			logged = true
-		}
-	}
-	assert.True(t, logged, "the build logs that the roots did not yield a bounded restriction")
+	buildQ := promqlfake.New(nil)
+	_, err = New(buildQ, Options{QoSScopeBatchBytes: 1}, nil, nil).BuildStorage(
+		t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, buildQ.Issued())
 }
 
 func itoa(n int) string {
@@ -407,7 +408,7 @@ func TestReadScopedPods_WaitsOnRecoveryAndPVCAnnotations(t *testing.T) {
 	close(bindingsDone)
 	appDone := make(chan struct{})
 	pvcDone := make(chan struct{})
-	var recovered []string
+	var recovered []podSeriesKey
 	errCh := make(chan error, 1)
 	go func() {
 		v := &topologyVectors{PVC: model.Vector{podBinding("orders-0")}}
@@ -418,7 +419,7 @@ func TestReadScopedPods_WaitsOnRecoveryAndPVCAnnotations(t *testing.T) {
 
 	assert.Never(t, func() bool { return len(f.QueriesFor(promql.QPodInfo)) > 0 }, 80*time.Millisecond, 10*time.Millisecond,
 		"the pod read waits for the recovery")
-	recovered = []string{"orders-0"}
+	recovered = []podSeriesKey{{cluster: "c1", namespace: "shop", pod: "orders-0"}}
 	close(appDone)
 	assert.Never(t, func() bool { return len(f.QueriesFor(promql.QPodInfo)) > 0 }, 80*time.Millisecond, 10*time.Millisecond,
 		"the pod read also waits for pvc annotations")
@@ -435,16 +436,14 @@ func TestReadScopedPods_UnrelatedBindingPodsNotRead(t *testing.T) {
 			planKSM("namespace", "shop", "pod", "ledger-0", "uid", "uid-l"),
 		},
 	})
+	// The seed has already kept only the recovered pod's bindings. readScopedPods
+	// loads every pod those bindings name, plus the recovered names.
 	v := &topologyVectors{PVC: model.Vector{
 		planKSM("namespace", "shop", "pod", "orders-0", "persistentvolumeclaim", "orders-data"),
-		planKSM("namespace", "shop", "pod", "catalog-0", "persistentvolumeclaim", "catalog-data"),
-		planKSM("namespace", "shop", "pod", "ledger-0", "persistentvolumeclaim", "ledger-data"),
-	}, PVCAnnotations: model.Vector{
-		planKSM("namespace", "shop", "persistentvolumeclaim", "ledger-data", trackingLabel, "billing:apps/PersistentVolumeClaim:shop/ledger-data"),
 	}}
 	done := make(chan struct{})
 	close(done)
-	recovered := []string{"orders-0"}
+	recovered := []podSeriesKey{{cluster: "c1", namespace: "shop", pod: "orders-0"}}
 	var mu sync.Mutex
 	err := readScopedPods(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, storageSel,
 		nil, []string{"checkout"}, v, &mu, done, done, done, &recovered)

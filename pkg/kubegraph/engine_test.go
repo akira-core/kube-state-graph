@@ -97,6 +97,7 @@ func TestBuildStorageFromValues_EmptyUpstream(t *testing.T) {
 		"end":   {"1700003600"},
 		"az":    {"zone-a"},
 		"env":   {"prod"},
+		"aggr":  {"aggr1"},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "v1", body.APIVersion)

@@ -104,13 +104,19 @@ func topologyLegs(v *topologyVectors) []topologyLeg {
 // controller families by reference. /v1/graph reads everything (fullPlan);
 // /v1/storage-graph reads only what its body can draw (storagePlan).
 type topologyPlan struct {
+	// kind, names and pods are the storage request's one root. fullPlan leaves
+	// them zero. names is every non-pod kind; pods is the pod kind. Both are
+	// sorted and de-duplicated.
+	kind  graph.StorageRootKind
+	names []string
+	pods  []graph.PodRef
 	// skip names first-wave legs this read never issues. A skipped leg is
 	// neither launched nor tallied, and its topologyVectors slot stays nil —
 	// the state parseTopology already handles for a degraded optional leg.
 	skip map[promql.Query]bool
 	// byReference reads every promql.ReferenceScopedQueries family BY
 	// REFERENCE instead of in the first wave: kube_pod_info / kube_pod_owner
-	// restricted to the pods a claim-binding series names plus podRoots
+	// restricted to the pods a claim-binding series names plus the pod roots
 	// (readScopedPods); the four kube_node_* families restricted to those
 	// pods' nodes plus nodeRoots (readScopedNodes); and the eight
 	// controller-owner / controller-annotation families restricted to those
@@ -120,24 +126,21 @@ type topologyPlan struct {
 	// unrestricted pod read would derive a scope from the whole estate.
 	// False reads every one of them unscoped, in the first wave.
 	byReference bool
-	// podRoots are the pod-name segments of the request's pod=<ns>/<name>
-	// roots, sorted. A pod root mounting no claim is drawable only if its pod
-	// is read, so the roots must reach the scope.
-	podRoots []string
 	// nodeRoots are the request's node=<name> roots, sorted. A node root
 	// naming a Kubernetes node no loaded pod runs on is drawable only if the
 	// node families are read for it, so the roots must reach the node scope
-	// exactly as podRoots reaches the pod scope.
+	// exactly as the pod roots reach the pod scope.
 	nodeRoots []string
 	// volumeClusters, volumeAggrs and volumeSVMs are the request's
-	// ontap_cluster=, aggr= and svm= roots, sorted and de-duplicated: the three
-	// storage-exclusive roots the Harvest volume-label topology read is
-	// restricted by (scope-volume-labels-by-storage-root,
-	// read-storage-roots-through-volume-hub). They are values, not a decision —
-	// restrictsVolumeLabels and resolveVolumeLabelRead are the decision.
+	// ontap_cluster=, aggr= and svm= roots, sorted and de-duplicated. harvestSeed
+	// is the decision; these slices are the values phase 1 renders.
 	volumeClusters []string
 	volumeAggrs    []string
 	volumeSVMs     []string
+	// volumeNodes are an ontap_node root's controller names. Phase 1 restricts
+	// volume_labels on `node`; the claim source is then the aggregates whose
+	// owner vote lands on one of these names.
+	volumeNodes []string
 	// applicationRoots are the request's application=<name> values, sorted.
 	// Non-empty launches the recovery wave and narrows the pod scope to the
 	// pods related to those Applications (see appscope.go). The volume-label
@@ -155,29 +158,23 @@ type topologyPlan struct {
 	// read) fails closed unconditionally.
 	failClosed bool
 
-	// The fields below are filled by resolveVolumeLabelRead, once per build,
-	// and are zero on an unresolved plan.
-	//
-	// hub is the volume-hub decision (read-storage-roots-through-volume-hub
-	// D1): the volume-label read is restricted to the rooted components AND
-	// its phase 1 is bounded and renderable. It is the same fact as "the
-	// volume-label read is restricted" — the predicate that allows a
-	// restriction and the one that engages the hub are one predicate — so a
-	// build that falls back to the unrestricted read is exactly today's build,
-	// claim families and request matchers included.
-	//
-	// It is decided BEFORE the fan-out launches, not when phase 1 returns:
-	// phase 1's shape is a pure function of the roots and the byte budget, and
-	// the decision also picks the request matchers and the backend routing of
-	// every Kubernetes leg, which must be known when the first of them starts.
-	hub bool
-	// phaseOne is hub's phase-1 read, rendered, in (group, chunk) order.
+	// phaseOne is the Harvest seed's phase-1 read, rendered, in (group, chunk)
+	// order. Non-empty means this build reads volume_labels from the root and
+	// the claim families from those rows. It is filled by prepareHarvestSeed
+	// before the fan-out launches: the render is a pure function of the roots
+	// and the byte budget, so a seed past the cap is rejected before any query.
 	phaseOne []rootedVolumeLabelsQuery
-	// phaseOneUnbounded records that the plan asked for a restriction and
-	// phase 1 did not yield a bounded, renderable one — the one case the build
-	// logs, because the request's roots were not honoured by the read.
-	phaseOneUnbounded bool
-	resolved          bool
+	resolved bool
+	// nodeSeed is the rendered kube_pod_info{node} queries of a node root.
+	// Empty unless prepareNodeSeed rendered a seed that fits the cap.
+	nodeSeed     []string
+	nodePrepared bool
+	// podSeed is the rendered bindings{namespace,pod} queries of a pod root.
+	// Empty unless preparePodSeed rendered a seed that fits the cap.
+	podSeed          []string
+	podPrepared      bool
+	appPrepared      bool
+	flowlessPrepared bool
 }
 
 // failsClosed reports whether a query error of q must fail this build even
@@ -205,80 +202,86 @@ var storageSkippedLegs = map[promql.Query]bool{
 	promql.QServiceAnnotations:     true,
 }
 
-// storagePlan is the /v1/storage-graph read for one request's roots.
+// storagePlan is the /v1/storage-graph read for one request's root kind.
+//
+// It maps the one kind onto the plan fields the read consults. ontap_cluster,
+// aggr, svm and ontap_node seed volume_labels; node and pod seed their claim
+// bindings; application still reads the claim side from the zone until its
+// seed replaces that.
 func storagePlan(roots graph.StorageRoots) topologyPlan {
-	names := make([]string, 0, len(roots.Pods))
-	for ref := range roots.Pods {
-		names = append(names, ref.Name)
+	plan := topologyPlan{
+		kind:        roots.Kind,
+		names:       sortedNames(roots.Names),
+		pods:        slices.Clone(roots.Pods),
+		skip:        storageSkippedLegs,
+		byReference: true,
+		failClosed:  true,
 	}
-	slices.Sort(names) // map order must not reach the scope
-	nodeNames := make([]string, 0, len(roots.Nodes))
-	for n := range roots.Nodes {
-		nodeNames = append(nodeNames, n)
+	// sortedNames drops empty values, which is what keeps harvestSeed and the
+	// renderer in agreement: the renderer normalises too, so a plan carrying
+	// only empty values would answer "seeded" to a query that cannot be
+	// rendered. graph.NewStorageScope already drops them for an HTTP caller,
+	// but pkg/build is an importable engine and StorageRoots is an exported
+	// value an embedder fills itself.
+	switch roots.Kind {
+	case graph.StorageRootONTAPCluster:
+		plan.volumeClusters = sortedNames(roots.Names)
+	case graph.StorageRootAggr:
+		plan.volumeAggrs = sortedNames(roots.Names)
+	case graph.StorageRootSVM:
+		plan.volumeSVMs = sortedNames(roots.Names)
+	case graph.StorageRootONTAPNode:
+		plan.volumeNodes = sortedNames(roots.Names)
+	case graph.StorageRootNode:
+		plan.nodeRoots = sortedNames(roots.Names)
+	case graph.StorageRootPod:
+		// plan.pods carries the (namespace, pod) refs the pod seed and the pod
+		// wave read; nothing more to derive.
+	case graph.StorageRootApplication:
+		plan.applicationRoots = sortedNames(roots.Names)
 	}
-	slices.Sort(nodeNames)
-	return topologyPlan{
-		skip: storageSkippedLegs, byReference: true, failClosed: true, podRoots: names, nodeRoots: nodeNames,
-		// sortedNames drops empty values, which is what keeps
-		// restrictsVolumeLabels and the renderer in agreement: the renderer
-		// normalises too, so a plan carrying only empty values would answer
-		// "restricted" to a query that cannot be rendered. graph.NewStorageScope
-		// already drops them for an HTTP caller, but pkg/build is an importable
-		// engine and StorageRoots is an exported map an embedder fills itself.
-		volumeClusters:   sortedNames(slices.Collect(maps.Keys(roots.ONTAPClusters))),
-		volumeAggrs:      sortedNames(slices.Collect(maps.Keys(roots.Aggrs))),
-		volumeSVMs:       sortedNames(slices.Collect(maps.Keys(roots.SVMs))),
-		applicationRoots: sortedNames(slices.Collect(maps.Keys(roots.Applications))),
-	}
+	return plan
 }
 
-// restrictsVolumeLabels reports whether this build reads the Harvest
-// volume-label topology family restricted to the rooted components, in phases
-// (see volumelabelscope.go), instead of whole.
-//
-// All three must hold:
-//
-//   - the plan is by-reference — only /v1/storage-graph carries roots, so
-//     fullPlan answers false structurally rather than by having none;
-//   - the request roots at an ONTAP cluster, an aggregate or an SVM — a
-//     storage-EXCLUSIVE root. The projection unions aggr= with svm=, so phase 1
-//     issues one query group per root kind; an SVM group is followed by an
-//     owner-completion read, because the aggregate owner vote runs over every
-//     series of the aggregate;
-//   - the configured match mode renders as an alternation branch, because
-//     phase 2 restricts on the claims' derived tokens.
-//
-// pod=, application= and node= compose freely: the projection ANDs each of
-// them with the storage-exclusive roots, so every retained path is one the
-// restriction keeps. A node= root naming an ONTAP controller is drawn from the
-// unrestricted controller and aggregate families; one naming a Kubernetes node
-// still enters the node scope. A request whose only storage-side root is node=
-// reads the family whole: a path retained through a Kubernetes node is found
-// from its pods, not from the filer.
-func (p topologyPlan) restrictsVolumeLabels(rw *VolumeKeyRewriter) bool {
+// harvestSeed reports whether this storage build's volume_labels read is the
+// root's own phase 1. storagePlan sets the volume slices for an ontap_cluster,
+// aggr, or svm root and for nothing else, so fullPlan and a workload root
+// answer false. The slices are the decision, not the kind alone: a caller can
+// clear them to read the family whole while keeping the same root for projection.
+func (p topologyPlan) harvestSeed() bool {
 	return p.byReference &&
-		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs) > 0 &&
-		rw.tokenScope() != tokenScopeNone
+		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs)+len(p.volumeNodes) > 0
 }
 
-// resolveVolumeLabelRead decides the volume hub for this build and renders its
-// phase-1 read under the request's own matchers (keys, sel — az / env on
-// Harvest). It is a pure function of the plan, the match mode, the window, the
-// byte budget and the request, and it is idempotent: a resolved plan is
-// returned as is, so the storage build can resolve once for its span and log
-// and hand the resolved plan to the read.
-func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) topologyPlan {
+// rootedClaims reports whether phase 1 was rendered, so the claim families are
+// read from those rows rather than across the zone.
+func (p topologyPlan) rootedClaims() bool {
+	return len(p.phaseOne) > 0
+}
+
+// prepareHarvestSeed renders the Harvest seed's phase 1 under the request's
+// az / env matchers. It is a pure function of the plan, the window, the byte
+// budget and the request, and it is idempotent: a resolved plan is returned
+// as is. A seed that would take more queries than the cap returns
+// ReasonInvalidScope and leaves phase 1 empty — the build issues nothing.
+func (p topologyPlan) prepareHarvestSeed(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
 	if p.resolved {
-		return p
+		return p, nil
 	}
 	p.resolved = true
-	if !p.restrictsVolumeLabels(rw) {
-		return p
+	if !p.harvestSeed() {
+		return p, nil
 	}
 	// Every chunk repeats the request matchers, so they come off the budget
 	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunks.
 	budget -= promql.RequestMatcherCost(promql.QVolumeLabels, keys, sel)
-	queries, ok := rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, budget)
+	var queries []rootedVolumeLabelsQuery
+	var ok bool
+	if len(p.volumeNodes) > 0 {
+		queries, ok = rootedNodeLabelChunks(p.volumeNodes, budget)
+	} else {
+		queries, ok = rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, budget)
+	}
 	for i := range queries {
 		if !ok {
 			break
@@ -286,32 +289,265 @@ func (p topologyPlan) resolveVolumeLabelRead(rw *VolumeKeyRewriter, window time.
 		queries[i].rendered, ok = queries[i].render(window, keys, sel)
 	}
 	if !ok {
-		// Too many chunks, or a value set that normalised away. The build reads
-		// the family as it was read before the restriction existed — one query,
-		// the same body, and a bound on what one request can ask for — and
-		// with it every claim family, under the request's own matchers.
-		p.phaseOneUnbounded = true
-		return p
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
-	p.hub = true
 	p.phaseOne = queries
-	return p
+	return p, nil
+}
+
+// prepareNodeSeed renders a node root's first read, kube_pod_info restricted
+// on node. A seed past the chunk cap returns ReasonInvalidScope before any
+// query. Idempotent, like prepareHarvestSeed.
+func (p topologyPlan) prepareNodeSeed(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	if p.nodePrepared {
+		return p, nil
+	}
+	p.nodePrepared = true
+	if p.kind != graph.StorageRootNode || len(p.nodeRoots) == 0 {
+		return p, nil
+	}
+	budget -= promql.RequestMatcherCost(promql.QPodInfo, keys, sel)
+	if budget < 1 {
+		budget = 1
+	}
+	chunks := promql.ChunkScope(p.nodeRoots, budget)
+	if len(chunks) > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
+	for _, chunk := range chunks {
+		rendered, ok := promql.RenderPodInfoByNode(window, keys, sel, chunk)
+		if !ok {
+			continue
+		}
+		p.nodeSeed = append(p.nodeSeed, rendered)
+	}
+	return p, nil
+}
+
+// preparePodSeed renders a pod root's first read: the claim-binding family
+// restricted on namespace and pod. A seed past the chunk cap returns
+// ReasonInvalidScope before any query. Idempotent, like prepareNodeSeed.
+//
+// The namespace matcher is charged whole, once, because every chunk repeats
+// it. Pod names are what the byte budget then splits. A chunk renders only
+// the namespaces of the refs whose name it carries; the independent
+// alternations can still match a cross pair, and the seed drops those rows.
+func (p topologyPlan) preparePodSeed(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	if p.podPrepared {
+		return p, nil
+	}
+	p.podPrepared = true
+	if p.kind != graph.StorageRootPod || len(p.pods) == 0 {
+		return p, nil
+	}
+	budget -= promql.RequestMatcherCost(promql.QPVCBindings, keys, sel)
+	if nsCost := promql.MatcherCost(promql.NamespaceLabel, podRefNamespaces(p.pods)); nsCost > 0 {
+		budget -= nsCost + 1 // the comma before the pod alternation
+	}
+	if budget < 1 {
+		budget = 1
+	}
+	names := podRefNames(p.pods)
+	chunks := promql.ChunkScope(names, budget)
+	if len(chunks) > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
+	for _, chunk := range chunks {
+		rendered, ok := promql.RenderClaimBindingsByPod(window, keys, sel, namespacesForNames(p.pods, chunk), chunk)
+		if !ok {
+			continue
+		}
+		p.podSeed = append(p.podSeed, rendered)
+	}
+	return p, nil
+}
+
+func podRefNames(refs []graph.PodRef) []string {
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Name != "" {
+			seen[ref.Name] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+func podRefNamespaces(refs []graph.PodRef) []string {
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.Namespace != "" {
+			seen[ref.Namespace] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+func namespacesForNames(refs []graph.PodRef, names []string) []string {
+	want := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		want[name] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	for _, ref := range refs {
+		if _, ok := want[ref.Name]; ok && ref.Namespace != "" {
+			seen[ref.Namespace] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
 }
 
 // issuesFirstWave reports whether the plan launches q in the first wave.
 //
-// A hub-mode plan also withholds the five claim-keyed families: they are read
-// by reference from the rooted volume-label rows (claimscope.go). The plan is
-// resolved before the fan-out launches, so a build whose phase 1 fell back to
-// the unrestricted read issues them here, first wave, exactly as before.
+// A storage plan's first wave is ALERTS alone. Every other family it reads
+// hangs off the seed or runs beside it (issuesBesideSeed). fullPlan launches
+// every leg it does not skip.
 func (p topologyPlan) issuesFirstWave(q promql.Query) bool {
 	if p.skip[q] {
 		return false
 	}
-	if p.hub && slices.Contains(promql.ClaimScopedQueries, q) {
+	if p.byReference {
+		return q == promql.QAlerts
+	}
+	return true
+}
+
+// tracksByReference reports whether this storage build reads every family but
+// ALERTS from the root's reach. A Harvest seed and a workload seed do. A plan
+// whose seed slices were cleared does not: that is the parity control, which
+// keeps the storage plan's skip set and fail-closed rule while reading the
+// inventory across the zone.
+func (p topologyPlan) tracksByReference() bool {
+	if !p.byReference {
 		return false
 	}
-	return !p.byReference || !slices.Contains(promql.ReferenceScopedQueries, q)
+	if p.harvestSeed() || p.rootedClaims() {
+		return true
+	}
+	switch p.kind {
+	case graph.StorageRootNode:
+		return len(p.nodeRoots) > 0
+	case graph.StorageRootPod:
+		return len(p.pods) > 0
+	case graph.StorageRootApplication:
+		return len(p.applicationRoots) > 0
+	default:
+		return false
+	}
+}
+
+// issuesBesideSeed reports whether a storage build launches q concurrently
+// with ALERTS, without waiting on the seed. A tracking build launches only
+// the Harvest seed's phase-1 volume_labels read here; everything else hangs
+// off the seed or the expansion. A non-tracking storage plan (no root, or the
+// parity control with its seed slices cleared) still launches the inventory
+// it does not scope. fullPlan launches nothing here.
+func (p topologyPlan) issuesBesideSeed(q promql.Query) bool {
+	if !p.byReference || p.skip[q] || q == promql.QAlerts {
+		return false
+	}
+	if q == promql.QVolumeLabels && p.harvestSeed() {
+		return true
+	}
+	if p.tracksByReference() {
+		return false
+	}
+	return !slices.Contains(promql.ReferenceScopedQueries, q)
+}
+
+// flowlessAggrGauges reports whether aggregate gauges are read for the root
+// instead of across the zone. The slices are the decision, so a caller can
+// clear them and keep the zone-wide read.
+func (p topologyPlan) flowlessAggrGauges() bool {
+	if !p.byReference {
+		return false
+	}
+	switch p.kind {
+	case graph.StorageRootAggr:
+		return len(p.volumeAggrs) > 0
+	case graph.StorageRootONTAPCluster:
+		return len(p.volumeClusters) > 0
+	default:
+		return false
+	}
+}
+
+// flowlessControllers reports whether controller families are read for the
+// root, or for the owners of an aggr root's gauges, instead of across the zone.
+func (p topologyPlan) flowlessControllers() bool {
+	if !p.byReference {
+		return false
+	}
+	switch p.kind {
+	case graph.StorageRootAggr:
+		return len(p.volumeAggrs) > 0
+	case graph.StorageRootONTAPNode:
+		return len(p.volumeNodes) > 0
+	case graph.StorageRootONTAPCluster:
+		return len(p.volumeClusters) > 0
+	default:
+		return false
+	}
+}
+
+// prepareFlowless rejects a flowless gauge scope that would take more queries
+// than the cap. Idempotent. The check uses the same chunk split the read uses.
+func (p topologyPlan) prepareFlowless(budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	if p.flowlessPrepared {
+		return p, nil
+	}
+	p.flowlessPrepared = true
+	var names []string
+	switch {
+	case p.kind == graph.StorageRootAggr && len(p.volumeAggrs) > 0:
+		names = p.volumeAggrs
+	case p.kind == graph.StorageRootONTAPNode && len(p.volumeNodes) > 0:
+		names = p.volumeNodes
+	case p.kind == graph.StorageRootONTAPCluster && len(p.volumeClusters) > 0:
+		names = p.volumeClusters
+	default:
+		return p, nil
+	}
+	budget -= promql.RequestMatcherCost(promql.QAggrStatus, keys, sel)
+	if budget < 1 {
+		budget = 1
+	}
+	if len(promql.ChunkScope(names, budget)) > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
+	return p, nil
+}
+
+// bindingsFromSeed reports whether this plan's claim bindings come from a
+// root seed rather than a beside-seed read of the whole zone.
+func (p topologyPlan) bindingsFromSeed() bool {
+	switch p.kind {
+	case graph.StorageRootNode:
+		return len(p.nodeRoots) > 0
+	case graph.StorageRootPod:
+		return len(p.pods) > 0
+	case graph.StorageRootApplication:
+		return len(p.applicationRoots) > 0
+	default:
+		return false
+	}
+}
+
+// prepareApplicationSeed rejects an application root whose stage-1 tracking-id
+// read would exceed the chunk cap. The claim-annotation read uses the same
+// split, so one check covers both. Idempotent. The rejection happens before
+// any query when the build calls it ahead of the fan-out.
+func (p topologyPlan) prepareApplicationSeed(budget int) (topologyPlan, error) {
+	if p.appPrepared {
+		return p, nil
+	}
+	p.appPrepared = true
+	if p.kind != graph.StorageRootApplication || len(p.applicationRoots) == 0 {
+		return p, nil
+	}
+	if len(applicationRootChunks(p.applicationRoots, budget)) > maxApplicationRootChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
+	return p, nil
 }
 
 // tallySeries is RawSeriesCount for one read: one entry per family the read
@@ -321,7 +557,10 @@ func (p topologyPlan) issuesFirstWave(q promql.Query) bool {
 func tallySeries(legs []topologyLeg, plan topologyPlan, v *topologyVectors) map[string]int {
 	raw := make(map[string]int, len(legs)+len(promql.QoSWorkloadQueries)+len(promql.ReferenceScopedQueries))
 	for _, l := range legs {
-		if plan.issuesFirstWave(l.query) {
+		// A flowless gauge read is issued beside the first wave but lands
+		// through the scoped writer, so it is tallied from ScopeIssued rather
+		// than from the beside-seed bit.
+		if plan.issuesFirstWave(l.query) || plan.issuesBesideSeed(l.query) || v.ScopeIssued[l.query] {
 			raw[string(l.query)] = len(*l.dst)
 		}
 	}

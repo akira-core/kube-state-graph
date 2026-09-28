@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
 )
 
@@ -27,15 +28,20 @@ func TestParseStorageValues_Errors(t *testing.T) {
 		wantReason string
 		wantMsg    string
 	}{
-		{"missing start", url.Values{"end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}}, "missing_start", ""},
-		{"missing end", url.Values{"start": {"1700000000"}, "az": {"zone-a"}, "env": {"prod"}}, "missing_end", ""},
-		{"invalid start", url.Values{"start": {"nope"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}}, "invalid_start", ""},
-		{"invalid end", url.Values{"start": {"1700000000"}, "end": {"nope"}, "az": {"zone-a"}, "env": {"prod"}}, "invalid_end", ""},
-		{"end not after start", url.Values{"start": {"1700003600"}, "end": {"1700000000"}, "az": {"zone-a"}, "env": {"prod"}}, "invalid_range", ""},
+		{"missing start", url.Values{"end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}}, "missing_start", ""},
+		{"missing end", url.Values{"start": {"1700000000"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}}, "missing_end", ""},
+		{"invalid start", url.Values{"start": {"nope"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}}, "invalid_start", ""},
+		{"invalid end", url.Values{"start": {"1700000000"}, "end": {"nope"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}}, "invalid_end", ""},
+		{"end not after start", url.Values{"start": {"1700003600"}, "end": {"1700000000"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}}, "invalid_range", ""},
 		{"missing az", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "env": {"prod"}}, "missing_az", ""},
+		{"missing az before the root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "env": {"prod"}}, "missing_az", ""},
 		{"missing env", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}}, "missing_env", ""},
-		{"repeated env", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod", "dev"}}, "invalid_scope", "env"},
-		{"repeated az", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a", "zone-b"}, "env": {"prod"}}, "invalid_scope", "az"},
+		{"repeated env", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod", "dev"}, "aggr": {"aggr1"}}, "invalid_scope", "env"},
+		{"repeated az", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a", "zone-b"}, "env": {"prod"}, "aggr": {"aggr1"}}, "invalid_scope", "az"},
+		{"missing root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}}, "missing_root", ""},
+		{"bare root is missing", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {""}}, "missing_root", ""},
+		{"two root kinds", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"}, "pod": {"shop/orders-0"}}, "invalid_scope", "aggr and pod"},
+		{"ontap_cluster no longer qualifies an aggregate", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "ontap_cluster": {"ontap-prod"}, "aggr": {"aggr1"}}, "invalid_scope", "ontap_cluster and aggr"},
 		{"malformed pod root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"orders-0"}}, "invalid_scope", "orders-0"},
 		{"pod empty name", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"shop/"}}, "invalid_scope", ""},
 		{"selector value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {strings.Repeat("a", 254)}}, "invalid_scope", ""},
@@ -58,9 +64,9 @@ func TestParseStorageValues_Errors(t *testing.T) {
 
 func TestParseStorageValues_HappyPath(t *testing.T) {
 	v := storageBase()
-	v["aggr"] = []string{"aggr1", "aggr1"}
-	v["pod"] = []string{"shop/orders-0"}
+	v["aggr"] = []string{"aggr1", "aggr1", ""}
 	v["cluster"] = []string{"c1"}
+	v["namespace"] = []string{"shop"}
 	v["edge_type"] = []string{"storage-flow"}
 	v["prune"] = []string{"false"}
 
@@ -69,100 +75,61 @@ func TestParseStorageValues_HappyPath(t *testing.T) {
 	assert.Equal(t, []string{"zone-a"}, req.Selector.AZ)
 	assert.Equal(t, []string{"prod"}, req.Selector.Env)
 	assert.Equal(t, []string{"c1"}, req.Selector.Cluster)
-	assert.Equal(t, map[string]struct{}{"aggr1": {}}, req.Scope.Roots.Aggrs)
-	assert.Len(t, req.Scope.Roots.Pods, 1)
+	assert.Equal(t, []string{"shop"}, req.Selector.Namespace)
+	assert.Equal(t, graph.StorageRootAggr, req.Scope.Roots.Kind)
+	assert.Equal(t, []string{"aggr1"}, req.Scope.Roots.Names)
+	assert.Equal(t, map[string]struct{}{"shop": {}}, req.Scope.Namespaces)
 
 	apps := storageBase()
 	apps["application"] = []string{"checkout", "a"}
 	req, err = kubegraph.ParseStorageValues(apps)
 	require.NoError(t, err)
-	assert.Equal(t, map[string]struct{}{"a": {}, "checkout": {}}, req.Scope.Roots.Applications)
+	assert.Equal(t, graph.StorageRootApplication, req.Scope.Roots.Kind)
+	assert.Equal(t, []string{"a", "checkout"}, req.Scope.Roots.Names)
+	assert.Empty(t, req.Selector.Namespace, "a pod root's namespace is not derived")
+
+	pods := storageBase()
+	pods["pod"] = []string{"shop/orders-0", "platform/redis-0"}
+	req, err = kubegraph.ParseStorageValues(pods)
+	require.NoError(t, err)
+	assert.Equal(t, graph.StorageRootPod, req.Scope.Roots.Kind)
+	assert.Equal(t, []graph.PodRef{
+		{Namespace: "platform", Name: "redis-0"},
+		{Namespace: "shop", Name: "orders-0"},
+	}, req.Scope.Roots.Pods)
+	assert.Empty(t, req.Selector.Namespace)
+
+	node := storageBase()
+	node["ontap_node"] = []string{"ontap-prod-01"}
+	req, err = kubegraph.ParseStorageValues(node)
+	require.NoError(t, err)
+	assert.Equal(t, graph.StorageRootONTAPNode, req.Scope.Roots.Kind)
+	assert.Equal(t, []string{"ontap-prod-01"}, req.Scope.Roots.Names)
 }
 
 func TestParseStorageValues_IgnoresEdgeTypeAndPrune(t *testing.T) {
 	v := storageBase()
+	v.Set("aggr", "aggr1")
 	v.Set("edge_type", "not-a-type")
 	v.Set("prune", "maybe")
-	_, err := kubegraph.ParseStorageValues(v)
+	got, err := kubegraph.ParseStorageValues(v)
 	require.NoError(t, err, "edge_type and prune are ignored, even when invalid")
-}
-
-// Spec: "Pod-only roots narrow the upstream read" — the derived selector, and
-// every rule that suppresses it.
-func TestParseStorageValues_DerivesNamespaceFromPodOnlyRoots(t *testing.T) {
-	cases := []struct {
-		name  string
-		extra url.Values
-		want  []string
-	}{
-		{"pod roots push their namespaces", url.Values{"pod": {"shop/orders-0", "platform/redis-0"}}, []string{"platform", "shop"}},
-		{"one namespace collapses", url.Values{"pod": {"shop/a", "shop/b"}}, []string{"shop"}},
-		{"a storage root suppresses it", url.Values{"pod": {"shop/orders-0"}, "aggr": {"aggr1"}}, nil},
-		{"an ontap_cluster root suppresses it", url.Values{"pod": {"shop/orders-0"}, "ontap_cluster": {"ontap-prod"}}, nil},
-		{"a node root suppresses it", url.Values{"pod": {"shop/orders-0"}, "node": {"n1"}}, nil},
-		{"an application root suppresses it", url.Values{"pod": {"shop/orders-0"}, "application": {"checkout"}}, nil},
-		{"an explicit namespace wins", url.Values{"pod": {"shop/orders-0"}, "namespace": {"platform"}}, []string{"platform"}},
-		{"explicit namespace wins over an application root", url.Values{"pod": {"shop/orders-0"}, "application": {"checkout"}, "namespace": {"platform"}}, []string{"platform"}},
-		{"an empty namespace value is no namespace", url.Values{"pod": {"shop/x"}, "namespace": {""}}, []string{"shop"}},
-		{"no root derives nothing", url.Values{}, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			v := storageBase()
-			for k, vs := range tc.extra {
-				v[k] = vs
-			}
-			req, err := kubegraph.ParseStorageValues(v)
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, req.Selector.Namespace)
-		})
-	}
-}
-
-// The derivation narrows the upstream read only: the projection's own
-// namespace filter stays exactly what the request said.
-func TestParseStorageValues_DerivedNamespaceLeavesTheProjectionAlone(t *testing.T) {
-	v := storageBase()
-	v["pod"] = []string{"shop/orders-0"}
-	req, err := kubegraph.ParseStorageValues(v)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"shop"}, req.Selector.Namespace)
-	assert.Empty(t, req.Scope.Namespaces)
-}
-
-// Spec: "Root order does not change the queries".
-func TestParseStorageValues_DerivedNamespaceIsOrderFree(t *testing.T) {
-	a, b := storageBase(), storageBase()
-	a["pod"] = []string{"b/x", "a/y"}
-	b["pod"] = []string{"a/y", "b/x", "a/y"}
-	ra, err := kubegraph.ParseStorageValues(a)
-	require.NoError(t, err)
-	rb, err := kubegraph.ParseStorageValues(b)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"a", "b"}, ra.Selector.Namespace)
-	assert.Equal(t, ra.Selector, rb.Selector)
-}
-
-func TestParseStorageValues_ApplicationRootDoesNotDeriveNamespace(t *testing.T) {
-	v := storageBase()
-	v["pod"] = []string{"shop/orders-0"}
-	v["application"] = []string{"checkout"}
-	req, err := kubegraph.ParseStorageValues(v)
-	require.NoError(t, err)
-	assert.Empty(t, req.Selector.Namespace)
-	assert.Equal(t, map[string]struct{}{"checkout": {}}, req.Scope.Roots.Applications)
 
 	bare := storageBase()
-	bare["application"] = []string{""}
-	req, err = kubegraph.ParseStorageValues(bare)
+	bare.Set("aggr", "aggr1")
+	want, err := kubegraph.ParseStorageValues(bare)
 	require.NoError(t, err)
-	assert.Nil(t, req.Scope.Roots.Applications, "a bare application= is a no-op")
+	assert.Equal(t, want, got)
+}
 
-	explicit := storageBase()
-	explicit["pod"] = []string{"shop/orders-0"}
-	explicit["application"] = []string{"checkout"}
-	explicit["namespace"] = []string{"platform"}
-	req, err = kubegraph.ParseStorageValues(explicit)
+func TestParseStorageValues_FiltersCombineWithAnyRootKind(t *testing.T) {
+	v := storageBase()
+	v["aggr"] = []string{"aggr1"}
+	v["namespace"] = []string{"shop"}
+	v["cluster"] = []string{"c1"}
+	req, err := kubegraph.ParseStorageValues(v)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"platform"}, req.Selector.Namespace)
+	assert.Equal(t, graph.StorageRootAggr, req.Scope.Roots.Kind)
+	assert.Equal(t, map[string]struct{}{"shop": {}}, req.Scope.Namespaces)
+	assert.Equal(t, map[string]struct{}{"c1": {}}, req.Scope.Clusters)
 }

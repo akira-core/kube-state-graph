@@ -34,8 +34,19 @@ func TestRenderTrackingIDScoped(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, meta, `annotation_argocd_argoproj_io_tracking_id=~"(?:a\\.b\"c)(?::.*)?"`)
 
+	pvc, ok := RenderTrackingIDScoped(QPVCAnnotations, time.Minute, LabelKeys{}, Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"},
+	}, []string{"billing"})
+	require.True(t, ok)
+	assert.Equal(t,
+		`last_over_time(kube_persistentvolumeclaim_annotations{az="zone-a",env="prod",cluster="c1",namespace="shop",annotation_argocd_argoproj_io_tracking_id=~"(?:billing)(?::.*)?"}[1m])`,
+		pvc, "the claim-annotation family has no fixed != selector")
+	assert.NotContains(t, pvc, `!=""`)
+
 	_, ok = RenderTrackingIDScoped(QPodInfo, time.Minute, LabelKeys{}, Selector{}, []string{"checkout"})
-	assert.False(t, ok, "only the six annotation families accept a tracking-id scope")
+	assert.False(t, ok, "a pod family is not a tracking-id family")
+	_, ok = RenderTrackingIDScoped(QServiceAnnotations, time.Minute, LabelKeys{}, Selector{}, []string{"checkout"})
+	assert.False(t, ok, "service annotations stay on the claim-name scope")
 	_, ok = RenderTrackingIDScoped(QDeploymentAnnotations, time.Minute, LabelKeys{}, Selector{}, nil)
 	assert.False(t, ok)
 	_, ok = RenderTrackingIDScoped(QDeploymentAnnotations, time.Minute, LabelKeys{}, Selector{}, []string{"", ""})
@@ -48,6 +59,7 @@ func TestRenderTrackingIDScoped_IsRenderPlusOneMatcher(t *testing.T) {
 	families := []Query{
 		QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
 		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations,
+		QPVCAnnotations,
 	}
 	for _, q := range families {
 		for _, s := range []Selector{{}, sel} {

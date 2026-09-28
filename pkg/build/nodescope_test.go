@@ -39,17 +39,17 @@ func TestNodeScope(t *testing.T) {
 
 // Spec: "Node read is restricted to the pods' nodes and node roots".
 func TestReadScopedNodes_RestrictedToPodNodesAndRoots(t *testing.T) {
-	bind := func(pod string) *model.Sample {
-		return planKSM("namespace", "shop", "pod", pod, "persistentvolumeclaim", "data-"+pod)
-	}
 	podInfo := func(pod, node string) *model.Sample {
 		return planKSM("namespace", "shop", "pod", pod, "uid", "uid-"+pod, "node", node)
 	}
 	f := promqlfake.New(map[promql.Query]model.Vector{
-		promql.QPVCBindings: {bind("orders-0"), bind("orders-1")},
-		promql.QPodInfo:     {podInfo("orders-0", "n1"), podInfo("orders-1", "n2")},
+		promql.QPVCBindings: {
+			planKSM("namespace", "shop", "pod", "orders-0", "persistentvolumeclaim", "data-shared"),
+			planKSM("namespace", "shop", "pod", "orders-1", "persistentvolumeclaim", "data-shared"),
+		},
+		promql.QPodInfo: {podInfo("orders-0", "n9"), podInfo("orders-1", "n2")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"n9"})
 	require.NoError(t, err)
 
 	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -58,7 +58,7 @@ func TestReadScopedNodes_RestrictedToPodNodesAndRoots(t *testing.T) {
 	for _, q := range promql.NodeScopedQueries {
 		got := f.QueriesFor(q)
 		require.Len(t, got, 1, "%s", q)
-		assert.Contains(t, got[0], `node=~"n1|n2|n9"`, "%s: restricted to exactly the pods' nodes plus the root", q)
+		assert.Contains(t, got[0], `node=~"n2|n9"`, "%s: the root plus the co-mounter's node", q)
 	}
 }
 
@@ -67,7 +67,7 @@ func TestReadScopedNodes_RootWithoutPodsIsLoaded(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QNodeInfo: {planKSM("node", "n9")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n9"}, nil, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"n9"})
 	require.NoError(t, err)
 
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -78,7 +78,10 @@ func TestReadScopedNodes_RootWithoutPodsIsLoaded(t *testing.T) {
 		require.Len(t, got, 1, "%s", q)
 		assert.Contains(t, got[0], `node="n9"`, "no binding, no pod: the root alone makes the scope")
 	}
-	assert.Empty(t, f.QueriesFor(promql.QPodInfo), "no pod query at all: no binding and no pod root")
+	podInfo := f.QueriesFor(promql.QPodInfo)
+	require.Len(t, podInfo, 1, "the node seed still asks which pods run on the root")
+	assert.Contains(t, podInfo[0], `node="n9"`)
+	assert.Empty(t, f.QueriesFor(promql.QPVCBindings), "no pod on the root, so no binding is fetched")
 
 	body := cytoscape.Serialise(g, graph.ProjectStorage(g, scope))
 	drawn := false
@@ -93,7 +96,7 @@ func TestReadScopedNodes_EmptyScopeIssuesNothing(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QAggrStatus: {planHarvest("cluster", "ontap-prod", "node", "ontap-prod-01", "aggr", "aggr1")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
 
 	tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, storageSel, storagePlan(scope.Roots))
@@ -123,7 +126,7 @@ func TestReadScopedNodes_ChunkFailureFailsBuild(t *testing.T) {
 	})
 	f.Fail = failN2
 
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, "", nil)
 	require.NoError(t, err)
 	_, err = New(f, Options{QoSScopeBatchBytes: 1}, nil, nil).
 		BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)

@@ -138,8 +138,8 @@ func edgeBetween(v View, src, tgt string) *Edge {
 	return nil
 }
 
-func scopeRoots(ontap, nodes, aggrs, svms, pods []string) StorageScope {
-	s, err := NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
+func scopeRoots(kind StorageRootKind, values ...string) StorageScope {
+	s, err := NewStorageScope(nil, nil, kind, values)
 	if err != nil {
 		panic(err)
 	}
@@ -160,7 +160,7 @@ func twoClaimsOnAggr1() *Graph {
 }
 
 func TestProjectStorage_StorageRootFindsItsConsumers(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(nil, nil, []string{"aggr1"}, nil, nil))
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootAggr, "aggr1"))
 	ids := viewIDs(v)
 	assert.True(t, ids[NetAppNodeID(stOC, "ontap-prod-01")])
 	assert.True(t, ids[NetAppAggrID(stOC, "aggr1")])
@@ -175,7 +175,7 @@ func TestProjectStorage_StorageRootFindsItsConsumers(t *testing.T) {
 }
 
 func TestProjectStorage_WorkloadRootFindsItsStorage(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(nil, nil, nil, nil, []string{"shop/orders-0"}))
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootPod, "shop/orders-0"))
 	ids := viewIDs(v)
 	assert.True(t, ids[NetAppNodeID(stOC, "ontap-prod-01")])
 	assert.True(t, ids[NetAppAggrID(stOC, "aggr1")])
@@ -218,7 +218,7 @@ func TestProjectStorage_NodeMatchesBothTiers(t *testing.T) {
 	edges = append(edges, stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), pvcA.ID(), podA.ID(), knA.ID(), stIO(2), 1)...)
 	g := stGraph([]GraphNode{ctrlN, aggrN, svmN, pvcN, podN, knN, ctrl1, aggr1, svm1, pvcA, podA, knA}, edges)
 
-	v := ProjectStorage(g, scopeRoots(nil, []string{"n1"}, nil, nil, nil))
+	v := ProjectStorage(g, scopeRoots(StorageRootONTAPNode, "n1"))
 	ids := viewIDs(v)
 	assert.True(t, ids[ctrlN.ID()], "controller n1 is a storage root")
 	assert.True(t, ids[knN.ID()], "k8s node n1 is a workload root")
@@ -240,21 +240,21 @@ func TestProjectStorage_RootsOnBothSidesIntersect(t *testing.T) {
 	edges = append(edges, stChain(ctrl.ID(), aggr1.ID(), svm1.ID(), catalog.ID(), other.ID(), n2.ID(), stIO(250), 1)...)
 	g := stGraph([]GraphNode{ctrl, aggr1, aggr2, svm1, svm2, orders, extra, catalog, pod, other, n1, n2}, edges)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1"}, nil, []string{"shop/orders-0"}))
+	v := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/orders-0"))
 	ids := viewIDs(v)
 	assert.True(t, ids[aggr1.ID()])
 	assert.True(t, ids[orders.ID()])
+	assert.True(t, ids[extra.ID()], "a pod root keeps every claim that pod mounts")
+	assert.True(t, ids[aggr2.ID()])
 	assert.True(t, ids[pod.ID()])
-	assert.False(t, ids[extra.ID()], "aggr2 chain dropped by the intersection")
-	assert.False(t, ids[aggr2.ID()])
-	assert.False(t, ids[other.ID()], "other pods on aggr1 dropped")
+	assert.False(t, ids[other.ID()], "catalog-0 is not the root pod")
+	assert.False(t, ids[catalog.ID()])
 }
 
-func TestProjectStorage_NoRootReturnsTheEstate(t *testing.T) {
+func TestProjectStorage_NoRootRetainsNothing(t *testing.T) {
 	v := ProjectStorage(twoClaimsOnAggr1(), StorageScope{})
-	assert.Len(t, v.Edges, 8) // shared node-aggr + aggr-svm, then 2× (svm-pvc, pvc-pod, pod-node)
-	assert.True(t, viewIDs(v)[PodID(stC, "uid-1")])
-	assert.True(t, viewIDs(v)[PodID(stC, "uid-2")])
+	assert.Empty(t, v.Nodes)
+	assert.Empty(t, v.Edges)
 }
 
 func TestProjectStorage_AggregateWithNoClaimsStillShows(t *testing.T) {
@@ -262,7 +262,7 @@ func TestProjectStorage_AggregateWithNoClaimsStillShows(t *testing.T) {
 	aggr := stAggr("aggr9", "ontap-prod-02")
 	g := stGraph([]GraphNode{ctrl, aggr, stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01")}, nil)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr9"}, nil, nil))
+	v := ProjectStorage(g, scopeRoots(StorageRootAggr, "aggr9"))
 	ids := viewIDs(v)
 	assert.True(t, ids[aggr.ID()])
 	assert.True(t, ids[ctrl.ID()], "owning controller pulled so data.parent cannot dangle")
@@ -275,7 +275,7 @@ func TestProjectStorage_PodWithNoNetAppClaimStillShows(t *testing.T) {
 	node := stNode("worker-1")
 	g := stGraph([]GraphNode{pod, node, stCtrl("ontap-prod-01")}, nil)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/web-0"}))
+	v := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/web-0"))
 	ids := viewIDs(v)
 	assert.True(t, ids[pod.ID()])
 	assert.False(t, ids[node.ID()], "an unscheduled-looking isolated pod pulls no node without a path")
@@ -283,13 +283,13 @@ func TestProjectStorage_PodWithNoNetAppClaimStillShows(t *testing.T) {
 }
 
 func TestProjectStorage_UnknownRootIsNotDrawn(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(nil, nil, []string{"typo"}, nil, nil))
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootAggr, "typo"))
 	assert.Empty(t, v.Nodes)
 	assert.Empty(t, v.Edges)
 }
 
 func TestProjectStorage_UnknownPodRootIsNotDrawn(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(nil, nil, nil, nil, []string{"shop/missing-0"}))
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootPod, "shop/missing-0"))
 	assert.Empty(t, v.Nodes)
 	assert.Empty(t, v.Edges)
 }
@@ -315,7 +315,7 @@ func TestProjectStorage_NamespaceFilterNarrowsWorkloadSideOnly(t *testing.T) {
 	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svmPlat.ID(), db.ID(), podP.ID(), n3.ID(), stIO(50), 1)...)
 	g := stGraph([]GraphNode{ctrl, aggr, svmShop, svmPlat, orders, db, podS, podP, n1, n3}, edges)
 
-	scope := scopeRoots(nil, nil, []string{"aggr1"}, nil, nil)
+	scope := scopeRoots(StorageRootAggr, "aggr1")
 	scope.Namespaces = map[string]struct{}{"shop": {}}
 	v := ProjectStorage(g, scope)
 	ids := viewIDs(v)
@@ -336,7 +336,7 @@ func TestProjectStorage_FlexGroupClaimStartsAtSVM(t *testing.T) {
 	edges := stChain("", "", svm.ID(), pvc.ID(), pod.ID(), node.ID(), nil, 1)
 	g := stGraph([]GraphNode{svm, pvc, pod, node, stCtrl("ontap-prod-01"), stAggr("aggr1", "ontap-prod-01")}, edges)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/big-0"}))
+	v := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/big-0"))
 	ids := viewIDs(v)
 	assert.True(t, ids[svm.ID()])
 	assert.True(t, ids[pvc.ID()])
@@ -363,7 +363,7 @@ func TestProjectStorage_FlexGroupSharingSVMBorrowsNoAggregate(t *testing.T) {
 	g := stGraph([]GraphNode{ctrl, aggr, svm, orders, big, podA, podB, n1, n2}, edges)
 
 	t.Run("pod root draws no aggregate", func(t *testing.T) {
-		v := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/big-0"}))
+		v := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/big-0"))
 		ids := viewIDs(v)
 		assert.False(t, ids[aggr.ID()], "FlexGroup claim borrowed the FlexVol claim's aggregate")
 		assert.False(t, ids[ctrl.ID()])
@@ -375,7 +375,7 @@ func TestProjectStorage_FlexGroupSharingSVMBorrowsNoAggregate(t *testing.T) {
 	})
 
 	t.Run("aggregate root keeps only its own claim", func(t *testing.T) {
-		v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1"}, nil, nil))
+		v := ProjectStorage(g, scopeRoots(StorageRootAggr, "aggr1"))
 		ids := viewIDs(v)
 		assert.True(t, ids[orders.ID()])
 		assert.False(t, ids[big.ID()], "FlexGroup claim retained under ?aggr=aggr1")
@@ -383,7 +383,7 @@ func TestProjectStorage_FlexGroupSharingSVMBorrowsNoAggregate(t *testing.T) {
 	})
 
 	t.Run("aggregate hops weigh only the FlexVol claim", func(t *testing.T) {
-		v := ProjectStorage(g, StorageScope{})
+		v := ProjectStorage(g, scopeRoots(StorageRootONTAPCluster, stOC))
 		for _, hop := range []*Edge{edgeBetween(v, aggr.ID(), svm.ID()), edgeBetween(v, ctrl.ID(), aggr.ID())} {
 			require.NotNil(t, hop)
 			require.NotNil(t, hop.IO)
@@ -406,7 +406,7 @@ func TestProjectStorage_UnstampedGraphFallsBackToTheSVMsOnlyAggregate(t *testing
 	}
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pod, node}, edges)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1"}, nil, nil))
+	v := ProjectStorage(g, scopeRoots(StorageRootAggr, "aggr1"))
 	ids := viewIDs(v)
 	assert.True(t, ids[pvc.ID()], "unstamped claim not recovered through the SVM's only aggregate")
 	assert.True(t, ids[pod.ID()])
@@ -414,14 +414,14 @@ func TestProjectStorage_UnstampedGraphFallsBackToTheSVMsOnlyAggregate(t *testing
 }
 
 func TestProjectStorage_ClaimAggrLabelStrippedFromView(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), StorageScope{})
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootONTAPCluster, stOC))
 	for _, e := range v.Edges {
 		assert.NotContains(t, e.Labels, ClaimAggrLabel)
 	}
 }
 
 func TestProjectStorage_K8sNodeRootFindsStorageChains(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(nil, []string{"worker-1"}, nil, nil, nil))
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootNode, "worker-1"))
 	ids := viewIDs(v)
 	assert.True(t, ids[PodID(stC, "uid-1")])
 	assert.True(t, ids[NetAppAggrID(stOC, "aggr1")])
@@ -430,8 +430,8 @@ func TestProjectStorage_K8sNodeRootFindsStorageChains(t *testing.T) {
 
 func TestProjectStorage_RootOrderDoesNotMatter(t *testing.T) {
 	g := twoClaimsOnAggr1()
-	a := ProjectStorage(g, scopeRoots(nil, nil, []string{"aggr1", "missing"}, nil, nil))
-	b := ProjectStorage(g, scopeRoots(nil, nil, []string{"missing", "aggr1", "aggr1"}, nil, nil))
+	a := ProjectStorage(g, scopeRoots(StorageRootAggr, "aggr1", "missing"))
+	b := ProjectStorage(g, scopeRoots(StorageRootAggr, "missing", "aggr1", "aggr1"))
 	require.Equal(t, nodeIDList(a), nodeIDList(b))
 	require.Equal(t, edgeIDList(a), edgeIDList(b))
 }
@@ -455,7 +455,7 @@ func edgeIDList(v View) []string {
 // --- weights (task 6.2) ---------------------------------------------------
 
 func TestProjectStorage_WeightsConserveThroughTheChain(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), StorageScope{})
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootONTAPCluster, stOC))
 	nodeAggr := edgeBetween(v, NetAppNodeID(stOC, "ontap-prod-01"), NetAppAggrID(stOC, "aggr1"))
 	require.NotNil(t, nodeAggr)
 	require.NotNil(t, nodeAggr.IO)
@@ -494,7 +494,7 @@ func TestProjectStorage_RWXClaimSplitAcrossItsMounters(t *testing.T) {
 	}
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pods[0], pods[1], pods[2], n1, n2}, edges)
 
-	v := ProjectStorage(g, StorageScope{})
+	v := ProjectStorage(g, scopeRoots(StorageRootONTAPCluster, stOC))
 	claim := edgeBetween(v, svm.ID(), pvc.ID())
 	require.NotNil(t, claim.IO)
 	assert.InDelta(t, 300.0, *claim.IO.ReadOps, 1e-12)
@@ -532,7 +532,7 @@ func TestProjectStorage_RWXPodRootShowsHonestShare(t *testing.T) {
 	}
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pods[0], pods[1], pods[2], n1, n2}, edges)
 
-	v := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/rwx-0"}))
+	v := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/rwx-0"))
 	claim := edgeBetween(v, svm.ID(), pvc.ID())
 	require.NotNil(t, claim.IO)
 	assert.InDelta(t, 100.0, *claim.IO.ReadOps, 1e-12, "pod= root shows this pod's 1/n, carried up-tier")
@@ -542,7 +542,7 @@ func TestProjectStorage_RWXPodRootShowsHonestShare(t *testing.T) {
 }
 
 func TestProjectStorage_LatencyAndCeilingOnlyOnTheClaimLevelEdge(t *testing.T) {
-	v := ProjectStorage(twoClaimsOnAggr1(), StorageScope{})
+	v := ProjectStorage(twoClaimsOnAggr1(), scopeRoots(StorageRootONTAPCluster, stOC))
 	for _, e := range v.Edges {
 		require.NotNil(t, e.IO, "every hop of a measured path carries flow figures")
 		if e.Labels["tier"] == StorageTierSVMPVC {
@@ -568,7 +568,7 @@ func TestProjectStorage_UnmeasuredClaimDrawsAWeightlessPath(t *testing.T) {
 	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svm.ID(), measured.ID(), podM.ID(), node.ID(), stIO(100), 1)...)
 	g := stGraph([]GraphNode{ctrl, aggr, svm, plain, measured, podP, podM, node}, edges)
 
-	v := ProjectStorage(g, StorageScope{})
+	v := ProjectStorage(g, scopeRoots(StorageRootONTAPCluster, stOC))
 	plainEdge := edgeBetween(v, svm.ID(), plain.ID())
 	require.NotNil(t, plainEdge)
 	assert.Nil(t, plainEdge.IO, "unmeasured claim's own edge carries no metrics")
@@ -595,7 +595,7 @@ func TestProjectStorage_UnloadedNodeEndsThePathAtThePod(t *testing.T) {
 	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvc.ID(), pod.ID(), phantom, stIO(100), 1)
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pod}, edges)
 
-	v := ProjectStorage(g, StorageScope{})
+	v := ProjectStorage(g, scopeRoots(StorageRootONTAPCluster, stOC))
 	ids := viewIDs(v)
 	for _, id := range []string{ctrl.ID(), aggr.ID(), svm.ID(), pvc.ID(), pod.ID()} {
 		assert.True(t, ids[id], id)
@@ -606,7 +606,7 @@ func TestProjectStorage_UnloadedNodeEndsThePathAtThePod(t *testing.T) {
 		assert.NotEqual(t, StorageTierPodNode, e.Labels["tier"], "no hop to the phantom node")
 	}
 
-	rooted := ProjectStorage(g, scopeRoots(nil, nil, nil, nil, []string{"shop/orders-0"}))
+	rooted := ProjectStorage(g, scopeRoots(StorageRootPod, "shop/orders-0"))
 	assert.True(t, viewIDs(rooted)[aggr.ID()], "a pod root still finds its storage")
 }
 
@@ -622,7 +622,7 @@ func TestProjectStorage_LatencyOnlyClaimKeepsLatencyOnItsEdge(t *testing.T) {
 	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvc.ID(), pod.ID(), node.ID(), latencyOnly, 1)
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvc, pod, node}, edges)
 
-	v := ProjectStorage(g, StorageScope{})
+	v := ProjectStorage(g, scopeRoots(StorageRootONTAPCluster, stOC))
 	claim := edgeBetween(v, svm.ID(), pvc.ID())
 	require.NotNil(t, claim)
 	require.NotNil(t, claim.IO, "the claim-level edge keeps its latency")
@@ -647,8 +647,8 @@ func appPVC(ns, claim, app string) *PVCNode {
 	return p
 }
 
-func appScope(namespaces, aggrs, pods, apps []string) StorageScope {
-	s, err := NewStorageScope(nil, namespaces, nil, nil, aggrs, nil, pods, apps)
+func appScope(namespaces []string, kind StorageRootKind, values ...string) StorageScope {
+	s, err := NewStorageScope(nil, namespaces, kind, values)
 	if err != nil {
 		panic(err)
 	}
@@ -675,7 +675,7 @@ func TestProjectStorage_ApplicationRootFindsItsStorageAcrossNamespaces(t *testin
 		orders, queue, ledgerPVC, ordersPod, queuePod, ledgerPod, n1, n2,
 	}, edges)
 
-	ids := viewIDs(ProjectStorage(g, appScope(nil, nil, nil, []string{"checkout"})))
+	ids := viewIDs(ProjectStorage(g, appScope(nil, StorageRootApplication, "checkout")))
 	for _, id := range []string{
 		ctrl1.ID(), ctrl2.ID(), aggr1.ID(), aggr2.ID(), svm1.ID(), svm2.ID(),
 		orders.ID(), queue.ID(), ordersPod.ID(), queuePod.ID(), n1.ID(), n2.ID(),
@@ -696,7 +696,7 @@ func TestProjectStorage_ApplicationRootMatchesClaimOwnApplication(t *testing.T) 
 	node := stNode("worker-1")
 	nodes := []GraphNode{ctrl, aggr, svm, pvc, pod, node}
 	edges := stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvc.ID(), pod.ID(), node.ID(), stIO(10), 1)
-	ids := viewIDs(ProjectStorage(stGraph(nodes, edges), appScope(nil, nil, nil, []string{"billing"})))
+	ids := viewIDs(ProjectStorage(stGraph(nodes, edges), appScope(nil, StorageRootApplication, "billing")))
 	assert.True(t, ids[pod.ID()], "the pod is drawn as part of the claim's path")
 	assert.True(t, ids[pvc.ID()])
 
@@ -707,7 +707,7 @@ func TestProjectStorage_ApplicationRootMatchesClaimOwnApplication(t *testing.T) 
 		}
 		stripped = append(stripped, e)
 	}
-	gone := viewIDs(ProjectStorage(stGraph(nodes, stripped), appScope(nil, nil, nil, []string{"billing"})))
+	gone := viewIDs(ProjectStorage(stGraph(nodes, stripped), appScope(nil, StorageRootApplication, "billing")))
 	assert.False(t, gone[pod.ID()], "without the path the pod is not a root")
 	assert.False(t, gone[pvc.ID()], "a claim hit is never materialised on its own")
 }
@@ -726,18 +726,15 @@ func TestProjectStorage_ApplicationRootIntersectsStorageRoot(t *testing.T) {
 	edges = append(edges, stChain(ctrl1.ID(), aggr1.ID(), svm1.ID(), pvcO.ID(), other.ID(), n.ID(), stIO(1), 1)...)
 	g := stGraph([]GraphNode{ctrl1, ctrl2, aggr1, aggr2, svm1, svm2, pvc1, pvc2, pvcO, pod1, pod2, other, n}, edges)
 
-	v := ProjectStorage(g, appScope(nil, []string{"aggr1"}, nil, []string{"checkout"}))
+	v := ProjectStorage(g, appScope(nil, StorageRootApplication, "checkout"))
 	ids := viewIDs(v)
 	assert.True(t, ids[pod1.ID()])
 	assert.True(t, ids[aggr1.ID()])
 	assert.True(t, ids[pvc1.ID()])
-	assert.False(t, ids[aggr2.ID()], "the aggr2 chain is the other side of the AND")
-	assert.False(t, ids[svm2.ID()])
-	assert.False(t, ids[pvc2.ID()])
-	assert.False(t, ids[ctrl2.ID()])
-	assert.True(t, ids[pod2.ID()], "a checkout pod is still materialised when its chain was filtered out")
-	assert.Nil(t, edgeBetween(v, pvc2.ID(), pod2.ID()))
-	assert.False(t, ids[other.ID()], "non-checkout on aggr1 is absent")
+	assert.True(t, ids[aggr2.ID()], "an application root keeps every checkout path")
+	assert.True(t, ids[pod2.ID()])
+	assert.True(t, ids[pvc2.ID()])
+	assert.False(t, ids[other.ID()], "ledger is not the application")
 }
 
 func TestProjectStorage_ApplicationAndPodRootsUnion(t *testing.T) {
@@ -750,9 +747,9 @@ func TestProjectStorage_ApplicationAndPodRootsUnion(t *testing.T) {
 	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svm.ID(), pvcR.ID(), redis.ID(), n2.ID(), stIO(1), 1)...)
 	g := stGraph([]GraphNode{ctrl, aggr, svm, pvcC, pvcR, checkout, redis, n1, n2}, edges)
 
-	ids := viewIDs(ProjectStorage(g, appScope(nil, nil, []string{"platform/redis-0"}, []string{"checkout"})))
+	ids := viewIDs(ProjectStorage(g, appScope(nil, StorageRootApplication, "checkout")))
 	assert.True(t, ids[checkout.ID()])
-	assert.True(t, ids[redis.ID()])
+	assert.False(t, ids[redis.ID()], "cache is a different application")
 }
 
 func TestProjectStorage_StatelessApplicationStillShows(t *testing.T) {
@@ -761,14 +758,14 @@ func TestProjectStorage_StatelessApplicationStillShows(t *testing.T) {
 	for _, name := range names {
 		nodes = append(nodes, appPod("shop", name, "uid-"+name, "worker-1", "checkout"))
 	}
-	v := ProjectStorage(stGraph(nodes, nil), appScope(nil, nil, nil, []string{"checkout"}))
+	v := ProjectStorage(stGraph(nodes, nil), appScope(nil, StorageRootApplication, "checkout"))
 	assert.Len(t, v.Nodes, 3)
 	assert.Empty(t, v.Edges)
 }
 
 func TestProjectStorage_UnknownApplicationIsNotDrawn(t *testing.T) {
 	pod := appPod("shop", "orders-0", "uid-o", "worker-1", "checkout")
-	v := ProjectStorage(stGraph([]GraphNode{pod}, nil), appScope(nil, nil, nil, []string{"typo"}))
+	v := ProjectStorage(stGraph([]GraphNode{pod}, nil), appScope(nil, StorageRootApplication, "typo"))
 	assert.Empty(t, v.Nodes)
 	assert.Empty(t, v.Edges)
 }
@@ -784,7 +781,7 @@ func TestProjectStorage_NamespaceFilterNarrowsApplicationRoot(t *testing.T) {
 	edges = append(edges, stChain(ctrl.ID(), aggr.ID(), svm.ID(), platPVC.ID(), plat.ID(), n2.ID(), stIO(1), 1)...)
 	g := stGraph([]GraphNode{ctrl, aggr, svm, shopPVC, platPVC, shop, plat, claimless, n1, n2}, edges)
 
-	ids := viewIDs(ProjectStorage(g, appScope([]string{"shop"}, nil, nil, []string{"checkout"})))
+	ids := viewIDs(ProjectStorage(g, appScope([]string{"shop"}, StorageRootApplication, "checkout")))
 	assert.True(t, ids[shop.ID()])
 	assert.False(t, ids[plat.ID()])
 	assert.False(t, ids[claimless.ID()], "a materialised root still honours namespace")
@@ -792,7 +789,7 @@ func TestProjectStorage_NamespaceFilterNarrowsApplicationRoot(t *testing.T) {
 
 func TestProjectStorage_ApplicationClaimIsNeverMaterialised(t *testing.T) {
 	pvc := appPVC("shop", "idle-data", "checkout")
-	v := ProjectStorage(stGraph([]GraphNode{pvc}, nil), appScope(nil, nil, nil, []string{"checkout"}))
+	v := ProjectStorage(stGraph([]GraphNode{pvc}, nil), appScope(nil, StorageRootApplication, "checkout"))
 	assert.Empty(t, v.Nodes, "an unmounted claim is a retention hit only")
 	assert.Empty(t, v.Edges)
 }

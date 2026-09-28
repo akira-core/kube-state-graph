@@ -303,9 +303,14 @@ func TestParse_NetAppVolumeKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, cfg.NetAppVolumeKeyRewrite,
 		"nil means the operator configured none, which adopts the build defaults")
-	assert.Equal(t, string(build.DefaultVolumeMatchMode), cfg.NetAppVolumeMatchMode)
 	assert.Equal(t, build.DefaultQoSScopeBatchBytes, cfg.NetAppQoSScopeBatchBytes)
+	_, err = cfg.VolumeKeyRewriter()
+	require.NoError(t, err)
 
+	withoutMode := map[string]string{
+		"KSG_NETAPP_VOLUME_KEY_REWRITE":    `-=_ ; ^=vol_`,
+		"KSG_NETAPP_QOS_SCOPE_BATCH_BYTES": "4096",
+	}
 	env := map[string]string{
 		"KSG_NETAPP_VOLUME_KEY_REWRITE":    `-=_ ; ^=vol_`,
 		"KSG_NETAPP_VOLUME_MATCH_MODE":     "contains",
@@ -316,17 +321,20 @@ func TestParse_NetAppVolumeKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"-=_", "^=vol_"}, cfg.NetAppVolumeKeyRewrite,
 		"the env form splits on semicolons and trims")
-	assert.Equal(t, "contains", cfg.NetAppVolumeMatchMode)
 	assert.Equal(t, 4096, cfg.NetAppQoSScopeBatchBytes)
+	untouched, err := Parse(nil, func(k string) (string, bool) {
+		v, ok := withoutMode[k]
+		return v, ok
+	})
+	require.NoError(t, err)
+	assert.Equal(t, untouched, cfg, "KSG_NETAPP_VOLUME_MATCH_MODE is not read and changes nothing")
 
 	cfg, err = Parse([]string{
 		"--netapp-volume-key-rewrite=-=_",
-		"--netapp-volume-match-mode=exact",
 	}, lookup)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"-=_"}, cfg.NetAppVolumeKeyRewrite,
 		"the flag replaces the env list wholesale rather than appending to it")
-	assert.Equal(t, "exact", cfg.NetAppVolumeMatchMode, "flag overrides env")
 	assert.Equal(t, 4096, cfg.NetAppQoSScopeBatchBytes, "untouched dimensions keep the env value")
 
 	cfg, err = Parse([]string{
@@ -348,7 +356,7 @@ func TestParse_NetAppVolumeKeyRejected(t *testing.T) {
 		{"uncompilable pattern", []string{"--netapp-volume-key-rewrite=([=x"}, `"(["`},
 		{"missing separator", []string{"--netapp-volume-key-rewrite=nosep"}, "no \"=\" separator"},
 		{"empty pattern", []string{"--netapp-volume-key-rewrite==x"}, "empty pattern"},
-		{"unknown match mode", []string{"--netapp-volume-match-mode=prefix"}, "prefix"},
+		{"removed match-mode flag", []string{"--netapp-volume-match-mode=contains"}, "flag provided but not defined: -netapp-volume-match-mode"},
 		{"non-positive batch budget", []string{"--netapp-qos-scope-batch-bytes=0"}, "must be > 0"},
 	}
 	for _, c := range cases {

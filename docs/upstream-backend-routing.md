@@ -116,12 +116,10 @@ that accepts it. Routing narrows *which store is asked*; the matcher narrows
 *what that store returns*. `env`, `cluster` and `namespace` play no part in
 backend selection. No family is routed by zone without the matcher.
 
-**The volume hub routes like every other storage build.** A
-`/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=` runs
-in hub mode (`storage-graph-api`, "Storage-side roots read the claim chain
-through the volume hub"): it reads the claims FROM the rooted filer's rows, but
-every one of its queries is routed by the request's `az` and carries the
-request's matchers exactly as outside hub mode. No query reaches a store of
+**A storage seed routes like every other storage build.** A
+`/v1/storage-graph` request reads claims FROM the rooted filer's rows, or from
+the workload root's pods, but every one of its queries is routed by the
+request's `az` and carries the request's matchers. No query reaches a store of
 another zone; a filer shared across zones is drawn with the requested zone's
 claims only.
 

@@ -31,21 +31,33 @@ func TestTopologyPlans(t *testing.T) {
 		assert.True(t, fullPlan.issuesFirstWave(l.query), "the full plan issues %s", l.query)
 	}
 
-	scope, err := graph.NewStorageScope(nil, nil, nil, []string{"n1"}, nil, nil, []string{"b/y", "a/x", "c/x"}, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"b/y", "a/x", "c/x"})
 	require.NoError(t, err)
 	p := storagePlan(scope.Roots)
 	assert.True(t, p.byReference)
-	assert.Equal(t, []string{"x", "x", "y"}, p.podRoots, "root names are sorted: map order must not reach the scope")
-	assert.Equal(t, []string{"n1"}, p.nodeRoots)
+	nodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"n1"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"n1"}, storagePlan(nodeScope.Roots).nodeRoots)
 	issued := 0
 	for _, l := range legs {
 		if p.issuesFirstWave(l.query) {
 			issued++
 		}
 	}
-	assert.Equal(t, 18, issued,
-		"37 less the five skipped families less the fourteen pod/node/controller families moved to by-reference waves")
+	assert.Equal(t, 1, issued, "a storage plan's first wave is ALERTS alone")
+	assert.True(t, p.issuesFirstWave(promql.QAlerts))
+	beside := 0
+	for _, l := range legs {
+		if p.issuesBesideSeed(l.query) {
+			beside++
+		}
+	}
+	assert.Equal(t, 0, beside,
+		"a pod root reads nothing across the zone; ALERTS is the first wave and every other family hangs off the seed")
 	for _, q := range promql.ReferenceScopedQueries {
 		assert.False(t, p.issuesFirstWave(q), "%s is read by reference, in a second wave", q)
+		assert.False(t, p.issuesBesideSeed(q), "%s is not zone-wide inventory", q)
 	}
+	assert.Equal(t, graph.StorageRootPod, p.kind)
+	assert.Equal(t, []graph.PodRef{{Namespace: "a", Name: "x"}, {Namespace: "b", Name: "y"}, {Namespace: "c", Name: "x"}}, p.pods)
 }

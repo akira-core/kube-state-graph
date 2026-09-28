@@ -46,7 +46,7 @@ func instantRecorder(t *testing.T) (*promqlmocks.MockQuerier, func() map[time.Ti
 func TestEndAlign_AppliedOnBothGraphEndpoints(t *testing.T) {
 	paths := map[string]string{
 		"graph":         "/v1/graph?start=2026-05-02T12:04:17Z&end=2026-05-02T12:19:47Z",
-		"storage-graph": "/v1/storage-graph?start=2026-05-02T12:04:17Z&end=2026-05-02T12:19:47Z&az=zone-a&env=prod",
+		"storage-graph": "/v1/storage-graph?start=2026-05-02T12:04:17Z&end=2026-05-02T12:19:47Z&az=zone-a&env=prod&aggr=aggr1",
 	}
 	cases := []struct {
 		name  string

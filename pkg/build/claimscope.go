@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
@@ -98,19 +97,6 @@ func volumeNames(rows model.Vector) []string {
 	return slices.Compact(out)
 }
 
-// maxHubClaimChunks bounds how many queries one claim-keyed family's scope may
-// become. Past it the family is read ONCE with no restriction — its fixed
-// selector and the request matchers only — and its rows are filtered in the
-// reader to the same scope (read-storage-roots-through-volume-hub D6).
-//
-// Unlike the phase-1 root set, these scopes are data-derived and can be large:
-// `ontap_cluster=` on a filer serving tens of thousands of claims yields as
-// many candidates. One wide read of a one-series-per-claim family is cheaper
-// than dozens of chunk round-trips, and the body is identical either way,
-// because the reader keeps exactly the rows the restriction would have
-// admitted.
-const maxHubClaimChunks = scopeConcurrency
-
 // claimFamily is one claim-keyed family a hub read issues: its scope on the
 // family's scopedLabel, and keep, the reader-side filter applied to whatever
 // the query returned — the restriction's own predicate, plus the claim-key
@@ -122,11 +108,12 @@ type claimFamily struct {
 	keep  func(model.Metric) bool
 }
 
-// issueClaimKeyed issues each family restricted to its scope — chunked under
-// the shared byte budget, or once unrestricted past maxHubClaimChunks — and
-// then keeps only the rows keep admits. A family whose scope is empty is not
-// issued and not tallied. The first query error fails the build: the hub runs
-// only on /v1/storage-graph, which fails closed.
+// issueClaimKeyed issues each family restricted to its scope, chunked under
+// the shared byte budget however large the scope is, and then keeps only the
+// rows keep admits. A data-derived scope is never replaced by a read across
+// the zone. A family whose scope is empty is not issued and not tallied. The
+// first query error fails the build: the hub runs only on /v1/storage-graph,
+// which fails closed.
 func issueClaimKeyed(
 	ctx context.Context,
 	q promql.Querier,
@@ -138,45 +125,17 @@ func issueClaimKeyed(
 	scopeMu *sync.Mutex,
 	fams []claimFamily,
 ) error {
-	var scoped []scopedFamily
-	var wide []claimFamily
+	scoped := make([]scopedFamily, 0, len(fams))
 	for _, f := range fams {
 		if len(f.scope) == 0 {
 			continue
 		}
-		if chunks := promql.ChunkScope(f.scope, opts.qosScopeBatchBytes()); len(chunks) > maxHubClaimChunks {
-			slog.DebugContext(ctx, "hub claim scope unbounded; reading the family unrestricted and filtering",
-				"query", string(f.query),
-				"scope", len(f.scope),
-				"chunks", len(chunks),
-				"max_chunks", maxHubClaimChunks)
-			wide = append(wide, f)
-			continue
-		}
 		scoped = append(scoped, scopedFamily{query: f.query, dst: f.dst, scope: f.scope})
 	}
-
-	g, gctx := errgroup.WithContext(ctx)
 	if len(scoped) > 0 {
-		g.Go(func() (err error) {
-			// Chunking runs here, outside issueScopedChunk's per-query recover.
-			defer recoverScopedPanic(gctx, scoped[0].query, &err)
-			return issueScopedFamilies(gctx, q, window, end, opts, sel, v, scopeMu, scoped)
-		})
-	}
-	for _, f := range wide {
-		g.Go(func() error {
-			out, err := issueUnrestricted(gctx, q, f.query, window, end, opts.LabelKeys, sel)
-			if err != nil {
-				return err
-			}
-			*f.dst = out
-			markScopeIssued(v, scopeMu, f.query)
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return err
+		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
+			return err
+		}
 	}
 	for _, f := range fams {
 		if len(f.scope) > 0 {
@@ -280,7 +239,9 @@ func readHubClaimInfo(
 	return nil
 }
 
-// hubClaimKey is one claim as the hub's claim-info read names it. The zone and
+// claimKey is one claim as the parse keys it, and the one key every storage
+// read filters claim rows on — the storage seeds' claim-info rows, the
+// workload seeds' bindings and the claim expansion alike. The zone and
 // environment labels are part of it because (az, env, cluster) is the claim's
 // cluster identity — the key every structure of the parse is built on — and a
 // claim name is unique only per namespace of one cluster. The request's az /
@@ -288,12 +249,12 @@ func readHubClaimInfo(
 // cluster is bucketed exactly as the parse buckets it (bucketCluster): an
 // absent label and a literal `unknown` are one cluster there, so they must be
 // one here, or the filter would drop a row the parse joins.
-type hubClaimKey struct {
+type claimKey struct {
 	az, env, cluster, namespace, claim string
 }
 
-func hubClaimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) hubClaimKey {
-	return hubClaimKey{
+func claimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) claimKey {
+	return claimKey{
 		az:        string(m[model.LabelName(keys.AZ)]),
 		env:       string(m[model.LabelName(keys.Env)]),
 		cluster:   bucketCluster(string(m["cluster"])),
@@ -337,14 +298,14 @@ func readHubClaimFamilies(
 	}
 
 	keys := opts.LabelKeys.OrDefault()
-	claims := make(map[hubClaimKey]struct{}, len(v.PVCInfo))
+	claims := make(map[claimKey]struct{}, len(v.PVCInfo))
 	names := make([]string, 0, len(v.PVCInfo))
 	for _, s := range v.PVCInfo {
 		claim := string(s.Metric[promql.ClaimLabel])
 		if claim == "" {
 			continue
 		}
-		claims[hubClaimKeyOf(s.Metric, keys, claim)] = struct{}{}
+		claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 		names = append(names, claim)
 	}
 	names = sortedNames(names)
@@ -359,7 +320,7 @@ func readHubClaimFamilies(
 		return nil
 	}
 	isLoadedClaim := func(m model.Metric) bool {
-		_, ok := claims[hubClaimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
+		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
 	fams := make([]claimFamily, 0, len(promql.ClaimScopedQueries)-1)

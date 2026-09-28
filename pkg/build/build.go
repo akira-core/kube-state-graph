@@ -284,14 +284,36 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 // binds, so no query reaches a store of another zone and no series of another
 // zone or environment reaches the body.
 func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
-	plan = plan.resolveVolumeLabelRead(b.opts.volumeKey(), window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	var err error
+	plan, err = plan.prepareHarvestSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	if err != nil {
+		// The cap is a pure function of the root values and the byte budget, so
+		// the rejection happens before a querier is bound and before any query.
+		return nil, err
+	}
+	plan, err = plan.prepareNodeSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	if err != nil {
+		return nil, err
+	}
+	plan, err = plan.preparePodSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	if err != nil {
+		return nil, err
+	}
+	plan, err = plan.prepareApplicationSeed(b.opts.qosScopeBatchBytes())
+	if err != nil {
+		return nil, err
+	}
+	plan, err = plan.prepareFlowless(b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	if err != nil {
+		return nil, err
+	}
 	q := b.querierFor(sel)
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
 			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
-			attribute.Bool("kube_state_graph.volume_hub", plan.hub),
+			attribute.Bool("kube_state_graph.volume_hub", plan.rootedClaims()),
 		),
 	)
 	defer span.End()
@@ -320,7 +342,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
-		"volume_hub", plan.hub,
+		"volume_hub", plan.rootedClaims(),
 	)
 	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 

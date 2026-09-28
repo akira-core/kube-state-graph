@@ -18,7 +18,15 @@ const (
 	// so the API layer maps it to a 4xx and avoids 5xx metric / span-error
 	// pollution.
 	ReasonCanceled Reason = "canceled"
+	// ReasonInvalidScope marks a storage root whose first read would take more
+	// queries than the cap. It is a client condition: the build issues nothing,
+	// and the API maps it to 400 invalid_scope.
+	ReasonInvalidScope Reason = "invalid_scope"
 )
+
+// RootScopeCapMessage is the client-facing text for ReasonInvalidScope. It
+// names no root value and no upstream detail.
+const RootScopeCapMessage = "root scope exceeds the query cap"
 
 // Error wraps an underlying cause with a typed Reason for HTTP mapping.
 //

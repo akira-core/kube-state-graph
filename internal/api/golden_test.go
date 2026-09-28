@@ -69,11 +69,15 @@ func TestGolden_GraphResponses(t *testing.T) {
 func TestGolden_StorageGraphResponses(t *testing.T) {
 	g := buildStorageGraphEstate()
 	stampFixtureStatuses(slices.Collect(maps.Values(g.NodesByID)))
-	aggrScope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+	aggrScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
-	podScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+	podScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 	require.NoError(t, err)
-	appScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{"checkout"})
+	appScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"checkout"})
+	require.NoError(t, err)
+	ontapNodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootONTAPNode, []string{"ontap-prod-02"})
+	require.NoError(t, err)
+	nodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"worker-2"})
 	require.NoError(t, err)
 	appGraph := applicationRootEstate(g)
 	stampFixtureStatuses(slices.Collect(maps.Values(appGraph.NodesByID)))
@@ -82,6 +86,8 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 		"storage-graph-aggr-root":        graph.ProjectStorage(g, aggrScope),
 		"storage-graph-pod-root":         graph.ProjectStorage(g, podScope),
 		"storage-graph-application-root": graph.ProjectStorage(appGraph, appScope),
+		"storage-graph-ontap-node-root":  graph.ProjectStorage(g, ontapNodeScope),
+		"storage-graph-node-root":        graph.ProjectStorage(g, nodeScope),
 	}
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {

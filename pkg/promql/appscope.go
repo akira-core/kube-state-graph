@@ -9,7 +9,8 @@ import (
 
 // TrackingIDLabel is kube-state-metrics' sanitised form of the
 // argocd.argoproj.io/tracking-id annotation. The application recovery
-// restricts the six controller-annotation families on it.
+// restricts the six controller-annotation families and
+// kube_persistentvolumeclaim_annotations on it.
 const TrackingIDLabel = "annotation_argocd_argoproj_io_tracking_id"
 
 // TrackingIDWrapperCost is the rendered length of the fixed `(?:` … `)(?::.*)?`
@@ -21,25 +22,29 @@ const TrackingIDWrapperCost = len("(?:") + len(")(?::.*)?")
 func trackingIDFamily(q Query) bool {
 	switch q {
 	case QDeploymentAnnotations, QStatefulSetAnnotations, QDaemonSetAnnotations,
-		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations:
+		QReplicaSetAnnotations, QJobAnnotations, QCronJobAnnotations,
+		QPVCAnnotations:
 		return true
 	default:
 		return false
 	}
 }
 
-// RenderTrackingIDScoped renders one controller-annotation family restricted
-// to tracking-ids whose segment before the first ":" is one of apps:
+// RenderTrackingIDScoped renders one tracking-id family restricted to
+// tracking-ids whose segment before the first ":" is one of apps:
 //
 //	last_over_time(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",annotation_argocd_argoproj_io_tracking_id=~"(?:checkout)(?::.*)?"}[5m])
 //
-// The fixed `!=""` selector and the request matchers are composed, never
-// replaced. Each value is QuoteMeta-escaped; the optional `:` suffix is what
-// lets a verbatim Application (no colon in the raw tracking-id) match too.
-// PromQL anchors `=~`, so a value matches itself and nothing else.
+// The six controller-annotation families keep their fixed `!=""` selector
+// ahead of the request matchers. kube_persistentvolumeclaim_annotations has
+// no fixed selector — adding one would change its unscoped rendering — so
+// its tracking-id matcher follows the request matchers directly. Each value
+// is QuoteMeta-escaped; the optional `:` suffix lets a verbatim Application
+// (no colon in the raw tracking-id) match too. PromQL anchors `=~`, so a
+// value matches itself and nothing else.
 //
-// ok is false when apps holds no non-empty value or q is not one of the six
-// annotation families. The caller MUST then skip the query.
+// ok is false when apps holds no non-empty value or q is not a tracking-id
+// family. The caller MUST then skip the query.
 func RenderTrackingIDScoped(q Query, window time.Duration, keys LabelKeys, sel Selector, apps []string) (string, bool) {
 	if !trackingIDFamily(q) {
 		return "", false

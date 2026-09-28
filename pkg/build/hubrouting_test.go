@@ -94,7 +94,7 @@ func assertOnlyZoneA(t *testing.T, f hubZonesFixture) {
 // claim in both zones; a zone-a request draws zone-a's and never asks zone-b.
 func TestBuildStorage_HubStaysInTheRequestZone(t *testing.T) {
 	f := newHubZonesFixture(t)
-	scope := vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil)
+	scope := vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"})
 	g, err := New(f.router, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
 	require.NoError(t, err)
 
@@ -116,7 +116,7 @@ func TestBuildStorage_HubStaysInTheRequestZone(t *testing.T) {
 // is byte-identical to the pre-change read's — the same request with the
 // storage roots taken out of the READ plan.
 func TestBuildStorage_HubMatchesThePreChangeReadAcrossZones(t *testing.T) {
-	scope := vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil)
+	scope := vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"})
 
 	hub := newHubZonesFixture(t)
 	gHub, err := New(hub.router, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
@@ -148,7 +148,7 @@ func TestBuildStorage_HubAlertsStayInTheRequestZone(t *testing.T) {
 	k8sB[promql.QAlerts] = model.Vector{alert("AggrFillingB", "critical", "zone-b")}
 	f := newHubZonesFixtureFrom(t, k8sA, k8sB, netappA, netappB)
 
-	scope := vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil)
+	scope := vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"})
 	g, err := New(f.router, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
 	require.NoError(t, err)
 
@@ -172,8 +172,8 @@ func TestBuildStorage_HubKeepsTheRequestMatchers(t *testing.T) {
 		return fam == promql.FamilyKSM || fam == promql.FamilyKubelet || fam == promql.FamilyAlerts
 	}
 	for name, roots := range map[string]graph.StorageRoots{
-		"hub mode":         vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil).Roots,
-		"outside hub mode": vlrScope(t, nil, nil, nil, nil, []string{"shop/orders-0"}).Roots,
+		"hub mode":         vlrScope(t, graph.StorageRootAggr, []string{"aggr1"}).Roots,
+		"outside hub mode": vlrScope(t, graph.StorageRootPod, []string{"shop/orders-0"}).Roots,
 	} {
 		t.Run(name, func(t *testing.T) {
 			q := promqlfake.New(planEstate())

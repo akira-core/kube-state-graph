@@ -8,7 +8,7 @@ import (
 )
 
 // PodRef names one pod by (namespace, name) rather than by UID. It is the
-// workload-root key of the storage-flow projection: an operator searching for
+// pod-root key of the storage-flow projection: an operator searching for
 // "the storage under shop/orders-0" knows the pod's name, never its UID, and
 // pod names are unique per namespace within a cluster. When the selected
 // estate holds several clusters the name may resolve in more than one; the
@@ -22,60 +22,61 @@ type PodRef struct {
 // String renders the ref in the wire form the `pod=` parameter accepts.
 func (r PodRef) String() string { return r.Namespace + "/" + r.Name }
 
-// StorageRoots is the resolved root selection of a storage-flow request: the
-// components a path must touch to be retained.
+// StorageRootKind is the one root parameter a storage-flow request carries.
+// Values are the wire parameter names.
+type StorageRootKind string
+
+const (
+	StorageRootONTAPCluster StorageRootKind = "ontap_cluster"
+	StorageRootONTAPNode    StorageRootKind = "ontap_node"
+	StorageRootAggr         StorageRootKind = "aggr"
+	StorageRootSVM          StorageRootKind = "svm"
+	StorageRootNode         StorageRootKind = "node"
+	StorageRootPod          StorageRootKind = "pod"
+	StorageRootApplication  StorageRootKind = "application"
+)
+
+// StorageRootKinds is every accepted kind, in parameter order.
+var StorageRootKinds = []StorageRootKind{
+	StorageRootONTAPCluster,
+	StorageRootONTAPNode,
+	StorageRootAggr,
+	StorageRootSVM,
+	StorageRootNode,
+	StorageRootPod,
+	StorageRootApplication,
+}
+
+// StorageRoots is the resolved root selection of a storage-flow request: one
+// kind and its values. A path is retained when it touches any of them.
 //
-// The sets mirror the root parameters. They are RAW NAMES, not node
-// ids — resolution to ids happens in ProjectStorage against the built graph,
-// because an id needs the ONTAP cluster (or the Kubernetes cluster identity)
-// that only the graph knows.
-//
-// Nodes is deliberately ONE set serving BOTH sides of the flow. The `node=`
-// parameter is matched against the ONTAP controller name AND the Kubernetes
-// node name: an operator searching for a node by name generally does not know
-// which kind it is, and a name present on both tiers makes both roots. That is
-// why RequestedStorage and RequestedWorkload both consult it.
+// The values are RAW NAMES, not node ids — resolution to ids happens in
+// ProjectStorage against the built graph, because an id needs the ONTAP
+// cluster (or the Kubernetes cluster identity) that only the graph knows.
+// Pods are PodRef; every other kind stores Names. Both are sorted and
+// de-duplicated, and a kind whose every value was empty is the zero value
+// (no root).
 type StorageRoots struct {
-	// ONTAPClusters selects every controller, aggregate and SVM of an ONTAP
-	// cluster. Storage side.
-	ONTAPClusters map[string]struct{}
-	// Nodes selects an ONTAP controller (storage side) or a Kubernetes node
-	// (workload side) — or both, when the name exists on both tiers.
-	Nodes map[string]struct{}
-	// Aggrs selects an ONTAP aggregate. Storage side.
-	Aggrs map[string]struct{}
-	// SVMs selects an SVM. Storage side.
-	SVMs map[string]struct{}
-	// Pods selects one pod by (namespace, name). Workload side.
-	Pods map[PodRef]struct{}
-	// Applications selects an ArgoCD Application by the name data.application
-	// carries (the tracking-id segment before the first ":"). Workload side:
-	// a pod whose Application() is a root value is materialised, and a claim
-	// whose Application() is a root value retains its path but is never
-	// materialised on its own.
-	Applications map[string]struct{}
+	Kind StorageRootKind
+	// Names is the value set for every kind except pod.
+	Names []string
+	// Pods is the value set when Kind is pod.
+	Pods []PodRef
 }
 
-// RequestedStorage reports whether the request carried any root that could
-// resolve to a storage-side component. It is a property of the REQUEST, not of
-// what resolved: a requested side that resolved to nothing retains nothing (a
-// mistyped `?aggr=` returns an empty body, never the whole estate), which is
-// only expressible by separating "asked" from "found".
-func (r StorageRoots) RequestedStorage() bool {
-	return len(r.ONTAPClusters) > 0 || len(r.Aggrs) > 0 || len(r.SVMs) > 0 || len(r.Nodes) > 0
-}
-
-// RequestedWorkload reports whether the request carried any root that could
-// resolve to a workload-side component. See RequestedStorage for why this is a
-// property of the request rather than of the resolution.
-func (r StorageRoots) RequestedWorkload() bool {
-	return len(r.Pods) > 0 || len(r.Applications) > 0 || len(r.Nodes) > 0
-}
-
-// Any reports whether any root at all was requested. No root means "the whole
-// selected estate", which is a legitimate request rather than an empty one.
+// Any reports whether a root kind with at least one value was requested.
 func (r StorageRoots) Any() bool {
-	return r.RequestedStorage() || r.RequestedWorkload()
+	return r.Kind != "" && (len(r.Names) > 0 || len(r.Pods) > 0)
+}
+
+// HasName reports whether name is one of this root's non-pod values.
+func (r StorageRoots) HasName(name string) bool {
+	return slices.Contains(r.Names, name)
+}
+
+// HasPod reports whether ref is one of this root's pod values.
+func (r StorageRoots) HasPod(ref PodRef) bool {
+	return slices.Contains(r.Pods, ref)
 }
 
 // StorageScope is the projection filter of GET /v1/storage-graph, the
@@ -100,81 +101,82 @@ type StorageScope struct {
 
 // NewStorageScope constructs a StorageScope from raw query-parameter values.
 //
-// Every set drops empty values and de-duplicates, so `?aggr=a&aggr=a&aggr=` and
-// `?aggr=a` are indistinguishable — the determinism rule that makes two
-// differently-ordered requests produce byte-identical bodies.
+// kind is the one root parameter. values are its raw values: `pod` values are
+// `<namespace>/<name>`, every other kind is a bare name. Empty values are
+// dropped and the rest are sorted and de-duplicated, so `?aggr=a&aggr=a&aggr=`
+// and `?aggr=a` are indistinguishable. A kind whose every value was empty is
+// stored as no root.
 //
-// pods carries the raw `pod=<namespace>/<name>` values. Each must split on
-// exactly one "/" into two non-empty segments; anything else is an error, so a
-// bare `?pod=orders-0` is rejected rather than silently matching nothing. The
-// self-contained form is what keeps a root unambiguous: `namespace` is already
-// an OR-combined narrowing filter, so qualifying a pod root with it would make
-// `?namespace=a&namespace=b&pod=x` undecidable.
-//
-// applications carries the raw `application=<name>` values. Empty values are
-// dropped, so a bare `?application=` is a no-op; a value is matched exactly
-// against data.application.
-func NewStorageScope(clusters, namespaces, ontapClusters, nodes, aggrs, svms, pods, applications []string) (StorageScope, error) {
-	refs, err := podRefSet(pods)
+// A pod value must split on exactly one "/" into two non-empty segments;
+// anything else is an error, so a bare `?pod=orders-0` is rejected rather than
+// silently matching nothing. An unknown kind is an error.
+func NewStorageScope(clusters, namespaces []string, kind StorageRootKind, values []string) (StorageScope, error) {
+	roots, err := newStorageRoots(kind, values)
 	if err != nil {
 		return StorageScope{}, err
-	}
-	// stringSet keeps an empty map when every value was blank. A bare
-	// `?application=` is a no-op, so the field stays nil — the same shape
-	// podRefSet gives a bare `?pod=`.
-	apps := stringSet(applications)
-	if len(apps) == 0 {
-		apps = nil
 	}
 	return StorageScope{
 		Clusters:   stringSet(clusters),
 		Namespaces: stringSet(namespaces),
-		Roots: StorageRoots{
-			ONTAPClusters: stringSet(ontapClusters),
-			Nodes:         stringSet(nodes),
-			Aggrs:         stringSet(aggrs),
-			SVMs:          stringSet(svms),
-			Pods:          refs,
-			Applications:  apps,
-		},
+		Roots:      roots,
 	}, nil
 }
 
-// podRefSet parses the `pod=` values into a de-duplicated PodRef set. An empty
-// value is skipped (a bare `?pod=` is a no-op, matching every other set), but a
-// NON-empty malformed value is an error — a typo must not degrade into "no root
-// on this side", which would silently widen the answer to the whole estate.
-func podRefSet(values []string) (map[PodRef]struct{}, error) {
-	if len(values) == 0 {
-		return nil, nil
-	}
-	out := make(map[PodRef]struct{}, len(values))
-	for _, v := range values {
-		if v == "" {
-			continue
+func newStorageRoots(kind StorageRootKind, values []string) (StorageRoots, error) {
+	if kind == "" {
+		if len(nonEmpty(values)) > 0 {
+			return StorageRoots{}, fmt.Errorf("storage root values require a kind")
 		}
+		return StorageRoots{}, nil
+	}
+	if !slices.Contains(StorageRootKinds, kind) {
+		return StorageRoots{}, fmt.Errorf("unknown storage root kind %q", kind)
+	}
+	kept := nonEmpty(values)
+	if len(kept) == 0 {
+		return StorageRoots{}, nil
+	}
+	if kind == StorageRootPod {
+		pods, err := podRefs(kept)
+		if err != nil {
+			return StorageRoots{}, err
+		}
+		return StorageRoots{Kind: kind, Pods: pods}, nil
+	}
+	slices.Sort(kept)
+	kept = slices.Compact(kept)
+	return StorageRoots{Kind: kind, Names: kept}, nil
+}
+
+func nonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// podRefs parses `pod=` values into a sorted, de-duplicated PodRef slice.
+// Every value is non-empty; a malformed one is an error.
+func podRefs(values []string) ([]PodRef, error) {
+	out := make([]PodRef, 0, len(values))
+	seen := make(map[PodRef]struct{}, len(values))
+	for _, v := range values {
 		ns, name, ok := strings.Cut(v, "/")
 		if !ok || ns == "" || name == "" || strings.Contains(name, "/") {
 			return nil, fmt.Errorf("invalid pod root %q: expected <namespace>/<pod-name>", v)
 		}
-		out[PodRef{Namespace: ns, Name: name}] = struct{}{}
-	}
-	if len(out) == 0 {
-		return nil, nil
-	}
-	return out, nil
-}
-
-// SortedPodRefs returns the refs in deterministic (namespace, name) order.
-// Root resolution iterates them in this order so the projection is a pure
-// function of the value set rather than of map iteration.
-func SortedPodRefs(m map[PodRef]struct{}) []PodRef {
-	out := make([]PodRef, 0, len(m))
-	for r := range m {
-		out = append(out, r)
+		ref := PodRef{Namespace: ns, Name: name}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
 	}
 	slices.SortFunc(out, func(a, b PodRef) int {
 		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
 	})
-	return out
+	return out, nil
 }

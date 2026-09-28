@@ -58,11 +58,11 @@ Each of the six SHALL be queried with the fixed, request-invariant matcher `anno
 - `kube_job_annotations{cluster, namespace, job_name, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
 - `kube_cronjob_annotations{cluster, namespace, cronjob, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
 
-The kubelet volume-stats series of the "PVC usage from kubelet volume stats" requirement are **[AECN]**. The NetApp Harvest series of the `netapp-storage-graph` capability receive **no** request-scoped matcher — the `az` dimension reaches them through backend selection only (the `upstream-backend-routing` capability's zone rule) and `env` does not reach them at all.
+The kubelet volume-stats series of the "PVC usage from kubelet volume stats" requirement are **[AECN]**. The NetApp Harvest series of the `netapp-storage-graph` capability receive the `az` and `env` matchers and no other request-scoped matcher (that capability's "Harvest legs carry the request zone and environment"); the `az` dimension additionally selects their backends (the `upstream-backend-routing` capability's zone rule).
 
 Every series above SHALL be queried at its bare (unprefixed) name — there is no configurable metric-name prefix. A request with no selector-level filter SHALL issue each query exactly as listed, with no request-scoped matcher.
 
-Which of the families above a build issues, and how, depends on the endpoint. A `/v1/graph` build SHALL issue every family unrestricted. A `/v1/storage-graph` build SHALL issue the subset the `storage-graph-api` capability's "Storage build reads only what the body draws" requirement defines: the families whose output that body cannot carry are not read at all; the pod families, the four Kubernetes-node families and the eight controller-owner / controller-annotation families are read **by reference** — each restricted to the object names the families read before it actually carry (claim bindings name the pods, the loaded pods name their nodes and owners, the resolved owners name their Deployments and CronJobs), composed with the family's fixed selector and the request-scoped matchers listed above; and the claim, Harvest and `ALERTS` families are read unrestricted. A `/v1/storage-graph` build SHALL fail on a query error of any family except `ALERTS`, including the families this requirement calls OPTIONAL, as the `storage-graph-api` capability's "Storage build fails closed on upstream query errors" requires; OPTIONAL there still means that an ABSENT family — an empty vector — never fails a build. A family a build does not issue — including a by-reference family whose scope came out empty — SHALL be absent from that build's per-family series tally, never reported as zero: zero means "read, matched nothing", and a by-reference family's count is the count of series its restriction matched.
+Which of the families above a build issues, and how, depends on the endpoint. A `/v1/graph` build SHALL issue every family unrestricted. A `/v1/storage-graph` build SHALL issue the subset the `storage-graph-api` capability's "Storage build reads every family by reference" requirement defines: the families whose output that body cannot carry are not read at all; `ALERTS` is read under the request-scoped matchers alone and is the one family read across the whole requested zone; and EVERY other family is read **by reference** — restricted to the object names the request's root or the families read before it actually carry (pods by Kubernetes node or by `(namespace, pod)` pair, claim bindings by `(namespace, pod)` pair or by claim, claims by PersistentVolume or by name, claim annotations by claim or by Application tracking-id, the kubelet volume-stats families by claim, Kubernetes nodes by name, controllers by owner name or tracking-id, and the Harvest families by ONTAP component, token or `(ONTAP cluster, SVM)`), composed with the family's fixed selector and the request-scoped matchers listed above. A `/v1/storage-graph` build SHALL fail on a query error of any family except `ALERTS`, including the families this requirement calls OPTIONAL, as the `storage-graph-api` capability's "Storage build fails closed on upstream query errors" requires; OPTIONAL there still means that an ABSENT family — an empty vector — never fails a build. A family a build does not issue — including a by-reference family whose scope came out empty — SHALL be absent from that build's per-family series tally, never reported as zero: zero means "read, matched nothing", and a by-reference family's count is the count of series its restriction matched.
 
 The three service/endpointslice families are OPTIONAL: when absent (kube-state-metrics not exporting services or endpointslices), the reader SHALL still build a valid topology, the service/endpoint indexes are simply empty, and connection-string resolution in the pod-service-graph reader degrades gracefully — `"://"` service endpoints that cannot be resolved against an empty index become `external/<label>` nodes. Under a selector-level filter the indexes hold only the in-scope services and the in-scope backing pods.
 
@@ -184,6 +184,11 @@ A degrade SHALL be **subtractive**: it removes Applications the failed family wo
 
 - **WHEN** a `/v1/storage-graph` build loads pods owned by two StatefulSets and no other controller kind
 - **THEN** the build's per-family tally carries `kube_statefulset_annotations` with the count of series its `statefulset` restriction matched and carries no key at all for `kube_replicaset_owner`, `kube_job_owner`, `kube_deployment_annotations`, `kube_daemonset_annotations`, `kube_replicaset_annotations`, `kube_job_annotations` or `kube_cronjob_annotations`
+
+#### Scenario: Storage build reads no family but ALERTS across the zone
+
+- **WHEN** a `/v1/storage-graph` build for `?az=zone-a&env=prod&node=worker-1` runs
+- **THEN** every query it issues other than `ALERTS` carries a restriction on the family's identity label (or labels) beyond the request-scoped matchers, and `ALERTS` carries the request-scoped matchers alone
 
 ### Requirement: Service and endpoint indexes
 
@@ -793,10 +798,10 @@ Both series are OPTIONAL and per-field independent: `used_bytes` resolves from t
 
 The build SHALL accept four request-scoped selector dimensions — `az`, `env`, `cluster`, `namespace` — each a set of values, and SHALL render them into the upstream PromQL queries as label matchers composed **with** (never replacing) each query's fixed, request-invariant selectors (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on each of the six controller-annotation families, the service-graph sentinel and `edge_relation!="link"` matchers). Which dimensions reach which series is a hardcoded contract with no configuration surface:
 
-- `az` and `env`: every kube-state-metrics and kubelet series. **Never** a NetApp Harvest series — the `az` dimension reaches Harvest through backend selection only (the `upstream-backend-routing` capability's zone rule), and `env` does not reach Harvest at all.
+- `az` and `env`: every kube-state-metrics, kubelet and NetApp Harvest series. On Harvest they are the ONLY request-scoped matchers, and they render on every Harvest query — including the data- and root-derived restricted reads of the `netapp-storage-graph` and `storage-graph-api` capabilities — ahead of that query's own restriction.
 - `cluster`: every kube-state-metrics and kubelet series. **Never** a Harvest series — Harvest's `cluster` label names the ONTAP cluster, not a Kubernetes cluster — and never a service-graph series.
 - `namespace`: every kube-state-metrics and kubelet series that carries a `namespace` label — the pod-, claim-, Service-, EndpointSlice-, and **controller**-scoped series (the six controller-annotation families and `kube_job_owner` are namespaced like every other workload family). Never a node series, never a Harvest series, never a service-graph series.
-- Every NetApp Harvest series, the three `traces_service_graph_*` series, and the `up{}` probe SHALL carry **no** request-scoped matcher under any request. The `qos_*` families keep their fixed `lun=""` selector.
+- The three `traces_service_graph_*` series and the `up{}` probe SHALL carry **no** request-scoped matcher under any request, and a NetApp Harvest series none beyond `az` and `env`. The `qos_*` families keep their fixed `lun=""` selector.
 
 Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=~"unknown|"` (see "Series missing the cluster label"), the one value that is not rendered as a plain literal. Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
 
@@ -819,8 +824,13 @@ A build with every dimension empty SHALL add **no** request-scoped matcher to an
 
 #### Scenario: Harvest receives no request-scoped matcher
 
+- **WHEN** a build runs with `cluster={cluster-alpha}` and `namespace={shop}` and no `az` / `env` value
+- **THEN** every Harvest query is issued exactly as in an unfiltered build, with no `cluster` or `namespace` matcher
+
+#### Scenario: Harvest receives the zone and environment only
+
 - **WHEN** a build runs with `az={zone-a}`, `env={prod}`, `cluster={cluster-alpha}`, `namespace={shop}`
-- **THEN** every Harvest query (`volume_labels`, the `qos_*` families, `qos_policy_fixed_max_throughput_*`, `aggr_*`, `node_new_status`) is issued exactly as in an unfiltered build — the `qos_*` families with `lun=""` only — with no `az`, `env`, `cluster`, or `namespace` matcher; the `az` value reaches Harvest only as backend selection (which `harvest` backends the query is issued to) and the `env` value does not reach it at all
+- **THEN** every Harvest query (`volume_labels`, the `qos_*` families, `qos_policy_fixed_max_throughput_*`, `aggr_*`, the `node_*` families) carries `<az-key>="zone-a",<env-key>="prod"` ahead of any restriction of its own and no `cluster` or `namespace` matcher; the `aggr_new_status` query is issued as `last_over_time(aggr_new_status{<az-key>="zone-a",<env-key>="prod"}[<window>])`
 
 #### Scenario: Service-graph series are never narrowed
 
@@ -875,7 +885,7 @@ The same two keys SHALL name the labels the reader composes a cluster's identity
 
 ### Requirement: Backend routing composes with request-scoped selectors
 
-Backend selection and PromQL matcher rendering SHALL be independent, composed mechanisms. The `az` dimension SHALL continue to be rendered as a label matcher on every query that accepts it — exactly as specified by "Request-scoped upstream selectors" — **in addition to** selecting which backends the query is issued to. Neither mechanism SHALL substitute for the other: routing narrows which store is asked, the matcher narrows what that store returns. The `harvest` family is the one family where the two diverge: it is zone-routed yet accepts no `az` matcher, so backend selection is the only effect `az` has on it (see the `netapp-storage-graph` capability).
+Backend selection and PromQL matcher rendering SHALL be independent, composed mechanisms. The `az` dimension SHALL continue to be rendered as a label matcher on every query that accepts it — exactly as specified by "Request-scoped upstream selectors" — **in addition to** selecting which backends the query is issued to. Neither mechanism SHALL substitute for the other: routing narrows which store is asked, the matcher narrows what that store returns. Every zone-routed family — `ksm`, `kubelet`, `alerts` and `harvest` — takes the matcher; no family is routed by zone without it.
 
 The rendered query string for a given query SHALL be identical across every backend the query is fanned out to. A per-backend query variant SHALL NOT exist.
 
@@ -959,14 +969,15 @@ A build whose series carry no zone/environment pair SHALL produce every identity
 
 ### Requirement: Application-rooted recovery reads of the owner and annotation families
 
-Under a `/v1/storage-graph` request carrying an `application=` root, the topology reader SHALL issue — in addition to the by-reference reads of "Topology series consumed" — a recovery of the Application's pods over the SAME families, restricted by a different key at each stage (the `storage-graph-api` capability's "Application roots recover their pods before the pod read" defines the stages, their gating, error classes and bound — and, on that endpoint, every recovery query error fails the build, per its "Storage build fails closed on upstream query errors"):
+Under a `/v1/storage-graph` request carrying an `application=` root, the topology reader SHALL issue — in addition to the by-reference reads of "Topology series consumed" — a recovery of the Application's pods over the SAME families, restricted by a different key at each stage (the `storage-graph-api` capability's "Application roots are tracked through their controllers and claims" defines the stages, their gating, error classes and bound — and, on that endpoint, every recovery query error fails the build, per its "Storage build fails closed on upstream query errors"):
 
 - the six controller-annotation families restricted on `annotation_argocd_argoproj_io_tracking_id` to the values whose segment before the first `:` is a root Application — beside their fixed `annotation_argocd_argoproj_io_tracking_id!=""` matcher;
 - `kube_replicaset_owner` restricted to `owner_kind="Deployment"` and `owner_name` in the recovered Deployment names;
 - `kube_job_owner` restricted on `owner_name` to the recovered CronJob names — beside its fixed `owner_kind="CronJob",owner_is_controller="true"` matcher;
-- `kube_pod_owner` restricted to `owner_is_controller="true"`, one query per `owner_kind`, with `owner_name` in that kind's recovered names.
+- `kube_pod_owner` restricted to `owner_is_controller="true"`, one query per `owner_kind`, with `owner_name` in that kind's recovered names;
+- `kube_persistentvolumeclaim_annotations` restricted on `annotation_argocd_argoproj_io_tracking_id` to the same values as the six controller-annotation families — the claims carrying a root Application of their own.
 
-Every recovery query SHALL carry the family's request-scoped matchers (**[AECN]**) exactly as its by-reference read does, SHALL be issued at the family's bare name, and its returned series SHALL be counted under the family's name in the build's per-family tally, added to what the by-reference read of the same family contributes. The recovery SHALL NOT write into the vectors the by-reference reads parse: it yields pod names only, and every attribute of a recovered pod — `owner`, `application`, `status` — is resolved from the by-reference reads exactly as for a claim-binding pod. `/v1/graph`, and a `/v1/storage-graph` request without an `application=` root, SHALL issue none of these reads.
+Every recovery query SHALL carry the family's request-scoped matchers (**[AECN]**) exactly as its by-reference read does, SHALL be issued at the family's bare name, and its returned series SHALL be counted under the family's name in the build's per-family tally, added to what the by-reference read of the same family contributes. The recovery SHALL NOT write into the vectors the by-reference reads parse: it yields pod and claim names only, and every attribute of a recovered pod — `owner`, `application`, `status` — is resolved from the by-reference reads exactly as for a claim-binding pod. `/v1/graph`, and a `/v1/storage-graph` request without an `application=` root, SHALL issue none of these reads.
 
 #### Scenario: Recovery queries compose the fixed selector, the request matchers and the recovery key
 
@@ -982,3 +993,8 @@ Every recovery query SHALL carry the family's request-scoped matchers (**[AECN]*
 
 - **WHEN** a `/v1/storage-graph` build's recovery returns two `kube_deployment_annotations` series and its by-reference controller read returns three
 - **THEN** the per-family tally carries `kube_deployment_annotations` with `5`
+
+#### Scenario: Claims carrying the Application are recovered by tracking-id
+
+- **WHEN** a `/v1/storage-graph` build for `?az=zone-a&env=prod&application=billing` runs and claim `shop/ledger-data` carries tracking-id `billing:/PersistentVolumeClaim:shop/ledger-data`
+- **THEN** a `kube_persistentvolumeclaim_annotations` query restricted to the tracking-id values whose segment before the first `:` is `billing` is issued beside the request-scoped matchers, it returns the `shop/ledger-data` series, and the claim's `data.application` is still resolved by the ordinary claim-annotation rules

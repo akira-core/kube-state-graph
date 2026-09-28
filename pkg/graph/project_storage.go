@@ -13,18 +13,17 @@ import (
 //  1. Extract flow units — one per (claim, mounting pod) — by walking each
 //     svm-pvc edge up (aggr-svm, node-aggr; absent for a FlexGroup) and down
 //     (pvc-pod, then that pod's pod-node).
-//  2. Resolve roots to node-id sets. Exclusive storage parameters
-//     (ontap_cluster / aggr / svm) and exclusive workload parameters (pod,
-//     application) are AND-combined across sides. `node=` is one selector
-//     matched against both tiers; its hits are OR-combined with each other
-//     (values of one selector) and AND-combined with the exclusive sides. A
-//     requested selector that resolved to nothing retains nothing —
-//     `?aggr=typo` is empty, not the estate. An application root matches a
-//     pod (materialised) or a claim (retention only).
-//  3. A unit is kept iff it hits every requested selector group and its
-//     pod / PVC / K8s node pass the re-applied cluster / namespace filters.
-//     Storage-side nodes are never dropped by those filters. A claim hit
-//     retains the unit; it does not materialise the claim on its own.
+//  2. Resolve the one root kind to node-id sets. ontap_cluster roots every
+//     NetApp entity of the filer; ontap_node roots the controller; aggr and
+//     svm root that name on every filer; node roots the Kubernetes node;
+//     pod roots the pod ref; application roots pods (materialised) and
+//     claims (retention only). A kind that resolved to nothing retains
+//     nothing — `?aggr=typo` is empty, not the estate.
+//  3. A unit is kept iff it touches a resolved root (or, for an application
+//     root, a claim hit) and its pod / PVC / K8s node pass the re-applied
+//     cluster / namespace filters. Storage-side nodes are never dropped by
+//     those filters. A claim hit retains the unit; it does not materialise
+//     the claim on its own.
 //  4. Nodes = ∪ retained units ∪ resolved root ids ∪ owning controllers of
 //     admitted aggregates (pullNetAppParents). Edges = the retained units'
 //     hops, weighted over those units (n = mounter count in the *built*
@@ -35,26 +34,12 @@ func ProjectStorage(g *Graph, scope StorageScope) View {
 	}
 
 	units := extractFlowUnits(g)
-	storageIDs, workloadIDs, claimHits, nodeIDs := resolveStorageRoots(g, scope)
-
-	storageExclusive := len(scope.Roots.ONTAPClusters) > 0 ||
-		len(scope.Roots.Aggrs) > 0 || len(scope.Roots.SVMs) > 0
-	workloadExclusive := len(scope.Roots.Pods) > 0 || len(scope.Roots.Applications) > 0
-	nodeRequested := len(scope.Roots.Nodes) > 0
+	storageIDs, workloadIDs, claimHits := resolveStorageRoots(g, scope)
 
 	rawName := g.ClusterRawName
 	retained := make([]flowUnit, 0, len(units))
 	for _, u := range units {
-		if storageExclusive && !u.intersects(storageIDs) {
-			continue
-		}
-		// A pod hit materialises; a claim hit only retains. Either satisfies
-		// the workload side, so an application root keeps a path whose pod or
-		// whose claim carries it.
-		if workloadExclusive && !u.intersects(workloadIDs) && !u.intersects(claimHits) {
-			continue
-		}
-		if nodeRequested && !u.intersects(nodeIDs) {
+		if !u.intersects(storageIDs) && !u.intersects(workloadIDs) && !u.intersects(claimHits) {
 			continue
 		}
 		if !u.passesFilters(g, scope, rawName) {
@@ -78,14 +63,6 @@ func ProjectStorage(g *Graph, scope StorageScope) View {
 	}
 	for id := range workloadIDs {
 		admitRoot(g, nodes, id, true, scope, rawName)
-	}
-	for id := range nodeIDs {
-		n, ok := g.NodesByID[id]
-		if !ok {
-			continue
-		}
-		workload := n.Type() == NodeTypeK8sNode || n.Type() == NodeTypePod
-		admitRoot(g, nodes, id, workload, scope, rawName)
 	}
 	pullNetAppParents(g, nodes)
 
@@ -328,79 +305,79 @@ func claimAggrOf(claim *Edge, incoming []*Edge, stamped bool) string {
 	return ""
 }
 
-func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claimHits, nodeHits map[string]struct{}) {
+func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claimHits map[string]struct{}) {
 	storage = map[string]struct{}{}
 	workload = map[string]struct{}{}
 	claimHits = map[string]struct{}{}
-	nodeHits = map[string]struct{}{}
-	ocSet := scope.Roots.ONTAPClusters
-	namedAggrOrSVM := len(scope.Roots.Aggrs) > 0 || len(scope.Roots.SVMs) > 0
-
-	inOC := func(n GraphNode) bool {
-		if len(ocSet) == 0 {
-			return true
-		}
-		_, ok := ocSet[n.Labels()["ontap_cluster"]]
+	roots := scope.Roots
+	if !roots.Any() {
+		return storage, workload, claimHits
+	}
+	names := make(map[string]struct{}, len(roots.Names))
+	for _, name := range roots.Names {
+		names[name] = struct{}{}
+	}
+	pods := make(map[PodRef]struct{}, len(roots.Pods))
+	for _, ref := range roots.Pods {
+		pods[ref] = struct{}{}
+	}
+	named := func(n GraphNode) bool {
+		_, ok := names[n.Name()]
 		return ok
 	}
-
 	for _, n := range g.NodesByID {
-		switch n.Type() {
-		case NodeTypeNetAppAggr:
-			if _, ok := scope.Roots.Aggrs[n.Name()]; ok && inOC(n) {
-				storage[n.ID()] = struct{}{}
-			}
-		case NodeTypeNetAppSVM:
-			if _, ok := scope.Roots.SVMs[n.Name()]; ok && inOC(n) {
-				storage[n.ID()] = struct{}{}
-			}
-		case NodeTypeNetAppNode:
-			if _, ok := scope.Roots.Nodes[n.Name()]; ok && inOC(n) {
-				nodeHits[n.ID()] = struct{}{}
-			}
-		case NodeTypeK8sNode:
-			if _, ok := scope.Roots.Nodes[n.Name()]; ok {
-				nodeHits[n.ID()] = struct{}{}
-			}
-		case NodeTypePod:
-			ref := PodRef{Namespace: n.Labels()["namespace"], Name: n.Name()}
-			if _, ok := scope.Roots.Pods[ref]; ok {
-				workload[n.ID()] = struct{}{}
-			}
-			if app := n.Application(); app != "" {
-				if _, ok := scope.Roots.Applications[app]; ok {
-					workload[n.ID()] = struct{}{}
-				}
-			}
-		case NodeTypePVC:
-			// A claim hit retains the path and is never materialised on its
-			// own — admitRoot runs over workload only.
-			if app := n.Application(); app != "" {
-				if _, ok := scope.Roots.Applications[app]; ok {
-					claimHits[n.ID()] = struct{}{}
-				}
-			}
-		default:
-			// service / external are never storage or workload roots
-		}
-	}
-
-	// ontap_cluster used alone (no named aggr/svm) roots every NetApp entity
-	// in those clusters. Combined with aggr=/svm= it only NARROWS those
-	// named roots — "unless ontap_cluster narrows it".
-	if len(ocSet) > 0 && !namedAggrOrSVM {
-		for _, n := range g.NodesByID {
+		switch roots.Kind {
+		case StorageRootONTAPCluster:
 			switch n.Type() {
 			case NodeTypeNetAppAggr, NodeTypeNetAppSVM, NodeTypeNetAppNode:
-				if inOC(n) {
+				if _, ok := names[n.Labels()["ontap_cluster"]]; ok {
 					storage[n.ID()] = struct{}{}
 				}
 			default:
-				// Kubernetes types are not ONTAP-cluster-scoped
+			}
+		case StorageRootONTAPNode:
+			if n.Type() == NodeTypeNetAppNode && named(n) {
+				storage[n.ID()] = struct{}{}
+			}
+		case StorageRootAggr:
+			if n.Type() == NodeTypeNetAppAggr && named(n) {
+				storage[n.ID()] = struct{}{}
+			}
+		case StorageRootSVM:
+			if n.Type() == NodeTypeNetAppSVM && named(n) {
+				storage[n.ID()] = struct{}{}
+			}
+		case StorageRootNode:
+			if n.Type() == NodeTypeK8sNode && named(n) {
+				workload[n.ID()] = struct{}{}
+			}
+		case StorageRootPod:
+			if n.Type() == NodeTypePod {
+				ref := PodRef{Namespace: n.Labels()["namespace"], Name: n.Name()}
+				if _, ok := pods[ref]; ok {
+					workload[n.ID()] = struct{}{}
+				}
+			}
+		case StorageRootApplication:
+			app := n.Application()
+			if app == "" {
+				continue
+			}
+			if _, ok := names[app]; !ok {
+				continue
+			}
+			switch n.Type() {
+			case NodeTypePod:
+				workload[n.ID()] = struct{}{}
+			case NodeTypePVC:
+				// A claim hit retains the path and is never materialised on
+				// its own — admitRoot runs over storage and workload only.
+				claimHits[n.ID()] = struct{}{}
+			default:
 			}
 		}
 	}
-	return storage, workload, claimHits, nodeHits
+	return storage, workload, claimHits
 }
 
 // weightRetained sums each retained edge's I/O over the retained units that

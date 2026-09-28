@@ -5,7 +5,7 @@ This document is the install-side companion to the Harvest + kubelet table in
 [`upstream-metrics.md`](upstream-metrics.md) — all 40 graph-input series plus
 the `up` diagnostic probe.
 
-## The join is derive-then-match, and needs no relabel rule
+## The join is derive-then-suffix, and needs no relabel rule
 
 ONTAP volume names admit only letters, digits and `_`. A Kubernetes
 PersistentVolume is named `pvc-<uuid>`. The two can therefore never be equal,
@@ -17,7 +17,7 @@ kube_persistentvolumeclaim_info.volumename        (the bound PV name)
         ▼  rewrite rules            (default: replace `-` with `_`)
    match token
         │
-        ▼  match mode               (default: suffix)
+        ▼  suffix                   (the FlexVol name ends with the token)
 volume_labels.volume  ==  qos_*.volume            (the ONTAP FlexVol name)
 ```
 
@@ -35,39 +35,23 @@ FlexVol   trident_pvc_8f0c1e2a_1234_5678_9abc_def012345678
           └────────┘ the configured storagePrefix
 ```
 
-The default **suffix** match is what makes the prefix irrelevant — the backend
-never needs to be told what `storagePrefix` is set to, and an estate running
-several backends with different prefixes still resolves.
+The suffix comparison is what makes the prefix irrelevant — the backend never
+needs to be told what `storagePrefix` is set to, and an estate running several
+backends with different prefixes still resolves. A FlexVol named exactly the
+token matches, because a value ends with itself. A clone or snapshot whose
+name extends past the token (`trident_pvc_x_clone`) does not.
 
 ### Configuration
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `--netapp-volume-key-rewrite` / `KSG_NETAPP_VOLUME_KEY_REWRITE` | `-=_` | Ordered `<regex>=<replacement>` rules producing the match token from the PV name. Repeat the flag for several rules; the env form is semicolon-separated. Each entry splits on its FIRST `=`; a pattern needing a literal `=` writes `\x3d`. The first flag occurrence REPLACES the default list rather than appending to it |
-| `--netapp-volume-match-mode` / `KSG_NETAPP_VOLUME_MATCH_MODE` | `suffix` | `exact`, `suffix`, `contains`, or `regex` (the token is compiled as a regular expression) |
 | `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, a `/v1/storage-graph` pod read's `pod`, or a storage-rooted `volume_labels` read's `aggr` / `cluster` / token set. A larger matched set is split across several queries |
 
-An uncompilable pattern or an unknown match mode is a **startup failure**, never
-a silent fallback to the defaults: a typo would otherwise resolve a different
-estate than the operator declared.
-
-Pick the mode by what the estate's FlexVol names look like:
-
-- **`suffix`** — the FlexVol name ENDS with the transformed PV name. Every
-  Trident ONTAP driver. Resolves without knowing `storagePrefix`, and rejects a
-  clone or snapshot whose name extends past the PV name
-  (`trident_pvc_x_clone`).
-- **`exact`** — the FlexVol name IS the transformed PV name (a backend with an
-  empty `storagePrefix`).
-- **`contains`** — the transformed PV name appears anywhere in the FlexVol
-  name. Accepts the suffixed-clone shape above, so a claim can pick up a
-  derived volume's aggregate. Scans every claim per series.
-- **`regex`** — the token is a regular expression. For naming schemes the other
-  three cannot express; write the rewrite rules to produce the pattern. Also a
-  scan.
-
-`exact` and `suffix` resolve through a hash index and cost one lookup per
-Harvest series. `contains` and `regex` cost claims × series.
+An uncompilable pattern is a **startup failure**, never a silent fallback to
+the defaults: a typo would otherwise resolve a different estate than the
+operator declared. The comparison is always a suffix. Tokens are bucketed by
+length and cost one lookup per Harvest series.
 
 ### Tuning loop
 
@@ -80,7 +64,7 @@ Harvest series. `contains` and `regex` cost claims × series.
    cannot report a derivation that fits no claim at all — see below.
 3. If non-zero, look at what the filer actually calls its volumes:
    `count by (volume) (volume_labels)`, and compare with a claim's
-   `volumename`. Adjust the rewrite rules or the match mode.
+   `volumename`. Adjust the rewrite rules.
 4. Once step 2 reports zero, any legacy `volume_name` relabel rule may be
    deleted from the Prometheus scrape config. Leaving it installed is harmless.
 
@@ -121,7 +105,7 @@ build where hop A matched nothing issues no hop-B query at all.
    QoS workloads that measure the edge, and the `(ontap_cluster, svm)` pair the
    throughput ceiling is keyed on all come from that filer's series alone.
 
-## Storage-rooted requests read claims FROM the FlexVol name (hub mode)
+## Storage-rooted requests read claims FROM the FlexVol name
 
 A `/v1/storage-graph` request rooted at `ontap_cluster=`, `aggr=` or `svm=`
 does not scan the zone's claims: it reads the rooted `volume_labels` rows first
@@ -144,14 +128,14 @@ have:
   storage-rooted body. `/v1/graph`, rootless storage requests and requests
   rooted only at `pod=`, `application=` or `node=` still join it. Size the gap
   with `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
-- **The claim-binding family must carry `persistentvolumeclaim`.** Hub mode
+- **The claim-binding family must carry `persistentvolumeclaim`.** The storage seed
   scopes `kube_pod_spec_volumes_persistentvolumeclaims_info` on that label; an
   exporter labelling the binding with `claim_name` only (outside the documented
   label contract) draws no path from a storage root.
 
-The operator-configured rewrite rules and match mode do not change the
-extraction: an ordered list of regexps cannot be inverted, so a custom rule set
-can make a storage-rooted request find fewer claims, never attach a wrong one.
+The operator-configured rewrite rules do not change the extraction: an ordered
+list of regexps cannot be inverted, so a custom rule set can make a
+storage-rooted request find fewer claims, never attach a wrong one.
 
 ## Zone and environment labels are REQUIRED on Harvest
 
@@ -203,7 +187,7 @@ Three coverage signals, each gated on its OWN family being present:
   one QoS family returned series"; a build that issued no QoS query at all is
   silent.
 - `slog.Warn("storage_root_claim_miss", "reason", r, …)` — a storage-rooted
-  request (hub mode, above) whose rooted rows led to no claim.
+  request (the seed above) whose rooted rows led to no claim.
   `reason="no_pv_candidate"` (with `volumes`) means rooted volumes were read
   and none embeds `pvc_` — the FlexVol naming does not carry the PV name.
   `reason="no_claim"` (with `candidates`) means candidates were derived and no

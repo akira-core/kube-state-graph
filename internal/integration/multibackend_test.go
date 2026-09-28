@@ -423,7 +423,7 @@ func (s *MultiBackendSuite) TestDuplicateServiceGraphSeriesDoesNotDoubleTheRate(
 func (s *MultiBackendSuite) TestAlertsFamilyOptionalAndDedicated() {
 	srv := s.startRoutedAPI(s.familySplitBackends())
 	s.fetchGraph(srv, inventory)
-	resp := s.httpGet(s.storageGraphURL(srv.URL, nil))
+	resp := s.httpGet(s.storageGraphURL(srv.URL, func(q url.Values) { q.Set("aggr", "aggr1") }))
 	s.Equal(http.StatusOK, resp.StatusCode, "an unserved alerts family still serves /v1/storage-graph")
 	_ = resp.Body.Close()
 

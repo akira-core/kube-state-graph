@@ -85,15 +85,16 @@ type Topology struct {
 	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:
 	// the storage-flow graph needs flowless roots (a degraded aggregate serving
 	// no claim is a valid answer to "what is on this filer?"), and a storage
-	// root must stay drawable when no claim reaches it. That is why the
-	// aggregate, controller and policy Harvest families are NEVER narrowed by a
-	// root: they are what draws a rooted component with no volume on it. Roots
-	// reach the pod scope (readScopedPods), the node scope (readScopedNodes) and
-	// — for an ontap_cluster= / aggr= / svm= root — the volume_labels leg itself
-	// (readRootedVolumeLabels), which is safe because that leg is restricted to
-	// exactly the components the roots name, every aggregate an svm= root
-	// touches is re-read whole for its owner vote, and each matched claim's
-	// whole candidate set is recovered in a second phase.
+	// root must stay drawable when no claim reaches it. An aggr, ontap_node or
+	// ontap_cluster root therefore reads its aggregate and controller gauges
+	// for that root (readFlowlessHarvest). A pod, node, svm or application
+	// root still reads those gauges across the zone. Roots reach the pod scope
+	// (readScopedPods), the node scope (readScopedNodes) and — for an
+	// ontap_cluster= / aggr= / svm= / ontap_node= root — the volume_labels leg
+	// itself (readRootedVolumeLabels), which is safe because that leg is
+	// restricted to exactly the components the roots name, every aggregate an
+	// svm= root touches is re-read whole for its owner vote, and each matched
+	// claim's whole candidate set is recovered in a second phase.
 	//
 	// Its size is bounded by the FILER (tens of aggregates, hundreds of SVMs),
 	// not by the Kubernetes estate, and a flowless entity costs nothing at
@@ -405,21 +406,33 @@ func readTopology(
 	v.VolumeKey = opts.volumeKey()
 	// Whether this build is in hub mode: the volume-label family read
 	// restricted to the rooted components, and the claim families read FROM
-	// those rows. A plan property AND a configuration property (the match mode,
-	// the byte budget), so it is decided once, before anything launches, and
+	// those rows. A plan property and a configuration property (the byte
+	// budget), so it is decided once, before anything launches, and
 	// the launch, the waves and the parse all read the same answer. A storage
 	// build has usually resolved it already, to pick its request matchers and
 	// routing; resolving is idempotent.
-	plan = plan.resolveVolumeLabelRead(v.VolumeKey, window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
-	if plan.phaseOneUnbounded {
-		slog.WarnContext(ctx, "storage roots did not yield a bounded volume-label restriction; reading the family unrestricted",
-			"query", string(promql.QVolumeLabels),
-			"ontap_clusters", len(plan.volumeClusters),
-			"aggrs", len(plan.volumeAggrs),
-			"svms", len(plan.volumeSVMs),
-			"max_chunks", maxRootedVolumeLabelChunks)
+	var prepErr error
+	plan, prepErr = plan.prepareHarvestSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if prepErr != nil {
+		return Topology{}, prepErr
 	}
-	v.VolumeLabelsRestricted = plan.hub
+	plan, prepErr = plan.prepareNodeSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if prepErr != nil {
+		return Topology{}, prepErr
+	}
+	plan, prepErr = plan.preparePodSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if prepErr != nil {
+		return Topology{}, prepErr
+	}
+	plan, prepErr = plan.prepareApplicationSeed(opts.qosScopeBatchBytes())
+	if prepErr != nil {
+		return Topology{}, prepErr
+	}
+	plan, prepErr = plan.prepareFlowless(opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if prepErr != nil {
+		return Topology{}, prepErr
+	}
+	v.VolumeLabelsRestricted = plan.rootedClaims()
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -513,29 +526,41 @@ func readTopology(
 		promql.QPVCBindings:    bindingsDone,
 		promql.QPVCAnnotations: pvcAnnotationsDone,
 	}
-	if plan.hub {
-		// The claim families are not first-wave legs in hub mode: the hub's
+	if plan.rootedClaims() {
+		// The claim families are not beside-seed legs for a Harvest root: the
 		// claim-keyed reads below close these three channels when they return,
 		// and closing them here as well would panic.
 		delete(signals, promql.QPVCInfo)
 		delete(signals, promql.QPVCBindings)
 		delete(signals, promql.QPVCAnnotations)
 	}
+	if plan.bindingsFromSeed() {
+		// The node or pod seed closes bindingsDone. Closing it here as well
+		// would panic, and leaving it to the unissued-signal closer would
+		// let the pod wave run before the seed's bindings land.
+		delete(signals, promql.QPVCBindings)
+	}
+	if plan.tracksByReference() && !plan.rootedClaims() {
+		// The workload expansion closes these when the claim side and the
+		// token read return. Closing them here would let QoS run on empty
+		// vectors, and closing them twice would panic.
+		delete(signals, promql.QPVCInfo)
+		delete(signals, promql.QVolumeLabels)
+		delete(signals, promql.QPVCAnnotations)
+	}
 	// svmRows are phase 1's SVM-group rows, kept apart for owner completion.
 	// Written by the phase-1 leg before volumeLabelsDone closes.
 	var svmRows model.Vector
 	legs := topologyLegs(&v)
-	for _, l := range legs {
-		if !plan.issuesFirstWave(l.query) {
-			continue
-		}
+	start := func(l topologyLeg) {
 		var run func() error
 		switch {
-		case l.query == promql.QVolumeLabels && plan.hub:
-			// Phase 1 of the rooted read: a first-wave leg, because its
-			// restriction comes from the request and nothing precedes it. It
-			// keeps this leg's done-signal, which now also gates the hub's claim
-			// read and owner completion.
+		case l.query == promql.QVolumeLabels && plan.kind == graph.StorageRootONTAPNode && plan.rootedClaims():
+			run = readONTAPNodeVolumeLabels(ctx, q, window, end, opts, sel, plan, l.dst, &svmRows)
+		case l.query == promql.QVolumeLabels && plan.rootedClaims():
+			// Phase 1 of the rooted read. Its restriction comes from the
+			// request, so it runs beside ALERTS. The done-signal also gates
+			// the claim read and owner completion.
 			run = readRootedVolumeLabels(ctx, q, end, plan.phaseOne, l.dst, &svmRows)
 		case !l.optional || plan.failsClosed(l.query):
 			run = fetch(l.query, l.dst)
@@ -549,6 +574,11 @@ func readTopology(
 			delete(signals, l.query)
 		}
 		g.Go(run)
+	}
+	for _, l := range legs {
+		if plan.issuesFirstWave(l.query) || plan.issuesBesideSeed(l.query) {
+			start(l)
+		}
 	}
 	// A prerequisite this plan never issues can never signal. Closing it lets the
 	// wave it gates compute an empty scope and issue nothing, instead of waiting
@@ -585,7 +615,8 @@ func readTopology(
 	// on every return path, so a failed leg empties the scopes downstream of it
 	// instead of blocking them.
 	volumeLabelsFinal := volumeLabelsDone
-	if plan.hub {
+	appDone := make(chan struct{})
+	if plan.rootedClaims() {
 		var cov hubCoverage
 		g.Go(signalWhenDone(func() error {
 			return readHubClaimInfo(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, volumeLabelsDone)
@@ -597,6 +628,23 @@ func readTopology(
 		g.Go(signalWhenDone(func() error {
 			return readVolumeLabelsTail(ctx, q, window, end, opts, sel, plan, &v, &svmRows,
 				volumeLabelsDone, pvcInfoDone)
+		}, finalDone))
+		volumeLabelsFinal = finalDone
+	}
+	if plan.byReference {
+		if len(plan.applicationRoots) == 0 {
+			close(appDone)
+		}
+	} else {
+		close(appDone)
+	}
+	if plan.tracksByReference() && !plan.rootedClaims() {
+		finalDone := make(chan struct{})
+		g.Go(signalWhenDone(signalWhenDone(func() error {
+			return readWorkloadClaims(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, bindingsDone, appDone)
+		}, pvcInfoDone), pvcAnnotationsDone))
+		g.Go(signalWhenDone(func() error {
+			return readWorkloadVolumeLabels(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone)
 		}, finalDone))
 		volumeLabelsFinal = finalDone
 	}
@@ -614,21 +662,49 @@ func readTopology(
 	// closes on every return path of readScopedPods, success or failure, so
 	// the two later waves compute an empty scope and issue nothing rather
 	// than block forever when the pod wave fails).
-	if plan.byReference {
-		appDone := make(chan struct{})
-		var recovered []string
-		if len(plan.applicationRoots) > 0 {
+	switch plan.kind {
+	case graph.StorageRootNode:
+		if len(plan.nodeRoots) > 0 {
 			g.Go(signalWhenDone(func() error {
+				return readNodeSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
+			}, bindingsDone))
+		}
+	case graph.StorageRootPod:
+		if len(plan.pods) > 0 {
+			g.Go(signalWhenDone(func() error {
+				return readPodSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
+			}, bindingsDone))
+		}
+	case graph.StorageRootONTAPCluster, graph.StorageRootONTAPNode, graph.StorageRootAggr, graph.StorageRootSVM, graph.StorageRootApplication:
+		// Harvest and application seeds are launched with the expansion, not here.
+	}
+	flowlessDone := make(chan struct{})
+	// Either read launches the goroutine. Every kind reading aggregate gauges
+	// reads controllers today, but the launch must not depend on that.
+	if plan.flowlessAggrGauges() || plan.flowlessControllers() {
+		g.Go(signalWhenDone(func() error {
+			return readFlowlessHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, volumeLabelsFinal)
+		}, flowlessDone))
+	} else {
+		close(flowlessDone)
+	}
+	if plan.tracksByReference() {
+		g.Go(func() error {
+			return readReachedHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone, volumeLabelsFinal, flowlessDone)
+		})
+	}
+	if plan.byReference {
+		var recovered []podSeriesKey
+		if len(plan.applicationRoots) > 0 {
+			g.Go(signalWhenDone(signalWhenDone(func() error {
 				names, err := readScopedApplications(ctx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
 				recovered = names
 				return err
-			}, appDone))
-		} else {
-			close(appDone)
+			}, bindingsDone), appDone))
 		}
 		podsDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, plan.applicationRoots, &v, &scopeMu,
+			return readScopedPods(ctx, q, window, end, opts, sel, plan.pods, plan.applicationRoots, &v, &scopeMu,
 				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
 		}, podsDone))
 		g.Go(func() error {

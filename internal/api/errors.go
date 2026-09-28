@@ -78,6 +78,12 @@ func (s *Server) mapBuildError(c *gin.Context, err error) {
 		writeError(c, http.StatusBadGateway, "upstream", upstreamMessage(err))
 	case build.ReasonCanceled:
 		writeError(c, statusClientClosedRequest, "canceled", "request canceled")
+	case build.ReasonInvalidScope:
+		msg := build.RootScopeCapMessage
+		if be, ok := errors.AsType[*build.Error](err); ok && be.Message != "" {
+			msg = be.Message
+		}
+		writeError(c, http.StatusBadRequest, "invalid_scope", msg)
 	default:
 		s.logger.ErrorContext(c.Request.Context(), "graph build failed",
 			"err", err, "request_id", c.GetString("request_id"))

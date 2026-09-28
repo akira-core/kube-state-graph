@@ -3,8 +3,8 @@ package kubegraph
 import (
 	"fmt"
 	"net/url"
-	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -126,16 +126,20 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, err
 	}
 
-	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "node", "aggr", "svm", "pod", "application"} {
+	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "application"} {
 		if err := validateSelectorValues(p, v[p]); err != nil {
 			return req, err
 		}
 	}
 
-	scope, serr := graph.NewStorageScope(
-		v["cluster"], v["namespace"],
-		v["ontap_cluster"], v["node"], v["aggr"], v["svm"], v["pod"], v["application"],
-	)
+	kind, values, rerr := oneStorageRoot(v)
+	if rerr != nil {
+		return req, rerr
+	}
+	// oneStorageRoot returned a kind holding at least one non-empty value, and
+	// NewStorageScope drops only empty values (a malformed pod is an error), so
+	// the scope always carries a root here.
+	scope, serr := graph.NewStorageScope(v["cluster"], v["namespace"], kind, values)
 	if serr != nil {
 		return req, &ParseError{"invalid_scope", serr.Error()}
 	}
@@ -144,43 +148,45 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		AZ:        []string{az},
 		Env:       []string{env},
 		Cluster:   v["cluster"],
-		Namespace: deriveStorageNamespaces(scope, v["namespace"]),
+		Namespace: v["namespace"],
 	}
 	return req, nil
 }
 
-// deriveStorageNamespaces returns the namespace selector a storage request's
-// build is narrowed by: the explicit `namespace` parameter whenever it carries a
-// value, and otherwise — when every root is a pod root — the roots' own
-// namespaces.
-//
-// The derived case is output-preserving, which is what lets the parser push it
-// upstream unasked. With pod roots only, a retained path is anchored on a root
-// pod; its claim lives in that pod's namespace (a pod can only reference a claim
-// in its own namespace), and every other pod on the path mounts that same claim.
-// Nothing a pod-rooted body draws lies outside the roots' namespaces, so reading
-// only those namespaces changes the queries and never the body.
-//
-// Any storage-side, `node` or `application` root suppresses it: those roots
-// select paths in every namespace (an Application is not bound to one). An
-// explicit namespace is never widened, intersected or replaced — an
-// intersection could come out empty, which the selector reads as "no filter",
-// the one outcome that would WIDEN the read. The projection's own namespace
-// filter (StorageScope.Namespaces) is untouched: this narrows the upstream
-// read only.
-func deriveStorageNamespaces(scope graph.StorageScope, explicit []string) []string {
-	if slices.ContainsFunc(explicit, func(ns string) bool { return ns != "" }) {
-		return explicit
+// storageRootParams is the root parameters in the order a mixed-kind error
+// names them.
+var storageRootParams = []string{
+	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "application",
+}
+
+// oneStorageRoot returns the single root kind that carries a non-empty value.
+// Zero kinds is missing_root; two or more is invalid_scope naming those
+// parameters. Empty values do not count, so a bare `?aggr=` is not a root.
+func oneStorageRoot(v url.Values) (graph.StorageRootKind, []string, error) {
+	var present []string
+	for _, p := range storageRootParams {
+		if hasNonEmpty(v[p]) {
+			present = append(present, p)
+		}
 	}
-	if scope.Roots.RequestedStorage() || len(scope.Roots.Applications) > 0 || len(scope.Roots.Pods) == 0 {
-		return explicit
+	switch len(present) {
+	case 0:
+		return "", nil, &ParseError{"missing_root", "a storage-graph request requires exactly one root kind"}
+	case 1:
+		p := present[0]
+		return graph.StorageRootKind(p), v[p], nil
+	default:
+		return "", nil, &ParseError{"invalid_scope", "exactly one root kind is allowed, got " + strings.Join(present, " and ")}
 	}
-	namespaces := make([]string, 0, len(scope.Roots.Pods))
-	for ref := range scope.Roots.Pods {
-		namespaces = append(namespaces, ref.Namespace)
+}
+
+func hasNonEmpty(values []string) bool {
+	for _, v := range values {
+		if v != "" {
+			return true
+		}
 	}
-	slices.Sort(namespaces)
-	return slices.Compact(namespaces)
+	return false
 }
 
 // parseWindow reads the required start / end pair shared by every graph

@@ -83,12 +83,6 @@ type Config struct {
 	// a legal ONTAP volume name. An explicitly empty value is an identity
 	// rewrite.
 	NetAppVolumeKeyRewrite []string
-	// NetAppVolumeMatchMode decides how that token is compared against the
-	// stock Harvest `volume` label: exact, suffix, contains or regex
-	// (--netapp-volume-match-mode / KSG_NETAPP_VOLUME_MATCH_MODE). Defaults to
-	// suffix, which resolves a FlexVol without the deployment declaring the
-	// provisioner's storage prefix.
-	NetAppVolumeMatchMode string
 	// NetAppQoSScopeBatchBytes bounds every data-derived alternation one query
 	// carries — the scoped QoS workload read's `volume` and the storage
 	// build's `pod`, `node` and controller-name (ReplicaSet / Job /
@@ -157,7 +151,6 @@ func Defaults() Config {
 		// and adopts build.DefaultVolumeKeyRules, while an explicitly empty
 		// list is an identity rewrite.
 		NetAppVolumeKeyRewrite:   nil,
-		NetAppVolumeMatchMode:    string(build.DefaultVolumeMatchMode),
 		NetAppQoSScopeBatchBytes: build.DefaultQoSScopeBatchBytes,
 		BackendsFile:             "",
 		// Matches APIKeysReloadInterval: the same mounted-file cadence, so an
@@ -194,7 +187,6 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
-	fs.StringVar(&cfg.NetAppVolumeMatchMode, "netapp-volume-match-mode", cfg.NetAppVolumeMatchMode, "How the derived token is matched against the stock Harvest `volume` label: exact, suffix, contains or regex.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
 	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
@@ -275,7 +267,6 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	if v, ok := lookup("KSG_NETAPP_VOLUME_KEY_REWRITE"); ok {
 		cfg.NetAppVolumeKeyRewrite = splitAndTrimOn(v, ";")
 	}
-	getStr("KSG_NETAPP_VOLUME_MATCH_MODE", &cfg.NetAppVolumeMatchMode)
 	if err := getInt("KSG_NETAPP_QOS_SCOPE_BATCH_BYTES", &cfg.NetAppQoSScopeBatchBytes); err != nil {
 		return err
 	}
@@ -390,9 +381,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("az-label and env-label must differ (both %q): one matcher would overwrite the other", c.AZLabel)
 	}
 	// The derivation decides which FlexVol every claim joins, so an
-	// uncompilable pattern or an unknown mode fails HERE rather than resolving
-	// a different estate than the operator declared. Compiling it also proves
-	// the value handed to build.Options is usable.
+	// uncompilable pattern fails HERE rather than resolving a different estate
+	// than the operator declared. Compiling it also proves the value handed to
+	// build.Options is usable.
 	if _, err := c.VolumeKeyRewriter(); err != nil {
 		return fmt.Errorf("netapp volume key derivation is invalid: %w", err)
 	}
@@ -474,7 +465,7 @@ func (c Config) VolumeKeyRewriter() (*build.VolumeKeyRewriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return build.NewVolumeKeyRewriter(rules, build.VolumeMatchMode(c.NetAppVolumeMatchMode))
+	return build.NewVolumeKeyRewriter(rules)
 }
 
 func splitAndTrimOn(v, sep string) []string {

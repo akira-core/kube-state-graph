@@ -38,13 +38,13 @@ func (d delayedQuerier) Instant(ctx context.Context, name, query string, ts time
 
 // scopedPodVectors drives readScopedPods directly with the binding family
 // already landed, so a test can assert on the merged vectors themselves.
-func scopedPodVectors(t *testing.T, q promql.Querier, opts Options, roots []string, bindings model.Vector) (*topologyVectors, error) {
+func scopedPodVectors(t *testing.T, q promql.Querier, opts Options, roots []graph.PodRef, bindings model.Vector) (*topologyVectors, error) {
 	t.Helper()
 	v := &topologyVectors{PVC: bindings}
 	var mu sync.Mutex
 	done := make(chan struct{})
 	close(done)
-	var recovered []string
+	var recovered []podSeriesKey
 	err := readScopedPods(t.Context(), q, time.Minute, time.Unix(1, 0).UTC(), opts, promql.Selector{}, roots, nil, v, &mu, done, done, done, &recovered)
 	return v, err
 }
@@ -67,28 +67,58 @@ func TestPodTargetsArePodScopedQueries(t *testing.T) {
 }
 
 // The scope mirrors the binding reader's discard: a series naming no claim
-// binds nothing, so its pod does not enter the scope unless it is a root.
-func TestPodScope(t *testing.T) {
+// binds nothing, so its pod does not enter the scope. Each pod keeps the
+// namespace its binding row carries.
+func TestBindingPodRefs(t *testing.T) {
 	bindings := model.Vector{
-		{Metric: model.Metric{"pod": "b", "persistentvolumeclaim": "c1"}},
-		{Metric: model.Metric{"pod": "a", "claim_name": "c2"}},
-		{Metric: model.Metric{"pod": "a", "persistentvolumeclaim": "c3"}},
-		{Metric: model.Metric{"pod": "unbound", "volume": "data"}},
-		{Metric: model.Metric{"persistentvolumeclaim": "c4"}},
+		{Metric: model.Metric{"namespace": "shop", "pod": "b", "persistentvolumeclaim": "c1"}},
+		{Metric: model.Metric{"namespace": "platform", "pod": "a", "claim_name": "c2"}},
+		{Metric: model.Metric{"namespace": "shop", "pod": "a", "persistentvolumeclaim": "c3"}},
+		{Metric: model.Metric{"namespace": "shop", "pod": "unbound", "volume": "data"}},
+		{Metric: model.Metric{"namespace": "shop", "persistentvolumeclaim": "c4"}},
 	}
-	assert.Equal(t, []string{"a", "b", "root"}, podScope(bindings, []string{"root", "", "b"}))
-	assert.Empty(t, podScope(nil, nil))
+	assert.Equal(t, []graph.PodRef{
+		{Namespace: "shop", Name: "b"},
+		{Namespace: "platform", Name: "a"},
+		{Namespace: "shop", Name: "a"},
+	}, bindingPodRefs(bindings))
+	assert.Empty(t, bindingPodRefs(nil))
 }
 
-// Spec: "Pod read is restricted to mounting pods and roots".
+// Refs group by namespace, sorted and de-duplicated, independent of input
+// order; a nameless ref is dropped.
+func TestGroupPodRefs(t *testing.T) {
+	in := []graph.PodRef{
+		{Namespace: "shop", Name: "web-0"},
+		{Namespace: "platform", Name: "orders-0"},
+		{Namespace: "shop", Name: "orders-0"},
+		{Namespace: "shop", Name: "web-0"},
+		{Namespace: "shop", Name: ""},
+	}
+	snapshot := slices.Clone(in)
+	namespaces, byNS := groupPodRefs(in)
+	assert.Equal(t, []string{"platform", "shop"}, namespaces)
+	assert.Equal(t, map[string][]string{"platform": {"orders-0"}, "shop": {"orders-0", "web-0"}}, byNS)
+	assert.Equal(t, snapshot, in, "the input is not mutated")
+
+	empty, _ := groupPodRefs([]graph.PodRef{{Namespace: "shop"}})
+	assert.Empty(t, empty)
+}
+
+// A pod root's pod read is the root plus the other mounters of its claims.
+// catalog-0 mounts a different claim, so the seed never tracks it.
 func TestReadScopedPods_RestrictedToMountingPodsAndRoots(t *testing.T) {
-	bind := func(pod string) *model.Sample {
-		return planKSM("namespace", "shop", "pod", pod, "persistentvolumeclaim", "data-"+pod)
+	bind := func(pod, claim string) *model.Sample {
+		return planKSM("namespace", "shop", "pod", pod, "persistentvolumeclaim", claim)
 	}
 	f := promqlfake.New(map[promql.Query]model.Vector{
-		promql.QPVCBindings: {bind("orders-0"), bind("orders-1"), bind("catalog-0")},
+		promql.QPVCBindings: {
+			bind("web-0", "data-web"),
+			bind("share-0", "data-web"),
+			bind("catalog-0", "data-catalog"),
+		},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 	require.NoError(t, err)
 
 	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -96,8 +126,8 @@ func TestReadScopedPods_RestrictedToMountingPodsAndRoots(t *testing.T) {
 
 	for _, q := range promql.PodScopedQueries {
 		assert.Equal(t, []string{
-			`last_over_time(` + string(q) + `{az="zone-a",env="prod",pod=~"catalog-0|orders-0|orders-1|web-0"}[1m])`,
-		}, f.QueriesFor(q), "request matchers first, then the scope")
+			`last_over_time(` + string(q) + `{az="zone-a",env="prod",namespace="shop",pod=~"share-0|web-0"}[1m])`,
+		}, f.QueriesFor(q), "request matchers first, then the (namespace, pod) scope")
 	}
 
 	// The wave waits for the binding family its scope is computed from.
@@ -113,7 +143,7 @@ func TestReadScopedPods_EmptyScopeIssuesNothing(t *testing.T) {
 	fixtures := map[promql.Query]model.Vector{
 		promql.QAggrStatus: {planHarvest("cluster", "ontap-prod", "node", "ontap-prod-01", "aggr", "aggr1")},
 	}
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
 
 	f := promqlfake.New(fixtures)
@@ -147,13 +177,13 @@ func TestReadScopedPods_ClaimlessRootIsLoaded(t *testing.T) {
 		promql.QPodInfo:  {planKSM("namespace", "shop", "pod", "web-0", "uid", "uid-w0", "node", "worker-1")},
 		promql.QNodeInfo: {planKSM("node", "worker-1")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 	require.NoError(t, err)
 
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{`last_over_time(kube_pod_info{az="zone-a",env="prod",pod="web-0"}[1m])`},
+	assert.Equal(t, []string{`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="web-0"}[1m])`},
 		f.QueriesFor(promql.QPodInfo), "no binding at all: the root alone makes the scope")
 	body := cytoscape.Serialise(g, graph.ProjectStorage(g, scope))
 	drawn := false
