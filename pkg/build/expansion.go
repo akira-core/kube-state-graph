@@ -39,10 +39,10 @@ func readWorkloadClaims(
 	}
 	keys := opts.LabelKeys.OrDefault()
 	tracked := trackedClaimKeys(v.PVC, keys)
-	for k := range annotationHubKeys(v.PVCAnnotations, plan.applicationRoots, keys) {
+	for k := range annotatedClaimKeys(v.PVCAnnotations, plan.applicationRoots, keys) {
 		tracked[k] = struct{}{}
 	}
-	names := claimNamesFromHubKeys(tracked)
+	names := claimNamesFromKeys(tracked)
 	if len(names) == 0 {
 		return nil
 	}
@@ -52,7 +52,7 @@ func readWorkloadClaims(
 		addExtraSeries(v, scopeMu, promql.QPVCAnnotations, n)
 	}
 	keep := func(m model.Metric) bool {
-		_, ok := tracked[hubClaimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
+		_, ok := tracked[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
 	fams := []scopedFamily{
@@ -173,19 +173,19 @@ func readReachedHarvest(
 	return g.Wait()
 }
 
-func trackedClaimKeys(rows model.Vector, keys promql.LabelKeys) map[hubClaimKey]struct{} {
-	out := make(map[hubClaimKey]struct{})
+func trackedClaimKeys(rows model.Vector, keys promql.LabelKeys) map[claimKey]struct{} {
+	out := make(map[claimKey]struct{})
 	for _, s := range rows {
 		claim := bindingClaim(s.Metric)
 		if claim == "" {
 			continue
 		}
-		out[hubClaimKeyOf(s.Metric, keys, claim)] = struct{}{}
+		out[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 	}
 	return out
 }
 
-func annotationHubKeys(rows model.Vector, roots []string, keys promql.LabelKeys) map[hubClaimKey]struct{} {
+func annotatedClaimKeys(rows model.Vector, roots []string, keys promql.LabelKeys) map[claimKey]struct{} {
 	if len(roots) == 0 || len(rows) == 0 {
 		return nil
 	}
@@ -195,7 +195,7 @@ func annotationHubKeys(rows model.Vector, roots []string, keys promql.LabelKeys)
 			apps[root] = struct{}{}
 		}
 	}
-	out := make(map[hubClaimKey]struct{})
+	out := make(map[claimKey]struct{})
 	for _, s := range rows {
 		app := argoAppName(string(s.Metric[argoTrackingIDLabel]))
 		if app == "" {
@@ -208,12 +208,12 @@ func annotationHubKeys(rows model.Vector, roots []string, keys promql.LabelKeys)
 		if claim == "" {
 			continue
 		}
-		out[hubClaimKeyOf(s.Metric, keys, claim)] = struct{}{}
+		out[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 	}
 	return out
 }
 
-func claimNamesFromHubKeys(keys map[hubClaimKey]struct{}) []string {
+func claimNamesFromKeys(keys map[claimKey]struct{}) []string {
 	names := make([]string, 0, len(keys))
 	for k := range keys {
 		if k.claim != "" {

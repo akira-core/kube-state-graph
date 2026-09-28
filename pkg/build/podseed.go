@@ -56,7 +56,8 @@ func readPodSeed(
 	}}); err != nil {
 		return err
 	}
-	v.PVC = keepClaimBindings(v.PVC, claimKeysOf(tracked))
+	lk := opts.LabelKeys.OrDefault()
+	v.PVC = keepClaimBindings(v.PVC, trackedClaimKeys(tracked, lk), lk)
 	return nil
 }
 

@@ -239,7 +239,9 @@ func readHubClaimInfo(
 	return nil
 }
 
-// hubClaimKey is one claim as the hub's claim-info read names it. The zone and
+// claimKey is one claim as the parse keys it, and the one key every storage
+// read filters claim rows on — the storage seeds' claim-info rows, the
+// workload seeds' bindings and the claim expansion alike. The zone and
 // environment labels are part of it because (az, env, cluster) is the claim's
 // cluster identity — the key every structure of the parse is built on — and a
 // claim name is unique only per namespace of one cluster. The request's az /
@@ -247,12 +249,12 @@ func readHubClaimInfo(
 // cluster is bucketed exactly as the parse buckets it (bucketCluster): an
 // absent label and a literal `unknown` are one cluster there, so they must be
 // one here, or the filter would drop a row the parse joins.
-type hubClaimKey struct {
+type claimKey struct {
 	az, env, cluster, namespace, claim string
 }
 
-func hubClaimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) hubClaimKey {
-	return hubClaimKey{
+func claimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) claimKey {
+	return claimKey{
 		az:        string(m[model.LabelName(keys.AZ)]),
 		env:       string(m[model.LabelName(keys.Env)]),
 		cluster:   bucketCluster(string(m["cluster"])),
@@ -296,14 +298,14 @@ func readHubClaimFamilies(
 	}
 
 	keys := opts.LabelKeys.OrDefault()
-	claims := make(map[hubClaimKey]struct{}, len(v.PVCInfo))
+	claims := make(map[claimKey]struct{}, len(v.PVCInfo))
 	names := make([]string, 0, len(v.PVCInfo))
 	for _, s := range v.PVCInfo {
 		claim := string(s.Metric[promql.ClaimLabel])
 		if claim == "" {
 			continue
 		}
-		claims[hubClaimKeyOf(s.Metric, keys, claim)] = struct{}{}
+		claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 		names = append(names, claim)
 	}
 	names = sortedNames(names)
@@ -318,7 +320,7 @@ func readHubClaimFamilies(
 		return nil
 	}
 	isLoadedClaim := func(m model.Metric) bool {
-		_, ok := claims[hubClaimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
+		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
 	fams := make([]claimFamily, 0, len(promql.ClaimScopedQueries)-1)

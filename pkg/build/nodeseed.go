@@ -85,7 +85,8 @@ func readNodeSeed(
 	}}); err != nil {
 		return err
 	}
-	v.PVC = keepClaimBindings(v.PVC, claimKeysOf(tracked))
+	lk := opts.LabelKeys.OrDefault()
+	v.PVC = keepClaimBindings(v.PVC, trackedClaimKeys(tracked, lk), lk)
 	return nil
 }
 
@@ -160,10 +161,6 @@ func keepPodBindings(rows model.Vector, pods map[podSeriesKey]struct{}) model.Ve
 	return out
 }
 
-type claimSeriesKey struct {
-	cluster, namespace, claim string
-}
-
 func claimNamesOf(rows model.Vector) []string {
 	names := make([]string, 0, len(rows))
 	for _, s := range rows {
@@ -175,31 +172,12 @@ func claimNamesOf(rows model.Vector) []string {
 	return slices.Compact(names)
 }
 
-func claimKeysOf(rows model.Vector) map[claimSeriesKey]struct{} {
-	out := make(map[claimSeriesKey]struct{})
-	for _, s := range rows {
-		claim := bindingClaim(s.Metric)
-		if claim == "" {
-			continue
-		}
-		out[claimSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric["namespace"]),
-			claim:     claim,
-		}] = struct{}{}
-	}
-	return out
-}
-
-func keepClaimBindings(rows model.Vector, claims map[claimSeriesKey]struct{}) model.Vector {
+// keepClaimBindings keeps the binding rows whose claim is one of claims, keyed
+// exactly as the parse keys a claim (claimKeyOf).
+func keepClaimBindings(rows model.Vector, claims map[claimKey]struct{}, keys promql.LabelKeys) model.Vector {
 	var out model.Vector
 	for _, s := range rows {
-		k := claimSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric["namespace"]),
-			claim:     bindingClaim(s.Metric),
-		}
-		if _, ok := claims[k]; ok {
+		if _, ok := claims[claimKeyOf(s.Metric, keys, bindingClaim(s.Metric))]; ok {
 			out = append(out, s)
 		}
 	}

@@ -212,7 +212,8 @@ func readApplicationBindings(
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
 ) error {
-	ann := annotatedClaimKeys(v.PVCAnnotations, roots)
+	lk := opts.LabelKeys.OrDefault()
+	ann := annotatedClaimKeys(v.PVCAnnotations, roots, lk)
 	var tracked model.Vector
 	if len(pods) > 0 {
 		byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(pods))
@@ -225,7 +226,7 @@ func readApplicationBindings(
 		}
 		tracked = keepPodBindings(byPod, recovered)
 	}
-	keys := claimKeysOf(tracked)
+	keys := trackedClaimKeys(tracked, lk)
 	for k := range ann {
 		keys[k] = struct{}{}
 	}
@@ -241,44 +242,8 @@ func readApplicationBindings(
 	}}); err != nil {
 		return err
 	}
-	v.PVC = keepClaimBindings(v.PVC, keys)
+	v.PVC = keepClaimBindings(v.PVC, keys, lk)
 	return nil
-}
-
-func annotatedClaimKeys(rows model.Vector, roots []string) map[claimSeriesKey]struct{} {
-	apps := make(map[string]struct{}, len(roots))
-	for _, root := range roots {
-		if root != "" {
-			apps[root] = struct{}{}
-		}
-	}
-	out := make(map[claimSeriesKey]struct{})
-	for _, s := range rows {
-		app := argoAppName(string(s.Metric[argoTrackingIDLabel]))
-		if _, ok := apps[app]; !ok || app == "" {
-			continue
-		}
-		claim := string(s.Metric["persistentvolumeclaim"])
-		if claim == "" {
-			continue
-		}
-		out[claimSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric["namespace"]),
-			claim:     claim,
-		}] = struct{}{}
-	}
-	return out
-}
-
-func claimNamesFromKeys(keys map[claimSeriesKey]struct{}) []string {
-	names := make([]string, 0, len(keys))
-	for k := range keys {
-		if k.claim != "" {
-			names = append(names, k.claim)
-		}
-	}
-	return sortedNames(names)
 }
 
 func namesFromTracking(vec model.Vector, label model.LabelName, apps map[string]struct{}) []string {
