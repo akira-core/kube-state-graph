@@ -80,15 +80,20 @@ func TestPodScope(t *testing.T) {
 	assert.Empty(t, podScope(nil, nil))
 }
 
-// Spec: "Pod read is restricted to mounting pods and roots".
+// A pod root's pod read is the root plus the other mounters of its claims.
+// catalog-0 mounts a different claim, so the seed never tracks it.
 func TestReadScopedPods_RestrictedToMountingPodsAndRoots(t *testing.T) {
-	bind := func(pod string) *model.Sample {
-		return planKSM("namespace", "shop", "pod", pod, "persistentvolumeclaim", "data-"+pod)
+	bind := func(pod, claim string) *model.Sample {
+		return planKSM("namespace", "shop", "pod", pod, "persistentvolumeclaim", claim)
 	}
 	f := promqlfake.New(map[promql.Query]model.Vector{
-		promql.QPVCBindings: {bind("orders-0"), bind("orders-1"), bind("catalog-0")},
+		promql.QPVCBindings: {
+			bind("web-0", "data-web"),
+			bind("share-0", "data-web"),
+			bind("catalog-0", "data-catalog"),
+		},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 	require.NoError(t, err)
 
 	_, err = New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)
@@ -96,7 +101,7 @@ func TestReadScopedPods_RestrictedToMountingPodsAndRoots(t *testing.T) {
 
 	for _, q := range promql.PodScopedQueries {
 		assert.Equal(t, []string{
-			`last_over_time(` + string(q) + `{az="zone-a",env="prod",pod=~"catalog-0|orders-0|orders-1|web-0"}[1m])`,
+			`last_over_time(` + string(q) + `{az="zone-a",env="prod",pod=~"share-0|web-0"}[1m])`,
 		}, f.QueriesFor(q), "request matchers first, then the scope")
 	}
 
@@ -113,7 +118,7 @@ func TestReadScopedPods_EmptyScopeIssuesNothing(t *testing.T) {
 	fixtures := map[promql.Query]model.Vector{
 		promql.QAggrStatus: {planHarvest("cluster", "ontap-prod", "node", "ontap-prod-01", "aggr", "aggr1")},
 	}
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
 
 	f := promqlfake.New(fixtures)
@@ -147,7 +152,7 @@ func TestReadScopedPods_ClaimlessRootIsLoaded(t *testing.T) {
 		promql.QPodInfo:  {planKSM("namespace", "shop", "pod", "web-0", "uid", "uid-w0", "node", "worker-1")},
 		promql.QNodeInfo: {planKSM("node", "worker-1")},
 	})
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 	require.NoError(t, err)
 
 	g, err := New(f, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, scope.Roots)

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
@@ -98,19 +97,6 @@ func volumeNames(rows model.Vector) []string {
 	return slices.Compact(out)
 }
 
-// maxHubClaimChunks bounds how many queries one claim-keyed family's scope may
-// become. Past it the family is read ONCE with no restriction — its fixed
-// selector and the request matchers only — and its rows are filtered in the
-// reader to the same scope (read-storage-roots-through-volume-hub D6).
-//
-// Unlike the phase-1 root set, these scopes are data-derived and can be large:
-// `ontap_cluster=` on a filer serving tens of thousands of claims yields as
-// many candidates. One wide read of a one-series-per-claim family is cheaper
-// than dozens of chunk round-trips, and the body is identical either way,
-// because the reader keeps exactly the rows the restriction would have
-// admitted.
-const maxHubClaimChunks = scopeConcurrency
-
 // claimFamily is one claim-keyed family a hub read issues: its scope on the
 // family's scopedLabel, and keep, the reader-side filter applied to whatever
 // the query returned — the restriction's own predicate, plus the claim-key
@@ -122,11 +108,12 @@ type claimFamily struct {
 	keep  func(model.Metric) bool
 }
 
-// issueClaimKeyed issues each family restricted to its scope — chunked under
-// the shared byte budget, or once unrestricted past maxHubClaimChunks — and
-// then keeps only the rows keep admits. A family whose scope is empty is not
-// issued and not tallied. The first query error fails the build: the hub runs
-// only on /v1/storage-graph, which fails closed.
+// issueClaimKeyed issues each family restricted to its scope, chunked under
+// the shared byte budget however large the scope is, and then keeps only the
+// rows keep admits. A data-derived scope is never replaced by a read across
+// the zone. A family whose scope is empty is not issued and not tallied. The
+// first query error fails the build: the hub runs only on /v1/storage-graph,
+// which fails closed.
 func issueClaimKeyed(
 	ctx context.Context,
 	q promql.Querier,
@@ -138,45 +125,17 @@ func issueClaimKeyed(
 	scopeMu *sync.Mutex,
 	fams []claimFamily,
 ) error {
-	var scoped []scopedFamily
-	var wide []claimFamily
+	scoped := make([]scopedFamily, 0, len(fams))
 	for _, f := range fams {
 		if len(f.scope) == 0 {
 			continue
 		}
-		if chunks := promql.ChunkScope(f.scope, opts.qosScopeBatchBytes()); len(chunks) > maxHubClaimChunks {
-			slog.DebugContext(ctx, "hub claim scope unbounded; reading the family unrestricted and filtering",
-				"query", string(f.query),
-				"scope", len(f.scope),
-				"chunks", len(chunks),
-				"max_chunks", maxHubClaimChunks)
-			wide = append(wide, f)
-			continue
-		}
 		scoped = append(scoped, scopedFamily{query: f.query, dst: f.dst, scope: f.scope})
 	}
-
-	g, gctx := errgroup.WithContext(ctx)
 	if len(scoped) > 0 {
-		g.Go(func() (err error) {
-			// Chunking runs here, outside issueScopedChunk's per-query recover.
-			defer recoverScopedPanic(gctx, scoped[0].query, &err)
-			return issueScopedFamilies(gctx, q, window, end, opts, sel, v, scopeMu, scoped)
-		})
-	}
-	for _, f := range wide {
-		g.Go(func() error {
-			out, err := issueUnrestricted(gctx, q, f.query, window, end, opts.LabelKeys, sel)
-			if err != nil {
-				return err
-			}
-			*f.dst = out
-			markScopeIssued(v, scopeMu, f.query)
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return err
+		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
+			return err
+		}
 	}
 	for _, f := range fams {
 		if len(f.scope) > 0 {

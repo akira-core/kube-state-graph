@@ -1,15 +1,12 @@
 package kubegraph_test
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
-	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/internal/promqlfake"
 	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
@@ -74,43 +71,28 @@ func namespaceEstate() map[promql.Query]model.Vector {
 	return out
 }
 
-// Spec: "Pod roots push their namespaces upstream" — the derived selector
-// changes the queries and never the body.
-func TestParseStorageValues_DerivedNamespaceIsOutputPreserving(t *testing.T) {
+// A pod root is keyed by the pod ref. It does not push the roots' namespaces
+// into the selector.
+func TestParseStorageValues_PodRootDoesNotDeriveNamespace(t *testing.T) {
 	vals := storageBase()
 	vals["pod"] = []string{"shop/orders-0", "platform/redis-0"}
 
-	derivedQ := promqlfake.New(namespaceEstate())
-	derived, err := kubegraph.New(derivedQ, kubegraph.Options{}).BuildStorageFromValues(t.Context(), vals)
+	q := promqlfake.New(namespaceEstate())
+	body, err := kubegraph.New(q, kubegraph.Options{}).BuildStorageFromValues(t.Context(), vals)
 	require.NoError(t, err)
+	require.NotEmpty(t, body.Elements.Edges, "a vacuous body would prove nothing")
 
 	req, err := kubegraph.ParseStorageValues(vals)
 	require.NoError(t, err)
-	plainSel := req.Selector
-	plainSel.Namespace = nil
-	plainQ := promqlfake.New(namespaceEstate())
-	g, err := kubegraph.New(plainQ, kubegraph.Options{}).
-		BuildStorage(t.Context(), req.End.Sub(req.Start), req.End, plainSel, req.Scope.Roots)
-	require.NoError(t, err)
-	plain := cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope))
-
-	require.NotEmpty(t, derived.Elements.Edges, "a vacuous body would prove nothing")
-	derivedJSON, err := json.Marshal(derived)
-	require.NoError(t, err)
-	plainJSON, err := json.Marshal(plain)
-	require.NoError(t, err)
-	assert.JSONEq(t, string(plainJSON), string(derivedJSON))
-
+	assert.Empty(t, req.Selector.Namespace)
 	assert.Equal(t, []string{
-		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace=~"platform|shop"}[1h])`,
-	}, derivedQ.QueriesFor(promql.QPVCBindings))
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1h])`,
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",persistentvolumeclaim=~"orders-data|redis-data"}[1h])`,
+	}, q.QueriesFor(promql.QPVCBindings), "bindings are the pod seed, then mounter completion by claim")
 	assert.Equal(t, []string{
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"platform|shop|"}[1h])`,
-	}, derivedQ.QueriesFor(promql.QAlerts), "namespace-less alerts still reach the aggregate")
-	require.Len(t, plainQ.QueriesFor(promql.QPVCBindings), 1)
-	assert.NotContains(t, plainQ.QueriesFor(promql.QPVCBindings)[0], "namespace")
-
-	// The derived read is genuinely narrower: other/batch-0 never reached it.
-	assert.NotContains(t, derivedQ.QueriesFor(promql.QPodInfo)[0], "batch-0")
-	assert.Contains(t, plainQ.QueriesFor(promql.QPodInfo)[0], "batch-0")
+		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",persistentvolumeclaim=~"orders-data|redis-data"}[1h])`,
+	}, q.QueriesFor(promql.QPVCInfo), "claim info is read by the tracked claim names")
+	assert.Equal(t, []string{
+		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
+	}, q.QueriesFor(promql.QAlerts))
 }

@@ -12,23 +12,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func mustRewriter(t *testing.T, rules []VolumeKeyRule, mode VolumeMatchMode) *VolumeKeyRewriter {
+func mustRewriter(t *testing.T, rules []VolumeKeyRule) *VolumeKeyRewriter {
 	t.Helper()
-	rw, err := NewVolumeKeyRewriter(rules, mode)
+	rw, err := NewVolumeKeyRewriter(rules)
 	require.NoError(t, err)
 	return rw
 }
 
 func TestNewVolumeKeyRewriter_DefaultsAndOrder(t *testing.T) {
 	t.Run("nil rules adopt the default dash-to-underscore rule", func(t *testing.T) {
-		rw := mustRewriter(t, nil, "")
-		assert.Equal(t, DefaultVolumeMatchMode, rw.mode)
+		rw := mustRewriter(t, nil)
 		assert.Equal(t, "pvc_9f3a_11d0", rw.token("pvc-9f3a-11d0"),
 			"every dash is replaced, not just the first")
 	})
 
 	t.Run("empty non-nil rules are an explicit identity rewrite", func(t *testing.T) {
-		rw := mustRewriter(t, []VolumeKeyRule{}, VolumeMatchExact)
+		rw := mustRewriter(t, []VolumeKeyRule{})
 		assert.Equal(t, "pvc-9f3a", rw.token("pvc-9f3a"))
 	})
 
@@ -36,7 +35,7 @@ func TestNewVolumeKeyRewriter_DefaultsAndOrder(t *testing.T) {
 		rw := mustRewriter(t, []VolumeKeyRule{
 			{Pattern: "-", Replacement: "_"},
 			{Pattern: "^", Replacement: "vol_"},
-		}, "")
+		})
 		assert.Equal(t, "vol_pvc_9f3a", rw.token("pvc-9f3a"))
 	})
 
@@ -44,7 +43,7 @@ func TestNewVolumeKeyRewriter_DefaultsAndOrder(t *testing.T) {
 		rw := mustRewriter(t, []VolumeKeyRule{
 			{Pattern: "^", Replacement: "vol-"},
 			{Pattern: "-", Replacement: "_"},
-		}, "")
+		})
 		assert.Equal(t, "vol_pvc_9f3a", rw.token("pvc-9f3a"),
 			"the prefix rule ran first, so its own dash is rewritten too")
 	})
@@ -53,18 +52,18 @@ func TestNewVolumeKeyRewriter_DefaultsAndOrder(t *testing.T) {
 		rw := mustRewriter(t, []VolumeKeyRule{
 			{Pattern: `^pvc-(.*)$`, Replacement: "trident_${1}"},
 			{Pattern: "-", Replacement: "_"},
-		}, "")
+		})
 		assert.Equal(t, "trident_9f3a_11d0", rw.token("pvc-9f3a-11d0"))
 	})
 
 	t.Run("an empty PV name derives no token", func(t *testing.T) {
-		assert.Empty(t, mustRewriter(t, nil, "").token(""))
+		assert.Empty(t, mustRewriter(t, nil).token(""))
 	})
 }
 
 func TestNewVolumeKeyRewriter_Errors(t *testing.T) {
 	t.Run("uncompilable pattern is an error naming it", func(t *testing.T) {
-		_, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "([", Replacement: "x"}}, "")
+		_, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "([", Replacement: "x"}})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `"(["`, "the offending pattern is named")
 	})
@@ -73,91 +72,58 @@ func TestNewVolumeKeyRewriter_Errors(t *testing.T) {
 		_, err := NewVolumeKeyRewriter([]VolumeKeyRule{
 			{Pattern: "-", Replacement: "_"},
 			{Pattern: "*bad", Replacement: "x"},
-		}, "")
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "rule 2")
 	})
 
-	t.Run("unknown match mode is an error listing the accepted set", func(t *testing.T) {
-		_, err := NewVolumeKeyRewriter(nil, VolumeMatchMode("prefix"))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "prefix")
-		assert.Contains(t, err.Error(), "suffix")
-	})
-
 	t.Run("no error silently falls back to the defaults", func(t *testing.T) {
-		rw, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "([", Replacement: "x"}}, "")
+		rw, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "([", Replacement: "x"}})
 		require.Error(t, err)
 		assert.Nil(t, rw, "a rejected configuration yields no usable rewriter")
 	})
 }
 
-func TestVolumeKeyRewriter_MatchModes(t *testing.T) {
+// Suffix is the only comparison: a stock Trident FlexVol (prefixed token)
+// matches, a FlexVol named exactly the token matches, and a clone whose name
+// extends past the token does not.
+func TestVolumeKeyRewriter_SuffixMatch(t *testing.T) {
 	const token = "pvc_9f3a"
-	cases := []struct {
-		mode   VolumeMatchMode
-		volume string
-		want   bool
-	}{
-		{VolumeMatchExact, "pvc_9f3a", true},
-		{VolumeMatchExact, "trident_pvc_9f3a", false},
-		{VolumeMatchSuffix, "trident_pvc_9f3a", true},
-		{VolumeMatchSuffix, "pvc_9f3a", true},
-		{VolumeMatchSuffix, "trident_pvc_9f3a_clone", false},
-		{VolumeMatchContains, "trident_pvc_9f3a_clone", true},
-		{VolumeMatchContains, "trident_pvc_0000", false},
-		{VolumeMatchRegex, "trident_pvc_9f3a", true},
-	}
-	for _, c := range cases {
-		t.Run(fmt.Sprintf("%s/%s", c.mode, c.volume), func(t *testing.T) {
-			rw := mustRewriter(t, nil, c.mode)
-			assert.Equal(t, c.want, rw.matches(token, c.volume))
-		})
-	}
-
-	t.Run("an empty token never matches", func(t *testing.T) {
-		for _, m := range VolumeMatchModes {
-			assert.False(t, mustRewriter(t, nil, m).matches("", "anything"), string(m))
-		}
-	})
+	rw := mustRewriter(t, nil)
+	assert.True(t, rw.matches(token, "trident_pvc_9f3a"), "stock Trident prefix")
+	assert.True(t, rw.matches(token, "pvc_9f3a"), "a FlexVol named exactly the token ends with it")
+	assert.False(t, rw.matches(token, "trident_pvc_9f3a_clone"))
+	assert.False(t, rw.matches("", "anything"), "an empty token never matches")
 }
 
-// Pins the spec scenario "Suffix mode rejects a clone whose name extends past
-// the PV name": the default mode must resolve the FlexVol without knowing the
-// provisioner's storage prefix while still excluding a derived volume.
+// Custom rewrite rules replace the default and the suffix comparison runs on
+// the derived token.
+func TestVolumeKeyRewriter_CustomRules(t *testing.T) {
+	rw := mustRewriter(t, []VolumeKeyRule{
+		{Pattern: "-", Replacement: "_"},
+		{Pattern: "^", Replacement: "vol_"},
+	})
+	assert.Equal(t, "vol_pvc_9f3a", rw.token("pvc-9f3a"))
+	assert.True(t, rw.matches(rw.token("pvc-9f3a"), "prefix_vol_pvc_9f3a"))
+	assert.False(t, rw.matches(rw.token("pvc-9f3a"), "prefix_vol_pvc_9f3a_clone"))
+}
+
+// Pins "A clone whose name extends past the PV name never matches": the
+// default rules resolve the FlexVol without knowing the provisioner's storage
+// prefix while still excluding a derived volume.
 func TestVolumeMatcher_SuffixRejectsClone(t *testing.T) {
 	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-9f3a"}}
-	m := newVolumeMatcher(mustRewriter(t, nil, ""), claims)
+	m := newVolumeMatcher(mustRewriter(t, nil), claims)
 
 	assert.True(t, m.any("trident_pvc_9f3a"))
+	assert.True(t, m.any("pvc_9f3a"), "a FlexVol named exactly the token matches")
 	assert.False(t, m.any("trident_pvc_9f3a_clone"))
 	assert.Equal(t, []int{0}, m.match("trident_pvc_9f3a", nil))
+	assert.Equal(t, []int{0}, m.match("pvc_9f3a", nil))
 	assert.Empty(t, m.match("trident_pvc_9f3a_clone", nil))
 }
 
-// Pins "Contains mode admits what suffix mode rejects".
-func TestVolumeMatcher_ContainsAdmitsClone(t *testing.T) {
-	claims := []pvcVolume{{id: "c/db/data", volumeName: "pvc-9f3a"}}
-	m := newVolumeMatcher(mustRewriter(t, nil, VolumeMatchContains), claims)
-
-	assert.True(t, m.any("trident_pvc_9f3a"))
-	assert.True(t, m.any("trident_pvc_9f3a_clone"))
-}
-
-func TestVolumeMatcher_RegexTokenThatDoesNotCompileNeverMatches(t *testing.T) {
-	// The token comes from upstream data, not configuration, so a PV name that
-	// is not valid regex degrades to "no match" instead of failing the build.
-	claims := []pvcVolume{
-		{id: "c/db/bad", volumeName: "pvc-(["},
-		{id: "c/db/good", volumeName: "pvc-9f3a"},
-	}
-	m := newVolumeMatcher(mustRewriter(t, nil, VolumeMatchRegex), claims)
-
-	assert.Empty(t, m.match("pvc_([", nil))
-	assert.Equal(t, []int{1}, m.match("trident_pvc_9f3a", nil))
-}
-
-// The bucketed exact/suffix index and the linear scan must agree exactly: the
+// The length-bucketed index and the suffix predicate must agree exactly: the
 // index is an optimisation, never a different predicate.
 func TestVolumeMatcher_IndexAgreesWithScan(t *testing.T) {
 	rnd := rand.New(rand.NewSource(20260901))
@@ -187,23 +153,19 @@ func TestVolumeMatcher_IndexAgreesWithScan(t *testing.T) {
 		volumes = append(volumes, "unrelated_"+seg())
 	}
 
-	for _, mode := range []VolumeMatchMode{VolumeMatchExact, VolumeMatchSuffix} {
-		t.Run(string(mode), func(t *testing.T) {
-			rw := mustRewriter(t, nil, mode)
-			m := newVolumeMatcher(rw, claims)
-			for _, v := range volumes {
-				want := []int{}
-				for i, c := range claims {
-					if rw.matches(rw.token(c.volumeName), v) {
-						want = append(want, i)
-					}
-				}
-				got := append([]int{}, m.match(v, nil)...)
-				sort.Ints(got)
-				assert.Equal(t, want, got, "volume %q", v)
-				assert.Equal(t, len(want) > 0, m.any(v), "volume %q", v)
+	rw := mustRewriter(t, nil)
+	m := newVolumeMatcher(rw, claims)
+	for _, v := range volumes {
+		want := []int{}
+		for i, c := range claims {
+			if rw.matches(rw.token(c.volumeName), v) {
+				want = append(want, i)
 			}
-		})
+		}
+		got := append([]int{}, m.match(v, nil)...)
+		sort.Ints(got)
+		assert.Equal(t, want, got, "volume %q", v)
+		assert.Equal(t, len(want) > 0, m.any(v), "volume %q", v)
 	}
 }
 
@@ -237,7 +199,7 @@ func volumeLabelSeries(volumes ...string) model.Vector {
 }
 
 func TestQoSVolumeScope(t *testing.T) {
-	rw := mustRewriter(t, nil, "")
+	rw := mustRewriter(t, nil)
 
 	t.Run("returns the matched FlexVol names sorted and deduped", func(t *testing.T) {
 		scope := qosVolumeScope(
@@ -287,11 +249,11 @@ func TestOptions_VolumeKeyDefaults(t *testing.T) {
 	var opts Options
 	rw := opts.volumeKey()
 	require.NotNil(t, rw)
-	assert.Equal(t, DefaultVolumeMatchMode, rw.mode)
 	assert.Equal(t, "pvc_9f3a", rw.token("pvc-9f3a"))
+	assert.True(t, rw.matches("pvc_9f3a", "trident_pvc_9f3a"))
 	assert.Equal(t, DefaultQoSScopeBatchBytes, opts.qosScopeBatchBytes())
 
-	custom, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "-", Replacement: "."}}, VolumeMatchExact)
+	custom, err := NewVolumeKeyRewriter([]VolumeKeyRule{{Pattern: "-", Replacement: "."}})
 	require.NoError(t, err)
 	set := Options{VolumeKey: custom, QoSScopeBatchBytes: 512}
 	assert.Same(t, custom, set.volumeKey())

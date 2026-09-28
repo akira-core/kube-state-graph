@@ -306,6 +306,10 @@ func TestHarvestRenderers_CarryTheRequestZone(t *testing.T) {
 			render(RenderQoSVolumeScoped(QQoSReadOps, time.Minute, keys, full, []string{"trident_pvc_a"})),
 			`last_over_time(qos_read_ops{zone="zone-a",tier="prod",volume="trident_pvc_a"}[1m])`,
 		},
+		"by ONTAP controller": {
+			render(RenderVolumeLabelsByNode(time.Minute, keys, full, []string{"na-02", "na-01"})),
+			`last_over_time(volume_labels{zone="zone-a",tier="prod",node=~"na-01|na-02"}[1m])`,
+		},
 	} {
 		assert.Equal(t, tc.want, tc.got, name)
 	}
@@ -314,6 +318,25 @@ func TestHarvestRenderers_CarryTheRequestZone(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, `last_over_time(volume_labels{aggr="aggr1"}[1m])`, got,
 		"an unfiltered request renders the restriction alone")
+}
+
+func TestRenderVolumeLabelsByNode(t *testing.T) {
+	t.Parallel()
+
+	one, ok := RenderVolumeLabelsByNode(time.Minute, LabelKeys{}, Selector{}, []string{"na-01"})
+	require.True(t, ok)
+	assert.Equal(t, `last_over_time(volume_labels{node="na-01"}[1m])`, one)
+
+	meta, ok := RenderVolumeLabelsByNode(time.Minute, LabelKeys{}, Selector{}, []string{`na.01`, `a"b`})
+	require.True(t, ok)
+	assert.Contains(t, meta, `node=~"a\"b|na\\.01"`)
+	assert.NotContains(t, meta, "volume=")
+	assert.NotContains(t, meta, "aggr=")
+
+	_, ok = RenderVolumeLabelsByNode(time.Minute, LabelKeys{}, Selector{}, nil)
+	assert.False(t, ok)
+	_, ok = RenderVolumeLabelsByNode(time.Minute, LabelKeys{}, Selector{}, []string{"", ""})
+	assert.False(t, ok)
 }
 
 // RequestMatcherCost is the rendered length of the request matchers a query

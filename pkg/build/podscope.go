@@ -47,8 +47,8 @@ func podScope(bindings model.Vector, roots []string) []string {
 //
 // It waits on the claim-binding family, and — when the request carries an
 // application root — on the application recovery and on
-// kube_persistentvolumeclaim_annotations. The scope is then podScope, or
-// podScopeUnderApp when an application root narrowed the binding half.
+// kube_persistentvolumeclaim_annotations. The scope is podScope over the
+// bindings the seed kept plus the recovered pod names.
 //
 // An empty scope issues no query at all and leaves both families unread: no pod
 // could be bound or is a root, so no pod could be drawn. That mirrors the QoS
@@ -98,16 +98,11 @@ func readScopedPods(
 		return nil
 	}
 
-	var scope []string
-	if len(applicationRoots) > 0 {
-		var names []string
-		if recovered != nil {
-			names = *recovered
-		}
-		scope = podScopeUnderApp(v.PVC, v.PVCAnnotations, names, podRoots, applicationRoots)
-	} else {
-		scope = podScope(v.PVC, podRoots)
+	names := slices.Clone(podRoots)
+	if recovered != nil {
+		names = append(names, *recovered...)
 	}
+	scope := podScope(v.PVC, names)
 	if len(scope) == 0 {
 		return nil
 	}

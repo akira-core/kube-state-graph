@@ -1,0 +1,29 @@
+{
+  "apiVersion": "v1",
+  "clusters": [],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "storage-cluster/ontap-prod",
+          "name": "ontap-prod",
+          "type": "storage-cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/ontap-prod-02",
+          "name": "ontap-prod-02",
+          "type": "netapp-node",
+          "parent": "storage-cluster/ontap-prod",
+          "status": "normal",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      }
+    ],
+    "edges": []
+  }
+}

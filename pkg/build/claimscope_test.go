@@ -129,7 +129,7 @@ func hubBuild(t *testing.T, fx map[promql.Query]model.Vector, scope graph.Storag
 // Spec: "Rooted volumes name their claims".
 func TestVolumeHub_RootedVolumesNameTheirClaims(t *testing.T) {
 	vols, claims := hubBase()
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	g, q, err := hubBuild(t, hubEstate(vols, claims), scope, Options{})
 	require.NoError(t, err)
 
@@ -159,7 +159,7 @@ func TestVolumeHub_SameNamedClaimInAnotherNamespaceIsFiltered(t *testing.T) {
 		{ns: "shop", claim: "data", pv: "pvc-ab12", pods: []string{"app-0"}},
 		{ns: "platform", claim: "data", pv: "pvc-zz99", pods: []string{"web-0"}},
 	})
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	g, q, err := hubBuild(t, fx, scope, Options{})
 	require.NoError(t, err)
 
@@ -183,7 +183,7 @@ func TestVolumeHub_NoCandidateIssuesNoClaimQuery(t *testing.T) {
 		{"shop_orders_01", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 300},
 		{"vol0", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 0},
 	}, []hubClaim{{ns: "shop", claim: "orders-data", pv: "pvc-ab12", pods: []string{"orders-0"}}})
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 
 	var (
 		g   *graph.Graph
@@ -208,7 +208,7 @@ func TestVolumeHub_CandidatesNamingNoClaim(t *testing.T) {
 	fx := hubEstate([]vlrVol{
 		{"trident_pvc_gone", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 300},
 	}, []hubClaim{{ns: "shop", claim: "orders-data", pv: "pvc-ab12", pods: []string{"orders-0"}}})
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 
 	var q *promqlfake.Querier
 	var err error
@@ -243,7 +243,7 @@ func TestVolumeHub_CandidatesNamingNoClaim(t *testing.T) {
 // account while a claim volume beside them yields one.
 func TestVolumeHub_RootVolumesDoNotWarn(t *testing.T) {
 	vols, claims := hubBase()
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	recs := captureDebugRecords(t, func() {
 		_, _, err := hubBuild(t, hubEstate(vols, claims), scope, Options{})
 		require.NoError(t, err)
@@ -278,7 +278,7 @@ func claimMisses(recs []map[string]any) []map[string]any {
 // neither blocks the waves downstream of it nor loses its family name.
 func TestVolumeHub_ClaimReadFailuresFailTheBuild(t *testing.T) {
 	vols, claims := hubBase()
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	boom := errors.New("upstream said no")
 	for _, fam := range promql.ClaimScopedQueries {
 		t.Run(string(fam), func(t *testing.T) {
@@ -299,93 +299,99 @@ func TestVolumeHub_ClaimReadFailuresFailTheBuild(t *testing.T) {
 	}
 }
 
-// Spec: "A large claim scope falls back to a filtered read". Twenty claims on
-// the rooted aggregate and a budget small enough to put every name in a chunk
-// of its own take every claim family past maxHubClaimChunks; each is then read
-// once with no scope and filtered to the same rows, and the body is the
-// chunked build's byte for byte.
-func TestVolumeHub_UnboundedClaimScopeReadsWideAndFilters(t *testing.T) {
-	vols := make([]vlrVol, 0, maxHubClaimChunks+5)
-	claims := make([]hubClaim, 0, maxHubClaimChunks+5)
-	for i := range maxHubClaimChunks + 4 {
+// Spec: "A large tracked set is chunked, never read across the zone". Twenty
+// claims on the rooted aggregate and a budget small enough to put every name
+// in a chunk of its own still issue one restricted query per chunk — never one
+// query with only the request's az / env — and the body matches the
+// single-chunk build.
+func TestVolumeHub_LargeClaimScopeIsChunked(t *testing.T) {
+	const n = 20
+	vols := make([]vlrVol, 0, n+1)
+	claims := make([]hubClaim, 0, n+1)
+	for i := range n {
 		id := fmt.Sprintf("c%02d", i)
 		vols = append(vols, vlrVol{"trident_pvc_" + id, "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", float64(i)})
 		claims = append(claims, hubClaim{ns: "shop", claim: "data-" + id, pv: "pvc-" + id, pods: []string{"pod-" + id}})
 	}
-	// Off the rooted aggregate: kept out by the filter of the wide read.
+	// Off the rooted aggregate: the claim-name restriction never asks for it.
 	vols = append(vols, vlrVol{"trident_pvc_off", "ontap-prod", "ontap-prod-02", "aggr2", "svm_shop", 1})
 	claims = append(claims, hubClaim{ns: "shop", claim: "data-off", pv: "pvc-off", pods: []string{"pod-off"}})
 	fx := hubEstate(vols, claims)
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
+	bare := func(fam promql.Query) string {
+		return promql.Render(fam, time.Minute, promql.LabelKeys{}, vlrSel)
+	}
 
-	wideG, wideQ, err := hubBuild(t, fx, scope, Options{QoSScopeBatchBytes: 6})
+	chunkedG, chunkedQ, err := hubBuild(t, fx, scope, Options{QoSScopeBatchBytes: 6})
 	require.NoError(t, err)
-	chunkedG, chunkedQ, err := hubBuild(t, fx, scope, Options{})
+	roomyG, roomyQ, err := hubBuild(t, fx, scope, Options{})
 	require.NoError(t, err)
 
 	for _, fam := range promql.ClaimScopedQueries {
-		assert.Equal(t, []string{promql.Render(fam, time.Minute, promql.LabelKeys{}, vlrSel)},
-			wideQ.QueriesFor(fam), "%s: one unscoped query — no scope, the request's az / env only", fam)
-		assert.Len(t, chunkedQ.QueriesFor(fam), 1, "%s: the roomy budget fits the scope in one chunk", fam)
-		assert.NotEqual(t, wideQ.QueriesFor(fam), chunkedQ.QueriesFor(fam))
+		got := chunkedQ.QueriesFor(fam)
+		assert.Greater(t, len(got), 1, "%s: the tight budget splits the scope", fam)
+		assert.NotContains(t, got, bare(fam), "%s: no query without a restriction", fam)
+		assert.Len(t, roomyQ.QueriesFor(fam), 1, "%s: the roomy budget fits the scope in one chunk", fam)
 	}
-	assert.NotContains(t, wideG.NodesByID, "zone-a-prod-c1/shop/data-off", "the reader filter keeps what the scope would")
-	assert.JSONEq(t, planBodyJSON(t, vlrBody(t, chunkedG, scope)), planBodyJSON(t, vlrBody(t, wideG, scope)))
+	assert.NotContains(t, chunkedG.NodesByID, "zone-a-prod-c1/shop/data-off")
+	assert.JSONEq(t, planBodyJSON(t, vlrBody(t, roomyG, scope)), planBodyJSON(t, vlrBody(t, chunkedG, scope)))
 
-	wideTopo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd,
+	chunkedTopo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd,
 		Options{QoSScopeBatchBytes: 6}, promql.Selector{}, storagePlan(scope.Roots))
 	require.NoError(t, err)
-	chunkedTopo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd,
+	roomyTopo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd,
 		Options{}, promql.Selector{}, storagePlan(scope.Roots))
 	require.NoError(t, err)
 	for _, fam := range promql.ClaimScopedQueries {
-		want := maxHubClaimChunks + 4
+		want := n
 		if fam == promql.QPVCAnnotations {
 			want = 0 // issued, and the estate annotates no claim
 		}
-		n, ok := wideTopo.RawSeriesCount[string(fam)]
+		got, ok := chunkedTopo.RawSeriesCount[string(fam)]
 		assert.True(t, ok, "%s: issued, so tallied", fam)
-		assert.Equal(t, want, n, "%s: the tally is the filtered count", fam)
-		assert.Equal(t, chunkedTopo.RawSeriesCount[string(fam)], n, "%s: the same in either read", fam)
+		assert.Equal(t, want, got, "%s: the tally is the rows the restriction matched", fam)
+		assert.Equal(t, roomyTopo.RawSeriesCount[string(fam)], got, "%s: the same in either read", fam)
 	}
 }
 
-// The claim families are withheld from the first wave in hub mode, and only
-// in hub mode: a build whose phase 1 fell back — or that never qualified —
-// issues them first-wave under the request's own matchers.
+// The claim families are withheld from the beside-seed wave for a Harvest
+// root and for a pod root. A root set past the chunk cap never becomes a
+// build: it is rejected before the first wave, so it does not fall back to an
+// unrestricted read. fullPlan issues every claim family in its first wave.
 func TestVolumeHub_ClaimFamiliesLeaveTheFirstWaveOnlyInHubMode(t *testing.T) {
-	suffix := defaultVolumeKeyRewriter()
-	hub := storagePlan(vlrRoots(t, nil, nil, []string{"aggr1"}, nil, nil)).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
-	require.True(t, hub.hub)
-	unbounded := storagePlan(vlrRoots(t, nil, nil, manyAggrRoots(5000, 240), nil, nil)).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
-	require.False(t, unbounded.hub)
-	require.True(t, unbounded.phaseOneUnbounded)
-	podOnly := storagePlan(vlrRoots(t, nil, nil, nil, nil, []string{"shop/orders-0"})).
-		resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
-	require.False(t, podOnly.hub)
-	full := fullPlan.resolveVolumeLabelRead(suffix, time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
-	require.False(t, full.hub)
+	hub, err := storagePlan(vlrRoots(t, graph.StorageRootAggr, []string{"aggr1"})).
+		prepareHarvestSeed(time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
+	require.NoError(t, err)
+	require.True(t, hub.rootedClaims())
+	_, err = storagePlan(vlrRoots(t, graph.StorageRootAggr, manyAggrRoots(5000, 240))).
+		prepareHarvestSeed(time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	podOnly, err := storagePlan(vlrRoots(t, graph.StorageRootPod, []string{"shop/orders-0"})).
+		prepareHarvestSeed(time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
+	require.NoError(t, err)
+	require.False(t, podOnly.rootedClaims())
+	full, err := fullPlan.prepareHarvestSeed(time.Minute, DefaultQoSScopeBatchBytes, promql.LabelKeys{}, vlrSel)
+	require.NoError(t, err)
+	require.False(t, full.rootedClaims())
 
+	assert.False(t, podOnly.issuesBesideSeed(promql.QPVCBindings), "a pod root reads bindings from its seed")
 	for _, qy := range promql.ClaimScopedQueries {
-		assert.False(t, hub.issuesFirstWave(qy), "%s: read by reference in hub mode", qy)
-		assert.True(t, unbounded.issuesFirstWave(qy), "%s: a fallen-back build is today's build", qy)
-		assert.True(t, podOnly.issuesFirstWave(qy), "%s", qy)
+		assert.False(t, hub.issuesFirstWave(qy), "%s is not in the ALERTS-only first wave", qy)
+		assert.False(t, hub.issuesBesideSeed(qy), "%s: read by reference in hub mode", qy)
+		assert.False(t, podOnly.issuesBesideSeed(qy), "%s: a pod root reads this claim family from the tracked claims", qy)
 		assert.True(t, full.issuesFirstWave(qy), "%s", qy)
 	}
-	assert.True(t, hub.issuesFirstWave(promql.QVolumeLabels), "phase 1 IS a first-wave leg")
+	assert.True(t, hub.issuesBesideSeed(promql.QVolumeLabels), "phase 1 runs beside ALERTS")
 	assert.True(t, hub.issuesFirstWave(promql.QAlerts))
+	assert.False(t, hub.issuesBesideSeed(promql.QAlerts))
 
-	t.Run("a fallen-back build keeps the request's own matchers", func(t *testing.T) {
+	t.Run("a root set past the cap issues nothing", func(t *testing.T) {
 		vols, claims := hubBase()
-		_, q, err := hubBuild(t, hubEstate(vols, claims),
-			vlrScope(t, nil, nil, append(manyAggrRoots(5000, 240), "aggr1"), nil, nil), Options{})
-		require.NoError(t, err)
-		assert.Equal(t, []string{vlrBare}, q.QueriesFor(promql.QVolumeLabels))
-		assert.Equal(t,
-			[]string{promql.Render(promql.QPVCInfo, time.Minute, promql.LabelKeys{}, vlrSel)},
-			q.QueriesFor(promql.QPVCInfo), "whole-zone, first wave, az and env included")
+		q := promqlfake.New(hubEstate(vols, claims))
+		_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+			vlrScope(t, graph.StorageRootAggr, append(manyAggrRoots(5000, 240), "aggr1")).Roots)
+		require.Equal(t, ReasonInvalidScope, AsReason(err))
+		assert.Empty(t, q.Issued())
 	})
 }
 
@@ -394,7 +400,7 @@ func TestVolumeHub_ClaimFamiliesLeaveTheFirstWaveOnlyInHubMode(t *testing.T) {
 // Run under -race: the tail's merge must never overlap the claim-info read.
 func TestVolumeHub_FailedClaimInfoDoesNotBlock(t *testing.T) {
 	vols, claims := hubBase()
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, []string{"svm_shop"}, nil, []string{"beta"})
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
 	for range 20 {
 		q := promqlfake.New(hubEstate(vols, claims))
@@ -428,7 +434,7 @@ func TestVolumeHub_StaticPVIsNotReachedFromAStorageRoot(t *testing.T) {
 		{ns: "db", claim: "mongo-data", pv: "mongo-data-01", pods: []string{"mongo-0"}},
 		{ns: "shop", claim: "orders-data", pv: "pvc-ab12", pods: []string{"orders-0"}},
 	})
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	g, q, err := hubBuild(t, fx, scope, Options{})
 	require.NoError(t, err)
 
@@ -462,7 +468,7 @@ func TestVolumeHub_CompletionRowsAreNeverACandidateSource(t *testing.T) {
 		{ns: "shop", claim: "shop-data", pv: "pvc-shop", pods: []string{"shop-0"}},
 		{ns: "other", claim: "other-data", pv: "pvc-other", pods: []string{"other-0"}},
 	})
-	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	g, q, err := hubBuild(t, fx, scope, Options{})
 	require.NoError(t, err)
 
@@ -488,21 +494,15 @@ func TestVolumeHub_CompletionRowsAreNeverACandidateSource(t *testing.T) {
 // carries every controller kind, a shared (RWX) claim, PVC Application
 // inheritance and an application root's own-annotated claim.
 func TestVolumeHub_ParityWithThePreChangeRead(t *testing.T) {
-	scope := func(ontap, nodes, aggrs, svms, pods, apps []string) graph.StorageScope {
-		s, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, apps)
+	scope := func(kind graph.StorageRootKind, values ...string) graph.StorageScope {
+		s, err := graph.NewStorageScope(nil, nil, kind, values)
 		require.NoError(t, err)
 		return s
 	}
 	cases := map[string]graph.StorageScope{
-		"ontap_cluster":                          scope([]string{"ontap-prod"}, nil, nil, nil, nil, nil),
-		"aggr":                                   scope(nil, nil, []string{"aggr1"}, nil, nil, nil),
-		"svm":                                    scope(nil, nil, nil, []string{"svm_shop"}, nil, nil),
-		"aggr and svm":                           scope(nil, nil, []string{"aggr1"}, []string{"svm_platform"}, nil, nil),
-		"aggr and a Kubernetes node":             scope(nil, []string{"worker-1"}, []string{"aggr1"}, nil, nil, nil),
-		"aggr and an ONTAP controller":           scope(nil, []string{"ontap-prod-01"}, []string{"aggr1"}, nil, nil, nil),
-		"aggr and pod":                           scope(nil, nil, []string{"aggr1"}, nil, []string{"shop/orders-0"}, nil),
-		"aggr and application":                   scope(nil, nil, []string{"aggr1"}, nil, nil, []string{"beta"}),
-		"svm, application and a Kubernetes node": scope(nil, []string{"worker-1"}, nil, []string{"svm_shop"}, nil, []string{"beta"}),
+		"ontap_cluster": scope(graph.StorageRootONTAPCluster, "ontap-prod"),
+		"aggr":          scope(graph.StorageRootAggr, "aggr1"),
+		"svm":           scope(graph.StorageRootSVM, "svm_shop"),
 	}
 	for name, sc := range cases {
 		t.Run(name, func(t *testing.T) {

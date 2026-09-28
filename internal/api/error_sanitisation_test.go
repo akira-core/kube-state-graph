@@ -63,6 +63,37 @@ func TestGraphEndpoint_Upstream502_SanitisedMessage(t *testing.T) {
 
 // nameFailQuerier fails every query issued under the family name failing and
 // answers every other query with an empty vector.
+// claimThenFailQuerier answers the storage seed with one FlexVol and the claim
+// it embeds, and fails `failing`. Without the claim the kubelet read is never
+// issued, so a failure of it could not surface.
+func claimThenFailQuerier(t *testing.T, failing string, err error) *promqlmocks.MockQuerier {
+	t.Helper()
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().
+		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, name, _ string, _ time.Time) (model.Vector, error) {
+			if name == failing {
+				return nil, err
+			}
+			switch name {
+			case "volume_labels":
+				return model.Vector{&model.Sample{Metric: model.Metric{
+					"volume": "trident_pvc_ab12", "cluster": "ontap-prod", "node": "ontap-prod-01",
+					"aggr": "aggr1", "svm": "svm0", "az": "zone-a", "env": "prod",
+				}, Value: 1}}, nil
+			case "kube_persistentvolumeclaim_info":
+				return model.Vector{&model.Sample{Metric: model.Metric{
+					"cluster": "c1", "namespace": "shop", "persistentvolumeclaim": "data",
+					"volumename": "pvc-ab12", "az": "zone-a", "env": "prod",
+				}, Value: 1}}, nil
+			default:
+				return model.Vector{}, nil
+			}
+		}).
+		Maybe()
+	return q
+}
+
 func nameFailQuerier(t *testing.T, failing string, err error) *promqlmocks.MockQuerier {
 	t.Helper()
 	q := promqlmocks.NewMockQuerier(t)
@@ -81,10 +112,17 @@ func nameFailQuerier(t *testing.T, failing string, err error) *promqlmocks.MockQ
 // errors"): a family /v1/graph degrades fails the storage request with a 502
 // naming the family and nothing of the upstream error text; ALERTS does not.
 func TestStorageGraphEndpoint_FailsClosedNamingFamily(t *testing.T) {
-	const path = "/v1/storage-graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z&az=zone-a&env=prod"
+	// aggr= issues volume_labels and the aggregate gauges even when nothing
+	// matches a claim. kubelet is issued only once a claim is tracked, so that
+	// case answers the seed with one rooted volume and its claim.
+	const path = "/v1/storage-graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z&az=zone-a&env=prod&aggr=aggr1"
 	for _, family := range []string{"volume_labels", "aggr_space_used", "kubelet_volume_stats_used_bytes"} {
 		t.Run(family, func(t *testing.T) {
-			s := newServerWithMocks(t, nameFailQuerier(t, family, upstreamDialErr()), nil)
+			q := nameFailQuerier(t, family, upstreamDialErr())
+			if family == "kubelet_volume_stats_used_bytes" {
+				q = claimThenFailQuerier(t, family, upstreamDialErr())
+			}
+			s := newServerWithMocks(t, q, nil)
 			srv := httptest.NewServer(s.Handler())
 			t.Cleanup(srv.Close)
 

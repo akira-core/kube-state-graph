@@ -2,9 +2,6 @@ package build
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -13,11 +10,11 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// maxApplicationRootChunks bounds stage 1 of the application recovery. The
-// parser limits each application= value's length, never the count, so the
-// client can inflate the restriction; past this many chunks the family is
-// read unrestricted and filtered in the reader. The cap matches the
-// volume-label restriction and the wave's own concurrency.
+// maxApplicationRootChunks bounds stage 1 of the application recovery and the
+// claim-annotation read beside it. The parser limits each application=
+// value's length, never the count, so the client can inflate the restriction;
+// past this many chunks the request is rejected before any query. The cap
+// matches the volume-label restriction and the wave's own concurrency.
 const maxApplicationRootChunks = scopeConcurrency
 
 // applicationRootChunks splits root Applications under the byte budget with
@@ -80,43 +77,42 @@ func readScopedApplications(
 		apps[a] = struct{}{}
 	}
 
+	if len(applicationRootChunks(roots, opts.qosScopeBatchBytes())) > maxApplicationRootChunks {
+		return nil, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
 	families := annotationRecoveryFamilies()
 	namesByKind := map[string][]string{}
-	chunks := applicationRootChunks(roots, opts.qosScopeBatchBytes())
-	if len(chunks) > maxApplicationRootChunks {
-		for _, f := range families {
-			slog.WarnContext(ctx, "application_root_restriction_unbounded",
-				"query", string(f.query),
-				"chunks", len(chunks),
-			)
-			vec, err := issueUnrestricted(ctx, q, f.query, window, end, keys, sel)
-			if err != nil {
-				return nil, err
-			}
-			addExtraSeries(v, scopeMu, f.query, len(vec))
-			namesByKind[f.kind] = namesFromTracking(vec, f.label, apps)
+	dsts := make([]model.Vector, len(families))
+	scoped := make([]scopedFamily, len(families), len(families)+1)
+	for i, f := range families {
+		scoped[i] = scopedFamily{
+			query:         f.query,
+			dst:           &dsts[i],
+			scope:         roots,
+			budgetReserve: promql.TrackingIDWrapperCost,
+			render: func(chunk []string) (string, bool) {
+				return promql.RenderTrackingIDScoped(f.query, window, keys, sel, chunk)
+			},
 		}
-	} else {
-		dsts := make([]model.Vector, len(families))
-		scoped := make([]scopedFamily, len(families))
-		for i, f := range families {
-			scoped[i] = scopedFamily{
-				query:         f.query,
-				dst:           &dsts[i],
-				scope:         roots,
-				budgetReserve: promql.TrackingIDWrapperCost,
-				render: func(chunk []string) (string, bool) {
-					return promql.RenderTrackingIDScoped(f.query, window, keys, sel, chunk)
-				},
-			}
-		}
-		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
-			return nil, err
-		}
-		for i, f := range families {
-			addExtraSeries(v, scopeMu, f.query, len(dsts[i]))
-			namesByKind[f.kind] = namesFromTracking(dsts[i], f.label, apps)
-		}
+	}
+	// Own-annotated claims are discovered here, in parallel with stage 1.
+	// The rows land in v.PVCAnnotations; the claim expansion re-reads the
+	// family by claim name and the tally keeps both reads.
+	scoped = append(scoped, scopedFamily{
+		query:         promql.QPVCAnnotations,
+		dst:           &v.PVCAnnotations,
+		scope:         roots,
+		budgetReserve: promql.TrackingIDWrapperCost,
+		render: func(chunk []string) (string, bool) {
+			return promql.RenderTrackingIDScoped(promql.QPVCAnnotations, window, keys, sel, chunk)
+		},
+	})
+	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
+		return nil, err
+	}
+	for i, f := range families {
+		addExtraSeries(v, scopeMu, f.query, len(dsts[i]))
+		namesByKind[f.kind] = namesFromTracking(dsts[i], f.label, apps)
 	}
 
 	var rsVec, jobVec model.Vector
@@ -180,22 +176,124 @@ func readScopedApplications(
 			},
 		})
 	}
-	if len(stage3) == 0 {
-		return nil, nil
-	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stage3); err != nil {
-		return nil, err
-	}
 	var pods []string
-	for _, dst := range podVecs {
-		addExtraSeries(v, scopeMu, promql.QPodOwner, len(*dst))
-		for _, s := range *dst {
-			if p := string(s.Metric[promql.PodLabel]); p != "" {
-				pods = append(pods, p)
+	if len(stage3) > 0 {
+		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stage3); err != nil {
+			return nil, err
+		}
+		for _, dst := range podVecs {
+			addExtraSeries(v, scopeMu, promql.QPodOwner, len(*dst))
+			for _, s := range *dst {
+				if p := string(s.Metric[promql.PodLabel]); p != "" {
+					pods = append(pods, p)
+				}
 			}
 		}
 	}
-	return sortedNames(pods), nil
+	pods = sortedNames(pods)
+	if err := readApplicationBindings(ctx, q, window, end, opts, sel, pods, roots, v, scopeMu); err != nil {
+		return nil, err
+	}
+	return pods, nil
+}
+
+// readApplicationBindings reads claim bindings for the recovered pods, unions
+// the claims an annotation row names with a root Application, and re-reads
+// bindings by claim so every mounter of that set is loaded. An empty set
+// issues no binding query.
+func readApplicationBindings(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	pods, roots []string,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+) error {
+	ann := annotatedClaimKeys(v.PVCAnnotations, roots)
+	var tracked model.Vector
+	if len(pods) > 0 {
+		byPod, err := queryRendered(ctx, q, end, opts, promql.QPVCBindings, pods, func(chunk []string) (string, bool) {
+			return promql.RenderClaimBindingsByPodName(window, opts.LabelKeys, sel, chunk)
+		})
+		if err != nil {
+			return err
+		}
+		markScopeIssued(v, scopeMu, promql.QPVCBindings)
+		tracked = keepNamedPodBindings(byPod, pods)
+	}
+	keys := claimKeysOf(tracked)
+	for k := range ann {
+		keys[k] = struct{}{}
+	}
+	claims := claimNamesFromKeys(keys)
+	if len(claims) == 0 {
+		v.PVC = tracked
+		return nil
+	}
+	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
+		query: promql.QPVCBindings,
+		dst:   &v.PVC,
+		scope: claims,
+	}}); err != nil {
+		return err
+	}
+	v.PVC = keepClaimBindings(v.PVC, keys)
+	return nil
+}
+
+func annotatedClaimKeys(rows model.Vector, roots []string) map[claimSeriesKey]struct{} {
+	apps := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		if root != "" {
+			apps[root] = struct{}{}
+		}
+	}
+	out := make(map[claimSeriesKey]struct{})
+	for _, s := range rows {
+		app := argoAppName(string(s.Metric[argoTrackingIDLabel]))
+		if _, ok := apps[app]; !ok || app == "" {
+			continue
+		}
+		claim := string(s.Metric["persistentvolumeclaim"])
+		if claim == "" {
+			continue
+		}
+		out[claimSeriesKey{
+			cluster:   string(s.Metric["cluster"]),
+			namespace: string(s.Metric["namespace"]),
+			claim:     claim,
+		}] = struct{}{}
+	}
+	return out
+}
+
+func keepNamedPodBindings(rows model.Vector, pods []string) model.Vector {
+	keep := make(map[string]struct{}, len(pods))
+	for _, pod := range pods {
+		if pod != "" {
+			keep[pod] = struct{}{}
+		}
+	}
+	var out model.Vector
+	for _, s := range rows {
+		if _, ok := keep[string(s.Metric[promql.PodLabel])]; ok && bindingClaim(s.Metric) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func claimNamesFromKeys(keys map[claimSeriesKey]struct{}) []string {
+	names := make([]string, 0, len(keys))
+	for k := range keys {
+		if k.claim != "" {
+			names = append(names, k.claim)
+		}
+	}
+	return sortedNames(names)
 }
 
 func namesFromTracking(vec model.Vector, label model.LabelName, apps map[string]struct{}) []string {
@@ -228,121 +326,9 @@ func filteredNames(vec model.Vector, label model.LabelName, keep func(model.Metr
 	return sortedNames(out)
 }
 
-// issueUnrestricted reads one family with its fixed selector and the request
-// matchers only — the /v1/graph shape. It is the stage-1 fallback when the
-// root set does not yield a bounded restriction, and like every recovery read
-// it fails the build on a query error.
-func issueUnrestricted(
-	ctx context.Context,
-	q promql.Querier,
-	name promql.Query,
-	window time.Duration,
-	end time.Time,
-	keys promql.LabelKeys,
-	sel promql.Selector,
-) (out model.Vector, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.ErrorContext(ctx, "panic in unrestricted topology query",
-				"query", string(name),
-				"panic", fmt.Sprint(rec),
-				"stack", string(debug.Stack()),
-			)
-			out, err = nil, fmt.Errorf("panic in %s query: %v", name, rec)
-		}
-	}()
-	res, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
-	if qerr != nil {
-		return nil, wrapQueryError(name, qerr)
-	}
-	return res, nil
-}
-
-// storageClaimKey is one claim as the binding and annotation readers name it.
-// Namespace is part of the key: a same-named claim in another namespace is a
-// different object.
-type storageClaimKey struct {
-	cluster, namespace, claim string
-}
-
 func bindingClaim(m model.Metric) string {
 	if c := string(m["persistentvolumeclaim"]); c != "" {
 		return c
 	}
 	return string(m["claim_name"])
-}
-
-// podScopeUnderApp is the pod scope under an application root. The keep set
-// is the recovered names plus the request's pod= roots. A claim is related
-// when it is own-annotated with a root Application or mounted by a pod in the
-// keep set; every mounter of a related claim joins the scope, so a shared
-// claim's split weight and inherited Application are computed over the same
-// mounters as an un-narrowed read.
-func podScopeUnderApp(bindings, pvcAnnotations model.Vector, recovered, podRoots, apps []string) []string {
-	appSet := make(map[string]struct{}, len(apps))
-	for _, a := range apps {
-		if a != "" {
-			appSet[a] = struct{}{}
-		}
-	}
-	keep := map[string]struct{}{}
-	for _, n := range recovered {
-		if n != "" {
-			keep[n] = struct{}{}
-		}
-	}
-	for _, n := range podRoots {
-		if n != "" {
-			keep[n] = struct{}{}
-		}
-	}
-	related := map[storageClaimKey]struct{}{}
-	for _, s := range pvcAnnotations {
-		app := argoAppName(string(s.Metric[argoTrackingIDLabel]))
-		if app == "" {
-			continue
-		}
-		if _, ok := appSet[app]; !ok {
-			continue
-		}
-		claim := string(s.Metric["persistentvolumeclaim"])
-		if claim == "" {
-			continue
-		}
-		related[storageClaimKey{string(s.Metric["cluster"]), string(s.Metric["namespace"]), claim}] = struct{}{}
-	}
-	claimOf := func(s *model.Sample) (storageClaimKey, bool) {
-		claim := bindingClaim(s.Metric)
-		if claim == "" {
-			return storageClaimKey{}, false
-		}
-		return storageClaimKey{string(s.Metric["cluster"]), string(s.Metric["namespace"]), claim}, true
-	}
-	for _, s := range bindings {
-		pod := string(s.Metric[promql.PodLabel])
-		if _, ok := keep[pod]; !ok || pod == "" {
-			continue
-		}
-		if key, ok := claimOf(s); ok {
-			related[key] = struct{}{}
-		}
-	}
-	names := make([]string, 0, len(keep)+len(bindings))
-	for n := range keep {
-		names = append(names, n)
-	}
-	for _, s := range bindings {
-		pod := string(s.Metric[promql.PodLabel])
-		if pod == "" {
-			continue
-		}
-		key, ok := claimOf(s)
-		if !ok {
-			continue
-		}
-		if _, relatedClaim := related[key]; relatedClaim {
-			names = append(names, pod)
-		}
-	}
-	return sortedNames(names)
 }

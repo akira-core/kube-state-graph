@@ -1282,7 +1282,7 @@ func TestResolveNetAppStorage_QoSSummedAcrossMatchedVolumes(t *testing.T) {
 
 // A derivation that does not fit the estate's FlexVol naming is REPORTED, not
 // silent: every claim misses and the aggregated warning carries the full count.
-// This is the operator's signal to tune the rewrite rules or the match mode.
+// This is the operator's signal to tune the rewrite rules.
 func TestResolveNetAppStorage_DerivationMisfitIsCounted(t *testing.T) {
 	claims := []pvcVolume{
 		{id: "c/db/a", volumeName: "pvc-a"},

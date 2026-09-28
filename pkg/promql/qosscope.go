@@ -32,8 +32,8 @@ func isQoSWorkloadQuery(q Query) bool {
 //	last_over_time(qos_read_ops{az="zone-a",env="prod",volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //
 // The values are FlexVol names the volume-object family already returned, so
-// the restriction is EXACT: pkg/build's derive-then-match runs once, in Go,
-// during scope computation, and its match modes never reach the query layer.
+// the restriction is EXACT: pkg/build's derive-then-suffix runs once, in Go,
+// during scope computation, and the comparison never reaches the query layer.
 // PromQL anchors `=~` as ^(?:...)$, and each value is QuoteMeta-escaped, so a
 // name containing a regex metacharacter still matches itself and nothing else.
 //

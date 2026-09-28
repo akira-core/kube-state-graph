@@ -18,38 +18,6 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// ---------------------------------------------------------------- 2. mode gate
-
-func TestVolumeModeTokenScope_EveryModeClassified(t *testing.T) {
-	// A mode added to VolumeMatchModes must be classified deliberately, so a new
-	// mode can never silently default into (or out of) the rooted read.
-	for _, m := range VolumeMatchModes {
-		_, ok := volumeModeTokenScope[m]
-		assert.True(t, ok, "match mode %q has no token-scope classification", m)
-	}
-	assert.Len(t, volumeModeTokenScope, len(VolumeMatchModes),
-		"the table names no mode the enum does not")
-}
-
-func TestVolumeKeyRewriter_TokenScope(t *testing.T) {
-	want := map[VolumeMatchMode]tokenScopeKind{
-		VolumeMatchExact:    tokenScopeExact,
-		VolumeMatchSuffix:   tokenScopeSuffix,
-		VolumeMatchContains: tokenScopeNone,
-		VolumeMatchRegex:    tokenScopeNone,
-	}
-	for mode, kind := range want {
-		rw, err := NewVolumeKeyRewriter(nil, mode)
-		require.NoError(t, err)
-		assert.Equal(t, kind, rw.tokenScope(), string(mode))
-	}
-	assert.Equal(t, tokenScopeSuffix, defaultVolumeKeyRewriter().tokenScope(),
-		"the default mode is suffix, which is scopeable")
-	assert.Equal(t, tokenScopeNone, (*VolumeKeyRewriter)(nil).tokenScope())
-	assert.Equal(t, tokenScopeNone, (&VolumeKeyRewriter{}).tokenScope(),
-		"a zero-value rewriter has no mode and must read unrestricted")
-}
-
 func TestMatchedClaimTokens(t *testing.T) {
 	rw := defaultVolumeKeyRewriter()
 	pvc := func(volumeName string) *model.Sample {
@@ -85,8 +53,7 @@ func TestMatchedClaimTokens(t *testing.T) {
 		// Phase 2 must fetch for the token the parse joins under, or a claim
 		// could be fetched for and then not joined.
 		custom, err := NewVolumeKeyRewriter(
-			[]VolumeKeyRule{{Pattern: `^pvc-`, Replacement: "vol_"}, {Pattern: `-`, Replacement: "_"}},
-			VolumeMatchSuffix)
+			[]VolumeKeyRule{{Pattern: `^pvc-`, Replacement: "vol_"}, {Pattern: `-`, Replacement: "_"}})
 		require.NoError(t, err)
 		claims := []pvcVolume{{volumeName: "pvc-9f3a-11d0"}}
 		indexed := newVolumeMatcher(custom, claims).tokens[0]
@@ -123,77 +90,60 @@ func TestMergeVolumeLabels_DeduplicatesByLabelSet(t *testing.T) {
 
 // ----------------------------------------------------------------- 3. the plan
 
-func vlrRoots(t *testing.T, ontap, nodes, aggrs, svms, pods []string) graph.StorageRoots {
+func vlrRoots(t *testing.T, kind graph.StorageRootKind, values []string) graph.StorageRoots {
 	t.Helper()
-	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
-	require.NoError(t, err)
-	return scope.Roots
+	return vlrScope(t, kind, values).Roots
 }
 
 func TestStoragePlan_CarriesTheVolumeRoots(t *testing.T) {
-	plan := storagePlan(vlrRoots(t,
-		[]string{"ontap-b", "ontap-a", "ontap-a", ""},
-		nil,
-		[]string{"aggr2", "aggr1", ""},
-		[]string{"svm_x"}, nil))
+	plan := storagePlan(vlrRoots(t, graph.StorageRootONTAPCluster, []string{"ontap-b", "ontap-a", "ontap-a", ""}))
 	assert.Equal(t, []string{"ontap-a", "ontap-b"}, plan.volumeClusters,
-		"sorted, de-duplicated, empties dropped — map order must never reach the plan")
-	assert.Equal(t, []string{"aggr1", "aggr2"}, plan.volumeAggrs)
-	assert.Equal(t, []string{"svm_x"}, plan.volumeSVMs)
+		"sorted, de-duplicated, empties dropped")
+	assert.Equal(t, []string{"aggr1", "aggr2"},
+		storagePlan(vlrRoots(t, graph.StorageRootAggr, []string{"aggr2", "aggr1", ""})).volumeAggrs)
+	assert.Equal(t, []string{"svm_x"},
+		storagePlan(vlrRoots(t, graph.StorageRootSVM, []string{"svm_x"})).volumeSVMs)
+	assert.Equal(t, []string{"ctl"},
+		storagePlan(vlrRoots(t, graph.StorageRootONTAPNode, []string{"ctl"})).volumeNodes,
+		"an ontap_node root seeds volume_labels on the controller name")
+	assert.Empty(t, storagePlan(vlrRoots(t, graph.StorageRootONTAPNode, []string{"ctl"})).nodeRoots,
+		"ontap_node is not a Kubernetes node root")
 
 	assert.Empty(t, storagePlan(graph.StorageRoots{}).volumeSVMs)
 	assert.Empty(t, storagePlan(graph.StorageRoots{}).volumeAggrs)
 
-	t.Run("svm values, not a presence bit, sorted and de-duplicated with empties dropped", func(t *testing.T) {
-		roots := graph.StorageRoots{SVMs: map[string]struct{}{"svm_b": {}, "svm_a": {}, "": {}, "svm_c": {}}}
-		for range 20 { // map order must never reach the plan
-			assert.Equal(t, []string{"svm_a", "svm_b", "svm_c"}, storagePlan(roots).volumeSVMs)
-		}
+	t.Run("svm values sorted and de-duplicated with empties dropped", func(t *testing.T) {
+		roots := graph.StorageRoots{Kind: graph.StorageRootSVM, Names: []string{"svm_b", "svm_a", "", "svm_c", "svm_a"}}
+		assert.Equal(t, []string{"svm_a", "svm_b", "svm_c"}, storagePlan(roots).volumeSVMs)
 	})
 }
 
 func TestTopologyPlan_RestrictsVolumeLabels(t *testing.T) {
-	suffix := defaultVolumeKeyRewriter()
-	mode := func(m VolumeMatchMode) *VolumeKeyRewriter {
-		rw, err := NewVolumeKeyRewriter(nil, m)
-		require.NoError(t, err)
-		return rw
-	}
 	cases := []struct {
 		name string
 		plan topologyPlan
-		rw   *VolumeKeyRewriter
 		want bool
 	}{
-		{"no roots at all", storagePlan(vlrRoots(t, nil, nil, nil, nil, nil)), suffix, false},
-		{"pod root only", storagePlan(vlrRoots(t, nil, nil, nil, nil, []string{"shop/a"})), suffix, false},
-		{"node only: a path through a Kubernetes node is found from its pods", storagePlan(vlrRoots(t, nil, []string{"n"}, nil, nil, nil)), suffix, false},
-		{"svm only", storagePlan(vlrRoots(t, nil, nil, nil, []string{"s"}, nil)), suffix, true},
-		{"aggr plus svm: one group each", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, []string{"s"}, nil)), suffix, true},
-		{"aggr plus node: the projection ANDs the node root", storagePlan(vlrRoots(t, nil, []string{"n"}, []string{"a"}, nil, nil)), suffix, true},
-		{"svm plus node", storagePlan(vlrRoots(t, nil, []string{"n"}, nil, []string{"s"}, nil)), suffix, true},
-		{"cluster plus svm", storagePlan(vlrRoots(t, []string{"o"}, nil, nil, []string{"s"}, nil)), suffix, true},
-		{"svm, contains mode", storagePlan(vlrRoots(t, nil, nil, nil, []string{"s"}, nil)), mode(VolumeMatchContains), false},
-		{"aggr, contains mode", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, nil, nil)), mode(VolumeMatchContains), false},
-		{"aggr, regex mode", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, nil, nil)), mode(VolumeMatchRegex), false},
-		{"aggr", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, nil, nil)), suffix, true},
-		{"ontap_cluster", storagePlan(vlrRoots(t, []string{"o"}, nil, nil, nil, nil)), suffix, true},
-		{"ontap_cluster plus aggr", storagePlan(vlrRoots(t, []string{"o"}, nil, []string{"a"}, nil, nil)), suffix, true},
-		{"aggr plus pod composes", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, nil, []string{"shop/a"})), suffix, true},
-		{"aggr, exact mode", storagePlan(vlrRoots(t, nil, nil, []string{"a"}, nil, nil)), mode(VolumeMatchExact), true},
+		{"no roots at all", storagePlan(vlrRoots(t, "", nil)), false},
+		{"pod root only", storagePlan(vlrRoots(t, graph.StorageRootPod, []string{"shop/a"})), false},
+		{"node only: a path through a Kubernetes node is found from its pods", storagePlan(vlrRoots(t, graph.StorageRootNode, []string{"n"})), false},
+		{"ontap_node seeds volume_labels on the controller", storagePlan(vlrRoots(t, graph.StorageRootONTAPNode, []string{"ctl"})), true},
+		{"svm only", storagePlan(vlrRoots(t, graph.StorageRootSVM, []string{"s"})), true},
+		{"aggr", storagePlan(vlrRoots(t, graph.StorageRootAggr, []string{"a"})), true},
+		{"ontap_cluster", storagePlan(vlrRoots(t, graph.StorageRootONTAPCluster, []string{"o"})), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, tc.plan.restrictsVolumeLabels(tc.rw))
+			assert.Equal(t, tc.want, tc.plan.harvestSeed())
 		})
 	}
 
-	t.Run("fullPlan can never restrict, structurally", func(t *testing.T) {
-		assert.False(t, fullPlan.restrictsVolumeLabels(suffix))
-		// Even a plan that somehow carried roots stays unrestricted unless it
-		// is by-reference: only /v1/storage-graph has roots to restrict by.
-		forged := topologyPlan{volumeAggrs: []string{"a"}}
-		assert.False(t, forged.restrictsVolumeLabels(suffix))
+	t.Run("fullPlan can never seed, structurally", func(t *testing.T) {
+		assert.False(t, fullPlan.harvestSeed())
+		// A plan that carried aggregate names without being the storage read
+		// stays unseeded: only /v1/storage-graph has a root kind.
+		forged := topologyPlan{kind: graph.StorageRootAggr, names: []string{"a"}, volumeAggrs: []string{"a"}}
+		assert.False(t, forged.harvestSeed())
 	})
 }
 
@@ -268,11 +218,11 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 		assert.Equal(t, []string{long}, got[1].aggrs)
 	})
 
-	t.Run("more chunks than the cap reads unrestricted instead", func(t *testing.T) {
+	t.Run("more chunks than the cap is not a renderable seed", func(t *testing.T) {
 		// `?aggr=` is repeatable and the request parser caps each value's
 		// LENGTH, never the count, so this is the one scope a client can
-		// inflate. Past the cap the leg reads as it did before the
-		// restriction existed: one query, same body, bounded fan-out.
+		// inflate. Past the cap the seed does not render; the build rejects
+		// it before any query.
 		_, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 240), nil, DefaultQoSScopeBatchBytes)
 		assert.False(t, ok, "5000 near-maximum-length values")
 
@@ -303,30 +253,31 @@ func manyAggrRoots(n, pad int) []string {
 }
 
 // An uncapped `?aggr=` must not turn one query into thousands. Past the cap the
-// build reads the family whole — the pre-change behaviour — and says so.
-func TestRootedVolumeLabels_UnboundedRootSetReadsUnrestricted(t *testing.T) {
-	scope := vlrScope(t, nil, nil, append(manyAggrRoots(5000, 240), "aggr1"), nil, nil)
+// build is rejected before the querier is asked anything.
+func TestRootedVolumeLabels_UnboundedRootSetIsRejected(t *testing.T) {
+	scope := vlrScope(t, graph.StorageRootAggr, append(manyAggrRoots(5000, 240), "aggr1"))
 	q := promqlfake.New(vlrMultiFiler())
-	g, err := New(q, Options{}, nil, nil).buildStorage(
+	_, err := New(q, Options{}, nil, nil).buildStorage(
 		t.Context(), time.Minute, vlrEnd, vlrSel, storagePlan(scope.Roots))
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Contains(t, err.Error(), RootScopeCapMessage)
+	assert.Empty(t, q.Issued(), "rejection happens before any query")
 
-	assert.Equal(t, []string{vlrBare}, q.QueriesFor(promql.QVolumeLabels),
-		"one unrestricted query, not thousands of chunks — and no phase 2 after the fallback")
-
-	// And the body is still right: aggr1 is among the 5000, so its claim draws.
-	rooted := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
-	gu, _ := vlrBuild(t, vlrMultiFiler(), rooted.Roots, Options{}, false)
-	assert.JSONEq(t, planBodyJSON(t, vlrBody(t, gu, rooted)), planBodyJSON(t, vlrBody(t, g, rooted)))
+	// readTopology is the same gate for a caller that does not go through buildStorage.
+	_, err = readTopology(t.Context(), q, time.Minute, vlrEnd, Options{}, vlrSel, storagePlan(scope.Roots))
+	require.Error(t, err)
+	assert.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, q.Issued())
 }
 
 // A value set that normalises away makes the predicate true and the renderer
 // false. graph.NewStorageScope drops empties for an HTTP caller, but
 // pkg/build is an importable engine and StorageRoots is an exported map.
 func TestRootedVolumeLabels_EmptyRootValueDoesNotFailAnOptionalLeg(t *testing.T) {
-	plan := storagePlan(graph.StorageRoots{ONTAPClusters: map[string]struct{}{"": {}}})
+	plan := storagePlan(graph.StorageRoots{Kind: graph.StorageRootONTAPCluster, Names: []string{""}})
 	assert.Empty(t, plan.volumeClusters, "the plan normalises, so the predicate and the renderer agree")
-	assert.False(t, plan.restrictsVolumeLabels(defaultVolumeKeyRewriter()))
+	assert.False(t, plan.harvestSeed())
 
 	q := promqlfake.New(vlrMultiFiler())
 	g, err := New(q, Options{}, nil, nil).buildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, plan)
@@ -420,7 +371,7 @@ func vlrBuild(t *testing.T, fx map[promql.Query]model.Vector, roots graph.Storag
 	t.Helper()
 	plan := storagePlan(roots)
 	if !restricted {
-		plan.volumeClusters, plan.volumeAggrs, plan.volumeSVMs = nil, nil, nil
+		plan.volumeClusters, plan.volumeAggrs, plan.volumeSVMs, plan.volumeNodes = nil, nil, nil, nil
 	}
 	q := promqlfake.New(fx)
 	g, err := New(q, opts, nil, nil).buildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, plan)
@@ -455,9 +406,9 @@ func vlrParity(t *testing.T, fx map[promql.Query]model.Vector, scope graph.Stora
 	return qr, qu, br
 }
 
-func vlrScope(t *testing.T, ontap, nodes, aggrs, svms, pods []string) graph.StorageScope {
+func vlrScope(t *testing.T, kind graph.StorageRootKind, values []string) graph.StorageScope {
 	t.Helper()
-	scope, err := graph.NewStorageScope(nil, nil, ontap, nodes, aggrs, svms, pods, nil)
+	scope, err := graph.NewStorageScope(nil, nil, kind, values)
 	require.NoError(t, err)
 	return scope
 }
@@ -474,44 +425,20 @@ func TestRootedVolumeLabels_ParityAcrossRootShapes(t *testing.T) {
 		phase1 []string
 	}{
 		"aggregate": {
-			vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil),
+			vlrScope(t, graph.StorageRootAggr, []string{"aggr1"}),
 			[]string{`aggr="aggr1"`},
 		},
 		"ontap cluster": {
-			vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil),
+			vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"}),
 			[]string{`cluster="ontap-prod"`},
 		},
-		"cluster and aggregate narrow one query": {
-			vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil),
-			[]string{`cluster="ontap-prod",aggr="aggr1"`},
-		},
 		"two aggregates": {
-			vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil),
+			vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"}),
 			[]string{`aggr=~"aggr1|aggr2"`},
 		},
-		"aggregate composed with a pod root": {
-			vlrScope(t, nil, nil, []string{"aggr1"}, nil, []string{"shop/orders-0"}),
-			[]string{`aggr="aggr1"`},
-		},
 		"svm": {
-			vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil),
+			vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"}),
 			[]string{`svm="svm_shop"`},
-		},
-		"cluster and svm narrow one query": {
-			vlrScope(t, []string{"ontap-prod"}, nil, nil, []string{"svm_shop"}, nil),
-			[]string{`cluster="ontap-prod",svm="svm_shop"`},
-		},
-		"aggregate and svm: one query group each": {
-			vlrScope(t, nil, nil, []string{"aggr1"}, []string{"svm_platform"}, nil),
-			[]string{`aggr="aggr1"`, `svm="svm_platform"`},
-		},
-		"aggregate composed with a node root": {
-			vlrScope(t, nil, []string{"ontap-prod-01"}, []string{"aggr1"}, nil, nil),
-			[]string{`aggr="aggr1"`},
-		},
-		"aggregate, svm and node": {
-			vlrScope(t, nil, []string{"ontap-prod-01"}, []string{"aggr1"}, []string{"svm_shop"}, nil),
-			[]string{`aggr="aggr1"`, `svm="svm_shop"`},
 		},
 	}
 	for name, tc := range cases {
@@ -534,28 +461,17 @@ func TestRootedVolumeLabels_ParityAcrossRootShapes(t *testing.T) {
 	}
 }
 
-func TestRootedVolumeLabels_ClusterAndAggregateAreAnded(t *testing.T) {
-	// ontap-lab also has an aggr1. `ontap_cluster=ontap-prod&aggr=aggr1` roots
-	// ONLY ontap-prod's, so its body must not draw the lab aggregate, while
-	// `aggr=aggr1` alone roots both.
+func TestRootedVolumeLabels_BareAggregateRootsEveryFiler(t *testing.T) {
+	// A bare aggr= names that aggregate on every filer. ontap_cluster= is its
+	// own root kind and no longer qualifies aggr=.
 	fx := vlrMultiFiler()
 	labAggr := "netapp/ontap-lab/aggr/aggr1"
 	prodAggr := "netapp/ontap-prod/aggr/aggr1"
 
-	_, _, both := vlrParity(t, fx, vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil), Options{})
-	ids := vlrIDs(both)
+	_, _, only := vlrParity(t, fx, vlrScope(t, graph.StorageRootAggr, []string{"aggr1"}), Options{})
+	ids := vlrIDs(only)
 	assert.True(t, ids[prodAggr])
-	assert.False(t, ids[labAggr], "an aggr= root names an aggregate only WITHIN the ontap_cluster= values")
-
-	_, _, only := vlrParity(t, fx, vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil), Options{})
-	ids = vlrIDs(only)
-	assert.True(t, ids[prodAggr])
-	assert.True(t, ids[labAggr], "with no ontap_cluster= both filers' aggr1 are roots")
-
-	// And the query shape says the same thing: one selector, both matchers.
-	_, q := vlrBuild(t, fx, vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil).Roots, Options{}, true)
-	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
-		q.QueriesFor(promql.QVolumeLabels)[0])
+	assert.True(t, ids[labAggr], "a bare aggr= roots that name on every filer")
 }
 
 // A Trident clone whose FlexVol name also ends with the claim's token sits on a
@@ -574,7 +490,7 @@ func TestRootedVolumeLabels_CloneOnLexicallySmallerAggregateKeepsItsPick(t *test
 	const ordersPod = "zone-a-prod-c1/uid-o0"
 
 	t.Run("rooted at the larger aggregate the claim is not retained", func(t *testing.T) {
-		scope := vlrScope(t, nil, nil, []string{"aggr9"}, nil, nil)
+		scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr9"})
 		restricted, _, body := vlrParity(t, vlrClone(), scope, Options{})
 		ids := vlrIDs(body)
 		assert.True(t, ids["netapp/ontap-prod/aggr/aggr9"], "the root is drawn")
@@ -592,7 +508,7 @@ func TestRootedVolumeLabels_CloneOnLexicallySmallerAggregateKeepsItsPick(t *test
 	})
 
 	t.Run("rooted at the smaller aggregate the I/O sums both volumes in both builds", func(t *testing.T) {
-		scope := vlrScope(t, nil, nil, []string{"aggr0"}, nil, nil)
+		scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr0"})
 		restricted, _, body := vlrParity(t, vlrClone(), scope, Options{})
 		assert.True(t, vlrIDs(body)[ordersPod], "the pick is aggr0, so the claim IS retained")
 
@@ -648,7 +564,7 @@ func TestRootedVolumeLabels_CrossFilerNameCollisionKeepsItsPick(t *testing.T) {
 		{"trident_pvc_orders", "ontap-lab", "ontap-lab-07", "aggr7", "svm_lab", 90},
 		{"trident_pvc_redis", "ontap-prod", "ontap-prod-02", "aggr2", "svm_platform", 100},
 	}))
-	scope := vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	assert.False(t, vlrIDs(body)["zone-a-prod-c1/uid-o0"],
@@ -656,9 +572,32 @@ func TestRootedVolumeLabels_CrossFilerNameCollisionKeepsItsPick(t *testing.T) {
 	assert.True(t, vlrIDs(body)["netapp/ontap-prod/aggr/aggr1"])
 	var sawTokens bool
 	for _, q := range restricted.QueriesFor(promql.QVolumeLabels) {
-		sawTokens = sawTokens || strings.Contains(q, `volume=~".*pvc_orders"`)
+		sawTokens = sawTokens || strings.Contains(q, "pvc_orders")
 	}
 	assert.True(t, sawTokens, "phase 1 was cluster-scoped, so only phase 2 could see the lab filer's series")
+}
+
+func TestONTAPNodeSeed_TouchedAggregateAnotherControllerOwnsContributesNoClaim(t *testing.T) {
+	fx := vlrEstate(vlrHarvest([]vlrVol{
+		{"trident_pvc_orders", "ontap-prod", "ontap-b", "aggr1", "svm_shop", 300},
+		{"prod_unrelated_1", "ontap-prod", "ontap-b", "aggr1", "svm_shop", 7},
+		{"trident_pvc_redis", "ontap-prod", "ontap-b", "aggr9", "svm_platform", 90},
+		{"owned_by_a", "ontap-prod", "ontap-a", "aggr9", "svm_platform", 1},
+	}))
+	body := assertStorageParity(t, fx, parityRoot{kind: graph.StorageRootONTAPNode, values: []string{"ontap-b"}})
+	assert.True(t, parityHasID(body, "zone-a-prod-c1/uid-o0"), "aggr1 is owned by ontap-b, so its claim is tracked")
+	assert.False(t, parityHasID(body, "zone-a-prod-c1/uid-r0"), "aggr9's vote is ontap-a, so its claim is not a candidate")
+
+	q := promqlfake.New(fx)
+	_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+		vlrScope(t, graph.StorageRootONTAPNode, []string{"ontap-b"}).Roots)
+	require.NoError(t, err)
+	labels := strings.Join(q.QueriesFor(promql.QVolumeLabels), "\n")
+	assert.Contains(t, labels, `node="ontap-b"`, "phase 1 restricts volume_labels on the controller")
+	assert.Contains(t, labels, `aggr=~"aggr1|aggr9"`, "both touched aggregates are re-read whole")
+	info := strings.Join(q.QueriesFor(promql.QPVCInfo), "\n")
+	assert.Contains(t, info, "pvc-orders", "aggr1's volume contributes its claim")
+	assert.NotContains(t, info, "pvc-redis", "aggr9's volume contributes no candidate")
 }
 
 func TestRootedVolumeLabels_TakeoverOwnershipSurvives(t *testing.T) {
@@ -670,7 +609,7 @@ func TestRootedVolumeLabels_TakeoverOwnershipSurvives(t *testing.T) {
 		{"prod_unrelated_1", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 7},
 		{"trident_pvc_redis", "ontap-prod", "ontap-prod-02", "aggr2", "svm_platform", 100},
 	}))
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	gr, _ := vlrBuild(t, fx, scope.Roots, Options{}, true)
 	_, _, body := vlrParity(t, fx, scope, Options{})
 
@@ -686,7 +625,7 @@ func TestRootedVolumeLabels_RootedAggregateWithNoClaimIsStillDrawn(t *testing.T)
 	fx := vlrEstate(vlrHarvest([]vlrVol{
 		{"trident_pvc_orders", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 300},
 	}, [3]string{"ontap-prod", "ontap-prod-03", "aggr3"}))
-	scope := vlrScope(t, nil, nil, []string{"aggr3"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr3"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	ids := vlrIDs(body)
@@ -696,36 +635,28 @@ func TestRootedVolumeLabels_RootedAggregateWithNoClaimIsStillDrawn(t *testing.T)
 		"phase 1 matched nothing, so phase 2 is not issued at all")
 }
 
-func TestRootedVolumeLabels_OptOutsReadTheWholeFiler(t *testing.T) {
-	contains, err := NewVolumeKeyRewriter(nil, VolumeMatchContains)
-	require.NoError(t, err)
-	regex, err := NewVolumeKeyRewriter(nil, VolumeMatchRegex)
-	require.NoError(t, err)
-
-	cases := map[string]struct {
-		scope graph.StorageScope
-		opts  Options
-	}{
-		"node only":              {vlrScope(t, nil, []string{"ontap-prod-01"}, nil, nil, nil), Options{}},
-		"contains mode":          {vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil), Options{VolumeKey: contains}},
-		"regex mode":             {vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil), Options{VolumeKey: regex}},
-		"no storage-side root":   {vlrScope(t, nil, nil, nil, nil, []string{"shop/orders-0"}), Options{}},
-		"cluster, contains mode": {vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil), Options{VolumeKey: contains}},
-		"svm, regex mode":        {vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil), Options{VolumeKey: regex}},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			g, q := vlrBuild(t, vlrMultiFiler(), tc.scope.Roots, tc.opts, true)
-			assert.Equal(t, []string{vlrBare}, q.QueriesFor(promql.QVolumeLabels),
-				"exactly one bare unrestricted query and no second phase")
-			require.NotNil(t, g)
-		})
-	}
+func TestWorkloadRootsReadVolumeLabelsByToken(t *testing.T) {
+	t.Run("kubernetes node with no pod", func(t *testing.T) {
+		// ontap-prod-01 is a controller name. As node= it is a Kubernetes node
+		// the estate does not schedule, so the seed tracks no claim.
+		g, q := vlrBuild(t, vlrMultiFiler(), vlrScope(t, graph.StorageRootNode, []string{"ontap-prod-01"}).Roots, Options{}, true)
+		assert.Empty(t, q.QueriesFor(promql.QVolumeLabels))
+		require.NotNil(t, g)
+	})
+	t.Run("pod root", func(t *testing.T) {
+		g, q := vlrBuild(t, vlrMultiFiler(), vlrScope(t, graph.StorageRootPod, []string{"shop/orders-0"}).Roots, Options{}, true)
+		queries := q.QueriesFor(promql.QVolumeLabels)
+		joined := strings.Join(queries, "\n")
+		assert.NotContains(t, queries, vlrBare)
+		assert.Contains(t, joined, `volume=~".*pvc_orders"`, "candidate completion")
+		assert.Contains(t, joined, `aggr="aggr1"`, "owner completion of the aggregate the token read named")
+		require.NotNil(t, g)
+	})
 
 	t.Run("an SVM root keeps a claim that only the SVM reaches", func(t *testing.T) {
 		// redis is on aggr2 / svm_platform. Rooting aggr1 AND svm_platform must
 		// retain it through the SVM — which a restriction by aggr alone would drop.
-		scope := vlrScope(t, nil, nil, []string{"aggr1"}, []string{"svm_platform"}, nil)
+		scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_platform"})
 		_, _, body := vlrParity(t, vlrMultiFiler(), scope, Options{})
 		ids := vlrIDs(body)
 		assert.True(t, ids["zone-a-prod-c1/uid-r0"], "platform/redis-0 is reached through svm_platform")
@@ -736,7 +667,7 @@ func TestRootedVolumeLabels_OptOutsReadTheWholeFiler(t *testing.T) {
 // ---------------------------------------------------------------- phases + tally
 
 func TestRootedVolumeLabels_PhaseTwoWaitsForPhaseOne(t *testing.T) {
-	scope := vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"})
 	q := promqlfake.New(vlrMultiFiler())
 	// A tiny budget forces several phase-1 chunks AND several phase-2 chunks.
 	_, err := New(q, Options{QoSScopeBatchBytes: 6}, nil, nil).buildStorage(
@@ -775,7 +706,7 @@ func TestRootedVolumeLabels_SeriesTallyIsTheMergedCount(t *testing.T) {
 	// Roots aggr1 (3 series: orders, lab_unrelated_1, prod_unrelated_1). Phase 2
 	// re-reads `.*pvc_orders`, which returns trident_pvc_orders AGAIN. The tally
 	// is the merged, de-duplicated count under the one family name.
-	scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 	q := promqlfake.New(vlrMultiFiler())
 	topo, err := readTopology(t.Context(), q, time.Minute, vlrEnd, Options{}, vlrSel, storagePlan(scope.Roots))
 	require.NoError(t, err)
@@ -794,7 +725,7 @@ func TestRootedVolumeLabels_SeriesTallyIsTheMergedCount(t *testing.T) {
 // Spec: "A failed restricted chunk fails the build". The rooted read only
 // runs on /v1/storage-graph, which fails closed on every family but ALERTS.
 func TestRootedVolumeLabels_ChunkFailuresFailTheBuild(t *testing.T) {
-	scope := vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"})
 	boom := errors.New("upstream said no")
 
 	for _, tc := range []struct {
@@ -884,7 +815,7 @@ func TestRootedVolumeLabels_JoinMissSignalUnderARestriction(t *testing.T) {
 	t.Run("end to end through a build", func(t *testing.T) {
 		// cache-data is a claim no FlexVol backs anywhere. Unrooted it is a
 		// coverage miss; under ?aggr=aggr1 it matched nothing, so it is silent.
-		scope := vlrScope(t, nil, nil, []string{"aggr1"}, nil, nil)
+		scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 		restricted := captureDebugRecords(t, func() {
 			vlrBuild(t, vlrMultiFiler(), scope.Roots, Options{}, true)
 		})
@@ -912,7 +843,7 @@ func TestRootedVolumeLabels_PhaseTwoOnlyAggregateIsNeverDrawn(t *testing.T) {
 		{"snap_trident_pvc_orders", "ontap-prod", "ontap-prod-05", "aggr0", "svm_shop", 50},
 		{"prod_unrelated_1", "ontap-prod", "ontap-prod-01", "aggr0", "svm_shop", 7},
 	}))
-	scope := vlrScope(t, nil, nil, []string{"aggr9"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr9"})
 
 	gr, _ := vlrBuild(t, fx, scope.Roots, Options{}, true)
 	gu, _ := vlrBuild(t, fx, scope.Roots, Options{}, false)
@@ -942,7 +873,7 @@ func TestRootedVolumeLabels_ClusterOnlyPhaseTwoExcludesWhatPhaseOneRead(t *testi
 	}))
 
 	t.Run("cluster only excludes the filer phase 1 read whole", func(t *testing.T) {
-		scope := vlrScope(t, []string{"ontap-prod"}, nil, nil, nil, nil)
+		scope := vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"})
 		restricted, _, _ := vlrParity(t, fx, scope, Options{})
 		var token string
 		for _, q := range restricted.QueriesFor(promql.QVolumeLabels) {
@@ -958,7 +889,7 @@ func TestRootedVolumeLabels_ClusterOnlyPhaseTwoExcludesWhatPhaseOneRead(t *testi
 	t.Run("an aggregate root must NOT exclude its cluster", func(t *testing.T) {
 		// Phase 1 read only part of ontap-prod, so a candidate on another of
 		// its aggregates is exactly what phase 2 has to find.
-		scope := vlrScope(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, nil, nil)
+		scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1"})
 		restricted, _, _ := vlrParity(t, fx, scope, Options{})
 		for _, q := range restricted.QueriesFor(promql.QVolumeLabels) {
 			if strings.Contains(q, "volume=") {
@@ -1013,7 +944,7 @@ func TestOwnerCompletionTargets(t *testing.T) {
 	}
 
 	t.Run("no aggregate root: every touched aggregate, per cluster, sorted", func(t *testing.T) {
-		plan := storagePlan(vlrRoots(t, nil, nil, nil, []string{"svm_shop"}, nil))
+		plan := storagePlan(vlrRoots(t, graph.StorageRootSVM, []string{"svm_shop"}))
 		assert.Equal(t, map[string][]string{
 			"ontap-prod": {"aggr1", "aggr3", "aggr7"},
 			"ontap-lab":  {"aggr1"},
@@ -1021,21 +952,13 @@ func TestOwnerCompletionTargets(t *testing.T) {
 	})
 
 	t.Run("an aggregate the aggregate group read whole is not completed", func(t *testing.T) {
-		plan := storagePlan(vlrRoots(t, nil, nil, []string{"aggr1"}, []string{"svm_shop"}, nil))
+		plan := storagePlan(vlrRoots(t, graph.StorageRootAggr, []string{"aggr1"}))
 		assert.Equal(t, map[string][]string{"ontap-prod": {"aggr3", "aggr7"}},
-			ownerCompletionTargets(svmRows, plan), "aggr=aggr1 with no ontap_cluster= read aggr1 on every filer")
-	})
-
-	t.Run("an aggregate root narrowed by a cluster reads only that cluster's aggregate whole", func(t *testing.T) {
-		plan := storagePlan(vlrRoots(t, []string{"ontap-prod"}, nil, []string{"aggr1"}, []string{"svm_shop"}, nil))
-		assert.Equal(t, map[string][]string{
-			"ontap-prod": {"aggr3", "aggr7"},
-			"ontap-lab":  {"aggr1"},
-		}, ownerCompletionTargets(svmRows, plan))
+			ownerCompletionTargets(svmRows, plan), "aggr=aggr1 reads aggr1 on every filer")
 	})
 
 	t.Run("no SVM rows, no completion", func(t *testing.T) {
-		assert.Empty(t, ownerCompletionTargets(nil, storagePlan(vlrRoots(t, nil, nil, []string{"aggr1"}, nil, nil))))
+		assert.Empty(t, ownerCompletionTargets(nil, storagePlan(vlrRoots(t, graph.StorageRootAggr, []string{"aggr1"}))))
 	})
 }
 
@@ -1062,7 +985,7 @@ func TestRootedVolumeLabels_SVMRootCompletesEveryTouchedAggregate(t *testing.T) 
 		{"other_1", "ontap-prod", "ontap-prod-01", "aggr03", "svm_other", 5},
 		{"trident_pvc_redis", "ontap-prod", "ontap-prod-02", "aggr05", "svm_platform", 100},
 	}))
-	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	assert.Contains(t, restricted.QueriesFor(promql.QVolumeLabels), `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
@@ -1081,27 +1004,14 @@ func TestRootedVolumeLabels_AggregateAndSVMRootsAreUnioned(t *testing.T) {
 		{"trident_pvc_orders", "ontap-prod", "ontap-prod-09", "aggr09", "svm_shop", 300},
 		{"shop_on_rooted_aggr", "ontap-prod", "ontap-prod-01", "aggr00", "svm_shop", 1},
 	}))
-	scope := vlrScope(t, nil, nil, []string{"aggr00"}, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	vl := restricted.QueriesFor(promql.QVolumeLabels)
-	assert.Contains(t, vl, `last_over_time(volume_labels{az="zone-a",env="prod",aggr="aggr00"}[1m])`)
 	assert.Contains(t, vl, `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
-	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr09"}[1m])`},
-		completionQueries(restricted), "aggr00 was read whole by the aggregate group; aggr09 was not")
 	ids := vlrIDs(body)
 	assert.True(t, ids["zone-a-prod-c1/uid-o0"], "the aggr09 claim is retained through its SVM")
-	assert.True(t, ids["zone-a-prod-c1/uid-r0"], "the aggr00 claim is retained through its aggregate")
-
-	t.Run("a series both groups return is merged once", func(t *testing.T) {
-		topo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd, Options{}, vlrSel,
-			storagePlan(scope.Roots))
-		require.NoError(t, err)
-		// aggr group: redis, shop_on_rooted_aggr. SVM group: orders,
-		// shop_on_rooted_aggr (again). Completion (aggr09) and phase 2 return
-		// only series already held.
-		assert.Equal(t, 3, topo.RawSeriesCount[string(promql.QVolumeLabels)])
-	})
+	assert.False(t, ids["zone-a-prod-c1/uid-r0"], "redis sits on svm_platform, which this root does not name")
 }
 
 // Spec: "Owner completion preserves the takeover vote".
@@ -1112,7 +1022,7 @@ func TestRootedVolumeLabels_OwnerCompletionPreservesTheTakeoverVote(t *testing.T
 		{"other_1", "ontap-prod", "ontap-prod-01", "aggr09", "svm_other", 5},
 		{"trident_pvc_redis", "ontap-prod", "ontap-prod-02", "aggr02", "svm_platform", 100},
 	}))
-	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	gr, _ := vlrBuild(t, fx, scope.Roots, Options{}, true)
 	_, _, body := vlrParity(t, fx, scope, Options{})
 
@@ -1145,7 +1055,7 @@ func TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates(t *testing.T)
 		{"snap_trident_pvc_orders", "ontap-prod", "ontap-prod-05", "aggr0", "svm_zzz", 50},
 		{"prod_unrelated_1", "ontap-prod", "ontap-prod-01", "aggr0", "svm_zzz", 7},
 	}))
-	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	ids := vlrIDs(body)
@@ -1158,7 +1068,7 @@ func TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates(t *testing.T)
 	}, completionQueries(restricted), "aggr9 completed after phase 1, aggr0 after phase 2")
 
 	t.Run("no svm root, no phase-2 completion", func(t *testing.T) {
-		restricted, _, _ := vlrParity(t, fx, vlrScope(t, nil, nil, []string{"aggr9"}, nil, nil), Options{})
+		restricted, _, _ := vlrParity(t, fx, vlrScope(t, graph.StorageRootAggr, []string{"aggr9"}), Options{})
 		assert.Empty(t, completionQueries(restricted),
 			"an aggregate root never retains a unit through a phase-2-only aggregate")
 	})
@@ -1175,7 +1085,7 @@ func TestWithoutTargets(t *testing.T) {
 }
 
 func TestRootedVolumeLabels_NoSVMRootIssuesNoCompletion(t *testing.T) {
-	scope := vlrScope(t, nil, nil, []string{"aggr1", "aggr2"}, nil, nil)
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"})
 	restricted, _, _ := vlrParity(t, vlrMultiFiler(), scope, Options{})
 	assert.Empty(t, completionQueries(restricted))
 }
@@ -1183,7 +1093,7 @@ func TestRootedVolumeLabels_NoSVMRootIssuesNoCompletion(t *testing.T) {
 // A failed owner-completion chunk fails the build like every other chunk of
 // the family.
 func TestRootedVolumeLabels_OwnerCompletionFailureFailsTheBuild(t *testing.T) {
-	scope := vlrScope(t, nil, nil, nil, []string{"svm_shop"}, nil)
+	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	q := promqlfake.New(vlrMultiFiler())
 	q.Fail = func(name, query string) error {
 		if name == string(promql.QVolumeLabels) && strings.Contains(query, `,cluster="`) {

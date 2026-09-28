@@ -19,9 +19,7 @@ import (
 // read-storage-roots-through-volume-hub).
 //
 // A /v1/storage-graph request rooted at an ONTAP cluster, an aggregate or an SVM
-// used to read the whole filer's volume-label family and discard nearly all of
-// it at projection. Under a restriction — which is also what puts the build in
-// hub mode (topologyPlan.hub) — the build reads it in phases:
+// reads the volume-label family from that root, in phases:
 //
 //	phase 1           the family restricted to the rooted components: an
 //	                  aggregate group {cluster=~OC?, aggr=~A} (or {cluster=~OC}
@@ -90,6 +88,9 @@ const (
 	// groupSVM is {cluster=~OC?, svm=~S}: each SVM's share of every aggregate
 	// it touches.
 	groupSVM
+	// groupNode is {node=~N}: an ontap_node seed. The rows name the aggregates
+	// to re-read whole; they are not themselves the claim source.
+	groupNode
 )
 
 // rootedVolumeLabelsQuery is one rendered phase-1 query, kept beside the value
@@ -99,43 +100,56 @@ type rootedVolumeLabelsQuery struct {
 	clusters []string
 	aggrs    []string
 	svms     []string
+	nodes    []string
 	rendered string
 }
 
 // render is the query's PromQL. ok is false when its value sets normalise
 // away, which only an embedder filling StorageRoots directly can produce.
 func (r rootedVolumeLabelsQuery) render(window time.Duration, keys promql.LabelKeys, sel promql.Selector) (string, bool) {
-	if r.group == groupSVM {
+	switch r.group {
+	case groupSVM:
 		return promql.RenderVolumeLabelsSVMRooted(window, keys, sel, r.clusters, r.svms)
+	case groupNode:
+		return promql.RenderVolumeLabelsByNode(window, keys, sel, r.nodes)
+	default:
+		return promql.RenderVolumeLabelsRooted(window, keys, sel, r.clusters, r.aggrs)
 	}
-	return promql.RenderVolumeLabelsRooted(window, keys, sel, r.clusters, r.aggrs)
 }
 
-// maxRootedVolumeLabelChunks bounds how many queries the phase-1 restriction may
-// become, summed over its aggregate and SVM groups. Past it the build reads the
-// family UNRESTRICTED instead — and, since the restriction is what engages the
-// volume hub, reads every claim family as it did before the hub existed.
+// rootedNodeLabelChunks splits an ontap_node seed across as many node-scoped
+// volume_labels queries as the byte budget requires. ok is false past the cap.
+func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
+	chunks := promql.ChunkScope(nodes, max(budget, 1))
+	out := make([]rootedVolumeLabelsQuery, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, rootedVolumeLabelsQuery{group: groupNode, nodes: chunk})
+	}
+	if len(out) > maxRootedVolumeLabelChunks {
+		return nil, false
+	}
+	return out, true
+}
+
+// maxRootedVolumeLabelChunks bounds how many queries a request-derived
+// volume-label seed may become. Past it the build is rejected with
+// ReasonInvalidScope before any query is issued — an unrestricted read is not
+// a fallback, because it is the read a series limit rejects first.
 //
 // This is the one scope in the package derived from the REQUEST rather than from
 // upstream data, and `?aggr=` / `?svm=` / `?ontap_cluster=` are repeatable with
 // no cap on how many values a client may send (the request parser bounds each value's
 // length, never the count). Without a ceiling, one request naming thousands of
 // aggregates would turn a single `last_over_time(volume_labels[w])` into
-// thousands of queries, each still carrying the whole repeated cluster
-// alternation — a self-inflicted fan-out no upstream limit protects against,
-// and one no data-derived scope can produce.
-//
-// Falling back to the unrestricted read is the safe direction: it is exactly
-// what this leg did before the restriction existed, it is one query, and the
-// body is unchanged either way. The value matches scopeConcurrency, so a
-// restricted read never spans more than one concurrency wave.
+// thousands of queries. The value matches scopeConcurrency, so a restricted
+// read never spans more than one concurrency wave.
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
 // rootedVolumeLabelsChunks splits the phase-1 restriction across as many
 // queries as the byte budget requires, in (group, chunk) order: the aggregate
 // group's chunks first, then the SVM group's. ok is false when that would take
 // more than maxRootedVolumeLabelChunks queries IN TOTAL across both groups; the
-// caller then reads unrestricted.
+// caller rejects the build and issues nothing.
 //
 // Each group chunks ITS alternation — `aggr` for the aggregate group, `svm` for
 // the SVM group, `cluster` for a request rooted at ONTAP clusters alone — and
@@ -366,6 +380,105 @@ func readRootedVolumeLabels(
 	}
 }
 
+// readONTAPNodeVolumeLabels is the ontap_node seed. Phase 1 restricts
+// volume_labels on the controller name. Every aggregate those rows touch is
+// then re-read whole, because the owner vote runs over all of the aggregate's
+// series and a takeover inside the window names more than one controller.
+// Only the aggregates whose vote lands on a root controller are written to
+// dst, and that vector is the claim source: a touched aggregate another
+// controller owns contributes no candidate.
+func readONTAPNodeVolumeLabels(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	plan topologyPlan,
+	dst *model.Vector,
+	svmRows *model.Vector,
+) func() error {
+	return func() (err error) {
+		defer recoverScopedPanic(ctx, promql.QVolumeLabels, &err)
+		rendered := make([]string, len(plan.phaseOne))
+		for i, r := range plan.phaseOne {
+			rendered[i] = r.rendered
+		}
+		parts, qerr := issueVolumeLabelsParts(ctx, q, end, "ontap_node", rendered)
+		if qerr != nil {
+			return qerr
+		}
+		var seeded model.Vector
+		for _, part := range parts {
+			seeded = append(seeded, part...)
+		}
+		completed, qerr := readOwnerCompletion(ctx, q, window, end, opts, sel, aggregatesTouched(seeded))
+		if qerr != nil {
+			return qerr
+		}
+		*svmRows = nil
+		*dst = rowsOwnedBy(mergeVolumeLabels(seeded, completed), plan.volumeNodes)
+		return nil
+	}
+}
+
+// aggregatesTouched is every (ONTAP cluster, aggregate) a volume-label vector
+// names, keyed and sorted the way owner completion chunks them.
+func aggregatesTouched(rows model.Vector) map[string][]string {
+	seen := map[string]map[string]struct{}{}
+	for _, s := range rows {
+		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
+		aggr := string(s.Metric["aggr"])
+		if cluster == "" || aggr == "" {
+			continue
+		}
+		if seen[cluster] == nil {
+			seen[cluster] = map[string]struct{}{}
+		}
+		seen[cluster][aggr] = struct{}{}
+	}
+	out := make(map[string][]string, len(seen))
+	for cluster, aggrs := range seen {
+		out[cluster] = slices.Sorted(maps.Keys(aggrs))
+	}
+	return out
+}
+
+// rowsOwnedBy keeps the rows of every aggregate whose lexically-smallest node
+// label is one of roots. That is pickOwner's vote, applied before any candidate
+// is derived. An empty aggregate (a FlexGroup) has no vote and contributes nothing.
+func rowsOwnedBy(rows model.Vector, roots []string) model.Vector {
+	type aggrKey struct{ cluster, aggr string }
+	owner := map[aggrKey]string{}
+	for _, s := range rows {
+		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
+		aggr := string(s.Metric["aggr"])
+		node := string(s.Metric["node"])
+		if cluster == "" || aggr == "" || node == "" {
+			continue
+		}
+		k := aggrKey{cluster, aggr}
+		if cur, ok := owner[k]; !ok || node < cur {
+			owner[k] = node
+		}
+	}
+	root := make(map[string]struct{}, len(roots))
+	for _, r := range roots {
+		root[r] = struct{}{}
+	}
+	var out model.Vector
+	for _, s := range rows {
+		k := aggrKey{
+			string(s.Metric[promql.VolumeLabelsClusterLabel]),
+			string(s.Metric["aggr"]),
+		}
+		if _, ok := root[owner[k]]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // ownerCompletionTargets is the owner-completion scope: every (ONTAP cluster,
 // aggregate) pair an SVM-group row names, minus the aggregates an aggregate
 // group of the same request already read whole — an aggregate named by an
@@ -487,20 +600,11 @@ func readTokenScopedVolumeLabels(
 	if rw == nil {
 		rw = defaultVolumeKeyRewriter()
 	}
-	kind := rw.tokenScope()
-	if kind == tokenScopeNone {
-		return nil, nil // unreachable under the predicate; never guess a branch shape
-	}
 	tokens := matchedClaimTokens(v.PVCInfo, v.VolumeLabels, rw)
 	if len(tokens) == 0 {
 		return nil, nil
 	}
 
-	suffix := kind == tokenScopeSuffix
-	overhead := 0
-	if suffix {
-		overhead = promql.VolumeTokenBranchOverhead
-	}
 	// A restriction by ONTAP cluster ALONE read those filers whole, so every
 	// candidate on them is already in hand and the only ones left to recover
 	// are elsewhere. Excluding them turns phase 2 from a second full-family
@@ -512,10 +616,43 @@ func readTokenScopedVolumeLabels(
 	if len(plan.volumeAggrs) == 0 && len(plan.volumeSVMs) == 0 {
 		excludeClusters = plan.volumeClusters
 	}
+	return issueTokenVolumeLabels(ctx, q, window, end, opts, sel, tokens, excludeClusters)
+}
+
+// tokensOfClaims is every tracked claim's derived token. Unlike
+// matchedClaimTokens it does not require a phase-1 row: a workload seed
+// already knows the claims, and candidate completion is their whole set.
+func tokensOfClaims(pvcInfo model.Vector, rw *VolumeKeyRewriter) []string {
+	_, matcher := claimVolumeMatcher(pvcInfo, rw)
+	if matcher == nil {
+		return nil
+	}
+	tokens := slices.Clone(matcher.tokens)
+	tokens = slices.DeleteFunc(tokens, func(t string) bool { return t == "" })
+	slices.Sort(tokens)
+	return slices.Compact(tokens)
+}
+
+// issueTokenVolumeLabels reads volume_labels restricted on volume to tokens,
+// each branch the suffix comparison `.*<token>`. excludeClusters drops filers
+// a cluster-only phase 1 already read whole.
+func issueTokenVolumeLabels(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	tokens, excludeClusters []string,
+) (model.Vector, error) {
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	overhead := promql.VolumeTokenBranchOverhead
 	chunks := promql.ChunkScopeWithOverhead(tokens, opts.qosScopeBatchBytes(), overhead)
 	rendered := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
-		query, ok := promql.RenderVolumeLabelsTokenScoped(window, opts.LabelKeys, sel, chunk, suffix, excludeClusters)
+		query, ok := promql.RenderVolumeLabelsTokenScoped(window, opts.LabelKeys, sel, chunk, true, excludeClusters)
 		if !ok {
 			// Unreachable for a non-empty chunk. Failing is the only honest
 			// answer under a fail-closed read: an incomplete candidate set

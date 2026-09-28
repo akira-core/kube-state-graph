@@ -70,11 +70,11 @@ func singleRouterOver(t *testing.T, q promql.Querier, opts ...promql.RouterOptio
 func TestCachedSamplesNotMutated(t *testing.T) {
 	end := time.Unix(1, 0).UTC()
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
-	aggrScope, err := graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+	aggrScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 	require.NoError(t, err)
-	podScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/orders-0"}, nil)
+	podScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/orders-0"})
 	require.NoError(t, err)
-	appScope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{"beta"})
+	appScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"beta"})
 	require.NoError(t, err)
 
 	run := func(q promql.Querier) []string {

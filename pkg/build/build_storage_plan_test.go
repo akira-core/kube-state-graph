@@ -262,53 +262,50 @@ func TestBuildStorage_PlanIsOutputPreserving(t *testing.T) {
 		namespaces []string
 		scope      func() (graph.StorageScope, error)
 	}{
-		"no root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, nil)
-		}},
 		"claimless pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/web-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web-0"})
 		}},
 		"mounting pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/orders-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/orders-0"})
 		}},
 		"pod roots in two namespaces": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/orders-0", "platform/redis-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/orders-0", "platform/redis-0"})
 		}},
 		"aggregate root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, nil, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 		}},
 		"roots on both sides": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, []string{"aggr1"}, nil, []string{"shop/orders-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
 		}},
 		"kubernetes node root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, []string{"worker-2"}, nil, nil, nil, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"worker-2"})
 		}},
 		"kubernetes node root with no mounting pod": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, []string{"worker-3"}, nil, nil, nil, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"worker-3"})
 		}},
 		"daemonset-owned pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/daemon-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/daemon-0"})
 		}},
 		"bare replicaset-owned pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/rs-bare-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/rs-bare-0"})
 		}},
 		"job with its own annotation, pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/job-annotated-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/job-annotated-0"})
 		}},
 		"job resolved through its cronjob, pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/job-cronjob-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/job-cronjob-0"})
 		}},
 		"ownerless pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/ownerless-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/ownerless-0"})
 		}},
 		"unscheduled pod root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, []string{"shop/unscheduled-0"}, nil)
+			return graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/unscheduled-0"})
 		}},
 		"namespace filter": {namespaces: []string{"shop"}, scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, []string{"shop"}, nil, nil, nil, nil, nil, nil)
+			return graph.NewStorageScope(nil, []string{"shop"}, graph.StorageRootPod, []string{"shop/orders-0"})
 		}},
 		"application root": {scope: func() (graph.StorageScope, error) {
-			return graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{"beta"})
+			return graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"beta"})
 		}},
 	}
 	for name, tc := range cases {
@@ -356,14 +353,15 @@ func TestBuildStorage_CrossNamespaceNameCollisionIsHarmless(t *testing.T) {
 		bystand  = ident + "/uid-a0" // shop/api-0, claimless, named by nothing
 	)
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
+	roots := graph.StorageRoots{Kind: graph.StorageRootAggr, Names: []string{"aggr1"}}
 	g, err := New(promqlfake.New(planEstate()), Options{}, nil, nil).
-		BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), sel, graph.StorageRoots{})
+		BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), sel, roots)
 	require.NoError(t, err)
 
 	assert.Contains(t, g.NodesByID, collider, "its name matches a mounting pod's, so the scoped read fetches it")
 	assert.NotContains(t, g.NodesByID, bystand, "a pod no binding and no root names is never read")
 
-	body := cytoscape.Serialise(g, graph.ProjectStorage(g, graph.StorageScope{}))
+	body := cytoscape.Serialise(g, graph.ProjectStorage(g, graph.StorageScope{Roots: roots}))
 	drawn := map[string]bool{}
 	for _, n := range body.Elements.Nodes {
 		drawn[n.Data.ID] = true
@@ -376,7 +374,7 @@ func TestBuildStorage_CrossNamespaceNameCollisionIsHarmless(t *testing.T) {
 // does not pick — is loaded and then dropped. The body matches an estate
 // whose controller carries only the winning tracking-id.
 func TestBuildStorage_OverAdmittedPodIsDropped(t *testing.T) {
-	scope, err := graph.NewStorageScope(nil, nil, nil, nil, nil, nil, nil, []string{"beta"})
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootApplication, []string{"beta"})
 	require.NoError(t, err)
 	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
 	end := time.Unix(1, 0).UTC()
@@ -433,7 +431,7 @@ func TestBuildStorage_RecoveryTalliedUnderFamilyName(t *testing.T) {
 			planKSM("namespace", "shop", "pod", "web-7d9f-abc", "uid", "uid-web", "node", "n1"),
 		},
 	})
-	roots := graph.StorageRoots{Applications: map[string]struct{}{"checkout": {}}}
+	roots := graph.StorageRoots{Kind: graph.StorageRootApplication, Names: []string{"checkout"}}
 	tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, promql.Selector{}, storagePlan(roots))
 	require.NoError(t, err)
 	assert.Equal(t, 5, tp.RawSeriesCount["kube_deployment_annotations"], "stage-1 2 + by-reference 3")
@@ -501,19 +499,26 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 		fixtures    map[promql.Query]model.Vector
 		roots       graph.StorageRoots
 		byReference []promql.Query // by-reference families this build must issue
+		skip        []promql.Query // unrestricted legs this root no longer issues zone-wide
 		matchVolume bool           // also load a claim that matches a FlexVol: +6 QoS legs
 		want        int
+		// tracked roots issue ALERTS plus byReference only. An empty root keeps
+		// the zone-wide inventory: that case is not a storage request the
+		// parser accepts, and it pins the plan's skip set.
+		tracked bool
 	}{
-		{"empty scope, no roots", nil, graph.StorageRoots{}, nil, false, 18},
+		{"empty scope, no roots", nil, graph.StorageRoots{}, nil, nil, false, 18, false},
 		{"node root alone, no mounting pod", nil,
-			graph.StorageRoots{Nodes: map[string]struct{}{"n9": {}}}, promql.NodeScopedQueries, false, 22},
+			graph.StorageRoots{Kind: graph.StorageRootNode, Names: []string{"n9"}},
+			slices.Concat(promql.NodeScopedQueries, []promql.Query{promql.QPodInfo}),
+			nil, false, 6, true},
 		{"one statefulset-owned scheduled pod", map[promql.Query]model.Vector{
 			promql.QPVCBindings: binding("db", "db-0"),
 			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
 			promql.QPodOwner:    owner("db", "db-0", "StatefulSet", "orders"),
 		}, graph.StorageRoots{},
 			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, []promql.Query{promql.QStatefulSetAnnotations}),
-			false, 25},
+			nil, false, 25, false},
 		{"one deployment-owned pod via replicaset", map[promql.Query]model.Vector{
 			promql.QPVCBindings: binding("db", "db-0"),
 			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
@@ -524,7 +529,7 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 		}, graph.StorageRoots{},
 			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries,
 				[]promql.Query{promql.QReplicaSetOwner, promql.QReplicaSetAnnotations, promql.QDeploymentAnnotations}),
-			false, 27},
+			nil, false, 27, false},
 		{"one cronjob-owned pod via job", map[promql.Query]model.Vector{
 			promql.QPVCBindings: binding("db", "db-0"),
 			promql.QPodInfo:     podInfo("db", "db-0", "n1"),
@@ -536,7 +541,7 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 		}, graph.StorageRoots{},
 			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries,
 				[]promql.Query{promql.QJobOwner, promql.QJobAnnotations, promql.QCronJobAnnotations}),
-			false, 27},
+			nil, false, 27, false},
 		{"every controller kind present", map[promql.Query]model.Vector{
 			promql.QPVCBindings: merge(binding("db", "sts-0"), binding("db", "ds-0"), binding("db", "dep-0"),
 				binding("db", "rs-0"), binding("db", "job-0"), binding("db", "cj-0")),
@@ -559,10 +564,10 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 			}}),
 		}, graph.StorageRoots{},
 			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, promql.ControllerScopedQueries),
-			false, 32},
+			nil, false, 32, false},
 		{"every controller kind present, and a matched volume", nil /* filled below */, graph.StorageRoots{},
 			slices.Concat(promql.PodScopedQueries, promql.NodeScopedQueries, promql.ControllerScopedQueries),
-			true, 38},
+			nil, true, 38, false},
 	}
 	// The last case reuses the richest fixture with the volume join added.
 	cases[len(cases)-1].fixtures = merge2(cases[5].fixtures, map[promql.Query]model.Vector{
@@ -581,7 +586,14 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 				seen[is.Name]++
 			}
 			want := make(map[string]bool, tc.want)
-			for _, q := range storageUnrestrictedLegs {
+			base := storageUnrestrictedLegs
+			if tc.tracked {
+				base = []promql.Query{promql.QAlerts}
+			}
+			for _, q := range base {
+				if slices.Contains(tc.skip, q) {
+					continue
+				}
 				want[string(q)] = true
 			}
 			for _, q := range tc.byReference {
@@ -635,18 +647,21 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 		promql.QDeploymentAnnotations, promql.QStatefulSetAnnotations, promql.QDaemonSetAnnotations,
 		promql.QCronJobAnnotations, promql.QReplicaSetAnnotations, promql.QJobAnnotations,
 	}
-	base := func(qs ...promql.Query) map[string]int {
-		m := map[string]int{}
-		for _, q := range storageUnrestrictedLegs {
+	// An application root issues ALERTS plus the recovery, never the zone-wide
+	// Harvest inventory. base is that floor: ALERTS and one query per
+	// controller-annotation family plus the claim-annotation recovery.
+	base := func(extra ...promql.Query) map[string]int {
+		m := map[string]int{string(promql.QAlerts): 1, string(promql.QPVCAnnotations): 1}
+		for _, q := range ann {
 			m[string(q)] = 1
 		}
-		for _, q := range qs {
+		for _, q := range extra {
 			m[string(q)]++
 		}
 		return m
 	}
 	app := func(name string) graph.StorageRoots {
-		return graph.StorageRoots{Applications: map[string]struct{}{name: {}}}
+		return graph.StorageRoots{Kind: graph.StorageRootApplication, Names: []string{name}}
 	}
 	track := func(label, name, id string) model.Vector {
 		return sampleVec(model.Sample{Metric: model.Metric{
@@ -660,18 +675,18 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 		promql.QPodOwner, promql.QPodOwner, promql.QPodOwner,
 		promql.QNodeInfo, promql.QNodeAddresses, promql.QNodeLabels, promql.QNodeStatusCondition,
 		promql.QReplicaSetOwner, promql.QReplicaSetOwner,
-		promql.QReplicaSetAnnotations, promql.QReplicaSetAnnotations,
-		promql.QDeploymentAnnotations, promql.QDeploymentAnnotations,
-		promql.QStatefulSetAnnotations, promql.QDaemonSetAnnotations, promql.QJobAnnotations, promql.QCronJobAnnotations,
+		promql.QReplicaSetAnnotations,
+		promql.QDeploymentAnnotations,
+		promql.QPVCBindings,
 	)
 	cronPod := base(
 		promql.QPodInfo,
 		promql.QPodOwner, promql.QPodOwner, promql.QPodOwner,
 		promql.QNodeInfo, promql.QNodeAddresses, promql.QNodeLabels, promql.QNodeStatusCondition,
 		promql.QJobOwner, promql.QJobOwner,
-		promql.QJobAnnotations, promql.QJobAnnotations,
-		promql.QCronJobAnnotations, promql.QCronJobAnnotations,
-		promql.QDeploymentAnnotations, promql.QStatefulSetAnnotations, promql.QDaemonSetAnnotations, promql.QReplicaSetAnnotations,
+		promql.QJobAnnotations,
+		promql.QCronJobAnnotations,
+		promql.QPVCBindings,
 	)
 
 	everyForward := slices.Concat(storageUnrestrictedLegs, promql.PodScopedQueries, promql.NodeScopedQueries, promql.ControllerScopedQueries, promql.QoSWorkloadQueries)
@@ -702,7 +717,7 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 				}}),
 			},
 			roots: app("checkout"),
-			want:  base(ann...),
+			want:  base(),
 		},
 		{
 			name: "one deployment-managed claimless pod",
@@ -786,9 +801,14 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 		promql.QReplicaSetAnnotations:  track("replicaset", "rs-bare", "ReplicaSet"),
 		promql.QJobAnnotations:         track("job_name", "batch-1", "Job"),
 		promql.QCronJobAnnotations:     track("cronjob", "nightly", "CronJob"),
-		promql.QPVCInfo: sampleVec(model.Sample{Metric: model.Metric{
-			"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-db-0", "volumename": "pvc-9f3a",
-		}}),
+		promql.QPVCInfo: sampleVec(
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-sts-0", "volumename": "pvc-9f3a"}},
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-ds-0", "volumename": "pvc-9f3a"}},
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-dep-0", "volumename": "pvc-9f3a"}},
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-rs-0", "volumename": "pvc-9f3a"}},
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-job-0", "volumename": "pvc-9f3a"}},
+			model.Sample{Metric: model.Metric{"cluster": "c", "namespace": "db", "persistentvolumeclaim": "data-cj-0", "volumename": "pvc-9f3a"}},
+		),
 		promql.QVolumeLabels: sampleVec(model.Sample{Metric: model.Metric{
 			"volume": "trident_pvc_9f3a", "cluster": "ontap-prod", "node": "ontap-prod-01", "aggr": "aggr1", "svm": "svm0",
 		}}),
@@ -800,6 +820,15 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 		want     map[string]int
 		podKinds int
 	}{name: "every controller kind present, and a matched volume", fixtures: everyFix, roots: app("checkout"), want: every, podKinds: 6})
+
+	// Nothing matches checkout, so the seed issues no binding query. The rich
+	// case recovers pods that mount claims, so bindings are read twice: by pod,
+	// then by claim for the other mounters.
+	delete(cases[0].want, string(promql.QPVCBindings))
+	every[string(promql.QPVCBindings)] = 2
+	// Tracking-id recovery plus the claim-name read; token scope plus owner completion.
+	every[string(promql.QPVCAnnotations)] = 2
+	every[string(promql.QVolumeLabels)] = 2
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -860,6 +889,11 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 		promql.QPodInfo:      {ksm("pod", "db-0", "uid", "u-db-0", "node", "n1")},
 		promql.QPodOwner:     {ksm("pod", "db-0", "owner_kind", "StatefulSet", "owner_name", "db", "owner_is_controller", "true")},
 	}
+	withoutPolicy := func(m map[string]int) map[string]int {
+		delete(m, string(promql.QQoSPolicyFixedMaxIOPS))
+		delete(m, string(promql.QQoSPolicyFixedMaxMBps))
+		return m
+	}
 	count := func(qs ...promql.Query) map[string]int {
 		m := map[string]int{}
 		for _, q := range hubFirstWave {
@@ -883,19 +917,19 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 	}{
 		{"aggregate root, no candidate", map[promql.Query]model.Vector{
 			promql.QVolumeLabels: {vol("vol0", "svm0")},
-		}, graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}}, count()},
+		}, graph.StorageRoots{Kind: graph.StorageRootAggr, Names: []string{"aggr1"}}, withoutPolicy(count())},
 		{"aggregate root, a candidate naming no claim", map[promql.Query]model.Vector{
 			promql.QVolumeLabels: {vol("trident_pvc_gone", "svm0")},
-		}, graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}}, count(promql.QPVCInfo)},
+		}, graph.StorageRoots{Kind: graph.StorageRootAggr, Names: []string{"aggr1"}}, withoutPolicy(count(promql.QPVCInfo))},
 		{"aggregate root, one statefulset-owned pod on a matched volume", path,
-			graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}},
+			graph.StorageRoots{Kind: graph.StorageRootAggr, Names: []string{"aggr1"}},
 			count(append(fullPath, promql.QVolumeLabels)...)}, // + phase 2
 		{"svm root, the same path", path,
-			graph.StorageRoots{SVMs: map[string]struct{}{"svm0": {}}},
+			graph.StorageRoots{Kind: graph.StorageRootSVM, Names: []string{"svm0"}},
 			count(append(fullPath, promql.QVolumeLabels, promql.QVolumeLabels)...)}, // + completion + phase 2
-		{"aggregate and svm roots on the same aggregate: nothing to complete", path,
-			graph.StorageRoots{Aggrs: map[string]struct{}{"aggr1": {}}, SVMs: map[string]struct{}{"svm0": {}}},
-			count(append(fullPath, promql.QVolumeLabels, promql.QVolumeLabels)...)}, // + SVM group + phase 2
+		{"svm root on the matched volume", path,
+			graph.StorageRoots{Kind: graph.StorageRootSVM, Names: []string{"svm0"}},
+			count(append(fullPath, promql.QVolumeLabels, promql.QVolumeLabels)...)}, // + completion + phase 2
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -915,6 +949,41 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 					assert.NotContains(t, tp.RawSeriesCount, string(q), "%s: not issued, so absent, never 0", q)
 				}
 			}
+		})
+	}
+}
+
+// Every storage build reads ALERTS across the zone and restricts every other
+// family it issues. The bare render — fixed selector plus the request's az /
+// env only — is the unrestricted form, and a tracking build must not issue it
+// for any family but ALERTS.
+func TestStorageBuild_OnlyAlertsUnrestricted(t *testing.T) {
+	fx := vlrMultiFiler()
+	roots := []graph.StorageScope{
+		vlrScope(t, graph.StorageRootONTAPCluster, []string{"ontap-prod"}),
+		vlrScope(t, graph.StorageRootONTAPNode, []string{"ontap-prod-01"}),
+		vlrScope(t, graph.StorageRootAggr, []string{"aggr1"}),
+		vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"}),
+		vlrScope(t, graph.StorageRootNode, []string{"worker-1"}),
+		vlrScope(t, graph.StorageRootPod, []string{"shop/orders-0"}),
+		vlrScope(t, graph.StorageRootApplication, []string{"checkout"}),
+	}
+	for _, scope := range roots {
+		t.Run(string(scope.Roots.Kind), func(t *testing.T) {
+			q := promqlfake.New(fx)
+			_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+			require.NoError(t, err)
+			var restricted int
+			for _, is := range q.Issued() {
+				if is.Name == string(promql.QAlerts) {
+					assert.Equal(t, promql.Render(promql.QAlerts, time.Minute, promql.LabelKeys{}, vlrSel), is.Query)
+					continue
+				}
+				bare := promql.Render(promql.Query(is.Name), time.Minute, promql.LabelKeys{}, vlrSel)
+				assert.NotEqual(t, bare, is.Query, "%s is restricted beyond the request matchers", is.Name)
+				restricted++
+			}
+			assert.NotZero(t, restricted, "a rooted build issues more than ALERTS")
 		})
 	}
 }

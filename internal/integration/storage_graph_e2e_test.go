@@ -149,13 +149,7 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 // TestStorageGraph_RootedVolumeLabelsMatchTheWholeFilerRead proves, against a
 // real VictoriaMetrics, that restricting the volume-label topology read to the
 // request's rooted components — and recovering each matched claim's candidate
-// set in a second phase — draws exactly what reading the whole filer draws
-// (scope-volume-labels-by-storage-root).
-//
-// The control is the `contains` volume-match mode, which the rooted read opts
-// out of by design: it reads the family whole. On this fixture `contains` and
-// the default `suffix` mode select the same volumes, so the two servers differ
-// in exactly one thing — which read they issue.
+// set in a second phase — keeps the clone pick (scope-volume-labels-by-storage-root).
 //
 // The fixture is the hazard the second phase exists for: the claim's token
 // (pvc_rv) ends BOTH trident_pvc_rv on rv-aggr9 and a clone
@@ -187,8 +181,7 @@ node_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",test=
 		s.Require().True(s.WaitForSeries(series, fixedNow, 30*time.Second), "VM did not observe %s", series)
 	}
 
-	rooted := s.StartAPIServer(func(cfg *config.Config) {})
-	whole := s.StartAPIServer(func(cfg *config.Config) { cfg.NetAppVolumeMatchMode = "contains" })
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
 	const (
 		ident   = "zone-a-prod-c1"
 		pod     = ident + "/uid-rv-0"
@@ -196,31 +189,16 @@ node_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",test=
 		aggr9   = "netapp/ontap-rv/aggr/rv-aggr9"
 		claimID = ident + "/rvshop/rv-data"
 	)
-	both := func(configure func(url.Values)) (rootedBody, wholeBody cytoscape.Body) {
-		rootedBody = s.fetchStorageGraph(rooted.URL, configure)
-		wholeBody = s.fetchStorageGraph(whole.URL, configure)
-		s.Require().NotEmpty(rootedBody.Elements.Nodes, "a vacuous body would prove nothing")
-		s.Equal(wholeBody, rootedBody, "the rooted read must draw exactly what the whole-filer read draws")
-		return rootedBody, wholeBody
+	fetch := func(configure func(url.Values)) cytoscape.Body {
+		body := s.fetchStorageGraph(srv.URL, configure)
+		s.Require().NotEmpty(body.Elements.Nodes, "a vacuous body would prove nothing")
+		return body
 	}
-
-	// The control is only a control while `contains` and `suffix` select the
-	// same volumes on this VictoriaMetrics — which the suite shares, and which
-	// none of these queries scope to the fixture's `test=` discriminator. Assert
-	// that precondition on an UNROOTED request, where neither server restricts
-	// anything and the two modes therefore differ in nothing but the join: if a
-	// later fixture ingests a volume whose name CONTAINS a token it does not end
-	// with, this fails and names the reason instead of turning a real regression
-	// into a green comparison below.
-	s.Require().Equal(
-		s.fetchStorageGraph(whole.URL, nil),
-		s.fetchStorageGraph(rooted.URL, nil),
-		"contains and suffix must select the same volumes here, or the whole-read control is not one")
 
 	// Rooted at the LARGER aggregate: the claim's pick is rv-aggr0 (the clone
 	// sorts first), so the claim is NOT under this root — which a phase-1-only
 	// read, seeing only rv-aggr9, would get wrong.
-	larger, _ := both(func(q url.Values) { q.Set("aggr", "rv-aggr9") })
+	larger := fetch(func(q url.Values) { q.Set("aggr", "rv-aggr9") })
 	ids := nodesByID(larger)
 	s.Contains(ids, aggr9, "the root itself is always drawn")
 	s.Contains(ids, "netapp/ontap-rv/rv-ctl-09", "with its owning controller")
@@ -229,28 +207,66 @@ node_new_status{az="zone-a",env="prod",cluster="ontap-rv",node="rv-ctl-00",test=
 	// Rooted at the SMALLER aggregate: the claim IS retained, its I/O sums both
 	// volumes (the QoS scope is computed over the merged candidate set), and it
 	// names rv-aggr0.
-	smaller, _ := both(func(q url.Values) { q.Set("aggr", "rv-aggr0") })
+	smaller := fetch(func(q url.Values) { q.Set("aggr", "rv-aggr0") })
 	ids = nodesByID(smaller)
 	s.Contains(ids, pod)
 	s.Equal(aggr0, ids[claimID].Labels["aggr"])
 
-	// cluster AND aggregate narrow ONE selector.
-	both(func(q url.Values) {
-		q.Set("ontap_cluster", "ontap-rv")
-		q.Set("aggr", "rv-aggr0")
-	})
-
 	// A cluster root alone roots every entity of that filer.
-	filer, _ := both(func(q url.Values) { q.Set("ontap_cluster", "ontap-rv") })
+	filer := fetch(func(q url.Values) { q.Set("ontap_cluster", "ontap-rv") })
 	ids = nodesByID(filer)
 	s.Contains(ids, aggr0)
 	s.Contains(ids, aggr9)
 	s.Contains(ids, pod)
 
 	// A typo roots nothing: never the whole filer.
-	typo := s.fetchStorageGraph(rooted.URL, func(q url.Values) { q.Set("aggr", "rv-typo") })
+	typo := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("aggr", "rv-typo") })
 	s.Empty(typo.Elements.Nodes)
 	s.Empty(typo.Elements.Edges)
+
+	// ontap_node= is the controller. rv-ctl-00 owns rv-aggr0, which is the
+	// claim's pick, so the pod is drawn. rv-ctl-09 owns only rv-aggr9.
+	owned := fetch(func(q url.Values) { q.Set("ontap_node", "rv-ctl-00") })
+	s.Contains(nodesByID(owned), pod, "the controller that owns the picked aggregate draws the pod")
+	other := fetch(func(q url.Values) { q.Set("ontap_node", "rv-ctl-09") })
+	s.Contains(nodesByID(other), "netapp/ontap-rv/rv-ctl-09")
+	s.NotContains(nodesByID(other), pod, "rv-aggr9 is not the claim's pick")
+
+	// node= is a Kubernetes node. The pod scheduled there is drawn; an ONTAP
+	// controller name sent as node= draws nothing.
+	k8s := fetch(func(q url.Values) { q.Set("node", "worker-rv") })
+	s.Contains(nodesByID(k8s), pod)
+	asNode := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("node", "rv-ctl-00") })
+	s.Empty(asNode.Elements.Nodes, "an ONTAP controller name is not a Kubernetes node")
+
+	// The same claim's aggregate on /v1/graph agrees with the storage pick.
+	graphResp := s.httpGet(s.graphURL(srv.URL, func(q url.Values) { q.Set("prune", "false") }))
+	defer func() { _ = graphResp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, graphResp.StatusCode)
+	var graphBody cytoscape.Body
+	s.Require().NoError(json.NewDecoder(graphResp.Body).Decode(&graphBody))
+	s.Equal(aggr0, nodesByID(graphBody)[claimID].Labels["aggr"],
+		"the storage pick and /v1/graph name the same aggregate")
+
+	s.assertStorageRejected(srv.URL, nil, "missing_root")
+	s.assertStorageRejected(srv.URL, func(q url.Values) {
+		q.Set("aggr", "rv-aggr0")
+		q.Set("pod", "rvshop/rv-0")
+	}, "invalid_scope")
+}
+
+func (s *GraphSuite) assertStorageRejected(base string, configure func(url.Values), reason string) {
+	s.T().Helper()
+	resp := s.httpGet(s.storageGraphURL(base, configure))
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusBadRequest, resp.StatusCode)
+	var body struct {
+		Error struct {
+			Reason string `json:"reason"`
+		} `json:"error"`
+	}
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	s.Equal(reason, body.Error.Reason)
 }
 
 // TestStorageGraph_ByReferenceControllersAndNodes proves the

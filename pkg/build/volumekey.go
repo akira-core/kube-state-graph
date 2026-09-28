@@ -11,41 +11,6 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// VolumeMatchMode selects how a claim's derived match token is compared against
-// the stock `volume` label of a Harvest series (the ONTAP FlexVol name).
-//
-// ONTAP volume names admit only letters, digits and `_`, so a `volume` value
-// can never equal a `pvc-<uuid>` PersistentVolume name and the two are never
-// compared for equality directly: the PV name is first rewritten into a match
-// token (see VolumeKeyRewriter), and the token is compared under one of these
-// modes.
-type VolumeMatchMode string
-
-const (
-	// VolumeMatchExact requires the token to equal the whole `volume` value.
-	VolumeMatchExact VolumeMatchMode = "exact"
-	// VolumeMatchSuffix requires `volume` to END with the token. This is the
-	// default: a provisioner names a FlexVol by PREFIXING the transformed PV
-	// name, so a suffix match resolves it without the deployment declaring the
-	// prefix, while still rejecting a derived volume whose name extends past
-	// the PV name (`trident_pvc_x_clone`), which VolumeMatchContains accepts.
-	VolumeMatchSuffix VolumeMatchMode = "suffix"
-	// VolumeMatchContains requires `volume` to contain the token anywhere.
-	VolumeMatchContains VolumeMatchMode = "contains"
-	// VolumeMatchRegex compiles the token itself as a regular expression and
-	// matches it against `volume`.
-	VolumeMatchRegex VolumeMatchMode = "regex"
-)
-
-// DefaultVolumeMatchMode is the mode used when the operator configures none.
-const DefaultVolumeMatchMode = VolumeMatchSuffix
-
-// VolumeMatchModes lists every accepted mode, in the order the operator
-// reference documents them.
-var VolumeMatchModes = []VolumeMatchMode{
-	VolumeMatchExact, VolumeMatchSuffix, VolumeMatchContains, VolumeMatchRegex,
-}
-
 // VolumeKeyRule is one ordered rewrite step turning a PersistentVolume name
 // into the match token. Every match of Pattern is replaced by Replacement.
 type VolumeKeyRule struct {
@@ -57,18 +22,23 @@ type VolumeKeyRule struct {
 // none: replace `-` with `_`, which is exactly the transformation a
 // CSI provisioner performs to make a `pvc-<uuid>` PV name a legal ONTAP volume
 // name. It deliberately does NOT prepend a storage prefix — the prefix is
-// per-backend configurable in the provisioner, and DefaultVolumeMatchMode does
+// per-backend configurable in the provisioner, and a suffix comparison does
 // not need to know it.
 func DefaultVolumeKeyRules() []VolumeKeyRule {
 	return []VolumeKeyRule{{Pattern: "-", Replacement: "_"}}
 }
 
 // VolumeKeyRewriter derives a claim's match token from its bound PV name and
-// answers whether that token matches a Harvest `volume` value. It is immutable
-// after construction and safe for concurrent use.
+// answers whether a Harvest `volume` value ends with that token. The join is
+// suffix-only: a provisioner names a FlexVol by prefixing the transformed PV
+// name, so the comparison resolves it without the deployment declaring the
+// prefix, rejects a derived volume whose name extends past the PV name
+// (`trident_pvc_x_clone`), and is the one comparison a storage build can both
+// render as an anchored alternation branch and invert from a FlexVol name
+// back to candidate PersistentVolume names. It is immutable after construction
+// and safe for concurrent use.
 type VolumeKeyRewriter struct {
 	rules []compiledVolumeKeyRule
-	mode  VolumeMatchMode
 }
 
 type compiledVolumeKeyRule struct {
@@ -76,27 +46,18 @@ type compiledVolumeKeyRule struct {
 	replacement string
 }
 
-// NewVolumeKeyRewriter compiles the ordered rewrite rules and validates the
-// match mode. An uncompilable pattern or an unrecognised mode is an error, never
-// a silent fallback to the defaults: a typo would otherwise resolve a different
-// estate than the operator declared.
+// NewVolumeKeyRewriter compiles the ordered rewrite rules. An uncompilable
+// pattern is an error, never a silent fallback to the defaults: a typo would
+// otherwise resolve a different estate than the operator declared.
 //
 // A NIL rules slice means "the operator configured none" and adopts
 // DefaultVolumeKeyRules; a non-nil EMPTY slice is an explicit identity rewrite
-// (the token is the PV name verbatim). An empty mode adopts
-// DefaultVolumeMatchMode.
-func NewVolumeKeyRewriter(rules []VolumeKeyRule, mode VolumeMatchMode) (*VolumeKeyRewriter, error) {
+// (the token is the PV name verbatim).
+func NewVolumeKeyRewriter(rules []VolumeKeyRule) (*VolumeKeyRewriter, error) {
 	if rules == nil {
 		rules = DefaultVolumeKeyRules()
 	}
-	if mode == "" {
-		mode = DefaultVolumeMatchMode
-	}
-	if !validVolumeMatchMode(mode) {
-		return nil, fmt.Errorf("unknown volume match mode %q (want one of %s)",
-			mode, joinVolumeMatchModes())
-	}
-	out := &VolumeKeyRewriter{mode: mode, rules: make([]compiledVolumeKeyRule, 0, len(rules))}
+	out := &VolumeKeyRewriter{rules: make([]compiledVolumeKeyRule, 0, len(rules))}
 	for i, r := range rules {
 		re, err := regexp.Compile(r.Pattern)
 		if err != nil {
@@ -108,67 +69,10 @@ func NewVolumeKeyRewriter(rules []VolumeKeyRule, mode VolumeMatchMode) (*VolumeK
 	return out, nil
 }
 
-// tokenScopeKind says how a match mode's per-token comparison renders as ONE
-// branch of an anchored regular-expression alternation — the form a data-derived
-// `volume` restriction takes on the wire. It is what decides whether the
-// two-phase rooted volume-label read (see volumelabelscope.go) may run at all.
-type tokenScopeKind int
-
-const (
-	// tokenScopeNone: the mode's comparison cannot be rendered into an anchored
-	// alternation branch without changing what it selects. A build configured
-	// with such a mode reads the volume-label family unrestricted.
-	tokenScopeNone tokenScopeKind = iota
-	// tokenScopeExact: the branch is the escaped token alone.
-	tokenScopeExact
-	// tokenScopeSuffix: the branch is `.*` followed by the escaped token.
-	tokenScopeSuffix
-)
-
-// volumeModeTokenScope classifies EVERY declared match mode. It is a table
-// beside the mode enum rather than a switch with a default, so a mode added to
-// VolumeMatchModes must be classified deliberately —
-// TestVolumeModeTokenScope_EveryModeClassified fails on a missing entry, and the
-// safe reading of an unclassified mode is still "unrestricted".
-//
-// `contains` would need `.*tok.*`, which is expressible, but a `contains` token
-// is chosen precisely because the estate's naming is irregular; and a `regex`
-// token IS operator-supplied RE2 whose own anchors (`^`, `$`) change meaning
-// inside a fully-anchored alternation. Both read unrestricted rather than be
-// reasoned about case by case.
-var volumeModeTokenScope = map[VolumeMatchMode]tokenScopeKind{
-	VolumeMatchExact:    tokenScopeExact,
-	VolumeMatchSuffix:   tokenScopeSuffix,
-	VolumeMatchContains: tokenScopeNone,
-	VolumeMatchRegex:    tokenScopeNone,
-}
-
-// tokenScope reports how this rewriter's mode renders as an alternation branch.
-// A zero-value rewriter (no mode) and any unclassified mode answer
-// tokenScopeNone.
-func (r *VolumeKeyRewriter) tokenScope() tokenScopeKind {
-	if r == nil {
-		return tokenScopeNone
-	}
-	return volumeModeTokenScope[r.mode]
-}
-
-func validVolumeMatchMode(m VolumeMatchMode) bool {
-	return slices.Contains(VolumeMatchModes, m)
-}
-
-func joinVolumeMatchModes() string {
-	s := make([]string, len(VolumeMatchModes))
-	for i, m := range VolumeMatchModes {
-		s[i] = string(m)
-	}
-	return strings.Join(s, ", ")
-}
-
 // defaultVolumeKeyRewriter is the rewriter a zero build.Options resolves to.
 // It cannot fail — the defaults are compiled from constants.
 func defaultVolumeKeyRewriter() *VolumeKeyRewriter {
-	rw, err := NewVolumeKeyRewriter(nil, "")
+	rw, err := NewVolumeKeyRewriter(nil)
 	if err != nil {
 		panic("build: default volume key rewriter does not compile: " + err.Error())
 	}
@@ -211,28 +115,15 @@ func (r *VolumeKeyRewriter) token(pvName string) string {
 	return pvName
 }
 
-// matches reports whether a derived token matches a Harvest `volume` value
-// under the configured mode. It is the single-pair form of the predicate the
-// volumeMatcher index answers in bulk; the two MUST agree.
+// matches reports whether a derived token is a suffix of a Harvest `volume`
+// value. A FlexVol named exactly the token matches, because a value ends with
+// itself. It is the single-pair form of the predicate the volumeMatcher index
+// answers in bulk; the two MUST agree.
 func (r *VolumeKeyRewriter) matches(token, volume string) bool {
 	if token == "" {
 		return false
 	}
-	switch r.mode {
-	case VolumeMatchExact:
-		return token == volume
-	case VolumeMatchSuffix:
-		return strings.HasSuffix(volume, token)
-	case VolumeMatchContains:
-		return strings.Contains(volume, token)
-	case VolumeMatchRegex:
-		re, err := regexp.Compile(token)
-		if err != nil {
-			return false
-		}
-		return re.MatchString(volume)
-	}
-	return false
+	return strings.HasSuffix(volume, token)
 }
 
 // volumeMatcher answers, for one Harvest `volume` value, which of a build's
@@ -240,136 +131,71 @@ func (r *VolumeKeyRewriter) matches(token, volume string) bool {
 // cost of the whole join is one pass over the Harvest vector rather than one
 // pass per claim.
 //
-// `exact` and `suffix` resolve through a hash index and cost O(volumes):
-// tokens are bucketed by byte length, and for each series only the trailing
-// len(token) bytes are looked up per distinct length (one length in practice,
-// since every `pvc-<uuid>` derives the same length). `contains` and `regex`
-// have no such reduction and scan every claim per series — that cost is the
-// documented price of opting into them.
+// Suffix resolves through a hash index and costs O(volumes): tokens are
+// bucketed by byte length, and for each series only the trailing len(token)
+// bytes are looked up per distinct length (one length in practice, since every
+// `pvc-<uuid>` derives the same length).
 type volumeMatcher struct {
-	rw *VolumeKeyRewriter
-
 	tokens []string // per claim index; "" for a claim that derived none
 
-	// exact / suffix
 	byToken map[string][]int
 	lengths []int // distinct token byte lengths, ascending
-
-	// regex
-	res []*regexp.Regexp // per claim index; nil when the token does not compile
 }
 
-// newVolumeMatcher indexes the claims. A claim whose token fails to compile in
-// `regex` mode simply never matches: the token comes from upstream data, not
-// from configuration, so it degrades (and is then counted by
-// netapp_volume_join_miss) rather than failing the build.
+// newVolumeMatcher indexes the claims by their derived tokens.
 func newVolumeMatcher(rw *VolumeKeyRewriter, claims []pvcVolume) *volumeMatcher {
-	m := &volumeMatcher{rw: rw, tokens: make([]string, len(claims))}
+	m := &volumeMatcher{
+		tokens:  make([]string, len(claims)),
+		byToken: make(map[string][]int, len(claims)),
+	}
+	seenLen := map[int]bool{}
 	for i, c := range claims {
-		m.tokens[i] = rw.token(c.volumeName)
-	}
-	switch rw.mode {
-	case VolumeMatchExact, VolumeMatchSuffix:
-		m.byToken = make(map[string][]int, len(claims))
-		seenLen := map[int]bool{}
-		for i, t := range m.tokens {
-			if t == "" {
-				continue
-			}
-			m.byToken[t] = append(m.byToken[t], i)
-			if !seenLen[len(t)] {
-				seenLen[len(t)] = true
-				m.lengths = append(m.lengths, len(t))
-			}
+		t := rw.token(c.volumeName)
+		m.tokens[i] = t
+		if t == "" {
+			continue
 		}
-		slices.Sort(m.lengths)
-	case VolumeMatchRegex:
-		m.res = make([]*regexp.Regexp, len(claims))
-		for i, t := range m.tokens {
-			if t == "" {
-				continue
-			}
-			if re, err := regexp.Compile(t); err == nil {
-				m.res[i] = re
-			}
+		m.byToken[t] = append(m.byToken[t], i)
+		if !seenLen[len(t)] {
+			seenLen[len(t)] = true
+			m.lengths = append(m.lengths, len(t))
 		}
-	case VolumeMatchContains:
-		// No index: substring search has no hash-lookup form. match scans the
-		// token slice, which newVolumeMatcher has already filled.
 	}
+	slices.Sort(m.lengths)
 	return m
 }
 
-// match appends the indexes of every claim matching this `volume` value to dst
-// and returns it. dst is reused across series to keep the pass allocation-free.
+// match appends the indexes of every claim whose token is a suffix of this
+// `volume` value to dst and returns it. dst is reused across series to keep
+// the pass allocation-free.
 func (m *volumeMatcher) match(volume string, dst []int) []int {
 	dst = dst[:0]
 	if volume == "" {
 		return dst
 	}
-	switch m.rw.mode {
-	case VolumeMatchExact:
-		return append(dst, m.byToken[volume]...)
-	case VolumeMatchSuffix:
-		for _, l := range m.lengths {
-			if l > len(volume) {
-				break // lengths ascend; no longer token can be a suffix
-			}
-			dst = append(dst, m.byToken[volume[len(volume)-l:]]...)
+	for _, l := range m.lengths {
+		if l > len(volume) {
+			break // lengths ascend; no longer token can be a suffix
 		}
-		return dst
-	case VolumeMatchContains:
-		for i, t := range m.tokens {
-			if t != "" && strings.Contains(volume, t) {
-				dst = append(dst, i)
-			}
-		}
-		return dst
-	case VolumeMatchRegex:
-		for i, re := range m.res {
-			if re != nil && re.MatchString(volume) {
-				dst = append(dst, i)
-			}
-		}
-		return dst
+		dst = append(dst, m.byToken[volume[len(volume)-l:]]...)
 	}
 	return dst
 }
 
-// any reports whether ANY claim matches this `volume` value. It is the
-// scope-computation form: it needs no claim identity and can stop at the first
-// hit.
+// any reports whether ANY claim's token is a suffix of this `volume` value.
+// It is the scope-computation form: it needs no claim identity and can stop
+// at the first hit.
 func (m *volumeMatcher) any(volume string) bool {
 	if volume == "" {
 		return false
 	}
-	switch m.rw.mode {
-	case VolumeMatchExact:
-		return len(m.byToken[volume]) > 0
-	case VolumeMatchSuffix:
-		for _, l := range m.lengths {
-			if l > len(volume) {
-				break
-			}
-			if len(m.byToken[volume[len(volume)-l:]]) > 0 {
-				return true
-			}
+	for _, l := range m.lengths {
+		if l > len(volume) {
+			break
 		}
-		return false
-	case VolumeMatchContains:
-		for _, t := range m.tokens {
-			if t != "" && strings.Contains(volume, t) {
-				return true
-			}
+		if len(m.byToken[volume[len(volume)-l:]]) > 0 {
+			return true
 		}
-		return false
-	case VolumeMatchRegex:
-		for _, re := range m.res {
-			if re != nil && re.MatchString(volume) {
-				return true
-			}
-		}
-		return false
 	}
 	return false
 }

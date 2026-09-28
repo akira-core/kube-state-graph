@@ -69,7 +69,7 @@ func TestEngine_EndAlignDefaultsOn(t *testing.T) {
 			require.NoError(t, err)
 			_, err = eng.BuildStorageFromValues(t.Context(), url.Values{
 				"start": unalignedWindow["start"], "end": unalignedWindow["end"],
-				"az": {"zone-a"}, "env": {"prod"},
+				"az": {"zone-a"}, "env": {"prod"}, "aggr": {"aggr1"},
 			})
 			require.NoError(t, err)
 

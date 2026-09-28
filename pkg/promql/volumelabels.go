@@ -221,3 +221,25 @@ func RenderVolumeLabelsTokenScoped(window time.Duration, keys LabelKeys, sel Sel
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
 }
+
+// RenderVolumeLabelsByNode renders the volume-label family restricted on the
+// ONTAP controller name (`node`):
+//
+//	last_over_time(volume_labels{az="zone-a",node=~"na-01|na-02"}[5m])
+//
+// An ontap_node seed reads every aggregate that names one of those
+// controllers. The label is the stock Harvest `node` label, the same spelling
+// as a Kubernetes node and a different identity. Request matchers — az and
+// env, the only ones queryDims grants Harvest — precede the scope.
+//
+// ok is false when nodes holds no non-empty value. The caller MUST skip the
+// query rather than fall back to an unscoped read.
+func RenderVolumeLabelsByNode(window time.Duration, keys LabelKeys, sel Selector, nodes []string) (string, bool) {
+	vals := normaliseValues(nodes)
+	if len(vals) == 0 {
+		return "", false
+	}
+	matchers := appendMatcher(requestMatchers(QVolumeLabels, keys, sel), NodeLabel, vals)
+	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
+		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
+}
