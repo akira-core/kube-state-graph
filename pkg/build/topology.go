@@ -692,7 +692,7 @@ func readTopology(
 		})
 	}
 	if plan.byReference {
-		var recovered []string
+		var recovered []podSeriesKey
 		if len(plan.applicationRoots) > 0 {
 			g.Go(signalWhenDone(signalWhenDone(func() error {
 				names, err := readScopedApplications(ctx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
@@ -702,7 +702,7 @@ func readTopology(
 		}
 		podsDone := make(chan struct{})
 		g.Go(signalWhenDone(func() error {
-			return readScopedPods(ctx, q, window, end, opts, sel, plan.podRoots, plan.applicationRoots, &v, &scopeMu,
+			return readScopedPods(ctx, q, window, end, opts, sel, plan.pods, plan.applicationRoots, &v, &scopeMu,
 				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
 		}, podsDone))
 		g.Go(func() error {

@@ -116,7 +116,7 @@ type topologyPlan struct {
 	skip map[promql.Query]bool
 	// byReference reads every promql.ReferenceScopedQueries family BY
 	// REFERENCE instead of in the first wave: kube_pod_info / kube_pod_owner
-	// restricted to the pods a claim-binding series names plus podRoots
+	// restricted to the pods a claim-binding series names plus the pod roots
 	// (readScopedPods); the four kube_node_* families restricted to those
 	// pods' nodes plus nodeRoots (readScopedNodes); and the eight
 	// controller-owner / controller-annotation families restricted to those
@@ -126,14 +126,10 @@ type topologyPlan struct {
 	// unrestricted pod read would derive a scope from the whole estate.
 	// False reads every one of them unscoped, in the first wave.
 	byReference bool
-	// podRoots are the pod-name segments of the request's pod=<ns>/<name>
-	// roots, sorted. A pod root mounting no claim is drawable only if its pod
-	// is read, so the roots must reach the scope.
-	podRoots []string
 	// nodeRoots are the request's node=<name> roots, sorted. A node root
 	// naming a Kubernetes node no loaded pod runs on is drawable only if the
 	// node families are read for it, so the roots must reach the node scope
-	// exactly as podRoots reaches the pod scope.
+	// exactly as the pod roots reach the pod scope.
 	nodeRoots []string
 	// volumeClusters, volumeAggrs and volumeSVMs are the request's
 	// ontap_cluster=, aggr= and svm= roots, sorted and de-duplicated. harvestSeed
@@ -239,12 +235,8 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 	case graph.StorageRootNode:
 		plan.nodeRoots = sortedNames(roots.Names)
 	case graph.StorageRootPod:
-		names := make([]string, 0, len(roots.Pods))
-		for _, ref := range roots.Pods {
-			names = append(names, ref.Name)
-		}
-		slices.Sort(names)
-		plan.podRoots = names
+		// plan.pods carries the (namespace, pod) refs the pod seed and the pod
+		// wave read; nothing more to derive.
 	case graph.StorageRootApplication:
 		plan.applicationRoots = sortedNames(roots.Names)
 	}

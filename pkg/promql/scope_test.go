@@ -237,15 +237,56 @@ func TestRenderPodInfoByNode(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestRenderClaimBindingsByPodName(t *testing.T) {
+func TestRenderPodsInNamespace(t *testing.T) {
 	t.Parallel()
-	got, ok := RenderClaimBindingsByPodName(time.Minute, LabelKeys{}, Selector{}, []string{"web-0", "orders-0"})
+
+	for _, q := range PodNamespaceScopedQueries {
+		got, ok := RenderPodsInNamespace(q, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"web-0", "orders-0", "web-0"})
+		require.True(t, ok, q)
+		assert.Equal(t,
+			`last_over_time(`+string(q)+`{namespace="shop",pod=~"orders-0|web-0"}[1m])`,
+			got, "one namespace as an equality, its pods as the alternation")
+	}
+
+	one, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"orders-0"})
+	require.True(t, ok)
+	assert.Equal(t, `last_over_time(kube_pod_info{namespace="shop",pod="orders-0"}[1m])`, one)
+
+	sel, ok := RenderPodsInNamespace(QPodOwner, time.Minute, LabelKeys{}, Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop", "platform"},
+	}, "shop", []string{"orders-0"})
 	require.True(t, ok)
 	assert.Equal(t,
-		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{pod=~"orders-0|web-0"}[1m])`,
-		got)
-	_, ok = RenderClaimBindingsByPodName(time.Minute, LabelKeys{}, Selector{}, nil)
+		`last_over_time(kube_pod_owner{az="zone-a",env="prod",cluster="c1",namespace=~"platform|shop",namespace="shop",pod="orders-0"}[1m])`,
+		sel, "the request matchers come first and are composed with the pair, never replaced")
+
+	meta, ok := RenderPodsInNamespace(QPVCBindings, time.Minute, LabelKeys{}, Selector{}, `shop"a`, []string{`web.0`, "z"})
+	require.True(t, ok)
+	assert.Equal(t,
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{namespace="shop\"a",pod=~"web\\.0|z"}[1m])`,
+		meta)
+
+	empty, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "", []string{"orders-0"})
+	require.True(t, ok)
+	assert.Equal(t, `last_over_time(kube_pod_info{namespace="",pod="orders-0"}[1m])`, empty,
+		"the namespace equality is always rendered, so a query never spans namespaces")
+
+	_, ok = RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", nil)
 	assert.False(t, ok)
+	_, ok = RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{""})
+	assert.False(t, ok)
+	_, ok = RenderPodsInNamespace(QNodeInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"orders-0"})
+	assert.False(t, ok, "a family not keyed by (namespace, pod) is refused")
+}
+
+func TestNamespaceEqualityCost(t *testing.T) {
+	t.Parallel()
+	got, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, `sh"op`, []string{"p"})
+	require.True(t, ok)
+	pair := `namespace="sh\"op",`
+	require.Contains(t, got, pair)
+	assert.Equal(t, len(pair), NamespaceEqualityCost(`sh"op`),
+		"the cost is the rendered equality plus its separator, escaping included")
 }
 
 func TestRenderClaimBindingsByPod(t *testing.T) {

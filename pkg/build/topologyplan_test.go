@@ -35,7 +35,6 @@ func TestTopologyPlans(t *testing.T) {
 	require.NoError(t, err)
 	p := storagePlan(scope.Roots)
 	assert.True(t, p.byReference)
-	assert.Equal(t, []string{"x", "x", "y"}, p.podRoots, "root names are sorted: map order must not reach the scope")
 	nodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"n1"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"n1"}, storagePlan(nodeScope.Roots).nodeRoots)

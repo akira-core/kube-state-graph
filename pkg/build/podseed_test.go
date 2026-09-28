@@ -53,10 +53,12 @@ func TestPodSeed_ReadsBindingsByReference(t *testing.T) {
 		assert.True(t, restricted, "every binding query is restricted: %s", query)
 	}
 
-	info := q.QueriesFor(promql.QPodInfo)
-	require.NotEmpty(t, info)
-	assert.Contains(t, info[0], `pod=~"orders-0|redis-0"`)
-	assert.NotContains(t, info[0], "catalog-0")
+	// The pod wave reads the roots by (namespace, pod), one query per namespace,
+	// so neither cross pair (shop/redis-0, platform/orders-0) is fetched.
+	assert.ElementsMatch(t, []string{
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="platform",pod="redis-0"}[1m])`,
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="orders-0"}[1m])`,
+	}, q.QueriesFor(promql.QPodInfo))
 }
 
 // Spec: "Claimless pod root is still drawn", kept identical to an unrestricted

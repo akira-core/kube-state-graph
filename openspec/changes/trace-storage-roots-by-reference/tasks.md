@@ -96,6 +96,14 @@
   - the per-family tally sums every read of a family and omits unissued families;
   - `go test -race ./pkg/build/` passes.
 - [x] 5.6 Update `docs/upstream-metrics.md` (per-kind read plan and leg counts) and the storage-build bullets of `CLAUDE.md` (replace the hub-mode, rooted volume-label and pod-namespace-derivation text with seed + expansion + completions). Verify `grep -n "hub mode\|hub-mode\|deriveStorageNamespaces" CLAUDE.md docs` returns nothing.
+- [x] 5.7 Key every read of known pods by `(namespace, pod)`, one query per namespace (D15):
+  - add `promql.RenderPodsInNamespace` and `NamespaceEqualityCost`;
+  - the pod wave scopes on the bindings' `(namespace, pod)`, the pod roots' refs and the recovered pods;
+  - the node seed's incarnation completion and bindings-by-pod read, and the application seed's bindings-by-pod read, are keyed the same way;
+  - the application seed keeps bindings only for a recovered `(cluster, namespace, pod)`;
+  - `RenderClaimBindingsByPodName`, `keepNamedPodBindings` and the plan's name-only `podRoots` are deleted.
+
+  Verify `pkg/build/podnamespace_test.go`: a same-named pod in another namespace is never read by the pod wave, never widens the node or controller read, is never read by a node seed, and contributes no claim to an application root. Also verify the parity harness and `go test -race ./pkg/build/ ./pkg/promql/`.
 
 ## 6. Fan-out pins
 

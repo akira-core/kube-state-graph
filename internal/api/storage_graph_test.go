@@ -125,9 +125,10 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 	assert.NotContains(t, seen, "up", "no retention probe on a filtered build")
 }
 
-// A pod root reads kube_pod_info for the root names and does not derive a
-// namespace matcher onto the controller wave. Harvest is read only for the
-// claims the roots mount; this fixture mounts none.
+// A pod root reads kube_pod_info for the root (namespace, pod) pairs, one query
+// per namespace, and does not derive a namespace matcher onto the controller
+// wave. Harvest is read only for the claims the roots mount; this fixture
+// mounts none.
 func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 	q, captured := recordingQuerierWith(t, map[string]model.Vector{
 		"kube_pod_owner": {&model.Sample{Metric: model.Metric{
@@ -145,9 +146,12 @@ func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	seen := captured()
-	assert.Equal(t,
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",pod=~"orders-0|redis-0"}[1h])`,
-		seen["kube_pod_info"])
+	// The recorder keeps the last query per family, and the two namespaces'
+	// queries run concurrently, so either may be the one kept.
+	assert.Contains(t, []string{
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="platform",pod="redis-0"}[1h])`,
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="orders-0"}[1h])`,
+	}, seen["kube_pod_info"], "each namespace's pods are read by their own query")
 	assert.Equal(t,
 		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
 		seen["ALERTS"])

@@ -52,10 +52,11 @@ func annotationRecoveryFamilies() []annotationRecovery {
 	}
 }
 
-// readScopedApplications recovers pod names owned by controllers whose
-// tracking-id names a root Application. It returns names only: the pods are
-// read by the existing by-reference waves, and the projection decides which
-// of them are roots. An empty root set returns no names and issues nothing.
+// readScopedApplications recovers the pods owned by controllers whose
+// tracking-id names a root Application, as the (cluster, namespace, pod) their
+// kube_pod_owner rows carry. It returns identities only: the pods are read by
+// the existing by-reference waves, and the projection decides which of them are
+// roots. An empty root set returns nothing and issues nothing.
 func readScopedApplications(
 	ctx context.Context,
 	q promql.Querier,
@@ -66,7 +67,7 @@ func readScopedApplications(
 	roots []string,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
-) ([]string, error) {
+) ([]podSeriesKey, error) {
 	roots = sortedNames(roots)
 	if len(roots) == 0 {
 		return nil, nil
@@ -176,28 +177,26 @@ func readScopedApplications(
 			},
 		})
 	}
-	var pods []string
+	var owned model.Vector
 	if len(stage3) > 0 {
 		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, stage3); err != nil {
 			return nil, err
 		}
 		for _, dst := range podVecs {
 			addExtraSeries(v, scopeMu, promql.QPodOwner, len(*dst))
-			for _, s := range *dst {
-				if p := string(s.Metric[promql.PodLabel]); p != "" {
-					pods = append(pods, p)
-				}
-			}
+			owned = append(owned, *dst...)
 		}
 	}
-	pods = sortedNames(pods)
+	pods := podKeysOf(owned)
 	if err := readApplicationBindings(ctx, q, window, end, opts, sel, pods, roots, v, scopeMu); err != nil {
 		return nil, err
 	}
 	return pods, nil
 }
 
-// readApplicationBindings reads claim bindings for the recovered pods, unions
+// readApplicationBindings reads claim bindings for the recovered pods — by
+// (namespace, pod), kept only for a recovered (cluster, namespace, pod), so a
+// same-named pod elsewhere contributes no claim — unions
 // the claims an annotation row names with a root Application, and re-reads
 // bindings by claim so every mounter of that set is loaded. An empty set
 // issues no binding query.
@@ -208,21 +207,23 @@ func readApplicationBindings(
 	end time.Time,
 	opts Options,
 	sel promql.Selector,
-	pods, roots []string,
+	pods []podSeriesKey,
+	roots []string,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
 ) error {
 	ann := annotatedClaimKeys(v.PVCAnnotations, roots)
 	var tracked model.Vector
 	if len(pods) > 0 {
-		byPod, err := queryRendered(ctx, q, end, opts, promql.QPVCBindings, pods, func(chunk []string) (string, bool) {
-			return promql.RenderClaimBindingsByPodName(window, opts.LabelKeys, sel, chunk)
-		})
+		byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(pods))
 		if err != nil {
 			return err
 		}
-		markScopeIssued(v, scopeMu, promql.QPVCBindings)
-		tracked = keepNamedPodBindings(byPod, pods)
+		recovered := make(map[podSeriesKey]struct{}, len(pods))
+		for _, k := range pods {
+			recovered[k] = struct{}{}
+		}
+		tracked = keepPodBindings(byPod, recovered)
 	}
 	keys := claimKeysOf(tracked)
 	for k := range ann {
@@ -266,22 +267,6 @@ func annotatedClaimKeys(rows model.Vector, roots []string) map[claimSeriesKey]st
 			namespace: string(s.Metric["namespace"]),
 			claim:     claim,
 		}] = struct{}{}
-	}
-	return out
-}
-
-func keepNamedPodBindings(rows model.Vector, pods []string) model.Vector {
-	keep := make(map[string]struct{}, len(pods))
-	for _, pod := range pods {
-		if pod != "" {
-			keep[pod] = struct{}{}
-		}
-	}
-	var out model.Vector
-	for _, s := range rows {
-		if _, ok := keep[string(s.Metric[promql.PodLabel])]; ok && bindingClaim(s.Metric) != "" {
-			out = append(out, s)
-		}
 	}
 	return out
 }

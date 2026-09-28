@@ -19,9 +19,9 @@ import (
 // of a tracked claim is loaded: the split weight and an inherited Application
 // are computed over the same mounters an unrestricted read sees.
 //
-// kube_pod_info for the roots is the pod wave that follows. podScope adds
-// podRoots, so a claimless root is still read, and that read is the flowless
-// one.
+// kube_pod_info for the roots is the pod wave that follows. readScopedPods
+// adds the pod roots to its (namespace, pod) scope, so a claimless root is
+// still read, and that read is the flowless one.
 func readPodSeed(
 	ctx context.Context,
 	q promql.Querier,

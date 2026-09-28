@@ -90,7 +90,7 @@ The storage build SHALL reach the claims a request can retain by walking from it
 
 **Storage-side kinds.** `ontap_cluster` reads `volume_labels` restricted on `cluster` to the root values; `aggr` restricted on `aggr`; `svm` restricted on `svm`. `ontap_node` reads `volume_labels` restricted on `node` to the root values, then reads WHOLE every `(ONTAP cluster, aggregate)` pair those rows name. Only the aggregates whose owning controller the vote resolves to a root value contribute claims: the vote picks one of the aggregate's own `node` values, so every aggregate a root controller owns has a row naming it and is found by the first read. For each of the four kinds, the build SHALL derive **candidate PersistentVolume names** from the `volume` label of every contributing row: for every position at which the value continues with `pvc_` and which is the start of the value or follows a `_`, the remainder of the value from that position with every `_` replaced by `-` is one candidate; candidates are sorted and de-duplicated. It SHALL then read `kube_persistentvolumeclaim_info` restricted on `volumename` to the candidates, and the claims that read returns are the tracked set. Candidate extraction is a **generator, never a judge**: a candidate naming no PersistentVolume loads nothing, and whether a loaded claim lands on a FlexVol — and on which aggregate, SVM and controller — SHALL be decided solely by the forward derivation and join of the `netapp-storage-graph` capability, exactly as on `/v1/graph`. The rewrite rules SHALL NOT change the extraction, so a custom rule set can make a storage root find fewer claims, never a wrong one.
 
-**Kubernetes node.** `node` reads `kube_pod_info` restricted on `node` to the root values, then reads `kube_pod_info` again restricted on `pod` to the names the first read returned, WITHOUT the node restriction (**incarnation completion**): a pod's node is its newest incarnation's, so a pod name recreated on another node inside the window SHALL be placed where an unrestricted read places it. It then reads the claim-binding family restricted on `pod` to the pods whose newest incarnation runs on a root node, keeping only rows whose `(cluster, namespace, pod)` names such a pod. The claims those rows bind are the tracked set.
+**Kubernetes node.** `node` reads `kube_pod_info` restricted on `node` to the root values, then reads `kube_pod_info` again restricted to the `(namespace, pod)` pairs the first read returned, WITHOUT the node restriction (**incarnation completion**): a pod's node is its newest incarnation's, so a pod name recreated on another node inside the window SHALL be placed where an unrestricted read places it. It then reads the claim-binding family restricted to the `(namespace, pod)` pairs of the pods whose newest incarnation runs on a root node, keeping only rows whose `(cluster, namespace, pod)` names such a pod. The claims those rows bind are the tracked set. Both reads are keyed by `(namespace, pod)` as "Storage build reads every family by reference" requires of every read of known pods.
 
 **Pod.** `pod` reads the claim-binding family restricted on `namespace` and `pod` to the roots, keeping only rows whose `(namespace, pod)` is a root ref, and reads `kube_pod_info` restricted to the root names. The claims those rows bind are the tracked set.
 
@@ -141,7 +141,12 @@ The storage build SHALL reach the claims a request can retain by walking from it
 #### Scenario: A Kubernetes node root reads pods by node
 
 - **WHEN** a client sends `?az=zone-a&env=prod&node=worker-1` against an estate of 40000 pods, of which `orders-0` and `web-0` run on `worker-1`
-- **THEN** the first `kube_pod_info` query is restricted to `node="worker-1"`, the incarnation-completion query to `pod=~"orders-0|web-0"`, the claim-binding query to the same two names, and no other pod's binding is fetched
+- **THEN** the first `kube_pod_info` query is restricted to `node="worker-1"`, the incarnation-completion query to `namespace="shop",pod=~"orders-0|web-0"` (both pods run in `shop`), the claim-binding query to the same pairs, and no other pod's binding is fetched
+
+#### Scenario: A Kubernetes node root never reads a same-named pod elsewhere
+
+- **WHEN** a client sends `?az=zone-a&env=prod&node=worker-1`, `shop/web-0` runs on `worker-1`, and `platform/web-0` runs on `worker-2`
+- **THEN** incarnation completion and the claim-binding read carry `namespace="shop",pod="web-0"`, `platform/web-0` and its claims are never fetched, and the body is byte-identical to the body an unrestricted read produces
 
 #### Scenario: A pod rescheduled inside the window follows its newest incarnation
 
@@ -253,7 +258,7 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 
 A by-reference restriction SHALL be a sorted, de-duplicated, anchored alternation on the family's own identity label, **composed with** the family's fixed, request-invariant selector where it has one and with the request-scoped matchers the family already carries — never replacing either. A family keyed by an `(ONTAP cluster, name)` pair SHALL be issued one query per ONTAP cluster, with that cluster as an equality and its names as the alternation, so no row outside the key set is read. Every restriction SHALL be chunked deterministically under one byte budget shared by every data-derived alternation, one query per chunk per family, results merged in chunk order, each chunk issued under the bare family name for self-metrics and span dimensions, and a single value SHALL always be issued even when it alone exceeds the budget. A by-reference family whose scope is empty SHALL NOT be issued and SHALL be absent from the build's per-family series tally; an issued family's entry is the total count of series its restrictions matched across every read of the build. A chunk error of any of these families SHALL fail the build, as "Storage build fails closed on upstream query errors" requires. Caller-originated cancellation SHALL fail the request whatever the family.
 
-**Pods.** `kube_pod_info` and `kube_pod_owner` SHALL be read restricted on `pod` to the mounters of the tracked claims, the `pod` roots, the pods a `node` root placed on a root node, and the pods an `application` root recovered. A `pod` root that mounts no claim, and every recovered pod that resolves a root Application, SHALL still be materialised.
+**Pods.** A pod is identified by its namespace and name, never by its name alone. `kube_pod_info` and `kube_pod_owner` SHALL be read restricted to the `(namespace, pod)` pairs of the mounters of the tracked claims, the `pod` roots, the pods a `node` root placed on a root node, and the pods an `application` root recovered: one query per namespace, carrying that namespace as an equality and its pod names as the alternation, so no pair outside the set is read and a same-named pod in another namespace — with its node and its controllers, which the next waves scope from what this read returns — is never fetched. The same pair keying SHALL apply to every other read of known pods: the `node` root's incarnation completion and claim-binding read, and the `application` root's claim-binding read. A `pod` root that mounts no claim, and every recovered pod that resolves a root Application, SHALL still be materialised.
 
 **Kubernetes nodes.** `kube_node_info`, `kube_node_status_addresses`, `kube_node_labels` and `kube_node_status_condition` SHALL be read restricted on `node` to the nodes of the loaded pods and the `node` roots. An unscheduled pod contributes no name.
 
@@ -311,7 +316,17 @@ So the body SHALL be byte-identical to the body an unrestricted read would produ
 #### Scenario: Cross-namespace name collision is harmless
 
 - **WHEN** claim-binding series name `shop/web-0` and the estate also holds a claimless `platform/web-0`
-- **THEN** `platform/web-0` may be fetched but does not appear in the body, which is byte-identical to the body an unrestricted pod read would produce
+- **THEN** the pod read carries `namespace="shop",pod="web-0"`, `platform/web-0` is never fetched, and the body is byte-identical to the body an unrestricted pod read would produce
+
+#### Scenario: Pods are read one query per namespace
+
+- **WHEN** the pods to read are `shop/orders-0`, `shop/web-0` and `platform/orders-0`
+- **THEN** `kube_pod_info` and `kube_pod_owner` are each issued as `{namespace="platform",pod="orders-0"}` and `{namespace="shop",pod=~"orders-0|web-0"}` beside the request matchers, `platform/web-0` is never read, and the merged vector follows namespace order
+
+#### Scenario: A same-named pod in another namespace never widens the node or controller read
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/postgres-0` and `platform/postgres-0`, owned by StatefulSet `pg-other`, runs on `worker-9`
+- **THEN** no `kube_pod_info` or `kube_pod_owner` query admits `platform/postgres-0`, no Kubernetes-node query names `worker-9`, and no controller query names `pg-other`
 
 #### Scenario: A pod chunk failure fails the build
 
@@ -370,7 +385,7 @@ When a `/v1/storage-graph` request's root kind is `application`, the build SHALL
 - the pods owned by a controller whose ArgoCD tracking-id names one of the root Applications, recovered in the three stages below;
 - the claims carrying a root Application of their own, read from `kube_persistentvolumeclaim_annotations` restricted on `annotation_argocd_argoproj_io_tracking_id` exactly as stage 1 restricts the controller families.
 
-The claim-binding family SHALL be read restricted on `pod` to the recovered pods, and the claims those rows bind, together with the own-annotated claims, SHALL form the tracked claim set of "Every root kind is tracked from its own tier to its claims". Every mounter of a tracked claim is then loaded by the mounter completion of "The tracked claims expand to both ends of the chain".
+The claim-binding family SHALL be read restricted to the recovered pods' `(namespace, pod)` pairs — the namespace the recovering `kube_pod_owner` row carries, one query per namespace — keeping only rows whose `(cluster, namespace, pod)` is a recovered pod, so a same-named pod elsewhere contributes no claim. The claims those rows bind, together with the own-annotated claims, SHALL form the tracked claim set of "Every root kind is tracked from its own tier to its claims". Every mounter of a tracked claim is then loaded by the mounter completion of "The tracked claims expand to both ends of the chain".
 
 The recovery is a **candidate generator, never a judge**: a recovered pod is read exactly like any other scoped pod, its Application is resolved by the same controller-annotation rules every pod's is, and whether it is a root is decided solely by the projection over that resolved value. A recovered pod whose resolved Application is not a root value — a controller whose lexically-smallest tracking-id in the window names a different Application — is loaded and then dropped, so the body is a pure function of the forward resolution and never of the recovery.
 
@@ -426,7 +441,12 @@ An empty stage yields nothing downstream. When no controller and no claim carrie
 #### Scenario: Only the recovered pods' bindings are read
 
 - **WHEN** a client sends `?application=checkout`, the recovery returns `orders-0`, and the estate also holds pods `catalog-0` (claim `catalog-data`, unannotated, mounted by nobody else) and `ledger-0` (claim `ledger-data`, own-annotated `billing:…`)
-- **THEN** the claim-binding query by pod is restricted to `{orders-0}`, `catalog-0` and `ledger-0` are never read, and the body is byte-identical to the body an unrestricted read produces
+- **THEN** the claim-binding query by pod is restricted to `namespace="shop",pod="orders-0"`, `catalog-0` and `ledger-0` are never read, and the body is byte-identical to the body an unrestricted read produces
+
+#### Scenario: A same-named pod in another namespace contributes no claim
+
+- **WHEN** a client sends `?application=checkout`, the recovery returns `shop/web-0`, and `platform/web-0`, owned by a controller carrying no root Application, mounts claim `platform/platform-data`
+- **THEN** the claim-binding query by pod carries `namespace="shop",pod="web-0"`, `platform-data` is never tracked, and no claim-side, pod, node or Harvest query is issued on its account
 
 #### Scenario: Every mounter of a tracked claim is read
 

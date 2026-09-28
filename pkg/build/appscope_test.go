@@ -24,7 +24,11 @@ func recoverNames(t *testing.T, f promql.Querier, opts Options, sel promql.Selec
 	t.Helper()
 	v := &topologyVectors{}
 	var mu sync.Mutex
-	names, err := readScopedApplications(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
+	keys, err := readScopedApplications(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), opts, sel, roots, v, &mu)
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		names = append(names, k.pod)
+	}
 	return names, v, err
 }
 
@@ -404,7 +408,7 @@ func TestReadScopedPods_WaitsOnRecoveryAndPVCAnnotations(t *testing.T) {
 	close(bindingsDone)
 	appDone := make(chan struct{})
 	pvcDone := make(chan struct{})
-	var recovered []string
+	var recovered []podSeriesKey
 	errCh := make(chan error, 1)
 	go func() {
 		v := &topologyVectors{PVC: model.Vector{podBinding("orders-0")}}
@@ -415,7 +419,7 @@ func TestReadScopedPods_WaitsOnRecoveryAndPVCAnnotations(t *testing.T) {
 
 	assert.Never(t, func() bool { return len(f.QueriesFor(promql.QPodInfo)) > 0 }, 80*time.Millisecond, 10*time.Millisecond,
 		"the pod read waits for the recovery")
-	recovered = []string{"orders-0"}
+	recovered = []podSeriesKey{{cluster: "c1", namespace: "shop", pod: "orders-0"}}
 	close(appDone)
 	assert.Never(t, func() bool { return len(f.QueriesFor(promql.QPodInfo)) > 0 }, 80*time.Millisecond, 10*time.Millisecond,
 		"the pod read also waits for pvc annotations")
@@ -439,7 +443,7 @@ func TestReadScopedPods_UnrelatedBindingPodsNotRead(t *testing.T) {
 	}}
 	done := make(chan struct{})
 	close(done)
-	recovered := []string{"orders-0"}
+	recovered := []podSeriesKey{{cluster: "c1", namespace: "shop", pod: "orders-0"}}
 	var mu sync.Mutex
 	err := readScopedPods(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(), Options{}, storageSel,
 		nil, []string{"checkout"}, v, &mu, done, done, done, &recovered)

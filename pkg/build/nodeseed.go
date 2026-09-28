@@ -18,13 +18,14 @@ type podSeriesKey struct {
 }
 
 // readNodeSeed is the Kubernetes node root's seed. It reads kube_pod_info
-// restricted on the root nodes, then again restricted on pod name without the
-// node matcher (incarnation completion), and keeps a pod only when its newest
-// incarnation still runs on a root node. Claim bindings are read for those pod
-// names and filtered to the kept (cluster, namespace, pod) keys. Bindings are
-// then re-read by claim so every mounter of a tracked claim is loaded — the
-// split weight and an inherited Application are computed over the same mounters
-// an unrestricted read sees.
+// restricted on the root nodes, then again restricted on the (namespace, pod)
+// pairs that read returned, without the node matcher (incarnation completion),
+// and keeps a pod only when its newest incarnation still runs on a root node.
+// Claim bindings are read for those (namespace, pod) pairs and filtered to the
+// kept (cluster, namespace, pod) keys. Bindings are then re-read by claim so
+// every mounter of a tracked claim is loaded — the split weight and an
+// inherited Application are computed over the same mounters an unrestricted
+// read sees.
 func readNodeSeed(
 	ctx context.Context,
 	q promql.Querier,
@@ -46,13 +47,13 @@ func readNodeSeed(
 		// later pod wave overwrites v.Pod when it loads the kept pods.
 		markScopeIssued(v, scopeMu, promql.QPodInfo)
 	}
-	names := podNamesOf(onNode)
-	if len(names) == 0 {
+	onNodeRefs := podRefsOf(onNode)
+	if len(onNodeRefs) == 0 {
 		return nil
 	}
-	incarnation, err := queryRendered(ctx, q, end, opts, promql.QPodInfo, names, func(chunk []string) (string, bool) {
-		return promql.RenderScoped(promql.QPodInfo, window, opts.LabelKeys, sel, chunk)
-	})
+	// The node read returned each pod's namespace, so incarnation completion
+	// re-reads exactly those (namespace, pod) pairs, without the node matcher.
+	incarnation, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPodInfo, onNodeRefs)
 	if err != nil {
 		return err
 	}
@@ -60,15 +61,11 @@ func readNodeSeed(
 	if len(onRoot) == 0 {
 		return nil
 	}
-	podScope := make([]string, 0, len(onRoot))
+	rootKeys := make([]podSeriesKey, 0, len(onRoot))
 	for k := range onRoot {
-		podScope = append(podScope, k.pod)
+		rootKeys = append(rootKeys, k)
 	}
-	slices.Sort(podScope)
-	podScope = slices.Compact(podScope)
-	byPod, err := queryRendered(ctx, q, end, opts, promql.QPVCBindings, podScope, func(chunk []string) (string, bool) {
-		return promql.RenderClaimBindingsByPodName(window, opts.LabelKeys, sel, chunk)
-	})
+	byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(rootKeys))
 	if err != nil {
 		return err
 	}
@@ -90,17 +87,6 @@ func readNodeSeed(
 	}
 	v.PVC = keepClaimBindings(v.PVC, claimKeysOf(tracked))
 	return nil
-}
-
-func podNamesOf(rows model.Vector) []string {
-	names := make([]string, 0, len(rows))
-	for _, s := range rows {
-		if name := string(s.Metric[promql.PodLabel]); name != "" {
-			names = append(names, name)
-		}
-	}
-	slices.Sort(names)
-	return slices.Compact(names)
 }
 
 // podsNewestOn returns the pods whose newest incarnation runs on a root node.
@@ -218,33 +204,6 @@ func keepClaimBindings(rows model.Vector, claims map[claimSeriesKey]struct{}) mo
 		}
 	}
 	return out
-}
-
-// queryRendered chunks values and issues one rendered query per chunk, merged
-// in chunk order. It does not mark the family issued: the caller decides what
-// lands in the topology vectors.
-func queryRendered(
-	ctx context.Context,
-	q promql.Querier,
-	end time.Time,
-	opts Options,
-	name promql.Query,
-	values []string,
-	render func(chunk []string) (string, bool),
-) (model.Vector, error) {
-	budget := opts.qosScopeBatchBytes()
-	if budget < 1 {
-		budget = 1
-	}
-	var rendered []string
-	for _, chunk := range promql.ChunkScope(values, budget) {
-		query, ok := render(chunk)
-		if !ok {
-			continue
-		}
-		rendered = append(rendered, query)
-	}
-	return instantAll(ctx, q, name, end, rendered)
 }
 
 func instantAll(ctx context.Context, q promql.Querier, name promql.Query, end time.Time, queries []string) (model.Vector, error) {

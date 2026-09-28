@@ -87,9 +87,9 @@ Each hop is one scoped family read rendered like `promql.RenderScoped` (fixed se
 | `aggr` | `volume_labels{aggr=~A}` (each aggregate whole) | same | `aggr_*{aggr=~A}` |
 | `svm` | `volume_labels{svm=~S}` → owner completion ① | same | none (an SVM exists only in `volume_labels`) |
 | `ontap_node` | `volume_labels{node=~N}` → every touched `(cluster, aggr)` re-read whole (①) | rows of aggregates whose `pickOwner` ∈ N | `node_*{node=~N}` |
-| `node` | `kube_pod_info{node=~N}` → incarnation completion ② → `bindings{pod}` for pods whose canonical node ∈ N | `bindings{pod}` → `pvc_info{claim}` | `kube_node_*{node=~N}` |
+| `node` | `kube_pod_info{node=~N}` → incarnation completion ② by `(namespace, pod)` → `bindings` by `(namespace, pod)` for pods whose canonical node ∈ N | those bindings → `pvc_info{claim}` | `kube_node_*{node=~N}` |
 | `pod` | `bindings{namespace=~,pod=~}` filtered to the `(namespace, pod)` refs ‖ `kube_pod_info{pod=~}` | same | `kube_pod_info{pod}` (already read) |
-| `application` | recovery (`appscope.go`, three stages) → pods → `bindings{pod}`; ‖ `pvc_annotations{tracking-id=~app}` | union of both halves | none (an Application is never materialised) |
+| `application` | recovery (`appscope.go`, three stages) → `(cluster, namespace, pod)` → `bindings` by `(namespace, pod)`; ‖ `pvc_annotations{tracking-id=~app}` | union of both halves | none (an Application is never materialised) |
 
 **Closure (why the seed never misses a retained claim):**
 
@@ -104,14 +104,14 @@ The pod seed replaces `deriveStorageNamespaces`: it is keyed by `(namespace, pod
 
 Once `C` is known (with each claim's `volumename`), the expansion issues, as dependency edges inside one errgroup rather than as barriers:
 
-- **Claim side.** `pvc_info` (if the seed did not already read it), `pvc_annotations`, kubelet ×2 and **③ mounter completion** `bindings{claim}`, all keyed on `C`. Then `kube_pod_info` + `kube_pod_owner` for EVERY mounter.
+- **Claim side.** `pvc_info` (if the seed did not already read it), `pvc_annotations`, kubelet ×2 and **③ mounter completion** `bindings{claim}`, all keyed on `C`. Then `kube_pod_info` + `kube_pod_owner` for EVERY mounter, by `(namespace, pod)` (D15).
 - **Workload side.** Then `kube_node_*` for the mounters' nodes ∪ `node` roots, and the two controller stages for their owners — the existing waves, now scoped from all mounters.
 - **Storage side.** **④ candidate completion**: `volume_labels{volume=~token}` for `C`, which is the existing phase 2, plus the existing svm-root completion of aggregates only phase 2 named. Then **① owner completion**: every touched aggregate re-read whole. Then `aggr_*{cluster, aggr}` and `node_*{cluster, controller}` for the aggregates and owners reached ∪ the flowless-root reads. In parallel with that, QoS ×6 `{volume}` (existing) and `qos_policy_fixed{cluster, svm}` for the claims' SVMs.
 
 | # | Completion | Preserves | Failure without it |
 |---|---|---|---|
 | ① | owner | `pickOwner` over every row | a takeover aggregate is drawn under the wrong controller |
-| ② | incarnation (`node` seed only — every other pod read is by name) | canonical newest incarnation | a StatefulSet pod rescheduled from N to Y within the window is drawn on N |
+| ② | incarnation (`node` seed only — every other pod read names pods the build already placed) | canonical newest incarnation | a StatefulSet pod rescheduled from N to Y within the window is drawn on N |
 | ③ | mounter | binding needs a loaded pod; weight ÷ built-graph `n`; PVC Application inheritance | a claim with three mounters on three nodes shows its full IO on one node's path, and an unannotated claim inherits the wrong Application |
 | ④ | candidate | `pickAggr` / `pickSVM` over the full candidate set | a clone or a same-named FlexVol on another filer moves a claim onto or off the rooted aggregate |
 
@@ -187,6 +187,27 @@ Alternatives considered:
 
 - *Keep the modes on `/v1/graph` only* — rejected. Two join semantics would let the two endpoints disagree about which aggregate a claim sits on, which the storage body's `aggr` label and the `pvc-to-netapp-aggr` edge must never do.
 - *Reject the storage route under the other modes* — rejected. The operator chose to drop the modes rather than carry a configuration the storage endpoint cannot serve.
+
+### D15. Known pods are read by `(namespace, pod)`, one query per namespace
+
+A pod name is unique within a namespace only. Every read of pods the build already knows is therefore keyed by the `(namespace, pod)` pair and issued as one query per namespace: `{namespace="ns", pod=~"a|b"}` beside the fixed selector and the request matchers (`promql.RenderPodsInNamespace`). That covers:
+
+- the pod wave (mounters, `pod` roots, node-seeded and recovered pods);
+- the `node` seed's incarnation completion;
+- the claim-binding reads of node-seeded and recovered pods.
+
+The namespace of each pair is the one carried by the row that named the pod, so no read is added. That row is a claim binding (a pod mounts only claims of its own namespace), a `pod=` root, a `kube_pod_info{node}` row or a recovering `kube_pod_owner` row.
+
+A pod read keyed by name alone admits every same-named pod in the zone, and nothing filtered those rows:
+
+- the node and controller waves, which scope from what the pod read returns, fetched those pods' nodes and controllers too;
+- the application seed tracked a same-named pod's claims through the whole expansion.
+
+The projection dropped all of it, so the body never changed, but the read grew with how common a pod name is (`postgres-0`, `web-0`). For `pod` roots, the namespace derivation this change removed had hidden the problem.
+
+- *Alternative:* two independent alternations (`namespace=~"a|b",pod=~"x|y"`) plus a row filter — rejected. It reads every cross pair, and a large namespace set repeats a long alternation in every chunk.
+- *Cost:* one query per namespace per family, chunked under the shared byte budget (the namespace equality is charged once per chunk) and issued under `scopeConcurrency`.
+- *Exception:* the `pod` seed keeps its two-alternation binding read with an exact `(namespace, pod)` row filter. Its query count is the request-derived bound of D10, and one query per namespace would reject a root set that merely spans many namespaces. Its cross pairs are limited to the roots' own names and namespaces.
 
 ## Risks / Trade-offs
 

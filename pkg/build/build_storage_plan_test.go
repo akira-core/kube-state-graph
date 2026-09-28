@@ -342,9 +342,9 @@ func TestBuildStorage_PlanIsOutputPreserving(t *testing.T) {
 	}
 }
 
-// A pod name is unique per namespace only, so the name-scoped pod read admits a
-// claimless pod that shares a mounting pod's name. It lies on no drawn path and
-// is not a root, so the body does not change.
+// A pod name is unique per namespace only. The pod read is keyed by
+// (namespace, pod), so a claimless pod sharing a mounting pod's name in another
+// namespace is never read, and the body is the one an unrestricted read draws.
 func TestBuildStorage_CrossNamespaceNameCollisionIsHarmless(t *testing.T) {
 	const (
 		ident    = "zone-a-prod-c1"
@@ -358,7 +358,7 @@ func TestBuildStorage_CrossNamespaceNameCollisionIsHarmless(t *testing.T) {
 		BuildStorage(t.Context(), time.Minute, time.Unix(1, 0).UTC(), sel, roots)
 	require.NoError(t, err)
 
-	assert.Contains(t, g.NodesByID, collider, "its name matches a mounting pod's, so the scoped read fetches it")
+	assert.NotContains(t, g.NodesByID, collider, "a same-named pod in another namespace is not read")
 	assert.NotContains(t, g.NodesByID, bystand, "a pod no binding and no root names is never read")
 
 	body := cytoscape.Serialise(g, graph.ProjectStorage(g, graph.StorageScope{Roots: roots}))
