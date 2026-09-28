@@ -40,8 +40,11 @@ func readPodSeed(
 	}
 	if len(plan.podSeed) > 0 {
 		// Issued even when no root mounts a claim, so the tally records the
-		// family at zero rather than omitting a query that ran.
+		// family at zero rather than omitting a query that ran. v.PVC is
+		// filled by the by-claim read below, so these rows are tallied beside
+		// it.
 		markScopeIssued(v, scopeMu, promql.QPVCBindings)
+		addExtraSeries(v, scopeMu, promql.QPVCBindings, len(rows))
 	}
 	tracked := keepRootBindings(rows, plan.pods)
 	claims := claimNamesOf(tracked)

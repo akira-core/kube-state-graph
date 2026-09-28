@@ -44,8 +44,10 @@ func readNodeSeed(
 	}
 	if len(plan.nodeSeed) > 0 {
 		// The seed read the family even when no pod runs on the root. The
-		// later pod wave overwrites v.Pod when it loads the kept pods.
+		// later pod wave overwrites v.Pod when it loads the kept pods, so the
+		// seed's own rows are tallied beside it.
 		markScopeIssued(v, scopeMu, promql.QPodInfo)
+		addExtraSeries(v, scopeMu, promql.QPodInfo, len(onNode))
 	}
 	onNodeRefs := podRefsOf(onNode)
 	if len(onNodeRefs) == 0 {
@@ -57,6 +59,7 @@ func readNodeSeed(
 	if err != nil {
 		return err
 	}
+	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation))
 	onRoot := podsNewestOn(incarnation, plan.nodeRoots)
 	if len(onRoot) == 0 {
 		return nil
@@ -69,6 +72,9 @@ func readNodeSeed(
 	if err != nil {
 		return err
 	}
+	// v.PVC is filled by the by-claim read below, so these rows are tallied
+	// beside it.
+	addExtraSeries(v, scopeMu, promql.QPVCBindings, len(byPod))
 	// Issued even when it matched nothing, so the tally records the family at
 	// zero rather than omitting a query that ran.
 	markScopeIssued(v, scopeMu, promql.QPVCBindings)

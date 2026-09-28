@@ -220,6 +220,9 @@ func readApplicationBindings(
 		if err != nil {
 			return err
 		}
+		// v.PVC is filled by the by-claim read below, so these rows are
+		// tallied beside it.
+		addExtraSeries(v, scopeMu, promql.QPVCBindings, len(byPod))
 		recovered := make(map[podSeriesKey]struct{}, len(pods))
 		for _, k := range pods {
 			recovered[k] = struct{}{}
