@@ -32,7 +32,8 @@ func readPodSeed(
 	plan topologyPlan,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
-) error {
+) (err error) {
+	defer recoverScopedPanic(ctx, promql.QPVCBindings, &err)
 	rows, err := instantAll(ctx, q, promql.QPVCBindings, end, plan.podSeed)
 	if err != nil {
 		return err

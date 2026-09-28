@@ -143,23 +143,34 @@ func readReachedHarvest(
 		return nil
 	}
 	alreadyControllers := controllersAlreadyRead(plan, v)
-	if err := issueHarvestPairMap(ctx, q, window, end, opts, sel, v, scopeMu,
-		promql.AggrPairQueries, uncoveredAggrPairs(v.VolumeLabels, plan)); err != nil {
-		return err
-	}
-	controllerRows := []model.Vector{
-		v.VolumeLabels, v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal,
-	}
-	if err := issueHarvestPairMap(ctx, q, window, end, opts, sel, v, scopeMu,
-		promql.NetAppNodePairQueries, uncoveredControllerPairs(controllerRows, plan, alreadyControllers)); err != nil {
-		return err
-	}
 	rw := v.VolumeKey
 	if rw == nil {
 		rw = defaultVolumeKeyRewriter()
 	}
-	return issueHarvestPairMap(ctx, q, window, end, opts, sel, v, scopeMu,
-		promql.PolicyPairQueries, svmPairsOfMatched(v.VolumeLabels, v.PVCInfo, rw))
+	// The fixed-policy read depends only on the claims and the volume-label
+	// rows, so it runs beside the aggregate → controller chain instead of
+	// behind it. The two write disjoint vectors.
+	policyPairs := svmPairsOfMatched(v.VolumeLabels, v.PVCInfo, rw)
+	aggrPairs := uncoveredAggrPairs(v.VolumeLabels, plan)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) {
+		defer recoverScopedPanic(gctx, promql.QQoSPolicyFixedMaxIOPS, &err)
+		return issueHarvestPairMap(gctx, q, window, end, opts, sel, v, scopeMu,
+			promql.PolicyPairQueries, policyPairs)
+	})
+	g.Go(func() (err error) {
+		defer recoverScopedPanic(gctx, promql.QAggrStatus, &err)
+		if err := issueHarvestPairMap(gctx, q, window, end, opts, sel, v, scopeMu,
+			promql.AggrPairQueries, aggrPairs); err != nil {
+			return err
+		}
+		controllerRows := []model.Vector{
+			v.VolumeLabels, v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal,
+		}
+		return issueHarvestPairMap(gctx, q, window, end, opts, sel, v, scopeMu,
+			promql.NetAppNodePairQueries, uncoveredControllerPairs(controllerRows, plan, alreadyControllers))
+	})
+	return g.Wait()
 }
 
 func trackedClaimKeys(rows model.Vector, keys promql.LabelKeys) map[hubClaimKey]struct{} {
@@ -258,10 +269,9 @@ func uncoveredControllerPairs(rows []model.Vector, plan topologyPlan, alreadyByN
 	out := map[string][]string{}
 	for _, vec := range rows {
 		for _, s := range vec {
+			// volume_labels and the aggr_* gauges name the ONTAP cluster with
+			// the same label.
 			cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
-			if cluster == "" {
-				cluster = string(s.Metric["cluster"])
-			}
 			node := string(s.Metric["node"])
 			if cluster == "" || node == "" {
 				continue
@@ -291,11 +301,8 @@ func svmPairsOfMatched(volumeLabels, pvcInfo model.Vector, rw *VolumeKeyRewriter
 		return nil
 	}
 	out := map[string][]string{}
-	var hits []int
 	for _, s := range volumeLabels {
-		vol := string(s.Metric[promql.HarvestVolumeLabel])
-		hits = matcher.match(vol, hits)
-		if len(hits) == 0 {
+		if !matcher.any(string(s.Metric[promql.HarvestVolumeLabel])) {
 			continue
 		}
 		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
@@ -348,12 +355,14 @@ func issueHarvestPairMap(
 		if len(chunks) == 0 {
 			continue
 		}
-		wave.Go(func() error {
+		wave.Go(func() (err error) {
+			defer recoverScopedPanic(wctx, fam, &err)
 			parts := make([]model.Vector, len(chunks))
 			partWave, pctx := errgroup.WithContext(wctx)
 			partWave.SetLimit(scopeConcurrency)
 			for i, chunk := range chunks {
-				partWave.Go(func() error {
+				partWave.Go(func() (err error) {
+					defer recoverScopedPanic(pctx, fam, &err)
 					query, ok := promql.RenderHarvestPair(fam, window, opts.LabelKeys, sel, chunk.Cluster, chunk.Names)
 					if !ok {
 						return nil
@@ -376,9 +385,7 @@ func issueHarvestPairMap(
 			scopeMu.Lock()
 			*dst = mergeVolumeLabels(*dst, merged)
 			scopeMu.Unlock()
-			if len(merged) > 0 || len(chunks) > 0 {
-				markScopeIssued(v, scopeMu, fam)
-			}
+			markScopeIssued(v, scopeMu, fam)
 			return nil
 		})
 	}

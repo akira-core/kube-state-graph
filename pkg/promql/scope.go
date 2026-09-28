@@ -222,7 +222,7 @@ const NamespaceLabel = "namespace"
 // ok is false when nodes holds no non-empty value. The caller MUST skip the
 // query rather than fall back to an unscoped read.
 func RenderPodInfoByNode(window time.Duration, keys LabelKeys, sel Selector, nodes []string) (string, bool) {
-	return renderScoped(QPodInfo, window, keys, sel, NodeLabel, nodes)
+	return RenderOnLabel(QPodInfo, window, keys, sel, NodeLabel, nodes)
 }
 
 // RenderClaimBindingsByPodName renders the claim-binding family restricted on
@@ -234,7 +234,7 @@ func RenderPodInfoByNode(window time.Duration, keys LabelKeys, sel Selector, nod
 // same-named pod in another namespace; the caller drops those rows. ok is
 // false when pods holds no non-empty value.
 func RenderClaimBindingsByPodName(window time.Duration, keys LabelKeys, sel Selector, pods []string) (string, bool) {
-	return renderScoped(QPVCBindings, window, keys, sel, PodLabel, pods)
+	return RenderOnLabel(QPVCBindings, window, keys, sel, PodLabel, pods)
 }
 
 // RenderClaimBindingsByPod renders the claim-binding family restricted on
@@ -266,25 +266,4 @@ func RenderClaimBindingsByPod(window time.Duration, keys LabelKeys, sel Selector
 	matchers = appendMatcher(matchers, PodLabel, ps)
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		QPVCBindings, strings.Join(matchers, ","), FormatDuration(window)), true
-}
-
-// renderScoped renders q restricted on one label. ok is false when values
-// holds no non-empty value. q is the caller's to choose: this does not consult
-// scopedLabel, so a family can be restricted on a key other than the one
-// RenderScoped uses.
-func renderScoped(q Query, window time.Duration, keys LabelKeys, sel Selector, label string, values []string) (string, bool) {
-	vals := normaliseValues(values)
-	if len(vals) == 0 {
-		return "", false
-	}
-	var matchers []string
-	if fixed := fixedSelector[q]; fixed != "" {
-		matchers = append(matchers, fixed)
-	}
-	if req := sel.render(queryDims[q], keys); req != "" {
-		matchers = append(matchers, req)
-	}
-	matchers = appendMatcher(matchers, label, vals)
-	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
-		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }

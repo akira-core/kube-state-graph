@@ -35,7 +35,8 @@ func readNodeSeed(
 	plan topologyPlan,
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
-) error {
+) (err error) {
+	defer recoverScopedPanic(ctx, promql.QPodInfo, &err)
 	onNode, err := instantAll(ctx, q, promql.QPodInfo, end, plan.nodeSeed)
 	if err != nil {
 		return err
@@ -71,13 +72,13 @@ func readNodeSeed(
 	if err != nil {
 		return err
 	}
+	// Issued even when it matched nothing, so the tally records the family at
+	// zero rather than omitting a query that ran.
+	markScopeIssued(v, scopeMu, promql.QPVCBindings)
 	tracked := keepPodBindings(byPod, onRoot)
 	claims := claimNamesOf(tracked)
 	if len(claims) == 0 {
 		v.PVC = tracked
-		if len(byPod) > 0 || len(tracked) > 0 {
-			markScopeIssued(v, scopeMu, promql.QPVCBindings)
-		}
 		return nil
 	}
 	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
@@ -106,6 +107,12 @@ func podNamesOf(rows model.Vector) []string {
 // Newest is the greatest timestamp, then the lexically-largest UID, matching
 // parseTopology's canonical pod. A series with no UID is ignored, as the parse
 // ignores it.
+//
+// kube-state-metrics emits several series per UID while a pod is scheduled
+// (the first scrape can carry no node). parseTopology merges a UID's labels
+// and keeps the first non-empty node, so the node here is merged the same way:
+// an empty-node series of the canonical UID never hides the node another
+// series of that UID names.
 func podsNewestOn(rows model.Vector, roots []string) map[podSeriesKey]struct{} {
 	type best struct {
 		ts   model.Time
@@ -130,9 +137,17 @@ func podsNewestOn(rows model.Vector, roots []string) map[podSeriesKey]struct{} {
 		if k.pod == "" {
 			continue
 		}
+		node := string(s.Metric["node"])
 		cur, ok := canon[k]
-		if !ok || s.Timestamp > cur.ts || (s.Timestamp == cur.ts && uid > cur.uid) {
-			canon[k] = best{ts: s.Timestamp, uid: uid, node: string(s.Metric["node"])}
+		switch {
+		case !ok || s.Timestamp > cur.ts || (s.Timestamp == cur.ts && uid > cur.uid):
+			if ok && uid == cur.uid && node == "" {
+				node = cur.node
+			}
+			canon[k] = best{ts: s.Timestamp, uid: uid, node: node}
+		case uid == cur.uid && cur.node == "":
+			cur.node = node
+			canon[k] = cur
 		}
 	}
 	out := make(map[podSeriesKey]struct{})
@@ -240,7 +255,8 @@ func instantAll(ctx context.Context, q promql.Querier, name promql.Query, end ti
 	wave, wctx := errgroup.WithContext(ctx)
 	wave.SetLimit(scopeConcurrency)
 	for i, query := range queries {
-		wave.Go(func() error {
+		wave.Go(func() (err error) {
+			defer recoverScopedPanic(wctx, name, &err)
 			out, err := q.Instant(wctx, string(name), query, end)
 			if err != nil {
 				return wrapQueryError(name, err)

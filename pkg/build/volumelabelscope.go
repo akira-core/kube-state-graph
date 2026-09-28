@@ -671,12 +671,14 @@ func issueTokenVolumeLabels(
 // and the parse read the merged result; the caller closes their done-channel
 // when this returns.
 //
-// Under an svm= root it then completes the aggregates phase 2 ALONE named —
-// neither read whole by an aggregate group nor completed above — and merges
-// those rows last. A claim retained through its rooted SVM can land on such an
-// aggregate (pickAggr and pickSVM are separate picks), so its owner vote must
-// run over the whole aggregate too. In the common case phase 2 re-reads only
-// series phase 1 already holds and this issues nothing.
+// Under an svm= or ontap_node= root it then completes the aggregates phase 2
+// ALONE named — neither read whole by an aggregate group nor completed above —
+// and merges those rows last. A claim retained through its rooted SVM can land
+// on such an aggregate (pickAggr and pickSVM are separate picks), and a claim
+// retained through its rooted controller is retained BY the owner vote of the
+// aggregate it lands on, so in both cases that vote must run over the whole
+// aggregate too. In the common case phase 2 re-reads only series phase 1
+// already holds and this issues nothing.
 //
 // The merge writes v.VolumeLabels, which the hub's claim-info read reads, so it
 // happens only once pvcInfoDone has been OBSERVED closed — phase 2 waits on it
@@ -734,9 +736,14 @@ func readVolumeLabelsTail(
 		return nil
 	}
 	var late model.Vector
-	if len(plan.volumeSVMs) > 0 {
-		late, err = readOwnerCompletion(ctx, q, window, end, opts, sel,
-			withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed))
+	if len(plan.volumeSVMs) > 0 || len(plan.volumeNodes) > 0 {
+		// An ontap_node phase 1 already re-read whole every aggregate its
+		// kept rows name, so those need no second completion.
+		targets := withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed)
+		if len(plan.volumeNodes) > 0 {
+			targets = withoutTargets(targets, aggregatesTouched(v.VolumeLabels))
+		}
+		late, err = readOwnerCompletion(ctx, q, window, end, opts, sel, targets)
 		if err != nil {
 			return err
 		}

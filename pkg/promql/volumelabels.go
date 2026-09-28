@@ -235,11 +235,5 @@ func RenderVolumeLabelsTokenScoped(window time.Duration, keys LabelKeys, sel Sel
 // ok is false when nodes holds no non-empty value. The caller MUST skip the
 // query rather than fall back to an unscoped read.
 func RenderVolumeLabelsByNode(window time.Duration, keys LabelKeys, sel Selector, nodes []string) (string, bool) {
-	vals := normaliseValues(nodes)
-	if len(vals) == 0 {
-		return "", false
-	}
-	matchers := appendMatcher(requestMatchers(QVolumeLabels, keys, sel), NodeLabel, vals)
-	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
-		QVolumeLabels, strings.Join(matchers, ","), FormatDuration(window)), true
+	return RenderOnLabel(QVolumeLabels, window, keys, sel, NodeLabel, nodes)
 }

@@ -99,3 +99,20 @@ func TestNodeSeed_OverCapRejected(t *testing.T) {
 	require.Equal(t, ReasonInvalidScope, AsReason(err))
 	assert.Empty(t, q.Issued())
 }
+
+// A pod's first kube_pod_info series can carry no node (scraped before
+// scheduling). parseTopology merges a UID's labels, so the node another series
+// of the same UID names must decide the seed, whatever the vector order.
+func TestPodsNewestOn_EmptyNodeSeriesOfSameUIDDoesNotHideTheNode(t *testing.T) {
+	at := model.Time(1000)
+	unscheduled := &model.Sample{Timestamp: at, Metric: model.Metric{
+		"cluster": "c1", "namespace": "shop", "pod": "orders-0", "uid": "u1",
+	}}
+	scheduled := &model.Sample{Timestamp: at, Metric: model.Metric{
+		"cluster": "c1", "namespace": "shop", "pod": "orders-0", "uid": "u1", "node": "worker-1",
+	}}
+	want := map[podSeriesKey]struct{}{{cluster: "c1", namespace: "shop", pod: "orders-0"}: {}}
+	for _, rows := range []model.Vector{{unscheduled, scheduled}, {scheduled, unscheduled}} {
+		assert.Equal(t, want, podsNewestOn(rows, []string{"worker-1"}))
+	}
+}

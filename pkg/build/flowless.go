@@ -31,7 +31,8 @@ func readFlowlessHarvest(
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
 	volumeLabelsDone <-chan struct{},
-) error {
+) (err error) {
+	defer recoverScopedPanic(ctx, promql.QAggrStatus, &err)
 	switch plan.kind {
 	case graph.StorageRootAggr:
 		if err := issueHarvestByName(ctx, q, window, end, opts, sel, v, scopeMu, promql.AggrPairQueries, plan.volumeAggrs); err != nil {
