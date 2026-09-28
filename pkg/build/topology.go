@@ -679,6 +679,8 @@ func readTopology(
 		// Harvest and application seeds are launched with the expansion, not here.
 	}
 	flowlessDone := make(chan struct{})
+	// Either read launches the goroutine. Every kind reading aggregate gauges
+	// reads controllers today, but the launch must not depend on that.
 	if plan.flowlessAggrGauges() || plan.flowlessControllers() {
 		g.Go(signalWhenDone(func() error {
 			return readFlowlessHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, volumeLabelsFinal)

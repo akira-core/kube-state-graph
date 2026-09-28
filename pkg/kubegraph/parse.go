@@ -136,12 +136,12 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	if rerr != nil {
 		return req, rerr
 	}
+	// oneStorageRoot returned a kind holding at least one non-empty value, and
+	// NewStorageScope drops only empty values (a malformed pod is an error), so
+	// the scope always carries a root here.
 	scope, serr := graph.NewStorageScope(v["cluster"], v["namespace"], kind, values)
 	if serr != nil {
 		return req, &ParseError{"invalid_scope", serr.Error()}
-	}
-	if !scope.Roots.Any() {
-		return req, &ParseError{"missing_root", "a storage-graph request requires exactly one root kind"}
 	}
 	req.Scope = scope
 	req.Selector = promql.Selector{
