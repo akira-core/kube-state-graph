@@ -46,22 +46,7 @@ func readPodSeed(
 		markScopeIssued(v, scopeMu, promql.QPVCBindings)
 		addExtraSeries(v, scopeMu, promql.QPVCBindings, len(rows))
 	}
-	tracked := keepRootBindings(rows, plan.pods)
-	claims := claimNamesOf(tracked)
-	if len(claims) == 0 {
-		v.PVC = tracked
-		return nil
-	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
-		query: promql.QPVCBindings,
-		dst:   &v.PVC,
-		scope: claims,
-	}}); err != nil {
-		return err
-	}
-	lk := opts.LabelKeys.OrDefault()
-	v.PVC = keepClaimBindings(v.PVC, trackedClaimKeys(tracked, lk), lk)
-	return nil
+	return readMountersOf(ctx, q, window, end, opts, sel, v, scopeMu, keepRootBindings(rows, plan.pods))
 }
 
 // keepRootBindings keeps binding rows whose (namespace, pod) is a root ref.

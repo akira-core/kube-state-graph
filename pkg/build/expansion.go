@@ -16,8 +16,9 @@ import (
 // readWorkloadClaims is the claim side of a workload root (node, pod,
 // application). The seed already named the claims, so every claim family but
 // the bindings — those the seed re-read by claim, which is the mounter
-// completion — is restricted on persistentvolumeclaim and kept only when the
-// row's (cluster, namespace, claim) is tracked. An empty set issues nothing.
+// completion — is read per namespace on (namespace, persistentvolumeclaim)
+// and kept only when the row's (az, env, cluster, namespace, claim) is
+// tracked. An empty set issues nothing.
 func readWorkloadClaims(
 	ctx context.Context,
 	q promql.Querier,
@@ -42,8 +43,7 @@ func readWorkloadClaims(
 	for k := range annotatedClaimKeys(v.PVCAnnotations, plan.applicationRoots, keys) {
 		tracked[k] = struct{}{}
 	}
-	names := claimNamesFromKeys(tracked)
-	if len(names) == 0 {
+	if len(tracked) == 0 {
 		return nil
 	}
 	// The application seed already landed tracking-id rows in this vector.
@@ -51,30 +51,12 @@ func readWorkloadClaims(
 	if n := len(v.PVCAnnotations); n > 0 {
 		addExtraSeries(v, scopeMu, promql.QPVCAnnotations, n)
 	}
-	keep := func(m model.Metric) bool {
-		_, ok := tracked[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
-		return ok
-	}
-	fams := []scopedFamily{
-		{
-			query: promql.QPVCInfo,
-			dst:   &v.PVCInfo,
-			scope: names,
-			render: func(chunk []string) (string, bool) {
-				return promql.RenderOnLabel(promql.QPVCInfo, window, opts.LabelKeys, sel, promql.ClaimLabel, chunk)
-			},
-		},
-		{query: promql.QPVCAnnotations, dst: &v.PVCAnnotations, scope: names},
-		{query: promql.QKubeletVolumeUsedBytes, dst: &v.KubeletVolumeUsed, scope: names},
-		{query: promql.QKubeletVolumeCapacityBytes, dst: &v.KubeletVolumeCapacity, scope: names},
-	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {
-		return err
-	}
-	for _, f := range fams {
-		*f.dst = keepRows(*f.dst, keep)
-	}
-	return nil
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{
+		{promql.QPVCInfo, &v.PVCInfo},
+		{promql.QPVCAnnotations, &v.PVCAnnotations},
+		{promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed},
+		{promql.QKubeletVolumeCapacityBytes, &v.KubeletVolumeCapacity},
+	}, tracked)
 }
 
 // readWorkloadVolumeLabels is candidate completion for a workload root, plus
@@ -217,16 +199,6 @@ func annotatedClaimKeys(rows model.Vector, roots []string, keys promql.LabelKeys
 		out[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 	}
 	return out
-}
-
-func claimNamesFromKeys(keys map[claimKey]struct{}) []string {
-	names := make([]string, 0, len(keys))
-	for k := range keys {
-		if k.claim != "" {
-			names = append(names, k.claim)
-		}
-	}
-	return sortedNames(names)
 }
 
 // controllersAlreadyRead is the set of controller names a flowless root read

@@ -306,15 +306,10 @@ func readHubClaimFamilies(
 
 	keys := opts.LabelKeys.OrDefault()
 	claims := make(map[claimKey]struct{}, len(v.PVCInfo))
-	byNS := make(map[string][]string)
 	for _, s := range v.PVCInfo {
-		claim := string(s.Metric[promql.ClaimLabel])
-		if claim == "" {
-			continue
+		if claim := string(s.Metric[promql.ClaimLabel]); claim != "" {
+			claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 		}
-		claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
-		ns := string(s.Metric[promql.NamespaceLabel])
-		byNS[ns] = append(byNS[ns], claim)
 	}
 	defer func() {
 		slog.DebugContext(ctx, "storage graph volume hub",
@@ -323,15 +318,47 @@ func readHubClaimFamilies(
 			"claims", len(claims),
 			"bindings", len(v.PVC))
 	}()
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, claimTargets(v)[1:], claims)
+}
+
+// issueClaimFamiliesByNamespace reads every target family restricted to the
+// tracked claims, one query group per namespace on `namespace` and
+// `persistentvolumeclaim` (promql.RenderNamesInNamespace, chunked under the
+// shared byte budget, the namespace equality charged once per chunk), and keeps
+// only the rows whose (az, env, cluster, namespace, claim) is tracked. A
+// namespace is shared by every selected cluster and zone, so the read can still
+// return a same-named claim of another cluster; the filter drops it.
+//
+// Each target's vector is the merge of its namespaces' results in namespace
+// order, so it is a pure function of the claim set rather than of upstream
+// timing. No tracked claim issues nothing and leaves every target untouched.
+func issueClaimFamiliesByNamespace(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+	targets []scopedTarget,
+	claims map[claimKey]struct{},
+) error {
+	byNS := make(map[string][]string)
+	for k := range claims {
+		if k.claim != "" {
+			byNS[k.namespace] = append(byNS[k.namespace], k.claim)
+		}
+	}
 	if len(byNS) == 0 {
 		return nil
 	}
 	namespaces := slices.Sorted(maps.Keys(byNS))
-	isLoadedClaim := func(m model.Metric) bool {
+	keys := opts.LabelKeys.OrDefault()
+	isTracked := func(m model.Metric) bool {
 		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
-	targets := claimTargets(v)[1:]
 	parts := make([][]model.Vector, len(targets))
 	fams := make([]claimFamily, 0, len(targets)*len(namespaces))
 	for ti, t := range targets {
@@ -347,15 +374,13 @@ func readHubClaimFamilies(
 					},
 					budgetReserve: promql.NamespaceEqualityCost(ns),
 				},
-				keep: isLoadedClaim,
+				keep: isTracked,
 			})
 		}
 	}
 	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {
 		return err
 	}
-	// Merged in namespace order, so each vector is a pure function of the
-	// claim set rather than of upstream timing.
 	for ti, t := range targets {
 		var merged model.Vector
 		for _, part := range parts[ti] {

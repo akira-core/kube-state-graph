@@ -85,13 +85,21 @@ func TestParseStorageValues_PodRootDoesNotDeriveNamespace(t *testing.T) {
 	req, err := kubegraph.ParseStorageValues(vals)
 	require.NoError(t, err)
 	assert.Empty(t, req.Selector.Namespace)
-	assert.Equal(t, []string{
+	// The seed read comes first; mounter completion then reads the tracked
+	// claims one namespace at a time, concurrently, so only its set is pinned.
+	bindings := q.QueriesFor(promql.QPVCBindings)
+	require.Len(t, bindings, 3)
+	assert.Equal(t,
 		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1h])`,
-		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",persistentvolumeclaim=~"orders-data|redis-data"}[1h])`,
-	}, q.QueriesFor(promql.QPVCBindings), "bindings are the pod seed, then mounter completion by claim")
-	assert.Equal(t, []string{
-		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",persistentvolumeclaim=~"orders-data|redis-data"}[1h])`,
-	}, q.QueriesFor(promql.QPVCInfo), "claim info is read by the tracked claim names")
+		bindings[0], "bindings are the pod seed first")
+	assert.ElementsMatch(t, []string{
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="platform",persistentvolumeclaim="redis-data"}[1h])`,
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1h])`,
+	}, bindings[1:], "then mounter completion by (namespace, claim)")
+	assert.ElementsMatch(t, []string{
+		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",namespace="platform",persistentvolumeclaim="redis-data"}[1h])`,
+		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1h])`,
+	}, q.QueriesFor(promql.QPVCInfo), "claim info is read by the tracked (namespace, claim) pairs")
 	assert.Equal(t, []string{
 		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
 	}, q.QueriesFor(promql.QAlerts))

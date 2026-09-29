@@ -233,20 +233,11 @@ func readApplicationBindings(
 	for k := range ann {
 		keys[k] = struct{}{}
 	}
-	claims := claimNamesFromKeys(keys)
-	if len(claims) == 0 {
+	if len(keys) == 0 {
 		v.PVC = tracked
 		return nil
 	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
-		query: promql.QPVCBindings,
-		dst:   &v.PVC,
-		scope: claims,
-	}}); err != nil {
-		return err
-	}
-	v.PVC = keepClaimBindings(v.PVC, keys, lk)
-	return nil
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, keys)
 }
 
 func namesFromTracking(vec model.Vector, label model.LabelName, apps map[string]struct{}) []string {

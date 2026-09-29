@@ -162,7 +162,10 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
 
 Every storage build is a seed plus an expansion. The claim families are read
 FROM the seed (a Harvest seed's volume-label rows, or a workload seed's
-bindings), and the waves above hang off that claim set:
+bindings), and the waves above hang off that claim set. Every read keyed by a
+known claim — the claim side and mounter completion alike, under every root
+kind — is issued one query per namespace on `(namespace, persistentvolumeclaim)`,
+so a common claim name is never read across the estate:
 
 ```
  L1  volume_labels phase 1 (aggr / svm groups)   aggr_* node_* qos_policy_* ALERTS   app recovery st.1

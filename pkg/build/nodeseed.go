@@ -3,7 +3,6 @@ package build
 import (
 	"cmp"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -110,20 +109,31 @@ func readNodeSeed(
 	// zero rather than omitting a query that ran.
 	markScopeIssued(v, scopeMu, promql.QPVCBindings)
 	tracked := keepPodBindings(byPod, onRoot, lk)
-	claims := claimNamesOf(tracked)
+	return readMountersOf(ctx, q, window, end, opts, sel, v, scopeMu, tracked)
+}
+
+// readMountersOf is mounter completion: every pod mounting a claim the seed's
+// bindings name. The binding family is re-read by claim — per namespace, on
+// (namespace, persistentvolumeclaim), so a common claim name is never read
+// across the estate — and kept only when the row's claim is one the seed
+// tracked. No tracked claim issues nothing and keeps the seed's own rows.
+func readMountersOf(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+	tracked model.Vector,
+) error {
+	claims := trackedClaimKeys(tracked, opts.LabelKeys.OrDefault())
 	if len(claims) == 0 {
 		v.PVC = tracked
 		return nil
 	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
-		query: promql.QPVCBindings,
-		dst:   &v.PVC,
-		scope: claims,
-	}}); err != nil {
-		return err
-	}
-	v.PVC = keepClaimBindings(v.PVC, trackedClaimKeys(tracked, lk), lk)
-	return nil
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, claims)
 }
 
 // podsNewestOn returns the pods whose newest incarnation runs on a root node.
@@ -182,29 +192,6 @@ func keepPodBindings(rows model.Vector, pods map[podSeriesKey]struct{}, keys pro
 	var out model.Vector
 	for _, s := range rows {
 		if _, ok := pods[podSeriesKeyOf(s.Metric, keys)]; ok && bindingClaim(s.Metric) != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func claimNamesOf(rows model.Vector) []string {
-	names := make([]string, 0, len(rows))
-	for _, s := range rows {
-		if claim := bindingClaim(s.Metric); claim != "" {
-			names = append(names, claim)
-		}
-	}
-	slices.Sort(names)
-	return slices.Compact(names)
-}
-
-// keepClaimBindings keeps the binding rows whose claim is one of claims, keyed
-// exactly as the parse keys a claim (claimKeyOf).
-func keepClaimBindings(rows model.Vector, claims map[claimKey]struct{}, keys promql.LabelKeys) model.Vector {
-	var out model.Vector
-	for _, s := range rows {
-		if _, ok := claims[claimKeyOf(s.Metric, keys, bindingClaim(s.Metric))]; ok {
 			out = append(out, s)
 		}
 	}

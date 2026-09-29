@@ -111,8 +111,9 @@ Builder.BuildStorage(…, roots) ── readTopology under storagePlan. The firs
                                   itself — kube_persistentvolumeclaim_info{namespace,persistentvolumeclaim}
                                   per namespace, or {volumename} — with no volume_labels phase 1 in front
                                   of it). One expansion then walks that
-                                  claim set both ways: claim families per namespace, by claim name (filtered to the
-                                  tracked cluster/namespace/claim), mounter completion (bindings by claim,
+                                  claim set both ways: claim families by (namespace, claim), one query per
+                                  namespace (filtered to the tracked az/env/cluster/namespace/claim),
+                                  mounter completion (bindings by (namespace, claim),
                                   then every mounter's pod), candidate completion (volume_labels by token)
                                   and owner completion (every touched aggregate re-read whole). Kubernetes
                                   nodes and controllers are scoped from the loaded pods; Harvest gauges,
@@ -914,8 +915,10 @@ live under `openspec/specs/`.
     PV name (a generator, never a judge; static PVs and custom volume-name
     prefixes are NOT reached from a storage root), `kube_persistentvolumeclaim_info`
     is scoped on `volumename`, and the expansion reads the other claim families
-    on `persistentvolumeclaim`, filtered to the loaded `(az, env, cluster, namespace, claim)`
-    keys. A data-derived scope is chunked however large it is and never replaced
+    one query per namespace on `(namespace, persistentvolumeclaim)`
+    (`issueClaimFamiliesByNamespace`, shared by every seed kind's claim side and
+    mounter completion — a claim name alone would be read across the estate),
+    filtered to the loaded `(az, env, cluster, namespace, claim)` keys. A data-derived scope is chunked however large it is and never replaced
     by a read across the zone. `storage_root_claim_miss` (`no_pv_candidate` /
     `no_claim`) reports a seed that found nothing (`no_claim` drops to Debug under
     a `cluster=` / `namespace=` filter). **The build stays in the request's zones**

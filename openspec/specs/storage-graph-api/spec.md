@@ -236,7 +236,7 @@ For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info`
 #### Scenario: Rooted volumes name their claims
 
 - **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr00`, the rooted read returns FlexVol `trident_pvc_ab12_cd34`, and claim `shop/orders-data` is bound to PV `pvc-ab12-cd34` and mounted by `orders-0` and `orders-1`
-- **THEN** `kube_persistentvolumeclaim_info` is issued restricted to `volumename=~"pvc-ab12-cd34"`, the claim-side families are restricted to `persistentvolumeclaim=~"orders-data"`, the pod read is restricted to `{orders-0, orders-1}`, and the body carries the claim's complete path
+- **THEN** `kube_persistentvolumeclaim_info` is issued restricted to `volumename=~"pvc-ab12-cd34"`, the claim-side families are restricted to `namespace="shop",persistentvolumeclaim="orders-data"`, the pod read is restricted to `{orders-0, orders-1}`, and the body carries the claim's complete path
 
 #### Scenario: A FlexVol with no storage prefix yields a candidate
 
@@ -280,8 +280,13 @@ For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info`
 
 #### Scenario: A same-named claim in another namespace is filtered out
 
-- **WHEN** the build tracks claim `shop/data` and the claim-binding read, restricted to `persistentvolumeclaim=~"data"`, also returns a binding of `platform/data`
-- **THEN** the `platform/data` binding is discarded before the pod scope is computed, its pod is not read, and no `platform/data` PVC node is built
+- **WHEN** the build tracks claim `shop/data` of cluster `c1` and claim `platform/data` exists in the same estate
+- **THEN** the claim-binding read is issued as `{namespace="shop",persistentvolumeclaim="data"}` beside the request matchers, so no `platform/data` binding is read, its pod is not read, and no `platform/data` PVC node is built
+
+#### Scenario: A same-named claim in another cluster is filtered out
+
+- **WHEN** the build tracks claim `shop/data` of cluster `c1` and the claim-binding read `{namespace="shop",persistentvolumeclaim="data"}` also returns a binding of `shop/data` in cluster `c2`, which no root or seed row names
+- **THEN** that binding is discarded before the pod scope is computed, its pod is not read, and no `c2` PVC node is built
 
 #### Scenario: A claim root reads its claim by reference
 
@@ -332,8 +337,8 @@ For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info`
 
 From the tracked claim set, the build SHALL read everything the body draws for those claims, restricted by reference, with four **completions** that keep each reader's whole-population rules intact:
 
-- **Claim side.** `kube_persistentvolumeclaim_info` (when the root's reads did not already return the claim), `kube_persistentvolumeclaim_annotations`, the two kubelet volume-stats families and the claim-binding family, each restricted on `persistentvolumeclaim` to the tracked claim names. Rows SHALL be kept only when their `(cluster, namespace, claim)` names a tracked claim.
-- **Mounter completion.** The claim-binding read by claim names EVERY pod mounting a tracked claim, and every such pod SHALL be loaded. A shared claim's `pvc-pod` weight is split over the mounters present in the built graph, and an unannotated claim inherits the Application of its mounters, so a mounter left unloaded would change both.
+- **Claim side.** `kube_persistentvolumeclaim_info` (when the root's reads did not already return the claim), `kube_persistentvolumeclaim_annotations`, the two kubelet volume-stats families and the claim-binding family, each restricted to the tracked `(namespace, claim)` pairs — one query per namespace, carrying that namespace as an equality and its tracked claim names as the alternation on `persistentvolumeclaim` — so a same-named claim in another namespace is never read. Rows SHALL be kept only when their `(az, env, cluster, namespace, claim)` names a tracked claim.
+- **Mounter completion.** The claim-binding read by `(namespace, claim)` names EVERY pod mounting a tracked claim, and every such pod SHALL be loaded. A shared claim's `pvc-pod` weight is split over the mounters present in the built graph, and an unannotated claim inherits the Application of its mounters, so a mounter left unloaded would change both.
 - **Workload side.** The mounters' pods, their Kubernetes nodes and their controllers, as "Storage build reads every family by reference" defines.
 - **Candidate completion.** `volume_labels` restricted on `volume` to the derived tokens of every tracked claim, rendered as the suffix comparison `.*<token>`, so each claim's aggregate and SVM picks run over its WHOLE candidate set — a clone or a same-named FlexVol on another filer included. Its rows SHALL NOT add claims to the tracked set.
 - **Owner completion.** Every `(ONTAP cluster, aggregate)` pair any volume-label row of the build names SHALL be read whole, except the aggregates a read of the build already covered whole, so the owning-controller vote runs over every row of every aggregate the body can draw. Under an `svm` root this SHALL include the aggregates candidate completion alone named: the aggregate and SVM picks are separate, so a claim retained through its SVM can land on such an aggregate. Its rows SHALL NOT add claims.
@@ -370,7 +375,7 @@ The join-coverage signal of the `netapp-storage-graph` capability SHALL count ov
 #### Scenario: A shared claim keeps its split across nodes
 
 - **WHEN** a client sends `?az=zone-a&env=prod&node=worker-1` and the RWX claim `shop/shared-data` is mounted by `orders-0` on `worker-1` and by `report-0` and `report-1` on `worker-2`
-- **THEN** the claim-binding read by claim loads all three mounters, the body retains only the `orders-0` path, its `pvc-pod` edge carries one third of the claim's figures with `labels.attribution="split"`, and the body is byte-identical to the unrestricted body
+- **THEN** the claim-binding read by `(namespace, claim)` loads all three mounters, the body retains only the `orders-0` path, its `pvc-pod` edge carries one third of the claim's figures with `labels.attribution="split"`, and the body is byte-identical to the unrestricted body
 
 #### Scenario: The QoS scope follows the tracked claims
 

@@ -99,12 +99,12 @@ func TestApplicationSeed_AnnotatedClaimLoadsItsMounter(t *testing.T) {
 	anns := f.QueriesFor(promql.QPVCAnnotations)
 	require.Len(t, anns, 2, "tracking-id recovery, then the claim-name read")
 	assert.Contains(t, anns[0], `annotation_argocd_argoproj_io_tracking_id=~"(?:billing)(?::.*)?"`)
-	assert.Contains(t, anns[1], `persistentvolumeclaim="ledger-data"`)
+	assert.Contains(t, anns[1], `namespace="shop",persistentvolumeclaim="ledger-data"`)
 	for _, query := range f.QueriesFor(promql.QPodOwner) {
 		assert.NotContains(t, query, `owner_kind=`, "no controller carries billing, so stage 3 does not run")
 	}
 	joined := strings.Join(f.QueriesFor(promql.QPVCBindings), "\n")
-	assert.Contains(t, joined, `persistentvolumeclaim="ledger-data"`)
+	assert.Contains(t, joined, `namespace="shop",persistentvolumeclaim="ledger-data"`)
 	assert.Contains(t, strings.Join(f.QueriesFor(promql.QPodInfo), "\n"), "ledger-0")
 }
 
