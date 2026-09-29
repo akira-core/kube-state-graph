@@ -170,30 +170,35 @@ Each chunk SHALL degrade independently and SHALL NOT fail the build: a failed ch
 
 The builder SHALL resolve each joined volume's declared throughput ceiling from the OPTIONAL Harvest QoS fixed-policy series `qos_policy_fixed_max_throughput_iops` and `qos_policy_fixed_max_throughput_mbps`. The fixed, case-sensitive label contract: `cluster` (the ONTAP cluster), `svm`, and the policy's own identity label naming the policy group, read as `name` with a `policy_group` fallback (Harvest spells it differently across templates; the contract pins the key's SHAPE, not the label's spelling).
 
-The join key is the `(ontap-cluster, svm, policy-group)` triple, assembled from BOTH topology hops:
+A ceiling SHALL be resolved for every claim whose `volume_labels` match resolved an SVM — a claim that also resolved an aggregate AND a claim that resolved an SVM but no aggregate (the FlexGroup shape). The join key is the `(ontap-cluster, svm, policy-group)` triple, assembled from BOTH topology hops:
 
-- `ontap-cluster` and `svm` come from **hop A** — the ONTAP cluster of the claim's picked aggregate and the SVM the `volume_labels` match resolved (see "PVC svm label re-sourced from the Harvest join"), so the ceiling is anchored on the same filer and SVM the edge itself points at.
-- `policy-group` comes from **hop B** — the `policy_group` label of the claim's in-scope QoS workload candidates, which is the ONLY upstream statement of which policy group governs THIS FlexVol; `volume_labels` carries no policy identity. Candidates SHALL be read at **both granularities**, LUN-level rows included: on a SAN backend the QoS policy is attached to the LUN, and the FlexVol's own workload then falls into the provisioner-independent built-in class the storage system assigns to unmanaged workloads (`User-Best_effort` on ONTAP), which by definition declares no ceiling and therefore has no fixed-policy series. Admitting LUN rows here cannot affect a measurement, since the I/O sum reads volume-level rows only.
+- `ontap-cluster` and `svm` come from **hop A** — the SVM the `volume_labels` match resolved (see "PVC svm label re-sourced from the Harvest join") and the ONTAP cluster it sits on: the ONTAP cluster of the claim's picked aggregate when an aggregate resolved (the SVM pick is scoped to that filer), otherwise the ONTAP cluster the SVM pick itself landed on. The ceiling is therefore anchored on the same filer and SVM the claim's storage chain points at.
+- `policy-group` comes from **hop B** — the `policy_group` label of the claim's in-scope QoS workload candidates (those on the key's ONTAP cluster whose `svm`, when present, equals the key's), which is the ONLY upstream statement of which policy group governs THIS FlexVol; `volume_labels` carries no policy identity. Candidates SHALL be read at **both granularities**, LUN-level rows included: on a SAN backend the QoS policy is attached to the LUN, and the FlexVol's own workload then falls into the provisioner-independent built-in class the storage system assigns to unmanaged workloads (`User-Best_effort` on ONTAP), which by definition declares no ceiling and therefore has no fixed-policy series. Admitting LUN rows here cannot affect a measurement, since the I/O sum reads volume-level rows only.
 
   The pick SHALL **prefer a policy group the fixed-policy families actually hold** for the claim's `(ontap-cluster, svm)`, taking the lexically-smallest such value; when none resolves it SHALL fall back to the lexically-smallest non-empty value overall, which leaves the ceiling absent exactly as an unmatched key does. Both passes are order-free. The preference SHALL be data-driven — the builder SHALL NOT carry a hardcoded list of built-in class names, whose spelling varies by storage-system release — and it is what stops a built-in class that sorts ahead of the real policy from winning the pick.
 
 Sourcing the cluster and SVM from hop A rather than from the workload series is what lets a workload series carrying a `policy_group` but NO `svm` label still resolve a ceiling, and what keeps the key on the picked filer under a cross-filer FlexVol-name collision.
 
-The resolved values SHALL surface as the `max_iops` and `max_bytes_per_sec` fields of the edge's `data.metrics` object. `max_iops` is read verbatim. `max_bytes_per_sec` is the **one** figure in this capability NOT read verbatim: it is `qos_policy_fixed_max_throughput_mbps × 1048576`, converted so the ceiling carries the same unit as the measured `read_bytes_per_sec` / `write_bytes_per_sec` and the two compare without client-side arithmetic.
+`max_iops` is read verbatim. `max_bytes_per_sec` is the **one** figure in this capability NOT read verbatim: it is `qos_policy_fixed_max_throughput_mbps × 1048576`, converted so the ceiling carries the same unit as the measured `read_bytes_per_sec` / `write_bytes_per_sec` and the two compare without client-side arithmetic.
 
-Each field SHALL be present iff its own family holds a series for the triple; on duplicate series for one triple the builder SHALL pick deterministically (the smallest numeric value). **An incomplete or unmatched key SHALL be ignored, never widened**: a claim whose hop A resolved no `svm`, whose in-scope workload candidates carry no non-empty `policy_group` (the volume is in no policy group, or the Harvest template omits the label), or whose triple matches no fixed-policy series SHALL leave both fields absent. The builder SHALL NOT fall back to an SVM-wide or cluster-wide ceiling: a figure resolved from another policy group would name a limit this volume does not have. Absence means *no declared ceiling* and SHALL NEVER be rendered as a number, whether `0` or an "unlimited" sentinel. Failure of either query SHALL degrade gracefully and SHALL NOT fail the build.
+Each field SHALL be present iff its own family holds a series for the triple; on duplicate series for one triple the builder SHALL pick deterministically (the smallest numeric value). **An incomplete or unmatched key SHALL be ignored, never widened**: a claim whose hop A resolved no `svm`, whose in-scope workload candidates carry no non-empty `policy_group` (the volume is in no policy group, or the Harvest template omits the label), or whose triple matches no fixed-policy series SHALL resolve no ceiling. The builder SHALL NOT fall back to an SVM-wide or cluster-wide ceiling: a figure resolved from another policy group would name a limit this volume does not have. Absence means *no declared ceiling* and SHALL NEVER be rendered as a number, whether `0` or an "unlimited" sentinel. Failure of either query SHALL degrade gracefully and SHALL NOT fail the build.
 
-Because the policy group is recovered from a matched workload series, a ceiling field SHALL NEVER appear on an edge carrying no measurement field — the two ride together, or the ceiling is absent.
+The resolved ceiling SHALL surface in two places, both from the ONE resolution per claim so the two can never disagree:
+
+- **On the claim's PVC node** as the `data.qos` attribute (the `graph-api` capability's "PVC `qos` attribute"), whenever a ceiling resolved — whether or not the claim carries any I/O measurement, and whether or not an aggregate resolved.
+- **On the claim's `pvc-to-netapp-aggr` edge** as the `max_iops` and `max_bytes_per_sec` fields of `data.metrics`, only when that edge exists (an aggregate resolved) AND carries at least one measurement field. A ceiling field SHALL NEVER appear on an edge carrying no measurement field — on the edge the two ride together, or the ceiling is absent there.
+
+Because the policy group is recovered from a matched workload series, a claim with no in-scope workload series at all resolves no ceiling in either place.
 
 #### Scenario: Ceiling resolved from the volume's policy group
 
 - **WHEN** a claim's picked aggregate is on `cluster="ontap-prod"`, its `volume_labels` match resolved `svm="svm-prod"`, its in-scope QoS workload series carry `policy_group="gold-tier"`, and the fixed-policy series `qos_policy_fixed_max_throughput_iops{cluster="ontap-prod", svm="svm-prod", name="gold-tier"} = 5000` and `qos_policy_fixed_max_throughput_mbps{...} = 250` exist
-- **THEN** the edge's `data.metrics` contains `max_iops: 5000` and `max_bytes_per_sec: 262144000`
+- **THEN** the edge's `data.metrics` contains `max_iops: 5000` and `max_bytes_per_sec: 262144000`, and the claim's PVC node carries `data.qos` with `policy_group: "gold-tier"`, `max_iops: 5000` and `max_bytes_per_sec: 262144000`
 
 #### Scenario: SAN claim resolves its ceiling through the LUN workload
 
 - **WHEN** a claim's FlexVol carries a volume-level workload in the built-in `User-Best_effort` class (`qos_read_ops` = `150`, no fixed-policy series for that class) and a LUN-level workload in `gold-tier` (`qos_read_ops` = `90`), and `gold-tier` holds fixed-policy series for the claim's `(ontap-cluster, svm)`
-- **THEN** the edge reports `read_ops: 150` (the LUN row is not summed) AND resolves `gold-tier`'s ceiling — the policy group is recovered from the LUN row, the only series naming it
+- **THEN** the edge reports `read_ops: 150` (the LUN row is not summed) AND resolves `gold-tier`'s ceiling — the policy group is recovered from the LUN row, the only series naming it — and the PVC node's `data.qos.policy_group` is `"gold-tier"`
 
 #### Scenario: A built-in class sorting first does not win the pick
 
@@ -203,12 +208,12 @@ Because the policy group is recovered from a matched workload series, a ceiling 
 #### Scenario: Another policy group in the same SVM is never borrowed
 
 - **WHEN** `svm-prod` also holds a `bronze-tier` policy with `max_throughput_iops = 100`, and the claim's workload series carry `policy_group="gold-tier"`
-- **THEN** the edge reports `max_iops: 5000` — the ceiling is the volume's own policy group's, and the SVM's other policies are neither consulted nor minimised over
+- **THEN** the edge and the PVC node both report `max_iops: 5000` — the ceiling is the volume's own policy group's, and the SVM's other policies are neither consulted nor minimised over
 
 #### Scenario: Volume in no policy group carries no ceiling
 
 - **WHEN** a claim's in-scope QoS workload series all carry an empty `policy_group` label, while its SVM does hold fixed-policy series for other groups
-- **THEN** the edge's `data.metrics` carries its measurement fields and has neither a `max_iops` nor a `max_bytes_per_sec` key — an empty match is ignored, never widened to the SVM
+- **THEN** the edge's `data.metrics` carries its measurement fields and has neither a `max_iops` nor a `max_bytes_per_sec` key, and the PVC node has no `qos` key — an empty match is ignored, never widened to the SVM
 
 #### Scenario: Workload without an svm label still resolves its ceiling
 
@@ -218,17 +223,27 @@ Because the policy group is recovered from a matched workload series, a ceiling 
 #### Scenario: Claim without an SVM carries no ceiling
 
 - **WHEN** a claim's matched `volume_labels` series carries an empty `svm` label, while its workload series carry a `policy_group` and the ONTAP cluster holds fixed-policy series
-- **THEN** the edge's `data.metrics` carries its measurement fields and has neither a `max_iops` nor a `max_bytes_per_sec` key — the triple is incomplete and is ignored
+- **THEN** the edge's `data.metrics` carries its measurement fields and has neither a `max_iops` nor a `max_bytes_per_sec` key, and the PVC node has no `qos` key — the triple is incomplete and is ignored
 
 #### Scenario: Partial ceiling keeps only the resolved field
 
 - **WHEN** the claim's triple matches `qos_policy_fixed_max_throughput_iops` but no `qos_policy_fixed_max_throughput_mbps` series
-- **THEN** the edge's `data.metrics` contains `max_iops` and no `max_bytes_per_sec` key
+- **THEN** the edge's `data.metrics` contains `max_iops` and no `max_bytes_per_sec` key, and the PVC node's `data.qos` likewise carries `max_iops` and no `max_bytes_per_sec`
 
 #### Scenario: No ceiling without a measurement
 
 - **WHEN** a claim draws its edge from `volume_labels` but matches no QoS workload series
-- **THEN** the edge has no `metrics` key at all — neither a measurement nor a ceiling field is emitted; with no workload series there is no policy group to key on
+- **THEN** the edge has no `metrics` key at all and the PVC node has no `qos` key — with no workload series there is no policy group to key on
+
+#### Scenario: FlexGroup claim resolves its ceiling on the node
+
+- **WHEN** a claim's matched `volume_labels` series carries `svm="svm_big"` on `cluster="ontap-prod"` and an empty `aggr`, its in-scope workload series carry `policy_group="gold-tier"`, and `(ontap-prod, svm_big, gold-tier)` holds fixed-policy series with `max_throughput_iops = 8000`
+- **THEN** the claim has no `pvc-to-netapp-aggr` edge, and its PVC node carries `data.qos` with `policy_group: "gold-tier"` and `max_iops: 8000`
+
+#### Scenario: Ceiling on the node when the edge carries no measurement
+
+- **WHEN** a claim resolved an aggregate and SVM, its only in-scope workload series are LUN-level rows carrying `policy_group="gold-tier"` (no volume-level row, so the edge carries no measurement), and `gold-tier` holds fixed-policy series for the claim's `(ontap-cluster, svm)`
+- **THEN** the claim's `pvc-to-netapp-aggr` edge has no `metrics` key, and its PVC node carries `data.qos` with `policy_group: "gold-tier"` and the resolved ceiling fields
 
 ### Requirement: NetApp aggregate entity
 
@@ -367,6 +382,8 @@ All three metrics are OPTIONAL; their absence degrades gracefully (attributes om
 
 For every PVC entity whose resolved PV name (`volumename`) is non-empty, the builder SHALL derive that PV name into a match token and match it against the `volume` label of the Harvest `volume_labels` series by the suffix comparison of "Suffix-only PV-name-to-FlexVol-name derivation". On a match with a **non-empty `aggr` label** it SHALL emit one directed `pvc-to-netapp-aggr` edge from the PVC node to the NetApp aggregate node `netapp/<ontap-cluster>/aggr/<aggr>` derived from the same matched series' `cluster` and `aggr` labels — no separate topology query is issued. The edge is a pure function of this one family: whether it is drawn SHALL NOT depend on the QoS families, which only decide what it carries. The join is rooted at the PV name alone (CSI-provisioned PV names are UUID-derived, so cross-cluster collisions are not a practical concern).
 
+**Zone agreement.** A claim's **candidate set** — the matched `volume_labels` series every pick of this capability runs over (the aggregate, the SVM, the owning controller the edge's target names, the QoS scope and the ceiling key) — SHALL contain only series whose zone agrees with the claim's. A claim's zone is the `(az, env)` pair its `kube_persistentvolumeclaim_info` series carries under the configured label keys; a series' zone is the pair it carries likewise. A matched series SHALL be excluded from the candidate set only when BOTH sides carry a complete pair and the pairs differ — an unknown zone on either side never excludes, the rule the `alert-overlay` capability applies to alerts. The exclusion narrows a claim's candidates only: the excluded series still names its aggregate, controller and SVM for the owner vote and the storage-flow inventory. A token collision across zones — the same FlexVol name, or a clone, on filers of two zones — therefore never moves a claim onto another zone's filer, which is what makes a multi-zone `/v1/storage-graph` body the union of its single-zone bodies; on an unfiltered `/v1/graph` it changes the body only in an estate holding such a collision.
+
 The edge SHALL carry empty `labels` (`{}`), a deterministic UUIDv5 `id` (canonical input `<type>|<source>|<target>`), and SHALL de-duplicate by `(pvc, netapp-aggr)`. When matched series disagree on the containing aggregate for one claim — including when several distinct FlexVol names end with the token (the same FlexVol name on a second filer, or a name carrying a different prefix) — the builder SHALL pick deterministically the lexically-smallest `(ontap-cluster, aggr)` pair, so the emitted edge set is byte-stable across rebuilds, independent of vector order. A PVC with no resolved `volumename` SHALL emit no `pvc-to-netapp-aggr` edge. A matched series whose `aggr` label is **empty** (the FlexGroup shape) SHALL emit no edge and SHALL be counted by the join-coverage signal.
 
 #### Scenario: Joined claim emits the edge
@@ -388,6 +405,16 @@ The edge SHALL carry empty `labels` (`{}`), a deterministic UUIDv5 `id` (canonic
 
 - **WHEN** two series matched by one claim's token report `(ontap-prod, aggr-b)` and `(ontap-prod, aggr-a)`
 - **THEN** the edge targets `netapp/ontap-prod/aggr/aggr-a` (the lexically-smallest pair) deterministically across rebuilds
+
+#### Scenario: Another zone's colliding FlexVol is never a candidate
+
+- **WHEN** claim `zone-a-prod-c1/shop/orders-data` (its claim-info series carrying `az="zone-a",env="prod"`) resolves `volumename="pvc-9f3a"`, and two `volume_labels` series end with its token: `(ontap-a, aggr-z)` carrying `az="zone-a",env="prod"` and `(ontap-0, aggr-a)` carrying `az="zone-b",env="prod"`
+- **THEN** the edge targets `netapp/ontap-a/aggr/aggr-z` although `(ontap-0, aggr-a)` sorts first, and the claim's `svm` label, QoS measurement and ceiling all come from the `ontap-a` series
+
+#### Scenario: An unknown zone never excludes
+
+- **WHEN** the same claim's only other matching series carries no `az` label
+- **THEN** that series stays in the candidate set and the lexically-smallest pair is picked across both, exactly as before this rule
 
 #### Scenario: Edge id stable across rebuilds
 
@@ -548,7 +575,7 @@ The `qos_*` families carry one selector and no other: the `volume` alternation o
 
 These queries constitute the `harvest` query family of the `upstream-backend-routing` capability, so they MAY be served by a different upstream installation from the kube-state-metrics and kubelet legs. The family is **zone-routed**: a request's `az` values select which `harvest` backends are asked — those whose `zones` intersect the request, plus any catch-all — under the same rule as the `ksm` and `kubelet` families, and, like them, the zone is ALSO rendered as a matcher, so a catch-all backend or a store holding several zones returns the requested zone's series only. The `env` dimension has no routing counterpart and reaches Harvest as a matcher alone. Routing changes **which** installation answers a Harvest query; it changes neither the query string, the three-hop join, nor the per-hop degradation below.
 
-Within a filtered build the storage chain is therefore narrowed **by reference**: an aggregate and its owning controller materialise only when a **loaded** claim's derived token matches a `volume_labels` series (or, in the storage-flow graph, when selected as a root), so a `cluster` or `namespace` filter reaches the NetApp graph solely through the claims it loads, and an `az` or `env` filter reaches it through the claims it loads plus its own matcher on every Harvest query (and, for `az`, the backends it selects). A filer shared across clusters, zones, or environments is one node set, reached from whichever loaded claims match it. In a `/v1/storage-graph` build rooted at a storage component (`storage-graph-api`, "Every root kind is tracked from its own tier to its claims") the direction reverses: the claims are loaded FROM the rooted volume-label rows, under the request's `az`, `env`, `cluster` and `namespace` matchers and from the backends the request's `az` selects, so a rooted FlexVol whose claim lives in another zone or environment loads no claim. Only an unfiltered build reads every zone's and environment's Harvest series; there, a FlexVol name carried by volumes in two zones or environments resolves to the lexically-smallest `(ontap_cluster, aggr)`.
+Within a filtered build the storage chain is therefore narrowed **by reference**: an aggregate and its owning controller materialise only when a **loaded** claim's derived token matches a `volume_labels` series (or, in the storage-flow graph, when selected as a root), so a `cluster` or `namespace` filter reaches the NetApp graph solely through the claims it loads, and an `az` or `env` filter reaches it through the claims it loads plus its own matcher on every Harvest query (and, for `az`, the backends it selects). A filer shared across clusters, zones, or environments is one node set, reached from whichever loaded claims match it. In a `/v1/storage-graph` build rooted at a storage component (`storage-graph-api`, "Every root kind is tracked from its own tier to its claims") the direction reverses: the claims are loaded FROM the rooted volume-label rows, under the request's `az`, `env`, `cluster` and `namespace` matchers and from the backends the request's `az` selects, so a rooted FlexVol whose claim lives in another zone or environment loads no claim. An unfiltered build, and a `/v1/storage-graph` build selecting several zones or environments, reads the Harvest series of every selected zone; there, a claim's candidates are restricted to its own zone ("PVC-to-NetApp-aggregate edge join"), so a FlexVol name carried by volumes in two zones or environments resolves, for each claim, among its own zone's series — falling back to the lexically-smallest `(ontap_cluster, aggr)` over every candidate only when a side carries no zone.
 
 #### Scenario: Cluster and namespace filters never reach Harvest
 

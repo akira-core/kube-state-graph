@@ -77,6 +77,8 @@ The endpoint SHALL accept the following root kinds, each a repeatable parameter 
 - `svm=<name>` or `svm=<ontap_cluster>/<name>` — an SVM, the bare form matched on every ONTAP cluster likewise and the qualified form on the named one only;
 - `node=<name>` — a Kubernetes node, matched in every Kubernetes cluster of the selected estate. It SHALL NOT match an ONTAP controller;
 - `pod=<namespace>/<pod-name>` — one pod. A value without exactly one `/` separating two non-empty segments SHALL be rejected 400 `invalid_scope`;
+- `pvc=<namespace>/<claim-name>` — one PersistentVolumeClaim, matched in every Kubernetes cluster of the selected estate. A value without exactly one `/` separating two non-empty segments SHALL be rejected 400 `invalid_scope`;
+- `pv=<name>` — a PersistentVolume, by its bare (cluster-scoped) name, matched in every Kubernetes cluster of the selected estate. It roots the claim(s) whose `kube_persistentvolumeclaim_info` series names it as `volumename`; a PersistentVolume bound to no claim roots nothing;
 - `application=<name>` — an ArgoCD Application, in the form `data.application` carries it (the segment of the tracking-id before the first `:`). A path is retained by it when its **pod or its claim** carries that Application — the claim's own annotation or the Application it inherited from a mounting pod, exactly as the body reports it. A value containing `:` can name no Application and matches nothing.
 
 Empty values SHALL be dropped, so a bare `?aggr=` is a no-op and does not count as a root. A request SHALL carry exactly ONE root kind with at least one non-empty value. A request carrying none SHALL be rejected 400 with `reason: "missing_root"`. A request carrying two or more root kinds SHALL be rejected 400 with `reason: "invalid_scope"` and a message naming the parameters. The values of the one kind SHALL be OR-combined: a path is retained when it touches any of them. Root names are matched exactly and case-sensitively. An `aggr` or `svm` value containing `/` SHALL be the qualified form: it SHALL split on exactly one `/` into two non-empty segments (the ONTAP cluster, then the name), and any other value containing `/` SHALL be rejected 400 `invalid_scope`. Bare and qualified values MAY be mixed within the one root kind and are OR-combined; a qualified value whose name also appears bare adds nothing. `cluster` and `namespace` are narrowing filters, not root kinds, and SHALL combine with any root kind.
@@ -166,6 +168,31 @@ Empty values SHALL be dropped, so a bare `?aggr=` is a no-op and does not count 
 - **WHEN** a client sends `?application=` followed by a value of 300 bytes, or a value carrying a control character
 - **THEN** the server returns 400 with `reason: "invalid_scope"`; a bare `?application=` is a no-op
 
+#### Scenario: Claim root finds its storage and its consumers
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pvc=shop/orders-data`, the claim joins `(ontap-prod, ontap-prod-01, aggr1, svm_shop)` and is mounted by `shop/orders-0` on `worker-1`
+- **THEN** the body contains exactly the chain `netapp/ontap-prod/ontap-prod-01 → netapp/ontap-prod/aggr/aggr1 → netapp/ontap-prod/svm/svm_shop → <shop/orders-data> → <shop/orders-0> → <worker-1>`, and no other claim sharing `aggr1` or `svm_shop`
+
+#### Scenario: Volume root resolves to its claim
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pv=pvc-ab12-cd34` and claim `shop/orders-data` is bound to PersistentVolume `pvc-ab12-cd34`
+- **THEN** the body is identical to the body of `?az=zone-a&env=prod&pvc=shop/orders-data`
+
+#### Scenario: A claim root matches the claim in every cluster
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pvc=shop/data` and clusters `c1` and `c2` both hold a claim `shop/data`
+- **THEN** both claims are roots and the body contains each one's path; adding `&cluster=c1` narrows it to the `c1` claim
+
+#### Scenario: Malformed claim root
+
+- **WHEN** a client sends `?pvc=orders-data` or `?pvc=shop/orders/data`
+- **THEN** the server returns 400 with `reason: "invalid_scope"`
+
+#### Scenario: Claim roots combine with no other root kind
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pvc=shop/orders-data&pv=pvc-ab12-cd34`
+- **THEN** the server returns 400 with `reason: "invalid_scope"` and a message naming `pvc` and `pv`, and issues no upstream query
+
 ### Requirement: Every root kind is tracked from its own tier to its claims
 
 The storage build SHALL reach the claims a request can retain by walking from its root, never by reading a family across the requested zone and discarding what the root does not reach. For each root kind it SHALL issue the reads below, each restricted as "Storage build reads every family by reference" defines; the claims those reads name form the build's **tracked claim set**.
@@ -176,20 +203,27 @@ The storage build SHALL reach the claims a request can retain by walking from it
 
 **Pod.** `pod` reads the claim-binding family restricted on `namespace` and `pod` to the roots, keeping only rows whose `(namespace, pod)` is a root ref, and reads `kube_pod_info` restricted to the root names. The claims those rows bind are the tracked set.
 
+**Claim.** `pvc` reads `kube_persistentvolumeclaim_info` restricted to the root `(namespace, claim)` pairs — one query per namespace, carrying that namespace as an equality and its claim names as the alternation on `persistentvolumeclaim` — keeping only rows whose `(namespace, claim)` is a root ref. The claims those rows name, in every Kubernetes cluster of the selected estate, are the tracked set.
+
+**Volume.** `pv` reads `kube_persistentvolumeclaim_info` restricted on `volumename` to the root values. The claims that read returns are the tracked set. This is the storage-side kinds' claim read without the candidate derivation: no `volume_labels` read precedes it, and a root value is used verbatim, never rewritten.
+
+For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info` read of "The tracked claims expand to both ends of the chain", which is therefore not issued again; the expansion's other claim-side reads, mounter completion, candidate completion, owner completion and storage-side reads apply unchanged. Because candidate completion reads `volume_labels` by the derived token of every tracked claim, a claim root's aggregate, SVM and controller are found exactly as on `/v1/graph`.
+
 **Application.** `application` runs the recovery of "Application roots are tracked through their controllers and claims" and tracks the claims that requirement names.
 
-**Closure.** The tracked set SHALL contain every claim the projection can retain for the request. A claim is retained through a storage-side root only if its picked aggregate, SVM or controller is a root, which requires at least one of its candidates on a rooted component, so the rooted rows name it. It is retained through a `node` or `pod` root only if one of its mounting pods is or runs on a root, so that pod's bindings name it.
+**Closure.** The tracked set SHALL contain every claim the projection can retain for the request. A claim is retained through a storage-side root only if its picked aggregate, SVM or controller is a root, which requires at least one of its candidates on a rooted component, so the rooted rows name it. It is retained through a `node` or `pod` root only if one of its mounting pods is or runs on a root, so that pod's bindings name it. It is retained through a `pvc` or `pv` root only if it is itself a root claim, which the seed read names.
 
 **Roots with no claim.** For the root alone, the build SHALL also read the families that materialise a root no claim reaches, as "Roots are always materialised when the upstream knows them" requires:
 
 - the aggregate gauge families for `aggr` (by aggregate name for a bare value, by `(ONTAP cluster, aggregate)` pair for a qualified one) and for `ontap_cluster` (by ONTAP cluster);
 - the controller families for `ontap_node` (by controller name) and for `ontap_cluster` (by ONTAP cluster);
 - the four Kubernetes-node families for `node`;
-- `kube_pod_info` for `pod`.
+- `kube_pod_info` for `pod`;
+- nothing further for `pvc` and `pv`: the seed read is the read that names a root claim.
 
 **Bounded root sets.** Root parameters are repeatable and the parser bounds each value's length, never their count, so a root set is a scope a client can inflate. When a root kind's first read would take more than a fixed maximum number of queries under the shared byte budget, the request SHALL be rejected 400 with `reason: "invalid_scope"` before any upstream query is issued. The first read's shape is a pure function of the root values and the byte budget, so no upstream data is needed to decide. The build SHALL NOT fall back to reading the family across the zone.
 
-**Static PersistentVolumes.** A claim bound to a PersistentVolume whose name yields no candidate — a statically provisioned PV, or a provisioner configured with a non-`pvc` volume-name prefix — SHALL NOT be found from a storage-side root, even when the forward join would match it. `/v1/graph`, and a `node`, `pod` or `application` root reaching the same claim, SHALL still join it.
+**Static PersistentVolumes.** A claim bound to a PersistentVolume whose name yields no candidate — a statically provisioned PV, or a provisioner configured with a non-`pvc` volume-name prefix — SHALL NOT be found from a storage-side root, even when the forward join would match it. `/v1/graph`, and a `node`, `pod`, `application`, `pvc` or `pv` root reaching the same claim, SHALL still join it — a `pvc` / `pv` root in particular is the way to root at a claim bound to a statically provisioned volume.
 
 **Coverage signal.** When a storage-side root's contributing rows carry a `volume` and none produced a candidate, the build SHALL log one aggregated warning `storage_root_claim_miss` with `reason="no_pv_candidate"` and the volume count. When candidates were produced and the claim-info read returned no claim, it SHALL log `storage_root_claim_miss` with `reason="no_claim"` and the candidate count. `no_claim` SHALL be logged at Debug instead when the request carries a `cluster` or `namespace` filter, which can legitimately exclude every candidate. Neither changes the response status.
 
@@ -244,6 +278,21 @@ The storage build SHALL reach the claims a request can retain by walking from it
 
 - **WHEN** the build tracks claim `shop/data` and the claim-binding read, restricted to `persistentvolumeclaim=~"data"`, also returns a binding of `platform/data`
 - **THEN** the `platform/data` binding is discarded before the pod scope is computed, its pod is not read, and no `platform/data` PVC node is built
+
+#### Scenario: A claim root reads its claim by reference
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pvc=shop/orders-data&pvc=shop/cache&pvc=platform/queue`
+- **THEN** `kube_persistentvolumeclaim_info` is issued as `{namespace="platform",persistentvolumeclaim="queue"}` and `{namespace="shop",persistentvolumeclaim=~"cache|orders-data"}` beside the request matchers, no `volume_labels` query precedes it, and a `platform/cache` row admitted by no query is never read
+
+#### Scenario: A volume root reads its claim by volume name
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pv=pvc-ab12-cd34&pv=mongo-data-01`
+- **THEN** `kube_persistentvolumeclaim_info` is issued restricted to `volumename=~"mongo-data-01|pvc-ab12-cd34"` beside the request matchers, no `volume_labels` query precedes it, and the claims it returns are expanded exactly as a storage-side root's claims are
+
+#### Scenario: A statically provisioned volume is reachable from a volume root
+
+- **WHEN** claim `db/mongo-data` is bound to PV `mongo-data-01`, the filer holds FlexVol `mongo_data_01` whose name the configured rewrite rules match to that PV, and a client sends `?az=zone-a&env=prod&pv=mongo-data-01`
+- **THEN** the body contains the claim's complete path to its aggregate, SVM and controller, identical to the path `GET /v1/graph` draws for it
 
 #### Scenario: A statically provisioned volume is not reached from a storage root
 
@@ -403,7 +452,9 @@ So the body SHALL be byte-identical to the body an unrestricted read would produ
 
 ### Requirement: Roots are always materialised when the upstream knows them
 
-A root the upstream names in the window SHALL appear in the body even when no flow passes through it. A root "exists" when a series the build reads for it names it: an `ontap_cluster` root when any Harvest series read for it carries that ONTAP cluster (its controllers, aggregates and SVMs are then all roots); an `aggr` root when a `volume_labels` or `aggr_*` series names that aggregate (for a qualified value, that aggregate on that ONTAP cluster); an `svm` root when a `volume_labels` series names it (for a qualified value, on that ONTAP cluster); an `ontap_node` root when a `volume_labels`, `node_labels`, `node_new_status` or node performance series names that controller; a `node` root when `kube_node_info` names that Kubernetes node; a `pod` root when `kube_pod_info` names it in the selected estate. "Every root kind is tracked from its own tier to its claims" defines the reads that make a root with no claim visible. A flowless root SHALL be emitted with its ordinary attributes and its compound parent (an aggregate root also materialises the controller currently owning it, so that `data.parent` never dangles) and **no** edges. A root NO series names SHALL NOT be drawn: the body is simply empty of it, with no error and no marker.
+A root the upstream names in the window SHALL appear in the body even when no flow passes through it. A root "exists" when a series the build reads for it names it: an `ontap_cluster` root when any Harvest series read for it carries that ONTAP cluster (its controllers, aggregates and SVMs are then all roots); an `aggr` root when a `volume_labels` or `aggr_*` series names that aggregate (for a qualified value, that aggregate on that ONTAP cluster); an `svm` root when a `volume_labels` series names it (for a qualified value, on that ONTAP cluster); an `ontap_node` root when a `volume_labels`, `node_labels`, `node_new_status` or node performance series names that controller; a `node` root when `kube_node_info` names that Kubernetes node; a `pod` root when `kube_pod_info` names it in the selected estate; a `pvc` root when a `kube_persistentvolumeclaim_info` series names that `(namespace, claim)` in the selected estate; a `pv` root when a `kube_persistentvolumeclaim_info` series names it as `volumename`, in which case the claim that series names is the materialised root. "Every root kind is tracked from its own tier to its claims" defines the reads that make a root with no claim visible. A flowless root SHALL be emitted with its ordinary attributes and its compound parent (an aggregate root also materialises the controller currently owning it, so that `data.parent` never dangles) and **no** edges. A root NO series names SHALL NOT be drawn: the body is simply empty of it, with no error and no marker.
+
+A root claim (of a `pvc` or `pv` root) is NOT flowless merely because no pod mounts it: when its volume joins the Harvest topology it keeps its storage-side path, as "Storage-reachability projection" defines. Only a root claim whose volume joins no Harvest topology (a non-NetApp claim, or a join miss) is emitted alone, with its ordinary attributes and compound parents and no edges; its mounting pods are then NOT drawn, exactly as a pod root's non-NetApp claims are not.
 
 An `application=` root exists when at least one pod loaded in the selected estate resolves that Application, and **every** such pod SHALL be materialised with its ordinary attributes and compound parents and no edges — including pods that mount no claim, which the build loads for exactly this purpose (see "Application roots are tracked through their controllers and claims") — so a stateless Application returns its pods rather than an empty body. A claim carrying a root Application SHALL NOT be materialised on its own: it participates in path retention only, and appears only on a retained path. An Application no loaded pod resolves is not drawn.
 
@@ -437,8 +488,17 @@ An `application=` root exists when at least one pod loaded in the selected estat
 - **WHEN** a client sends `?application=typo` and no loaded pod resolves that Application
 - **THEN** the server returns 200 with empty `nodes` and `edges` and an empty `clusters` array
 
+#### Scenario: Non-NetApp claim root still shows
+
+- **WHEN** a client sends `?az=zone-a&env=prod&pvc=shop/cache` and `shop/cache` is bound to a PersistentVolume that joins no Harvest series, mounted by `shop/redis-0`
+- **THEN** the body contains the PVC node `shop/cache` (with its namespace / application groups and its `usage` / `storageclass`) and no edge, and does not contain `shop/redis-0`
+
+#### Scenario: Unknown claim root is not drawn
+
+- **WHEN** a client sends `?pvc=shop/typo` or `?pv=pvc-typo` and no `kube_persistentvolumeclaim_info` series in the window names it
+- **THEN** the server returns 200 with empty `nodes` and `edges` and an empty `clusters` array
+
 #### Scenario: Controller with no claims still shows
 
 - **WHEN** a client sends `?az=zone-a&env=prod&ontap_node=ontap-prod-03` and Harvest reports `ontap-prod-03` in `node_labels` and `node_new_status` but no loaded claim sits on an aggregate it owns
 - **THEN** the body contains `netapp/ontap-prod/ontap-prod-03` with its hardware, performance and health attributes, and no edge
-
