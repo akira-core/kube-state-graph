@@ -109,21 +109,6 @@ func (r StorageRoots) Any() bool {
 	return r.Kind != "" && (len(r.Names) > 0 || len(r.Qualified) > 0 || len(r.Pods) > 0 || len(r.Claims) > 0)
 }
 
-// HasName reports whether name is one of this root's non-pod values.
-func (r StorageRoots) HasName(name string) bool {
-	return slices.Contains(r.Names, name)
-}
-
-// HasPod reports whether ref is one of this root's pod values.
-func (r StorageRoots) HasPod(ref PodRef) bool {
-	return slices.Contains(r.Pods, ref)
-}
-
-// HasClaim reports whether ref is one of this root's claim values.
-func (r StorageRoots) HasClaim(ref ClaimRef) bool {
-	return slices.Contains(r.Claims, ref)
-}
-
 // StorageScope is the projection filter of GET /v1/storage-graph, the
 // storage-flow counterpart of Scope.
 //

@@ -242,8 +242,10 @@ switches exhaustively on `StorageRootKind` must handle both.
 `promql.RenderPodsInNamespace` is **replaced** by
 `promql.RenderNamesInNamespace(q, window, keys, sel, namespace, label, names)`;
 pass `promql.PodLabel` for the pod-keyed families it accepted before.
-`build.Topology` and the rendered queries of every existing request are
-unchanged.
+`graph.StorageRoots.HasName` and `HasPod` are **removed**: nothing in the engine
+called them. Test membership directly on the fields, for example
+`slices.Contains(roots.Pods, ref)`. `build.Topology` and the rendered queries of
+every existing request are unchanged.
 
 ## `/v1/storage-graph` accepts several zones and qualified `aggr=` / `svm=` roots
 

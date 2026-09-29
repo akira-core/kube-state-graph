@@ -84,7 +84,6 @@ func TestNewStorageScope_Kind(t *testing.T) {
 		assert.Equal(t, kind, s.Roots.Kind)
 		assert.Equal(t, []string{"n"}, s.Roots.Names)
 		assert.True(t, s.Roots.Any())
-		assert.True(t, s.Roots.HasName("n"))
 	}
 
 	_, err := NewStorageScope(nil, nil, StorageRootKind("nope"), []string{"n"})
@@ -111,9 +110,6 @@ func TestNewStorageScope_ClaimRoots(t *testing.T) {
 	assert.Empty(t, s.Roots.Names)
 	assert.Empty(t, s.Roots.Pods)
 	assert.True(t, s.Roots.Any())
-	assert.True(t, s.Roots.HasClaim(ClaimRef{Namespace: "shop", Name: "cache"}))
-	assert.False(t, s.Roots.HasClaim(ClaimRef{Namespace: "platform", Name: "cache"}),
-		"the same claim name in another namespace is not a root")
 
 	reordered, err := NewStorageScope(nil, nil, StorageRootPVC,
 		[]string{"platform/queue", "shop/orders-data", "shop/cache"})
@@ -134,7 +130,6 @@ func TestNewStorageScope_VolumeRoots(t *testing.T) {
 	assert.Equal(t, []string{"pvc-a", "pvc-b"}, s.Roots.Names)
 	assert.Empty(t, s.Roots.Claims)
 	assert.True(t, s.Roots.Any())
-	assert.True(t, s.Roots.HasName("pvc-a"))
 }
 
 // A pvc value shares the pod rule verbatim: exactly one "/" between two
