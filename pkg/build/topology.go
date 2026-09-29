@@ -197,7 +197,7 @@ type Topology struct {
 	// Harvest read named, for the zone-agreeing alert match
 	// (read-storage-roots-through-volume-hub D11). Nil when no Harvest series
 	// carried the pair, which leaves NetApp alerts matching by label alone.
-	ontapZones map[string][]alertZone
+	ontapZones map[string][]zone
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It
@@ -1262,10 +1262,11 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	claims := make([]pvcVolume, 0, len(pvcs))
 	for _, pv := range pvcs {
 		if vn := pv.LabelsValue["volumename"]; vn != "" {
-			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn})
+			attrs := pvcInfo[pvcKey{pv.LabelsValue["cluster"], pv.LabelsValue["namespace"], pv.NameValue}]
+			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn, zone: attrs.zone, zoned: attrs.zoned})
 		}
 	}
-	netapp := resolveNetAppStorage(claims, v)
+	netapp := resolveNetAppStorage(claims, v, mc.keys)
 	aggrByPVC := make(map[string]string, len(netapp.edges))
 	for _, e := range netapp.edges {
 		if e.Type == graph.EdgeTypePVCToNetAppAggr {
@@ -1850,6 +1851,11 @@ type pvcKey struct{ cluster, namespace, claim string }
 type pvcInfoAttrs struct {
 	storageClass string
 	volumeName   string
+	// zone is the (az, env) pair of the claim's info series; zoned is false when
+	// no series carried the complete pair. It is the claim's side of the
+	// zone-agreeing FlexVol join.
+	zone  zone
+	zoned bool
 }
 
 // resolvePVCInfo builds the (cluster, namespace, persistentvolumeclaim) →
@@ -1887,6 +1893,9 @@ func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAtt
 		attrs := out[key]
 		pick(&attrs.storageClass, string(s.Metric["storageclass"]))
 		pick(&attrs.volumeName, string(s.Metric["volumename"]))
+		if z, ok := zoneOf(s.Metric, mc.keys); ok && (!attrs.zoned || z.less(attrs.zone)) {
+			attrs.zone, attrs.zoned = z, true
+		}
 		out[key] = attrs
 	}
 	return out

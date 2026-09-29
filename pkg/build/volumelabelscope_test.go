@@ -372,6 +372,7 @@ func vlrBuild(t *testing.T, fx map[promql.Query]model.Vector, roots graph.Storag
 	plan := storagePlan(roots)
 	if !restricted {
 		plan.volumeClusters, plan.volumeAggrs, plan.volumeSVMs, plan.volumeNodes = nil, nil, nil, nil
+		plan.volumeAggrPairs, plan.volumeSVMPairs = nil, nil
 	}
 	q := promqlfake.New(fx)
 	g, err := New(q, opts, nil, nil).buildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, plan)
@@ -792,7 +793,7 @@ func TestRootedVolumeLabels_JoinMissSignalUnderARestriction(t *testing.T) {
 		return captureDebugRecords(t, func() {
 			v := f.vectors()
 			v.VolumeLabelsRestricted = restricted
-			resolveNetAppStorage(f.claims, v)
+			resolveNetAppStorage(f.claims, v, promql.LabelKeys{})
 		})
 	}
 	countOf := func(recs []map[string]any) float64 {

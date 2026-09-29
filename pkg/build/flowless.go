@@ -15,7 +15,8 @@ import (
 
 // readFlowlessHarvest reads the gauge families that materialise a storage
 // root no claim reaches. An aggr root reads aggregate gauges by aggregate
-// name, then controller families for the owners those rows and the rooted
+// name (a bare value) or by (ONTAP cluster, aggregate) pair (a qualified one),
+// then controller families for the owners those rows and the rooted
 // volume-label rows name. An ontap_node root reads controller families by
 // controller name. An ontap_cluster root reads both families for the filers
 // it names. The read is skipped when the plan carries no such scope, which
@@ -36,6 +37,11 @@ func readFlowlessHarvest(
 	switch plan.kind {
 	case graph.StorageRootAggr:
 		if err := issueHarvestByName(ctx, q, window, end, opts, sel, v, scopeMu, promql.AggrPairQueries, plan.volumeAggrs); err != nil {
+			return err
+		}
+		// The by-name read above assigns its vectors and the pair read merges into
+		// them, so the order is load-bearing.
+		if err := issueHarvestPairMap(ctx, q, window, end, opts, sel, v, scopeMu, promql.AggrPairQueries, plan.volumeAggrPairs); err != nil {
 			return err
 		}
 		if !waitSignal(ctx, volumeLabelsDone) {

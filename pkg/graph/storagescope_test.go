@@ -175,3 +175,74 @@ func TestStorageRootKinds_Order(t *testing.T) {
 		StorageRootNode, StorageRootPod, StorageRootPVC, StorageRootPV, StorageRootApplication,
 	}, StorageRootKinds)
 }
+
+// accept-multi-zone-storage-graph: `aggr=` and `svm=` also accept
+// `<ontap_cluster>/<name>`, naming exactly one component. Bare values keep their
+// meaning (that name on every filer) and the two forms may be mixed.
+func TestNewStorageScope_QualifiedAggrAndSVM(t *testing.T) {
+	for _, kind := range []StorageRootKind{StorageRootAggr, StorageRootSVM} {
+		t.Run(string(kind), func(t *testing.T) {
+			s, err := NewStorageScope(nil, nil, kind, []string{
+				"ontap-prod/x2", "bare", "ontap-lab/x1", "ontap-prod/x2", "ontap-prod/x1", "",
+			})
+			require.NoError(t, err)
+			assert.Equal(t, kind, s.Roots.Kind)
+			assert.Equal(t, []string{"bare"}, s.Roots.Names)
+			assert.Equal(t, []ONTAPRef{
+				{ONTAPCluster: "ontap-lab", Name: "x1"},
+				{ONTAPCluster: "ontap-prod", Name: "x1"},
+				{ONTAPCluster: "ontap-prod", Name: "x2"},
+			}, s.Roots.Qualified, "sorted by (ONTAP cluster, name) and de-duplicated")
+			assert.True(t, s.Roots.Any())
+
+			reordered, err := NewStorageScope(nil, nil, kind, []string{
+				"ontap-prod/x1", "ontap-lab/x1", "bare", "ontap-prod/x2",
+			})
+			require.NoError(t, err)
+			assert.Equal(t, s, reordered, "value order never changes the scope")
+		})
+	}
+}
+
+func TestNewStorageScope_QualifiedOnlyIsARoot(t *testing.T) {
+	s, err := NewStorageScope(nil, nil, StorageRootAggr, []string{"ontap-prod/aggr9"})
+	require.NoError(t, err)
+	assert.True(t, s.Roots.Any(), "a qualified value alone is a root")
+	assert.Empty(t, s.Roots.Names)
+	assert.Equal(t, []ONTAPRef{{ONTAPCluster: "ontap-prod", Name: "aggr9"}}, s.Roots.Qualified)
+}
+
+// A qualified value whose name also appears bare adds nothing: the bare form
+// already roots that name on every filer.
+func TestNewStorageScope_BareSubsumesQualified(t *testing.T) {
+	s, err := NewStorageScope(nil, nil, StorageRootSVM, []string{"ontap-prod/svm0", "svm0", "ontap-lab/svm_shop"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"svm0"}, s.Roots.Names)
+	assert.Equal(t, []ONTAPRef{{ONTAPCluster: "ontap-lab", Name: "svm_shop"}}, s.Roots.Qualified)
+}
+
+func TestNewStorageScope_RejectsMalformedQualifiedRoot(t *testing.T) {
+	for _, kind := range []StorageRootKind{StorageRootAggr, StorageRootSVM} {
+		for _, bad := range []string{
+			"ontap-prod/", // empty name
+			"/aggr1",      // empty ONTAP cluster
+			"a/b/c",       // two separators
+			"/",           // both empty
+		} {
+			_, err := NewStorageScope(nil, nil, kind, []string{"ok", bad})
+			require.Error(t, err, "%s %q", kind, bad)
+			assert.Contains(t, err.Error(), bad)
+			assert.Contains(t, err.Error(), string(kind))
+		}
+	}
+}
+
+// Only aggr and svm split on "/": every other kind's value is a bare name.
+func TestNewStorageScope_OtherKindsDoNotSplit(t *testing.T) {
+	for _, kind := range []StorageRootKind{StorageRootONTAPCluster, StorageRootONTAPNode, StorageRootNode, StorageRootApplication} {
+		s, err := NewStorageScope(nil, nil, kind, []string{"a/b"})
+		require.NoError(t, err, kind)
+		assert.Equal(t, []string{"a/b"}, s.Roots.Names, kind)
+		assert.Empty(t, s.Roots.Qualified, kind)
+	}
+}

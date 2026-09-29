@@ -85,7 +85,7 @@ func resolveOver(t *testing.T, nodes []graph.GraphNode, samples ...model.Sample)
 
 // resolveZoned runs the matcher with an explicit resolver and ONTAP zone sets;
 // the index and the matcher share the resolver, as they do in attachAlerts.
-func resolveZoned(nodes []graph.GraphNode, r *clusterResolver, ontapZones map[string][]alertZone,
+func resolveZoned(nodes []graph.GraphNode, r *clusterResolver, ontapZones map[string][]zone,
 	samples ...model.Sample,
 ) (map[string][]graph.Alert, int, int) {
 	return resolveAlerts(sampleVec(samples...), newAlertIndex(nodes, r, ontapZones), r)
@@ -445,8 +445,8 @@ func zoneResolver(t *testing.T) *clusterResolver {
 
 // ontapProdInZoneA is the zone set the topology read collects when every
 // Harvest series naming ontap-prod carries az=zone-a, env=prod.
-func ontapProdInZoneA() map[string][]alertZone {
-	return map[string][]alertZone{"ontap-prod": {{az: "zone-a", env: "prod"}}}
+func ontapProdInZoneA() map[string][]zone {
+	return map[string][]zone{"ontap-prod": {{az: "zone-a", env: "prod"}}}
 }
 
 // Spec: "Aggregate alert from its own zone attached", "Aggregate alert from
@@ -458,7 +458,7 @@ func TestResolveAlerts_NetAppZoneAgreement(t *testing.T) {
 	aggrID := graph.NetAppAggrID("ontap-prod", "aggr1")
 	ctrlID := graph.NetAppNodeID("ontap-prod", "ontap-prod-01")
 	cases := map[string]struct {
-		zones     map[string][]alertZone
+		zones     map[string][]zone
 		labels    map[string]string
 		want      string
 		unmatched int
@@ -504,7 +504,7 @@ func TestResolveAlerts_NetAppZoneAgreement(t *testing.T) {
 			want:   aggrID,
 		},
 		"a filer seen under several pairs admits each": {
-			zones: map[string][]alertZone{"ontap-prod": {
+			zones: map[string][]zone{"ontap-prod": {
 				{az: "zone-a", env: "prod"}, {az: "zone-b", env: "prod"},
 			}},
 			labels: map[string]string{"az": "zone-b", "env": "prod", "cluster": "ontap-prod", "aggr": "aggr1"},
@@ -593,7 +593,7 @@ func TestResolveAlerts_MissingClusterOtherZoneOnly(t *testing.T) {
 			IDValue: ctrl, NameValue: "worker-1",
 			LabelsValue: map[string]string{"ontap_cluster": "ontap-lab"},
 		})
-		zones := map[string][]alertZone{"ontap-lab": {{az: "zone-b", env: "prod"}}}
+		zones := map[string][]zone{"ontap-lab": {{az: "zone-b", env: "prod"}}}
 		byNode, unmatched, ambiguous := resolveZoned(nodes, zoneResolver(t), zones,
 			alertSample("Something", "warning", map[string]string{"az": "zone-b", "env": "prod", "node": "worker-1"}))
 		assert.Zero(t, unmatched)
@@ -645,7 +645,7 @@ func TestOntapZonesOf(t *testing.T) {
 		QoSReadOps: sampleVec(h("cluster", "ontap-qos", "volume", "v1", "az", "zone-a", "env", "prod")),
 	}
 
-	assert.Equal(t, map[string][]alertZone{
+	assert.Equal(t, map[string][]zone{
 		"ontap-prod": {{az: "zone-a", env: "prod"}},
 		"ontap-lab":  {{az: "zone-a", env: "prod"}, {az: "zone-b", env: "prod"}},
 	}, ontapZonesOf(v, promql.LabelKeys{}), "sorted, de-duplicated; half-stamped, bare, cluster-less and QoS series count for nothing")

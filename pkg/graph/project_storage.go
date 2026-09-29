@@ -375,6 +375,19 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 		_, ok := names[n.Name()]
 		return ok
 	}
+	qualified := make(map[ONTAPRef]struct{}, len(roots.Qualified))
+	for _, ref := range roots.Qualified {
+		qualified[ref] = struct{}{}
+	}
+	// rooted is the aggr / svm match: a bare value names the component on every
+	// filer, a qualified one only on its own ONTAP cluster.
+	rooted := func(n GraphNode) bool {
+		if named(n) {
+			return true
+		}
+		_, ok := qualified[ONTAPRef{ONTAPCluster: n.Labels()["ontap_cluster"], Name: n.Name()}]
+		return ok
+	}
 	for _, n := range g.NodesByID {
 		switch roots.Kind {
 		case StorageRootONTAPCluster:
@@ -390,11 +403,11 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 				storage[n.ID()] = struct{}{}
 			}
 		case StorageRootAggr:
-			if n.Type() == NodeTypeNetAppAggr && named(n) {
+			if n.Type() == NodeTypeNetAppAggr && rooted(n) {
 				storage[n.ID()] = struct{}{}
 			}
 		case StorageRootSVM:
-			if n.Type() == NodeTypeNetAppSVM && named(n) {
+			if n.Type() == NodeTypeNetAppSVM && rooted(n) {
 				storage[n.ID()] = struct{}{}
 			}
 		case StorageRootNode:

@@ -36,6 +36,19 @@ type ClaimRef struct {
 // String renders the ref in the wire form the `pvc=` parameter accepts.
 func (r ClaimRef) String() string { return r.Namespace + "/" + r.Name }
 
+// ONTAPRef names one aggregate or SVM on one ONTAP cluster. It is the qualified
+// form of an `aggr=` / `svm=` root (`<ontap_cluster>/<name>`): aggregate and SVM
+// names recur on every filer, so the bare form roots that name everywhere and
+// this one roots exactly one component. ONTAP cluster, aggregate and SVM names
+// cannot contain "/", which makes the split unambiguous.
+type ONTAPRef struct {
+	ONTAPCluster string
+	Name         string
+}
+
+// String renders the ref in the wire form `aggr=` / `svm=` accept.
+func (r ONTAPRef) String() string { return r.ONTAPCluster + "/" + r.Name }
+
 // StorageRootKind is the one root parameter a storage-flow request carries.
 // Values are the wire parameter names.
 type StorageRootKind string
@@ -72,13 +85,19 @@ var StorageRootKinds = []StorageRootKind{
 // ProjectStorage against the built graph, because an id needs the ONTAP
 // cluster (or the Kubernetes cluster identity) that only the graph knows.
 // Pods are PodRef and claims are ClaimRef; every other kind — a PersistentVolume
-// (`pv`) included, being cluster-scoped and named bare — stores Names. Each is
-// sorted and de-duplicated, and a kind whose every value was empty is the zero
-// value (no root).
+// (`pv`) included, being cluster-scoped and named bare — stores Names, except
+// that an `aggr` / `svm` value of the form `<ontap_cluster>/<name>` is stored in
+// Qualified. Each is sorted and de-duplicated, and a kind whose every value was
+// empty is the zero value (no root).
 type StorageRoots struct {
 	Kind StorageRootKind
-	// Names is the value set for every kind except pod and pvc.
+	// Names is the value set for every kind except pod and pvc; for aggr and svm
+	// it holds the BARE values only (a name on every filer).
 	Names []string
+	// Qualified is the value set of the aggr and svm kinds' qualified values —
+	// one aggregate or SVM on one ONTAP cluster. A qualified value whose name is
+	// also a bare value is dropped at construction: the bare form subsumes it.
+	Qualified []ONTAPRef
 	// Pods is the value set when Kind is pod.
 	Pods []PodRef
 	// Claims is the value set when Kind is pvc.
@@ -87,7 +106,7 @@ type StorageRoots struct {
 
 // Any reports whether a root kind with at least one value was requested.
 func (r StorageRoots) Any() bool {
-	return r.Kind != "" && (len(r.Names) > 0 || len(r.Pods) > 0 || len(r.Claims) > 0)
+	return r.Kind != "" && (len(r.Names) > 0 || len(r.Qualified) > 0 || len(r.Pods) > 0 || len(r.Claims) > 0)
 }
 
 // HasName reports whether name is one of this root's non-pod values.
@@ -135,8 +154,10 @@ type StorageScope struct {
 //
 // A pod or pvc value must split on exactly one "/" into two non-empty segments;
 // anything else is an error, so a bare `?pod=orders-0` is rejected rather than
-// silently matching nothing. A pv value is a bare PersistentVolume name. An
-// unknown kind is an error.
+// silently matching nothing. A pv value is a bare PersistentVolume name. An aggr
+// or svm value containing "/" is the qualified `<ontap_cluster>/<name>` form and
+// must split the same way; a bare value is unchanged. An unknown kind is an
+// error.
 func NewStorageScope(clusters, namespaces []string, kind StorageRootKind, values []string) (StorageScope, error) {
 	roots, err := newStorageRoots(kind, values)
 	if err != nil {
@@ -176,12 +197,47 @@ func newStorageRoots(kind StorageRootKind, values []string) (StorageRoots, error
 			return StorageRoots{}, err
 		}
 		return StorageRoots{Kind: kind, Claims: claims}, nil
+	case StorageRootAggr, StorageRootSVM:
+		return ontapRoots(kind, kept)
 	default:
 		// every other kind, a PersistentVolume included, is a bare name
 	}
 	slices.Sort(kept)
 	kept = slices.Compact(kept)
 	return StorageRoots{Kind: kind, Names: kept}, nil
+}
+
+// ontapRoots splits `aggr=` / `svm=` values into bare names and qualified
+// `<ontap_cluster>/<name>` refs. A value with a "/" must split into two
+// non-empty segments on exactly one of them, else it is an error naming the
+// parameter and the expected shape. Both sets are sorted and de-duplicated, and a
+// qualified ref whose name is also bare is dropped: the bare form already roots
+// that name on every filer.
+func ontapRoots(kind StorageRootKind, values []string) (StorageRoots, error) {
+	var bare []string
+	var qualified []ONTAPRef
+	for _, v := range values {
+		if !strings.Contains(v, "/") {
+			bare = append(bare, v)
+			continue
+		}
+		oc, name, _ := strings.Cut(v, "/")
+		if oc == "" || name == "" || strings.Contains(name, "/") {
+			return StorageRoots{}, fmt.Errorf("invalid %s root %q: expected <name> or <ontap_cluster>/<name>", kind, v)
+		}
+		qualified = append(qualified, ONTAPRef{ONTAPCluster: oc, Name: name})
+	}
+	slices.Sort(bare)
+	bare = slices.Compact(bare)
+	slices.SortFunc(qualified, func(a, b ONTAPRef) int {
+		return cmp.Or(cmp.Compare(a.ONTAPCluster, b.ONTAPCluster), cmp.Compare(a.Name, b.Name))
+	})
+	qualified = slices.Compact(qualified)
+	qualified = slices.DeleteFunc(qualified, func(r ONTAPRef) bool { return slices.Contains(bare, r.Name) })
+	if len(qualified) == 0 {
+		qualified = nil
+	}
+	return StorageRoots{Kind: kind, Names: bare, Qualified: qualified}, nil
 }
 
 func nonEmpty(values []string) []string {

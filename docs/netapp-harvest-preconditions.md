@@ -93,17 +93,44 @@ build where hop A matched nothing issues no hop-B query at all.
 4. **Volumes with no QoS workload.** ONTAP does not collect a workload for every
    volume, so hop B can miss where hop A hit. The claim keeps its edge,
    aggregate, controller and `svm` and simply carries no `metrics` key.
-5. **A FlexVol name matched from two zones or environments.** The Harvest legs
-   carry the request's `az` / `env` matchers (see below), so only a build that
-   reads several zones' Harvest series — an unfiltered request — can see two
-   filers whose volume names both match one claim's token. Both are then
-   candidates, and the claim joins the
-   lexically-smallest `(ontap_cluster, aggr)` with no warning. FlexVol names
-   derived from Kubernetes PV names (`pvc-<uuid>`) do not collide; a
-   hand-chosen naming scheme that does is the operator's risk. Everything the
-   claim resolves stays on the filer that pick landed on: the `svm` label, the
-   QoS workloads that measure the edge, and the `(ontap_cluster, svm)` pair the
-   throughput ceiling is keyed on all come from that filer's series alone.
+5. **A FlexVol name matched from two zones or environments.** A claim joins
+   only FlexVols of its OWN zone: its `volume_labels` candidates are restricted
+   to series whose `az` / `env` agree with the pair its
+   `kube_persistentvolumeclaim_info` series carries. A series is excluded only
+   when BOTH sides carry a complete pair and the pairs differ, so a Harvest
+   series with no `az` / `env` still competes for every claim. Two filers of
+   ONE zone whose volume names both match a claim's token are still both
+   candidates, and the claim joins the lexically-smallest
+   `(ontap_cluster, aggr)` with no warning. FlexVol names derived from
+   Kubernetes PV names (`pvc-<uuid>`) do not collide; a hand-chosen naming
+   scheme that does is the operator's risk. Everything the claim resolves stays
+   on the filer that pick landed on: the `svm` label, the QoS workloads that
+   measure the edge, and the `(ontap_cluster, svm)` pair the throughput ceiling
+   is keyed on all come from that filer's series alone. The excluded series
+   still names its aggregate, controller and SVM for the owner vote and the
+   storage inventory.
+
+## ONTAP cluster and controller names must be unique across the estate
+
+Every NetApp node id is qualified by its ONTAP cluster
+(`netapp/<ontap_cluster>/…`), and a `/v1/storage-graph` request may select
+several zones and environments in one body. The graph therefore assumes **an
+ONTAP cluster name — and a controller name — identifies one filer across the
+whole estate**: two filers sharing either merge into one node on BOTH endpoints
+(their aggregates, SVMs and claims land under one controller and one storage
+cluster), in `/v1/graph` and `/v1/storage-graph` alike. Aggregate and SVM names
+are NOT required to be unique — `aggr1` and `svm0` recur on every filer — which
+is why `aggr=` / `svm=` accept `<ontap_cluster>/<name>` to root exactly one.
+Check the assumption before selecting several zones:
+
+```promql
+count by (cluster) (count by (cluster, az, env) (node_labels)) > 1
+```
+
+Any row it returns is an ONTAP cluster name reported in more than one zone or
+environment. That is legitimate for ONE filer that several zones' Harvest
+pollers scrape (each stamping its own `az` / `env`); it is a collision when the
+name belongs to two different filers.
 
 ## Storage-rooted requests read claims FROM the FlexVol name
 
@@ -113,8 +140,9 @@ and derives candidate PersistentVolume names from their `volume` label — every
 suffix that starts with `pvc_` at the start of the name or right after a `_`,
 with `_` rewritten to `-` (`trident_pvc_ab12_cd34` → `pvc-ab12-cd34`). Only
 claims bound to a candidate PV are read, under the request's `az` / `env`
-matchers and from the backends its `az` selects — a filer shared across zones
-is drawn with the requested zone's claims only. The
+matchers and from the backends its `az` values select — a filer shared across
+zones is drawn with the selected zones' claims only, each joining only FlexVols
+of its own zone. The
 configured derivation above still decides every pick; extraction only decides
 which claims are loaded. That adds a precondition the forward join does not
 have:
@@ -144,7 +172,8 @@ storage-rooted request find fewer claims, never attach a wrong one.
 
 Every Harvest series MUST carry the configured `az` / `env` labels (default
 `az` / `env`, see `--az-label` / `--env-label`) — the same two labels
-kube-state-metrics carries. The `az` / `env` request filters are pushed down as
+kube-state-metrics carries. The `az` / `env` request filters (repeatable on
+`/v1/storage-graph`, as on `/v1/graph`) are pushed down as
 PromQL matchers on every Harvest query exactly as on the kube-state-metrics and
 kubelet families, and `?az=` also selects which `harvest` backend of the
 routing table is asked (see `upstream-backend-routing.md`). A request therefore

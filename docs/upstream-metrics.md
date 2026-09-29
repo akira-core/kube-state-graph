@@ -266,9 +266,16 @@ components, in phases:
    when the request carries `ontap_cluster=` (a request rooted at ONTAP
    clusters alone issues `volume_labels{cluster=~"…"}`). Each group is chunked
    by the same byte budget, charging the repeated matcher at its rendered
-   length; the groups' results are merged de-duplicated by label set.
+   length; the groups' results are merged de-duplicated by label set. A
+   **qualified** `aggr=<ontap_cluster>/<name>` / `svm=<ontap_cluster>/<name>` value
+   adds one group per ONTAP cluster after the bare groups —
+   `volume_labels{cluster="ontap-prod",aggr=~"aggr1|aggr2"}` — so an aggregate or
+   SVM of that name on another filer is never read for the root; the aggregate
+   gauges of a qualified aggregate are read the same way, one query per ONTAP
+   cluster and family.
    **Capped:** these are repeatable parameters whose count nothing bounds, so a
-   restriction that would take more than sixteen queries in total is rejected
+   restriction that would take more than sixteen queries in total, every bare and
+   qualified group counted, is rejected
    as `invalid_scope` before any query, and no body is returned.
 2. **Owner completion — SVM roots only.** An aggregate's owning controller is a
    vote over every one of its series, and an SVM group returns only the SVM's

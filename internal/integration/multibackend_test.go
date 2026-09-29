@@ -617,3 +617,152 @@ volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="onta
 	}
 	s.Positive(flows, "the zone-a claim's path is drawn end to end")
 }
+
+// zonesNow dates the multi-zone fixtures four hours after fixedNow, clear of
+// every other fixture of this suite (hubNow is two hours out).
+var zonesNow = fixedNow.Add(4 * time.Hour)
+
+// zonesFixture ingests two zones, each in its own installation, that run a
+// cluster of the SAME raw name, serve an aggregate `aggr1` and a FlexVol of the
+// same name, and hold a claim of the same name: zone-a's on filer ontap-za
+// (installation A), zone-b's on filer ontap-zb (installation B).
+func (s *MultiBackendSuite) zonesFixture() {
+	s.T().Helper()
+	t1 := zonesNow.Unix() * 1000
+	zone := func(az, oc string, ops int) string {
+		return fmt.Sprintf(`
+kube_pod_info{cluster="zn-c1",namespace="shop",pod="orders-0",uid="zn-uid-%[1]s",node="zn-worker",az="%[1]s",env="prod"} 1 %[4]d
+kube_node_info{cluster="zn-c1",node="zn-worker",az="%[1]s",env="prod"} 1 %[4]d
+kube_persistentvolumeclaim_info{cluster="zn-c1",namespace="shop",persistentvolumeclaim="orders-data",storageclass="netapp-nas",volumename="pvc-zn-orders",az="%[1]s",env="prod"} 1 %[4]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="zn-c1",namespace="shop",pod="orders-0",volume="data",persistentvolumeclaim="orders-data",az="%[1]s",env="prod"} 1 %[4]d
+volume_labels{volume="trident_pvc_zn_orders",cluster="%[2]s",node="%[2]s-01",aggr="aggr1",svm="svm_shop",az="%[1]s",env="prod"} 1 %[4]d
+qos_read_ops{volume="trident_pvc_zn_orders",cluster="%[2]s",svm="svm_shop",policy_group="",az="%[1]s",env="prod"} %[3]d %[4]d
+aggr_new_status{cluster="%[2]s",node="%[2]s-01",aggr="aggr1",az="%[1]s",env="prod"} 1 %[4]d
+node_new_status{cluster="%[2]s",node="%[2]s-01",az="%[1]s",env="prod"} 1 %[4]d
+`, az, oc, ops, t1)
+	}
+	s.IngestExpFmt(zone("zone-a", "ontap-za", 100))
+	s.ingestInto(s.secondURL, zone("zone-b", "ontap-zb", 900))
+	s.Require().True(s.WaitForSeries(`volume_labels{cluster="ontap-za"}`, zonesNow, 30*time.Second))
+	s.Require().True(s.WaitForSeries(`kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",persistentvolumeclaim="orders-data"}`, zonesNow, 30*time.Second))
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{cluster="ontap-zb"}`, zonesNow, 30*time.Second))
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-b",persistentvolumeclaim="orders-data"}`, zonesNow, 30*time.Second))
+}
+
+// zonesBackends is one ksm + kubelet backend and one harvest backend per zone,
+// zone-a's on installation A and zone-b's on installation B.
+func (s *MultiBackendSuite) zonesBackends() []promql.Backend {
+	k8s := []promql.Family{promql.FamilyKSM, promql.FamilyKubelet}
+	return []promql.Backend{
+		promql.NewBackend("k8s-a", s.VMURL(),
+			slices.Concat(k8s, []promql.Family{promql.FamilyServiceGraph, promql.FamilyProbe}), []string{"zone-a"}, "", ""),
+		promql.NewBackend("k8s-b", s.secondURL, k8s, []string{"zone-b"}, "", ""),
+		promql.NewBackend("netapp-a", s.VMURL(), []promql.Family{promql.FamilyHarvest}, []string{"zone-a"}, "", ""),
+		promql.NewBackend("netapp-b", s.secondURL, []promql.Family{promql.FamilyHarvest}, []string{"zone-b"}, "", ""),
+	}
+}
+
+// storageBody requests /v1/storage-graph over zonesNow with the given az values
+// and one further parameter (the root).
+func (s *MultiBackendSuite) storageBody(srv *httptest.Server, azs []string, rootKey, rootValue string) cytoscape.Body {
+	s.T().Helper()
+	q := url.Values{}
+	q.Set("start", strconv.FormatInt(zonesNow.Add(-5*time.Minute).Unix(), 10))
+	q.Set("end", strconv.FormatInt(zonesNow.Unix(), 10))
+	q["az"] = azs
+	q.Set("env", "prod")
+	q.Set(rootKey, rootValue)
+	resp := s.httpGet(srv.URL + "/v1/storage-graph?" + q.Encode())
+	defer func() { _ = resp.Body.Close() }()
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	var body cytoscape.Body
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&body))
+	return body
+}
+
+// elementJSON keys every element of a body by id, as the JSON it serialises to.
+func (s *MultiBackendSuite) elementJSON(body cytoscape.Body) (nodes, edges map[string]string) {
+	s.T().Helper()
+	nodes, edges = map[string]string{}, map[string]string{}
+	for _, n := range body.Elements.Nodes {
+		raw, err := json.Marshal(n)
+		s.Require().NoError(err)
+		nodes[n.Data.ID] = string(raw)
+	}
+	for _, e := range body.Elements.Edges {
+		raw, err := json.Marshal(e)
+		s.Require().NoError(err)
+		edges[e.Data.ID] = string(raw)
+	}
+	return nodes, edges
+}
+
+// TestStorageGraphMultiZoneIsTheUnionOfItsZones (accept-multi-zone-storage-graph
+// task 7.1): against two zone-scoped installations, a request selecting both
+// zones draws both and equals — element for element, weights included — the
+// union of the two single-zone requests, although the two zones share a cluster
+// name, an aggregate name, a FlexVol name and a claim name.
+func (s *MultiBackendSuite) TestStorageGraphMultiZoneIsTheUnionOfItsZones() {
+	s.zonesFixture()
+	srv := s.startRoutedAPI(s.zonesBackends())
+
+	a := s.storageBody(srv, []string{"zone-a"}, "aggr", "aggr1")
+	b := s.storageBody(srv, []string{"zone-b"}, "aggr", "aggr1")
+	both := s.storageBody(srv, []string{"zone-b", "zone-a"}, "aggr", "aggr1")
+
+	aNodes, aEdges := s.elementJSON(a)
+	bNodes, bEdges := s.elementJSON(b)
+	gotNodes, gotEdges := s.elementJSON(both)
+	s.Require().NotEmpty(aNodes)
+	s.Require().NotEmpty(bNodes)
+
+	s.Contains(aNodes, "netapp/ontap-za/aggr/aggr1")
+	s.NotContains(aNodes, "netapp/ontap-zb/aggr/aggr1", "zone-b's filer is not asked by a zone-a request")
+	s.Contains(bNodes, "netapp/ontap-zb/aggr/aggr1")
+
+	wantNodes, wantEdges := map[string]string{}, map[string]string{}
+	for _, m := range []map[string]string{aNodes, bNodes} {
+		for k, v := range m {
+			wantNodes[k] = v
+		}
+	}
+	for _, m := range []map[string]string{aEdges, bEdges} {
+		for k, v := range m {
+			wantEdges[k] = v
+		}
+	}
+	s.Equal(wantNodes, gotNodes, "the multi-zone nodes are the union of the single-zone nodes")
+	s.Equal(wantEdges, gotEdges, "the multi-zone edges, weights included, are the union of the single-zone edges")
+
+	s.Equal([]string{"zone-a-prod-zn-c1", "zone-b-prod-zn-c1"}, both.Clusters,
+		"the shared cluster name is two identities")
+	s.Contains(gotNodes, "zone-a-prod-zn-c1/shop/orders-data")
+	s.Contains(gotNodes, "zone-b-prod-zn-c1/shop/orders-data")
+
+	reads := map[string]float64{}
+	for _, e := range both.Elements.Edges {
+		if e.Data.Type == string(graph.EdgeTypeStorageFlow) && e.Data.Metrics != nil && e.Data.Metrics.ReadOps != nil {
+			reads[e.Data.Target] = *e.Data.Metrics.ReadOps
+		}
+	}
+	s.InDelta(100.0, reads["zone-a-prod-zn-c1/shop/orders-data"], 1e-9, "each claim carries its own zone's measurement")
+	s.InDelta(900.0, reads["zone-b-prod-zn-c1/shop/orders-data"], 1e-9, "and the two are never summed")
+}
+
+// A qualified `aggr=<ontap_cluster>/<name>` roots one filer's aggregate although
+// the bare name exists on the other zone's filer too, and both zones are
+// selected.
+func (s *MultiBackendSuite) TestStorageGraphQualifiedAggregateRootDrawsOneFiler() {
+	s.zonesFixture()
+	srv := s.startRoutedAPI(s.zonesBackends())
+
+	bare := nodeIDs(s.storageBody(srv, []string{"zone-a", "zone-b"}, "aggr", "aggr1"))
+	s.Contains(bare, "netapp/ontap-za/aggr/aggr1")
+	s.Contains(bare, "netapp/ontap-zb/aggr/aggr1", "the bare name roots every filer of the selected zones")
+
+	qualified := nodeIDs(s.storageBody(srv, []string{"zone-a", "zone-b"}, "aggr", "ontap-zb/aggr1"))
+	s.Contains(qualified, "netapp/ontap-zb/aggr/aggr1")
+	s.Contains(qualified, "zone-b-prod-zn-c1/shop/orders-data", "the rooted filer's claim, with its full path")
+	s.NotContains(qualified, "netapp/ontap-za/aggr/aggr1", "the same name on the other filer is not a root")
+	s.NotContains(qualified, "zone-a-prod-zn-c1/shop/orders-data", "and neither is a claim reachable only through it")
+}

@@ -3,6 +3,7 @@ package graph
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -352,13 +353,27 @@ func genStorageScope(r *rand.Rand, g *Graph) StorageScope {
 	case 0:
 		return StorageScope{}
 	case 1:
+		// Each value is picked either bare (that name on every filer) or
+		// qualified by its ONTAP cluster (exactly one component), so the
+		// invariants below hold for both forms.
 		var aggrs, svms []string
+		pick := func(n GraphNode) string {
+			if r.Intn(2) == 0 {
+				return n.Name()
+			}
+			return n.Labels()["ontap_cluster"] + "/" + n.Name()
+		}
+		nodes := make([]GraphNode, 0, len(g.NodesByID))
 		for _, n := range g.NodesByID {
+			nodes = append(nodes, n)
+		}
+		sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID() < nodes[j].ID() })
+		for _, n := range nodes {
 			switch n.Type() {
 			case NodeTypeNetAppAggr:
-				aggrs = append(aggrs, n.Name())
+				aggrs = append(aggrs, pick(n))
 			case NodeTypeNetAppSVM:
-				svms = append(svms, n.Name())
+				svms = append(svms, pick(n))
 			default:
 				// other kinds are not storage roots
 			}

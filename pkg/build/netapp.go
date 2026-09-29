@@ -38,6 +38,10 @@ type volumeLabelCandidate struct {
 	node         string
 	aggr         string
 	svm          string
+	// zone is the (az, env) pair the series carries; zoned is false when either
+	// label is absent, which the zone-agreement rule never excludes.
+	zone  zone
+	zoned bool
 }
 
 // qosCandidate is one Harvest QoS workload sample — hop B. It carries no
@@ -61,9 +65,14 @@ type qosCandidate struct {
 	value  float64
 }
 
-// pvcVolume is a PVC that carries a non-empty volumename (the join key).
+// pvcVolume is a PVC that carries a non-empty volumename (the join key). Its
+// zone is the (az, env) pair its kube_persistentvolumeclaim_info series carries
+// (zoned is false when either label is absent): a claim joins only FlexVols of
+// its own zone (accept-multi-zone-storage-graph).
 type pvcVolume struct {
 	id, volumeName string
+	zone           zone
+	zoned          bool
 }
 
 // netappResult is the demand-driven output of resolveNetAppStorage.
@@ -159,11 +168,19 @@ func aggrKeyOf(m model.Metric) (aggrKey, bool) {
 // The hops degrade independently: a hop-B miss leaves a valid measurement-less
 // edge rather than erasing the claim's storage topology. Pure except for the
 // two aggregated coverage warnings (D8).
+//
+// A claim's candidate set — the matched series every pick runs over — holds only
+// series whose zone agrees with the claim's (zonesAgree: an unknown zone on
+// either side never excludes). The exclusion narrows a claim's candidates ONLY:
+// volIndex and allByAggr stay unfiltered, so the owner vote and the inventory
+// see every series. keys are the configured az / env label names.
+//
 // The Harvest vectors arrive as the topologyVectors bundle rather than as a
 // positional list. Nineteen same-typed model.Vector parameters are trivially
 // transposable and the compiler cannot catch it; the bundle names every one at
 // the call site and makes adding a family a one-field edit.
-func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
+func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.LabelKeys) netappResult {
+	keys = keys.OrDefault()
 	rw := v.volumeKey()
 	volumeLabels := v.VolumeLabels
 	readOps, writeOps := v.QoSReadOps, v.QoSWriteOps
@@ -189,15 +206,21 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		if vol == "" || oc == "" {
 			continue
 		}
+		cz, czoned := zoneOf(s.Metric, keys)
 		cand := volumeLabelCandidate{
 			ontapCluster: oc,
 			node:         string(s.Metric["node"]),
 			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
+			zone:         cz,
+			zoned:        czoned,
 		}
 		volIndex[vol] = append(volIndex[vol], cand)
 		matched = matcher.match(vol, matched)
 		for _, ci := range matched {
+			if !zonesAgree(claims[ci].zone, claims[ci].zoned, cand.zone, cand.zoned) {
+				continue
+			}
 			candsByClaim[ci] = append(candsByClaim[ci], cand)
 			if volSeenByClaim[ci] == nil {
 				volSeenByClaim[ci] = map[string]bool{}

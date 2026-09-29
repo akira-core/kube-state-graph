@@ -187,7 +187,7 @@ func readScopedApplications(
 			owned = append(owned, *dst...)
 		}
 	}
-	pods := podKeysOf(owned)
+	pods := podKeysOf(owned, opts.LabelKeys.OrDefault())
 	if err := readApplicationBindings(ctx, q, window, end, opts, sel, pods, roots, v, scopeMu); err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func readApplicationBindings(
 		for _, k := range pods {
 			recovered[k] = struct{}{}
 		}
-		tracked = keepPodBindings(byPod, recovered)
+		tracked = keepPodBindings(byPod, recovered, lk)
 	}
 	keys := trackedClaimKeys(tracked, lk)
 	for k := range ann {

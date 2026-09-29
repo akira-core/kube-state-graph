@@ -263,7 +263,8 @@ func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]strin
 		if cluster == "" || aggr == "" {
 			continue
 		}
-		if slices.Contains(plan.volumeClusters, cluster) || slices.Contains(plan.volumeAggrs, aggr) {
+		if slices.Contains(plan.volumeClusters, cluster) || slices.Contains(plan.volumeAggrs, aggr) ||
+			slices.Contains(plan.volumeAggrPairs[cluster], aggr) {
 			continue
 		}
 		out[cluster] = append(out[cluster], aggr)

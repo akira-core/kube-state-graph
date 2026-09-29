@@ -1,7 +1,6 @@
 package build
 
 import (
-	"cmp"
 	"context"
 	"slices"
 	"sync"
@@ -53,8 +52,9 @@ func podRefsOf(rows model.Vector) []graph.PodRef {
 	return out
 }
 
-// podRefsOfKeys drops the cluster of each key: a pod-keyed read is issued per
-// namespace across the clusters the request selects.
+// podRefsOfKeys drops the zone and cluster of each key: a pod-keyed read is
+// issued per namespace across the clusters and zones the request selects, and
+// the key filters the rows it returns.
 func podRefsOfKeys(keys []podSeriesKey) []graph.PodRef {
 	out := make([]graph.PodRef, 0, len(keys))
 	for _, k := range keys {
@@ -63,23 +63,16 @@ func podRefsOfKeys(keys []podSeriesKey) []graph.PodRef {
 	return out
 }
 
-// podKeysOf returns the sorted, de-duplicated (cluster, namespace, pod) of
-// every row naming a pod.
-func podKeysOf(rows model.Vector) []podSeriesKey {
+// podKeysOf returns the sorted, de-duplicated (az, env, cluster, namespace, pod)
+// of every row naming a pod.
+func podKeysOf(rows model.Vector, keys promql.LabelKeys) []podSeriesKey {
 	out := make([]podSeriesKey, 0, len(rows))
 	for _, s := range rows {
-		k := podSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric[promql.NamespaceLabel]),
-			pod:       string(s.Metric[promql.PodLabel]),
-		}
-		if k.pod != "" {
+		if k := podSeriesKeyOf(s.Metric, keys); k.pod != "" {
 			out = append(out, k)
 		}
 	}
-	slices.SortFunc(out, func(a, b podSeriesKey) int {
-		return cmp.Or(cmp.Compare(a.cluster, b.cluster), cmp.Compare(a.namespace, b.namespace), cmp.Compare(a.pod, b.pod))
-	})
+	slices.SortFunc(out, comparePodSeriesKeys)
 	return slices.Compact(out)
 }
 
