@@ -67,6 +67,14 @@ type Topology struct {
 	StorageEdges []*graph.Edge
 	PodPVCs      []PodPVCBinding
 
+	// ClaimSeeded records that the build was claim-seeded (a pvc or pv root),
+	// copied from topologyVectors.MaterialiseUnboundClaims by the parse. It is
+	// the ONE statement of that fact downstream of the read: the parse has
+	// materialised every root claim no pod mounts, and assembleStorageFlow
+	// draws their chains as sinks. Carrying it here rather than as a second
+	// argument keeps the two from disagreeing.
+	ClaimSeeded bool
+
 	// NetAppInventory is every NetApp entity the Harvest read NAMED, whether or
 	// not a claim joined it. It is deliberately wider than NetAppAggrs /
 	// NetAppNodes above, which stay join-only so GET /v1/graph is unchanged:

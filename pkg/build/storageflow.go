@@ -42,16 +42,16 @@ type storageChain struct {
 // the RETAINED flow units — weights baked over the full estate would fail to
 // conserve the moment a filter or a root removed a unit.
 //
-// sinkUnmounted is true iff the build is claim-seeded (a pvc or pv root). Every
+// Unmounted claims are drawn iff topology.ClaimSeeded (a pvc or pv root). Every
 // claim such a build tracks IS a root claim — mounter completion loads pods,
 // never further claims — so the builder needs no root matching to know which
 // unmounted chains to draw: under a claim seed it draws them all, ending at the
 // claim, and under every other plan it draws none, exactly as before. The
 // projection still decides which of them a body retains.
-func assembleStorageFlow(topology Topology, sinkUnmounted bool) ([]graph.GraphNode, []*graph.Edge) {
+func assembleStorageFlow(topology Topology) ([]graph.GraphNode, []*graph.Edge) {
 	nodes := storageFlowNodes(topology)
 	chains := storageChains(topology)
-	edges := storageFlowEdges(chains, topology.PodPVCs, podNodeIDs(topology), sinkUnmounted)
+	edges := storageFlowEdges(chains, topology.PodPVCs, podNodeIDs(topology), topology.ClaimSeeded)
 
 	graph.SortNodes(nodes)
 	graph.SortEdges(edges)

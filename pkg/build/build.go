@@ -291,12 +291,15 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		return nil, err
 	}
 	q := b.querierFor(sel)
+	// Both a storage-side root (phase 1) and a claim root (the claim seed) read
+	// the claim side through the hub's claim-keyed reads.
+	volumeHub := plan.rootedClaims() || plan.claimSeeded()
 	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
 			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
-			attribute.Bool("kube_state_graph.volume_hub", plan.rootedClaims()),
+			attribute.Bool("kube_state_graph.volume_hub", volumeHub),
 		),
 	)
 	defer span.End()
@@ -306,7 +309,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
 
-	nodes, edges := assembleStorageFlow(topology, plan.claimSeeded())
+	nodes, edges := assembleStorageFlow(topology)
 	// Same "bake before freeze" point as Build: the overlay must reach this
 	// endpoint identically, since it is resolved onto the graph rather than by
 	// a projection.
@@ -325,7 +328,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
-		"volume_hub", plan.rootedClaims(),
+		"volume_hub", volumeHub,
 	)
 	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
 

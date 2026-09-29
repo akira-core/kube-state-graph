@@ -545,8 +545,10 @@ func TestParseTopology_MaterialisesUnboundClaimsOnlyWhenClaimSeeded(t *testing.T
 	}
 
 	assert.Empty(t, unbound(false).PVCs, "outside a claim seed an unmounted claim is not a node")
+	assert.False(t, unbound(false).ClaimSeeded)
 
 	tp := unbound(true)
+	assert.True(t, tp.ClaimSeeded, "the parse carries the fact to assembleStorageFlow")
 	require.Len(t, tp.PVCs, 2)
 	assert.Equal(t, "zone-a-prod-c1/shop/orphan-a", tp.PVCs[0].ID(), "sorted, so the result never depends on vector order")
 	assert.Equal(t, "zone-a-prod-c1/shop/orphan-b", tp.PVCs[1].ID())

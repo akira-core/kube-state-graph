@@ -563,6 +563,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		SVMByPVC:            netapp.svmByPVC,
 		Alerts:              v.Alerts,
 		PodPVCs:             bindings,
+		ClaimSeeded:         v.MaterialiseUnboundClaims,
 		PodsByUID:           podsByUID,
 		ServicesByNameNS:    servicesByNameNS,
 		EndpointsByService:  endpointsByService,
