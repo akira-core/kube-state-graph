@@ -225,6 +225,29 @@ when a claim matched. `TestBuildStorage_FanOutLegCount_Hub` pins:
 | `aggr=`, one StatefulSet-owned pod on a matched volume | 31 | 2 (phase 1, phase 2) |
 | `svm=`, the same path | 31 | 3 (phase 1, owner completion, phase 2) |
 
+**A claim root or a volume root is the cheapest seed.** `pvc=<namespace>/<claim>`
+and `pv=<name>` name the claim directly, so the seed IS the claim-side read:
+`kube_persistentvolumeclaim_info` restricted on the roots — one query per
+namespace for `pvc=` (`{namespace="shop",persistentvolumeclaim=~"cache|orders-data"}`),
+one query over the bare names for `pv=` (`{volumename=~"…"}`) — kept only when
+the row is a root, with no `volume_labels` read in front of it. Nothing but
+`ALERTS` runs beside it. The claims that read returns feed the same expansion a
+storage-side root uses: the claim-binding family, claim annotations and the two
+kubelet families by claim (so every mounter is loaded), then the token read that
+completes the claim's FlexVol candidates, then the pod / node / controller /
+QoS / Harvest waves. Both seeds are request-derived scopes: more than sixteen
+queries in total (namespaces summed for `pvc=`) is rejected as `invalid_scope`
+before any query. A root naming no claim issues nothing further. A claim bound
+to a statically provisioned PV is reached, because the seed does not derive
+candidates from a FlexVol name. `TestBuildStorage_FanOutLegCount_Hub` pins:
+
+| Request | Queries | Notes |
+|---|---|---|
+| `pvc=` / `pv=` naming no claim | 2 | `ALERTS`, `kube_persistentvolumeclaim_info` |
+| one claim, mounted by nothing, joining no FlexVol | 7 | + bindings, claim annotations, kubelet ×2, one `volume_labels` token read |
+| the same claim on a matched volume | 25 | + owner completion (a second `volume_labels`), QoS ×6, fixed policy ×2, aggregate gauges ×3, controller families ×6 |
+| one StatefulSet-owned pod mounting it, on a matched volume | 32 | + pods ×2, nodes ×4, `kube_statefulset_annotations` |
+
 **A pod root is keyed by `<namespace>/<pod>`.** The seed reads claim bindings
 restricted on those namespaces and pod names and keeps only the root refs. The
 parser does not add the roots' namespaces to the request selector. An explicit

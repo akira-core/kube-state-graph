@@ -299,6 +299,10 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 	if err != nil {
 		return nil, err
 	}
+	plan, err = plan.prepareClaimSeed(b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	if err != nil {
+		return nil, err
+	}
 	plan, err = plan.prepareApplicationSeed(b.opts.qosScopeBatchBytes())
 	if err != nil {
 		return nil, err
@@ -323,7 +327,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
 
-	nodes, edges := assembleStorageFlow(topology)
+	nodes, edges := assembleStorageFlow(topology, plan.claimSeeded())
 	// Same "bake before freeze" point as Build: the overlay must reach this
 	// endpoint identically, since it is resolved onto the graph rather than by
 	// a projection.

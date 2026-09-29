@@ -126,7 +126,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, err
 	}
 
-	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "application"} {
+	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "pvc", "pv", "application"} {
 		if err := validateSelectorValues(p, v[p]); err != nil {
 			return req, err
 		}
@@ -137,7 +137,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, rerr
 	}
 	// oneStorageRoot returned a kind holding at least one non-empty value, and
-	// NewStorageScope drops only empty values (a malformed pod is an error), so
+	// NewStorageScope drops only empty values (a malformed pod or pvc is an error), so
 	// the scope always carries a root here.
 	scope, serr := graph.NewStorageScope(v["cluster"], v["namespace"], kind, values)
 	if serr != nil {
@@ -156,7 +156,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 // storageRootParams is the root parameters in the order a mixed-kind error
 // names them.
 var storageRootParams = []string{
-	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "application",
+	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "pvc", "pv", "application",
 }
 
 // oneStorageRoot returns the single root kind that carries a non-empty value.

@@ -122,8 +122,9 @@ Three things a client can see:
   bound to a PV whose name embeds no `pvc_` (a static PV, a provisioner with a
   custom volume-name prefix or a Trident `nameTemplate`) draws no path in a
   storage-graph body, even though the forward join would match it. `/v1/graph`,
-  rootless storage requests and requests rooted only at `pod=`,
-  `application=` or `node=` still join it. Size it with
+  rootless storage requests and requests rooted only at `pod=`, `pvc=`, `pv=`,
+  `application=` or `node=` still join it — `pv=` / `pvc=` is the way to root
+  at such a claim. Size it with
   `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
 - **`svm=` restricts the Harvest read, and `node=` no longer disables it.**
   Phase 1 of the `volume_labels` read gains an `{svm=~…}` query group
@@ -203,6 +204,45 @@ carries an upstream URL, host or address.
 traffic" should surface the 502 message instead. Operators who relied on the
 storage view surviving a Harvest or kubelet store outage lose that: the view
 now reports the outage.
+
+## Non-breaking: `/v1/storage-graph` accepts `pvc=` and `pv=` roots
+
+*storage-graph-api — One root kind per request; Every root kind is tracked from its own tier to its claims; Roots are always materialised when the upstream knows them; Flow weights on every tier; Storage-reachability projection.*
+
+Not a compatibility break on the wire. `pvc=<namespace>/<claim>` roots a
+PersistentVolumeClaim in every cluster of the selected estate, and `pv=<name>`
+roots the claim(s) bound to a PersistentVolume by its bare name, matched on the
+`volumename` of `kube_persistentvolumeclaim_info`. Both are repeatable, count as
+one root kind (a request mixing them with another kind is the existing 400
+`invalid_scope`, the message naming the parameters in the order `… pod, pvc,
+pv, application`), and a malformed `pvc` — anything but exactly one `/` between
+two non-empty segments — is 400 `invalid_scope`. A request that sends neither
+issues the same queries and returns a byte-identical body.
+
+- **Static PVs are reachable.** The seed reads `kube_persistentvolumeclaim_info`
+  directly instead of deriving PV candidates from a FlexVol name, so a claim
+  bound to a statically provisioned PV is found; whether it lands on a FlexVol
+  is still decided by the forward join, exactly as on `/v1/graph`.
+- **An unmounted root claim keeps its storage-side path.** Every other root kind
+  drops a claim no pod mounts. A claim that is itself a `pvc=` / `pv=` root
+  keeps `node-aggr → aggr-svm → svm-pvc` and ends at the claim: its whole
+  measurement is summed onto its `svm-pvc` edge and every hop above it, with no
+  `pvc-pod` edge below. An unmounted claim that is not a root stays dropped.
+- **The seed is one read.** It is the
+  `kube_persistentvolumeclaim_info` read itself, one query per namespace for
+  `pvc=`; a root set past sixteen queries is 400 `invalid_scope` before any
+  query. See [upstream-metrics.md](upstream-metrics.md) for the fan-out.
+
+### In-process embedders
+
+`graph.StorageRootKinds` gains `pvc` and `pv`; `graph.ClaimRef` and
+`graph.StorageRoots.Claims` are new (`pv` values ride in `Names`). Code that
+switches exhaustively on `StorageRootKind` must handle both.
+`promql.RenderPodsInNamespace` is **replaced** by
+`promql.RenderNamesInNamespace(q, window, keys, sel, namespace, label, names)`;
+pass `promql.PodLabel` for the pod-keyed families it accepted before.
+`build.Topology` and the rendered queries of every existing request are
+unchanged.
 
 ## Non-breaking: `/v1/storage-graph` accepts an `application=` root
 

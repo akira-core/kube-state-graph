@@ -101,11 +101,18 @@ func volumeNames(rows model.Vector) []string {
 // family's scopedLabel, and keep, the reader-side filter applied to whatever
 // the query returned — the restriction's own predicate, plus the claim-key
 // filter of the four claim-name families.
+//
+// render and budgetReserve, when set, replace the family's identity-label
+// rendering and take a fixed cost off the byte budget once per chunk — the
+// per-namespace claim seed renders a namespace equality beside its names
+// (see scopedFamily).
 type claimFamily struct {
-	query promql.Query
-	dst   *model.Vector
-	scope []string
-	keep  func(model.Metric) bool
+	query         promql.Query
+	dst           *model.Vector
+	scope         []string
+	keep          func(model.Metric) bool
+	render        func(chunk []string) (string, bool)
+	budgetReserve int
 }
 
 // issueClaimKeyed issues each family restricted to its scope, chunked under
@@ -130,7 +137,13 @@ func issueClaimKeyed(
 		if len(f.scope) == 0 {
 			continue
 		}
-		scoped = append(scoped, scopedFamily{query: f.query, dst: f.dst, scope: f.scope})
+		scoped = append(scoped, scopedFamily{
+			query:         f.query,
+			dst:           f.dst,
+			scope:         f.scope,
+			render:        f.render,
+			budgetReserve: f.budgetReserve,
+		})
 	}
 	if len(scoped) > 0 {
 		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {

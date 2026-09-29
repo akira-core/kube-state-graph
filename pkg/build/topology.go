@@ -290,6 +290,14 @@ type topologyVectors struct {
 	// derivation that does not fit the estate's naming from a claim the request
 	// did not ask about, and is suppressed.
 	VolumeLabelsRestricted bool
+	// MaterialiseUnboundClaims records that the build is claim-seeded (a pvc or
+	// pv root): every claim its claim-info read returned is a root claim, and a
+	// root claim no pod mounts has no binding to materialise it, so the parse
+	// builds its PVC node — and runs the Harvest join over it — from the
+	// claim-info row. Off everywhere else, which keeps /v1/graph and every other
+	// root kind from drawing an unmounted claim. A build-scoped FACT like
+	// VolumeLabelsRestricted.
+	MaterialiseUnboundClaims bool
 	// NetApp Harvest storage series, in join order (design.md D3):
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
@@ -424,6 +432,10 @@ func readTopology(
 	if prepErr != nil {
 		return Topology{}, prepErr
 	}
+	plan, prepErr = plan.prepareClaimSeed(opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	if prepErr != nil {
+		return Topology{}, prepErr
+	}
 	plan, prepErr = plan.prepareApplicationSeed(opts.qosScopeBatchBytes())
 	if prepErr != nil {
 		return Topology{}, prepErr
@@ -433,6 +445,7 @@ func readTopology(
 		return Topology{}, prepErr
 	}
 	v.VolumeLabelsRestricted = plan.rootedClaims()
+	v.MaterialiseUnboundClaims = plan.claimSeeded()
 
 	// callerCtx is the CALLER's context, captured before errgroup shadows ctx.
 	// fetchOptional must distinguish "the caller went away (build timeout /
@@ -526,10 +539,10 @@ func readTopology(
 		promql.QPVCBindings:    bindingsDone,
 		promql.QPVCAnnotations: pvcAnnotationsDone,
 	}
-	if plan.rootedClaims() {
-		// The claim families are not beside-seed legs for a Harvest root: the
-		// claim-keyed reads below close these three channels when they return,
-		// and closing them here as well would panic.
+	if plan.rootedClaims() || plan.claimSeeded() {
+		// The claim families are not beside-seed legs for a Harvest root or a
+		// claim root: the claim-keyed reads below close these three channels
+		// when they return, and closing them here as well would panic.
 		delete(signals, promql.QPVCInfo)
 		delete(signals, promql.QPVCBindings)
 		delete(signals, promql.QPVCAnnotations)
@@ -541,9 +554,10 @@ func readTopology(
 		delete(signals, promql.QPVCBindings)
 	}
 	if plan.tracksByReference() && !plan.rootedClaims() {
-		// The workload expansion closes these when the claim side and the
-		// token read return. Closing them here would let QoS run on empty
-		// vectors, and closing them twice would panic.
+		// The workload expansion (or a claim root's, which shares its token
+		// read) closes these when the claim side and the token read return.
+		// Closing them here would let QoS run on empty vectors, and closing them
+		// twice would panic.
 		delete(signals, promql.QPVCInfo)
 		delete(signals, promql.QVolumeLabels)
 		delete(signals, promql.QPVCAnnotations)
@@ -638,7 +652,28 @@ func readTopology(
 	} else {
 		close(appDone)
 	}
-	if plan.tracksByReference() && !plan.rootedClaims() {
+	if plan.claimSeeded() {
+		// A claim root seeds exactly the claim-info read, so it takes the hub's
+		// claim side — claim-info already loaded, then the claim families by
+		// claim, mounters included — and the workload roots' candidate
+		// completion: no phase 1 exists, so every loaded claim's token is read.
+		// Each of the three channels has one closer here, and readWorkloadClaims
+		// stays out: it derives the claim set from bindings, which a claim root
+		// does not have before the claim-info read.
+		var cov hubCoverage
+		g.Go(signalWhenDone(func() error {
+			return readClaimSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
+		}, pvcInfoDone))
+		g.Go(signalWhenDone(signalWhenDone(func() error {
+			return readHubClaimFamilies(ctx, q, window, end, opts, sel, &v, &scopeMu, &cov, pvcInfoDone)
+		}, bindingsDone), pvcAnnotationsDone))
+		finalDone := make(chan struct{})
+		g.Go(signalWhenDone(func() error {
+			return readWorkloadVolumeLabels(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone)
+		}, finalDone))
+		volumeLabelsFinal = finalDone
+	}
+	if plan.tracksByReference() && !plan.rootedClaims() && !plan.claimSeeded() {
 		finalDone := make(chan struct{})
 		g.Go(signalWhenDone(signalWhenDone(func() error {
 			return readWorkloadClaims(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, bindingsDone, appDone)
@@ -675,8 +710,9 @@ func readTopology(
 				return readPodSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
 			}, bindingsDone))
 		}
-	case graph.StorageRootONTAPCluster, graph.StorageRootONTAPNode, graph.StorageRootAggr, graph.StorageRootSVM, graph.StorageRootApplication:
-		// Harvest and application seeds are launched with the expansion, not here.
+	case graph.StorageRootONTAPCluster, graph.StorageRootONTAPNode, graph.StorageRootAggr, graph.StorageRootSVM, graph.StorageRootApplication,
+		graph.StorageRootPVC, graph.StorageRootPV:
+		// Harvest, application and claim seeds are launched with the expansion, not here.
 	}
 	flowlessDone := make(chan struct{})
 	// Either read launches the goroutine. Every kind reading aggregate gauges
@@ -833,6 +869,13 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	// add to it, so a join input cannot invent a cluster that holds no entity.
 	for _, vec := range []model.Vector{v.Pod, v.Node, v.Service, v.PVC} {
 		for _, s := range vec {
+			mc.observe(s.Metric)
+		}
+	}
+	// A claim-seeded build materialises its unbound root claims, so their
+	// claim-info rows mint cluster-labelled entities too.
+	if v.MaterialiseUnboundClaims {
+		for _, s := range v.PVCInfo {
 			mc.observe(s.Metric)
 		}
 	}
@@ -1104,6 +1147,35 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	for k, group := range podGroups {
 		canonicalPodUID[[3]string{k.cluster, k.namespace, k.pod}] = group[0].uid
 	}
+	// newPVC builds a claim's node from what kube_persistentvolumeclaim_info,
+	// the annotation families and the kubelet stats say about it, and registers
+	// it. Bindings mint a claim through it; so does a claim-seeded build for a
+	// root claim no pod mounts.
+	newPVC := func(id, cluster, ns, claim string) *graph.PVCNode {
+		attrs := pvcInfo[pvcKey{cluster, ns, claim}]
+		labels := map[string]string{"cluster": cluster, "namespace": ns}
+		// Bound PV name and NetApp Trident SVM, as additive labels. Each
+		// key is set only when its value resolved non-empty — never an
+		// empty-string label — and svm is impossible without volumename
+		// (the chain is rooted at the PV name). `volumename` (the bound PV)
+		// is distinct from the `volume` key below (the pod-spec volume
+		// name); both may coexist on one PVC.
+		if attrs.volumeName != "" {
+			labels["volumename"] = attrs.volumeName
+		}
+		node := &graph.PVCNode{
+			IDValue:           id,
+			NameValue:         claim,
+			LabelsValue:       labels,
+			StorageClassValue: attrs.storageClass,
+			ApplicationValue:  pvcApplications[pvcKey{cluster, ns, claim}],
+			UsageValue:        pvcUsage[pvcKey{cluster, ns, claim}],
+		}
+		pvcByID[id] = node
+		pvcs = append(pvcs, node)
+		clusters[cluster] = struct{}{}
+		return node
+	}
 	for _, s := range v.PVC {
 		cluster := mc.bucket(promql.QPVCBindings, s.Metric)
 		ns := string(s.Metric["namespace"])
@@ -1118,27 +1190,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		id := graph.PVCID(cluster, ns, claim)
 		node, seen := pvcByID[id]
 		if !seen {
-			attrs := pvcInfo[pvcKey{cluster, ns, claim}]
-			labels := map[string]string{"cluster": cluster, "namespace": ns}
-			// Bound PV name and NetApp Trident SVM, as additive labels. Each
-			// key is set only when its value resolved non-empty — never an
-			// empty-string label — and svm is impossible without volumename
-			// (the chain is rooted at the PV name). `volumename` (the bound PV)
-			// is distinct from the `volume` key below (the pod-spec volume
-			// name); both may coexist on one PVC.
-			if attrs.volumeName != "" {
-				labels["volumename"] = attrs.volumeName
-			}
-			node = &graph.PVCNode{
-				IDValue:           id,
-				NameValue:         claim,
-				LabelsValue:       labels,
-				StorageClassValue: attrs.storageClass,
-				ApplicationValue:  pvcApplications[pvcKey{cluster, ns, claim}],
-				UsageValue:        pvcUsage[pvcKey{cluster, ns, claim}],
-			}
-			pvcByID[id] = node
-			pvcs = append(pvcs, node)
+			node = newPVC(id, cluster, ns, claim)
 		}
 		// Deterministic pick: the lexically-smallest non-empty volume wins
 		// across all samples for this PVC, so the emitted label is a pure
@@ -1162,6 +1214,20 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			}
 		}
 		clusters[cluster] = struct{}{}
+	}
+
+	// Root claims no pod mounts (claim-seeded builds only). Sorted, so the node
+	// order — and everything derived from it — never depends on vector order.
+	if v.MaterialiseUnboundClaims {
+		keys := slices.SortedFunc(maps.Keys(pvcInfo), func(a, b pvcKey) int {
+			return cmp.Or(cmp.Compare(a.cluster, b.cluster), cmp.Compare(a.namespace, b.namespace), cmp.Compare(a.claim, b.claim))
+		})
+		for _, k := range keys {
+			id := graph.PVCID(k.cluster, k.namespace, k.claim)
+			if _, ok := pvcByID[id]; !ok {
+				newPVC(id, k.cluster, k.namespace, k.claim)
+			}
+		}
 	}
 
 	// PVC ArgoCD Application inheritance (D13): a PVC with no Application of its

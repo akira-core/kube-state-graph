@@ -1,6 +1,7 @@
 package build
 
 import (
+	"cmp"
 	"maps"
 	"slices"
 	"time"
@@ -141,6 +142,12 @@ type topologyPlan struct {
 	// volume_labels on `node`; the claim source is then the aggregates whose
 	// owner vote lands on one of these names.
 	volumeNodes []string
+	// claimRoots are the request's pvc=<namespace>/<claim> roots, sorted, and
+	// volumeRoots its pv=<name> roots, sorted and de-duplicated. Either non-empty
+	// makes the plan claim-seeded (claimSeeded): the seed IS the claim-info read,
+	// restricted on them.
+	claimRoots  []graph.ClaimRef
+	volumeRoots []string
 	// applicationRoots are the request's application=<name> values, sorted.
 	// Non-empty launches the recovery wave and narrows the pod scope to the
 	// pods related to those Applications (see appscope.go). The volume-label
@@ -175,6 +182,7 @@ type topologyPlan struct {
 	podPrepared      bool
 	appPrepared      bool
 	flowlessPrepared bool
+	claimPrepared    bool
 }
 
 // failsClosed reports whether a query error of q must fail this build even
@@ -237,10 +245,31 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 	case graph.StorageRootPod:
 		// plan.pods carries the (namespace, pod) refs the pod seed and the pod
 		// wave read; nothing more to derive.
+	case graph.StorageRootPVC:
+		plan.claimRoots = usableClaimRefs(roots.Claims)
+	case graph.StorageRootPV:
+		plan.volumeRoots = sortedNames(roots.Names)
 	case graph.StorageRootApplication:
 		plan.applicationRoots = sortedNames(roots.Names)
 	}
 	return plan
+}
+
+// usableClaimRefs is the sorted claim refs that name both a namespace and a
+// claim. A ref with an empty half can match nothing a query could name, and an
+// embedder fills StorageRoots itself, so the plan drops it instead of asking
+// the renderer to.
+func usableClaimRefs(refs []graph.ClaimRef) []graph.ClaimRef {
+	out := make([]graph.ClaimRef, 0, len(refs))
+	for _, r := range refs {
+		if r.Namespace != "" && r.Name != "" {
+			out = append(out, r)
+		}
+	}
+	slices.SortFunc(out, func(a, b graph.ClaimRef) int {
+		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
+	})
+	return slices.Compact(out)
 }
 
 // harvestSeed reports whether this storage build's volume_labels read is the
@@ -251,6 +280,14 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 func (p topologyPlan) harvestSeed() bool {
 	return p.byReference &&
 		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs)+len(p.volumeNodes) > 0
+}
+
+// claimSeeded reports whether this storage build's seed is the claim-info read
+// itself: a pvc or pv root. Like harvestSeed, the slices are the decision rather
+// than the kind alone, so a caller can clear them to read the inventory across
+// the zone while keeping the same root for projection.
+func (p topologyPlan) claimSeeded() bool {
+	return p.byReference && len(p.claimRoots)+len(p.volumeRoots) > 0
 }
 
 // rootedClaims reports whether phase 1 was rendered, so the claim families are
@@ -320,6 +357,29 @@ func (p topologyPlan) prepareNodeSeed(window time.Duration, budget int, keys pro
 			continue
 		}
 		p.nodeSeed = append(p.nodeSeed, rendered)
+	}
+	return p, nil
+}
+
+// prepareClaimSeed rejects a claim or volume root whose first read would take
+// more queries than the cap, before any query. The count comes from the same
+// groups and the same per-group byte reserve the read chunks with
+// (claimSeedGroups), so the check and the read cannot disagree. Idempotent, like
+// prepareNodeSeed.
+func (p topologyPlan) prepareClaimSeed(budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	if p.claimPrepared {
+		return p, nil
+	}
+	p.claimPrepared = true
+	if !p.claimSeeded() {
+		return p, nil
+	}
+	chunks := 0
+	for _, g := range p.claimSeedGroups() {
+		chunks += len(promql.ChunkScope(g.names, g.budget(budget, keys, sel)))
+	}
+	if chunks > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
 	return p, nil
 }
@@ -420,7 +480,7 @@ func (p topologyPlan) tracksByReference() bool {
 	if !p.byReference {
 		return false
 	}
-	if p.harvestSeed() || p.rootedClaims() {
+	if p.harvestSeed() || p.rootedClaims() || p.claimSeeded() {
 		return true
 	}
 	switch p.kind {

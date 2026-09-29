@@ -12,18 +12,25 @@ import (
 //
 //  1. Extract flow units — one per (claim, mounting pod) — by walking each
 //     svm-pvc edge up (aggr-svm, node-aggr; absent for a FlexGroup) and down
-//     (pvc-pod, then that pod's pod-node).
+//     (pvc-pod, then that pod's pod-node). A claim no pod mounts yields one
+//     SINK unit that ends at the claim, so its whole measurement rides the
+//     path above it.
 //  2. Resolve the one root kind to node-id sets. ontap_cluster roots every
 //     NetApp entity of the filer; ontap_node roots the controller; aggr and
 //     svm root that name on every filer; node roots the Kubernetes node;
-//     pod roots the pod ref; application roots pods (materialised) and
-//     claims (retention only). A kind that resolved to nothing retains
-//     nothing — `?aggr=typo` is empty, not the estate.
+//     pod roots the pod ref; pvc roots the claim by (namespace, name) and pv
+//     the claim bound to that PersistentVolume (both materialised, and both
+//     the ONLY roots that retain a sink unit); application roots pods
+//     (materialised) and claims (retention only). A kind that resolved to
+//     nothing retains nothing — `?aggr=typo` is empty, not the estate.
 //  3. A unit is kept iff it touches a resolved root (or, for an application
 //     root, a claim hit) and its pod / PVC / K8s node pass the re-applied
 //     cluster / namespace filters. Storage-side nodes are never dropped by
 //     those filters. A claim hit retains the unit; it does not materialise
-//     the claim on its own.
+//     the claim on its own. A sink unit is kept only when its claim IS a
+//     pvc / pv root — never through a storage, workload or application root
+//     it merely intersects — so an unmounted claim that is not a root stays
+//     dropped under every kind.
 //  4. Nodes = ∪ retained units ∪ resolved root ids ∪ owning controllers of
 //     admitted aggregates (pullNetAppParents). Edges = the retained units'
 //     hops, weighted over those units (n = mounter count in the *built*
@@ -34,11 +41,18 @@ func ProjectStorage(g *Graph, scope StorageScope) View {
 	}
 
 	units := extractFlowUnits(g)
-	storageIDs, workloadIDs, claimHits := resolveStorageRoots(g, scope)
+	storageIDs, workloadIDs, claimHits, claimRoots := resolveStorageRoots(g, scope)
 
 	rawName := g.ClusterRawName
 	retained := make([]flowUnit, 0, len(units))
 	for _, u := range units {
+		if u.sink {
+			// An unmounted claim is drawn only as the sink of a pvc / pv root
+			// that names it.
+			if _, ok := claimRoots[u.claimID]; !ok {
+				continue
+			}
+		}
 		if !u.intersects(storageIDs) && !u.intersects(workloadIDs) && !u.intersects(claimHits) {
 			continue
 		}
@@ -98,10 +112,15 @@ func admitRoot(g *Graph, nodes map[string]GraphNode, id string, workload bool, s
 // controller are empty for a FlexGroup claim; the K8s node is empty for an
 // unscheduled pod. ids lists every node on the path so root intersection and
 // the retained node set are one walk.
+//
+// A sink unit is the path of a claim no pod mounts: podID and nodeID are empty
+// and n is 1, so scaleFlow hands the claim's whole measurement to every hop
+// above it. It is retained only through a claim root (see ProjectStorage).
 type flowUnit struct {
 	claimID, podID, nodeID string
 	svmID, aggrID, ctrlID  string
 	n                      int // mounter count in the built graph, not the view
+	sink                   bool
 	io                     *IOMetrics
 	edges                  []*Edge
 	ids                    []string
@@ -219,26 +238,11 @@ func extractFlowUnits(g *Graph) []flowUnit {
 		pvcID, svmID := claim.Target, claim.Source
 		mounters := mountersOf[pvcID]
 		n := len(mounters)
-		if n == 0 {
-			// Unmounted claim: the assembler already suppresses these, but a
-			// hand-built graph might still carry a dangling svm-pvc. No pod,
-			// no flow unit.
-			continue
-		}
 		aggrID := claimAggrOf(claim, incomingAggr[svmID], stamped)
 		ctrlID := ownerOf[aggrID]
-		for _, pe := range mounters {
-			u := flowUnit{
-				claimID: pvcID,
-				podID:   pe.Target,
-				svmID:   svmID,
-				aggrID:  aggrID,
-				ctrlID:  ctrlID,
-				n:       n,
-				io:      claim.IO,
-			}
-			u.edges = append(u.edges, claim, pe)
-			u.ids = append(u.ids, svmID, pvcID, pe.Target)
+		// addUpstream appends the hops above the claim: aggr-svm and node-aggr,
+		// each only when the claim resolved an aggregate / its owner.
+		addUpstream := func(u *flowUnit) {
 			if aggrID != "" {
 				u.ids = append(u.ids, aggrID)
 				if e := aggrSVMOf[[2]string{aggrID, svmID}]; e != nil {
@@ -251,6 +255,41 @@ func extractFlowUnits(g *Graph) []flowUnit {
 					u.edges = append(u.edges, e)
 				}
 			}
+		}
+		if n == 0 {
+			// Unmounted claim: no pod, so no flow through it — but a claim that
+			// is itself a pvc / pv root keeps its storage-side path, ending at
+			// the claim. The unit is a sink; ProjectStorage retains it only
+			// through such a root, so a hand-built graph carrying a dangling
+			// svm-pvc projects exactly as before under every other kind.
+			u := flowUnit{
+				claimID: pvcID,
+				svmID:   svmID,
+				aggrID:  aggrID,
+				ctrlID:  ctrlID,
+				n:       1,
+				sink:    true,
+				io:      claim.IO,
+			}
+			u.edges = append(u.edges, claim)
+			u.ids = append(u.ids, svmID, pvcID)
+			addUpstream(&u)
+			out = append(out, u)
+			continue
+		}
+		for _, pe := range mounters {
+			u := flowUnit{
+				claimID: pvcID,
+				podID:   pe.Target,
+				svmID:   svmID,
+				aggrID:  aggrID,
+				ctrlID:  ctrlID,
+				n:       n,
+				io:      claim.IO,
+			}
+			u.edges = append(u.edges, claim, pe)
+			u.ids = append(u.ids, svmID, pvcID, pe.Target)
+			addUpstream(&u)
 			// The pod-node hop is attached only when its target is a loaded
 			// node. kube_pod_info names the node a pod is scheduled on whether
 			// or not kube_node_info was read (the `nodes` collector off, or the
@@ -305,13 +344,20 @@ func claimAggrOf(claim *Edge, incoming []*Edge, stamped bool) string {
 	return ""
 }
 
-func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claimHits map[string]struct{}) {
+// resolveStorageRoots resolves the request's one root kind to node-id sets.
+// storage and workload are the roots that are materialised (storage roots
+// ignore the cluster / namespace filters, workload roots honour them);
+// claimHits are claims retained through an application root and never
+// materialised; claimRoots are the claims named by a pvc / pv root, a subset of
+// workload, and the only ones whose sink unit a body retains.
+func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claimHits, claimRoots map[string]struct{}) {
 	storage = map[string]struct{}{}
 	workload = map[string]struct{}{}
 	claimHits = map[string]struct{}{}
+	claimRoots = map[string]struct{}{}
 	roots := scope.Roots
 	if !roots.Any() {
-		return storage, workload, claimHits
+		return storage, workload, claimHits, claimRoots
 	}
 	names := make(map[string]struct{}, len(roots.Names))
 	for _, name := range roots.Names {
@@ -320,6 +366,10 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 	pods := make(map[PodRef]struct{}, len(roots.Pods))
 	for _, ref := range roots.Pods {
 		pods[ref] = struct{}{}
+	}
+	claims := make(map[ClaimRef]struct{}, len(roots.Claims))
+	for _, ref := range roots.Claims {
+		claims[ref] = struct{}{}
 	}
 	named := func(n GraphNode) bool {
 		_, ok := names[n.Name()]
@@ -358,6 +408,25 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 					workload[n.ID()] = struct{}{}
 				}
 			}
+		case StorageRootPVC:
+			if n.Type() == NodeTypePVC {
+				ref := ClaimRef{Namespace: n.Labels()["namespace"], Name: n.Name()}
+				if _, ok := claims[ref]; ok {
+					workload[n.ID()] = struct{}{}
+					claimRoots[n.ID()] = struct{}{}
+				}
+			}
+		case StorageRootPV:
+			// The claim bound to the named PersistentVolume: its volumename
+			// label, never its own name, so a bare claim name matches nothing.
+			if n.Type() == NodeTypePVC {
+				if vn := n.Labels()["volumename"]; vn != "" {
+					if _, ok := names[vn]; ok {
+						workload[n.ID()] = struct{}{}
+						claimRoots[n.ID()] = struct{}{}
+					}
+				}
+			}
 		case StorageRootApplication:
 			app := n.Application()
 			if app == "" {
@@ -377,7 +446,7 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 			}
 		}
 	}
-	return storage, workload, claimHits
+	return storage, workload, claimHits, claimRoots
 }
 
 // weightRetained sums each retained edge's I/O over the retained units that

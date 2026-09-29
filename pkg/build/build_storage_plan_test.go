@@ -909,12 +909,60 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 		[]promql.Query{promql.QStatefulSetAnnotations}, promql.QoSWorkloadQueries,
 	)
 
+	// A claim root's first wave is ALERTS alone: the seed is the claim-info
+	// read, so nothing but ALERTS runs beside it (add-storage-graph-pv-pvc-roots).
+	claimCount := func(qs ...promql.Query) map[string]int {
+		m := map[string]int{string(promql.QAlerts): 1}
+		for _, q := range qs {
+			m[string(q)]++
+		}
+		return m
+	}
+	claimRoot := graph.StorageRoots{Kind: graph.StorageRootPVC, Claims: []graph.ClaimRef{{Namespace: "db", Name: "data-db-0"}}}
+	volumeRoot := graph.StorageRoots{Kind: graph.StorageRootPV, Names: []string{"pvc-9f3a"}}
+	noClaim := graph.StorageRoots{Kind: graph.StorageRootPVC, Claims: []graph.ClaimRef{{Namespace: "db", Name: "absent"}}}
+	noVolume := graph.StorageRoots{Kind: graph.StorageRootPV, Names: []string{"pvc-absent"}}
+	// One claim, mounted by nothing and joining no FlexVol: the seed, the four
+	// claim families read by claim, and the token read that finds nothing.
+	unmounted := map[promql.Query]model.Vector{
+		promql.QPVCInfo: path[promql.QPVCInfo],
+	}
+	unmountedCount := claimCount(slices.Concat(promql.ClaimScopedQueries, []promql.Query{promql.QVolumeLabels})...)
+	// The same claim on a matched volume: owner completion adds a second
+	// volume_labels query, and the six QoS legs and the Harvest components the
+	// volume reaches follow — with no pod, node or controller wave, because
+	// nothing mounts the claim.
+	unmountedOnVolume := map[promql.Query]model.Vector{
+		promql.QPVCInfo:      path[promql.QPVCInfo],
+		promql.QVolumeLabels: path[promql.QVolumeLabels],
+	}
+	unmountedOnVolumeCount := claimCount(slices.Concat(
+		promql.ClaimScopedQueries, []promql.Query{promql.QVolumeLabels, promql.QVolumeLabels},
+		promql.QoSWorkloadQueries, promql.PolicyPairQueries, promql.AggrPairQueries, promql.NetAppNodePairQueries,
+	)...)
+	// The mounted claim on a matched volume: everything above, plus the pod,
+	// node and controller waves, owner completion (a second volume_labels
+	// query), the six QoS legs, and the Harvest components the volume reaches.
+	mountedCount := claimCount(slices.Concat(
+		promql.ClaimScopedQueries, promql.PodScopedQueries, promql.NodeScopedQueries,
+		[]promql.Query{promql.QStatefulSetAnnotations, promql.QVolumeLabels, promql.QVolumeLabels},
+		promql.QoSWorkloadQueries, promql.PolicyPairQueries, promql.AggrPairQueries, promql.NetAppNodePairQueries,
+	)...)
+
 	cases := []struct {
 		name     string
 		fixtures map[promql.Query]model.Vector
 		roots    graph.StorageRoots
 		want     map[string]int
 	}{
+		{"claim root naming no claim", path, noClaim, claimCount(promql.QPVCInfo)},
+		{"volume root naming no claim", path, noVolume, claimCount(promql.QPVCInfo)},
+		{"claim root, one unmounted claim", unmounted, claimRoot, unmountedCount},
+		{"volume root, one unmounted claim", unmounted, volumeRoot, unmountedCount},
+		{"claim root, one unmounted claim on a matched volume", unmountedOnVolume, claimRoot, unmountedOnVolumeCount},
+		{"volume root, one unmounted claim on a matched volume", unmountedOnVolume, volumeRoot, unmountedOnVolumeCount},
+		{"claim root, one statefulset-owned pod on a matched volume", path, claimRoot, mountedCount},
+		{"volume root, one statefulset-owned pod on a matched volume", path, volumeRoot, mountedCount},
 		{"aggregate root, no candidate", map[promql.Query]model.Vector{
 			promql.QVolumeLabels: {vol("vol0", "svm0")},
 		}, graph.StorageRoots{Kind: graph.StorageRootAggr, Names: []string{"aggr1"}}, withoutPolicy(count())},
@@ -942,6 +990,14 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 			}
 			assert.Equal(t, tc.want, seen)
 			for name := range tc.want {
+				// The token read of a workload or claim root is tallied only when
+				// it returned rows (readWorkloadVolumeLabels marks the family
+				// issued after its empty-result return), so a build whose claims
+				// join no FlexVol issues it without a count.
+				if name == string(promql.QVolumeLabels) && len(tc.fixtures[promql.QVolumeLabels]) == 0 &&
+					tc.roots.Kind != graph.StorageRootAggr && tc.roots.Kind != graph.StorageRootSVM {
+					continue
+				}
 				assert.Contains(t, tp.RawSeriesCount, name, "%s tallied", name)
 			}
 			for _, q := range promql.ClaimScopedQueries {

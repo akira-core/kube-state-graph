@@ -81,6 +81,14 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 	require.NoError(t, err)
 	appGraph := applicationRootEstate(g)
 	stampFixtureStatuses(slices.Collect(maps.Values(appGraph.NodesByID)))
+	claimGraph := claimRootEstate(g)
+	stampFixtureStatuses(slices.Collect(maps.Values(claimGraph.NodesByID)))
+	pvcScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPVC, []string{"shop/orders-data", "shop/orphan-data"})
+	require.NoError(t, err)
+	pvScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPV, []string{"pvc-orphan"})
+	require.NoError(t, err)
+	scratchScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPVC, []string{"shop/scratch-data"})
+	require.NoError(t, err)
 
 	scenarios := map[string]graph.View{
 		"storage-graph-aggr-root":        graph.ProjectStorage(g, aggrScope),
@@ -88,6 +96,12 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 		"storage-graph-application-root": graph.ProjectStorage(appGraph, appScope),
 		"storage-graph-ontap-node-root":  graph.ProjectStorage(g, ontapNodeScope),
 		"storage-graph-node-root":        graph.ProjectStorage(g, nodeScope),
+		// A claim root keeps the storage-side path of a claim no pod mounts (a
+		// sink) beside the mounted claim's full path; a volume root resolves to
+		// its claim; a claim on no filer is drawn alone.
+		"storage-graph-pvc-root":            graph.ProjectStorage(claimGraph, pvcScope),
+		"storage-graph-pv-root":             graph.ProjectStorage(claimGraph, pvScope),
+		"storage-graph-pvc-root-non-netapp": graph.ProjectStorage(claimGraph, scratchScope),
 	}
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
@@ -407,6 +421,60 @@ func applicationRootEstate(base *graph.Graph) *graph.Graph {
 		ApplicationValue: "checkout",
 	})
 	return graph.NewGraph(nodes, base.Edges, time.Time{})
+}
+
+// claimRootEstate is the shared storage estate plus what a pvc / pv root needs
+// that no other root kind draws: PersistentVolume names on the claims it roots
+// (the `volumename` label a pv root matches), a claim no pod mounts
+// (orphan-data, on aggr1 / svm_shop, so its chain ends at it) and a claim on no
+// filer (scratch-data). The shared estate is not mutated, and none of its goldens
+// changes: an unmounted claim that is not a claim root is dropped under every
+// other kind.
+func claimRootEstate(base *graph.Graph) *graph.Graph {
+	const cluster, oc = "cluster-alpha", "ontap-prod"
+	volumeNames := map[string]string{"orders-data": "pvc-orders"}
+	nodes := make([]graph.GraphNode, 0, len(base.NodesByID)+2)
+	for _, n := range base.NodesByID {
+		if pvc, ok := n.(*graph.PVCNode); ok && pvc.Labels()["cluster"] == cluster {
+			if pv, named := volumeNames[pvc.Name()]; named {
+				cloned := *pvc
+				cloned.LabelsValue = maps.Clone(pvc.LabelsValue)
+				cloned.LabelsValue["volumename"] = pv
+				nodes = append(nodes, &cloned)
+				continue
+			}
+		}
+		nodes = append(nodes, n)
+	}
+	orphan := &graph.PVCNode{
+		IDValue: graph.PVCID(cluster, "shop", "orphan-data"), NameValue: "orphan-data",
+		LabelsValue: map[string]string{
+			"cluster": cluster, "namespace": "shop", "volumename": "pvc-orphan",
+			"svm": "svm_shop", "aggr": graph.NetAppAggrID(oc, "aggr1"),
+		},
+	}
+	scratch := &graph.PVCNode{
+		IDValue: graph.PVCID(cluster, "shop", "scratch-data"), NameValue: "scratch-data",
+		LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "volumename": "pvc-scratch"},
+	}
+	nodes = append(nodes, orphan, scratch)
+
+	ioMetrics := graph.IOMetrics{ReadOps: new(25.0), WriteOps: new(5.0), ReadLatencyUs: new(450.0)}
+	ctrl, aggr, svm := graph.NetAppNodeID(oc, "ontap-prod-01"), graph.NetAppAggrID(oc, "aggr1"), graph.NetAppSVMID(oc, "svm_shop")
+	hop := func(tier, src, tgt string, labels map[string]string) *graph.Edge {
+		l := map[string]string{"tier": tier}
+		for k, v := range labels {
+			l[k] = v
+		}
+		return graph.NewEdge(graph.EdgeTypeStorageFlow, src, tgt, l)
+	}
+	edges := slices.Clone(base.Edges)
+	edges = append(edges,
+		hop(graph.StorageTierNodeAggr, ctrl, aggr, nil),
+		hop(graph.StorageTierAggrSVM, aggr, svm, nil),
+		hop(graph.StorageTierSVMPVC, svm, orphan.IDValue, map[string]string{graph.ClaimAggrLabel: aggr}).WithIO(ioMetrics),
+	)
+	return graph.NewGraph(nodes, edges, time.Time{})
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

@@ -126,8 +126,11 @@ have:
   `nameTemplate` that drops the PV name is NOT found from a storage root, even
   when the forward join would match it: such a claim draws no path in a
   storage-rooted body. `/v1/graph`, rootless storage requests and requests
-  rooted only at `pod=`, `application=` or `node=` still join it. Size the gap
-  with `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
+  rooted only at `pod=`, `pvc=`, `pv=`, `application=` or `node=` still join it;
+  `pv=<pv-name>` (or `pvc=<namespace>/<claim>`) is the way to see such a claim's
+  filer, aggregate and SVM from a storage-graph request, because a claim root
+  reads the claim directly instead of deriving it from a FlexVol name. Size the
+  gap with `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
 - **The claim-binding family must carry `persistentvolumeclaim`.** The storage seed
   scopes `kube_pod_spec_volumes_persistentvolumeclaims_info` on that label; an
   exporter labelling the binding with `claim_name` only (outside the documented

@@ -17,7 +17,7 @@ import (
 // unique within a namespace only. Every read a storage build issues for pods it
 // already knows — the pod wave, the node seed's incarnation completion, and the
 // claim bindings of node-seeded and recovered pods — is therefore keyed by that
-// pair, one query per namespace (promql.RenderPodsInNamespace). A same-named
+// pair, one query per namespace (promql.RenderNamesInNamespace). A same-named
 // pod in another namespace is never read, so it cannot widen the node,
 // controller or claim reads that are scoped from what these reads return.
 
@@ -118,7 +118,7 @@ func issuePodFamiliesByNamespace(
 				dst:   &parts[ti][ni],
 				scope: byNS[ns],
 				render: func(chunk []string) (string, bool) {
-					return promql.RenderPodsInNamespace(t.query, window, opts.LabelKeys, sel, ns, chunk)
+					return promql.RenderNamesInNamespace(t.query, window, opts.LabelKeys, sel, ns, promql.PodLabel, chunk)
 				},
 				budgetReserve: promql.NamespaceEqualityCost(ns),
 			})

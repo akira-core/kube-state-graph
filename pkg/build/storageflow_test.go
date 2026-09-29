@@ -136,7 +136,7 @@ func oneClaimTopology(io *graph.IOMetrics) Topology {
 // The spec's "One claim draws one path": exactly five edges, one per tier,
 // oriented storage → workload, and no edge of any other type.
 func TestAssembleStorageFlow_OneClaimDrawsOnePath(t *testing.T) {
-	_, edges := assembleStorageFlow(oneClaimTopology(nil))
+	_, edges := assembleStorageFlow(oneClaimTopology(nil), false)
 
 	assert.Equal(t, []string{
 		"aggr-svm netapp/ontap-prod/aggr/aggr1 -> netapp/ontap-prod/svm/svm_shop",
@@ -153,7 +153,7 @@ func TestAssembleStorageFlow_OneClaimDrawsOnePath(t *testing.T) {
 
 // Every emitted node type is present, and nothing the storage body forbids is.
 func TestAssembleStorageFlow_NodeSet(t *testing.T) {
-	nodes, _ := assembleStorageFlow(oneClaimTopology(nil))
+	nodes, _ := assembleStorageFlow(oneClaimTopology(nil), false)
 
 	kinds := map[graph.NodeType]int{}
 	for _, n := range nodes {
@@ -202,7 +202,7 @@ func TestAssembleStorageFlow_SharedUpstreamHopsEmittedOnce(t *testing.T) {
 			{PodID: podB.ID(), PVCID: pvcB.ID()},
 		},
 	}
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 
 	byTier := map[string]int{}
 	for _, e := range edges {
@@ -233,7 +233,7 @@ func TestAssembleStorageFlow_FlexGroupStartsAtTheSVM(t *testing.T) {
 		// No pvc-to-netapp-aggr edge at all — the FlexGroup shape.
 		PodPVCs: []PodPVCBinding{{PodID: pod.ID(), PVCID: pvc.ID()}},
 	}
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 
 	assert.Equal(t, []string{
 		"pod-node " + graph.PodID(sfCluster, "uid-1") + " -> " + graph.K8sNodeID(sfCluster, "worker-1"),
@@ -311,7 +311,7 @@ func TestAssembleStorageFlow_FlexVolAndFlexGroupShareSVM(t *testing.T) {
 	_, hasAggr := flexGroupPVC.Labels()["aggr"]
 	assert.False(t, hasAggr, "FlexGroup claim resolves svm but no aggr")
 
-	nodes, edges := assembleStorageFlow(tp)
+	nodes, edges := assembleStorageFlow(tp, false)
 
 	byTier := map[string]int{}
 	for _, e := range edges {
@@ -363,12 +363,12 @@ func TestAssembleStorageFlow_EmptySVMDrawsNoPath(t *testing.T) {
 	pvcID := graph.PVCID(sfCluster, "shop", "orders-data")
 	tp.SVMByPVC = map[string]SVMRef{pvcID: {ONTAPCluster: sfOC, SVM: ""}}
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 	assert.Empty(t, edges, "no SVM, no path — the chain has no aggr -> pvc shortcut")
 
 	// The nodes are still materialised: an aggregate with no drawable path is
 	// exactly the flowless entity ProjectStorage drops unless it is a root.
-	nodes, _ := assembleStorageFlow(tp)
+	nodes, _ := assembleStorageFlow(tp, false)
 	assert.NotEmpty(t, nodes)
 }
 
@@ -378,7 +378,7 @@ func TestAssembleStorageFlow_UnmountedClaimDrawsNoPath(t *testing.T) {
 	tp := oneClaimTopology(nil)
 	tp.PodPVCs = nil
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 	assert.Empty(t, edges)
 }
 
@@ -391,7 +391,7 @@ func TestAssembleStorageFlow_UnscheduledPodEndsAtPVCPod(t *testing.T) {
 	tp.Nodes = nil
 	tp.PodPVCs = []PodPVCBinding{{PodID: pod.ID(), PVCID: pvc.ID()}}
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 
 	tiers := map[string]int{}
 	for _, e := range edges {
@@ -407,7 +407,7 @@ func TestAssembleStorageFlow_UnscheduledPodEndsAtPVCPod(t *testing.T) {
 // other tier is weightless here; the projection sums them over the RETAINED
 // units, which is what makes conservation true in every view.
 func TestAssembleStorageFlow_WeightOnlyOnTheClaimEdge(t *testing.T) {
-	_, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)))
+	_, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)), false)
 
 	pvcID := graph.PVCID(sfCluster, "shop", "orders-data")
 	claim := sfEdge(t, edges, graph.NetAppSVMID(sfOC, "svm_shop"), pvcID)
@@ -427,7 +427,7 @@ func TestAssembleStorageFlow_WeightOnlyOnTheClaimEdge(t *testing.T) {
 
 // An unmeasured claim draws its whole path weightless.
 func TestAssembleStorageFlow_UnmeasuredClaimIsWeightless(t *testing.T) {
-	_, edges := assembleStorageFlow(oneClaimTopology(nil))
+	_, edges := assembleStorageFlow(oneClaimTopology(nil), false)
 	require.NotEmpty(t, edges)
 	for _, e := range edges {
 		assert.Nil(t, e.IO)
@@ -458,7 +458,7 @@ func TestAssembleStorageFlow_RWXMountersAreMarkedSplit(t *testing.T) {
 		tp.PodPVCs = append(tp.PodPVCs, PodPVCBinding{PodID: p.ID(), PVCID: pvc.ID()})
 	}
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 
 	split := 0
 	for _, e := range edges {
@@ -476,7 +476,7 @@ func TestAssembleStorageFlow_RWXMountersAreMarkedSplit(t *testing.T) {
 // A singly-mounted claim carries NO attribution key at all — absent, not
 // "single". The key means "this weight was attributed, not measured".
 func TestAssembleStorageFlow_SingleMounterHasNoAttribution(t *testing.T) {
-	_, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)))
+	_, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)), false)
 	for _, e := range edges {
 		assert.NotContains(t, e.Labels, "attribution")
 	}
@@ -489,7 +489,7 @@ func TestAssembleStorageFlow_SingleMounterHasNoAttribution(t *testing.T) {
 // the output, since every loop is over a sorted or set-keyed collection.
 func TestAssembleStorageFlow_DeterministicAcrossRuns(t *testing.T) {
 	build := func() ([]string, []string) {
-		nodes, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)))
+		nodes, edges := assembleStorageFlow(oneClaimTopology(sfIO(300)), false)
 		nodeIDs := make([]string, len(nodes))
 		for i, n := range nodes {
 			nodeIDs[i] = n.ID()
@@ -543,8 +543,8 @@ func TestAssembleStorageFlow_ChainOrderDoesNotMatter(t *testing.T) {
 		return tp
 	}
 
-	_, fwd := assembleStorageFlow(makeTopology(false))
-	_, rev := assembleStorageFlow(makeTopology(true))
+	_, fwd := assembleStorageFlow(makeTopology(false), false)
+	_, rev := assembleStorageFlow(makeTopology(true), false)
 	assert.Equal(t, tiersOf(fwd), tiersOf(rev))
 }
 
@@ -556,7 +556,7 @@ func TestAssembleStorageFlow_NodeAggrFollowsTheAggregateOwnerLabel(t *testing.T)
 	tp.NetAppInventory.Aggrs = []*graph.NetAppAggrNode{sfAggr("aggr1", "ontap-prod-02")}
 	tp.NetAppInventory.Nodes = []*graph.NetAppNode{sfCtrlNode("ontap-prod-02")}
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 	e := sfEdge(t, edges, graph.NetAppNodeID(sfOC, "ontap-prod-02"), graph.NetAppAggrID(sfOC, "aggr1"))
 	require.NotNil(t, e, "the node-aggr hop follows the current owner")
 	assert.Equal(t, graph.StorageTierNodeAggr, e.Labels["tier"])
@@ -568,10 +568,96 @@ func TestAssembleStorageFlow_OwnerlessAggrHasNoNodeHop(t *testing.T) {
 	tp := oneClaimTopology(nil)
 	tp.NetAppInventory.Aggrs = []*graph.NetAppAggrNode{sfAggr("aggr1", "")}
 
-	_, edges := assembleStorageFlow(tp)
+	_, edges := assembleStorageFlow(tp, false)
 	for _, e := range edges {
 		assert.NotEqual(t, graph.StorageTierNodeAggr, e.Labels["tier"])
 		assert.NotEmpty(t, e.Source)
 		assert.NotEmpty(t, e.Target)
 	}
+}
+
+// --- sink claims (add-storage-graph-pv-pvc-roots) --------------------------
+
+// A claim-seeded build draws the storage-side path of a claim no pod mounts: the
+// claim is a sink, so the chain ends at it. The claim's own measurement rides
+// the svm-pvc edge exactly as a mounted claim's does.
+func TestAssembleStorageFlow_UnmountedClaimIsASinkWhenClaimSeeded(t *testing.T) {
+	tp := oneClaimTopology(sfIO(40))
+	tp.PodPVCs = nil
+
+	_, edges := assembleStorageFlow(tp, true)
+
+	ctrl, aggr, svm, pvc := graph.NetAppNodeID(sfOC, sfCtrl), graph.NetAppAggrID(sfOC, "aggr1"),
+		graph.NetAppSVMID(sfOC, "svm_shop"), graph.PVCID(sfCluster, "shop", "orders-data")
+	assert.Equal(t, []string{
+		"aggr-svm " + aggr + " -> " + svm,
+		"node-aggr " + ctrl + " -> " + aggr,
+		"svm-pvc " + svm + " -> " + pvc,
+	}, tiersOf(edges), "the storage-side chain and nothing below the claim")
+
+	claim := sfEdge(t, edges, svm, pvc)
+	require.NotNil(t, claim)
+	require.NotNil(t, claim.IO, "the claim's whole measurement rides its own edge")
+	assert.InDelta(t, 40.0, *claim.IO.ReadOps, 1e-12)
+	assert.Equal(t, aggr, claim.Labels[graph.ClaimAggrLabel])
+	for _, tier := range []string{graph.StorageTierPVCPod, graph.StorageTierPodNode} {
+		for _, e := range edges {
+			assert.NotEqual(t, tier, e.Labels["tier"], "a sink claim has no %s edge", tier)
+		}
+	}
+}
+
+// Every other plan leaves an unmounted chain undrawn, so the built graph of any
+// non-claim root — and of any embedder calling BuildStorage — is unchanged.
+func TestAssembleStorageFlow_UnmountedClaimStaysDroppedOtherwise(t *testing.T) {
+	tp := oneClaimTopology(sfIO(40))
+	tp.PodPVCs = nil
+	_, edges := assembleStorageFlow(tp, false)
+	assert.Empty(t, edges)
+}
+
+// A FlexGroup sink enters the chain at the SVM: there is no aggregate hop.
+func TestAssembleStorageFlow_FlexGroupSinkEntersAtTheSVM(t *testing.T) {
+	tp := oneClaimTopology(nil)
+	tp.PodPVCs = nil
+	tp.StorageEdges = nil // no pvc-to-netapp-aggr edge: a FlexGroup claim resolved no aggregate
+
+	_, edges := assembleStorageFlow(tp, true)
+	svm, pvc := graph.NetAppSVMID(sfOC, "svm_shop"), graph.PVCID(sfCluster, "shop", "orders-data")
+	assert.Equal(t, []string{"svm-pvc " + svm + " -> " + pvc}, tiersOf(edges))
+	claim := sfEdge(t, edges, svm, pvc)
+	require.NotNil(t, claim)
+	assert.NotContains(t, claim.Labels, graph.ClaimAggrLabel)
+}
+
+// A claim with no SVM draws no path even as a sink: the tier chain is fixed.
+func TestAssembleStorageFlow_SinkWithNoSVMDrawsNoPath(t *testing.T) {
+	tp := oneClaimTopology(nil)
+	tp.PodPVCs = nil
+	tp.SVMByPVC = map[string]SVMRef{graph.PVCID(sfCluster, "shop", "orders-data"): {ONTAPCluster: sfOC}}
+	_, edges := assembleStorageFlow(tp, true)
+	assert.Empty(t, edges)
+}
+
+// A mounted and an unmounted claim on one aggregate and SVM share their upstream
+// hops: each pair is emitted once, and only the mounted claim reaches a pod.
+func TestAssembleStorageFlow_SinkSharesUpstreamHopsWithAMountedClaim(t *testing.T) {
+	tp := oneClaimTopology(sfIO(100))
+	orphan := sfPVC("orphan-data")
+	tp.PVCs = append(tp.PVCs, orphan)
+	tp.SVMByPVC[orphan.ID()] = SVMRef{ONTAPCluster: sfOC, SVM: "svm_shop"}
+	tp.StorageEdges = append(tp.StorageEdges,
+		graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, orphan.ID(), graph.NetAppAggrID(sfOC, "aggr1"), nil).WithIO(*sfIO(40)))
+
+	_, edges := assembleStorageFlow(tp, true)
+
+	tiers := map[string]int{}
+	for _, e := range edges {
+		tiers[e.Labels["tier"]]++
+	}
+	assert.Equal(t, 1, tiers[graph.StorageTierNodeAggr])
+	assert.Equal(t, 1, tiers[graph.StorageTierAggrSVM])
+	assert.Equal(t, 2, tiers[graph.StorageTierSVMPVC], "one claim edge per claim")
+	assert.Equal(t, 1, tiers[graph.StorageTierPVCPod], "only the mounted claim reaches a pod")
+	assert.Equal(t, 1, tiers[graph.StorageTierPodNode])
 }

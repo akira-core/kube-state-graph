@@ -599,7 +599,7 @@
         },
         "/v1/storage-graph": {
             "get": {
-                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (that name on every filer — `ontap_cluster` does not qualify them), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own.\n\n`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
+                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (that name on every filer — `ontap_cluster` does not qualify them), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `pvc=\u003cnamespace\u003e/\u003cclaim-name\u003e` (a PersistentVolumeClaim, in every cluster of the estate), `pv` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included), `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own. A `pvc` / `pv` root claim that no pod mounts keeps its storage-side path (controller → aggregate → SVM → claim) and its whole measurement rides that path with no `pvc-pod` edge; an unmounted claim that is not a root stays dropped under every root kind.\n\n`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
                 "parameters": [
                     {
                         "description": "Window start. RFC 3339 or Unix seconds.",
@@ -730,6 +730,32 @@
                         "example": "shop/orders-0",
                         "in": "query",
                         "name": "pod",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: `\u003cnamespace\u003e/\u003cclaim-name\u003e` — a PersistentVolumeClaim, matched in every Kubernetes cluster of the estate. Keeps its storage-side path even when no pod mounts it.",
+                        "example": "shop/orders-data",
+                        "in": "query",
+                        "name": "pvc",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: PersistentVolume name (cluster-scoped, bare), matched on the `volumename` of the claim bound to it; roots that claim. A volume bound to no claim roots nothing.",
+                        "example": "pvc-ab12-cd34",
+                        "in": "query",
+                        "name": "pv",
                         "schema": {
                             "items": {
                                 "type": "string"

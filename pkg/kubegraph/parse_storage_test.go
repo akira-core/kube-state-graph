@@ -44,6 +44,18 @@ func TestParseStorageValues_Errors(t *testing.T) {
 		{"ontap_cluster no longer qualifies an aggregate", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "ontap_cluster": {"ontap-prod"}, "aggr": {"aggr1"}}, "invalid_scope", "ontap_cluster and aggr"},
 		{"malformed pod root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"orders-0"}}, "invalid_scope", "orders-0"},
 		{"pod empty name", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"shop/"}}, "invalid_scope", ""},
+		{"malformed pvc root", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"orders-data"}}, "invalid_scope", "orders-data"},
+		{"pvc root with two slashes", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"shop/orders/data"}}, "invalid_scope", "shop/orders/data"},
+		{"pvc empty name", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"shop/"}}, "invalid_scope", ""},
+		{"pvc empty namespace", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"/orders-data"}}, "invalid_scope", ""},
+		{"pvc and pv are two root kinds", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"shop/orders-data"}, "pv": {"pvc-ab12-cd34"}}, "invalid_scope", "pvc and pv"},
+		{"pod and pvc are two root kinds", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pod": {"shop/orders-0"}, "pvc": {"shop/orders-data"}}, "invalid_scope", "pod and pvc"},
+		{"pv and application are two root kinds", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pv": {"pvc-ab12-cd34"}, "application": {"checkout"}}, "invalid_scope", "pv and application"},
+		{"bare pvc is missing", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {""}}, "missing_root", ""},
+		{"bare pv is missing", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pv": {""}}, "missing_root", ""},
+		{"pvc value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pvc": {"shop/" + strings.Repeat("a", 260)}}, "invalid_scope", "pvc"},
+		{"pv value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pv": {strings.Repeat("a", 254)}}, "invalid_scope", "pv"},
+		{"pv control character", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "pv": {"pvc-\nab"}}, "invalid_scope", "pv"},
 		{"selector value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {strings.Repeat("a", 254)}}, "invalid_scope", ""},
 		{"application value too long", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "application": {strings.Repeat("a", 300)}}, "invalid_scope", "application"},
 		{"application control character", url.Values{"start": {"1700000000"}, "end": {"1700003600"}, "az": {"zone-a"}, "env": {"prod"}, "application": {"check\nout"}}, "invalid_scope", "application"},
@@ -98,6 +110,25 @@ func TestParseStorageValues_HappyPath(t *testing.T) {
 		{Namespace: "shop", Name: "orders-0"},
 	}, req.Scope.Roots.Pods)
 	assert.Empty(t, req.Selector.Namespace)
+
+	claims := storageBase()
+	claims["pvc"] = []string{"shop/orders-data", "platform/queue", "shop/orders-data", ""}
+	req, err = kubegraph.ParseStorageValues(claims)
+	require.NoError(t, err)
+	assert.Equal(t, graph.StorageRootPVC, req.Scope.Roots.Kind)
+	assert.Equal(t, []graph.ClaimRef{
+		{Namespace: "platform", Name: "queue"},
+		{Namespace: "shop", Name: "orders-data"},
+	}, req.Scope.Roots.Claims)
+	assert.Empty(t, req.Selector.Namespace, "a claim root's namespace is not derived")
+
+	volumes := storageBase()
+	volumes["pv"] = []string{"pvc-b", "pvc-a", "pvc-b"}
+	req, err = kubegraph.ParseStorageValues(volumes)
+	require.NoError(t, err)
+	assert.Equal(t, graph.StorageRootPV, req.Scope.Roots.Kind)
+	assert.Equal(t, []string{"pvc-a", "pvc-b"}, req.Scope.Roots.Names)
+	assert.Empty(t, req.Scope.Roots.Claims)
 
 	node := storageBase()
 	node["ontap_node"] = []string{"ontap-prod-01"}

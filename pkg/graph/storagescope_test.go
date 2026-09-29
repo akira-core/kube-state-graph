@@ -76,8 +76,8 @@ func TestNewStorageScope_RejectsMalformedPodRoot(t *testing.T) {
 
 func TestNewStorageScope_Kind(t *testing.T) {
 	for _, kind := range StorageRootKinds {
-		if kind == StorageRootPod {
-			continue
+		if kind == StorageRootPod || kind == StorageRootPVC {
+			continue // ref-valued kinds: covered by their own tests
 		}
 		s, err := NewStorageScope(nil, nil, kind, []string{"n"})
 		require.NoError(t, err)
@@ -93,4 +93,85 @@ func TestNewStorageScope_Kind(t *testing.T) {
 
 func TestPodRef_String(t *testing.T) {
 	assert.Equal(t, "shop/orders-0", PodRef{Namespace: "shop", Name: "orders-0"}.String())
+}
+
+// A pvc root is a (namespace, claim) ref like a pod root, and lives in Claims
+// — never in Names or Pods. Refs are sorted and de-duplicated, empty values
+// dropped, so a request repeating or re-ordering its roots yields one scope.
+func TestNewStorageScope_ClaimRoots(t *testing.T) {
+	s, err := NewStorageScope(nil, nil, StorageRootPVC,
+		[]string{"shop/orders-data", "shop/cache", "", "platform/queue", "shop/cache"})
+	require.NoError(t, err)
+	assert.Equal(t, StorageRootPVC, s.Roots.Kind)
+	assert.Equal(t, []ClaimRef{
+		{Namespace: "platform", Name: "queue"},
+		{Namespace: "shop", Name: "cache"},
+		{Namespace: "shop", Name: "orders-data"},
+	}, s.Roots.Claims)
+	assert.Empty(t, s.Roots.Names)
+	assert.Empty(t, s.Roots.Pods)
+	assert.True(t, s.Roots.Any())
+	assert.True(t, s.Roots.HasClaim(ClaimRef{Namespace: "shop", Name: "cache"}))
+	assert.False(t, s.Roots.HasClaim(ClaimRef{Namespace: "platform", Name: "cache"}),
+		"the same claim name in another namespace is not a root")
+
+	reordered, err := NewStorageScope(nil, nil, StorageRootPVC,
+		[]string{"platform/queue", "shop/orders-data", "shop/cache"})
+	require.NoError(t, err)
+	assert.Equal(t, s, reordered)
+}
+
+func TestClaimRef_String(t *testing.T) {
+	assert.Equal(t, "shop/orders-data", ClaimRef{Namespace: "shop", Name: "orders-data"}.String())
+}
+
+// A pv root is a bare PersistentVolume name, so it is stored in Names like every
+// other bare-name kind.
+func TestNewStorageScope_VolumeRoots(t *testing.T) {
+	s, err := NewStorageScope(nil, nil, StorageRootPV, []string{"pvc-b", "", "pvc-a", "pvc-b"})
+	require.NoError(t, err)
+	assert.Equal(t, StorageRootPV, s.Roots.Kind)
+	assert.Equal(t, []string{"pvc-a", "pvc-b"}, s.Roots.Names)
+	assert.Empty(t, s.Roots.Claims)
+	assert.True(t, s.Roots.Any())
+	assert.True(t, s.Roots.HasName("pvc-a"))
+}
+
+// A pvc value shares the pod rule verbatim: exactly one "/" between two
+// non-empty segments.
+func TestNewStorageScope_MalformedClaimRoots(t *testing.T) {
+	for _, bad := range []string{"orders-data", "shop/orders/data", "/x", "x/"} {
+		t.Run(bad, func(t *testing.T) {
+			_, err := NewStorageScope(nil, nil, StorageRootPVC, []string{bad})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), bad)
+			assert.Contains(t, err.Error(), "<namespace>/<claim-name>")
+		})
+	}
+}
+
+// The pod rule and its message are unchanged by sharing the parser.
+func TestNewStorageScope_MalformedPodRootMessageUnchanged(t *testing.T) {
+	_, err := NewStorageScope(nil, nil, StorageRootPod, []string{"orders-0"})
+	require.EqualError(t, err, `invalid pod root "orders-0": expected <namespace>/<pod-name>`)
+}
+
+func TestNewStorageScope_BareClaimAndVolumeValuesAreNoOps(t *testing.T) {
+	for _, kind := range []StorageRootKind{StorageRootPVC, StorageRootPV} {
+		s, err := NewStorageScope(nil, nil, kind, []string{""})
+		require.NoError(t, err)
+		assert.False(t, s.Roots.Any(), "%s: bare values leave no root requested", kind)
+		assert.Empty(t, s.Roots.Kind)
+		assert.Nil(t, s.Roots.Claims)
+		assert.Nil(t, s.Roots.Names)
+	}
+}
+
+// Parameter order is part of the contract: the mixed-kind message names
+// parameters in this order.
+func TestStorageRootKinds_Order(t *testing.T) {
+	assert.Equal(t, []StorageRootKind{
+		StorageRootONTAPCluster, StorageRootONTAPNode, StorageRootAggr, StorageRootSVM,
+		StorageRootNode, StorageRootPod, StorageRootPVC, StorageRootPV, StorageRootApplication,
+	}, StorageRootKinds)
 }
