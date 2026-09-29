@@ -437,11 +437,14 @@ operator-configurable and defaults to "replace `-` with `_`, match as a suffix",
 which resolves a stock Trident estate without the deployment declaring its
 `storagePrefix`. Hop C is keyed on the `(ontap_cluster, svm, policy_group)`
 triple, assembled from both topology hops: hop A owns the ONTAP cluster of the
-picked aggregate and the SVM the `volume_labels` match resolved, and hop B owns
-the `policy_group` — the only upstream statement of which policy governs this
+picked aggregate (of the SVM pick itself for a FlexGroup claim, which resolved no
+aggregate) and the SVM the `volume_labels` match resolved, and hop B owns the
+`policy_group` — the only upstream statement of which policy governs this
 FlexVol. An incomplete or unmatched triple is ignored, never widened to an
-SVM-wide figure. A ceiling therefore never appears without a measurement: its
-policy group is recovered FROM a matched workload series. **No relabel rule is required
+SVM-wide figure. The resolved ceiling surfaces on the claim's PVC node as
+`data.qos` and, only alongside a measurement, on its `pvc-to-netapp-aggr` edge;
+either way its policy group is recovered FROM a matched workload series, so a
+claim with no in-scope workload series has none. **No relabel rule is required
 or read.** The six hop-B legs are issued in a second wave, scoped to the FlexVol
 names hop A matched. See
 [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md).
@@ -455,8 +458,8 @@ names hop A matched. See
 | `qos_write_latency` | B | `write_latency_us` | same |
 | `qos_read_data` | B | `read_bytes_per_sec` (bytes/s, verbatim) | same |
 | `qos_write_data` | B | `write_bytes_per_sec` | same |
-| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops`, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). A ceiling cannot appear without a measurement. A volume in no policy group gets none — another group's figure is never borrowed |
-| `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
+| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops` on the edge and `data.qos.max_iops` on the PVC node, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). An edge carries a ceiling only alongside a measurement; the PVC node's `data.qos` needs only a resolved policy group. A volume in no policy group gets none — another group's figure is never borrowed |
+| `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` (edge) and `data.qos.max_bytes_per_sec` (PVC node) = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
 | `aggr_new_status` | — | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | Attribute omitted |
 | `aggr_space_used` | — | Aggregate `data.usage.used_bytes` | `usage` incomplete / omitted |
 | `aggr_space_total` | — | Aggregate `data.usage.capacity_bytes` | same |

@@ -58,6 +58,7 @@ type NodeData struct {
 	Health       string            `json:"health,omitempty"`
 	Usage        *UsageDTO         `json:"usage,omitempty"`
 	StorageClass string            `json:"storageclass,omitempty"`
+	QoS          *QoSDTO           `json:"qos,omitempty"`
 	Hardware     *HardwareDTO      `json:"hardware,omitempty"`
 	Perf         *PerfDTO          `json:"perf,omitempty"`
 	Alerts       []AlertDTO        `json:"alerts,omitempty"`
@@ -95,6 +96,23 @@ type AlertDTO struct {
 type UsageDTO struct {
 	UsedBytes     *float64 `json:"used_bytes,omitempty"`
 	CapacityBytes *float64 `json:"capacity_bytes,omitempty"`
+}
+
+// QoSDTO is the wire form of graph.QoSCeiling — a PVC's declared QoS throughput
+// ceiling. Both figures are rounded to 6 significant digits, exactly as the
+// pvc-to-netapp-aggr edge's max_iops / max_bytes_per_sec are, so a node and its
+// edge serialise identical digits. Each figure is omitted when its own
+// fixed-policy family held no series; the object itself is omitted unless at
+// least one figure resolved. Absence means no declared ceiling, never 0.
+//
+//	@Description	The declared QoS throughput ceiling of the policy group governing the claim's volume. Present only on pvc nodes, and only when at least one figure resolved; absent means no declared ceiling, never 0. A copy of the figures on the claim's pvc-to-netapp-aggr edge, but independent of it: a FlexGroup claim, or a claim whose edge carries no measurement, still carries it. Figures are JSON numbers rounded to 6 significant digits and may appear in exponent form.
+type QoSDTO struct {
+	// PolicyGroup is the QoS policy group the ceiling was keyed on.
+	PolicyGroup string `json:"policy_group" example:"gold-tier"`
+	// MaxIOPS is the declared maximum throughput in requests per second.
+	MaxIOPS *float64 `json:"max_iops,omitempty" example:"5000"`
+	// MaxBytesPerSec is the declared maximum throughput in bytes per second (the policy's MB/s figure x 1048576, the unit of read_bytes_per_sec).
+	MaxBytesPerSec *float64 `json:"max_bytes_per_sec,omitempty" example:"262144000"`
 }
 
 // Edge wraps an edge's data in the Cytoscape `{ "data": {...} }` shape.
@@ -204,6 +222,23 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 	}
 	if !filled {
 		return nil
+	}
+	return dto
+}
+
+// qosDTO maps a resolved ceiling to its wire form, or nil when there is none —
+// including a ceiling carrying no figure, so the object is present iff at least
+// one figure resolved.
+func qosDTO(q *graph.QoSCeiling) *QoSDTO {
+	if q == nil || (q.MaxIOPS == nil && q.MaxBytesPerSec == nil) {
+		return nil
+	}
+	dto := &QoSDTO{PolicyGroup: q.PolicyGroup}
+	if q.MaxIOPS != nil {
+		dto.MaxIOPS = new(round6(*q.MaxIOPS))
+	}
+	if q.MaxBytesPerSec != nil {
+		dto.MaxBytesPerSec = new(round6(*q.MaxBytesPerSec))
 	}
 	return dto
 }
@@ -423,6 +458,7 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 				Health:       n.Health(),
 				Usage:        usageDTO(n.Usage()),
 				StorageClass: n.StorageClass(),
+				QoS:          qosDTO(n.QoS()),
 				Hardware:     hardwareDTO(n.Hardware()),
 				Perf:         perfDTO(n.Perf()),
 				Alerts:       alertsDTO(n.Alerts()),

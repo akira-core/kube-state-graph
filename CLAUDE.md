@@ -809,7 +809,8 @@ live under `openspec/specs/`.
   join; `may_cross_cluster: false` — the target belongs to no Kubernetes
   cluster; I/O on `data.metrics`: `read_ops`, `write_ops`, `read_latency_us`,
   `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`, plus the
-  declared ceiling `max_iops`, `max_bytes_per_sec`), and
+  declared ceiling `max_iops`, `max_bytes_per_sec` — which the claim's PVC node
+  also carries as `data.qos`), and
   `storage-flow` (the Sankey hop of `GET /v1/storage-graph`; `may_cross_cluster: false`; labels `tier` and `attribution`; `/v1/graph` never emits it).
 - **API-key auth is the only HTTP auth in v1.** Header is `X-API-Key`. Keys
   come from `--api-keys-file` (K8s `Secret` mount, hot-reloaded) or
@@ -950,7 +951,9 @@ live under `openspec/specs/`.
   - **hop C `qos_policy_fixed_max_throughput_{iops,mbps}`** — the declared
     ceiling, joined on the `(ontap_cluster, svm, policy_group)` triple assembled
     from BOTH topology hops: **hop A** owns the ONTAP cluster of the picked
-    aggregate and the SVM the `volume_labels` match resolved, **hop B** owns the
+    aggregate (a FlexGroup claim, which resolved no aggregate, takes the ONTAP
+    cluster the SVM pick itself landed on) and the SVM the `volume_labels` match
+    resolved, **hop B** owns the
     `policy_group` (`volume_labels` carries no policy identity, so hop B is the
     only upstream statement of which policy governs this FlexVol). Anchoring the
     first two on hop A is what lets a workload series carrying a `policy_group`
@@ -969,11 +972,19 @@ live under `openspec/specs/`.
     `mbps × 1048576` (`bytesPerMB`), so the ceiling shares the unit of
     `read_bytes_per_sec`.
   The hop split is load-bearing: a hop-B miss leaves a valid **measurement-less
-  edge**, it never costs the claim its topology. A ceiling can NEVER appear
-  without a measurement — structurally, because the policy group is recovered
-  FROM a matched workload series (and the attachment sits inside the `io != nil`
-  branch, with `metricsDTO` deliberately not letting a ceiling set `filled`).
-  A volume in no policy group carries no ceiling.
+  edge**, it never costs the claim its topology. On the EDGE a ceiling can NEVER
+  appear without a measurement — structurally, because the attachment sits inside
+  the `io != nil` branch (`applyCeiling`), with `metricsDTO` deliberately not
+  letting a ceiling set `filled`. The **PVC node** carries the same ceiling as
+  `data.qos` whenever one resolved, measured or not and aggregate or not
+  (FlexGroup included): `resolveCeiling` runs ONCE per claim, before the
+  aggregate gate, into `netappResult.qosByPVC` (stamped onto `PVCNode.QoSValue`
+  beside the `svm` / `aggr` labels), and the edge copies its two figures from
+  that value, so node and edge cannot disagree and never share a float cell. The
+  node is decoupled from the measurement rule but NOT from hop B: the policy
+  group is still recovered only FROM a matched workload series (LUN rows
+  included), so a claim with no in-scope workload series has no `qos` in either
+  place. A volume in no policy group carries no ceiling.
   Both `volumename` and `svm` are **plain labels**, set only when non-empty;
   `svm` is impossible without `volumename` and comes from hop A ONLY (hop B's
   own `svm` only SCOPES a workload candidate to the claim's volume in
@@ -1103,7 +1114,7 @@ types: `PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`,
 `NetAppAggrNode`, `NetAppNode`, `NetAppSVMNode`. All
 expose `ID()`, `Name()`, `Type()`, `Labels()`, `IPAddress()`, `Owner()`,
 `Application()`, `Containers()`, `ReadyStatus()`, `Health()`, `Usage()`,
-`StorageClass()`, `Hardware()`, `Perf()`, `Alerts()`, `Status()`. Serialisation
+`StorageClass()`, `QoS()`, `Hardware()`, `Perf()`, `Alerts()`, `Status()`. Serialisation
 goes through these methods — never through type switches in the serialiser.
 `IPAddress()` returns nil for `PVCNode` / `ExternalNode`; `PodNode` returns
 `[pod_ip]` when known;
@@ -1125,7 +1136,11 @@ attribute. `""` (omitted) is distinct from `"Unknown"` (kubelet lost contact).
 `Health() string` returns `"online"` / `"degraded"` for NetApp types (`""` otherwise;
 absence ≠ degraded). `Usage() *UsageBytes` returns kubelet/Harvest used+capacity
 bytes for PVC and aggregate nodes. `StorageClass() string` is the PVC's own
-policy name (`data.storageclass`). `Status() string` returns the baked
+policy name (`data.storageclass`). `QoS() *graph.QoSCeiling` returns a PVC's
+declared throughput ceiling `{PolicyGroup, MaxIOPS, MaxBytesPerSec}` (`nil` for
+every other node kind and for a PVC whose ceiling did not resolve; non-nil
+implies at least one figure) — serialised as the `omitempty` `data.qos` object,
+both figures rounded like the edge's. `Status() string` returns the baked
 `"normal"` / `"warning"` / `"critical"` verdict for pods, K8s nodes, PVCs,
 NetApp controllers, and aggregates, and `""` for services, externals, and SVMs.
 

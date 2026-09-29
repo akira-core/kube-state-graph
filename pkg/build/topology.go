@@ -1213,6 +1213,12 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		if aggr, ok := aggrByPVC[pv.IDValue]; ok {
 			pv.LabelsValue["aggr"] = aggr
 		}
+		// The declared ceiling rides on the node as a typed attribute, never a
+		// label, and independently of the edge: a FlexGroup claim has none, and
+		// an unmeasured claim's edge carries no ceiling, yet the node does.
+		if q, ok := netapp.qosByPVC[pv.IDValue]; ok {
+			pv.QoSValue = q
+		}
 	}
 
 	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.

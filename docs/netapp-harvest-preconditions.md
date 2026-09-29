@@ -72,9 +72,18 @@ length and cost one lookup per Harvest series.
 
 The join runs in three hops that degrade independently: hop A (`volume_labels`)
 decides the graph's shape, hop B (the QoS workload families) decides whether the
-edge carries measurements, hop C (the QoS fixed policy) whether it also carries
-a ceiling. A hop-B miss leaves a valid measurement-less edge — it never costs
+edge carries measurements, hop C (the QoS fixed policy) whether the claim's PVC
+node carries a ceiling (`data.qos`) and, on a measured edge, whether the edge
+does too. A hop-B miss leaves a valid measurement-less edge — it never costs
 the claim its storage topology.
+
+The ceiling is resolved once per claim and copied to both places, so they can
+never disagree. The two differ only in when they appear: the edge carries a
+ceiling only alongside a measurement, while the PVC node carries `data.qos`
+whenever the claim's policy group resolved one — including a FlexGroup claim
+(no aggregate, hence no edge) and a claim whose edge carries no `metrics`. Both
+still need hop B: the policy group is recovered from a matched workload series,
+so a claim with no workload series at all has a ceiling in neither place.
 
 Hop A and hop B are not independently *reachable*, though: hop B is issued only
 for the FlexVol names hop A matched (see "The QoS read is scoped" below), so a
@@ -89,10 +98,17 @@ build where hop A matched nothing issues no hop-B query at all.
    PV maps to a qtree or LUN, not a volume), so no per-claim volume series
    exists. Per-claim I/O figures do not exist.
 3. **FlexGroup volumes** span aggregates; the matched series carries an empty
-   `aggr` label. No aggregate edge can be drawn. `svm` may still resolve.
+   `aggr` label. No aggregate edge can be drawn. `svm` may still resolve, and so
+   may the declared ceiling: the PVC node carries `data.qos` when one of the
+   claim's workload series names a policy group the fixed-policy families hold,
+   keyed on the ONTAP cluster the SVM pick landed on.
 4. **Volumes with no QoS workload.** ONTAP does not collect a workload for every
    volume, so hop B can miss where hop A hit. The claim keeps its edge,
-   aggregate, controller and `svm` and simply carries no `metrics` key.
+   aggregate, controller and `svm` and simply carries no `metrics` key. It has
+   no `data.qos` either, since the policy group is recovered from a workload
+   series; a claim whose only workload rows are LUN-level (a SAN backend) is
+   the exception — its edge carries no `metrics` while its PVC node keeps
+   `data.qos`.
 5. **A FlexVol name matched from two zones or environments.** The Harvest legs
    carry the request's `az` / `env` matchers (see below), so only a build that
    reads several zones' Harvest series — an unfiltered request — can see two
@@ -221,7 +237,7 @@ template name.
 |---|---|---|---|
 | `volume_labels` | A | `conf/rest/9.12.0/volume.yaml` (`object: volume`; `instance_keys: aggr, node, style, svm, volume`) | Topology: aggregate, owning controller, `svm`. Info series — value ignored, labels only. Read UNFILTERED, except by a storage-rooted `/v1/storage-graph` request (restricted to the rooted `ontap_cluster=` / `aggr=` / `svm=`, every aggregate an SVM root touched re-read whole for its owner vote, then re-read for the matched claims' tokens) |
 | `qos_read_ops`, `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data`, `qos_write_data` | B | `conf/restperf/9.12.0/workload.yaml` (`object: qos`; counters `read_ops`, `write_ops`, `read_latency`, `write_latency`, `read_data`, `write_data`; `instance_keys` include `lun`, `policy_group`, `svm`, `volume`) | I/O (verbatim; no `rate()`; data families are already bytes/s). Read SCOPED |
-| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling `max_iops` / `max_bytes_per_sec` of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
+| `qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps` | C | `conf/rest/9.12.0/qos_policy_fixed.yaml` (`object: qos_policy_fixed`; `instance_keys: class, name, svm`; `max_throughput_iops` / `max_throughput_mbps` are instance labels) | Declared ceiling of the volume's own policy group, keyed on `(cluster, svm, policy_group)` — cluster and svm from hop A, policy group from hop B. Surfaced as `data.qos` `{policy_group, max_iops, max_bytes_per_sec}` on the claim's PVC node, and as `max_iops` / `max_bytes_per_sec` on its `pvc-to-netapp-aggr` edge when that edge carries a measurement. The policy's identity label is `name` here, which is why the reader falls back to `policy_group` only for template variance |
 | `aggr_new_status`, `aggr_space_used`, `aggr_space_total` | — | `conf/rest/9.12.0/aggr.yaml` (`object: aggr`; `space.block_storage.used => space_used`, `space.block_storage.size => space_total`; `new_status` from the LabelAgent `value_to_num` mapping of `state`) | Aggregate health / usage |
 | `node_new_status` | — | `conf/rest/9.12.0/node.yaml` (`object: node`; `new_status` from the LabelAgent `value_to_num` mapping of `healthy`) | Controller health |
 | `node_labels` | — | `conf/rest/9.12.0/node.yaml` (`object: node`; `instance_keys: ha_partner, node, serial`; `instance_labels` include `model`, `vendor`, `version`, `location`) | Controller hardware identity — `data.hardware` `{model, serial, version, vendor, location}`. Info series — value ignored, labels only |
@@ -318,6 +334,12 @@ group from the workload series, and the fixed-policy series addressed by its
 `name` (with a `policy_group` fallback for template variance). An incomplete or
 unmatched key is ignored, never widened: a volume in no policy group carries no
 ceiling rather than borrowing another group's figure from the same SVM.
+
+The resolved ceiling is exposed on the PVC node as `data.qos`
+(`{policy_group, max_iops, max_bytes_per_sec}`; each figure omitted when its own
+family held no series, the object omitted when neither did) — a copy of the edge's
+figures, rounded to 6 significant digits the same way, so a node and its edge
+serialise identical digits.
 
 **`svm` is required on the fixed-policy families.** A `qos_policy_fixed_max_*`
 series carrying no `cluster` or no `svm` label is not indexed at all, so a
