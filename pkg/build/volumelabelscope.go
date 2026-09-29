@@ -145,7 +145,7 @@ func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuer
 // read never spans more than one concurrency wave.
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
-// rootedVolumeLabelsChunksQualified splits the phase-1 restriction across as many
+// rootedVolumeLabelsChunks splits the phase-1 restriction across as many
 // queries as the byte budget requires, in (group, chunk) order: the bare
 // aggregate group's chunks first, then the bare SVM group's, then one group per
 // ONTAP cluster of the qualified aggregates and of the qualified SVMs, each in
@@ -175,7 +175,7 @@ const maxRootedVolumeLabelChunks = scopeConcurrency
 // pathological cluster set from producing a non-positive budget, which
 // ChunkScope would read as "no limit"; the chunk cap above is what actually
 // catches that case.
-func rootedVolumeLabelsChunksQualified(clusters, aggrs, svms []string, aggrPairs, svmPairs map[string][]string, budget int) ([]rootedVolumeLabelsQuery, bool) {
+func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, aggrPairs, svmPairs map[string][]string, budget int) ([]rootedVolumeLabelsQuery, bool) {
 	fixed := promql.MatcherCost(promql.VolumeLabelsClusterLabel, clusters)
 	if fixed > 0 {
 		fixed++ // the comma joining it to the chunked matcher

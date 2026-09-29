@@ -97,22 +97,15 @@ func volumeNames(rows model.Vector) []string {
 	return slices.Compact(out)
 }
 
-// claimFamily is one claim-keyed family a hub read issues: its scope on the
-// family's scopedLabel, and keep, the reader-side filter applied to whatever
-// the query returned — the restriction's own predicate, plus the claim-key
-// filter of the four claim-name families.
-//
-// render and budgetReserve, when set, replace the family's identity-label
-// rendering and take a fixed cost off the byte budget once per chunk — the
-// per-namespace claim seed renders a namespace equality beside its names
-// (see scopedFamily).
+// claimFamily is one claim-keyed family a hub read issues: the scopedFamily it
+// is read through (query, slot, scope and — for the per-namespace claim seed —
+// the render and budgetReserve that replace the identity-label rendering), and
+// keep, the reader-side filter applied to whatever the query returned — the
+// restriction's own predicate, plus the claim-key filter of the four claim-name
+// families.
 type claimFamily struct {
-	query         promql.Query
-	dst           *model.Vector
-	scope         []string
-	keep          func(model.Metric) bool
-	render        func(chunk []string) (string, bool)
-	budgetReserve int
+	scopedFamily
+	keep func(model.Metric) bool
 }
 
 // issueClaimKeyed issues each family restricted to its scope, chunked under
@@ -137,13 +130,7 @@ func issueClaimKeyed(
 		if len(f.scope) == 0 {
 			continue
 		}
-		scoped = append(scoped, scopedFamily{
-			query:         f.query,
-			dst:           f.dst,
-			scope:         f.scope,
-			render:        f.render,
-			budgetReserve: f.budgetReserve,
-		})
+		scoped = append(scoped, f.scopedFamily)
 	}
 	if len(scoped) > 0 {
 		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
@@ -224,9 +211,7 @@ func readHubClaimInfo(
 		want[c] = struct{}{}
 	}
 	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, []claimFamily{{
-		query: promql.QPVCInfo,
-		dst:   &v.PVCInfo,
-		scope: cands,
+		scopedFamily: scopedFamily{query: promql.QPVCInfo, dst: &v.PVCInfo, scope: cands},
 		keep: func(m model.Metric) bool {
 			_, ok := want[string(m[promql.VolumeNameLabel])]
 			return ok
@@ -338,7 +323,10 @@ func readHubClaimFamilies(
 	}
 	fams := make([]claimFamily, 0, len(promql.ClaimScopedQueries)-1)
 	for _, t := range claimTargets(v)[1:] {
-		fams = append(fams, claimFamily{query: t.query, dst: t.dst, scope: names, keep: isLoadedClaim})
+		fams = append(fams, claimFamily{
+			scopedFamily: scopedFamily{query: t.query, dst: t.dst, scope: names},
+			keep:         isLoadedClaim,
+		})
 	}
 	return issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams)
 }

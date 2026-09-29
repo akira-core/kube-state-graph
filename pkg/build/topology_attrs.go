@@ -64,7 +64,7 @@ func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAtt
 		attrs := out[key]
 		pick(&attrs.storageClass, string(s.Metric["storageclass"]))
 		pick(&attrs.volumeName, string(s.Metric["volumename"]))
-		if z, ok := zoneOf(s.Metric, mc.keys); ok && (!attrs.zone.known() || z.less(attrs.zone)) {
+		if z, ok := zoneOf(s.Metric, mc.keys); ok && (!attrs.zone.known() || z.compare(attrs.zone) < 0) {
 			attrs.zone = z
 		}
 		out[key] = attrs

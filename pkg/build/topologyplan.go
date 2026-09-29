@@ -105,12 +105,12 @@ func topologyLegs(v *topologyVectors) []topologyLeg {
 // controller families by reference. /v1/graph reads everything (fullPlan);
 // /v1/storage-graph reads only what its body can draw (storagePlan).
 type topologyPlan struct {
-	// kind, names and pods are the storage request's one root. fullPlan leaves
-	// them zero. names is every non-pod kind; pods is the pod kind. Both are
-	// sorted and de-duplicated.
-	kind  graph.StorageRootKind
-	names []string
-	pods  []graph.PodRef
+	// kind and pods are the storage request's one root. fullPlan leaves them
+	// zero. pods is the pod kind's refs, sorted and de-duplicated; every other
+	// kind's values live in the field the seed that reads them consults (the
+	// volume*, nodeRoots, claimRoots and applicationRoots fields below).
+	kind graph.StorageRootKind
+	pods []graph.PodRef
 	// skip names first-wave legs this read never issues. A skipped leg is
 	// neither launched nor tallied, and its topologyVectors slot stays nil —
 	// the state parseTopology already handles for a degraded optional leg.
@@ -225,7 +225,6 @@ var storageSkippedLegs = map[promql.Query]bool{
 func storagePlan(roots graph.StorageRoots) topologyPlan {
 	plan := topologyPlan{
 		kind:        roots.Kind,
-		names:       sortedNames(roots.Names),
 		pods:        slices.Clone(roots.Pods),
 		skip:        storageSkippedLegs,
 		byReference: true,
@@ -347,14 +346,14 @@ func (p topologyPlan) prepareHarvestSeed(window time.Duration, budget int, keys 
 		return p, nil
 	}
 	// Every chunk repeats the request matchers, so they come off the budget
-	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunksQualified.
+	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunks.
 	budget -= promql.RequestMatcherCost(promql.QVolumeLabels, keys, sel)
 	var queries []rootedVolumeLabelsQuery
 	var ok bool
 	if len(p.volumeNodes) > 0 {
 		queries, ok = rootedNodeLabelChunks(p.volumeNodes, budget)
 	} else {
-		queries, ok = rootedVolumeLabelsChunksQualified(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, p.volumeAggrPairs, p.volumeSVMPairs, budget)
+		queries, ok = rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, p.volumeAggrPairs, p.volumeSVMPairs, budget)
 	}
 	for i := range queries {
 		if !ok {

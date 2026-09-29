@@ -1,7 +1,6 @@
 package build
 
 import (
-	"cmp"
 	"context"
 	"log/slog"
 	"slices"
@@ -68,12 +67,7 @@ func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]zone {
 		for z := range set {
 			zones = append(zones, z)
 		}
-		slices.SortFunc(zones, func(a, b zone) int {
-			if c := cmp.Compare(a.az, b.az); c != 0 {
-				return c
-			}
-			return cmp.Compare(a.env, b.env)
-		})
+		slices.SortFunc(zones, zone.compare)
 		out[oc] = zones
 	}
 	return out

@@ -267,6 +267,20 @@ func TestClaimSeed_PVNamingNoClaimLoadsNothing(t *testing.T) {
 	assert.Empty(t, v.PVCInfo, "a row whose volumename is not a root is dropped by the reader")
 }
 
+// A claim is identified by (namespace, name): a pv-root row that names no
+// namespace is dropped by the reader instead of becoming a `<cluster>//<claim>`
+// node.
+func TestClaimSeed_PVDropsRowsWithNoNamespace(t *testing.T) {
+	q := &stubQuerier{rows: model.Vector{
+		claimInfoRow("", "data", "pvc-x"),
+		claimInfoRow("shop", "data", "pvc-x"),
+	}}
+	v, err := claimSeedRun(t, q, graph.StorageRootPV, []string{"pvc-x"})
+	require.NoError(t, err)
+	require.Len(t, v.PVCInfo, 1)
+	assert.Equal(t, "shop", string(v.PVCInfo[0].Metric[promql.NamespaceLabel]))
+}
+
 // The tally records the family when the seed issued it — including at zero
 // rows, so an issued query is never reported as one that never ran.
 func TestClaimSeed_MarksTheFamilyIssued(t *testing.T) {

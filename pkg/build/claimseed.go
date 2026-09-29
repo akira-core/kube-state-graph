@@ -97,14 +97,17 @@ func (g claimSeedGroup) render(window time.Duration, keys promql.LabelKeys, sel 
 // exporter may return more than was asked, and a claim name is unique per
 // namespace only — so the rows are filtered here, before any claim is tracked.
 // A pvc row must name the group's namespace and one of its claims; a pv row
-// must carry one of the root volume names.
+// must carry one of the root volume names. Either kind of row must carry a
+// namespace: a claim is identified by (namespace, name), and the parse would
+// mint a `<cluster>//<claim>` node from a row that names none.
 func (g claimSeedGroup) keep() func(model.Metric) bool {
 	want := make(map[string]struct{}, len(g.names))
 	for _, n := range g.names {
 		want[n] = struct{}{}
 	}
 	return func(m model.Metric) bool {
-		if g.namespace != "" && string(m[promql.NamespaceLabel]) != g.namespace {
+		ns := string(m[promql.NamespaceLabel])
+		if ns == "" || (g.namespace != "" && ns != g.namespace) {
 			return false
 		}
 		_, ok := want[string(m[model.LabelName(g.label)])]
@@ -145,12 +148,14 @@ func readClaimSeed(
 	fams := make([]claimFamily, len(groups))
 	for i, g := range groups {
 		fams[i] = claimFamily{
-			query:         promql.QPVCInfo,
-			dst:           &parts[i],
-			scope:         g.names,
-			keep:          g.keep(),
-			render:        g.render(window, opts.LabelKeys, sel),
-			budgetReserve: g.reserve(opts.LabelKeys, sel),
+			scopedFamily: scopedFamily{
+				query:         promql.QPVCInfo,
+				dst:           &parts[i],
+				scope:         g.names,
+				render:        g.render(window, opts.LabelKeys, sel),
+				budgetReserve: g.reserve(opts.LabelKeys, sel),
+			},
+			keep: g.keep(),
 		}
 	}
 	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {

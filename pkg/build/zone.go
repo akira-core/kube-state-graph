@@ -1,6 +1,7 @@
 package build
 
 import (
+	"cmp"
 	"slices"
 
 	"github.com/prometheus/common/model"
@@ -44,10 +45,8 @@ func zonesAgree(a, b zone) bool {
 	return !a.known() || !b.known() || a == b
 }
 
-// less orders zones by (az, env), so a choice among several is deterministic.
-func (z zone) less(o zone) bool {
-	if z.az != o.az {
-		return z.az < o.az
-	}
-	return z.env < o.env
+// compare orders zones by (az, env), so a choice among several is
+// deterministic. It has the signature slices.SortFunc wants (zone.compare).
+func (z zone) compare(o zone) int {
+	return cmp.Or(cmp.Compare(z.az, o.az), cmp.Compare(z.env, o.env))
 }

@@ -876,7 +876,7 @@ live under `openspec/specs/`.
     for a cluster-only request), merged in (group, chunk) order de-duplicated by
     fingerprint. A QUALIFIED `aggr=` / `svm=` value adds one group per ONTAP
     cluster after the bare groups (`{cluster="oc",aggr=~…}` / `{cluster="oc",svm=~…}`,
-    clusters in sorted order; `rootedVolumeLabelsChunksQualified`), and the chunk cap
+    clusters in sorted order; `rootedVolumeLabelsChunks`), and the chunk cap
     counts every group; a qualified aggregate is read whole like a bare one
     (owner completion and `uncoveredAggrPairs` skip it), and its flowless gauges go
     through `issueHarvestPairMap` — assigned by the by-name read first, merged by the
