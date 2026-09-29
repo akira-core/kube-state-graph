@@ -167,7 +167,7 @@ bindings), and the waves above hang off that claim set:
 ```
  L1  volume_labels phase 1 (aggr / svm groups)   aggr_* node_* qos_policy_* ALERTS   app recovery st.1
  L2  kube_persistentvolumeclaim_info{volumename}  owner completion (svm= only)        app recovery st.2
- L3  bindings / pvc_annotations / kubelet ×2 {persistentvolumeclaim}   phase 2 {volume=~tok}   st.3
+ L3  bindings / pvc_annotations / kubelet ×2 {namespace,persistentvolumeclaim}   phase 2 {volume=~tok}   st.3
  L4  pods                                          QoS ×6
  L5  kube_node_* ×4      controllers stage A
  L6                      controllers stage B
@@ -212,7 +212,8 @@ bindings still require:
 **Fan-out per build, storage seed**: the gauge families of a flowless root plus `volume_labels`, not the old 13 first-wave families (the 18 above minus
 the five claim families), plus 1 (`kube_persistentvolumeclaim_info`) when the
 rooted rows yield a PV candidate, plus 4 (bindings, claim annotations, kubelet
-×2) when a candidate names a claim, plus the pod / node / controller / QoS
+×2) when a candidate names a claim — each of those four once per namespace the
+loaded claims live in (the counts below are for one namespace), plus the pod / node / controller / QoS
 additions above for what those claims lead to. `volume_labels` is issued once
 per phase-1 chunk, plus once per owner-completion chunk (only with `svm=`, and
 only for aggregates no `aggr=` root read whole), plus once per phase-2 chunk
@@ -233,7 +234,8 @@ one query over the bare names for `pv=` (`{volumename=~"…"}`) — kept only wh
 the row is a root, with no `volume_labels` read in front of it. Nothing but
 `ALERTS` runs beside it. The claims that read returns feed the same expansion a
 storage-side root uses: the claim-binding family, claim annotations and the two
-kubelet families by claim (so every mounter is loaded), then the token read that
+kubelet families by claim, one query per namespace of the loaded claims (so every
+mounter is loaded), then the token read that
 completes the claim's FlexVol candidates, then the pod / node / controller /
 QoS / Harvest waves. Both seeds are request-derived scopes: more than sixteen
 queries in total (namespaces summed for `pvc=`) is rejected as `invalid_scope`
@@ -311,7 +313,9 @@ starts with `pvc_` at the start of the name or right after a `_` yields a
 candidate PV name (`_` → `-`); `kube_persistentvolumeclaim_info` is read
 restricted to `volumename=~"<candidates>"`, and the claim-binding family,
 `kube_persistentvolumeclaim_annotations` and the two kubelet families
-restricted to `persistentvolumeclaim=~"<claims>"`, their rows then kept only
+restricted, one query per namespace of the loaded claims, to
+`namespace="<ns>",persistentvolumeclaim=~"<claims of ns>"` (a claim name alone
+would be read in every namespace of the estate), their rows then kept only
 when `(zone, environment, cluster, namespace, claim)` names a loaded claim.
 Extraction is a candidate generator, never a judge: a candidate naming no PV
 loads nothing, and the forward join still decides every pick. No candidate

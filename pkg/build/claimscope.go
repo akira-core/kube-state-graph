@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -263,12 +264,20 @@ func claimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) claimKey {
 
 // readHubClaimFamilies reads the claim-binding family,
 // kube_persistentvolumeclaim_annotations and the two kubelet volume-stats
-// families restricted on `persistentvolumeclaim` to the claims the claim-info
-// read returned, and keeps only the rows whose claim IS one of them.
+// families restricted to the claims the claim-info read returned — one query
+// group per namespace, each on `namespace` and `persistentvolumeclaim`
+// (promql.RenderNamesInNamespace) — and keeps only the rows whose claim IS one
+// of them.
 //
-// The filter runs before the pod scope is computed and before the parse: a
-// claim name is unique per namespace only, so the restriction also returns
-// same-named claims of other namespaces and clusters, and such a binding would
+// A claim is identified by (namespace, name), so a name alone (`data`, `cache`)
+// would be read in every namespace of every selected cluster and zone, which a
+// large estate can push past the upstream series limits — and /v1/storage-graph
+// fails closed on that. The namespace equality bounds the read to the namespaces
+// the claim-info read actually returned.
+//
+// The filter still runs before the pod scope is computed and before the parse:
+// a namespace is shared by every selected cluster and zone, so the read also
+// returns a same-named claim of another cluster, and such a binding would
 // otherwise load a pod and build a PVC node the rooted filer does not serve.
 // Bindings are keyed on `persistentvolumeclaim` alone, never on `claim_name`,
 // so the filter admits exactly what the restriction can (an exporter labelling
@@ -297,16 +306,16 @@ func readHubClaimFamilies(
 
 	keys := opts.LabelKeys.OrDefault()
 	claims := make(map[claimKey]struct{}, len(v.PVCInfo))
-	names := make([]string, 0, len(v.PVCInfo))
+	byNS := make(map[string][]string)
 	for _, s := range v.PVCInfo {
 		claim := string(s.Metric[promql.ClaimLabel])
 		if claim == "" {
 			continue
 		}
 		claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
-		names = append(names, claim)
+		ns := string(s.Metric[promql.NamespaceLabel])
+		byNS[ns] = append(byNS[ns], claim)
 	}
-	names = sortedNames(names)
 	defer func() {
 		slog.DebugContext(ctx, "storage graph volume hub",
 			"volumes", cov.volumes,
@@ -314,21 +323,47 @@ func readHubClaimFamilies(
 			"claims", len(claims),
 			"bindings", len(v.PVC))
 	}()
-	if len(names) == 0 {
+	if len(byNS) == 0 {
 		return nil
 	}
+	namespaces := slices.Sorted(maps.Keys(byNS))
 	isLoadedClaim := func(m model.Metric) bool {
 		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
-	fams := make([]claimFamily, 0, len(promql.ClaimScopedQueries)-1)
-	for _, t := range claimTargets(v)[1:] {
-		fams = append(fams, claimFamily{
-			scopedFamily: scopedFamily{query: t.query, dst: t.dst, scope: names},
-			keep:         isLoadedClaim,
-		})
+	targets := claimTargets(v)[1:]
+	parts := make([][]model.Vector, len(targets))
+	fams := make([]claimFamily, 0, len(targets)*len(namespaces))
+	for ti, t := range targets {
+		parts[ti] = make([]model.Vector, len(namespaces))
+		for ni, ns := range namespaces {
+			fams = append(fams, claimFamily{
+				scopedFamily: scopedFamily{
+					query: t.query,
+					dst:   &parts[ti][ni],
+					scope: sortedNames(byNS[ns]),
+					render: func(chunk []string) (string, bool) {
+						return promql.RenderNamesInNamespace(t.query, window, opts.LabelKeys, sel, ns, promql.ClaimLabel, chunk)
+					},
+					budgetReserve: promql.NamespaceEqualityCost(ns),
+				},
+				keep: isLoadedClaim,
+			})
+		}
 	}
-	return issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams)
+	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {
+		return err
+	}
+	// Merged in namespace order, so each vector is a pure function of the
+	// claim set rather than of upstream timing.
+	for ti, t := range targets {
+		var merged model.Vector
+		for _, part := range parts[ti] {
+			merged = append(merged, part...)
+		}
+		*t.dst = merged
+	}
+	return nil
 }
 
 // recoverScopedPanic converts a panic in a hub or rooted volume-label read into

@@ -111,7 +111,7 @@ Builder.BuildStorage(…, roots) ── readTopology under storagePlan. The firs
                                   itself — kube_persistentvolumeclaim_info{namespace,persistentvolumeclaim}
                                   per namespace, or {volumename} — with no volume_labels phase 1 in front
                                   of it). One expansion then walks that
-                                  claim set both ways: claim families by claim name (filtered to the
+                                  claim set both ways: claim families per namespace, by claim name (filtered to the
                                   tracked cluster/namespace/claim), mounter completion (bindings by claim,
                                   then every mounter's pod), candidate completion (volume_labels by token)
                                   and owner completion (every touched aggregate re-read whole). Kubernetes

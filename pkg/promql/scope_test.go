@@ -312,6 +312,20 @@ func TestRenderNamesInNamespace_Claims(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// Every claim-keyed family a hub-mode build reads is namespace-scoped: the
+// claim-name restriction alone would read a common claim name in every
+// namespace of the estate.
+func TestRenderNamesInNamespace_EveryClaimFamily(t *testing.T) {
+	t.Parallel()
+
+	for _, q := range ClaimScopedQueries {
+		got, ok := RenderNamesInNamespace(q, time.Minute, LabelKeys{}, Selector{}, "shop", ClaimLabel, []string{"data"})
+		require.True(t, ok, q)
+		assert.Contains(t, got, `namespace="shop",persistentvolumeclaim="data"`, q)
+		assert.True(t, strings.HasPrefix(got, "last_over_time("+string(q)+"{"), q)
+	}
+}
+
 // A family is refused under a label it is not keyed by, so a caller cannot
 // restrict a pod-keyed family on a claim name (or the reverse) and read the
 // wrong population.

@@ -163,10 +163,13 @@ func TestVolumeHub_SameNamedClaimInAnotherNamespaceIsFiltered(t *testing.T) {
 	g, q, err := hubBuild(t, fx, scope, Options{})
 	require.NoError(t, err)
 
-	assert.Equal(t, [][]string{{"data"}}, q.ScopeValues(promql.QPVCBindings, promql.ClaimLabel),
-		"the name-scoped binding read returns both claims called data")
+	assert.Equal(t, [][]string{{"data"}}, q.ScopeValues(promql.QPVCBindings, promql.ClaimLabel))
+	assert.Equal(t,
+		[]string{`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="data"}[1m])`},
+		q.QueriesFor(promql.QPVCBindings),
+		"the claim families are read for the loaded claim's own namespace, so platform/data is never queried")
 	assert.Equal(t, [][]string{{"app-0"}}, q.ScopeValues(promql.QPodInfo, promql.PodLabel),
-		"platform/data's binding is discarded before the pod scope is computed")
+		"a row the shop query returns for platform/data is discarded before the pod scope is computed")
 	assert.Contains(t, g.NodesByID, "zone-a-prod-c1/shop/data")
 	assert.NotContains(t, g.NodesByID, "zone-a-prod-c1/platform/data", "no PVC node is built for it")
 
@@ -175,6 +178,26 @@ func TestVolumeHub_SameNamedClaimInAnotherNamespaceIsFiltered(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QPVCBindings)], "the tally counts the rows the reader kept")
 	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QKubeletVolumeUsedBytes)])
+}
+
+// Each claim family is read once per namespace the claim-info read returned,
+// in namespace order — never by claim name across the estate.
+func TestVolumeHub_ClaimFamiliesAreReadPerNamespace(t *testing.T) {
+	vols, claims := hubBase()
+	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"})
+	g, q, err := hubBuild(t, hubEstate(vols, claims), scope, Options{})
+	require.NoError(t, err)
+
+	for _, fam := range promql.ClaimScopedQueries[1:] {
+		// The namespaces are issued concurrently, so only the set is pinned.
+		got := strings.Join(q.QueriesFor(fam), "\n")
+		require.Len(t, q.QueriesFor(fam), 2, "%s: one query per namespace", fam)
+		assert.Contains(t, got, `namespace="platform",persistentvolumeclaim="redis-data"`, fam)
+		assert.Contains(t, got, `namespace="shop",persistentvolumeclaim="orders-data"`, fam)
+	}
+	ids := vlrIDs(vlrBody(t, g, scope))
+	assert.True(t, ids["zone-a-prod-c1/shop/orders-data"])
+	assert.True(t, ids["zone-a-prod-c1/platform/redis-data"])
 }
 
 // Spec: "No candidate is reported".

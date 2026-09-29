@@ -231,9 +231,11 @@ func RenderPodInfoByNode(window time.Duration, keys LabelKeys, sel Selector, nod
 var PodNamespaceScopedQueries = []Query{QPodInfo, QPodOwner, QPVCBindings}
 
 // ClaimNamespaceScopedQueries are the claim-keyed families
-// RenderNamesInNamespace accepts under ClaimLabel: the one family a claim root
-// seeds from, read one namespace at a time.
-var ClaimNamespaceScopedQueries = []Query{QPVCInfo}
+// RenderNamesInNamespace accepts under ClaimLabel: the family a claim root
+// seeds from and every family a hub-mode build then reads for the claims that
+// seed returned — each read one namespace at a time, so a common claim name is
+// never read across the estate.
+var ClaimNamespaceScopedQueries = ClaimScopedQueries
 
 // namespaceNameLabel reports whether q is keyed by (namespace, label) — the
 // pairs RenderNamesInNamespace can render.

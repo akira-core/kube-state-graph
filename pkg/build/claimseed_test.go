@@ -402,9 +402,10 @@ func TestClaimSeed_BuildLoadsTheRootClaimAndItsChain(t *testing.T) {
 			require.GreaterOrEqual(t, firstVolumes, 0, "candidate completion reads volume_labels by the claim's token")
 			assert.Less(t, firstInfo, firstVolumes, "no volume_labels query precedes the claim read")
 
-			// The expansion reads the claim families by claim, mounters included.
+			// The expansion reads the claim families by (namespace, claim),
+			// mounters included.
 			assert.Contains(t, q.QueriesFor(promql.QPVCBindings),
-				`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",persistentvolumeclaim="orders-data"}[1m])`)
+				`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1m])`)
 		})
 	}
 }
