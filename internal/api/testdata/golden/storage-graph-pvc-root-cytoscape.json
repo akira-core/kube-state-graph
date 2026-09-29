@@ -36,6 +36,10 @@
           "name": "orders-data",
           "type": "pvc",
           "parent": "cluster-alpha/namespace/shop",
+          "qos": {
+            "policy_group": "gold-tier",
+            "max_iops": 5000
+          },
           "status": "normal",
           "labels": {
             "aggr": "netapp/ontap-prod/aggr/aggr1",

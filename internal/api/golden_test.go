@@ -79,6 +79,8 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 	require.NoError(t, err)
 	nodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"worker-2"})
 	require.NoError(t, err)
+	svmScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootSVM, []string{"svm_big"})
+	require.NoError(t, err)
 	appGraph := applicationRootEstate(g)
 	stampFixtureStatuses(slices.Collect(maps.Values(appGraph.NodesByID)))
 	claimGraph := claimRootEstate(g)
@@ -113,6 +115,7 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 		"storage-graph-application-root":    graph.ProjectStorage(appGraph, appScope),
 		"storage-graph-ontap-node-root":     graph.ProjectStorage(g, ontapNodeScope),
 		"storage-graph-node-root":           graph.ProjectStorage(g, nodeScope),
+		"storage-graph-svm-root":            graph.ProjectStorage(g, svmScope),
 		// A claim root keeps the storage-side path of a claim no pod mounts (a
 		// sink) beside the mounted claim's full path; a volume root resolves to
 		// its claim; a claim on no filer is drawn alone.
@@ -276,6 +279,7 @@ func buildWithNetAppStorage() graph.View {
 	used, cap := 700000000000.0, 1000000000000.0
 	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
 	cpu, ops, lat, data := 72.5, 18500.0, 830.0, 1.2e9
+	maxIOPS, maxBps := 5000.0, 262144000.0
 	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
@@ -285,7 +289,9 @@ func buildWithNetAppStorage() graph.View {
 			"aggr": graph.NetAppAggrID("ontap-prod", "aggr1"),
 		},
 		StorageClassValue: "netapp-nas",
-		AlertsValue:       []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
+		// The same ceiling the edge below carries: one resolution feeds both.
+		QoSValue:    &graph.QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps},
+		AlertsValue: []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	aggr := &graph.NetAppAggrNode{
@@ -307,7 +313,6 @@ func buildWithNetAppStorage() graph.View {
 		PerfValue:   &graph.NodePerf{CPUBusyPct: &cpu, TotalOps: &ops, TotalLatencyUs: &lat, TotalBytesPerSec: &data},
 		AlertsValue: []graph.Alert{{Name: "NodeCPUBusy", State: graph.AlertStateFiring, Severity: "critical"}},
 	}
-	maxIOPS, maxBps := 5000.0, 262144000.0
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
 		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
 		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
@@ -361,6 +366,16 @@ func buildStorageGraphEstate() *graph.Graph {
 	wb := &graph.K8sNode{IDValue: graph.K8sNodeID(b, "worker-b"), NameValue: "worker-b", LabelsValue: map[string]string{"cluster": b}}
 
 	f64 := func(v float64) *float64 { return &v }
+	// A claim whose svm-pvc edge carries max_iops carries the same ceiling on
+	// its node: both come from the one per-claim resolution.
+	gold := func() *graph.QoSCeiling { return &graph.QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: f64(5000)} }
+	orders.QoSValue, shared.QoSValue, db.QoSValue = gold(), gold(), gold()
+	// The ceiling is independent of the edge. plain-data joined an aggregate but
+	// its edge carries no measurement (a LUN-only claim), yet the node still
+	// carries the one figure its policy group resolved; big-data is the FlexGroup
+	// shape — no aggregate, so no pvc-to-netapp-aggr edge — and carries both.
+	plain.QoSValue = &graph.QoSCeiling{PolicyGroup: "silver-tier", MaxBytesPerSec: f64(52428800)}
+	big.QoSValue = &graph.QoSCeiling{PolicyGroup: "bulk-tier", MaxIOPS: f64(8000), MaxBytesPerSec: f64(524288000)}
 	io := func(ops float64) *graph.IOMetrics {
 		return &graph.IOMetrics{ReadOps: f64(ops), WriteOps: f64(ops / 2), ReadLatencyUs: f64(450), MaxIOPS: f64(5000)}
 	}

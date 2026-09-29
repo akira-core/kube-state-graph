@@ -54,6 +54,10 @@
           "name": "orders-data",
           "type": "pvc",
           "parent": "cluster-alpha/namespace/shop",
+          "qos": {
+            "policy_group": "gold-tier",
+            "max_iops": 5000
+          },
           "status": "normal",
           "labels": {
             "aggr": "netapp/ontap-prod/aggr/aggr1",
@@ -68,6 +72,10 @@
           "name": "plain-data",
           "type": "pvc",
           "parent": "cluster-alpha/namespace/shop",
+          "qos": {
+            "policy_group": "silver-tier",
+            "max_bytes_per_sec": 52428800
+          },
           "status": "normal",
           "labels": {
             "aggr": "netapp/ontap-prod/aggr/aggr1",
@@ -82,6 +90,10 @@
           "name": "shared-data",
           "type": "pvc",
           "parent": "cluster-alpha/namespace/shop",
+          "qos": {
+            "policy_group": "gold-tier",
+            "max_iops": 5000
+          },
           "status": "normal",
           "labels": {
             "aggr": "netapp/ontap-prod/aggr/aggr1",
@@ -190,6 +202,10 @@
           "name": "db-data",
           "type": "pvc",
           "parent": "cluster-beta/namespace/db",
+          "qos": {
+            "policy_group": "gold-tier",
+            "max_iops": 5000
+          },
           "status": "normal",
           "labels": {
             "aggr": "netapp/ontap-prod/aggr/aggr1",

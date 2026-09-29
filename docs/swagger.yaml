@@ -160,6 +160,8 @@ components:
           type: string
         perf:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.PerfDTO'
+        qos:
+          $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.QoSDTO'
         ready_status:
           type: string
         status:
@@ -181,6 +183,30 @@ components:
           type: number
         total_ops:
           type: number
+      type: object
+    github_com_akira-core_kube-state-graph_pkg_cytoscape.QoSDTO:
+      description: 'The declared QoS throughput ceiling of the policy group governing
+        the claim''s volume. Present only on pvc nodes, and only when at least one
+        figure resolved; absent means no declared ceiling, never 0. A copy of the
+        figures on the claim''s pvc-to-netapp-aggr edge, but independent of it: a
+        FlexGroup claim, or a claim whose edge carries no measurement, still carries
+        it. Figures are JSON numbers rounded to 6 significant digits and may appear
+        in exponent form.'
+      properties:
+        max_bytes_per_sec:
+          description: MaxBytesPerSec is the declared maximum throughput in bytes
+            per second (the policy's MB/s figure x 1048576, the unit of read_bytes_per_sec).
+          example: 262144000
+          type: number
+        max_iops:
+          description: MaxIOPS is the declared maximum throughput in requests per
+            second.
+          example: 5000
+          type: number
+        policy_group:
+          description: PolicyGroup is the QoS policy group the ceiling was keyed on.
+          example: gold-tier
+          type: string
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.UsageDTO:
       properties:

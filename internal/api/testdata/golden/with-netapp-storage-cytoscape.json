@@ -76,6 +76,11 @@
           "type": "pvc",
           "parent": "cluster-alpha/namespace/db",
           "storageclass": "netapp-nas",
+          "qos": {
+            "policy_group": "gold-tier",
+            "max_iops": 5000,
+            "max_bytes_per_sec": 262144000
+          },
           "alerts": [
             {
               "name": "PVCAlmostFull",
