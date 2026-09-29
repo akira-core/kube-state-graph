@@ -1259,7 +1259,7 @@ changes, start a new change and write its delta specs under
   harness tooling are exempt.
 - Don't add dependencies casually. Current direct deps: Gin, Prometheus
   client_golang + common (`model`), google/uuid, golang.org/x/sync,
-  `sigs.k8s.io/yaml` (routing-file parser, `pkg/promql/backendsfile`), testify v1.11.x (test-only,
+  `sigs.k8s.io/yaml` (routing-file parser, `pkg/promql/backendsfile`), testify v1.12.x (test-only,
   also drives mockery-generated mocks), testcontainers-go (integration
   test-only), swaggo/swag/v2 (codegen tool, not imported at runtime),
   vektra/mockery v2.x (codegen tool tracked via go.mod `tool` directive,
