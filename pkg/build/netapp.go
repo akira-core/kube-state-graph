@@ -38,10 +38,9 @@ type volumeLabelCandidate struct {
 	node         string
 	aggr         string
 	svm          string
-	// zone is the (az, env) pair the series carries; zoned is false when either
-	// label is absent, which the zone-agreement rule never excludes.
-	zone  zone
-	zoned bool
+	// zone is the (az, env) pair the series carries; the zero zone (either
+	// label absent) is unknown, which the zone-agreement rule never excludes.
+	zone zone
 }
 
 // qosCandidate is one Harvest QoS workload sample — hop B. It carries no
@@ -67,12 +66,11 @@ type qosCandidate struct {
 
 // pvcVolume is a PVC that carries a non-empty volumename (the join key). Its
 // zone is the (az, env) pair its kube_persistentvolumeclaim_info series carries
-// (zoned is false when either label is absent): a claim joins only FlexVols of
+// (the zero zone when either label is absent): a claim joins only FlexVols of
 // its own zone (accept-multi-zone-storage-graph).
 type pvcVolume struct {
 	id, volumeName string
 	zone           zone
-	zoned          bool
 }
 
 // netappResult is the demand-driven output of resolveNetAppStorage.
@@ -213,19 +211,18 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 		if vol == "" || oc == "" {
 			continue
 		}
-		cz, czoned := zoneOf(s.Metric, keys)
+		cz, _ := zoneOf(s.Metric, keys)
 		cand := volumeLabelCandidate{
 			ontapCluster: oc,
 			node:         string(s.Metric["node"]),
 			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
 			zone:         cz,
-			zoned:        czoned,
 		}
 		volIndex[vol] = append(volIndex[vol], cand)
 		matched = matcher.match(vol, matched)
 		for _, ci := range matched {
-			if !zonesAgree(claims[ci].zone, claims[ci].zoned, cand.zone, cand.zoned) {
+			if !zonesAgree(claims[ci].zone, cand.zone) {
 				continue
 			}
 			candsByClaim[ci] = append(candsByClaim[ci], cand)

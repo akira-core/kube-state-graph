@@ -220,7 +220,7 @@ var storageSkippedLegs = map[promql.Query]bool{
 //
 // It maps the one kind onto the plan fields the read consults. ontap_cluster,
 // aggr, svm and ontap_node seed volume_labels; node and pod seed their claim
-// bindings; application still reads the claim side from the zone until its
+// bindings; pvc and pv seed the claim-info read itself (claimSeeded); application still reads the claim side from the zone until its
 // seed replaces that.
 func storagePlan(roots graph.StorageRoots) topologyPlan {
 	plan := topologyPlan{
@@ -347,7 +347,7 @@ func (p topologyPlan) prepareHarvestSeed(window time.Duration, budget int, keys 
 		return p, nil
 	}
 	// Every chunk repeats the request matchers, so they come off the budget
-	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunks.
+	// the way the repeated cluster matcher does inside rootedVolumeLabelsChunksQualified.
 	budget -= promql.RequestMatcherCost(promql.QVolumeLabels, keys, sel)
 	var queries []rootedVolumeLabelsQuery
 	var ok bool
@@ -394,6 +394,28 @@ func (p topologyPlan) prepareNodeSeed(window time.Duration, budget int, keys pro
 			continue
 		}
 		p.nodeSeed = append(p.nodeSeed, rendered)
+	}
+	return p, nil
+}
+
+// prepare resolves every seed of the plan, in the one order both buildStorage
+// and readTopology need: each step is idempotent, so the builder can reject a
+// capped request before binding a querier and readTopology can re-run it for a
+// plan that arrives unresolved. The first rejection is returned as is.
+func (p topologyPlan) prepare(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	steps := []func(topologyPlan) (topologyPlan, error){
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareHarvestSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareNodeSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.preparePodSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareClaimSeed(budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareApplicationSeed(budget) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareFlowless(budget, keys, sel) },
+	}
+	for _, step := range steps {
+		var err error
+		if p, err = step(p); err != nil {
+			return p, err
+		}
 	}
 	return p, nil
 }

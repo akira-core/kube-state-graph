@@ -145,12 +145,6 @@ func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuer
 // read never spans more than one concurrency wave.
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
-// rootedVolumeLabelsChunks is rootedVolumeLabelsChunksQualified for a request
-// carrying bare values only.
-func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
-	return rootedVolumeLabelsChunksQualified(clusters, aggrs, svms, nil, nil, budget)
-}
-
 // rootedVolumeLabelsChunksQualified splits the phase-1 restriction across as many
 // queries as the byte budget requires, in (group, chunk) order: the bare
 // aggregate group's chunks first, then the bare SVM group's, then one group per

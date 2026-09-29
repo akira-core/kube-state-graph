@@ -284,31 +284,10 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 // binds, so no query reaches a store of another zone and no series of another
 // zone or environment reaches the body.
 func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, plan topologyPlan) (*graph.Graph, error) {
-	var err error
-	plan, err = plan.prepareHarvestSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
+	plan, err := plan.prepare(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
 	if err != nil {
 		// The cap is a pure function of the root values and the byte budget, so
 		// the rejection happens before a querier is bound and before any query.
-		return nil, err
-	}
-	plan, err = plan.prepareNodeSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
-	if err != nil {
-		return nil, err
-	}
-	plan, err = plan.preparePodSeed(window, b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
-	if err != nil {
-		return nil, err
-	}
-	plan, err = plan.prepareClaimSeed(b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
-	if err != nil {
-		return nil, err
-	}
-	plan, err = plan.prepareApplicationSeed(b.opts.qosScopeBatchBytes())
-	if err != nil {
-		return nil, err
-	}
-	plan, err = plan.prepareFlowless(b.opts.qosScopeBatchBytes(), b.opts.LabelKeys, sel)
-	if err != nil {
 		return nil, err
 	}
 	q := b.querierFor(sel)

@@ -419,28 +419,7 @@ func readTopology(
 	// the launch, the waves and the parse all read the same answer. A storage
 	// build has usually resolved it already, to pick its request matchers and
 	// routing; resolving is idempotent.
-	var prepErr error
-	plan, prepErr = plan.prepareHarvestSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
-	if prepErr != nil {
-		return Topology{}, prepErr
-	}
-	plan, prepErr = plan.prepareNodeSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
-	if prepErr != nil {
-		return Topology{}, prepErr
-	}
-	plan, prepErr = plan.preparePodSeed(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
-	if prepErr != nil {
-		return Topology{}, prepErr
-	}
-	plan, prepErr = plan.prepareClaimSeed(opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
-	if prepErr != nil {
-		return Topology{}, prepErr
-	}
-	plan, prepErr = plan.prepareApplicationSeed(opts.qosScopeBatchBytes())
-	if prepErr != nil {
-		return Topology{}, prepErr
-	}
-	plan, prepErr = plan.prepareFlowless(opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
+	plan, prepErr := plan.prepare(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
 	if prepErr != nil {
 		return Topology{}, prepErr
 	}
@@ -1219,10 +1198,10 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	// Root claims no pod mounts (claim-seeded builds only). Sorted, so the node
 	// order — and everything derived from it — never depends on vector order.
 	if v.MaterialiseUnboundClaims {
-		keys := slices.SortedFunc(maps.Keys(pvcInfo), func(a, b pvcKey) int {
+		infoKeys := slices.SortedFunc(maps.Keys(pvcInfo), func(a, b pvcKey) int {
 			return cmp.Or(cmp.Compare(a.cluster, b.cluster), cmp.Compare(a.namespace, b.namespace), cmp.Compare(a.claim, b.claim))
 		})
-		for _, k := range keys {
+		for _, k := range infoKeys {
 			id := graph.PVCID(k.cluster, k.namespace, k.claim)
 			if _, ok := pvcByID[id]; !ok {
 				newPVC(id, k.cluster, k.namespace, k.claim)
@@ -1263,7 +1242,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	for _, pv := range pvcs {
 		if vn := pv.LabelsValue["volumename"]; vn != "" {
 			attrs := pvcInfo[pvcKey{pv.LabelsValue["cluster"], pv.LabelsValue["namespace"], pv.NameValue}]
-			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn, zone: attrs.zone, zoned: attrs.zoned})
+			claims = append(claims, pvcVolume{id: pv.IDValue, volumeName: vn, zone: attrs.zone})
 		}
 	}
 	netapp := resolveNetAppStorage(claims, v, mc.keys)
@@ -1857,17 +1836,17 @@ type pvcKey struct{ cluster, namespace, claim string }
 type pvcInfoAttrs struct {
 	storageClass string
 	volumeName   string
-	// zone is the (az, env) pair of the claim's info series; zoned is false when
+	// zone is the (az, env) pair of the claim's info series; the zero zone when
 	// no series carried the complete pair. It is the claim's side of the
 	// zone-agreeing FlexVol join.
-	zone  zone
-	zoned bool
+	zone zone
 }
 
 // resolvePVCInfo builds the (cluster, namespace, persistentvolumeclaim) →
 // {storageclass, volumename} index from kube_persistentvolumeclaim_info. The
 // result enriches PVC nodes that already exist (from the pod→PVC binding
-// metric); it never materialises a PVC on its own.
+// metric); only a claim-seeded build (MaterialiseUnboundClaims) also
+// materialises a root claim no pod mounts from its entry.
 //
 // The two fields are resolved per-field independently — a series may carry
 // `volumename` without `storageclass` and vice versa, and an empty value never
@@ -1899,8 +1878,8 @@ func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAtt
 		attrs := out[key]
 		pick(&attrs.storageClass, string(s.Metric["storageclass"]))
 		pick(&attrs.volumeName, string(s.Metric["volumename"]))
-		if z, ok := zoneOf(s.Metric, mc.keys); ok && (!attrs.zoned || z.less(attrs.zone)) {
-			attrs.zone, attrs.zoned = z, true
+		if z, ok := zoneOf(s.Metric, mc.keys); ok && (!attrs.zone.known() || z.less(attrs.zone)) {
+			attrs.zone = z
 		}
 		out[key] = attrs
 	}

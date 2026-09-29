@@ -22,7 +22,7 @@ func harvestInZone(s model.Sample, az, env string) model.Sample {
 }
 
 func zonedClaim(az, env string) []pvcVolume {
-	return []pvcVolume{{id: "zone-a-prod-c1/db/data", volumeName: "pvc-x", zone: zone{az: az, env: env}, zoned: true}}
+	return []pvcVolume{{id: "zone-a-prod-c1/db/data", volumeName: "pvc-x", zone: zone{az: az, env: env}}}
 }
 
 const zonedClaimID = "zone-a-prod-c1/db/data"

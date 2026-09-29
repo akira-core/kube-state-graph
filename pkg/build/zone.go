@@ -32,12 +32,16 @@ func zoneAdmits(candidate []zone, z zone, zoned bool) bool {
 	return !zoned || len(candidate) == 0 || slices.Contains(candidate, z)
 }
 
+// known reports whether the pair is complete. zoneOf never returns a partial
+// pair, so the zero zone is exactly "unknown".
+func (z zone) known() bool { return z != zone{} }
+
 // zonesAgree is the same rule for two single-zone sides: they disagree only when
 // BOTH carry a complete pair and the pairs differ. The claim → FlexVol join
 // (accept-multi-zone-storage-graph) applies it to a claim's own zone and each
 // matched volume_labels series'.
-func zonesAgree(a zone, aKnown bool, b zone, bKnown bool) bool {
-	return !aKnown || !bKnown || a == b
+func zonesAgree(a, b zone) bool {
+	return !a.known() || !b.known() || a == b
 }
 
 // less orders zones by (az, env), so a choice among several is deterministic.
