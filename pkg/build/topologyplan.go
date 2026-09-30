@@ -1,6 +1,7 @@
 package build
 
 import (
+	"cmp"
 	"maps"
 	"slices"
 	"time"
@@ -104,12 +105,12 @@ func topologyLegs(v *topologyVectors) []topologyLeg {
 // controller families by reference. /v1/graph reads everything (fullPlan);
 // /v1/storage-graph reads only what its body can draw (storagePlan).
 type topologyPlan struct {
-	// kind, names and pods are the storage request's one root. fullPlan leaves
-	// them zero. names is every non-pod kind; pods is the pod kind. Both are
-	// sorted and de-duplicated.
-	kind  graph.StorageRootKind
-	names []string
-	pods  []graph.PodRef
+	// kind and pods are the storage request's one root. fullPlan leaves them
+	// zero. pods is the pod kind's refs, sorted and de-duplicated; every other
+	// kind's values live in the field the seed that reads them consults (the
+	// volume*, nodeRoots, claimRoots and applicationRoots fields below).
+	kind graph.StorageRootKind
+	pods []graph.PodRef
 	// skip names first-wave legs this read never issues. A skipped leg is
 	// neither launched nor tallied, and its topologyVectors slot stays nil —
 	// the state parseTopology already handles for a degraded optional leg.
@@ -137,10 +138,22 @@ type topologyPlan struct {
 	volumeClusters []string
 	volumeAggrs    []string
 	volumeSVMs     []string
+	// volumeAggrPairs and volumeSVMPairs are the QUALIFIED `aggr=` / `svm=`
+	// values (`<ontap_cluster>/<name>`), keyed by ONTAP cluster with each name set
+	// sorted and de-duplicated. volumeAggrs / volumeSVMs hold the bare values
+	// (that name on every filer); the two forms are OR-combined.
+	volumeAggrPairs map[string][]string
+	volumeSVMPairs  map[string][]string
 	// volumeNodes are an ontap_node root's controller names. Phase 1 restricts
 	// volume_labels on `node`; the claim source is then the aggregates whose
 	// owner vote lands on one of these names.
 	volumeNodes []string
+	// claimRoots are the request's pvc=<namespace>/<claim> roots, sorted, and
+	// volumeRoots its pv=<name> roots, sorted and de-duplicated. Either non-empty
+	// makes the plan claim-seeded (claimSeeded): the seed IS the claim-info read,
+	// restricted on them.
+	claimRoots  []graph.ClaimRef
+	volumeRoots []string
 	// applicationRoots are the request's application=<name> values, sorted.
 	// Non-empty launches the recovery wave and narrows the pod scope to the
 	// pods related to those Applications (see appscope.go). The volume-label
@@ -175,6 +188,7 @@ type topologyPlan struct {
 	podPrepared      bool
 	appPrepared      bool
 	flowlessPrepared bool
+	claimPrepared    bool
 }
 
 // failsClosed reports whether a query error of q must fail this build even
@@ -206,12 +220,11 @@ var storageSkippedLegs = map[promql.Query]bool{
 //
 // It maps the one kind onto the plan fields the read consults. ontap_cluster,
 // aggr, svm and ontap_node seed volume_labels; node and pod seed their claim
-// bindings; application still reads the claim side from the zone until its
+// bindings; pvc and pv seed the claim-info read itself (claimSeeded); application still reads the claim side from the zone until its
 // seed replaces that.
 func storagePlan(roots graph.StorageRoots) topologyPlan {
 	plan := topologyPlan{
 		kind:        roots.Kind,
-		names:       sortedNames(roots.Names),
 		pods:        slices.Clone(roots.Pods),
 		skip:        storageSkippedLegs,
 		byReference: true,
@@ -228,8 +241,10 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 		plan.volumeClusters = sortedNames(roots.Names)
 	case graph.StorageRootAggr:
 		plan.volumeAggrs = sortedNames(roots.Names)
+		plan.volumeAggrPairs = qualifiedPairs(roots.Qualified)
 	case graph.StorageRootSVM:
 		plan.volumeSVMs = sortedNames(roots.Names)
+		plan.volumeSVMPairs = qualifiedPairs(roots.Qualified)
 	case graph.StorageRootONTAPNode:
 		plan.volumeNodes = sortedNames(roots.Names)
 	case graph.StorageRootNode:
@@ -237,10 +252,48 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 	case graph.StorageRootPod:
 		// plan.pods carries the (namespace, pod) refs the pod seed and the pod
 		// wave read; nothing more to derive.
+	case graph.StorageRootPVC:
+		plan.claimRoots = usableClaimRefs(roots.Claims)
+	case graph.StorageRootPV:
+		plan.volumeRoots = sortedNames(roots.Names)
 	case graph.StorageRootApplication:
 		plan.applicationRoots = sortedNames(roots.Names)
 	}
 	return plan
+}
+
+// qualifiedPairs groups qualified `aggr=` / `svm=` refs by ONTAP cluster, each
+// name set sorted and de-duplicated. A ref with an empty half can match nothing
+// a query could name, and an embedder fills StorageRoots itself, so it is
+// dropped here rather than left for the renderer. Nil when nothing is left.
+func qualifiedPairs(refs []graph.ONTAPRef) map[string][]string {
+	out := map[string][]string{}
+	for _, r := range refs {
+		if r.ONTAPCluster != "" && r.Name != "" {
+			out[r.ONTAPCluster] = append(out[r.ONTAPCluster], r.Name)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return compactPairs(out)
+}
+
+// usableClaimRefs is the sorted claim refs that name both a namespace and a
+// claim. A ref with an empty half can match nothing a query could name, and an
+// embedder fills StorageRoots itself, so the plan drops it instead of asking
+// the renderer to.
+func usableClaimRefs(refs []graph.ClaimRef) []graph.ClaimRef {
+	out := make([]graph.ClaimRef, 0, len(refs))
+	for _, r := range refs {
+		if r.Namespace != "" && r.Name != "" {
+			out = append(out, r)
+		}
+	}
+	slices.SortFunc(out, func(a, b graph.ClaimRef) int {
+		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
+	})
+	return slices.Compact(out)
 }
 
 // harvestSeed reports whether this storage build's volume_labels read is the
@@ -250,7 +303,27 @@ func storagePlan(roots graph.StorageRoots) topologyPlan {
 // clear them to read the family whole while keeping the same root for projection.
 func (p topologyPlan) harvestSeed() bool {
 	return p.byReference &&
-		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs)+len(p.volumeNodes) > 0
+		len(p.volumeClusters)+len(p.volumeAggrs)+len(p.volumeSVMs)+len(p.volumeNodes)+
+			len(p.volumeAggrPairs)+len(p.volumeSVMPairs) > 0
+}
+
+// aggrRoots reports whether the request roots any aggregate, by bare name or by
+// qualified (ONTAP cluster, aggregate) pair.
+func (p topologyPlan) aggrRoots() bool {
+	return len(p.volumeAggrs)+len(p.volumeAggrPairs) > 0
+}
+
+// svmRoots reports whether the request roots any SVM, bare or qualified.
+func (p topologyPlan) svmRoots() bool {
+	return len(p.volumeSVMs)+len(p.volumeSVMPairs) > 0
+}
+
+// claimSeeded reports whether this storage build's seed is the claim-info read
+// itself: a pvc or pv root. Like harvestSeed, the slices are the decision rather
+// than the kind alone, so a caller can clear them to read the inventory across
+// the zone while keeping the same root for projection.
+func (p topologyPlan) claimSeeded() bool {
+	return p.byReference && len(p.claimRoots)+len(p.volumeRoots) > 0
 }
 
 // rootedClaims reports whether phase 1 was rendered, so the claim families are
@@ -280,7 +353,7 @@ func (p topologyPlan) prepareHarvestSeed(window time.Duration, budget int, keys 
 	if len(p.volumeNodes) > 0 {
 		queries, ok = rootedNodeLabelChunks(p.volumeNodes, budget)
 	} else {
-		queries, ok = rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, budget)
+		queries, ok = rootedVolumeLabelsChunks(p.volumeClusters, p.volumeAggrs, p.volumeSVMs, p.volumeAggrPairs, p.volumeSVMPairs, budget)
 	}
 	for i := range queries {
 		if !ok {
@@ -320,6 +393,51 @@ func (p topologyPlan) prepareNodeSeed(window time.Duration, budget int, keys pro
 			continue
 		}
 		p.nodeSeed = append(p.nodeSeed, rendered)
+	}
+	return p, nil
+}
+
+// prepare resolves every seed of the plan, in the one order both buildStorage
+// and readTopology need: each step is idempotent, so the builder can reject a
+// capped request before binding a querier and readTopology can re-run it for a
+// plan that arrives unresolved. The first rejection is returned as is.
+func (p topologyPlan) prepare(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	steps := []func(topologyPlan) (topologyPlan, error){
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareHarvestSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareNodeSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.preparePodSeed(window, budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareClaimSeed(budget, keys, sel) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareApplicationSeed(budget) },
+		func(p topologyPlan) (topologyPlan, error) { return p.prepareFlowless(budget, keys, sel) },
+	}
+	for _, step := range steps {
+		var err error
+		if p, err = step(p); err != nil {
+			return p, err
+		}
+	}
+	return p, nil
+}
+
+// prepareClaimSeed rejects a claim or volume root whose first read would take
+// more queries than the cap, before any query. The count comes from the same
+// groups and the same per-group byte reserve the read chunks with
+// (claimSeedGroups), so the check and the read cannot disagree. Idempotent, like
+// prepareNodeSeed.
+func (p topologyPlan) prepareClaimSeed(budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
+	if p.claimPrepared {
+		return p, nil
+	}
+	p.claimPrepared = true
+	if !p.claimSeeded() {
+		return p, nil
+	}
+	chunks := 0
+	for _, g := range p.claimSeedGroups() {
+		chunks += len(promql.ChunkScope(g.names, g.budget(budget, keys, sel)))
+	}
+	if chunks > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
 	return p, nil
 }
@@ -420,7 +538,7 @@ func (p topologyPlan) tracksByReference() bool {
 	if !p.byReference {
 		return false
 	}
-	if p.harvestSeed() || p.rootedClaims() {
+	if p.harvestSeed() || p.rootedClaims() || p.claimSeeded() {
 		return true
 	}
 	switch p.kind {
@@ -463,7 +581,7 @@ func (p topologyPlan) flowlessAggrGauges() bool {
 	}
 	switch p.kind {
 	case graph.StorageRootAggr:
-		return len(p.volumeAggrs) > 0
+		return p.aggrRoots()
 	case graph.StorageRootONTAPCluster:
 		return len(p.volumeClusters) > 0
 	default:
@@ -479,7 +597,7 @@ func (p topologyPlan) flowlessControllers() bool {
 	}
 	switch p.kind {
 	case graph.StorageRootAggr:
-		return len(p.volumeAggrs) > 0
+		return p.aggrRoots()
 	case graph.StorageRootONTAPNode:
 		return len(p.volumeNodes) > 0
 	case graph.StorageRootONTAPCluster:
@@ -497,9 +615,10 @@ func (p topologyPlan) prepareFlowless(budget int, keys promql.LabelKeys, sel pro
 	}
 	p.flowlessPrepared = true
 	var names []string
+	var pairs map[string][]string
 	switch {
-	case p.kind == graph.StorageRootAggr && len(p.volumeAggrs) > 0:
-		names = p.volumeAggrs
+	case p.kind == graph.StorageRootAggr && p.aggrRoots():
+		names, pairs = p.volumeAggrs, p.volumeAggrPairs
 	case p.kind == graph.StorageRootONTAPNode && len(p.volumeNodes) > 0:
 		names = p.volumeNodes
 	case p.kind == graph.StorageRootONTAPCluster && len(p.volumeClusters) > 0:
@@ -507,11 +626,17 @@ func (p topologyPlan) prepareFlowless(budget int, keys promql.LabelKeys, sel pro
 	default:
 		return p, nil
 	}
+	// The qualified aggregates are read one query per ONTAP cluster beside the
+	// bare names, so the cap counts both.
+	chunks := len(promql.ChunkHarvestPairs(promql.QAggrStatus, keys, sel, pairs, budget))
 	budget -= promql.RequestMatcherCost(promql.QAggrStatus, keys, sel)
 	if budget < 1 {
 		budget = 1
 	}
-	if len(promql.ChunkScope(names, budget)) > maxRootedVolumeLabelChunks {
+	if len(names) > 0 {
+		chunks += len(promql.ChunkScope(names, budget))
+	}
+	if chunks > maxRootedVolumeLabelChunks {
 		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
 	return p, nil

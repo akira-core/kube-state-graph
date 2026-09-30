@@ -162,12 +162,15 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
 
 Every storage build is a seed plus an expansion. The claim families are read
 FROM the seed (a Harvest seed's volume-label rows, or a workload seed's
-bindings), and the waves above hang off that claim set:
+bindings), and the waves above hang off that claim set. Every read keyed by a
+known claim — the claim side and mounter completion alike, under every root
+kind — is issued one query per namespace on `(namespace, persistentvolumeclaim)`,
+so a common claim name is never read across the estate:
 
 ```
  L1  volume_labels phase 1 (aggr / svm groups)   aggr_* node_* qos_policy_* ALERTS   app recovery st.1
  L2  kube_persistentvolumeclaim_info{volumename}  owner completion (svm= only)        app recovery st.2
- L3  bindings / pvc_annotations / kubelet ×2 {persistentvolumeclaim}   phase 2 {volume=~tok}   st.3
+ L3  bindings / pvc_annotations / kubelet ×2 {namespace,persistentvolumeclaim}   phase 2 {volume=~tok}   st.3
  L4  pods                                          QoS ×6
  L5  kube_node_* ×4      controllers stage A
  L6                      controllers stage B
@@ -212,7 +215,8 @@ bindings still require:
 **Fan-out per build, storage seed**: the gauge families of a flowless root plus `volume_labels`, not the old 13 first-wave families (the 18 above minus
 the five claim families), plus 1 (`kube_persistentvolumeclaim_info`) when the
 rooted rows yield a PV candidate, plus 4 (bindings, claim annotations, kubelet
-×2) when a candidate names a claim, plus the pod / node / controller / QoS
+×2) when a candidate names a claim — each of those four once per namespace the
+loaded claims live in (the counts below are for one namespace), plus the pod / node / controller / QoS
 additions above for what those claims lead to. `volume_labels` is issued once
 per phase-1 chunk, plus once per owner-completion chunk (only with `svm=`, and
 only for aggregates no `aggr=` root read whole), plus once per phase-2 chunk
@@ -224,6 +228,30 @@ when a claim matched. `TestBuildStorage_FanOutLegCount_Hub` pins:
 | `aggr=`, a candidate naming no claim | 14 | 1 |
 | `aggr=`, one StatefulSet-owned pod on a matched volume | 31 | 2 (phase 1, phase 2) |
 | `svm=`, the same path | 31 | 3 (phase 1, owner completion, phase 2) |
+
+**A claim root or a volume root is the cheapest seed.** `pvc=<namespace>/<claim>`
+and `pv=<name>` name the claim directly, so the seed IS the claim-side read:
+`kube_persistentvolumeclaim_info` restricted on the roots — one query per
+namespace for `pvc=` (`{namespace="shop",persistentvolumeclaim=~"cache|orders-data"}`),
+one query over the bare names for `pv=` (`{volumename=~"…"}`) — kept only when
+the row is a root, with no `volume_labels` read in front of it. Nothing but
+`ALERTS` runs beside it. The claims that read returns feed the same expansion a
+storage-side root uses: the claim-binding family, claim annotations and the two
+kubelet families by claim, one query per namespace of the loaded claims (so every
+mounter is loaded), then the token read that
+completes the claim's FlexVol candidates, then the pod / node / controller /
+QoS / Harvest waves. Both seeds are request-derived scopes: more than sixteen
+queries in total (namespaces summed for `pvc=`) is rejected as `invalid_scope`
+before any query. A root naming no claim issues nothing further. A claim bound
+to a statically provisioned PV is reached, because the seed does not derive
+candidates from a FlexVol name. `TestBuildStorage_FanOutLegCount_Hub` pins:
+
+| Request | Queries | Notes |
+|---|---|---|
+| `pvc=` / `pv=` naming no claim | 2 | `ALERTS`, `kube_persistentvolumeclaim_info` |
+| one claim, mounted by nothing, joining no FlexVol | 7 | + bindings, claim annotations, kubelet ×2, one `volume_labels` token read |
+| the same claim on a matched volume | 25 | + owner completion (a second `volume_labels`), QoS ×6, fixed policy ×2, aggregate gauges ×3, controller families ×6 |
+| one StatefulSet-owned pod mounting it, on a matched volume | 32 | + pods ×2, nodes ×4, `kube_statefulset_annotations` |
 
 **A pod root is keyed by `<namespace>/<pod>`.** The seed reads claim bindings
 restricted on those namespaces and pod names and keeps only the root refs. The
@@ -243,9 +271,16 @@ components, in phases:
    when the request carries `ontap_cluster=` (a request rooted at ONTAP
    clusters alone issues `volume_labels{cluster=~"…"}`). Each group is chunked
    by the same byte budget, charging the repeated matcher at its rendered
-   length; the groups' results are merged de-duplicated by label set.
+   length; the groups' results are merged de-duplicated by label set. A
+   **qualified** `aggr=<ontap_cluster>/<name>` / `svm=<ontap_cluster>/<name>` value
+   adds one group per ONTAP cluster after the bare groups —
+   `volume_labels{cluster="ontap-prod",aggr=~"aggr1|aggr2"}` — so an aggregate or
+   SVM of that name on another filer is never read for the root; the aggregate
+   gauges of a qualified aggregate are read the same way, one query per ONTAP
+   cluster and family.
    **Capped:** these are repeatable parameters whose count nothing bounds, so a
-   restriction that would take more than sixteen queries in total is rejected
+   restriction that would take more than sixteen queries in total, every bare and
+   qualified group counted, is rejected
    as `invalid_scope` before any query, and no body is returned.
 2. **Owner completion — SVM roots only.** An aggregate's owning controller is a
    vote over every one of its series, and an SVM group returns only the SVM's
@@ -281,7 +316,9 @@ starts with `pvc_` at the start of the name or right after a `_` yields a
 candidate PV name (`_` → `-`); `kube_persistentvolumeclaim_info` is read
 restricted to `volumename=~"<candidates>"`, and the claim-binding family,
 `kube_persistentvolumeclaim_annotations` and the two kubelet families
-restricted to `persistentvolumeclaim=~"<claims>"`, their rows then kept only
+restricted, one query per namespace of the loaded claims, to
+`namespace="<ns>",persistentvolumeclaim=~"<claims of ns>"` (a claim name alone
+would be read in every namespace of the estate), their rows then kept only
 when `(zone, environment, cluster, namespace, claim)` names a loaded claim.
 Extraction is a candidate generator, never a judge: a candidate naming no PV
 loads nothing, and the forward join still decides every pick. No candidate
@@ -437,11 +474,14 @@ operator-configurable and defaults to "replace `-` with `_`, match as a suffix",
 which resolves a stock Trident estate without the deployment declaring its
 `storagePrefix`. Hop C is keyed on the `(ontap_cluster, svm, policy_group)`
 triple, assembled from both topology hops: hop A owns the ONTAP cluster of the
-picked aggregate and the SVM the `volume_labels` match resolved, and hop B owns
-the `policy_group` — the only upstream statement of which policy governs this
+picked aggregate (of the SVM pick itself for a FlexGroup claim, which resolved no
+aggregate) and the SVM the `volume_labels` match resolved, and hop B owns the
+`policy_group` — the only upstream statement of which policy governs this
 FlexVol. An incomplete or unmatched triple is ignored, never widened to an
-SVM-wide figure. A ceiling therefore never appears without a measurement: its
-policy group is recovered FROM a matched workload series. **No relabel rule is required
+SVM-wide figure. The resolved ceiling surfaces on the claim's PVC node as
+`data.qos` and, only alongside a measurement, on its `pvc-to-netapp-aggr` edge;
+either way its policy group is recovered FROM a matched workload series, so a
+claim with no in-scope workload series has none. **No relabel rule is required
 or read.** The six hop-B legs are issued in a second wave, scoped to the FlexVol
 names hop A matched. See
 [`netapp-harvest-preconditions.md`](netapp-harvest-preconditions.md).
@@ -455,8 +495,8 @@ names hop A matched. See
 | `qos_write_latency` | B | `write_latency_us` | same |
 | `qos_read_data` | B | `read_bytes_per_sec` (bytes/s, verbatim) | same |
 | `qos_write_data` | B | `write_bytes_per_sec` | same |
-| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops`, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). A ceiling cannot appear without a measurement. A volume in no policy group gets none — another group's figure is never borrowed |
-| `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
+| `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops` on the edge and `data.qos.max_iops` on the PVC node, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). An edge carries a ceiling only alongside a measurement; the PVC node's `data.qos` needs only a resolved policy group. A volume in no policy group gets none — another group's figure is never borrowed |
+| `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` (edge) and `data.qos.max_bytes_per_sec` (PVC node) = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
 | `aggr_new_status` | — | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | Attribute omitted |
 | `aggr_space_used` | — | Aggregate `data.usage.used_bytes` | `usage` incomplete / omitted |
 | `aggr_space_total` | — | Aggregate `data.usage.capacity_bytes` | same |

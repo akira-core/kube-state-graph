@@ -214,6 +214,9 @@
                     "perf": {
                         "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.PerfDTO"
                     },
+                    "qos": {
+                        "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.QoSDTO"
+                    },
                     "ready_status": {
                         "type": "string"
                     },
@@ -245,6 +248,27 @@
                     },
                     "total_ops": {
                         "type": "number"
+                    }
+                },
+                "type": "object"
+            },
+            "github_com_akira-core_kube-state-graph_pkg_cytoscape.QoSDTO": {
+                "description": "The declared QoS throughput ceiling of the policy group governing the claim's volume. Present only on pvc nodes, and only when at least one figure resolved; absent means no declared ceiling, never 0. A copy of the figures on the claim's pvc-to-netapp-aggr edge, but independent of it: a FlexGroup claim, or a claim whose edge carries no measurement, still carries it. Figures are JSON numbers rounded to 6 significant digits and may appear in exponent form.",
+                "properties": {
+                    "max_bytes_per_sec": {
+                        "description": "MaxBytesPerSec is the declared maximum throughput in bytes per second (the policy's MB/s figure x 1048576, the unit of read_bytes_per_sec).",
+                        "example": 262144000,
+                        "type": "number"
+                    },
+                    "max_iops": {
+                        "description": "MaxIOPS is the declared maximum throughput in requests per second.",
+                        "example": 5000,
+                        "type": "number"
+                    },
+                    "policy_group": {
+                        "description": "PolicyGroup is the QoS policy group the ceiling was keyed on.",
+                        "example": "gold-tier",
+                        "type": "string"
                     }
                 },
                 "type": "object"
@@ -599,7 +623,7 @@
         },
         "/v1/storage-graph": {
             "get": {
-                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus single-valued `az` and `env` (400 `missing_az` / `missing_env` when absent; 400 `invalid_scope` when repeated), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. They pin one estate: every Kubernetes and `ALERTS` query is narrowed to that zone and environment, and every query — Harvest included — is sent only to the backends serving that zone.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (that name on every filer — `ontap_cluster` does not qualify them), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own.\n\n`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
+                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus `az` and `env`, each at least once and repeatable (400 `missing_az` / `missing_env` when absent), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. The selected zones are the Cartesian product of the two value sets: every Kubernetes and `ALERTS` query is narrowed to them, and every query — Harvest included — is sent only to the backends serving the selected `az` values. The body is the union of the single-zone bodies: no node merges across zones, and a claim joins only FlexVols of its own zone.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (the bare form roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's component; the two forms may be mixed, and `ontap_cluster=` does not qualify them — it is a separate root kind), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `pvc=\u003cnamespace\u003e/\u003cclaim-name\u003e` (a PersistentVolumeClaim, in every cluster of the estate), `pv` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included), `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own. A `pvc` / `pv` root claim that no pod mounts keeps its storage-side path (controller → aggregate → SVM → claim) and its whole measurement rides that path with no `pvc-pod` edge; an unmounted claim that is not a root stays dropped under every root kind.\n\n`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
                 "parameters": [
                     {
                         "description": "Window start. RFC 3339 or Unix seconds.",
@@ -622,24 +646,32 @@
                         }
                     },
                     {
-                        "description": "Availability zone (required, single-valued). Narrows every Kubernetes and ALERTS query and selects the backends every query is sent to.",
+                        "description": "Availability zone (required, repeatable). Narrows every Kubernetes and ALERTS query and selects the backends every query is sent to. Several values are OR-combined and form a Cartesian product with `env`.",
                         "example": "zone-a",
                         "in": "query",
                         "name": "az",
                         "required": true,
                         "schema": {
-                            "type": "string"
-                        }
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
                     },
                     {
-                        "description": "Environment (required, single-valued). Narrows every Kubernetes and ALERTS query.",
+                        "description": "Environment (required, repeatable). Narrows every Kubernetes and ALERTS query. Several values are OR-combined and form a Cartesian product with `az`.",
                         "example": "prod",
                         "in": "query",
                         "name": "env",
                         "required": true,
                         "schema": {
-                            "type": "string"
-                        }
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
                     },
                     {
                         "description": "Restrict to listed Kubernetes clusters (repeatable, OR-combined).",
@@ -702,7 +734,8 @@
                         "style": "form"
                     },
                     {
-                        "description": "Root kind: ONTAP aggregate name, on every filer of the zone.",
+                        "description": "Root kind: ONTAP aggregate. A bare `\u003cname\u003e` roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's aggregate. Bare and qualified values may be mixed; a value with a `/` must have two non-empty segments (else 400 `invalid_scope`).",
+                        "example": "ontap-prod/aggr1",
                         "in": "query",
                         "name": "aggr",
                         "schema": {
@@ -714,7 +747,8 @@
                         "style": "form"
                     },
                     {
-                        "description": "Root kind: SVM name, on every filer of the zone.",
+                        "description": "Root kind: SVM. A bare `\u003cname\u003e` roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's SVM. Bare and qualified values may be mixed; a value with a `/` must have two non-empty segments (else 400 `invalid_scope`).",
+                        "example": "ontap-prod/svm0",
                         "in": "query",
                         "name": "svm",
                         "schema": {
@@ -730,6 +764,32 @@
                         "example": "shop/orders-0",
                         "in": "query",
                         "name": "pod",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: `\u003cnamespace\u003e/\u003cclaim-name\u003e` — a PersistentVolumeClaim, matched in every Kubernetes cluster of the estate. Keeps its storage-side path even when no pod mounts it.",
+                        "example": "shop/orders-data",
+                        "in": "query",
+                        "name": "pvc",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: PersistentVolume name (cluster-scoped, bare), matched on the `volumename` of the claim bound to it; roots that claim. A volume bound to no claim roots nothing.",
+                        "example": "pvc-ab12-cd34",
+                        "in": "query",
+                        "name": "pv",
                         "schema": {
                             "items": {
                                 "type": "string"

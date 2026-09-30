@@ -1,7 +1,6 @@
 package build
 
 import (
-	"cmp"
 	"context"
 	"log/slog"
 	"slices"
@@ -29,29 +28,6 @@ const (
 	alertClusterLabel   = "cluster"
 )
 
-// alertZone is one `az` / `env` pair. An alert, a Kubernetes identity and an
-// ONTAP cluster each have a zone only when BOTH configured labels are
-// non-empty — the same rule the identity ladder composes by.
-type alertZone struct{ az, env string }
-
-// zoneOf reads the pair through the configured label keys; ok is false when
-// either is empty.
-func zoneOf(m model.Metric, keys promql.LabelKeys) (alertZone, bool) {
-	az, env := string(m[model.LabelName(keys.AZ)]), string(m[model.LabelName(keys.Env)])
-	if az == "" || env == "" {
-		return alertZone{}, false
-	}
-	return alertZone{az: az, env: env}, true
-}
-
-// zoneAdmits is the zone-agreement rule (read-storage-roots-through-volume-hub
-// D11): a candidate is excluded only when BOTH sides know their zone and they
-// disagree. An alert with no pair, or a candidate whose zone is unknown,
-// falls back to the label comparison alone.
-func zoneAdmits(candidate []alertZone, zone alertZone, zoned bool) bool {
-	return !zoned || len(candidate) == 0 || slices.Contains(candidate, zone)
-}
-
 // ontapZonesOf collects, per ONTAP cluster, every `az` / `env` pair carried by
 // the Harvest series that NAME a NetApp entity — the families
 // buildNetAppIndexes inventories. The QoS families are left out: they name a
@@ -60,9 +36,9 @@ func zoneAdmits(candidate []alertZone, zone alertZone, zoned bool) bool {
 // and de-duplicated so the index is a pure function of the vectors. Nil when
 // no series carried a pair — the Harvest estate that stamps none, for which
 // every NetApp alert keeps matching by label alone.
-func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]alertZone {
+func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]zone {
 	keys = keys.OrDefault()
-	seen := map[string]map[alertZone]struct{}{}
+	seen := map[string]map[zone]struct{}{}
 	for _, vec := range []model.Vector{
 		v.VolumeLabels,
 		v.AggrStatus, v.AggrSpaceUsed, v.AggrSpaceTotal,
@@ -77,7 +53,7 @@ func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]alertZo
 				continue
 			}
 			if seen[oc] == nil {
-				seen[oc] = map[alertZone]struct{}{}
+				seen[oc] = map[zone]struct{}{}
 			}
 			seen[oc][z] = struct{}{}
 		}
@@ -85,18 +61,13 @@ func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]alertZo
 	if len(seen) == 0 {
 		return nil
 	}
-	out := make(map[string][]alertZone, len(seen))
+	out := make(map[string][]zone, len(seen))
 	for oc, set := range seen {
-		zones := make([]alertZone, 0, len(set))
+		zones := make([]zone, 0, len(set))
 		for z := range set {
 			zones = append(zones, z)
 		}
-		slices.SortFunc(zones, func(a, b alertZone) int {
-			if c := cmp.Compare(a.az, b.az); c != 0 {
-				return c
-			}
-			return cmp.Compare(a.env, b.env)
-		})
+		slices.SortFunc(zones, zone.compare)
 		out[oc] = zones
 	}
 	return out
@@ -106,7 +77,7 @@ func ontapZonesOf(v topologyVectors, keys promql.LabelKeys) map[string][]alertZo
 // to live in (nil when unknown, which the zone rule never excludes).
 type alertCand struct {
 	id    string
-	zones []alertZone
+	zones []zone
 }
 
 // Index keys. Each kind is indexed twice — once cluster-qualified and once by
@@ -149,7 +120,7 @@ type alertIndex struct {
 	aggrsByCluster map[alertOCKey]string
 	aggrsByName    map[string][]alertCand
 
-	ontapZones map[string][]alertZone
+	ontapZones map[string][]zone
 }
 
 // newAlertIndex builds the lookup structure from the assembled node set.
@@ -167,7 +138,7 @@ type alertIndex struct {
 // from the resolver that composed it; a NetApp node's is its ONTAP cluster's
 // zone set. Either is nil when unknown — a nil resolver, an identity that
 // composed nothing, a Harvest estate stamping no pair.
-func newAlertIndex(nodes []graph.GraphNode, clusters *clusterResolver, ontapZones map[string][]alertZone) alertIndex {
+func newAlertIndex(nodes []graph.GraphNode, clusters *clusterResolver, ontapZones map[string][]zone) alertIndex {
 	idx := alertIndex{
 		podsByCluster:     map[alertNSKey]string{},
 		podsByName:        map[alertNameKey][]alertCand{},
@@ -181,12 +152,12 @@ func newAlertIndex(nodes []graph.GraphNode, clusters *clusterResolver, ontapZone
 		aggrsByName:       map[string][]alertCand{},
 		ontapZones:        ontapZones,
 	}
-	k8sZone := func(identity string) []alertZone {
+	k8sZone := func(identity string) []zone {
 		if clusters == nil {
 			return nil
 		}
 		if ci, ok := clusters.identities[identity]; ok && ci.AZ != "" && ci.Env != "" {
-			return []alertZone{{az: ci.AZ, env: ci.Env}}
+			return []zone{{az: ci.AZ, env: ci.Env}}
 		}
 		return nil
 	}
@@ -212,7 +183,7 @@ func newAlertIndex(nodes []graph.GraphNode, clusters *clusterResolver, ontapZone
 		byName[nk] = append(byName[nk], alertCand{id: id, zones: k8sZone(cluster)})
 	}
 	addClusterScoped := func(byCluster map[alertOCKey]string, byName map[string][]alertCand,
-		cluster, name, id string, zones []alertZone,
+		cluster, name, id string, zones []zone,
 	) {
 		if name == "" {
 			return
@@ -261,10 +232,10 @@ func newAlertIndex(nodes []graph.GraphNode, clusters *clusterResolver, ontapZone
 // hold first), and none is unmatched. Candidates the zone rule excludes are
 // dropped FIRST, so another zone's same-named object neither absorbs the alert
 // nor makes it ambiguous.
-func matchUnique(cands []alertCand, zone alertZone, zoned bool) alertMatch {
+func matchUnique(cands []alertCand, z zone, zoned bool) alertMatch {
 	var match alertMatch
 	for _, c := range cands {
-		if !zoneAdmits(c.zones, zone, zoned) {
+		if !zoneAdmits(c.zones, z, zoned) {
 			continue
 		}
 		if match.id != "" {
@@ -349,7 +320,7 @@ func resolveOneAlert(m model.Metric, idx alertIndex, clusters *clusterResolver) 
 	node := string(m[alertNodeLabel])
 	aggr := string(m[alertAggrLabel])
 	rawCluster := string(m[alertClusterLabel])
-	zone, zoned := zoneOf(m, clusters.keys)
+	z, zoned := zoneOf(m, clusters.keys)
 
 	// `aggr` outranks `node`: the stock Harvest aggr_* series carry the owning
 	// controller's `node` beside `aggr`, so an alert written over them names
@@ -357,13 +328,13 @@ func resolveOneAlert(m model.Metric, idx alertIndex, clusters *clusterResolver) 
 	// controller would make every aggregate alert land one tier up.
 	switch {
 	case ns != "" && pod != "":
-		return matchNamespaced(idx.podsByCluster, idx.podsByName, m, rawCluster, ns, pod, clusters, zone, zoned)
+		return matchNamespaced(idx.podsByCluster, idx.podsByName, m, rawCluster, ns, pod, clusters, z, zoned)
 	case ns != "" && pvc != "":
-		return matchNamespaced(idx.pvcsByCluster, idx.pvcsByName, m, rawCluster, ns, pvc, clusters, zone, zoned)
+		return matchNamespaced(idx.pvcsByCluster, idx.pvcsByName, m, rawCluster, ns, pvc, clusters, z, zoned)
 	case aggr != "":
-		return matchAggr(idx, rawCluster, aggr, zone, zoned)
+		return matchAggr(idx, rawCluster, aggr, z, zoned)
 	case node != "":
-		return matchNodeShaped(idx, m, rawCluster, node, clusters, zone, zoned)
+		return matchNodeShaped(idx, m, rawCluster, node, clusters, z, zoned)
 	}
 	return alertMatch{}
 }
@@ -376,7 +347,7 @@ func resolveOneAlert(m model.Metric, idx alertIndex, clusters *clusterResolver) 
 func matchNamespaced(
 	byCluster map[alertNSKey]string, byName map[alertNameKey][]alertCand,
 	m model.Metric, rawCluster, namespace, name string, clusters *clusterResolver,
-	zone alertZone, zoned bool,
+	z zone, zoned bool,
 ) alertMatch {
 	if rawCluster != "" {
 		identity := clusters.identify(m)
@@ -389,7 +360,7 @@ func matchNamespaced(
 		// same-named pod in a different cluster must not absorb the alert.
 		return alertMatch{}
 	}
-	return matchUnique(byName[alertNameKey{namespace, name}], zone, zoned)
+	return matchUnique(byName[alertNameKey{namespace, name}], z, zoned)
 }
 
 // matchNodeShaped resolves the `{cluster, node}` shape, which the Kubernetes
@@ -407,13 +378,13 @@ func matchNamespaced(
 // must also agree on zone; the Kubernetes side already does, through the
 // identity the alert's own pair composes.
 func matchNodeShaped(idx alertIndex, m model.Metric, rawCluster, node string, clusters *clusterResolver,
-	zone alertZone, zoned bool,
+	z zone, zoned bool,
 ) alertMatch {
 	if rawCluster != "" {
 		identity := clusters.identify(m)
 		k8sID, isK8s := idx.k8sNodesByCluster[alertOCKey{identity, node}]
 		ctrlID, isCtrl := idx.ctrlsByCluster[alertOCKey{rawCluster, node}]
-		isCtrl = isCtrl && zoneAdmits(idx.ontapZones[rawCluster], zone, zoned)
+		isCtrl = isCtrl && zoneAdmits(idx.ontapZones[rawCluster], z, zoned)
 		switch {
 		case isK8s && isCtrl:
 			return alertMatch{ambiguous: true}
@@ -427,7 +398,7 @@ func matchNodeShaped(idx alertIndex, m model.Metric, rawCluster, node string, cl
 	// No cluster label: the eligible kinds are BOTH, so uniqueness is tested
 	// over their union. Two candidates of the same kind are as ambiguous as one
 	// of each.
-	return matchUnique(slices.Concat(idx.k8sNodesByName[node], idx.ctrlsByName[node]), zone, zoned)
+	return matchUnique(slices.Concat(idx.k8sNodesByName[node], idx.ctrlsByName[node]), z, zoned)
 }
 
 // matchAggr resolves the aggregate kind. Its `cluster` label is an ONTAP
@@ -435,15 +406,15 @@ func matchNodeShaped(idx alertIndex, m model.Metric, rawCluster, node string, cl
 // so the identity ladder has nothing to say about it. The raw name composes
 // with no zone, so the ONTAP cluster's zone set is what keeps another zone's
 // alert about an equally named filer off this one.
-func matchAggr(idx alertIndex, rawCluster, aggr string, zone alertZone, zoned bool) alertMatch {
+func matchAggr(idx alertIndex, rawCluster, aggr string, z zone, zoned bool) alertMatch {
 	if rawCluster != "" {
 		id, ok := idx.aggrsByCluster[alertOCKey{rawCluster, aggr}]
-		if ok && zoneAdmits(idx.ontapZones[rawCluster], zone, zoned) {
+		if ok && zoneAdmits(idx.ontapZones[rawCluster], z, zoned) {
 			return alertMatch{id: id}
 		}
 		return alertMatch{}
 	}
-	return matchUnique(idx.aggrsByName[aggr], zone, zoned)
+	return matchUnique(idx.aggrsByName[aggr], z, zoned)
 }
 
 // attachAlerts resolves the build's ALERTS vector against the assembled node

@@ -79,19 +79,58 @@ func TestGolden_StorageGraphResponses(t *testing.T) {
 	require.NoError(t, err)
 	nodeScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootNode, []string{"worker-2"})
 	require.NoError(t, err)
+	svmScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootSVM, []string{"svm_big"})
+	require.NoError(t, err)
 	appGraph := applicationRootEstate(g)
 	stampFixtureStatuses(slices.Collect(maps.Values(appGraph.NodesByID)))
+	claimGraph := claimRootEstate(g)
+	stampFixtureStatuses(slices.Collect(maps.Values(claimGraph.NodesByID)))
+	pvcScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPVC, []string{"shop/orders-data", "shop/orphan-data"})
+	require.NoError(t, err)
+	pvScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPV, []string{"pvc-orphan"})
+	require.NoError(t, err)
+	scratchScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPVC, []string{"shop/scratch-data"})
+	require.NoError(t, err)
+
+	// A second filer holds an aggregate and an SVM of the SAME names as ontap-prod's,
+	// each with a mounted claim. The qualified root names ontap-prod's aggr1 alone.
+	labGraph := secondFilerEstate(g)
+	stampFixtureStatuses(slices.Collect(maps.Values(labGraph.NodesByID)))
+	qualifiedScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"ontap-prod/aggr1"})
+	require.NoError(t, err)
+
+	// Two zones both run a cluster named c1 and both serve an aggregate aggr1: the
+	// multi-zone body is the union of the two zones' bodies, every id qualified by
+	// its zone.
+	zonesGraph := multiZoneStorageEstate()
+	stampFixtureStatuses(slices.Collect(maps.Values(zonesGraph.NodesByID)))
 
 	scenarios := map[string]graph.View{
-		"storage-graph-aggr-root":        graph.ProjectStorage(g, aggrScope),
-		"storage-graph-pod-root":         graph.ProjectStorage(g, podScope),
-		"storage-graph-application-root": graph.ProjectStorage(appGraph, appScope),
-		"storage-graph-ontap-node-root":  graph.ProjectStorage(g, ontapNodeScope),
-		"storage-graph-node-root":        graph.ProjectStorage(g, nodeScope),
+		"storage-graph-multi-zone": graph.ProjectStorage(zonesGraph, aggrScope),
+		"storage-graph-aggr-root":  graph.ProjectStorage(g, aggrScope),
+		// The same aggregate name on two filers: the qualified root draws ontap-prod's
+		// aggr1 and every path through it, and nothing of ontap-lab's.
+		"storage-graph-qualified-aggr-root": graph.ProjectStorage(labGraph, qualifiedScope),
+		"storage-graph-pod-root":            graph.ProjectStorage(g, podScope),
+		"storage-graph-application-root":    graph.ProjectStorage(appGraph, appScope),
+		"storage-graph-ontap-node-root":     graph.ProjectStorage(g, ontapNodeScope),
+		"storage-graph-node-root":           graph.ProjectStorage(g, nodeScope),
+		"storage-graph-svm-root":            graph.ProjectStorage(g, svmScope),
+		// A claim root keeps the storage-side path of a claim no pod mounts (a
+		// sink) beside the mounted claim's full path; a volume root resolves to
+		// its claim; a claim on no filer is drawn alone.
+		"storage-graph-pvc-root":            graph.ProjectStorage(claimGraph, pvcScope),
+		"storage-graph-pv-root":             graph.ProjectStorage(claimGraph, pvScope),
+		"storage-graph-pvc-root-non-netapp": graph.ProjectStorage(claimGraph, scratchScope),
 	}
+	graphOf := map[string]*graph.Graph{"storage-graph-multi-zone": zonesGraph}
 	for name, view := range scenarios {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
-			body := cytoscape.Serialise(g, view)
+			src := g
+			if own, ok := graphOf[name]; ok {
+				src = own
+			}
+			body := cytoscape.Serialise(src, view)
 			compareGolden(t, name+"-cytoscape.json", body)
 		})
 	}
@@ -240,6 +279,7 @@ func buildWithNetAppStorage() graph.View {
 	used, cap := 700000000000.0, 1000000000000.0
 	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
 	cpu, ops, lat, data := 72.5, 18500.0, 830.0, 1.2e9
+	maxIOPS, maxBps := 5000.0, 262144000.0
 	pvc := &graph.PVCNode{
 		IDValue:   "cluster-alpha/db/data-mongo-0",
 		NameValue: "data-mongo-0",
@@ -249,7 +289,9 @@ func buildWithNetAppStorage() graph.View {
 			"aggr": graph.NetAppAggrID("ontap-prod", "aggr1"),
 		},
 		StorageClassValue: "netapp-nas",
-		AlertsValue:       []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
+		// The same ceiling the edge below carries: one resolution feeds both.
+		QoSValue:    &graph.QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps},
+		AlertsValue: []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	aggr := &graph.NetAppAggrNode{
@@ -271,7 +313,6 @@ func buildWithNetAppStorage() graph.View {
 		PerfValue:   &graph.NodePerf{CPUBusyPct: &cpu, TotalOps: &ops, TotalLatencyUs: &lat, TotalBytesPerSec: &data},
 		AlertsValue: []graph.Alert{{Name: "NodeCPUBusy", State: graph.AlertStateFiring, Severity: "critical"}},
 	}
-	maxIOPS, maxBps := 5000.0, 262144000.0
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
 		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,
 		ReadBytesPerSec: &readBps, WriteBytesPerSec: &writeBps,
@@ -325,6 +366,16 @@ func buildStorageGraphEstate() *graph.Graph {
 	wb := &graph.K8sNode{IDValue: graph.K8sNodeID(b, "worker-b"), NameValue: "worker-b", LabelsValue: map[string]string{"cluster": b}}
 
 	f64 := func(v float64) *float64 { return &v }
+	// A claim whose svm-pvc edge carries max_iops carries the same ceiling on
+	// its node: both come from the one per-claim resolution.
+	gold := func() *graph.QoSCeiling { return &graph.QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: f64(5000)} }
+	orders.QoSValue, shared.QoSValue, db.QoSValue = gold(), gold(), gold()
+	// The ceiling is independent of the edge. plain-data joined an aggregate but
+	// its edge carries no measurement (a LUN-only claim), yet the node still
+	// carries the one figure its policy group resolved; big-data is the FlexGroup
+	// shape — no aggregate, so no pvc-to-netapp-aggr edge — and carries both.
+	plain.QoSValue = &graph.QoSCeiling{PolicyGroup: "silver-tier", MaxBytesPerSec: f64(52428800)}
+	big.QoSValue = &graph.QoSCeiling{PolicyGroup: "bulk-tier", MaxIOPS: f64(8000), MaxBytesPerSec: f64(524288000)}
 	io := func(ops float64) *graph.IOMetrics {
 		return &graph.IOMetrics{ReadOps: f64(ops), WriteOps: f64(ops / 2), ReadLatencyUs: f64(450), MaxIOPS: f64(5000)}
 	}
@@ -385,6 +436,88 @@ func buildStorageGraphEstate() *graph.Graph {
 	return graph.NewGraph(nodes, edges, time.Time{})
 }
 
+// multiZoneStorageEstate is what a multi-zone /v1/storage-graph request builds:
+// two zones (zone-a / zone-b, environment prod), each running a cluster named
+// c1 with a pod `shop/orders-0` mounting a claim `shop/orders-data` on an
+// aggregate `aggr1` of its OWN filer (ontap-a / ontap-b). Every Kubernetes id
+// carries the composed cluster identity, every NetApp id its ONTAP cluster, so
+// nothing merges across zones; the two claims carry different measurements.
+func multiZoneStorageEstate() *graph.Graph {
+	f64 := func(v float64) *float64 { return &v }
+	hop := func(tier, src, tgt string, extra map[string]string) *graph.Edge {
+		l := map[string]string{"tier": tier}
+		for k, v := range extra {
+			l[k] = v
+		}
+		return graph.NewEdge(graph.EdgeTypeStorageFlow, src, tgt, l)
+	}
+	nodes := make([]graph.GraphNode, 0, 12)
+	edges := make([]*graph.Edge, 0, 10)
+	for _, z := range []struct {
+		az, oc, ctrl string
+		ops          float64
+	}{
+		{"zone-a", "ontap-a", "ontap-a-01", 100},
+		{"zone-b", "ontap-b", "ontap-b-01", 900},
+	} {
+		cluster := z.az + "-prod-c1"
+		ctrl := &graph.NetAppNode{IDValue: graph.NetAppNodeID(z.oc, z.ctrl), NameValue: z.ctrl, LabelsValue: map[string]string{"ontap_cluster": z.oc}}
+		aggr := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID(z.oc, "aggr1"), NameValue: "aggr1", LabelsValue: map[string]string{"ontap_cluster": z.oc, "node": z.ctrl}}
+		svm := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(z.oc, "svm_shop"), NameValue: "svm_shop", LabelsValue: map[string]string{"ontap_cluster": z.oc}}
+		pvc := &graph.PVCNode{IDValue: graph.PVCID(cluster, "shop", "orders-data"), NameValue: "orders-data", LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "aggr": aggr.ID()}}
+		pod := &graph.PodNode{IDValue: graph.PodID(cluster, "uid-"+z.az+"-orders"), NameValue: "orders-0", LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "node": graph.K8sNodeID(cluster, "worker-1")}}
+		node := &graph.K8sNode{IDValue: graph.K8sNodeID(cluster, "worker-1"), NameValue: "worker-1", LabelsValue: map[string]string{"cluster": cluster}}
+		nodes = append(nodes, ctrl, aggr, svm, pvc, pod, node)
+		edges = append(edges,
+			hop(graph.StorageTierNodeAggr, ctrl.ID(), aggr.ID(), nil),
+			hop(graph.StorageTierAggrSVM, aggr.ID(), svm.ID(), nil),
+			hop(graph.StorageTierSVMPVC, svm.ID(), pvc.ID(), map[string]string{graph.ClaimAggrLabel: aggr.ID()}).
+				WithIO(graph.IOMetrics{ReadOps: f64(z.ops), WriteOps: f64(z.ops / 2), ReadLatencyUs: f64(450)}),
+			hop(graph.StorageTierPVCPod, pvc.ID(), pod.ID(), nil),
+			hop(graph.StorageTierPodNode, pod.ID(), node.ID(), nil),
+		)
+	}
+	g := graph.NewGraph(nodes, edges, time.Time{})
+	g.ClusterIdentities = map[string]graph.ClusterIdentity{
+		"zone-a-prod-c1": {AZ: "zone-a", Env: "prod", Name: "c1"},
+		"zone-b-prod-c1": {AZ: "zone-b", Env: "prod", Name: "c1"},
+	}
+	return g
+}
+
+// secondFilerEstate is the storage golden plus a second ONTAP cluster, ontap-lab,
+// serving an aggregate `aggr1` and an SVM `svm_shop` — the names ontap-prod
+// already uses — with one mounted claim, so a bare `aggr=aggr1` would root both
+// filers while a qualified value roots one. The shared estate is not mutated.
+func secondFilerEstate(base *graph.Graph) *graph.Graph {
+	const oc, cluster = "ontap-lab", "cluster-alpha"
+	ctrl := &graph.NetAppNode{IDValue: graph.NetAppNodeID(oc, "ontap-lab-01"), NameValue: "ontap-lab-01", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	aggr := &graph.NetAppAggrNode{IDValue: graph.NetAppAggrID(oc, "aggr1"), NameValue: "aggr1", LabelsValue: map[string]string{"ontap_cluster": oc, "node": "ontap-lab-01"}}
+	svm := &graph.NetAppSVMNode{IDValue: graph.NetAppSVMID(oc, "svm_shop"), NameValue: "svm_shop", LabelsValue: map[string]string{"ontap_cluster": oc}}
+	pvc := &graph.PVCNode{IDValue: graph.PVCID(cluster, "shop", "ledger-data"), NameValue: "ledger-data", LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "aggr": aggr.ID()}}
+	pod := &graph.PodNode{IDValue: graph.PodID(cluster, "uid-ledger"), NameValue: "ledger-0", LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "node": graph.K8sNodeID(cluster, "worker-2")}}
+
+	f64 := func(v float64) *float64 { return &v }
+	hop := func(tier, src, tgt string, extra map[string]string) *graph.Edge {
+		l := map[string]string{"tier": tier}
+		for k, v := range extra {
+			l[k] = v
+		}
+		return graph.NewEdge(graph.EdgeTypeStorageFlow, src, tgt, l)
+	}
+	edges := slices.Clone(base.Edges)
+	edges = append(edges,
+		hop(graph.StorageTierNodeAggr, ctrl.ID(), aggr.ID(), nil),
+		hop(graph.StorageTierAggrSVM, aggr.ID(), svm.ID(), nil),
+		hop(graph.StorageTierSVMPVC, svm.ID(), pvc.ID(), map[string]string{graph.ClaimAggrLabel: aggr.ID()}).WithIO(graph.IOMetrics{ReadOps: f64(700), WriteOps: f64(350)}),
+		hop(graph.StorageTierPVCPod, pvc.ID(), pod.ID(), nil),
+		hop(graph.StorageTierPodNode, pod.ID(), pod.Labels()["node"], nil),
+	)
+	nodes := slices.Collect(maps.Values(base.NodesByID))
+	nodes = append(nodes, ctrl, aggr, svm, pvc, pod)
+	return graph.NewGraph(nodes, edges, time.Time{})
+}
+
 // applicationRootEstate is the storage golden plus one mounting pod that
 // resolves the root Application and one claimless pod that resolves it and
 // therefore has no edge. The shared estate is not mutated.
@@ -407,6 +540,60 @@ func applicationRootEstate(base *graph.Graph) *graph.Graph {
 		ApplicationValue: "checkout",
 	})
 	return graph.NewGraph(nodes, base.Edges, time.Time{})
+}
+
+// claimRootEstate is the shared storage estate plus what a pvc / pv root needs
+// that no other root kind draws: PersistentVolume names on the claims it roots
+// (the `volumename` label a pv root matches), a claim no pod mounts
+// (orphan-data, on aggr1 / svm_shop, so its chain ends at it) and a claim on no
+// filer (scratch-data). The shared estate is not mutated, and none of its goldens
+// changes: an unmounted claim that is not a claim root is dropped under every
+// other kind.
+func claimRootEstate(base *graph.Graph) *graph.Graph {
+	const cluster, oc = "cluster-alpha", "ontap-prod"
+	volumeNames := map[string]string{"orders-data": "pvc-orders"}
+	nodes := make([]graph.GraphNode, 0, len(base.NodesByID)+2)
+	for _, n := range base.NodesByID {
+		if pvc, ok := n.(*graph.PVCNode); ok && pvc.Labels()["cluster"] == cluster {
+			if pv, named := volumeNames[pvc.Name()]; named {
+				cloned := *pvc
+				cloned.LabelsValue = maps.Clone(pvc.LabelsValue)
+				cloned.LabelsValue["volumename"] = pv
+				nodes = append(nodes, &cloned)
+				continue
+			}
+		}
+		nodes = append(nodes, n)
+	}
+	orphan := &graph.PVCNode{
+		IDValue: graph.PVCID(cluster, "shop", "orphan-data"), NameValue: "orphan-data",
+		LabelsValue: map[string]string{
+			"cluster": cluster, "namespace": "shop", "volumename": "pvc-orphan",
+			"svm": "svm_shop", "aggr": graph.NetAppAggrID(oc, "aggr1"),
+		},
+	}
+	scratch := &graph.PVCNode{
+		IDValue: graph.PVCID(cluster, "shop", "scratch-data"), NameValue: "scratch-data",
+		LabelsValue: map[string]string{"cluster": cluster, "namespace": "shop", "volumename": "pvc-scratch"},
+	}
+	nodes = append(nodes, orphan, scratch)
+
+	ioMetrics := graph.IOMetrics{ReadOps: new(25.0), WriteOps: new(5.0), ReadLatencyUs: new(450.0)}
+	ctrl, aggr, svm := graph.NetAppNodeID(oc, "ontap-prod-01"), graph.NetAppAggrID(oc, "aggr1"), graph.NetAppSVMID(oc, "svm_shop")
+	hop := func(tier, src, tgt string, labels map[string]string) *graph.Edge {
+		l := map[string]string{"tier": tier}
+		for k, v := range labels {
+			l[k] = v
+		}
+		return graph.NewEdge(graph.EdgeTypeStorageFlow, src, tgt, l)
+	}
+	edges := slices.Clone(base.Edges)
+	edges = append(edges,
+		hop(graph.StorageTierNodeAggr, ctrl, aggr, nil),
+		hop(graph.StorageTierAggrSVM, aggr, svm, nil),
+		hop(graph.StorageTierSVMPVC, svm, orphan.IDValue, map[string]string{graph.ClaimAggrLabel: aggr}).WithIO(ioMetrics),
+	)
+	return graph.NewGraph(nodes, edges, time.Time{})
 }
 
 // buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph

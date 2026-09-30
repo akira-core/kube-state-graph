@@ -237,51 +237,112 @@ func TestRenderPodInfoByNode(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestRenderPodsInNamespace(t *testing.T) {
+func TestRenderNamesInNamespace_Pods(t *testing.T) {
 	t.Parallel()
 
 	for _, q := range PodNamespaceScopedQueries {
-		got, ok := RenderPodsInNamespace(q, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"web-0", "orders-0", "web-0"})
+		got, ok := RenderNamesInNamespace(q, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, []string{"web-0", "orders-0", "web-0"})
 		require.True(t, ok, q)
 		assert.Equal(t,
 			`last_over_time(`+string(q)+`{namespace="shop",pod=~"orders-0|web-0"}[1m])`,
 			got, "one namespace as an equality, its pods as the alternation")
 	}
 
-	one, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"orders-0"})
+	one, ok := RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, []string{"orders-0"})
 	require.True(t, ok)
 	assert.Equal(t, `last_over_time(kube_pod_info{namespace="shop",pod="orders-0"}[1m])`, one)
 
-	sel, ok := RenderPodsInNamespace(QPodOwner, time.Minute, LabelKeys{}, Selector{
+	sel, ok := RenderNamesInNamespace(QPodOwner, time.Minute, LabelKeys{}, Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop", "platform"},
-	}, "shop", []string{"orders-0"})
+	}, "shop", PodLabel, []string{"orders-0"})
 	require.True(t, ok)
 	assert.Equal(t,
 		`last_over_time(kube_pod_owner{az="zone-a",env="prod",cluster="c1",namespace=~"platform|shop",namespace="shop",pod="orders-0"}[1m])`,
 		sel, "the request matchers come first and are composed with the pair, never replaced")
 
-	meta, ok := RenderPodsInNamespace(QPVCBindings, time.Minute, LabelKeys{}, Selector{}, `shop"a`, []string{`web.0`, "z"})
+	meta, ok := RenderNamesInNamespace(QPVCBindings, time.Minute, LabelKeys{}, Selector{}, `shop"a`, PodLabel, []string{`web.0`, "z"})
 	require.True(t, ok)
 	assert.Equal(t,
 		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{namespace="shop\"a",pod=~"web\\.0|z"}[1m])`,
 		meta)
 
-	empty, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "", []string{"orders-0"})
+	empty, ok := RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "", PodLabel, []string{"orders-0"})
 	require.True(t, ok)
 	assert.Equal(t, `last_over_time(kube_pod_info{namespace="",pod="orders-0"}[1m])`, empty,
 		"the namespace equality is always rendered, so a query never spans namespaces")
 
-	_, ok = RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", nil)
+	_, ok = RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, nil)
 	assert.False(t, ok)
-	_, ok = RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{""})
+	_, ok = RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, []string{""})
 	assert.False(t, ok)
-	_, ok = RenderPodsInNamespace(QNodeInfo, time.Minute, LabelKeys{}, Selector{}, "shop", []string{"orders-0"})
-	assert.False(t, ok, "a family not keyed by (namespace, pod) is refused")
+	_, ok = RenderNamesInNamespace(QNodeInfo, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, []string{"orders-0"})
+	assert.False(t, ok, "a family not keyed by (namespace, name) is refused")
+}
+
+// The claim-info family is keyed by (namespace, claim): the pvc-root seed reads
+// it one namespace at a time, so a same-named claim in another namespace is
+// never read.
+func TestRenderNamesInNamespace_Claims(t *testing.T) {
+	t.Parallel()
+
+	got, ok := RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{},
+		"shop", ClaimLabel, []string{"orders-data", "cache", "orders-data"})
+	require.True(t, ok)
+	assert.Equal(t,
+		`last_over_time(kube_persistentvolumeclaim_info{namespace="shop",persistentvolumeclaim=~"cache|orders-data"}[1m])`,
+		got)
+
+	one, ok := RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{},
+		"platform", ClaimLabel, []string{"queue"})
+	require.True(t, ok)
+	assert.Equal(t,
+		`last_over_time(kube_persistentvolumeclaim_info{namespace="platform",persistentvolumeclaim="queue"}[1m])`, one)
+
+	sel, ok := RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: []string{"shop", "platform"},
+	}, "shop", ClaimLabel, []string{"cache"})
+	require.True(t, ok)
+	assert.Equal(t,
+		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",namespace=~"platform|shop",namespace="shop",persistentvolumeclaim="cache"}[1m])`,
+		sel, "the request matchers come first and are composed with the pair, never replaced")
+
+	_, ok = RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{}, "shop", ClaimLabel, nil)
+	assert.False(t, ok)
+	_, ok = RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{}, "shop", ClaimLabel, []string{""})
+	assert.False(t, ok)
+}
+
+// Every claim-keyed family a hub-mode build reads is namespace-scoped: the
+// claim-name restriction alone would read a common claim name in every
+// namespace of the estate.
+func TestRenderNamesInNamespace_EveryClaimFamily(t *testing.T) {
+	t.Parallel()
+
+	for _, q := range ClaimScopedQueries {
+		got, ok := RenderNamesInNamespace(q, time.Minute, LabelKeys{}, Selector{}, "shop", ClaimLabel, []string{"data"})
+		require.True(t, ok, q)
+		assert.Contains(t, got, `namespace="shop",persistentvolumeclaim="data"`, q)
+		assert.True(t, strings.HasPrefix(got, "last_over_time("+string(q)+"{"), q)
+	}
+}
+
+// A family is refused under a label it is not keyed by, so a caller cannot
+// restrict a pod-keyed family on a claim name (or the reverse) and read the
+// wrong population.
+func TestRenderNamesInNamespace_RefusesAMismatchedLabel(t *testing.T) {
+	t.Parallel()
+
+	_, ok := RenderNamesInNamespace(QPVCInfo, time.Minute, LabelKeys{}, Selector{}, "shop", PodLabel, []string{"x"})
+	assert.False(t, ok, "claim info is keyed by persistentvolumeclaim, not pod")
+	_, ok = RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", ClaimLabel, []string{"x"})
+	assert.False(t, ok, "pod info is keyed by pod, not persistentvolumeclaim")
+	_, ok = RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, "shop", "", []string{"x"})
+	assert.False(t, ok)
 }
 
 func TestNamespaceEqualityCost(t *testing.T) {
 	t.Parallel()
-	got, ok := RenderPodsInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, `sh"op`, []string{"p"})
+	got, ok := RenderNamesInNamespace(QPodInfo, time.Minute, LabelKeys{}, Selector{}, `sh"op`, PodLabel, []string{"p"})
 	require.True(t, ok)
 	pair := `namespace="sh\"op",`
 	require.Contains(t, got, pair)

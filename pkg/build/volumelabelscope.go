@@ -146,18 +146,25 @@ func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuer
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
 // rootedVolumeLabelsChunks splits the phase-1 restriction across as many
-// queries as the byte budget requires, in (group, chunk) order: the aggregate
-// group's chunks first, then the SVM group's. ok is false when that would take
-// more than maxRootedVolumeLabelChunks queries IN TOTAL across both groups; the
-// caller rejects the build and issues nothing.
+// queries as the byte budget requires, in (group, chunk) order: the bare
+// aggregate group's chunks first, then the bare SVM group's, then one group per
+// ONTAP cluster of the qualified aggregates and of the qualified SVMs, each in
+// sorted cluster order. ok is false when that would take more than
+// maxRootedVolumeLabelChunks queries IN TOTAL across every group; the caller
+// rejects the build and issues nothing.
 //
-// Each group chunks ITS alternation — `aggr` for the aggregate group, `svm` for
-// the SVM group, `cluster` for a request rooted at ONTAP clusters alone — and
-// repeats the `cluster` alternation verbatim in every chunk. The matchers of
+// Each bare group chunks ITS alternation — `aggr` for the aggregate group, `svm`
+// for the SVM group, `cluster` for a request rooted at ONTAP clusters alone —
+// and repeats the `cluster` alternation verbatim in every chunk. The matchers of
 // one query are AND-combined, so a union over disjoint chunks of one of them is
 // exactly the unchunked selection; and disjoint chunks of one group return
-// disjoint series. The two groups DO overlap — a volume of a rooted SVM on a
-// rooted aggregate is returned by both — which the caller's merge removes.
+// disjoint series. The groups DO overlap — a volume of a rooted SVM on a rooted
+// aggregate is returned by both — which the caller's merge removes.
+//
+// A qualified group carries its ONE ONTAP cluster as the `cluster` equality and
+// chunks its name alternation the same way. A request carries one root kind, so
+// the bare `cluster` set is empty whenever a qualified group is present; the
+// two never AND together.
 //
 // The repeated alternation is not counted by ChunkScope, so its RENDERED length
 // — escaping, the `=~"…"` wrapper and the separating comma included — is taken
@@ -168,7 +175,7 @@ const maxRootedVolumeLabelChunks = scopeConcurrency
 // pathological cluster set from producing a non-positive budget, which
 // ChunkScope would read as "no limit"; the chunk cap above is what actually
 // catches that case.
-func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
+func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, aggrPairs, svmPairs map[string][]string, budget int) ([]rootedVolumeLabelsQuery, bool) {
 	fixed := promql.MatcherCost(promql.VolumeLabelsClusterLabel, clusters)
 	if fixed > 0 {
 		fixed++ // the comma joining it to the chunked matcher
@@ -184,9 +191,19 @@ func rootedVolumeLabelsChunks(clusters, aggrs, svms []string, budget int) ([]roo
 			out = append(out, rootedVolumeLabelsQuery{group: groupSVM, clusters: clusters, svms: chunk})
 		}
 	}
-	if len(aggrs) == 0 && len(svms) == 0 {
+	if len(aggrs) == 0 && len(svms) == 0 && len(aggrPairs) == 0 && len(svmPairs) == 0 {
 		for _, chunk := range promql.ChunkScope(clusters, budget) {
 			out = append(out, rootedVolumeLabelsQuery{group: groupAggr, clusters: chunk})
+		}
+	}
+	for _, oc := range slices.Sorted(maps.Keys(aggrPairs)) {
+		for _, chunk := range promql.ChunkScope(aggrPairs[oc], max(budget-promql.OwnerCompletionClusterCost(oc), 1)) {
+			out = append(out, rootedVolumeLabelsQuery{group: groupAggr, clusters: []string{oc}, aggrs: chunk})
+		}
+	}
+	for _, oc := range slices.Sorted(maps.Keys(svmPairs)) {
+		for _, chunk := range promql.ChunkScope(svmPairs[oc], max(budget-promql.OwnerCompletionClusterCost(oc), 1)) {
+			out = append(out, rootedVolumeLabelsQuery{group: groupSVM, clusters: []string{oc}, svms: chunk})
 		}
 	}
 	if len(out) > maxRootedVolumeLabelChunks {
@@ -481,9 +498,10 @@ func rowsOwnedBy(rows model.Vector, roots []string) model.Vector {
 
 // ownerCompletionTargets is the owner-completion scope: every (ONTAP cluster,
 // aggregate) pair an SVM-group row names, minus the aggregates an aggregate
-// group of the same request already read whole — an aggregate named by an
+// group of the same request already read whole — an aggregate named by a bare
 // aggr= root, on a filer inside the ontap_cluster= roots (any filer, when there
-// are none). Keyed by ONTAP cluster, each aggregate set sorted.
+// are none), or by a qualified aggr= root on exactly its own filer. Keyed by
+// ONTAP cluster, each aggregate set sorted.
 //
 // A row with an empty `aggr` (a FlexGroup) names no aggregate and completes
 // nothing: there is no single aggregate whose vote it could skew. Nor does a
@@ -491,6 +509,9 @@ func rowsOwnedBy(rows model.Vector, roots []string) model.Vector {
 // one (pickAggr and the owner index both skip it), so no vote could move.
 func ownerCompletionTargets(svmRows model.Vector, plan topologyPlan) map[string][]string {
 	readWhole := func(cluster, aggr string) bool {
+		if slices.Contains(plan.volumeAggrPairs[cluster], aggr) {
+			return true
+		}
 		if !slices.Contains(plan.volumeAggrs, aggr) {
 			return false
 		}
@@ -613,7 +634,7 @@ func readTokenScopedVolumeLabels(
 	// cluster, and a candidate on another aggregate or SVM of the same cluster
 	// is exactly what phase 2 must still find.
 	var excludeClusters []string
-	if len(plan.volumeAggrs) == 0 && len(plan.volumeSVMs) == 0 {
+	if !plan.aggrRoots() && !plan.svmRoots() {
 		excludeClusters = plan.volumeClusters
 	}
 	return issueTokenVolumeLabels(ctx, q, window, end, opts, sel, tokens, excludeClusters)
@@ -736,7 +757,7 @@ func readVolumeLabelsTail(
 		return nil
 	}
 	var late model.Vector
-	if len(plan.volumeSVMs) > 0 || len(plan.volumeNodes) > 0 {
+	if plan.svmRoots() || len(plan.volumeNodes) > 0 {
 		// An ontap_node phase 1 already re-read whole every aggregate its
 		// kept rows name, so those need no second completion.
 		targets := withoutTargets(ownerCompletionTargets(phaseTwo, plan), completed)

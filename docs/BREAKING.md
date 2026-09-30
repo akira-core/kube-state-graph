@@ -19,8 +19,9 @@ longer combines root kinds.
   `graph.NewStorageScope` is `(clusters, namespaces, kind, values)`.
 
 `cluster=` and `namespace=` stay optional filters and combine with any one
-root kind. `az` and `env` stay required and single-valued, and are checked
-before the root.
+root kind. `az` and `env` stay required, and are checked before the root
+(they became repeatable afterwards — see "`/v1/storage-graph` accepts several
+zones and qualified `aggr=` / `svm=` roots" below).
 
 ---
 
@@ -122,8 +123,9 @@ Three things a client can see:
   bound to a PV whose name embeds no `pvc_` (a static PV, a provisioner with a
   custom volume-name prefix or a Trident `nameTemplate`) draws no path in a
   storage-graph body, even though the forward join would match it. `/v1/graph`,
-  rootless storage requests and requests rooted only at `pod=`,
-  `application=` or `node=` still join it. Size it with
+  rootless storage requests and requests rooted only at `pod=`, `pvc=`, `pv=`,
+  `application=` or `node=` still join it — `pv=` / `pvc=` is the way to root
+  at such a claim. Size it with
   `count(kube_persistentvolumeclaim_info{volumename!~"pvc-.+", volumename!=""})`.
 - **`svm=` restricts the Harvest read, and `node=` no longer disables it.**
   Phase 1 of the `volume_labels` read gains an `{svm=~…}` query group
@@ -203,6 +205,102 @@ carries an upstream URL, host or address.
 traffic" should surface the 502 message instead. Operators who relied on the
 storage view surviving a Harvest or kubelet store outage lose that: the view
 now reports the outage.
+
+## Non-breaking: `/v1/storage-graph` accepts `pvc=` and `pv=` roots
+
+*storage-graph-api — One root kind per request; Every root kind is tracked from its own tier to its claims; Roots are always materialised when the upstream knows them; Flow weights on every tier; Storage-reachability projection.*
+
+Not a compatibility break on the wire. `pvc=<namespace>/<claim>` roots a
+PersistentVolumeClaim in every cluster of the selected estate, and `pv=<name>`
+roots the claim(s) bound to a PersistentVolume by its bare name, matched on the
+`volumename` of `kube_persistentvolumeclaim_info`. Both are repeatable, count as
+one root kind (a request mixing them with another kind is the existing 400
+`invalid_scope`, the message naming the parameters in the order `… pod, pvc,
+pv, application`), and a malformed `pvc` — anything but exactly one `/` between
+two non-empty segments — is 400 `invalid_scope`. A request that sends neither
+issues the same queries and returns a byte-identical body.
+
+- **Static PVs are reachable.** The seed reads `kube_persistentvolumeclaim_info`
+  directly instead of deriving PV candidates from a FlexVol name, so a claim
+  bound to a statically provisioned PV is found; whether it lands on a FlexVol
+  is still decided by the forward join, exactly as on `/v1/graph`.
+- **An unmounted root claim keeps its storage-side path.** Every other root kind
+  drops a claim no pod mounts. A claim that is itself a `pvc=` / `pv=` root
+  keeps `node-aggr → aggr-svm → svm-pvc` and ends at the claim: its whole
+  measurement is summed onto its `svm-pvc` edge and every hop above it, with no
+  `pvc-pod` edge below. An unmounted claim that is not a root stays dropped.
+- **The seed is one read.** It is the
+  `kube_persistentvolumeclaim_info` read itself, one query per namespace for
+  `pvc=`; a root set past sixteen queries is 400 `invalid_scope` before any
+  query. See [upstream-metrics.md](upstream-metrics.md) for the fan-out.
+
+### In-process embedders
+
+`graph.StorageRootKinds` gains `pvc` and `pv`; `graph.ClaimRef` and
+`graph.StorageRoots.Claims` are new (`pv` values ride in `Names`). Code that
+switches exhaustively on `StorageRootKind` must handle both.
+`promql.RenderPodsInNamespace` is **replaced** by
+`promql.RenderNamesInNamespace(q, window, keys, sel, namespace, label, names)`;
+pass `promql.PodLabel` for the pod-keyed families it accepted before.
+`graph.StorageRoots.HasName` and `HasPod` are **removed**: nothing in the engine
+called them. Test membership directly on the fields, for example
+`slices.Contains(roots.Pods, ref)`. `build.Topology` and the rendered queries of
+every existing request are unchanged.
+
+## `/v1/storage-graph` accepts several zones and qualified `aggr=` / `svm=` roots
+
+*storage-graph-api — Storage-flow graph endpoint; One root kind per request; Every root kind is tracked from its own tier to its claims; Roots are always materialised when the upstream knows them; Storage build reads every family by reference. netapp-storage-graph — PVC-to-NetApp-aggregate edge join; Harvest legs carry the request zone and environment.*
+
+Additive on the wire, with one narrow body change on the shared join.
+
+- **`az` and `env` are repeatable.** Both stay required (`missing_az` /
+  `missing_env` are unchanged, and are still checked after the window and before
+  the root). A request that repeated either used to be **400 `invalid_scope`**
+  (`… must be single-valued`); it is now accepted. The selected zones are the
+  Cartesian product of the two value sets, and a combination the estate does not
+  hold contributes nothing. Values are pushed upstream as on `/v1/graph` — sorted
+  and de-duplicated, a single value as `key="v"`, several as one anchored
+  `key=~"a|b"` — on every kube-state-metrics, kubelet, Harvest and `ALERTS`
+  query, and the `az` set selects the zone-routed backends. A request carrying
+  one value of each issues the same queries and returns a byte-identical body.
+- **The body is the union of its zones.** For a fixed root, filters and window,
+  the body of a multi-zone request equals the union of the single-zone bodies:
+  no node merges across zones, no flow weight sums claims of different zones,
+  and `clusters` lists every identity. The operator guarantees ONTAP cluster and
+  controller names are unique across the estate
+  ([netapp-harvest-preconditions.md](netapp-harvest-preconditions.md)); a
+  cluster name reused in two zones stays two clusters.
+- **`aggr=` and `svm=` accept `<ontap_cluster>/<name>`.** The qualified form
+  roots exactly one filer's component; the bare form still roots that name on
+  every filer of the selected zones. The two mix within the one root kind, and a
+  bare value subsumes a qualified one of its name. A value containing `/` used
+  to be an ordinary bare name that matched nothing (a 200 with an empty body);
+  it is now the qualified form, and one that does not split into two non-empty
+  segments (`ontap-prod/`, `/aggr1`, `a/b/c`) is **400 `invalid_scope`**. A
+  qualified set is read one `volume_labels` query per ONTAP cluster, so a root
+  set spanning more ONTAP clusters than the chunk cap (sixteen queries in
+  total, bare groups included) is 400 `invalid_scope` before any query.
+- **A claim joins only FlexVols of its own zone.** A claim's `volume_labels`
+  candidates are restricted to series whose `az` / `env` agree with the claim's
+  (an unknown zone on either side never excludes). This is what makes the union
+  hold, and it is part of the SHARED join, so it applies to every build path.
+  **Body change:** an estate in which the same FlexVol token — a clone, or a
+  hand-chosen naming scheme — appears on filers of two zones used to attach a
+  claim to the lexically-smallest `(ontap_cluster, aggr)` across both; it now
+  attaches to the smallest within its own zone. An unfiltered `/v1/graph`
+  changes only in such an estate. UUID-derived Trident volume names do not
+  collide, and a Harvest series carrying no `az` / `env` still competes for
+  every claim, exactly as before.
+
+### In-process embedders
+
+`graph.ONTAPRef` and `graph.StorageRoots.Qualified` are new; `StorageRoots.Names`
+holds the bare `aggr` / `svm` values only, and `StorageRoots.Any()` counts both.
+`graph.NewStorageScope` returns an error for a malformed qualified value.
+`kubegraph.ParseStorageValues` returns the full sorted `az` / `env` value sets in
+`StorageRequest.Selector`. Code that reads `StorageRoots.Names` for an `aggr` /
+`svm` root must also read `Qualified`. `pkg/build`'s exported surface is
+unchanged.
 
 ## Non-breaking: `/v1/storage-graph` accepts an `application=` root
 
@@ -488,7 +586,7 @@ is queried at its bare name.
 A deployment whose KSM series **are** published under an organisational prefix
 will silently return an empty graph after upgrade. Re-publish those series at
 their bare `kube_*` names (drop the prefixing relabel/fork) **before**
-upgrading. Embedders (`graph-api-gateway`) must drop `Options.MetricPrefix` in
+upgrading. Embedders must drop `Options.MetricPrefix` in
 the same version bump.
 
 ## `data.metrics.rate` is schema-optional

@@ -41,10 +41,17 @@ type storageChain struct {
 // edge. Every other tier is emitted weightless and is summed at projection over
 // the RETAINED flow units — weights baked over the full estate would fail to
 // conserve the moment a filter or a root removed a unit.
+//
+// Unmounted claims are drawn iff topology.ClaimSeeded (a pvc or pv root). Every
+// claim such a build tracks IS a root claim — mounter completion loads pods,
+// never further claims — so the builder needs no root matching to know which
+// unmounted chains to draw: under a claim seed it draws them all, ending at the
+// claim, and under every other plan it draws none, exactly as before. The
+// projection still decides which of them a body retains.
 func assembleStorageFlow(topology Topology) ([]graph.GraphNode, []*graph.Edge) {
 	nodes := storageFlowNodes(topology)
 	chains := storageChains(topology)
-	edges := storageFlowEdges(chains, topology.PodPVCs, podNodeIDs(topology))
+	edges := storageFlowEdges(chains, topology.PodPVCs, podNodeIDs(topology), topology.ClaimSeeded)
 
 	graph.SortNodes(nodes)
 	graph.SortEdges(edges)
@@ -169,7 +176,11 @@ func podNodeIDs(topology Topology) map[string]string {
 // mountersOf is derived from the pod-mounts-pvc bindings /v1/graph already
 // computes, so "which pods mount this claim" means the same thing on both
 // endpoints.
-func storageFlowEdges(chains []storageChain, bindings []PodPVCBinding, nodeOf map[string]string) []*graph.Edge {
+//
+// sinkUnmounted keeps the storage-side chain of a claim no pod mounts: the
+// claim is then a Sankey sink and its path ends at the claim. See
+// assembleStorageFlow for who sets it.
+func storageFlowEdges(chains []storageChain, bindings []PodPVCBinding, nodeOf map[string]string, sinkUnmounted bool) []*graph.Edge {
 	mountersOf := make(map[string][]string)
 	for _, b := range bindings {
 		mountersOf[b.PVCID] = append(mountersOf[b.PVCID], b.PodID)
@@ -206,11 +217,12 @@ func storageFlowEdges(chains []storageChain, bindings []PodPVCBinding, nodeOf ma
 
 	for _, c := range chains {
 		mounters := mountersOf[c.pvcID]
-		// An UNMOUNTED claim draws no path at all: with no pod there is no
-		// Sankey flow to render, and ProjectStorage would drop every node on
-		// the path anyway. Emitting it would put a dangling stub on the
-		// storage side of the diagram.
-		if len(mounters) == 0 {
+		// An UNMOUNTED claim draws no path at all unless it is a sink: with no
+		// pod there is no Sankey flow to render, and ProjectStorage would drop
+		// every node on the path anyway. Emitting it would put a dangling stub
+		// on the storage side of the diagram. A root claim of a pvc / pv root
+		// is the one exception — its path ends at the claim by definition.
+		if len(mounters) == 0 && !sinkUnmounted {
 			continue
 		}
 

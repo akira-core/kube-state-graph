@@ -142,7 +142,7 @@ func TestTopologyPlan_RestrictsVolumeLabels(t *testing.T) {
 		assert.False(t, fullPlan.harvestSeed())
 		// A plan that carried aggregate names without being the storage read
 		// stays unseeded: only /v1/storage-graph has a root kind.
-		forged := topologyPlan{kind: graph.StorageRootAggr, names: []string{"a"}, volumeAggrs: []string{"a"}}
+		forged := topologyPlan{kind: graph.StorageRootAggr, volumeAggrs: []string{"a"}}
 		assert.False(t, forged.harvestSeed())
 	})
 }
@@ -151,7 +151,7 @@ func TestTopologyPlan_RestrictsVolumeLabels(t *testing.T) {
 
 func TestRootedVolumeLabelsChunks(t *testing.T) {
 	t.Run("aggregates are chunked and the cluster set repeats in every chunk", func(t *testing.T) {
-		got, ok := rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr1", "aggr2", "aggr3"}, nil, 30)
+		got, ok := rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr1", "aggr2", "aggr3"}, nil, nil, nil, 30)
 		require.True(t, ok)
 		require.Greater(t, len(got), 1, "a tight budget must split the aggregate set")
 		var union []string
@@ -163,7 +163,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 	})
 
 	t.Run("with no aggregate the cluster set is chunked", func(t *testing.T) {
-		got, ok := rootedVolumeLabelsChunks([]string{"ontap-a", "ontap-b", "ontap-c"}, nil, nil, 12)
+		got, ok := rootedVolumeLabelsChunks([]string{"ontap-a", "ontap-b", "ontap-c"}, nil, nil, nil, nil, 12)
 		require.True(t, ok)
 		require.Greater(t, len(got), 1)
 		for _, c := range got {
@@ -172,7 +172,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 	})
 
 	t.Run("a roomy budget is one query", func(t *testing.T) {
-		got, ok := rootedVolumeLabelsChunks([]string{"o"}, []string{"a1", "a2"}, nil, 8192)
+		got, ok := rootedVolumeLabelsChunks([]string{"o"}, []string{"a1", "a2"}, nil, nil, nil, 8192)
 		require.True(t, ok)
 		require.Len(t, got, 1)
 		assert.Equal(t, []string{"a1", "a2"}, got[0].aggrs)
@@ -193,7 +193,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 
 		const budget = 40
 		remaining := budget - rendered - 1 // -1 for the comma joining the two matchers
-		got, ok := rootedVolumeLabelsChunks(dotted, []string{"a1", "a2", "a3", "a4"}, nil, budget)
+		got, ok := rootedVolumeLabelsChunks(dotted, []string{"a1", "a2", "a3", "a4"}, nil, nil, nil, budget)
 		require.True(t, ok)
 		require.Greater(t, len(got), 1, "only %d bytes are left for the aggregates", remaining)
 
@@ -212,7 +212,7 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 
 	t.Run("a single over-budget value still gets its own chunk", func(t *testing.T) {
 		long := strings.Repeat("a", 100)
-		got, ok := rootedVolumeLabelsChunks(nil, []string{"a", long, "b"}, nil, 10)
+		got, ok := rootedVolumeLabelsChunks(nil, []string{"a", long, "b"}, nil, nil, nil, 10)
 		require.True(t, ok)
 		require.Len(t, got, 3)
 		assert.Equal(t, []string{long}, got[1].aggrs)
@@ -223,20 +223,20 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 		// LENGTH, never the count, so this is the one scope a client can
 		// inflate. Past the cap the seed does not render; the build rejects
 		// it before any query.
-		_, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 240), nil, DefaultQoSScopeBatchBytes)
+		_, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 240), nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.False(t, ok, "5000 near-maximum-length values")
 
 		// A cluster set that eats the whole budget collapses the per-chunk
 		// budget to the floor, which would otherwise put every aggregate in a
 		// query of its own. The same cap catches it.
-		_, ok = rootedVolumeLabelsChunks([]string{strings.Repeat("c", 9000)}, manyAggrRoots(maxRootedVolumeLabelChunks+1, 0), nil, DefaultQoSScopeBatchBytes)
+		_, ok = rootedVolumeLabelsChunks([]string{strings.Repeat("c", 9000)}, manyAggrRoots(maxRootedVolumeLabelChunks+1, 0), nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.False(t, ok, "a budget collapsed to the floor")
 
 		// What a real request looks like is nowhere near it: a filer has tens
 		// of aggregates, and even 5000 ordinary names fit in six chunks.
-		_, ok = rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr1", "aggr2", "aggr3"}, nil, DefaultQoSScopeBatchBytes)
+		_, ok = rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr1", "aggr2", "aggr3"}, nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.True(t, ok)
-		got, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 0), nil, DefaultQoSScopeBatchBytes)
+		got, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 0), nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.True(t, ok)
 		assert.LessOrEqual(t, len(got), maxRootedVolumeLabelChunks)
 	})
@@ -372,6 +372,7 @@ func vlrBuild(t *testing.T, fx map[promql.Query]model.Vector, roots graph.Storag
 	plan := storagePlan(roots)
 	if !restricted {
 		plan.volumeClusters, plan.volumeAggrs, plan.volumeSVMs, plan.volumeNodes = nil, nil, nil, nil
+		plan.volumeAggrPairs, plan.volumeSVMPairs = nil, nil
 	}
 	q := promqlfake.New(fx)
 	g, err := New(q, opts, nil, nil).buildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, plan)
@@ -792,7 +793,7 @@ func TestRootedVolumeLabels_JoinMissSignalUnderARestriction(t *testing.T) {
 		return captureDebugRecords(t, func() {
 			v := f.vectors()
 			v.VolumeLabelsRestricted = restricted
-			resolveNetAppStorage(f.claims, v)
+			resolveNetAppStorage(f.claims, v, promql.LabelKeys{})
 		})
 	}
 	countOf := func(recs []map[string]any) float64 {
@@ -904,7 +905,7 @@ func TestRootedVolumeLabels_ClusterOnlyPhaseTwoExcludesWhatPhaseOneRead(t *testi
 
 func TestRootedVolumeLabelsChunks_Groups(t *testing.T) {
 	t.Run("aggregate chunks precede SVM chunks, each repeating the cluster set", func(t *testing.T) {
-		got, ok := rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr2", "aggr1"}, []string{"svm_b", "svm_a"}, 8192)
+		got, ok := rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr2", "aggr1"}, []string{"svm_b", "svm_a"}, nil, nil, 8192)
 		require.True(t, ok)
 		require.Len(t, got, 2)
 		assert.Equal(t, rootedVolumeLabelsQuery{group: groupAggr, clusters: []string{"ontap-prod"}, aggrs: []string{"aggr2", "aggr1"}}, got[0])
@@ -915,7 +916,7 @@ func TestRootedVolumeLabelsChunks_Groups(t *testing.T) {
 	})
 
 	t.Run("svm alone is the SVM group alone", func(t *testing.T) {
-		got, ok := rootedVolumeLabelsChunks(nil, nil, []string{"svm_a"}, 8192)
+		got, ok := rootedVolumeLabelsChunks(nil, nil, []string{"svm_a"}, nil, nil, 8192)
 		require.True(t, ok)
 		require.Len(t, got, 1)
 		assert.Equal(t, groupSVM, got[0].group)
@@ -925,11 +926,11 @@ func TestRootedVolumeLabelsChunks_Groups(t *testing.T) {
 		half := maxRootedVolumeLabelChunks/2 + 1
 		aggrs, svms := manyAggrRoots(half, 0), manyAggrRoots(half, 0)
 		// A budget of one byte puts every value in a chunk of its own.
-		_, ok := rootedVolumeLabelsChunks(nil, aggrs, nil, 1)
+		_, ok := rootedVolumeLabelsChunks(nil, aggrs, nil, nil, nil, 1)
 		assert.True(t, ok, "either group alone fits")
-		_, ok = rootedVolumeLabelsChunks(nil, nil, svms, 1)
+		_, ok = rootedVolumeLabelsChunks(nil, nil, svms, nil, nil, 1)
 		assert.True(t, ok)
-		_, ok = rootedVolumeLabelsChunks(nil, aggrs, svms, 1)
+		_, ok = rootedVolumeLabelsChunks(nil, aggrs, svms, nil, nil, 1)
 		assert.False(t, ok, "together they exceed the cap, so the family is read unrestricted")
 	})
 }

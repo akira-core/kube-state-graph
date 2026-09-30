@@ -67,21 +67,26 @@ func TestStorageGraph_MissingAZ(t *testing.T) {
 	assert.Equal(t, "missing_az", errField["reason"])
 }
 
-func TestStorageGraph_RepeatedEnv(t *testing.T) {
+func TestStorageGraph_RepeatedAZAndEnvAreAccepted(t *testing.T) {
 	s := newServerWithMocks(t, newMockQuerier(t, nil), nil)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/storage-graph?start=1746442800&end=1746446400&az=zone-a&env=prod&env=dev")
+	q := url.Values{
+		"start": {"1746442800"},
+		"end":   {"1746446400"},
+		"az":    {"zone-b", "zone-a"},
+		"env":   {"prod", "dev"},
+		"aggr":  {"aggr1"},
+	}
+	resp, err := http.Get(srv.URL + "/v1/storage-graph?" + q.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "az and env are repeatable")
 
-	var body map[string]any
+	var body cytoscape.Body
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	errField, _ := body["error"].(map[string]any)
-	assert.Equal(t, "invalid_scope", errField["reason"])
-	assert.Contains(t, errField["message"], "env")
+	assert.Equal(t, "v1", body.APIVersion)
 }
 
 func TestStorageGraph_RequiresKey(t *testing.T) {

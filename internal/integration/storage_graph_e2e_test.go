@@ -366,6 +366,148 @@ kube_node_info{cluster="c1",node="worker-approot",az="zone-a",env="prod",test=%[
 	s.Empty(typo.Elements.Edges)
 }
 
+// TestStorageGraphClaimRoots proves the pvc= / pv= roots against a real
+// VictoriaMetrics: a mounted claim, an unmounted claim that keeps its
+// storage-side path as a Sankey sink, a claim bound to a statically provisioned
+// PV that only a claim root reaches, and a claim on no filer that is drawn alone.
+func (s *GraphSuite) TestStorageGraphClaimRoots() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`
+kube_pod_info{cluster="c1",namespace="shop",pod="cr-web-0",uid="uid-cr-web",node="worker-cr",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="cr-static-0",uid="uid-cr-static",node="worker-cr",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_info{cluster="c1",namespace="shop",pod="cr-plain-0",uid="uid-cr-plain",node="worker-cr",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_node_info{cluster="c1",node="worker-cr",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="cr-mounted",storageclass="netapp-nas",volumename="pvc-cr-mounted",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="cr-orphan",storageclass="netapp-nas",volumename="pvc-cr-orphan",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="cr-static",storageclass="netapp-nas",volumename="cr-static-pv",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="c1",namespace="shop",persistentvolumeclaim="cr-plain",storageclass="standard",volumename="pvc-cr-plain",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="cr-web-0",persistentvolumeclaim="cr-mounted",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="cr-static-0",persistentvolumeclaim="cr-static",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="c1",namespace="shop",pod="cr-plain-0",persistentvolumeclaim="cr-plain",volume="data",az="zone-a",env="prod",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-cr-01",aggr="aggr-cr",svm="svm_cr",volume="trident_pvc_cr_mounted",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-cr-01",aggr="aggr-cr",svm="svm_cr",volume="trident_pvc_cr_orphan",test=%[1]q} 1 %[2]d
+volume_labels{az="zone-a",env="prod",cluster="ontap-prod",node="ontap-cr-01",aggr="aggr-cr",svm="svm_cr",volume="cr_static_pv",test=%[1]q} 1 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-prod",svm="svm_cr",volume="trident_pvc_cr_mounted",test=%[1]q} 200 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-prod",svm="svm_cr",volume="trident_pvc_cr_orphan",test=%[1]q} 50 %[2]d
+qos_read_ops{az="zone-a",env="prod",cluster="ontap-prod",svm="svm_cr",volume="cr_static_pv",test=%[1]q} 30 %[2]d
+`, disc, t1))
+	s.Require().True(
+		s.WaitForSeries(`volume_labels{volume="cr_static_pv",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the claim-root volume_labels")
+	s.Require().True(
+		s.WaitForSeries(`kube_persistentvolumeclaim_info{persistentvolumeclaim="cr-plain",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe the claim-root claims")
+
+	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	const (
+		ident = "zone-a-prod-c1"
+		ctrl  = "netapp/ontap-prod/ontap-cr-01"
+		aggr  = "netapp/ontap-prod/aggr/aggr-cr"
+		svm   = "netapp/ontap-prod/svm/svm_cr"
+	)
+	claim := func(name string) string { return graph.PVCID(ident, "shop", name) }
+	readOps := func(body cytoscape.Body, source, target string) float64 {
+		s.T().Helper()
+		for _, e := range body.Elements.Edges {
+			if e.Data.Source == source && e.Data.Target == target {
+				s.Require().NotNil(e.Data.Metrics, "%s -> %s carries a measurement", source, target)
+				s.Require().NotNil(e.Data.Metrics.ReadOps)
+				return *e.Data.Metrics.ReadOps
+			}
+		}
+		s.Failf("edge not found", "%s -> %s", source, target)
+		return 0
+	}
+	tiers := func(body cytoscape.Body) map[string]int {
+		out := map[string]int{}
+		for _, e := range body.Elements.Edges {
+			out[e.Data.Labels["tier"]]++
+		}
+		return out
+	}
+
+	// A mounted claim: the whole chain to its pod and node, and no other claim
+	// sharing the aggregate or SVM.
+	mounted := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pvc", "shop/cr-mounted") })
+	byID := nodesByID(mounted)
+	for _, id := range []string{ctrl, aggr, svm, claim("cr-mounted"), ident + "/uid-cr-web", ident + "/worker-cr"} {
+		s.Contains(byID, id, "%s is on the root claim's path", id)
+	}
+	for _, name := range []string{"cr-orphan", "cr-static", "cr-plain"} {
+		s.NotContains(byID, claim(name), "%s shares the filer but is not the root claim", name)
+	}
+	s.NotContains(byID, ident+"/uid-cr-static")
+	s.assertStorageConservation(mounted)
+	s.assertNoStrayStorageFlowLabels(mounted)
+	s.InDelta(200.0, readOps(mounted, aggr, svm), 1e-9)
+
+	// A volume root resolves to the same claim and returns the same body.
+	byVolume := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pv", "pvc-cr-mounted") })
+	s.Equal(mounted, byVolume, "?pv= is ?pvc= for the claim bound to that volume")
+
+	// An unmounted claim keeps its storage-side path and ends at the claim: its
+	// whole measurement rides every hop above it, and no edge leaves it.
+	sink := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pvc", "shop/cr-orphan") })
+	sinkByID := nodesByID(sink)
+	for _, id := range []string{ctrl, aggr, svm, claim("cr-orphan")} {
+		s.Contains(sinkByID, id)
+	}
+	s.NotContains(sinkByID, claim("cr-mounted"))
+	s.Equal(map[string]int{"node-aggr": 1, "aggr-svm": 1, "svm-pvc": 1}, tiers(sink), "no pvc-pod or pod-node edge")
+	s.InDelta(50.0, readOps(sink, ctrl, aggr), 1e-9)
+	s.InDelta(50.0, readOps(sink, aggr, svm), 1e-9)
+	s.InDelta(50.0, readOps(sink, svm, claim("cr-orphan")), 1e-9)
+	s.assertNoStrayStorageFlowLabels(sink)
+
+	// Both together: the sink and the mounted claim sum on the shared hops.
+	both := s.fetchStorageGraph(srv.URL, func(q url.Values) {
+		q.Add("pvc", "shop/cr-mounted")
+		q.Add("pvc", "shop/cr-orphan")
+	})
+	s.InDelta(250.0, readOps(both, ctrl, aggr), 1e-9)
+	s.InDelta(250.0, readOps(both, aggr, svm), 1e-9)
+	s.InDelta(200.0, readOps(both, svm, claim("cr-mounted")), 1e-9)
+	s.InDelta(50.0, readOps(both, svm, claim("cr-orphan")), 1e-9)
+
+	// The unmounted claim is not a node under any other root kind.
+	byAggr := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("aggr", "aggr-cr") })
+	s.NotContains(nodesByID(byAggr), claim("cr-orphan"), "an unmounted claim that is not a root stays dropped")
+	s.Contains(nodesByID(byAggr), claim("cr-mounted"))
+
+	// A claim bound to a statically provisioned PV embeds no `pvc_`, so no
+	// storage root finds it; a volume root does, and draws the chain the
+	// forward join resolves.
+	s.NotContains(nodesByID(byAggr), claim("cr-static"), "no candidate names cr-static-pv")
+	static := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pv", "cr-static-pv") })
+	staticByID := nodesByID(static)
+	for _, id := range []string{ctrl, aggr, svm, claim("cr-static"), ident + "/uid-cr-static"} {
+		s.Contains(staticByID, id, "%s is on the static claim's path", id)
+	}
+	s.InDelta(30.0, readOps(static, svm, claim("cr-static")), 1e-9)
+
+	// A claim on no filer is drawn alone; its mounting pod is not.
+	plain := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("pvc", "shop/cr-plain") })
+	plainByID := nodesByID(plain)
+	s.Contains(plainByID, claim("cr-plain"))
+	s.NotContains(plainByID, ident+"/uid-cr-plain")
+	s.Empty(plain.Elements.Edges)
+
+	// A root the upstream does not name is an empty 200.
+	for name, configure := range map[string]func(url.Values){
+		"pvc": func(q url.Values) { q.Set("pvc", "shop/cr-typo") },
+		"pv":  func(q url.Values) { q.Set("pv", "pvc-cr-typo") },
+	} {
+		typo := s.fetchStorageGraph(srv.URL, configure)
+		s.Empty(typo.Elements.Nodes, name)
+		s.Empty(typo.Elements.Edges, name)
+	}
+
+	// The request contract.
+	s.assertStorageRejected(srv.URL, func(q url.Values) { q.Set("pvc", "cr-mounted") }, "invalid_scope")
+	s.assertStorageRejected(srv.URL, func(q url.Values) { q.Set("pvc", "shop/cr-mounted"); q.Set("pv", "pvc-cr-mounted") }, "invalid_scope")
+}
+
 func (s *GraphSuite) fetchStorageGraph(base string, configure func(url.Values)) cytoscape.Body {
 	s.T().Helper()
 	resp := s.httpGet(s.storageGraphURL(base, configure))

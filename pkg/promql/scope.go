@@ -217,7 +217,7 @@ const NamespaceLabel = "namespace"
 //
 // This is a different key from RenderScoped(QPodInfo), which restricts `pod`.
 // A node seed reads pods by the node they run on; the incarnation completion
-// that follows is keyed by (namespace, pod) — see RenderPodsInNamespace.
+// that follows is keyed by (namespace, pod) — see RenderNamesInNamespace.
 //
 // ok is false when nodes holds no non-empty value. The caller MUST skip the
 // query rather than fall back to an unscoped read.
@@ -225,34 +225,58 @@ func RenderPodInfoByNode(window time.Duration, keys LabelKeys, sel Selector, nod
 	return RenderOnLabel(QPodInfo, window, keys, sel, NodeLabel, nodes)
 }
 
-// PodNamespaceScopedQueries are the pod-keyed families RenderPodsInNamespace
-// accepts: every family a storage build reads for a set of known pods.
+// PodNamespaceScopedQueries are the pod-keyed families RenderNamesInNamespace
+// accepts under PodLabel: every family a storage build reads for a set of known
+// pods.
 var PodNamespaceScopedQueries = []Query{QPodInfo, QPodOwner, QPVCBindings}
 
-// RenderPodsInNamespace renders a pod-keyed family restricted to pods of ONE
-// namespace, composed with the family's fixed selector and the request
-// matchers:
+// ClaimNamespaceScopedQueries are the claim-keyed families
+// RenderNamesInNamespace accepts under ClaimLabel: the family a claim root
+// seeds from and every family a hub-mode build then reads for the claims that
+// seed returned — each read one namespace at a time, so a common claim name is
+// never read across the estate.
+var ClaimNamespaceScopedQueries = ClaimScopedQueries
+
+// namespaceNameLabel reports whether q is keyed by (namespace, label) — the
+// pairs RenderNamesInNamespace can render.
+func namespaceNameLabel(q Query, label string) bool {
+	switch label {
+	case PodLabel:
+		return slices.Contains(PodNamespaceScopedQueries, q)
+	case ClaimLabel:
+		return slices.Contains(ClaimNamespaceScopedQueries, q)
+	}
+	return false
+}
+
+// RenderNamesInNamespace renders a family restricted to objects of ONE
+// namespace, named by the family's own identity label, composed with the
+// family's fixed selector and the request matchers:
 //
 //	last_over_time(kube_pod_info{az="zone-a",namespace="shop",pod=~"orders-0|web-0"}[5m])
+//	last_over_time(kube_persistentvolumeclaim_info{namespace="shop",persistentvolumeclaim=~"cache|orders-data"}[5m])
 //
-// A pod is identified by its namespace and name, never by its name alone, so a
-// caller holding (namespace, pod) pairs issues one query per namespace. The
-// query then matches exactly those pairs: a same-named pod in another namespace
-// is never read. Two independent alternations would read every cross pair.
+// An object is identified by its namespace and name, never by its name alone,
+// so a caller holding (namespace, name) pairs issues one query per namespace.
+// The query then matches exactly those pairs: a same-named object in another
+// namespace is never read. Two independent alternations would read every cross
+// pair.
 //
 // The namespace equality is always rendered, including when namespace is
 // empty, so a query never spans namespaces. A request namespace matcher is
 // composed ahead of it, never replaced.
 //
-// ok is false when q is not in PodNamespaceScopedQueries or pods holds no
-// non-empty value. The caller MUST skip the query rather than fall back to an
-// unscoped read.
-func RenderPodsInNamespace(q Query, window time.Duration, keys LabelKeys, sel Selector, namespace string, pods []string) (string, bool) {
-	if !slices.Contains(PodNamespaceScopedQueries, q) {
+// label names the identity label and is checked against the family — PodLabel
+// for the pod-keyed families, ClaimLabel for claim info — so a family can only
+// be restricted on the key its reader joins on. ok is false when (q, label) is
+// not such a pair or names holds no non-empty value. The caller MUST skip the
+// query rather than fall back to an unscoped read.
+func RenderNamesInNamespace(q Query, window time.Duration, keys LabelKeys, sel Selector, namespace, label string, names []string) (string, bool) {
+	if !namespaceNameLabel(q, label) {
 		return "", false
 	}
-	ps := normaliseValues(pods)
-	if len(ps) == 0 {
+	ns := normaliseValues(names)
+	if len(ns) == 0 {
 		return "", false
 	}
 	var matchers []string
@@ -263,14 +287,14 @@ func RenderPodsInNamespace(q Query, window time.Duration, keys LabelKeys, sel Se
 		matchers = append(matchers, req)
 	}
 	matchers = append(matchers, namespaceEquality(namespace))
-	matchers = appendMatcher(matchers, PodLabel, ps)
+	matchers = appendMatcher(matchers, label, ns)
 	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
 // NamespaceEqualityCost is the rendered length of the namespace equality
-// RenderPodsInNamespace repeats in every chunk of one namespace's pods, plus
-// its separator. A caller chunking the pod alternation takes it off the byte
+// RenderNamesInNamespace repeats in every chunk of one namespace's names, plus
+// its separator. A caller chunking the name alternation takes it off the byte
 // budget so the budget bounds the whole selector it sends.
 func NamespaceEqualityCost(namespace string) int {
 	return len(namespaceEquality(namespace)) + 1

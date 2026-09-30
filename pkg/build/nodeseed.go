@@ -1,8 +1,8 @@
 package build
 
 import (
+	"cmp"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -12,9 +12,38 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// podSeriesKey is one pod as kube_pod_info and the claim-binding family name it.
+// podSeriesKey is one pod as kube_pod_info and the claim-binding family name it,
+// keyed by the cluster IDENTITY — the (az, env, cluster) triple under the
+// configured label keys, the same triple claimKey carries — so a cluster name
+// reused in two selected zones is two clusters and a same-named pod of each is
+// two pods. The cluster is bucketed as the parse buckets it (bucketCluster). In
+// a single-zone request every row carries the same (az, env), so no comparison
+// changes.
 type podSeriesKey struct {
-	cluster, namespace, pod string
+	az, env, cluster, namespace, pod string
+}
+
+// podSeriesKeyOf reads a series' pod key. The pod may be empty: a caller that
+// needs a pod checks it.
+func podSeriesKeyOf(m model.Metric, keys promql.LabelKeys) podSeriesKey {
+	return podSeriesKey{
+		az:        string(m[model.LabelName(keys.AZ)]),
+		env:       string(m[model.LabelName(keys.Env)]),
+		cluster:   bucketCluster(string(m["cluster"])),
+		namespace: string(m[promql.NamespaceLabel]),
+		pod:       string(m[promql.PodLabel]),
+	}
+}
+
+// comparePodSeriesKeys orders keys by (az, env, cluster, namespace, pod).
+func comparePodSeriesKeys(a, b podSeriesKey) int {
+	return cmp.Or(
+		cmp.Compare(a.az, b.az),
+		cmp.Compare(a.env, b.env),
+		cmp.Compare(a.cluster, b.cluster),
+		cmp.Compare(a.namespace, b.namespace),
+		cmp.Compare(a.pod, b.pod),
+	)
 }
 
 // readNodeSeed is the Kubernetes node root's seed. It reads kube_pod_info
@@ -60,7 +89,8 @@ func readNodeSeed(
 		return err
 	}
 	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation))
-	onRoot := podsNewestOn(incarnation, plan.nodeRoots)
+	lk := opts.LabelKeys.OrDefault()
+	onRoot := podsNewestOn(incarnation, plan.nodeRoots, lk)
 	if len(onRoot) == 0 {
 		return nil
 	}
@@ -78,22 +108,32 @@ func readNodeSeed(
 	// Issued even when it matched nothing, so the tally records the family at
 	// zero rather than omitting a query that ran.
 	markScopeIssued(v, scopeMu, promql.QPVCBindings)
-	tracked := keepPodBindings(byPod, onRoot)
-	claims := claimNamesOf(tracked)
+	tracked := keepPodBindings(byPod, onRoot, lk)
+	return readMountersOf(ctx, q, window, end, opts, sel, v, scopeMu, tracked)
+}
+
+// readMountersOf is mounter completion: every pod mounting a claim the seed's
+// bindings name. The binding family is re-read by claim — per namespace, on
+// (namespace, persistentvolumeclaim), so a common claim name is never read
+// across the estate — and kept only when the row's claim is one the seed
+// tracked. No tracked claim issues nothing and keeps the seed's own rows.
+func readMountersOf(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+	tracked model.Vector,
+) error {
+	claims := trackedClaimKeys(tracked, opts.LabelKeys.OrDefault())
 	if len(claims) == 0 {
 		v.PVC = tracked
 		return nil
 	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, []scopedFamily{{
-		query: promql.QPVCBindings,
-		dst:   &v.PVC,
-		scope: claims,
-	}}); err != nil {
-		return err
-	}
-	lk := opts.LabelKeys.OrDefault()
-	v.PVC = keepClaimBindings(v.PVC, trackedClaimKeys(tracked, lk), lk)
-	return nil
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, claims)
 }
 
 // podsNewestOn returns the pods whose newest incarnation runs on a root node.
@@ -106,7 +146,7 @@ func readNodeSeed(
 // and keeps the first non-empty node, so the node here is merged the same way:
 // an empty-node series of the canonical UID never hides the node another
 // series of that UID names.
-func podsNewestOn(rows model.Vector, roots []string) map[podSeriesKey]struct{} {
+func podsNewestOn(rows model.Vector, roots []string, keys promql.LabelKeys) map[podSeriesKey]struct{} {
 	type best struct {
 		ts   model.Time
 		uid  string
@@ -122,11 +162,7 @@ func podsNewestOn(rows model.Vector, roots []string) map[podSeriesKey]struct{} {
 		if uid == "" {
 			continue
 		}
-		k := podSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric["namespace"]),
-			pod:       string(s.Metric[promql.PodLabel]),
-		}
+		k := podSeriesKeyOf(s.Metric, keys)
 		if k.pod == "" {
 			continue
 		}
@@ -152,38 +188,10 @@ func podsNewestOn(rows model.Vector, roots []string) map[podSeriesKey]struct{} {
 	return out
 }
 
-func keepPodBindings(rows model.Vector, pods map[podSeriesKey]struct{}) model.Vector {
+func keepPodBindings(rows model.Vector, pods map[podSeriesKey]struct{}, keys promql.LabelKeys) model.Vector {
 	var out model.Vector
 	for _, s := range rows {
-		k := podSeriesKey{
-			cluster:   string(s.Metric["cluster"]),
-			namespace: string(s.Metric["namespace"]),
-			pod:       string(s.Metric[promql.PodLabel]),
-		}
-		if _, ok := pods[k]; ok && bindingClaim(s.Metric) != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func claimNamesOf(rows model.Vector) []string {
-	names := make([]string, 0, len(rows))
-	for _, s := range rows {
-		if claim := bindingClaim(s.Metric); claim != "" {
-			names = append(names, claim)
-		}
-	}
-	slices.Sort(names)
-	return slices.Compact(names)
-}
-
-// keepClaimBindings keeps the binding rows whose claim is one of claims, keyed
-// exactly as the parse keys a claim (claimKeyOf).
-func keepClaimBindings(rows model.Vector, claims map[claimKey]struct{}, keys promql.LabelKeys) model.Vector {
-	var out model.Vector
-	for _, s := range rows {
-		if _, ok := claims[claimKeyOf(s.Metric, keys, bindingClaim(s.Metric))]; ok {
+		if _, ok := pods[podSeriesKeyOf(s.Metric, keys)]; ok && bindingClaim(s.Metric) != "" {
 			out = append(out, s)
 		}
 	}

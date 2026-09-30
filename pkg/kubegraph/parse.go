@@ -3,6 +3,7 @@ package kubegraph
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -94,8 +95,8 @@ func ParseValues(v url.Values) (Request, error) {
 }
 
 // StorageRequest is the parsed /v1/storage-graph request: a build window, the
-// upstream selector (az and env always single-valued), and the storage
-// projection scope.
+// upstream selector (az and env required, each one or more values), and the
+// storage projection scope.
 type StorageRequest struct {
 	Start    time.Time
 	End      time.Time
@@ -106,8 +107,8 @@ type StorageRequest struct {
 // ParseStorageValues parses the /v1/storage-graph query parameters. It shares
 // timestamp and selector-value validation with ParseValues so the two
 // endpoints cannot drift on those contracts. az and env are required and
-// single-valued; `prune` and every unknown parameter — including the
-// withdrawn `edge_type` — are ignored.
+// repeatable — the selected zones are their Cartesian product; `prune` and
+// every unknown parameter — including the withdrawn `edge_type` — are ignored.
 func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	var req StorageRequest
 
@@ -117,16 +118,16 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	}
 	req.Start, req.End = start, end
 
-	az, err := exactlyOne("az", v["az"])
+	az, err := atLeastOne("az", v["az"])
 	if err != nil {
 		return req, err
 	}
-	env, err := exactlyOne("env", v["env"])
+	env, err := atLeastOne("env", v["env"])
 	if err != nil {
 		return req, err
 	}
 
-	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "application"} {
+	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "pvc", "pv", "application"} {
 		if err := validateSelectorValues(p, v[p]); err != nil {
 			return req, err
 		}
@@ -137,7 +138,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, rerr
 	}
 	// oneStorageRoot returned a kind holding at least one non-empty value, and
-	// NewStorageScope drops only empty values (a malformed pod is an error), so
+	// NewStorageScope drops only empty values (a malformed pod or pvc is an error), so
 	// the scope always carries a root here.
 	scope, serr := graph.NewStorageScope(v["cluster"], v["namespace"], kind, values)
 	if serr != nil {
@@ -145,8 +146,8 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	}
 	req.Scope = scope
 	req.Selector = promql.Selector{
-		AZ:        []string{az},
-		Env:       []string{env},
+		AZ:        az,
+		Env:       env,
 		Cluster:   v["cluster"],
 		Namespace: v["namespace"],
 	}
@@ -156,7 +157,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 // storageRootParams is the root parameters in the order a mixed-kind error
 // names them.
 var storageRootParams = []string{
-	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "application",
+	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "pvc", "pv", "application",
 }
 
 // oneStorageRoot returns the single root kind that carries a non-empty value.
@@ -215,23 +216,23 @@ func parseWindow(v url.Values) (start, end time.Time, err error) {
 	return start, end, nil
 }
 
-// exactlyOne requires a selector parameter to be present with exactly one
-// non-empty value. Absence is missing_<param>; a second value is invalid_scope
-// (the message names the parameter so a client can tell az from env).
-func exactlyOne(param string, values []string) (string, error) {
-	var got []string
+// atLeastOne requires a selector parameter to carry at least one non-empty
+// value and returns the full value set, sorted and de-duplicated so the order a
+// client sends them in never changes the parsed request. Absence is
+// missing_<param> (the message names the parameter so a client can tell az from
+// env).
+func atLeastOne(param string, values []string) ([]string, error) {
+	got := make([]string, 0, len(values))
 	for _, v := range values {
 		if v != "" {
 			got = append(got, v)
 		}
 	}
 	if len(got) == 0 {
-		return "", &ParseError{"missing_" + param, param + " query parameter is required"}
+		return nil, &ParseError{"missing_" + param, param + " query parameter is required"}
 	}
-	if len(got) > 1 {
-		return "", &ParseError{"invalid_scope", param + " must be single-valued"}
-	}
-	return got[0], nil
+	slices.Sort(got)
+	return slices.Compact(got), nil
 }
 
 // parsePrune reads the single-valued `prune` parameter. Absent ⇒ true (the

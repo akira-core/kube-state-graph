@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -97,15 +98,15 @@ func volumeNames(rows model.Vector) []string {
 	return slices.Compact(out)
 }
 
-// claimFamily is one claim-keyed family a hub read issues: its scope on the
-// family's scopedLabel, and keep, the reader-side filter applied to whatever
-// the query returned — the restriction's own predicate, plus the claim-key
-// filter of the four claim-name families.
+// claimFamily is one claim-keyed family a hub read issues: the scopedFamily it
+// is read through (query, slot, scope and — for the per-namespace claim seed —
+// the render and budgetReserve that replace the identity-label rendering), and
+// keep, the reader-side filter applied to whatever the query returned — the
+// restriction's own predicate, plus the claim-key filter of the four claim-name
+// families.
 type claimFamily struct {
-	query promql.Query
-	dst   *model.Vector
-	scope []string
-	keep  func(model.Metric) bool
+	scopedFamily
+	keep func(model.Metric) bool
 }
 
 // issueClaimKeyed issues each family restricted to its scope, chunked under
@@ -130,7 +131,7 @@ func issueClaimKeyed(
 		if len(f.scope) == 0 {
 			continue
 		}
-		scoped = append(scoped, scopedFamily{query: f.query, dst: f.dst, scope: f.scope})
+		scoped = append(scoped, f.scopedFamily)
 	}
 	if len(scoped) > 0 {
 		if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
@@ -211,9 +212,7 @@ func readHubClaimInfo(
 		want[c] = struct{}{}
 	}
 	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, []claimFamily{{
-		query: promql.QPVCInfo,
-		dst:   &v.PVCInfo,
-		scope: cands,
+		scopedFamily: scopedFamily{query: promql.QPVCInfo, dst: &v.PVCInfo, scope: cands},
 		keep: func(m model.Metric) bool {
 			_, ok := want[string(m[promql.VolumeNameLabel])]
 			return ok
@@ -265,12 +264,20 @@ func claimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) claimKey {
 
 // readHubClaimFamilies reads the claim-binding family,
 // kube_persistentvolumeclaim_annotations and the two kubelet volume-stats
-// families restricted on `persistentvolumeclaim` to the claims the claim-info
-// read returned, and keeps only the rows whose claim IS one of them.
+// families restricted to the claims the claim-info read returned — one query
+// group per namespace, each on `namespace` and `persistentvolumeclaim`
+// (promql.RenderNamesInNamespace) — and keeps only the rows whose claim IS one
+// of them.
 //
-// The filter runs before the pod scope is computed and before the parse: a
-// claim name is unique per namespace only, so the restriction also returns
-// same-named claims of other namespaces and clusters, and such a binding would
+// A claim is identified by (namespace, name), so a name alone (`data`, `cache`)
+// would be read in every namespace of every selected cluster and zone, which a
+// large estate can push past the upstream series limits — and /v1/storage-graph
+// fails closed on that. The namespace equality bounds the read to the namespaces
+// the claim-info read actually returned.
+//
+// The filter still runs before the pod scope is computed and before the parse:
+// a namespace is shared by every selected cluster and zone, so the read also
+// returns a same-named claim of another cluster, and such a binding would
 // otherwise load a pod and build a PVC node the rooted filer does not serve.
 // Bindings are keyed on `persistentvolumeclaim` alone, never on `claim_name`,
 // so the filter admits exactly what the restriction can (an exporter labelling
@@ -299,16 +306,11 @@ func readHubClaimFamilies(
 
 	keys := opts.LabelKeys.OrDefault()
 	claims := make(map[claimKey]struct{}, len(v.PVCInfo))
-	names := make([]string, 0, len(v.PVCInfo))
 	for _, s := range v.PVCInfo {
-		claim := string(s.Metric[promql.ClaimLabel])
-		if claim == "" {
-			continue
+		if claim := string(s.Metric[promql.ClaimLabel]); claim != "" {
+			claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
 		}
-		claims[claimKeyOf(s.Metric, keys, claim)] = struct{}{}
-		names = append(names, claim)
 	}
-	names = sortedNames(names)
 	defer func() {
 		slog.DebugContext(ctx, "storage graph volume hub",
 			"volumes", cov.volumes,
@@ -316,18 +318,77 @@ func readHubClaimFamilies(
 			"claims", len(claims),
 			"bindings", len(v.PVC))
 	}()
-	if len(names) == 0 {
+	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, claimTargets(v)[1:], claims)
+}
+
+// issueClaimFamiliesByNamespace reads every target family restricted to the
+// tracked claims, one query group per namespace on `namespace` and
+// `persistentvolumeclaim` (promql.RenderNamesInNamespace, chunked under the
+// shared byte budget, the namespace equality charged once per chunk), and keeps
+// only the rows whose (az, env, cluster, namespace, claim) is tracked. A
+// namespace is shared by every selected cluster and zone, so the read can still
+// return a same-named claim of another cluster; the filter drops it.
+//
+// Each target's vector is the merge of its namespaces' results in namespace
+// order, so it is a pure function of the claim set rather than of upstream
+// timing. No tracked claim issues nothing and leaves every target untouched.
+func issueClaimFamiliesByNamespace(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+	targets []scopedTarget,
+	claims map[claimKey]struct{},
+) error {
+	byNS := make(map[string][]string)
+	for k := range claims {
+		if k.claim != "" {
+			byNS[k.namespace] = append(byNS[k.namespace], k.claim)
+		}
+	}
+	if len(byNS) == 0 {
 		return nil
 	}
-	isLoadedClaim := func(m model.Metric) bool {
+	namespaces := slices.Sorted(maps.Keys(byNS))
+	keys := opts.LabelKeys.OrDefault()
+	isTracked := func(m model.Metric) bool {
 		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
-	fams := make([]claimFamily, 0, len(promql.ClaimScopedQueries)-1)
-	for _, t := range claimTargets(v)[1:] {
-		fams = append(fams, claimFamily{query: t.query, dst: t.dst, scope: names, keep: isLoadedClaim})
+	parts := make([][]model.Vector, len(targets))
+	fams := make([]claimFamily, 0, len(targets)*len(namespaces))
+	for ti, t := range targets {
+		parts[ti] = make([]model.Vector, len(namespaces))
+		for ni, ns := range namespaces {
+			fams = append(fams, claimFamily{
+				scopedFamily: scopedFamily{
+					query: t.query,
+					dst:   &parts[ti][ni],
+					scope: sortedNames(byNS[ns]),
+					render: func(chunk []string) (string, bool) {
+						return promql.RenderNamesInNamespace(t.query, window, opts.LabelKeys, sel, ns, promql.ClaimLabel, chunk)
+					},
+					budgetReserve: promql.NamespaceEqualityCost(ns),
+				},
+				keep: isTracked,
+			})
+		}
 	}
-	return issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams)
+	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {
+		return err
+	}
+	for ti, t := range targets {
+		var merged model.Vector
+		for _, part := range parts[ti] {
+			merged = append(merged, part...)
+		}
+		*t.dst = merged
+	}
+	return nil
 }
 
 // recoverScopedPanic converts a panic in a hub or rooted volume-label read into
