@@ -586,7 +586,7 @@ is queried at its bare name.
 A deployment whose KSM series **are** published under an organisational prefix
 will silently return an empty graph after upgrade. Re-publish those series at
 their bare `kube_*` names (drop the prefixing relabel/fork) **before**
-upgrading. Embedders (`graph-api-gateway`) must drop `Options.MetricPrefix` in
+upgrading. Embedders must drop `Options.MetricPrefix` in
 the same version bump.
 
 ## `data.metrics.rate` is schema-optional
