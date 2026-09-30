@@ -16,7 +16,7 @@ series; service-graph edges come from `traces_service_graph_request_total`
 (carrying `client_k8s_pod_uid` + `server_k8s_pod_uid`) — both read from
 VictoriaMetrics. That upstream is **one or more** installations: a routing table
 dispatches each query to the store(s) holding it, selected by availability zone
-and by metric family (see "Upstream backend routing" below). With no routing
+and by metric family (see `.claude/rules/upstream-queries.md`). With no routing
 table configured it is a single endpoint at `--prom-url`, byte-for-byte as
 before. Multi-cluster, cross-cluster, and service-graph
 code paths are exercised by the integration tests in `internal/integration/`
@@ -25,50 +25,28 @@ fixture series through `POST /api/v1/import/prometheus`.
 
 ## Common commands
 
+Targets are in the `Makefile` (`make doctor` reports missing tooling). The
+non-obvious ones:
+
 ```bash
-# First-time dev env bootstrap (run once after clone). Downloads modules and
-# installs host-level dev tools (golangci-lint, govulncheck). Mockery is
-# tracked via go.mod `tool` directive (Go 1.24+) and invoked through
-# `go tool mockery` — no separate install step.
-make init                                   # one-shot: init-go + init-tools
-make doctor                                 # report toolchain versions / missing pieces
-make init-hooks                             # optional: pre-commit gofmt+lint+quick-test, pre-push CI mirror
+make init                 # one-shot bootstrap: modules + golangci-lint + govulncheck
+make init-hooks           # optional: point core.hooksPath at .githooks/ (pre-commit gofmt+lint+quick-test, pre-push `make ci`)
+make ci                   # full CI mirror: lint vuln test check-docs verify-mocks + containment checks
+make mocks                # after editing an interface listed in .mockery.yaml; commit <pkg>/mocks/ (CI: mocks-drift)
+make docs                 # after editing swag @-annotations or a handler signature; commit docs/ (CI: docs-drift)
 
-# Build / test loop
-make build                                  # ./bin/kube-state-graph
-make test                                   # go test ./... -count=1 -race -shuffle=on
-make vet                                    # go vet
-make lint                                   # golangci-lint (installed by `make init-tools`)
-make vuln                                   # govulncheck
-make cover                                  # go test ./... -coverprofile=coverage.out
-
-# Mocks (regenerate after editing an interface listed in .mockery.yaml).
-# Mocks are committed under <pkg>/mocks/ beside each interface so CI does not need
-# mockery installed; the `mocks-drift` CI job verifies freshness.
-make mocks                                  # go tool mockery
-make verify-mocks                           # CI-style freshness check (regen + git diff)
-
-# OpenAPI docs. Regenerate after editing @-annotations (cmd/.../main.go general
-# info; internal/api/*.go operations) or handler signatures, then commit docs/.
-# swag writes docs/swagger.{json,yaml}; docs/embed.go compiles them into the
-# binary (served at /openapi.{json,yaml}). The /docs Scalar UI is CDN-loaded.
-make docs                                   # go tool swag init --outputTypes json,yaml -> docs/
-make check-docs                             # CI docs-drift mirror (regen + git diff docs/)
-
-# Single test
-go test ./pkg/graph/ -run TestProject_ClusterFilter -v
-go test ./internal/api/ -run TestGolden -v
-
-# Update golden files (after changing serialiser shape on purpose)
-go test ./internal/api/ -update -run Golden
-
-# Run binary directly
+go test ./pkg/graph/ -run TestProject_ClusterFilter -v    # single test
+go test ./internal/api/ -update -run Golden               # refresh goldens after an INTENDED wire change
 ./bin/kube-state-graph --prom-url=http://localhost:8428 --listen-addr=:8080
 ```
 
+`make test` is `go test ./... -count=1 -race -shuffle=on`. Mockery and swag run
+through `go tool` (go.mod `tool` directive) — no separate install. Generated
+files (`<pkg>/mocks/*.go`, `docs/swagger.{json,yaml}`) are never hand-edited.
+
 Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.26 (`go.mod`); build toolchain pinned to `go1.26.6` via the `toolchain` directive.
 
-## Architecture (the 90 % you need to know)
+## Architecture
 
 ### Request lifecycle
 
@@ -87,738 +65,92 @@ context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; deadlin
          ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43)
          ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector — D30; joined with topology)
          └─ assemble → attachAlerts → attachStatus → graph.NewGraph (immutable)
-   (every upstream query passes its store's guard: query-result cache → miss coalescing → per-store slot, see "Upstream load controls")
+   (every upstream query passes its store's guard: query-result cache → miss coalescing → per-store slot, see .claude/rules/upstream-queries.md)
    ▼
 graph.Project(g, scope)            ── projection-level filters (cluster/namespace again, prune)
    ▼
 serialiseCytoscape
 
-HTTP /v1/storage-graph?start=&end=&az=&env=&…
-   │
+HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>
    ▼
-kubegraph.ParseStorageValues  ── StorageRequest{Start, End, Scope, Selector}
-                                  az/env required, each repeatable — the selected zones are their Cartesian
-                                  product (missing_az / missing_env);
-                                  exactly one root kind (missing_root when none; invalid_scope when two or more)
+kubegraph.ParseStorageValues  ── az/env required and repeatable; one root kind (missing_root / invalid_scope)
    ▼
-Builder.BuildStorage(…, roots) ── readTopology under storagePlan. The first wave is ALERTS
-                                  alone. A per-kind seed walks the root to the claims it reaches
-                                  (ontap_cluster / aggr / svm / ontap_node seed volume_labels, then
-                                  pvCandidates → kube_persistentvolumeclaim_info{volumename}; node seeds
-                                  kube_pod_info{node} plus incarnation completion; pod seeds bindings by
-                                  namespace+pod; application seeds the three-stage controller recovery
-                                  plus claim annotations by tracking-id; pvc / pv ARE the claim-info read
-                                  itself — kube_persistentvolumeclaim_info{namespace,persistentvolumeclaim}
-                                  per namespace, or {volumename} — with no volume_labels phase 1 in front
-                                  of it). One expansion then walks that
-                                  claim set both ways: claim families by (namespace, claim), one query per
-                                  namespace (filtered to the tracked az/env/cluster/namespace/claim),
-                                  mounter completion (bindings by (namespace, claim),
-                                  then every mounter's pod), candidate completion (volume_labels by token)
-                                  and owner completion (every touched aggregate re-read whole). Kubernetes
-                                  nodes and controllers are scoped from the loaded pods; Harvest gauges,
-                                  controller families and fixed-policy ceilings are scoped to the reached
-                                  components. A request-derived seed past the chunk cap is 400 invalid_scope
-                                  before any query; a data-derived scope is chunked and never read across
-                                  the zone. skips ReadServiceGraph; assembleStorageFlow, attachAlerts,
-                                  attachStatus; no up{} probe. Every query keeps the request's matchers
-                                  and az routing, so a build never reads another zone's store
+Builder.BuildStorage(…, roots) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
+                                  no ReadServiceGraph, no up{} probe; fails closed; never leaves the request's zones
    ▼
-graph.ProjectStorage          ── reachability over storage-flow units + root-always;
-                                  a pvc / pv root also keeps the SINK unit of a root claim no pod
-                                  mounts (node-aggr → aggr-svm → svm-pvc, ending at the claim)
-   ▼
-cytoscape.Serialise
+graph.ProjectStorage → cytoscape.Serialise
 ```
 
 v1 caches **upstream query RESULTS** in process (never built graphs or bodies) and coalesces concurrent identical misses; each request still builds and serialises its own graph. A horizontally scalable cache for distributed deployment (Redis L2, background materialiser, or graph DB) remains a separate, future change.
 
+### Design reference — read before editing
+
+The rules below are one-line statements of load-bearing, non-obvious behaviour.
+Each has a full statement — trigger conditions, rationale, the tests that pin
+it — in a reference file. **Read the reference file for an area before changing
+code in it**; the one-liner is a reminder, not the rule.
+
+| Working on | Read first |
+|---|---|
+| `pkg/build/servicegraph*.go`, `redmetrics.go`, `histogram.go`; any `pod-calls-*` / `service-selects-pod` edge, `data.metrics`, `traces_service_graph_*` | `.claude/rules/service-graph-resolution.md` — endpoint resolution ladder (D27 / D29 / D30 / D33), unknown-server peer enrichment, span-link marking, RED scope, filtered-build admission |
+| `pkg/route/**`, `pkg/build/route*.go`, `--route-store-dsn` | `.claude/rules/route-resolution.md` — Istio route engine, ingress-cluster pick, LB-Service fallback, ingress chain, containment |
+| `pkg/build/{netapp,qosscope,volumekey,volumelabelscope,claimscope,zone}.go`, `pkg/promql/{qosscope,volumelabels,harvestpair}.go`; Harvest series, `pvc-to-netapp-aggr`, `data.qos` | `.claude/rules/netapp-storage-join.md` — hops A / B / C, zone agreement, rooted `volume_labels` read, scoped QoS wave, ceiling key |
+| `/v1/storage-graph`: `pkg/build/{topologyplan,claimseed,*seed,*scope,expansion,storageflow}.go`, `pkg/graph/{storagescope,project_storage}.go`, `kubegraph.ParseStorageValues` | `.claude/rules/storage-graph.md` — build lifecycle, root kinds, qualified roots, claim seed, multi-zone union |
+| `pkg/promql/**`, `pkg/kubegraph/align.go`; a new `Query` constant, a selector, the cache, the routing table | `.claude/rules/upstream-queries.md` — per-store guard, end alignment, `queryDims` / `queryFamily`, selector rendering, backend routing |
+| `pkg/graph/**`, `pkg/cytoscape/**`, `pkg/build/{topology*,clusteridentity,status,alerts}.go`; a node attribute, a node / edge type, projection, goldens | `.claude/rules/graph-model.md` — connectivity prune, cluster identity, `EdgeTypes`, typed attributes, compound nodes, sealed node types |
+
+The files are path-scoped rules: each one's `paths:` frontmatter loads it
+automatically when a matching file is read or edited, and is the source of truth
+for the mapping — this table is the manual route (searches, subagents, planning).
+
+The decision ids (D1–D34) refer to the archived design doc
+`openspec/changes/archive/2026-06-06-add-k8s-pod-graph-api/design.md`; the
+capability specs live under `openspec/specs/`.
+
 ### Load-bearing design rules
 
-These are non-obvious; read the archived design doc
-`openspec/changes/archive/2026-06-06-add-k8s-pod-graph-api/design.md`
-(D1–D34) before changing any of them. The capability specs it produced
-live under `openspec/specs/`.
+**Wire contract**
 
-- **Upstream load controls — per-store guard, ON by default for server AND library** (add-upstream-limit-and-query-cache). Every backend STORE (`clientKey{url, username, password}`, so two table entries naming one VM share it) is wrapped by `promql.guard` in `routerState.byKey`, carried across `Swap` like its client. Order: **query-result cache** (key `(store id, rendered query, eval instant ns)` — no query name, no credential; LRU bounded by resident series, cost `max(1, len(vec))`, per-entry TTL; errors never cached, empty vectors are) → **miss coalescing** (`singleflight.DoChan`, each waiter selects on its OWN ctx; a waiter handed the LEADER's context error retries once as leader; the shared call re-reads the cache before fetching, since a flight that completed between a caller's lookup and its join has already left the group) → **per-store slot** (`semaphore.Weighted`, FIFO, wait ends only with the caller's ctx ⇒ the ordinary `504 timeout`, no new `build.Reason`) → inner client. Hits and coalesced waits hold no slot. **Probe-family queries bypass the whole guard** (by query name, so `ProbeAll`, the retention `up{}` and `Engine.Probe` all see live upstream). Cached vectors are shared: a hit returns a fresh slice header over the SAME `*model.Sample`s — **readers in `pkg/build` MUST NOT mutate a sample or its `Metric` map** (audited; `TestCachedSamplesNotMutated` pins it). Defaults are exported constants (`promql.DefaultMaxConcurrency`=32, `DefaultQueryCacheMaxSeries`=100000, `DefaultQueryCacheTTL`=60s, `kubegraph.DefaultEndAlign`=30s) that `config.Defaults()` reads. `promql.NewRouter` with no `RouterOption` is guarded; `WithMaxConcurrency(0)` / `WithQueryCache(0, 0)` disable. `kubegraph.New` wraps a NON-`QuerierSource` in `promql.Guard` (a Router is used as-is — wrapping would hide `QuerierFor`); its `Options` knobs read zero ⇒ default, negative ⇒ off. **`pkg/build.New` stays unguarded** — it is the seam component / golden / property tests drive with mocks. Self-metrics are new names only (`kube_state_graph_upstream_inflight{backend}`, `..._upstream_slot_wait_seconds{backend}`, `..._query_cache_{hits,misses,coalesced,evictions}_total`, `..._query_cache_series`) through the optional `promql.LimiterMetrics` / `promql.CacheMetrics` upgrades. The limit is per replica: `--upstream-max-concurrency × replicas` should stay ≤ vmselect's `-search.maxConcurrentRequests`.
-- **Default projection is the connectivity-connected subgraph.** Every `/v1/graph` response carries only the workload that sits on a **connectivity edge** (`pod-calls-pod` / `pod-calls-service` / `service-selects-pod`) plus the infra that hangs off it. Concretely: a pod is kept iff it is an endpoint of a connectivity edge; an edgeless pod is dropped, and with it (via the generalised D6 reference rule) the node hosting only edgeless pods, the PVC mounted only by edgeless pods, and the NetApp aggregate serving only such PVCs (and then its controller). **An unmounted PVC (no `pod-mounts-pvc` binding at all) is therefore dropped too** — a PVC is kept iff a connectivity-connected pod mounts it. **Service nodes are unaffected** — they are only ever materialised by the D29 connection-string resolver, so they are connectivity-born by construction (topology `kube_service_info` is index-only, never emitted as a node). The decision set is `graph.connectivityExcluded(g)` — a **pure function of the built graph** (scope-independent: a PVC's keep/drop depends on whether its mounting pod is *connected*, not on the request's cluster/namespace filter, and the two co-move because `pod-mounts-pvc` is intra-cluster/same-namespace), computed once in `graph.Project` and consulted in **both** `filterNodes` (skip excluded ids) **and** `filterEdges`/`readdEdgePartners` (an excluded pod/PVC is never resurrected as an edge partner — e.g. the pruned pod of a `pod-to-node` edge whose host node survived via another pod). The prune is **suppressed by exactly one escape hatch**: `?prune=false` (`graph.Scope.Inventory`, stored INVERTED so the zero `Scope` keeps the prune on). `?cluster=` / `?namespace=` / `?az=` / `?env=` do **not** disable the prune. **Consequence:** the default view is the traffic graph, not the inventory — an edgeless pod, an unmounted PVC, or a podless node is fetched with `?prune=false` (optionally narrowed by `cluster` / `namespace` / `az` / `env`). The prune itself stays a **projection concern** and a pure function of the built graph.
-- **End-time alignment, no window cap, no future-time guard.** Only `end > start` is validated, on the CALLER's values; then `kubegraph.AlignWindow` floors `end` to `--end-align` (default 30s, Unix-epoch anchored, `0` = verbatim) and shifts `start` by the same delta, so the window length is unchanged and requests within one step share cached query results. Applied in exactly two places — `internal/api` `runBuild` (both graph endpoints) and `Engine.BuildFromValues` / `BuildStorageFromValues` — never inside the parsers (which stay config-free) and never on `Engine.Build` / `BuildStorage` or `ResolvePodApplication`, which take an explicit instant. The aligned `end` is THE build instant, so route resolution's `At` follows it. Bounded query cost is delegated to upstream VictoriaMetrics search limits (`-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`, `-search.maxSamplesPerQuery`). Response body is `{apiVersion, clusters, elements}` — no time fields are echoed.
-- **`labels` is strict `map[string]string`** on both nodes and edges. No bools,
-  no numbers, no string-encoded numbers. Boolean flags (`cross_cluster`, `ghost`)
-  remain deferred to a future typed field. **RED edge metrics** live on the
-  typed nullable `Edge.Metrics *EdgeMetrics` (`rate`, `error_rate`,
-  `p90_server_ms`) serialised as `data.metrics` — never inside `labels`.
-  Attachment rule (hardcoded): a **trace-derived** edge whose **both resolved
-  endpoints** name a `type="pod"` node (real or synth) or a `type="service"`
-  node — enforced by `sgResolver.isPodOrServiceID`, NOT by the raw UID labels
-  and NOT by the edge type (D33 clears a `"://"` side's UID after the labels are
-  read, and an `external` target leaves the type at `pod-calls-pod`). **How** an
-  endpoint was identified is irrelevant: pod UID, `"://"` connection string,
-  `server="unknown"` peer address → ClusterIP or Pod IP, and route-engine
-  resolution all qualify, so `pod-calls-service` edges ARE measured. No metrics
-  on: any edge with an `external` endpoint; synthesised edges
-  (`service-selects-pod` fan-out, the ingress-chain gateway-pod → backend hop,
-  topology edges); and the route-hit chain's **caller → ingress entry hop**
-  (`chainEntryIndex` — that hop and the retained caller → backend edge are two
-  projections of ONE call, so only the backend is measured and a sum over the
-  chain never double-counts). A contributing series carrying
-  `edge_relation="link"` is **out of scope** (span-link virtual edge — the call
-  crosses a queue/DB and the two spans are different trace contexts): the edge
-  is still emitted, but the series feeds no rate/error/bucket, so a mixed edge
-  is measured over its non-link subset and an all-link edge gets no `metrics`
-  object (empty in-scope set ⇒ rate 0 ⇒ ineligible; no special case). Three
-  parallel queries: `traces_service_graph_request_total` (required for the
-  edge; deliberately NOT link-filtered), plus OPTIONAL `..._failed_total` and
-  `..._server_seconds_bucket` — both read at the total counter's **raw** label
-  granularity (the histogram has NO upstream `sum by`) and joined by exact
-  series identity (the histogram minus `le`) through one `seriesKey → pairKey`
-  map, both carrying D30's sentinel plus `serviceGraphLinkExclusionSelector`
-  (`edge_relation!="link"`). The queried population is a **superset** of the
-  attached one (endpoint node type has no label-level form); what holds is the
-  one-way property — every query-layer filter is mirrored in Go, so no eligible
-  edge loses its companion series and reads `error_rate: 0`. Failure/duration
-  errors degrade field-by-field (`error_rate` absent ≠ `0`; `p90_server_ms`
-  omitted) and never fail the build; a non-empty companion vector that joined
-  NOTHING is warned per vector (`failed_total_label_set_mismatch` /
-  `server_seconds_bucket_label_set_mismatch`). Values are JSON numbers rounded
-  to 6 significant digits at serialisation and MAY appear in exponent form.
-  `pod-calls-pod` and
-  `pod-calls-service` edges carry a single `labels.cluster` — the CLIENT POD's
-  cluster identity when the client side resolved to a topology pod, else the
-  trace `cluster` label put through the identity ladder; omitted when the client
-  side is non-pod. (Not the raw trace label: that label is not an identity and
-  could name a cluster present on no node of the response.) Cross-cluster
-  status is derived by comparing the resolved source-node and target-node
-  `labels.cluster` — D9.
+- **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`, and every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values (so `?az=b&az=a` and `?az=a&az=b` issue identical queries): node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Every golden carrying a pod / K8s node / PVC / NetApp controller / aggregate intentionally carries an explicit `data.status`; hand-built golden fixtures must stamp the same `FoldStatus` result the builder bakes before `graph.NewGraph`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
+- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, and edge `metrics`.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
   and the canonical input `<type>|<source>|<target>`. Stable across rebuilds —
   required for golden tests. Bumping the namespace UUID is a v2 break.
 - **Cluster-scoped IDs everywhere.** Pods: `<cluster>/<uid>`, K8s nodes:
   `<cluster>/<node>`, PVCs: `<cluster>/<namespace>/<claim>`, externals:
   `external/<value>`. Node names are not globally unique without the prefix.
-- **`<cluster>` is the composed cluster IDENTITY `<az>-<env>-<cluster>`, not the
-  raw label.** A raw name is reused across zones and environments, so keying on
-  it merges two estates into one id space. `build.clusterResolver`
-  (`pkg/build/clusteridentity.go`) composes the identity at the ONE point a
-  series' `cluster` label is read — `bucket(query, metric)`, ~20 call sites —
-  so ids, `labels.cluster`, every join key and index, `ClusterFamilyKey`,
-  cross-cluster status, `clusters[]` and the self-metric `cluster` VALUES all
-  inherit it with no downstream code taught about zones. `pkg/cytoscape` and
-  `pkg/route` are unchanged. Every cluster name — topology, kubelet, the
-  service-graph trace label, the route store — walks one ladder: **compose**
-  (both configured labels non-empty), else **adopt** (the raw name maps to
-  exactly one identity in this build), else **verbatim** + one aggregated
-  `cluster_identity_unresolved` Warn per metric. The identity table is built by
-  a FIRST PASS in `parseTopology` over the four entity families only
-  (`kube_pod_info`, `kube_node_info`, `kube_service_info`, the PVC binding); a
-  join input can never invent a cluster that holds no entity. `unknown`
-  composes like any other name (`us-dev-unknown`), keeping its raw component so
-  `?cluster=unknown` still addresses it. Adoption cannot rescue a family under
-  `?az=`/`?env=` — the matcher excludes it upstream before the reader sees it.
-- **`?cluster=` is the RAW name at BOTH layers; `clusters[]` is the identity.**
-  The upstream matcher is unchanged (`cluster="c1"`), and `pkg/graph/project.go`
-  compares `Graph.ClusterRawName(labels["cluster"])`, so `?cluster=c1` admits
-  every zone's `c1` and `?az=&env=&cluster=` pins one — the three request
-  dimensions ARE the identity's components. A value read out of `clusters[]`
-  and sent back as `?cluster=` returns an empty 200; that asymmetry is
-  deliberate and documented in `docs/BREAKING.md`. The table reaches the graph
-  as `Graph.ClusterIdentities`, assigned in `Builder.Build` right after
-  `graph.NewGraph`; nil (an unstamped estate, a hand-built graph, an older
-  embedder) degrades every comparison to the pre-identity behaviour, which is
-  what keeps every existing golden byte-identical.
-- **The cluster-family key runs over the identity string**, with the unchanged
-  digit-run rule, so a family is scoped to one zone AND one environment
-  (`us-dev-c1` ~ `us-dev-c2`, ≁ `eu-prod-c1`). Known widening: digits inside a
-  zone or environment value normalise too (`us-east-1-prod-c1` ~
-  `us-east-2-prod-c1`) — pinned by `TestClusterFamilyKey_OverClusterIdentities`
-  so a future struct-aware key is a deliberate edit.
-#### Service-graph glossary (load-bearing terms)
+- **`<cluster>` is the composed identity `<az>-<env>-<cluster>`**, composed at the ONE point a series' `cluster` label is read (`build.clusterResolver`, `bucket(query, metric)`); nothing downstream knows about zones. **`?cluster=` is the RAW name at both layers; `clusters[]` is the identity** — a `clusters[]` value sent back as `?cluster=` is an empty 200, deliberately.
+- **Default projection is the connectivity-connected subgraph**: a pod is kept iff it is an endpoint of a connectivity edge, and infra hangs off kept pods. `?prune=false` is the only escape hatch; `cluster` / `namespace` / `az` / `env` never disable the prune. The prune is a projection concern and a pure function of the built graph.
+- **`graph.EdgeTypes` is the single edge-type registry**: adding an edge type means updating the builder AND the registry in the same change. `GraphNode` is sealed; serialisation goes through its methods, never a type switch.
+- **Compound nodes (`cluster` / `namespace` / `application` / `controller` / `storage-cluster`) are presentation-only**, synthesised in `pkg/cytoscape`. NetApp nodes belong to no Kubernetes cluster and stay out of `clusters[]`.
+- **`data.status` is always present** on pods, K8s nodes, PVCs, NetApp controllers and aggregates (`graph.FoldStatus`, baked before `graph.NewGraph`); hand-built golden fixtures must stamp it too. `"normal"` means no negative signal, not full coverage.
 
-- **Trace-derived edge**: an edge produced from at least one
-  `traces_service_graph_request_total` series (the `pairs` map in the parse).
-- **Synthesised edge**: an edge with no originating series —
-  `service-selects-pod` fan-out, topology edges (`pod-to-node`, `pod-mounts-pvc`,
-  `pvc-to-netapp-aggr`), and the route-hit ingress-chain's gateway-pod →
-  backend-service `pod-calls-service` hop. Spelling is British **synthesised**
-  in prose; Go identifiers may use `synthesized` (e.g. `routeChainEdges`
-  comments). NOT synthesised: the chain's **caller → ingress entry hop**, which
-  IS trace-derived — it is excluded from RED for a different reason (it
-  re-projects the caller → backend call).
-- **UID-resolved endpoint**: resolved from a non-empty `client_k8s_pod_uid` /
-  `server_k8s_pod_uid` to a `type="pod"` node (topology or synth).
-- **Peer-resolved endpoint**: identified only via the unknown-server peer-address
-  ladder (including Pod-IP) — the connector could not pair a server span. Since
-  the RED revision this is a provenance label only: it does NOT affect metrics
-  eligibility, which turns on the resolved node type.
-- **Contributing series**: the set of total-series samples that collapsed onto
-  one `(src, tgt)` pair during resolution.
-- **In-scope series**: a contributing series that does NOT carry
-  `edge_relation="link"` — i.e. one that measures the edge. Rate, error
-  numerator and duration buckets are all summed over this subset and no other.
-- **RED scope**: the edges that carry `data.metrics` — trace-derived, both
-  endpoints pod-or-service, not the chain entry hop, at least one in-scope
-  contributing series.
+**Request and upstream**
 
-- **Connection-string resolution rule** (D29, hardcoded — no knob): for any
-  service-graph endpoint whose pod UID is empty, the verbatim `client`/`server`
-  label is checked for a `"://"` connection string. Detection is hardcoded —
-  there is no operator-tunable substring and no config knob. Per-endpoint
-  independent (both sides of a single edge are evaluated separately); edge `type`
-  is `pod-calls-service` when the target resolves to a service node, otherwise
-  `pod-calls-pod`. When a `"://"` label is found, its URL host is parsed and
-  the optional `.svc.<domain>` suffix stripped, then resolved by dotted-label
-  count. **Both** in-cluster DNS forms resolve to the **service** — there is no
-  per-pod resolution; a `"://"` endpoint is never a pod:
-  - **2 labels** `<service>.<namespace>` and **3 labels**
-    `<pod>.<service>.<namespace>` (headless per-pod) both → the addressed
-    `(namespace, service)`, resolved to a **SINGLE `type="service"` node in the
-    caller's own (anchor) cluster** (pod→svc is same-cluster only). The anchor
-    is the **UID-recovered client-pod cluster** when the client side resolved to
-    a topology pod (the trace `cluster` label is frequently missing or wrong),
-    falling back to the raw trace label otherwise; edge `labels.cluster` always
-    stays the raw trace label (D9). The endpoint resolves **iff the anchor
-    cluster itself holds the `(namespace, service)`** in `ServicesByNameNS` — a
-    same-named local Service is a service-mesh precondition (Istio multi-primary
-    / Cilium Cluster Mesh keep the Service in *every* cluster; cross-cluster is
-    endpoint aggregation), so a family sibling holding it is **not** enough.
-    This single anchor-membership test uniformly covers an anchor whose own
-    cluster lacks the Service, an `"unknown"`/empty/bogus anchor, **and** the
-    fully-unlabelled single-cluster case — `ClusterFamilyKey("unknown") =
-    "unknown"` is a family-of-one, so an `"unknown"`-bucketed Service makes
-    `"unknown"` a legitimate holder. There is **NO unknown-family fallback and
-    NO cross-family resolution**. The anchor materialises **one** node
-    (`id="<anchor>/<namespace>/<service>"`, `labels={cluster,namespace}`,
-    `ipaddress=[cluster_ip]` from the anchor's own `kube_service_info` unless
-    headless `cluster_ip="None"`) and yields **one** `pod-calls-service` edge
-    (this D29 path is always intra-cluster by construction; the TYPE is
-    registered `may_cross_cluster: true` only because the route-engine path
-    below can anchor on a sibling cluster). **Cross-cluster
-    `service-selects-pod` fan-out**: from that single node, one edge is emitted
-    per backing pod across the **UNION of `EndpointsByService` over every
-    same-family cluster holding the same-named Service** — two clusters are in
-    one family iff their names are equal after replacing every maximal digit run
-    with a single `0` sentinel (`prod-03` ↔ `prod-12` match; `staging-1` ≠
-    `prod-1`; digit-free names form exact-name singleton families; the sentinel
-    being a digit makes the mapping collision-free without escaping). These
-    `service-selects-pod` edges **MAY cross clusters** (**`may_cross_cluster:
-    true`**) — a local service node selecting a backing pod in a family sibling,
-    reflecting service-mesh endpoint aggregation (each cluster's KSM observes
-    only its OWN EndpointSlices, so the cross-cluster endpoint set is rebuilt by
-    unioning over the family). There is **no endpoint-backed pruning**: a
-    sibling holding the Service with zero endpoints contributes no edge, and a
-    service with zero endpoints anywhere still materialises its single (local)
-    node — an operator signal. Candidates are iterated in sorted order, the
-    anchor-membership test and the endpoint union are order-free, and
-    `service-selects-pod` edges dedupe by `(service-node, pod)` (determinism).
-    The family rule (`build.ClusterFamilyKey`, exported so pkg/route's
-    ingress-cluster pick shares it) and the membership/union logic
-    are hardcoded pure functions — no knob, no PromQL change (filtering is
-    in-memory at resolution — it adds no PromQL matcher of its own; the
-    request-scoped selectors of push-request-filters-upstream are a separate,
-    hardcoded per-series contract). The
-    3-label form drops the leading pod-hostname and resolves as its parent
-    service. When BOTH sides of a series are `"://"` labels, each resolves to a
-    single local node in the (shared) anchor cluster, so one intra-cluster edge
-    is emitted between them.
-  - **unresolvable** (host not a 2/3-label `.svc` name, or the anchor cluster
-    does not itself hold the service in its own family) → an `external` node
-    (`id="external/<label>"`, `labels={}`) with the verbatim label as `name`.
-  - A series with a **wholly empty side** (no UID, no label) is dropped before
-    any resolution — the other side's `"://"` label must not leak service /
-    external nodes or fan-out edges as an orphan subgraph.
-  A client-side `"://"` label resolves to `service` or `external` (never a pod),
-  so the edge `labels.cluster` is always omitted for it.
-- **Missing pod-UID human-label fallback** (D27, always on): when
-  `client_k8s_pod_uid` or `server_k8s_pod_uid` is empty AND the corresponding
-  `client`/`server` label is non-empty AND the label does NOT contain `"://"`,
-  that endpoint is promoted to `external/<label>` (no cluster prefix; `labels={}`)
-  instead of dropping the edge. Per-endpoint resolution order:
-  (1) connection-string resolution (`"://"` in the label, empty UID) →
-  a single `service` node in the caller's own (anchor) cluster (iff that
-  cluster holds the service), with a cross-cluster `service-selects-pod`
-  endpoint union over the same-family clusters holding it, or `external` when
-  the anchor cluster lacks the service, per the D29 same-cluster rule above
-  (never a pod; no unknown-family fallback, no endpoint-backed pruning);
-  (2) UID-based pod resolution / synth-pod fallback (only when UID is non-empty);
-  (3) missing-UID human-label fallback (this rule) → external with `labels={}`
-  (**only for non-`"://"` labels**);
-  (4) drop (both UID and label empty). A `"://"` label never reaches this fallback
-  — it is resolved (or produces an `external` node) at step (1). Edge
-  `labels.cluster` is omitted whenever the client side resolves to a non-pod node,
-  whether via the connection-string rule (`service` / `external`) or this fallback
-  (`external`).
-- **Self-loop UID guard** (D33, always on, no knob): a pre-resolution
-  normalisation in `parseServiceGraph`, applied **before** the resolution order
-  above. Some `servicegraph` exporters stamp the **caller's own** pod UID onto
-  **both** sides for a peer they could only identify as a `"://"` connection
-  string, so `client_k8s_pod_uid == server_k8s_pod_uid` (non-empty, equal) while
-  the real target lives only in the `"://"` label. A populated UID normally
-  short-circuits Stage 0 (step 1 above), so the `"://"` side would collapse onto
-  the caller's own pod — a self-loop `pod-calls-pod` edge, **no service node**.
-  The guard: when the two UIDs are non-empty AND equal, clear the UID on **any
-  side whose label contains `"://"`** (that side only), so it falls through to
-  connection-string resolution; the non-`"://"` side keeps the shared UID and
-  resolves to its real pod. Fires ONLY on the conjunction (UID collision AND a
-  `"://"` label on the cleared side): differing UIDs are untouched (`"://"` with
-  a populated UID still takes pod-UID resolution), and a UID collision with no
-  `"://"` label stays a legitimate `pod-calls-pod` self-loop. Do NOT broaden this
-  into a global "`"://"` always beats UID" reorder — that breaks the
-  populated-UID-means-pod contract; the collision is the specific fingerprint of
-  the exporter defect. Determinism unaffected (pure function of the two UID + two
-  string labels); no new node/edge type. Tests:
-  `pkg/build/servicegraph_test.go` (`TestParseServiceGraph_SelfLoopUID_*`) and
-  `internal/integration` (`TestConnStringSelfLoopUIDResolvesToServiceNode`).
-- **Sentinel-endpoint exclusion at the query layer** (D30, hardcoded — no knob):
-  the `servicegraph` connector emits virtual peers for endpoints it cannot pair
-  to an instrumented span — an uninstrumented caller as `client="user"`, an
-  unresolved peer as `"unknown"`. The service-graph selector drops these
-  **upstream** via anchored negative matchers —
-  `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[w])`
-  — so a `client="user"`/`"unknown"` series never reaches the resolver: no node
-  (`pod` / synth / `service` / `external`) and no edge is produced for it. The
-  **server-side matcher is narrower** (`server!~"user"` only —
-  resolve-unknown-server-peer-labels D1): a `server="unknown"` series
-  reaches Go, but the reader drops it (no node, no edge) **UNLESS** the
-  "Unknown-server peer-label enrichment" rule below applies — every
-  `server="unknown"` case outside that rule's narrow trigger (client
-  unresolved, or the server UID itself resolves) produces no node and no
-  edge. PromQL `!~` is fully anchored, so
-  the match is **exact** and **case-sensitive** (a `http://user/...` connection
-  string is NOT excluded — it is not equal to `user`). This is a fixed
-  selector contract on the `client` / `server` labels only — it does NOT touch
-  the `cluster="unknown"` bucketing (a different label). The matcher fragment
-  lives in `promql.serviceGraphSentinelSelector`; the `QServiceGraphTotal`
-  constant stays the bare metric name so `query_name` self-metric / span
-  dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
-  the same fragment when added.
-- **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
-  D1–D3, extended by resolve-unknown-server-ip-peer,
-  resolve-unknown-server-network-peer-address, and
-  resolve-unknown-server-pod-ip-peer, hardcoded — no knob): the one
-  carve-out from the D30 outcome above. When `client_k8s_pod_uid` resolves to
-  a **real topology pod** (never a synthesised one) AND the server side has no
-  resolvable pod (UID empty, or present but absent from `Topology.PodsByUID`)
-  AND the raw `server` label is exactly `"unknown"`, `resolveServer` dispatches
-  to the new `resolveUnknownServerPeer` instead of the generic empty-UID
-  (`resolveEmptyUID`, which owns the D27 fallback) or synth-pod path — never
-  both, for this literal value. It reads **three** client-recorded peer-address
-  labels, checked in this precedence order — `client_server_address` (checked
-  first), then `client_network_peer_address` (checked second), then
-  `client_net_peer_name` (checked third) — the first non-empty wins outright
-  and is never merged with, nor falls back to, a lower-precedence label that
-  fails to classify. The three are distinct OTel attributes, not three
-  spellings of one: `client_server_address` is the stable `server.address`
-  (logical destination as addressed — name, IP, or UDS name);
-  `client_network_peer_address` is the stable `network.peer.address`
-  (socket-level peer address, by convention an IP); `client_net_peer_name` is
-  the deprecated `net.peer.name`, superseded by `server.address`. The order
-  ranks them by what the classification chain below can resolve — strong on
-  names (DNS grammar / bare short name, both reaching `resolveServiceLevel`
-  with its family-wide fan-out), weak on IP literals (the `ClusterIP` lookup
-  is anchor-cluster-only) — so the name-valued stable attribute leads, the
-  IP-valued stable attribute follows, and the deprecated name-valued attribute
-  trails. `client_network_peer_port` is deliberately **not read** — the
-  stable conventions split the port into its own attribute, but a port
-  participates in neither peer identification nor node naming.
-  Whichever label wins is normalised in two steps before classification: (1)
-  bracket-suffix truncation — cut at the **first `[` whose index is > 0**,
-  discarding it and the remainder (some instrumentations append a bracketed
-  connection/session id to the authority, e.g. `mongo.com:27017[-181]`, which
-  `net.SplitHostPort` cannot handle and which `classifyK8sDNS`'s lack of
-  DNS-1123 validation would otherwise garbage-classify); a leading `[` (index
-  0) is left untouched because it is the IPv6 bracket form
-  (`[2001:db8::1]:8080`), which step (2) already handles correctly — an
-  unconditional cut would destroy a resolvable dual-stack `ClusterIP` peer;
-  (2) an optional trailing `:<port>` is then best-effort stripped via
-  `net.SplitHostPort`. Both steps apply uniformly regardless of which label
-  supplied the value — the resolver stays provenance-free. The result is
-  classified via the same `classifyK8sDNS` grammar D29 connection-string
-  resolution uses (2-label `<service>.<namespace>`, 3-label headless
-  `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped), **plus
-  three grammar extensions scoped to this rule only**: (1) a single dot-free,
-  non-IP-literal label is treated as a bare short Service name resolved in the
-  **client pod's own namespace** — note this means bracket truncation can
-  promote a value like `mongo:27017[-181]` into the bare short name `mongo`,
-  resolved in the client's own namespace, exactly as the un-bracketed
-  `mongo:27017` already does; (2) (resolve-unknown-server-ip-peer) when
-  neither the DNS grammar nor the bare-short-name form matches AND the host is
-  a valid IP literal (`net.ParseIP`), it is looked up as a Service `ClusterIP`
-  **within the already-resolved client pod's own (anchor) cluster only** —
-  never a family sibling, since a `ClusterIP` is a per-cluster address that
-  can legitimately collide across unrelated clusters' Service CIDRs (unlike a
-  Service DNS name, which is a mesh-wide convention the family union already
-  handles); (3) (resolve-unknown-server-pod-ip-peer) when the IP literal
-  matches **no** Service `ClusterIP`, it is looked up as a **Pod IP** against
-  a second index (`famIPKey{family, pod_ip} → []podIPCandidate{cluster, pod}`,
-  built once per parse from `topology.Pods` in **two stages**: stage 1 reduces
-  to one holder per `(cluster, ip)` in the same loop as `podByID`, skipping
-  pods with no `pod_ip`; stage 2 regroups by `ClusterFamilyKey(cluster)` and
-  sorts each group by cluster, exactly like `svcCandidates`). This covers a
-  caller that dialled another pod's address directly, bypassing any Service —
-  **including across a cluster boundary**, which is ordinary traffic wherever
-  clusters share a flat routable network. **Selection**: the **anchor
-  cluster's own** holder always wins (byte-for-byte the anchor-only
-  behaviour); otherwise a **lone family holder** resolves; **two or more**
-  family holders yield no pod and degrade via `routeExternal` with the
-  distinct reason `unknown_server_peer_pod_ip_ambiguous` — **no tie-break
-  across clusters**. Being the family's only holder IS the evidence that its
-  pod CIDRs do not overlap at that address, which is why **no service-mesh
-  gate is applied**: cross-cluster pod-to-pod reachability is a network-layer
-  property, and an `istio-proxy` sidecar is neither necessary (a flat network
-  needs no Istio) nor sufficient (in a multi-network mesh the caller's sidecar
-  is handed the east-west gateway address, never a remote Pod IP). A cluster
-  outside the anchor's family is never a candidate. A hit resolves the
-  endpoint **straight to that topology pod** — it does NOT go through
-  `resolveServiceLevel`, materialises **no service node** and emits **no
-  `service-selects-pod` edge**, so the generic target-driven rule makes the
-  edge `pod-calls-pod` (which MAY therefore cross clusters). Ordering is
-  structural, not conventional: the ClusterIP step lives inside
-  `classifyPeerHost` and a hit there returns `classified=true`, so
-  **`ClusterIP` always beats Pod IP**, and the Pod-IP step sits immediately
-  before `routeExternal`, so it also beats the route engine and the external
-  fallback. The **ClusterIP lookup itself stays anchor-only** — Service CIDRs
-  overlap just as readily, and under multi-primary the same
-  `(namespace, service)` carries a *different* ClusterIP in each cluster. On a
-  **same-cluster** duplicate `pod_ip` — the normal case for `hostNetwork`
-  pods, which all report their node's address, and transient on address reuse
-  within the window — stage 1 keeps the **lexically-smallest pod ID**
-  (order-free, D6), so an intra-cluster duplicate never makes the family look
-  ambiguous. `lookupPeerPodIP` is pure and shared with the
-  `collectRouteQueries` prescan, which skips resolvable endpoints so the route
-  engine is never asked about traffic the in-cluster ladder resolves —
-  while an **ambiguous** family, which does fall external, is still offered to
-  the engine. An IP-valued peer that matches neither an anchor-cluster
-  `ClusterIP` nor a resolvable family Pod IP (a sidecar loopback, a
-  NodePort/LB address, any off-cluster IP, or an ambiguous family) becomes an
-  `external/<ip>` node, not a dropped endpoint. The reverse index
-  (`(cluster, ClusterIP) → Service`) is built once per parse from
-  `topology.ServicesByNameNS`, skipping empty/`"None"` ClusterIP; on a
-  same-cluster duplicate `ClusterIP` (a data anomaly Kubernetes itself
-  prevents), the lexically-smaller `(namespace, service)` wins. Once
-  identified via IP, resolution proceeds through the SAME
-  `resolveServiceLevel` call as every other classification path below —
-  including its normal family-wide `service-selects-pod` fan-out — only the
-  identification lookup itself is anchor-scoped. A successful classification
-  resolves via the existing `resolveServiceLevel(anchorCluster, ns, svc)` —
-  anchor = the already-resolved client pod's own cluster (no anchor-recovery
-  fallback chain needed here, unlike D29) — with the same anchor-membership
-  test and cross-cluster `service-selects-pod` fan-out. An unresolvable
-  classification, or a `resolveServiceLevel` miss, falls back to
-  `external/<raw_peer_address>` — the RAW, wholly unnormalised label value
-  (neither bracket-truncated nor port-stripped) — same convention for all
-  three labels; a host dialed under several distinct bracketed identifiers
-  therefore materialises one external node per identifier. All three labels
-  empty/absent, or the client did not resolve to a real pod, drops the
-  endpoint (no node, no edge). This is the invariant the narrower
-  server-side selector must never violate: it must never leak a
-  `external/unknown` node via the generic D27 path for a case outside this
-  rule's trigger.
-- **Span-link logical edge relation marking** (add-span-link-logical-edges,
-  hardcoded — no knob): a series whose `edge_relation` label is exactly
-  `"link"` (span-link-derived: client = producer pod, server = consumer pod,
-  joined across trace IDs through a broker) resolves through the ordinary
-  ladder unchanged and its emitted edge carries `labels.relation="link"`;
-  each side whose own pod resolved to a REAL topology pod additionally
-  derives its broker node ID from its OWN peer-address labels — client side
-  the existing `client_server_address`/`client_net_peer_name` (+
-  `client_dns_answers`/`client_server_port`), server side the mirrored
-  `server_server_address`/`server_net_peer_name` (+ `server_dns_answers`/
-  `server_server_port`, filled into the same `peerLabels` struct by
-  `serverPeerLabelsOf`; no `server_network_peer_address` in v1) — via
-  `sgResolver.viaNodeID`, a **lookup-only** mirror of the
-  unknown-server-enrichment classification chain (shares every pure helper;
-  route index consulted through `routeNodeID`, the lookup-only twin of
-  `routeIndexResolve` that takes only the RouteHit BACKEND — never the
-  ingress hop, no `role` marking, no chain — and degrades everything else to
-  `ExternalID(raw)`); the `(pod, broker)` pair marks the matching
-  `pod-calls-pod`/`pod-calls-service` edge `labels.relation="transport"`.
-  Marking is set-membership at edge-build time over two
-  **`parseWithResolver`-local** sets (`linkPairs`/`transportPairs` — no
-  resolver field, no cross-build state); insert-only accumulation makes it
-  order-free (D6), `link` wins over `transport` and over plain series for the
-  same pair, `service-selects-pod` fan-out and synthesized route-chain edges
-  are NEVER marked, and a transport pair with no matching edge is a pure
-  marker (aggregated Debug, never synthesised — via lookup materialises
-  NOTHING, the `resolveRouteChain` orphan-protection precedent). A link
-  series with `server=="unknown"` and no resolvable server pod recovered no
-  consumer and contributes **NO markers at all** (neither `link` nor
-  `transport`, no via pairs — its producer→broker edge stays the ordinary
-  unmarked enrichment outcome, byte-identical): the rendering contract is
-  "transport = the network hop backing a rendered logical edge", so a
-  `transport` edge always coexists with a `link` edge from the same series
-  set in the built graph — do NOT re-add a demote-to-transport rule (other
-  degrades — synth pod, D27 ghost external — keep `link`). Any other
-  `edge_relation` value is ignored (exact match). Prescan: link series emit
-  ≤2 via keys (per resolved side, anchor = that side's own pod cluster)
-  through `viaRouteKey` — the extracted skip chain the unknown-server branch
-  also uses — deduped by the prescan `seen` map with ordinary unknown-server
-  keys (same `peerRouteKey` derivation ⇒ one store read per broker FQDN per
-  anchor cluster; the in-memory chain stays un-memoised per the
-  `resolveConnString` precedent). Edge IDs (UUIDv5 over `type|source|target`)
-  and the D30 selector are untouched; `relation` is registered on the
-  `pod-calls-pod`/`pod-calls-service` `graph.EdgeTypes` entries only. Tests:
-  `pkg/build/servicegraph_link_test.go`, golden
-  `link-relation-cytoscape.json`, `internal/integration`
-  (`TestSpanLinkRelationEdges`).
-- **Istio route resolution of global FQDN peers**
-  (translate-global-fqdn-to-k8s-service, OPT-IN — off by default): the ONE
-  step added to the enrichment above. When `--route-store-dsn` /
-  `KSG_ROUTE_STORE_DSN` is set, every point where `resolveUnknownServerPeer`
-  would emit an external node first consults an Istio route-resolution engine:
-  which Kubernetes Service did the **engine-selected ingress cluster's** Gateway
-  + VirtualService config route `(host, "/", port)` to **at the END of the
-  request's own window** (simplify-route-resolution-to-point-in-time D1 — a
-  single as-of instant, never a per-version range; `RouteRequest.At`, the same
-  instant the service-graph samples are evaluated at, so exactly ONE
-  configuration state is consulted and ONE outcome produced)? A hit resolves
-  through the SAME `resolveServiceLevel` as every
-  other path — anchored on the **selected ingress cluster** (`dest.Cluster`),
-  not the caller's (membership test, one service node, `pod-calls-service`
-  edge — which therefore MAY cross clusters, family-wide `service-selects-pod`
-  fan-out); any miss/error degrades to the existing external node — route
-  resolution can NEVER fail a build. Key facts:
-  **(1) The trigger is ALL THREE external branches**, not just "not k8s DNS" —
-  `classifyK8sDNS` splits on dots, so a global FQDN like `api.example.com`
-  (3 labels) is *successfully* classified (service `example`, namespace `com`)
-  and reaches external via the anchor-lacks-service branch; wiring only the
-  unclassifiable branch makes the feature a silent no-op for its motivating
-  case. **(2) I/O stays out of the parse** (D6): `ReadServiceGraph` runs a pure
-  prescan (`collectRouteQueries`, sharing `classifyPeerHost` /
-  `lookupClientPod` / `anchorHolds` with the parse — and, in `ReadServiceGraph`,
-  the very same `sgResolver` instance, so the two cannot drift and the topology
-  indexes are built once per build), resolves the deduped keys under a bounded
-  `errgroup` (`routeResolveConcurrency`; each call bounded by
-  `--route-resolve-timeout`; the key set capped at `maxRouteKeys` with any
-  truncation logged), and hands `parseServiceGraphRoutes` a prefetched index —
-  nil index ⇒ output identical to a build with no route store configured.
-  Concurrency cannot change the index's CONTENTS (entries are keyed by
-  `routeKey` and independent); it changes only which keys are answered when
-  the build deadline fires first, which is wall-clock dependent under any
-  schedule. **(3) Listener port
-  precedence** (D5): the `:<port>` on the peer-address value (returned by
-  `splitPeerAddressPort`) → the optional
-  `client_server_port` / `client_net_peer_port` dimension → default **443**
-  (a :443-only Gateway or an httpsRedirect :80 stub is the common ingress
-  shape; a wrong port fails as "no listener" — logged distinctly as
-  `route_engine_no_listener_on_port` — never as a wrong destination). The
-  RouteConfiguration is then selected **host-aware** within the port
-  (`translate.ListenerFor`, the single tri-state decision point shared by
-  `Translate` and the resolver's listener gate): among the servers on the
-  port, the one whose `hosts` most-specifically match the request FQDN
-  (`gwresolve.PickHosts` — Istio exact/wildcard semantics, declaration-order
-  independent, `<ns>/` binding prefixes stripped) owns the RC, with
-  `server.bind` reflected in the name (`http.<port>[.<bind>]` shared by HTTP
-  servers; `https.<port>.<portName>.<gw>.<ns>[.<bind>]` per TLS-terminated
-  HTTPS server). Servers on the port that serve only OTHER hosts short-circuit
-  as `route_engine_no_server_for_host` (`RouteNoServerForHost`, ranked between
-  `no_listener_on_port` and `no_route`) without a translate round-trip —
-  istiod builds vhosts from the server-hosts ∩ VS-hosts intersection, so such
-  a request could only ever reach an empty `RouteNoRoute`.
-  **(4) The `client_dns_answers` dimension is REQUIRED** (D6 rev): its IPs
-  select the ingress cluster and feed the ClickHouse IP 3-hop; no parseable IP
-  ⇒ the engine is NEVER consulted (prescan skip, no store read, distinct
-  `route_engine_no_ip` reason) — config_only mode and `LoadConfigWindow` were
-  removed. **(4b) Ingress-cluster selection** (D10, `pickIngressCluster` — a
-  pure function in `pkg/route`): per IP, the store probe
-  `ClustersWithIngressIP` (the store's ONLY cross-cluster read) yields the
-  candidate clusters G; F = G ∩ caller's family (`build.ClusterFamilyKey`,
-  exported). |F|==1 → it; |F|>1 → caller if caller∈F else ambiguous; F empty
-  and |G|==1 → it; |G|>1 → caller if caller∈G else ambiguous; G empty →
-  no-ingress. Multi-IP selections must all agree or degrade ambiguous;
-  candidate sets / snapshots are NEVER unioned across clusters. Misses surface as
-  `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
-  `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
-  `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
-  The `ClustersWithIngressIP` probe is a pure function of `(ip, at)` (both
-  constant across a build's keys), so it is **memoised per build** (D13): when
-  the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
-  (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
-  drives the whole build through one `scopedResolver` scope that caches the
-  probe by `(ip, at)`, collapsing keys that share a destination IP to a
-  single store read. The scope is one-build and mutex-guarded (keys resolve
-  concurrently; the store read stays outside the lock, so a racing duplicate
-  probe is possible and harmless); the shared `*Resolver` stays stateless (an
-  instance cache would leak). Errors are not cached; no outcome/determinism
-  change.
-  **(5) The engine** (`pkg/route`) loads an **ingress-cluster-scoped,
-  read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
-  `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
-  tables stay interval-versioned and are written by the metadata-exporter repo;
-  schema drift fails fast at startup; reads use the no-FINAL pattern —
-  `valid_to` NEVER filtered in SQL, SQL carries only `valid_from <= at` plus the
-  join keys, client-side dedup per version slot by max ingest_seq, and the
-  liveness test `valid_from <= at < valid_to` applied post-dedup — because the
-  exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
-  opts into SQL-side pruning for update-close writers ONLY; time operands are
-  `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
-  the **multi-IP union is deduped by resource-version identity**
-  `(cluster, namespace, name, valid_from)` — a dual-stack ingress Service makes
-  each per-IP load return the same rows, and istiod's config store rejects a
-  duplicate, so an undeduped union failed the whole resolution; `ScopedFor` /
-  `backendServices` enforce the same one-entry-per-identity invariant on their
-  own output. **Destination-host identity follows istiod exactly**: every
-  config carries `Domain` (`store.ClusterDomain`), so a dot-free
-  `destination.host` resolves to `<name>.<vs-namespace>.svc.cluster.local` (the
-  common way operators write a destination) while anything containing a dot is
-  left verbatim — istiod does not expand `checkout.shop` either, so that shape
-  names no registry Service and correctly stays external. One
-  `store.VSDestHosts` serves both the reader and the snapshot, and
-  `ParseBackendHost` requires exactly two leading labels;
-  bare `spec.gateways` names bind same-namespace gateways — see design
-  "production reader compatibility"),
-  translates that one gateway's scoped config via
-  in-process istiod (`ConfigGenerator`, no istiod pod, no Kubernetes client —
-  see the client-go rule) and matches with the native `router_check_tool`
-  binary (`--router-check-bin`; copied into the image from the Envoy tools
-  image; ~50–60 ms per config — one translate + one check per resolution, so
-  there is no segment loop and no config-signature cache). **Hop 3 is
-  namespace-scoped** (scope-gateway-candidates-to-ingress-namespace): a
-  candidate Gateway must live in the ingress Service's OWN namespace —
-  enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1
-  nsList, like the deploy hop) and the in-memory hop
-  (`r.Namespace == svcNS`) — so a single IP's candidate set can never hold two
-  same-named Gateways (K8s per-ns name uniqueness). Istio's cross-namespace
-  selector attachment is deliberately out of scope (degrades `no_gateway` → LB
-  fallback/external). The **gateway identity carried downstream is
-  `(namespace, name)`** (`ScopedFor(ns, name)`): the LOADED rows are a
-  deliberate superset spanning namespaces (the gw_versions SQL binds the union
-  of every ingress Service namespace carrying the IP), and a multi-IP request
-  unions candidates across IPs, so a bare-name scan could select another
-  namespace's same-named Gateway — and since the selected row's namespace also
-  decides which VirtualServices bind to it, that was a WRONG destination, not a
-  miss. `gwresolve` still matches on host patterns and returns a bare name;
-  `pickCandidate` recovers the namespace, and same-named candidates from two
-  namespaces (only reachable multi-IP) degrade rather than guess. **Hop 1
-  degrades on ambiguity** — more than one live Service identity carrying the IP
-  yields no candidates, matching `ingressServiceIdentity`'s rule for the same
-  situation — and **hop 2 unions** the pod labels of every matching ingress
-  Deployment (a revision-based canary gateway upgrade runs two; the SQL layer's
-  `labelUnion` already did this), so neither hop depends on storage row order.
-  Two
-  different-named candidates declaring an identical equal-specificity host
-  pattern resolve to the **lexically-smallest gateway name**
-  (`gwresolve.sortPats` tie-break; `PickHosts`' numeric-index semantics
-  unchanged), never to storage row order.
-  **(5b) Ingress LB Service fallback** (ingress-lb-service-fallback change):
-  when the pipeline produces no hit AND its miss is exactly
-  `RouteNoGateway` (resolution never got past gateway selection — the nginx
-  signature: Hop 3 finds no Istio Gateway CR; a DEEPER miss keeps its
-  diagnostic reason unmasked), the resolver falls back to an **as-of identity
-  dedup** over the already-loaded rows
-  (`snapshot.ResolveIPToIngressServices` — the in-memory, single-cluster
-  analogue of the `ClustersWithIngressIP` SQL; no new store read): per
-  destination IP the distinct `(namespace, name)` of every ingress-IP-carrying
-  Service row LIVE AT the instant, merged order-free — any IP with >1
-  simultaneous identity → `RouteAmbiguousIngressService`
-  (`route_engine_ambiguous_ingress_service` → external, no lexicographic
-  tie-break); any IP with 0 → keep the pipeline miss byte-for-byte; else all
-  singletons must agree → `RouteIngressLBService`, resolved by
-  `routeIndexResolve` via `resolveServiceLevelInCluster` — the same node
-  materialisation as `resolveServiceLevel` but with a **locked-cluster
-  `service-selects-pod` fan-out** (the selected cluster's own endpoints ONLY,
-  no family union — an LB IP is a per-cluster address, so a family sibling's
-  same-named Service is not behind it; route-hit-ingress-chain D2)
-  (dest.Cluster = the locked ingress cluster, topology miss →
-  `route_engine_dest_cluster_lacks_service`), with the outcome dimension in
-  the success debug log distinguishing the coarser "LB entry point" semantics
-  (host/path/port play no part — the fan-out reaches the ingress controller
-  pods, e.g. nginx, never a routed backend). An identity that was superseded
-  BEFORE the instant is not a candidate
-  (simplify-route-resolution-to-point-in-time D5).
-  **(5c) RouteHit ingress chain** (route-hit-ingress-chain): on every routed
-  hit the resolver ALSO recovers the ingress LB Service identity of the
-  destination IPs via the same as-of dedup (shared core
-  `ingressServiceIdentity` in `pkg/route/ingresslb.go`; zero new store
-  reads) into two new `RouteDestination` fields `IngressNamespace` /
-  `IngressService` — empty on ambiguous/incomplete identity, which NEVER
-  demotes the hit (the LB fallback mirrors its own identity into them for
-  uniformity). When populated AND every chain precondition holds, the parse
-  emits the **full chain in addition to the direct edge**: caller pod
-  -[pod-calls-service]→ ingress service (locked-cluster
-  `service-selects-pod` fan-out to the gateway pods) plus ONE synthesized
-  **`pod-calls-service`** edge per locked-cluster ingress pod → the
-  backend service (which keeps its family-wide fan-out); the direct
-  caller→backend edge is KEPT (`routeIndexResolve` returns `[ingress,
-  backend]` as the endpoint's resolution targets — the chain alone would
-  funnel every caller through the shared ingress node and erase the
-  per-caller → backend dependency), and it collapses with any
-  trace-derived edge for the same `(caller, backend)` pair via the traced
-  pairs map (identical UUIDv5 edge ID — no duplicate possible). **Ingress
-  role marker** (mark-ingress-route-path): the ingress entry-point node
-  stays `type="service"` (no new node type — `materializeServiceNode` is
-  idempotent by id, so a path-dependent type would be arrival-order
-  dependent) but its `labels` carry `role` — `ingress-gateway` for the
-  RouteHit chain's entry hop, `ingress-lb` for the
-  `RouteIngressLBService` (nginx) fallback destination (no routed backend
-  behind it). Assignment (`sgResolver.markIngressService`) is set-only and
-  MONOTONE: `ingress-gateway` always overwrites, `ingress-lb` writes only
-  into an unset value — one Service can be reached by both paths in one
-  build, and the marker must not depend on series arrival order (D6). The
-  key is absent (never empty-string) on every non-ingress service node; a
-  degrade materialises no ingress node and therefore no marker. Marking
-  happens strictly AFTER successful materialisation at the two call sites
-  owning the outcomes (`resolveRouteChain`, `routeIndexResolve`'s LB
-  branch). Preconditions — identity present,
-  identity ≠ backend identity, locked cluster holds the ingress Service in
-  topology, non-empty locked-cluster endpoint set — are checked **purely
-  before any materialisation** (`resolveRouteChain` in
-  `pkg/build/servicegraph.go`), so every degrade falls back to today's
-  direct-edge shape with zero stray nodes/edges, logged at Debug only
-  (`route_chain_degraded`, never counted in the external-fallback reasons —
-  no external node is produced). A backend topology miss stays the existing
-  `route_engine_dest_cluster_lacks_service` external path with the ingress
-  never materialised (backend resolves first). Synthesized edges carry
-  `labels={"cluster": <ingress cluster>}` (the client side is a pod in that
-  cluster — D9), accumulate in `sgResolver.routeChainEdges`, and dedupe
-  **traced-edge-wins** against the parse's `(src, tgt)` pairs (a
-  trace-derived `pod-calls-service` edge for the pair is emitted and the
-  synthesized hop skipped). No new engine outcome or PromQL change.
-  **(6) Containment** (D1, dependency hygiene, distinct from the client-go
-  rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
-  import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,
-  so a plain embedder never inherits istio/ClickHouse —
-  `make check-route-containment` enforces this in CI. No new node type, edge
-  type, attribute, or `labels` key; the destination's port/subset are parsed
-  and discarded. Tests: `pkg/build/routeprescan_test.go`,
-  `pkg/route/*_test.go`, `internal/integration/route_e2e_test.go`
-  (`TestRouteSuite` needs `router_check_tool` — set `KSG_ROUTER_CHECK_BIN`;
-  `TestRouteStoreSuite` needs only Docker), and the `-tags oracle` sweep.
-- **Server-side pod resolution** uses `Topology.PodsByUID` — a global pod-UID
-  index built from all loaded clusters. Service-graph metrics carry only the
-  trace-source `cluster` (client side); the server side's cluster is recovered
-  by looking up `server_k8s_pod_uid` against this index, since K8s pod UIDs
-  are unique cross-cluster in practice. Missing UIDs (with non-empty server
-  label) follow the missing-UID fallback above; UIDs present but unknown
-  to topology become synth pods with `cluster=""` (server-side cluster
-  unknown).
-- **Two filter classes: selector-level and projection-level** (push-request-filters-upstream). **Selector-level** — `cluster`, `namespace`, `az`, `env` — are rendered into the upstream queries as label matchers by `promql.Render(q, window, keys, sel)`, so VictoriaMetrics narrows the build at the source. **Projection-level** — `prune`, plus `cluster` / `namespace` re-applied as defence in depth — are applied over the built graph. Which dimension reaches which series is the hardcoded `promql.queryDims` table (a test parses `queries.go` and fails on a Query constant with no entry): pod/claim/Service/EndpointSlice KSM series + kubelet = all four; `kube_node_*` = az/env/cluster; **NetApp Harvest = `az` / `env` only** (`dimsHarvest = dimAZ | dimEnv`, read-storage-roots-through-volume-hub D13 — a request queries only its own az / env, so a catch-all or multi-environment Harvest store must not answer with another's filers; its `cluster` label is the ONTAP cluster, not a Kubernetes one, and it carries no namespace, so those two never reach it; beyond az / env it is narrowed by reference through the loaded claims — and, for `volume_labels` alone under a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=` / `svm=`, by a ROOT-DERIVED scope, a different mechanism from a selector-level dimension exactly as the QoS `volume` alternation is: `queryDims` and `Selector.Reaches` are untouched); **the three `traces_service_graph_*` queries and `up` take NO request matcher**; `ALERTS` = az/env plus `namespace` in its **or-absent** form (`dimsAlerts = dimAZ | dimEnv | dimNamespaceOrAbsent` — never `cluster`, because an alert expression does not reliably preserve it; `namespace=~"shop|"` so the namespace-less node / controller / aggregate alerts still reach the nodes the request loads by reference). Rendering is a pure function of the sorted, de-duplicated value set (single value → `key="v"`, several → one anchored `key=~"a|b"` with `regexp.QuoteMeta` + string escaping), fixed dimension order `az, env, cluster, namespace`, and the `cluster` value `unknown` renders `cluster=~"unknown|"` — the literal PLUS the empty alternative, always the regex form — because `build.bucketCluster` puts an absent label AND a literal `unknown` in the SAME bucket, so the matcher must accept both (`promql.ClusterUnknownValue` is the one spelling shared by the query and parse layers). Each query's **fixed** selector (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on the six controller-annotation families, `alertstate="firing"` on `ALERTS`, the D30 sentinel, `edge_relation!="link"`) is a request-invariant metric-selection contract and is always rendered FIRST, composed with — never replaced by — the request matchers. Each mirrors a discard its Go reader already performs BEFORE keying or tallying the sample, so the pushdown is output-preserving down to the missing-cluster tally — pinned by `TestResolveJobCronJobOwners_QuerySelectorIsOutputPreserving` / `TestResolveApplications_TrackingIDPresenceIsOutputPreserving`; a matcher STRICTER than its reader would silently drop data. A zero `promql.Selector` adds no request matcher, so every query renders exactly its fixed form (`TestRender_EmptySelectorMatchesBaseline` diffs against `pkg/promql/testdata/render-baseline.txt`, which moves whenever a fixed selector does). The `az` / `env` label KEYS are operator-configurable (`--az-label` / `KSG_AZ_LABEL`, `--env-label` / `KSG_ENV_LABEL`, defaults `az` / `env`, validated as PromQL label names and required to differ); the request parameter names never change. **Operator precondition:** every kube-state-metrics and kubelet family must carry the configured labels — a family that does not vanishes under an `az` / `env` filter, and the connectivity prune can then empty the graph (a `selector_family_empty` Warn fires when KSM matched but a kubelet family that a LIVE dimension actually reaches returned nothing — `promql.Selector.Reaches(q)` reads `queryDims` backwards). **Every Harvest series MUST carry the configured `az` / `env` labels too** (BREAKING, D13): one without them matches nothing under any filter, and `/v1/storage-graph` is always filtered. `selector_family_empty` never blames a Harvest family by an explicit rule — an empty Harvest read is also a deployment with no NetApp storage. The pair also scopes the zone-agreeing NetApp alert match (D11). Hub-mode storage builds follow the table like every other build — no exception.
-- **Filtered-build rules for the service graph** (design D5 / D6 of push-request-filters-upstream). Because the topology is narrowed while the service-graph series are read in full, a build with any selector-level dimension active applies two rules that are **inert when unfiltered** (`sgResolver.filtered`): (1) an endpoint whose non-empty pod UID names a pod the request did NOT load resolves exactly as if the UID were empty — the `"://"` ladder can still reach a LOADED Service, `server="unknown"` still goes through the peer ladder (which needs a real client pod, so an out-of-scope caller is dropped), any other non-empty label becomes `external/<label>` via the D27 fallback, and an empty label drops the side; **a filtered build NEVER synthesises a pod**; (2) a series is ADMITTED only when both sides resolved AND at least one resolved id names loaded topology (`podByID` or an already-materialised `services` entry) — otherwise a per-series **journal** rolls back every side effect (external / service / `service-selects-pod` / route-chain / ingress `role` / `extReasons`) and the series contributes nothing to `pairs`, the RED join or the link markers. This is what keeps the out-of-scope estate from rendering as an external-to-external web, and what makes an out-of-scope peer render as `external/<label>` instead of a ghost pod. **Consequence:** under `?cluster=` the cross-cluster partner is an `external` node, not a real pod — "Cross-cluster edge representation" requires BOTH clusters loaded.
-- **An empty filtered result is a 200, not `outside_retention`.** The zero-pods + zero-nodes + healthy-`up{}` classification runs only when `sel.Active()` is false; a filtered build issues no `up{}` probe and returns an empty `elements` array with an empty `clusters` list. It also issues **no `traces_service_graph_*` queries at all** when the selector loaded neither pods nor services: admission (D6) requires a resolved endpoint in loaded topology and a service node can only come from `ServicesByNameNS`, so every series would be rejected — and those three queries are the one leg `queryDims` never narrows, so a mistyped `?namespace=` would otherwise scan the whole estate per request.
-- **Request surface is `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`** on `/v1/graph` — everything but `start` / `end` optional. `GET /v1/storage-graph` additionally **requires** `az` and `env` (`missing_az` / `missing_env`), each **repeatable** — the selected zones are their Cartesian product, rendered exactly as on `/v1/graph` (sorted, de-duplicated, a single value `key="v"`, several one anchored `key=~"a|b"`), and the parser stores the sorted value sets — which narrow its Kubernetes side, and the `az` SET also selects the harvest backends — and **requires** exactly one root kind (`missing_root` when none; `invalid_scope` when two or more, naming the parameters): repeatable `ontap_cluster`, `ontap_node` (an ONTAP controller), `aggr`, `svm` (a bare aggregate or SVM name matches every filer of the selected zones; `<ontap_cluster>/<name>` is the **qualified form** naming exactly one filer's component — bare and qualified values mix and OR-combine, a bare value subsumes a qualified one of its name, and a value with a `/` must split into two non-empty segments else `invalid_scope`; `ontap_cluster=` does not qualify them — it is another root kind), `pod=<ns>/<name>`, `pvc=<ns>/<claim>` (a PersistentVolumeClaim, in every cluster of the estate), `pv=<name>` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included, since the seed never derives candidates from a FlexVol name), `application=<argo-app>`, or `node` (a Kubernetes node only — an ONTAP controller name sent as `node=` is an empty 200). **A `pvc` / `pv` root is a claim seed** (`topologyPlan.claimSeeded()`, `pkg/build/claimseed.go`): the seed IS the claim-side `kube_persistentvolumeclaim_info` read, restricted per namespace (`promql.RenderNamesInNamespace`, so a same-named claim in another namespace is never read) or on `volumename`, and filtered again in the reader; `readTopology` then wires it as `readClaimSeed → pvcInfoDone`, `readHubClaimFamilies` (claim families + mounter completion) and `readWorkloadVolumeLabels` (candidate + owner completion), and the workload-claims step is skipped. A root set past `maxRootedVolumeLabelChunks` is 400 `invalid_scope` before any query, the count summed across namespaces. **An unmounted root claim is a Sankey sink**: a claim with no `pod-mounts-pvc` binding has no PVC node at all, so a claim-seeded parse alone (`topologyVectors.MaterialiseUnboundClaims`) builds it from its claim-info row, `assembleStorageFlow` alone emits the `node-aggr` / `aggr-svm` / `svm-pvc` chain of an unmounted claim (reading `Topology.ClaimSeeded`, which the parse copies from that same flag, so the two cannot disagree), and `ProjectStorage` retains that sink unit only through a claim root that names it — its whole measurement rides the chain with no `pvc-pod` edge, and an unmounted claim that is NOT a root stays dropped under every root kind. `prune` is ignored there. `name`, `root`, `depth`, `direction` and `edge_type` are **withdrawn** (BREAKING) and, like any unknown parameter, ignored without error — their VALUE is never inspected, so an unregistered `edge_type` is a 200. An old client receives the unanchored, unfiltered view. `GET /v1/clusters` is **removed** (BREAKING) together with the `cluster_discovery` query — the cluster list is the `clusters` field of any `/v1/graph` response. `graph.Scope` is `{Clusters, Namespaces, Inventory}`; `traverse` / `MaxTraversalDepth` / `Direction` / `Names` are gone. `graph.StorageScope` is `{Clusters, Namespaces, Roots}`. **A multi-zone body is the UNION of its zones** (accept-multi-zone-storage-graph): for a fixed root, filters and window, the body of a request selecting several `(az, env)` combinations equals — element for element, flow weights included — the union of the single-combination bodies. Nothing merges across zones because every Kubernetes id is composed `<az>-<env>-<cluster>`, every NetApp id is qualified by its ONTAP cluster, and the two row-to-object keys that used to carry a raw `cluster` now carry the identity: `podSeriesKey{az, env, cluster, namespace, pod}` (`podSeriesKeyOf`, the pod twin of `claimKey`, so a cluster name reused in two zones is two clusters and a same-named pod of each is elected independently by `podsNewestOn`) and the claim → FlexVol join's zone agreement (NetApp bullet, hop A). **The operator guarantees ONTAP cluster and controller names are unique across the estate** (`docs/netapp-harvest-preconditions.md`); aggregate and SVM names are NOT unique, hence the qualified root. A qualified value is `graph.ONTAPRef{ONTAPCluster, Name}` in `graph.StorageRoots.Qualified` (sorted, de-duplicated, a bare name subsuming its qualified twin at construction; `Names` holds the bare values only, `Any()` counts both); the plan carries them as `topologyPlan.volumeAggrPairs` / `volumeSVMPairs` (`map[ONTAP cluster][]name`) beside the bare `volumeAggrs` / `volumeSVMs`, and `ProjectStorage` matches an aggr / svm root by `named || qualified[(labels.ontap_cluster, name)]`. A multi-zone build stays fail-closed across every backend it reaches.
-- **`graph.EdgeTypes` is the builder's declaration table, served to nobody.**
-  A single in-code registry: adding an edge type = update both the builder and
-  the registry in the same change. Its `MayCrossCluster` bit derives
-  `neverCrossCluster`, which buckets `kube_state_graph_graph_edge_count`, and
-  the `pod-service-graph` spec pins the `may_cross_cluster: true` declaration
-  on `pod-calls-service` — that is what keeps the registry load-bearing with
-  no route serving it. Current edge types include `pod-calls-pod`,
-  `pod-calls-service` (emitted when a `"://"` connection-string resolves to a
-  service node in the caller's OWN cluster — that path stays intra-cluster —
-  OR when the route engine resolves a global FQDN to a Service in the
-  engine-selected ingress cluster, which may be a family sibling, so the type
-  is `may_cross_cluster: true`; also used for the synthesized RouteHit
-  ingress-chain hop from gateway pod → backend service), and
-  `service-selects-pod` (directed service →
-  pod, emitted on demand by the D29 connection-string resolution; the local
-  service node fans out across same-family clusters holding the same-named
-  Service, so it MAY be cross-cluster — `may_cross_cluster: true`), and
-  `pvc-to-netapp-aggr` (PVC → ONTAP aggregate from the Harvest `volume_labels`
-  join; `may_cross_cluster: false` — the target belongs to no Kubernetes
-  cluster; I/O on `data.metrics`: `read_ops`, `write_ops`, `read_latency_us`,
-  `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`, plus the
-  declared ceiling `max_iops`, `max_bytes_per_sec` — which the claim's PVC node
-  also carries as `data.qos`), and
-  `storage-flow` (the Sankey hop of `GET /v1/storage-graph`; `may_cross_cluster: false`; labels `tier` and `attribution`; `/v1/graph` never emits it).
+- **`/v1/graph` takes `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`**; unknown parameters (including the withdrawn `name` / `root` / `depth` / `direction` / `edge_type`) are ignored without error. `GET /v1/clusters` is removed.
+- **Only `end > start` is validated** — no window cap, no future-time guard. `kubegraph.AlignWindow` floors `end` to `--end-align` in exactly two places (`internal/api` `runBuild`, `Engine.BuildFromValues` / `BuildStorageFromValues`), never inside the parsers.
+- **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries and `up` take NO request matcher. Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
+- **A filtered build NEVER synthesises a pod**, admits a service-graph series only when a resolved endpoint names loaded topology, and returns an empty 200 (never `outside_retention`) when nothing matched.
+- **Every upstream query passes a per-store guard** — result cache → miss coalescing → concurrency slot — ON by default for server and library. Cached vectors are shared: **readers in `pkg/build` MUST NOT mutate a sample or its `Metric` map**. `pkg/build.New` stays unguarded (the test seam).
+- **Upstream is a routed table of backends** (`promql.Router`; no `--backends-file` ⇒ one implicit `default` backend). `queryFamily` is exhaustive beside `queryDims`; the cross-backend merge MUST de-duplicate by label-set fingerprint (readers sum); required legs fail closed; credentials are env-var names, never literals; file parsing lives in `pkg/promql/backendsfile`, never `pkg/promql`.
+- **No configurable metric-name prefix.** `--metric-prefix` / `KSG_METRIC_PREFIX` / `Renderer.Prefix` are removed. Every series is queried at its bare name (`promql.Render(q, window)`). A deployment whose KSM series ARE prefixed silently returns an empty graph — see `docs/BREAKING.md`. The D29 endpointslice → service join still reads `kube_endpointslice_labels{label_kubernetes_io_service_name}`, which KSM only emits when `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` is set. The metric-name suffix and the label-name set per series are a fixed contract any compatible exporter MUST honour.
+
+**Service graph**
+
+- **Per-endpoint resolution order**: (1) empty UID + `"://"` label → a single `service` node in the caller's own cluster, else `external`; (2) non-empty UID → topology pod, else synth pod; (3) empty UID + other non-empty label → `external/<label>`; (4) drop. A `"://"` endpoint is never a pod.
+- **Fixed selector contracts, no knobs**: the D30 sentinel matcher (`client!~"user|unknown",server!~"user"`), the D33 self-loop UID guard, and `edge_relation!="link"` on the two RED companion queries.
+- **`server="unknown"` produces a node only through the peer-address ladder** (real client pod required): `client_server_address` → `client_network_peer_address` → `client_net_peer_name`, classified DNS → bare name → ClusterIP (anchor cluster only) → Pod IP (family, ambiguity degrades) → route engine → `external/<raw>`.
+- **Route resolution is opt-in and can never fail a build.** I/O stays out of the parse (prescan → prefetched index). `pkg/build` declares only `RouteResolver` and MUST NOT import `pkg/route` (`make check-route-containment`).
+- **RED metrics live on the typed `Edge.Metrics`** (`data.metrics`), only on trace-derived edges whose both endpoints are pod-or-service nodes; companion-query failures degrade field by field.
+
+**Storage**
+
+- **The NetApp join is three independently-degrading hops** keyed on the PVC's `volumename` rewritten to a token and suffix-matched against the stock Harvest `volume` label — never a label equality. `volume_labels` is the sole topology source; a QoS miss leaves a measurement-less edge; an incomplete ceiling key is ignored, never widened.
+- **`/v1/storage-graph` requires `az` + `env` and exactly one root kind, fails closed on any query error (except `ALERTS`), and never reads a zone the request did not select.** A request-derived scope past the chunk cap is 400 `invalid_scope` before any query; a data-derived scope is chunked, never widened. A multi-zone body is the union of its zones.
+- **Every Harvest series must carry the configured `az` / `env` labels**; ONTAP cluster and controller names are unique across the estate, aggregate and SVM names are not (hence the qualified `<ontap_cluster>/<name>` root).
+
+**Operations**
+
 - **API-key auth is the only HTTP auth in v1.** Header is `X-API-Key`. Keys
   come from `--api-keys-file` (K8s `Secret` mount, hot-reloaded) or
   `--api-keys`. Empty keyset = auth disabled (dev default). Open paths
@@ -829,278 +161,7 @@ live under `openspec/specs/`.
   Validation is constant-time and iterates the whole set —
   do NOT add early-return optimisations to `auth.KeySet.Validate`. Logs must
   never include the presented key value.
-- **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`, and every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values (so `?az=b&az=a` and `?az=a&az=b` issue identical queries): node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Every golden carrying a pod / K8s node / PVC / NetApp controller / aggregate intentionally carries an explicit `data.status`; hand-built golden fixtures must stamp the same `FoldStatus` result the builder bakes before `graph.NewGraph`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
-- **IP addresses live on the typed `ipaddress` attribute, never in `labels`.** `PodNode.IPAddress()` carries `[pod_ip]` from `kube_pod_info` (when present). `K8sNode.IPAddress()` carries `[external_ip]` from `kube_node_status_addresses{type="ExternalIP"}` when present, falling back to `[internal_ip]` from `kube_node_status_addresses{type="InternalIP"}` when the node has no ExternalIP row (ExternalIP always wins over InternalIP regardless of upstream sample order; within each type a duplicate `(cluster, node)` sample resolves to the lexically-smallest address; address types other than `ExternalIP`/`InternalIP` are ignored); omitted only when neither type is present. The selector is the anchored alternation `kube_node_status_addresses{type=~"ExternalIP|InternalIP"}` — a fixed, request-invariant metric-selection contract, not a caller filter. `ServiceNode.IPAddress()` carries `[cluster_ip]` from `kube_service_info` (when present, omitted for headless `cluster_ip="None"`). `PVCNode`, `ExternalNode`, `NetAppAggrNode`, and `NetAppNode` always return nil. `host_ip` from `kube_pod_info` is intentionally dropped — it is the node's IP, surfaced via the node entry instead. The serialiser emits `data.ipaddress` (with `omitempty`); `labels.pod_ip`, `labels.host_ip`, `labels.external_ip`, `labels.internal_ip`, and `labels.cluster_ip` MUST NOT appear.
-- **Cytoscape compound nodes are presentation-only — workload hierarchy plus storage chain.** `pkg/cytoscape` synthesises `type="cluster"` / `type="storage-cluster"` / `type="namespace"` / `type="application"` / `type="controller"` groups (all `labels={}`, no `ipaddress`, emitted in that tier order each sorted by id, before real nodes) and sets `data.parent` (`omitempty`) for `cluster > namespace > application > controller > pod` with **skip-absent-levels**, plus `cluster > namespace > [application >] {service, pvc}`, `cluster > node`, and `storage-cluster > netapp-node > netapp-aggr` and `storage-cluster > netapp-svm`. The **real** `type="netapp-node"` is the compound parent of its aggregates (via `labels.node`) — the one scoped exception to "relationships are edges, groups are synthesised". An SVM nests under its storage-cluster, never under a controller. `external` nodes get no parent. Group ids are **path-encoded**. **NetApp types** (`NodeTypeNetAppAggr` id `netapp/<oc>/aggr/<aggr>`, `NodeTypeNetAppNode` id `netapp/<oc>/<node>`, `NodeTypeNetAppSVM` id `netapp/<oc>/svm/<svm>`) belong to no Kubernetes cluster (`labels` carry `ontap_cluster`, never `cluster`) so they stay out of `clusters[]` and `?cluster=`. The SVM is emitted only by `/v1/storage-graph`. The PVC→aggregate relationship is the `pvc-to-netapp-aggr` edge (Harvest `volume_labels`, matching a token derived from the PV name against the stock `volume` label); the pod→node relationship is `pod-to-node`. The `storageclass` node type and `pvc-to-storageclass` edge are **removed**; the claim's StorageClass name survives as `PVCNode.StorageClass()` / `data.storageclass`. Infra admission (D6, transitive for NetApp): a K8s `node` is retained iff a pod is scheduled on it; a `netapp-aggr` iff an admitted PVC has a `pvc-to-netapp-aggr` edge to it; a `netapp-node` iff an admitted aggregate names it. An admitted aggregate always pulls its owning controller. See `pkg/build/netapp.go` and `docs/netapp-harvest-preconditions.md`.
 - **OTLP tracing/logging is config'd by OTel env vars only** (`OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`). No bespoke `--otlp-*` flags. Telemetry defaults to no-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset (zero export overhead, no background goroutines). Tracing MUST NOT alter response bodies — resource attrs and span IDs live on spans, never in JSON. `otelgin` is mounted on `/v1/*` only; `/livez`, `/readyz`, `/metrics`, and `/docs/*` are deliberately untraced. The auth middleware MUST NEVER log or attribute the presented `X-API-Key` value via either the local handler or the OTLP slog bridge.
-- **Pod controller-owner attribute (D34).** Each `type="pod"` node carries a typed, nullable `owner` attribute — `data.owner = {kind, name}`, serialised with `omitempty` and **omitted entirely** when the pod has no controller owner (never empty strings). It lives on the typed attribute, **never inside `labels`** (which stay strict typological metadata) — same precedent as `ipaddress`. Surfaced via `graph.GraphNode.Owner() *graph.Owner` (nil for non-pods and ownerless pods). Resolved from `kube_pod_owner` with the **ReplicaSet skipped to its owning Deployment** via `kube_replicaset_owner` (a bare ReplicaSet with no Deployment owner stays `kind="ReplicaSet"`; other owner kinds surface verbatim). Both series are KSM defaults (no `--metric-labels-allowlist`) and OPTIONAL (absence degrades gracefully, no build failure). Resolution lives in `pkg/build/topology_owners.go` (`resolvePodOwners`); the controller pick is deterministic (lexically-smallest `(kind, name)` on collision). No new node/edge type.
-- **Pod `application` and `containers` attributes.** Each `type="pod"` node may carry two more typed, nullable attributes, both serialised with `omitempty` and **never inside `labels`** — same precedent as `owner` / `ipaddress`. (1) `data.application` (string) is the pod's ArgoCD Application, joined from the pod's **CONTROLLER** — ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload object it applies, never on the pods a controller spawns, and no `argocd_tracking_id` label is read off `kube_pod_owner` (see `docs/BREAKING.md`). The lookup key is the controller owner already resolved for `data.owner` (`(cluster, namespace, owner_kind, owner_name)`, ReplicaSet already collapsed to its Deployment) against one annotation family per kind — `kube_deployment_annotations` / `kube_statefulset_annotations` / `kube_daemonset_annotations` / `kube_replicaset_annotations` (bare RS only) / `kube_job_annotations` (identity label `job_name`, NOT `job`) / `kube_cronjob_annotations` — each carrying the same `annotation_argocd_argoproj_io_tracking_id` label as the service / PVC families and parsed as the segment **before the first `:`** of the tracking-id value (`<app>:<group>/<kind>:<ns>/<name>`; a value with no `:` is verbatim); per-controller collisions pick the lexically-smallest non-empty tracking-id. The ONE extra hop is **Job → CronJob** via `kube_job_owner` (`owner_kind="CronJob"` + `owner_is_controller="true"`), tried only when the Job carries no annotation of its own — the Kubernetes CronJob controller copies only `spec.jobTemplate.metadata` annotations onto its Jobs. That hop is **resolution-only**: `resolvePodOwners` never reads the index, so `data.owner` still reads `{kind:"Job", …}`. An owner kind with no KSM annotation family (`ReplicationController`, `Node`, any CRD controller) resolves no Application. Every family is OPTIONAL and degrades **per family** (`--metric-annotations-allowlist` is per-resource). All seven queries carry a **fixed selector** mirroring their reader's own discard — `kube_job_owner{owner_kind="CronJob",owner_is_controller="true"}` and `kube_*_annotations{annotation_argocd_argoproj_io_tracking_id!=""}` — so an un-allowlisted family returns an EMPTY vector instead of one series per workload object, and `Topology.RawSeriesCount` for these seven counts matched (annotated / CronJob-controlled) objects, not all of them. On the **query-error** axis the seven split: `kube_replicaset_annotations` and `kube_job_annotations` are `fetchOptional` (log-and-continue — their cardinality accumulates with `revisionHistoryLimit` / Job history limits); the other four families and `kube_job_owner` stay abort-on-error `fetch`. Every degrade is **subtractive** — it removes an Application, never substitutes one — but a lost Application still reshapes the Cytoscape compound hierarchy (pods reparent, a sole-member `application` group node vanishes, an inheriting PVC re-inherits from a different mounter). Keeping it subtractive costs one gate: a degraded `kube_job_annotations` **suppresses the Job → CronJob hop** for that build (`topologyVectors.JobAnnotationsDegraded`, set only by `fetchOptionalTracking` on the swallowed-error path). The hop is gated on "this Job carries no annotation of its own", which an unread family cannot establish, so firing it would attribute a directly-managed Job's pod to its CronJob's Application — the one wrong-value degrade in the package. `kube_replicaset_annotations` needs no such flag: a bare ReplicaSet has no further ancestor to consult. Surfaced via `graph.GraphNode.Application() string` (`""` for non-pods and ArgoCD-less pods), resolved in `pkg/build/topology_owners.go` (`resolvePodApplications` + `resolveControllerApplications` + `resolveJobCronJobOwners`). **One pod on demand:** `build.ResolvePodApplication(ctx, LabelQuerier, PodApplicationRequest{AZ, Env, Cluster, Namespace, Pod, At, Window})` applies the same rules through `Router.QueryLabels` (family `ksm`, 2–5 sequential queries, no build); `Cluster` / `Namespace` / `Pod` are required, `AZ` / `Env` optional like on the graph request. It shares `controllerAnnotationFamilies` / `argoAppName` / `usableTrackingID` with the batch path, pins each unset `az` / `env` from the pod-owner rows so later legs route and match that zone (`ErrAmbiguousPod` on several combinations), and fails on any upstream error instead of degrading (add-pod-application-lookup). **Service and PVC nodes also carry `data.application`** (the `containers` attribute stays pod-only): resolved identically (segment before the first `:`, lexically-smallest on collision) from the `annotation_argocd_argoproj_io_tracking_id` label on `kube_service_annotations` / `kube_persistentvolumeclaim_annotations` (KSM's sanitised form of the `argocd.argoproj.io/tracking-id` annotation, gated on `--metric-annotations-allowlist`), via `resolveServiceApplications` / `resolvePVCApplications` (sharing the `argoAppName` + generic `resolveApplications` helper with the pod resolver). The PVC value is set at topology assembly; the **service** value is threaded into the connection-string resolver (`Topology.ServiceApplications` → `sgResolver.serviceApps`) since service nodes are materialised there. **PVC application inheritance (D13):** a PVC with **no** Application of its own additionally **inherits** the lexically-smallest Application among the pods that mount it (the `pod-mounts-pvc` bindings), via `pvcInheritedApps` in a post-PVC-loop pass at topology assembly (joins each binding's pod ID to the pod's already-resolved `Application()`). The PVC's **own** annotation always wins (the pass fills only app-less PVCs); the inherited value is baked onto `PVCNode.Application()` **before** `graph.NewGraph` freezes the nodes, so it is **indistinguishable** from an annotation-sourced value in `data.application` and drives the same `application` compound group. Because `pod-mounts-pvc` is intra-cluster and same-namespace, inheritance never crosses cluster/namespace; it is resolved over the full graph before projection (a `?cluster=`/`?namespace=` filter dropping the mounting pod does not change the PVC's app), and the min over the binding set is order-free (D6). No new query, metric, node, or edge type. So `Application()` returns non-empty on `PodNode` / `ServiceNode` / `PVCNode`, and these `application` values additionally drive the `application` compound group for all three (`controller` groups stay pod-only). (2) `data.containers` (`[{name, image}]`) is the pod's container list from `kube_pod_container_info` (one series per container/image; a topology leg rendered as `tlast_over_time(...)` so each series' value is its last-sample timestamp), ordered by `(name, image)` for determinism, empty-`image` series skipped, and — when a container reports more than one image in the window (each image a distinct series) — the **latest-seen image** kept (greatest last-sample timestamp; lexically-smallest image on an exact tie). The latest pick is reliable for near-now windows; for windows far from the real wall clock VM returns only one image-variant per container (see design.md D-A4), so a far-past window surfaces whatever single variant VM returns (never worse than a fixed pick). Surfaced via `graph.GraphNode.Containers() []graph.Container` (`nil` for non-pods and pods with no container info), resolved in `pkg/build/topology_owners.go` (`resolvePodContainers`). The container read is a KSM default (no `--metric-labels-allowlist`); the controller-annotation families need the operator's `--metric-annotations-allowlist`. All are OPTIONAL (absence degrades gracefully, no build failure). `kube_pod_container_info` also DEGRADES on a query error (`fetchOptional`, harden-topology-read-cardinality D1 — its cardinality multiplies with containers, image variants and pod churn, so it is the leg an upstream series limit rejects first), and `/v1/storage-graph` never reads it, so a storage-graph pod carries no `data.containers`. No new node/edge type.
-- **NetApp storage join is three independently-degrading hops** (`pkg/build/netapp.go`
-  `resolveNetAppStorage`), all rooted at the same key — the PVC's `volumename`
-  (the bound PV name) **rewritten into a match token** and matched against the
-  **stock** Harvest `volume` label (the ONTAP FlexVol name). It is NOT a label
-  equality: ONTAP volume names admit only letters, digits and `_`, so a `volume`
-  value can never equal a `pvc-<uuid>` PV name. The derivation is an ordered
-  list of regex rewrite rules (`--netapp-volume-key-rewrite`), defaulting to
-  "replace `-` with `_`", compared as a **suffix** — which resolves a stock
-  Trident estate without the deployment declaring its `storagePrefix`, while
-  rejecting a clone whose name extends past the PV name. A FlexVol named
-  exactly the token matches. `pkg/build/volumekey.go` owns it and resolves
-  suffix through a length-bucketed hash index (O(volumes)). An uncompilable
-  pattern is a STARTUP failure (`internal/config`), never a silent fallback.
-  **No relabel rule is required or read.** Hops:
-  - **hop A `volume_labels`** — the SOLE source of storage *topology*: the
-    `pvc-to-netapp-aggr` edge, the `netapp-aggr` / `netapp-node` entities, and
-    the PVC `svm` label. An **info series**: its sample value is discarded, only
-    its labels (`cluster` = ONTAP cluster, `node`, `aggr`, `svm`) are read.
-    **Zone agreement** (accept-multi-zone-storage-graph): a claim's CANDIDATE set —
-    the matched series every pick runs over (aggregate, SVM, the owner the edge
-    names, the QoS scope, the ceiling key) — holds only series whose zone agrees
-    with the claim's: `pvcVolume.zone` is the `(az, env)` pair of the claim's
-    `kube_persistentvolumeclaim_info` series and `volumeLabelCandidate.zone` the
-    series' own, both read through the configured label keys by `zoneOf` (the
-    shared `zone` type in `pkg/build/zone.go`, which alerts use too), and
-    `zonesAgree` excludes a series only when BOTH sides carry a complete pair and
-    the pairs differ — an unknown zone never excludes. `volIndex` / `allByAggr`
-    are NOT filtered, so the owner vote and the inventory see every series. It
-    makes a cross-zone FlexVol-token collision (a Trident clone, a hand-chosen
-    naming scheme) resolve within each claim's own zone; it applies to the shared
-    join, so an unfiltered `/v1/graph` changes only in an estate holding such a
-    collision.
-    **Rooted read** (scope-volume-labels-by-storage-root,
-    read-storage-roots-through-volume-hub): a `/v1/storage-graph` request rooted
-    at `ontap_cluster=`, `aggr=` and/or `svm=` reads it restricted. Phase 1 is up
-    to two query GROUPS mirroring the projection, which UNIONS `aggr=` with
-    `svm=` and narrows both by `ontap_cluster=`: `{cluster=…,aggr=…}` and
-    `{cluster=…,svm=…}` (the cluster matcher an AND — an `aggr=`/`svm=` root
-    names a component only WITHIN the `ontap_cluster=` values; `{cluster=…}` alone
-    for a cluster-only request), merged in (group, chunk) order de-duplicated by
-    fingerprint. A QUALIFIED `aggr=` / `svm=` value adds one group per ONTAP
-    cluster after the bare groups (`{cluster="oc",aggr=~…}` / `{cluster="oc",svm=~…}`,
-    clusters in sorted order; `rootedVolumeLabelsChunks`), and the chunk cap
-    counts every group; a qualified aggregate is read whole like a bare one
-    (owner completion and `uncoveredAggrPairs` skip it), and its flowless gauges go
-    through `issueHarvestPairMap` — assigned by the by-name read first, merged by the
-    pair read after, so the order is load-bearing. **Owner completion** then re-reads whole every
-    `(cluster, aggr)` an SVM-group row names, minus the aggregates an `aggr=`
-    root already read whole, because `pickOwner` votes over EVERY series of an
-    aggregate and an SVM group returns only its share (the takeover case). Phase 2
-    re-reads `volume=~".*<token>"` for
-    exactly the claims phase 1 matched, because `pickAggr` / `pickSVM` are
-    lexically-smallest over a claim's WHOLE candidate set and a Trident clone or a
-    same-named FlexVol on a second filer would otherwise move a claim onto or off
-    the rooted aggregate. Under an `svm=` root, every aggregate phase 2 ALONE
-    named is completed too, after phase 2: the two picks are separate, so a
-    claim retained through its rooted SVM can land on such an aggregate and draw
-    its controller. Completion and phase 2 are merged (fingerprint de-dup —
-    a series two reads return must vote once in `pickOwner`) only AFTER the seed's
-    claim read took its candidates from phase 1, so completion rows are never a
-    claim source. It is the FORWARD derivation the join already computes. Phase 2
-    is NOT issued when phase 1 matched no claim. A restriction naming ONLY ONTAP
-    clusters gives phase 2 a `cluster!~"…"` for them — phase 1 read those filers
-    whole. A seed that would take more than `maxRootedVolumeLabelChunks`
-    (= `scopeConcurrency`) queries is rejected 400 `invalid_scope` before any
-    query: the root parameters are repeatable and the parser bounds each value's
-    LENGTH, never the count, so this is the one scope a client can inflate.
-    A request carries one root kind, so `pod=`, `pvc=`, `pv=`, `application=` and
-    `node=` do not compose with a storage root. The join is always suffix, so the token
-    restriction is always renderable. `/v1/graph` never restricts
-    (`fullPlan` answers false structurally). The one body-changing corner: an
-    aggregate or controller named by `volume_labels` ALONE (no `aggr_*` /
-    `node_*` series) outside the rooted components is not materialised, which can
-    change whether a `cluster`-less alert matches a unique entity — the stock
-    Harvest templates name every one, so it needs a non-stock estate.
-    **A storage root's seed reads claims FROM the FlexVol name** (`claimscope.go`):
-    `pvCandidates` turns every `pvc_` boundary suffix of a seeded `volume` into a
-    PV name (a generator, never a judge; static PVs and custom volume-name
-    prefixes are NOT reached from a storage root), `kube_persistentvolumeclaim_info`
-    is scoped on `volumename`, and the expansion reads the other claim families
-    one query per namespace on `(namespace, persistentvolumeclaim)`
-    (`issueClaimFamiliesByNamespace`, shared by every seed kind's claim side and
-    mounter completion — a claim name alone would be read across the estate),
-    filtered to the loaded `(az, env, cluster, namespace, claim)` keys. A data-derived scope is chunked however large it is and never replaced
-    by a read across the zone. `storage_root_claim_miss` (`no_pv_candidate` /
-    `no_claim`) reports a seed that found nothing (`no_claim` drops to Debug under
-    a `cluster=` / `namespace=` filter). **The build stays in the request's zones**
-    (D7): `buildStorage` renders the request's FULL selector and binds
-    `QuerierFor(sel)`, so no query reaches the store of a zone the request did
-    not select and a filer shared across zones draws the selected zones' claims
-    only — operators require that a request queries only its own az / env
-    backends. Do NOT
-    reintroduce an az/env-relaxed or per-family-zone-routed read. Alert
-    matching also AGREES ON ZONE (D11, `pkg/build/alerts.go`), for the builds
-    that do hold several zones (unfiltered `/v1/graph`, a multi-zone `/v1/storage-graph`, catch-all backends): an alert's `az`/`env` pair must agree with the
-    candidate's zone — a Kubernetes object's composed identity, a NetApp
-    controller/aggregate's `ontapZones` set (the pairs its entity-naming Harvest
-    series carry, collected by `ontapZonesOf`, QoS excluded). The check runs on
-    the cluster-qualified NetApp path and filters every kind's no-`cluster`
-    candidates BEFORE `matchUnique`; an unknown zone on either side never
-    excludes. It runs on every build path. Tests: `pkg/build/volumelabelscope_test.go`
-    (parity across root shapes, clone, cross-filer collision, takeover, owner
-    completion, chunking, degrade), `pkg/build/claimscope_test.go`,
-    `pkg/build/hubrouting_test.go`, `pkg/promql/volumelabels_test.go`,
-    `internal/integration` (`TestStorageGraphHubStaysInTheRequestZone`).
-  - **hop B `qos_{read,write}_{ops,latency,data}`** — the six measured I/O
-    figures. **Volume granularity is a READER rule, not a matcher** (D11): the
-    queries carry the `volume` scope and nothing else, and `sumQoSIO` skips
-    every candidate with a non-empty `lun`. ONTAP collects a workload per LUN as
-    well as per volume and a LUN workload carries its FlexVol's `volume`, so the
-    two must never be summed — but the LUN row has to be FETCHED, because on an
-    `ontap-san` backend the QoS policy is attached to the LUN and the FlexVol's
-    own workload sits in ONTAP's built-in `User-Best_effort` class, which
-    declares no ceiling and has no fixed-policy series. A `lun=""` matcher hid
-    the only route to a SAN ceiling; it was also never airtight, since an
-    empty-string matcher admits rows carrying no `lun` label at all. Cardinality
-    stays bounded because the six legs are issued ONLY through
-    `RenderQoSVolumeScoped`. Candidates are further scoped in
-    Go to the picked aggregate's ONTAP cluster (and its `svm` when both sides
-    resolve one) so a colliding FlexVol name across two filers cannot merge.
-    **These six legs are read in a SECOND WAVE** (`pkg/build/qosscope.go`
-    `readScopedQoS`), issued only after hop A and restricted to exactly the
-    FlexVol names the loaded claims matched
-    (`promql.RenderQoSVolumeScoped` renders an anchored `volume=~"…"` as the
-    query's ONLY matcher). The launcher waits on `kube_persistentvolumeclaim_info`
-    and `volume_labels` ALONE — a dependency edge inside the one errgroup, not a
-    barrier behind the whole first wave. An **empty scope issues no QoS query at
-    all** (hop A drew no edge for hop B to measure), mirroring the
-    service-graph short-circuit. A scope exceeding
-    `--netapp-qos-scope-batch-bytes` (default 8192) is chunked deterministically
-    (`promql.ChunkQoSVolumeScope`); a single over-budget name still gets its own
-    query rather than being dropped. Chunks are issued concurrently under
-    `scopeConcurrency` and merged **in chunk-index order, never completion
-    order** — `sumQoSIO` adds float64s, so a timing-dependent merge would make
-    the last bits of every I/O figure depend on which chunk answered first.
-    On `/v1/graph` each chunk degrades on its own (log-and-continue), so a failed
-    chunk costs I/O measurements only for the claims whose volumes it carried and
-    never an edge, aggregate, controller or `svm`; on `/v1/storage-graph` a failed
-    chunk fails the build. The `volume` alternation is derived
-    from UPSTREAM DATA, not the request, so `queryDims` is unchanged and the
-    Harvest family still renders no `az` / `env` / `cluster` / `namespace`
-    matcher — but the claims that produced it were loaded under the request's
-    selectors, which is "narrowed by reference" reaching the query layer.
-  - **hop C `qos_policy_fixed_max_throughput_{iops,mbps}`** — the declared
-    ceiling, joined on the `(ontap_cluster, svm, policy_group)` triple assembled
-    from BOTH topology hops: **hop A** owns the ONTAP cluster of the picked
-    aggregate (a FlexGroup claim, which resolved no aggregate, takes the ONTAP
-    cluster the SVM pick itself landed on) and the SVM the `volume_labels` match
-    resolved, **hop B** owns the
-    `policy_group` (`volume_labels` carries no policy identity, so hop B is the
-    only upstream statement of which policy governs this FlexVol). Anchoring the
-    first two on hop A is what lets a workload series carrying a `policy_group`
-    but NO `svm` still resolve a ceiling, and keeps the key on the filer the
-    edge points at. The policy's identity label is read as `name` with a
-    `policy_group` fallback (Harvest spells it differently across templates).
-    The pick reads candidates at BOTH granularities and **prefers a
-    `policy_group` the fixed-policy index actually holds**, falling back to the
-    lexically-smallest non-empty value — data-driven rather than a hardcoded
-    list of built-in class names, and load-bearing because `User-Best_effort`
-    sorts BEFORE a name like `gold-tier`. An incomplete or unmatched key is
-    **ignored, never widened** — no hop-A
-    `svm`, no non-empty `policy_group`, or no matching series leaves both fields
-    absent rather than borrowing another policy group's figure from the same
-    SVM. `max_bytes_per_sec` is the **one** value not read verbatim:
-    `mbps × 1048576` (`bytesPerMB`), so the ceiling shares the unit of
-    `read_bytes_per_sec`.
-  The hop split is load-bearing: a hop-B miss leaves a valid **measurement-less
-  edge**, it never costs the claim its topology. On the EDGE a ceiling can NEVER
-  appear without a measurement — structurally, because the attachment sits inside
-  the `io != nil` branch (`applyCeiling`), with `metricsDTO` deliberately not
-  letting a ceiling set `filled`. The **PVC node** carries the same ceiling as
-  `data.qos` whenever one resolved, measured or not and aggregate or not
-  (FlexGroup included): `resolveCeiling` runs ONCE per claim, before the
-  aggregate gate, into `netappResult.qosByPVC` (stamped onto `PVCNode.QoSValue`
-  beside the `svm` / `aggr` labels), and the edge copies its two figures from
-  that value, so node and edge cannot disagree and never share a float cell. The
-  node is decoupled from the measurement rule but NOT from hop B: the policy
-  group is still recovered only FROM a matched workload series (LUN rows
-  included), so a claim with no in-scope workload series has no `qos` in either
-  place. A volume in no policy group carries no ceiling.
-  Both `volumename` and `svm` are **plain labels**, set only when non-empty;
-  `svm` is impossible without `volumename` and comes from hop A ONLY (hop B's
-  own `svm` only SCOPES a workload candidate to the claim's volume in
-  `qosInScope` — it is neither a join key nor a fallback since D9 re-keyed the
-  ceiling's `svm` component onto hop A). The hop-A pick runs `pickAggr` FIRST and scopes
-  `pickSVM` to the ONTAP cluster it landed on, so a cross-filer FlexVol-name
-  collision cannot pair one filer's aggregate with another's SVM — which would
-  reject every in-scope workload and key the ceiling on a foreign tenant (D10);
-  with no aggregate resolved (FlexGroup) the pick is unscoped and the claim
-  still gains its `svm`. **`volumename` ≠ `volume`**.
-  A third plain label, **`aggr`**, is copied verbatim from the `target` of the
-  same claim's `pvc-to-netapp-aggr` edge — never composed or re-derived — so it
-  is an **opaque node id** (`netapp/<ontap_cluster>/aggr/<aggr>`), matched
-  against a `netapp-aggr` node's `data.id` and never parsed for its aggregate
-  name or ONTAP cluster. It is absent, never an empty string, whenever the
-  claim resolved no aggregate (a FlexGroup volume, a join miss, a claim with no
-  `volumename`, or a window without Harvest), and it is independent of `svm`:
-  an empty-`svm` series still yields `aggr`, and a FlexGroup series yields
-  `svm` with no `aggr`. Both `GET /v1/graph` and `GET /v1/storage-graph` carry
-  it, stamped once in the shared topology beside `svm` — on `/v1/graph` it
-  restates the `pvc-to-netapp-aggr` edge already in the body.
-  All 20 Harvest/kubelet legs plus `ALERTS` are OPTIONAL (log-and-continue) on `/v1/graph`.
-  **`/v1/storage-graph` fails closed** (fail-storage-graph-on-any-leg-error): `storagePlan.failClosed`
-  makes every first-wave leg and every scoped QoS chunk required except `ALERTS`, and every wave
-  only a by-reference plan issues (pods, nodes, controllers, application recovery, the
-  seed's `volume_labels` incl. owner completion, and the expansion's claim-keyed reads) is required unconditionally — `scopedFamily` has no error class any more.
-  A failed query is wrapped in `build.QueryError`; `build.Error.Query` carries the bare family
-  name and `mapBuildError` writes `upstream query failed: <family>` (never upstream text).
-  An empty vector still never fails a build. **Two** coverage
-  warnings, each gated on its OWN family having been read:
-  `slog.Warn("netapp_volume_join_miss", "count", n)` (hop-A miss or
-  empty-`aggr`; under a restricted volume-label read counted only over claims
-  that matched a series, so a FlexGroup still reports and a claim off the rooted
-  components does not) and
-  `slog.Warn("netapp_qos_join_miss", "count", n)` (edge drawn,
-  no QoS match — under the scoped read its gate means "at least one issued chunk
-  returned series", so a build that issued none is silent). No signal for a
-  missing ceiling — an SVM with no fixed-policy series is normal. Tests: `pkg/build/volumekey_test.go`, `pkg/build/qosscope_test.go`,
-  `pkg/build/netapp_test.go` (incl. the fan-out pin: 37 legs with no matched
-  volume, 43 with one), `pkg/build/build_storage_plan_test.go` (the storage
-  plan's parity pin and its by-reference fan-out pin: 18 legs with nothing
-  named, growing per named pod/node/owner up to 38 with every controller kind
-  present and a matched volume; an `application=` root adds 6 / 6+1+2 / 6+2+6
-  as in docs/upstream-metrics.md; per-kind seed and expansion counts are pinned by
-  `TestBuildStorage_FanOutLegCount` and `TestBuildStorage_FanOutLegCount_Hub`, whose
-  `pvc` / `pv` rows pin 2 / 7 / 25 / 32 queries), `pkg/build/claimseed_test.go`,
-  `pkg/build/podscope_test.go`,
-  `pkg/build/appscope_test.go`, `pkg/build/nodescope_test.go`,
-  `pkg/build/controllerscope_test.go`, `pkg/build/scopedread_test.go`,
-  `pkg/promql/scope_test.go`, `pkg/promql/appscope_test.go`,
-  `pkg/promql/qosscope_test.go`,
-  `pkg/promql/queries_test.go` (`TestRender_QoSVolumeGranularity` pins the
-  ABSENCE of any `lun` matcher),
-  `internal/api/testdata/golden/with-netapp-storage-cytoscape.json`,
-  `internal/integration` (`TestPVCNetAppHarvestJoin`).
-- **Node `status` attribute.** `PodNode`, `K8sNode`, `PVCNode`,
-  `NetAppNode`, and `NetAppAggrNode` always carry one of `"normal"`,
-  `"warning"`, or `"critical"` in `data.status`; services, externals, SVMs,
-  and synthesised compound groups omit it. `attachStatus` runs immediately
-  after `attachAlerts` on both build paths and stores the pure
-  `graph.FoldStatus` result before `graph.NewGraph`: alert severity is compared
-  case-insensitively (`critical` → critical; `warning`, empty, or unrecognised
-  → warning; `info` / `none` → no effect), `health="degraded"` and
-  `ready_status="NotReady"` → critical, and `ready_status="Unknown"` →
-  warning; worst wins, else normal. `data.perf` is deliberately not read —
-  thresholds belong in alert rules. `"normal"` means no negative signal was
-  observed, NOT that every optional signal source was present. Status never
-  propagates to a parent or neighbour; consumer-side group roll-up remains a
-  view concern.
-- **K8s node `ready_status` attribute.** Each `type="node"` node may carry a typed, nullable `ready_status` attribute — `data.ready_status` (a string), serialised with `omitempty` and **never inside `labels`** — same precedent as `ipaddress` / `owner`. The value is one of `"Ready"`, `"NotReady"`, `"Unknown"`, derived from `kube_node_status_condition{condition="Ready"}` (a new topology query in the `ReadTopology` errgroup; the `condition="Ready"` selector is a fixed, **request-invariant metric-selection contract** — same class as the node-address `type` selector and the D30 sentinel — NOT a caller filter, and it is rendered ahead of any request-scoped matcher). The reader reads the `status` label of the **active** row (sample value `1`), matched **case-insensitively**: `true`→`Ready`, `false`→`NotReady`, `unknown`→`Unknown`. Status-label casing is NOT pinned by the KSM-shaped contract — stock kube-state-metrics lowercases it (`addConditionMetrics`→`strings.ToLower`), but an exporter that re-publishes the raw Kubernetes `v1.ConditionStatus` enum verbatim emits `True`/`False`/`Unknown`; both resolve (the reader canonicalises to lowercase at the read site). **Absence is distinct from `"Unknown"`**: `data.ready_status` is omitted entirely when the metric is absent, the node has no `condition="Ready"` series, or no row is active — `"Unknown"` is reserved for the genuine Kubernetes state where the kubelet has stopped reporting; the two MUST NOT be conflated (no defaulting missing data to `"Unknown"`). Surfaced via `graph.GraphNode.ReadyStatus() string` (`""` for non-nodes and nodes with no Ready data), resolved in `pkg/build/topology_attrs.go` (`resolveNodeReadyStatus`, keyed `(cluster, node)` like the IP/label joins); on the defensive multi-active tie the lexically-smallest `status` wins (determinism). The metric is a KSM default and OPTIONAL (absence degrades gracefully, no build failure). No new node/edge type.
-- **Upstream backend routing (`add-multi-backend-query-routing`).** Every upstream call is dispatched through a `*promql.Router` over a validated, immutable `promql.Table` of named backends (URL + `families` + `zones` + resolved credentials). Full operator reference: `docs/upstream-backend-routing.md`.
-  - **Caller-declared family (`Router.QueryLabels`).** An embedder names an arbitrary metric and supplies one of the six families; dispatch reuses Instant's Select / fan-out / merge / fail-closed core rather than a second policy. An unserved family is an error on this path (unlike the server's optional `alerts` Debug-empty).
-  - **The seam is an OPTIONAL upgrade interface, not a widened one** (D1). `Querier.Instant` carries the query name but not the `Selector`, and the selector's `az` is what picks a backend — so `promql.QuerierSource` (`QuerierFor(sel) Querier`) was added alongside `Querier`, and `build.New` type-asserts its argument for it. `*Router` satisfies BOTH. Nothing in `pkg/promql`, `pkg/build`, or `pkg/kubegraph` changed signature, so a plain `Querier` (a `*Client`, a mock, an embedder) behaves exactly as before. Same shape as `build.BuildScopedRouteResolver`.
-  - **`Builder.Build` resolves the querier ONCE** (D2) and threads it through `ReadTopology`, `ReadServiceGraph` and the retention `up{}` probe. That is what makes "a reload does not disturb a build in flight" structural: the bound querier closes over one table snapshot, and the build cannot probe a different set of stores than it read from.
-  - **`queryFamily` is a second hardcoded table beside `queryDims`** — six families (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`, `alerts`), exhaustive over the `Query` constants and guarded by `TestQueryFamily_EveryQueryListed`. `alerts` is the first **optional** family: a table serving it on no backend is valid. `Family.AcceptsAZ()` is **derived** from `queryDims` (true iff every query in the family carries `dimAZ`), so routing and matcher rendering read the same fact from the same place.
-  - **Zone-routability is declared per query beside the matcher table** (D4): `Family.AcceptsAZ()` is true iff every query in the family carries `dimAZ` (matcher AND route — `ksm`, `kubelet`, `alerts`, `harvest`); no family is routed by zone without the matcher, so `AcceptsAZ` and `RendersAZ` agree for every family. `servicegraph` and `probe` are `dimsNone`, so a `?az=`-scoped request still reaches EVERY backend serving them; narrowing them would drop edges whose series live in another zone's store, and the connectivity prune would then delete the pods on both ends. Routing composes **with** the PromQL matcher, never instead of it — the rendered query string is identical across every backend it is issued to, and `env` / `cluster` / `namespace` never route. **Harvest routes AND matches** (D13): the Harvest legs go to the zone's `harvest` backend(s) carrying the request's `az` / `env` (the six QoS workload legs and the restricted `volume_labels` reads additionally carry a data- or root-derived scope AFTER them — `promql.RenderQoSVolumeScoped` / `RenderVolumeLabels*` take `(keys, sel)`, and the phase-1 / owner-completion chunkers charge `promql.RequestMatcherCost`), so a catch-all `harvest` backend under `?az=` / `?env=` answers for the requested zone only. Only an unfiltered build reads every zone's filers; there a cross-zone FlexVol-name collision resolves to the lexically-smallest `(ontap_cluster, aggr)`.
-  - **The merge de-duplicates by label-set fingerprint, and that is mandatory** (D5). Backends are concatenated in ascending `name` order and a series whose label set was already contributed is dropped. Several readers SUM across contributing series — the service-graph request/failure totals most visibly — so an undeduplicated merge multiplies an edge's `rate`/`error_rate` by the number of backends holding the series. Pinned end-to-end by `internal/integration` (`TestDuplicateServiceGraphSeriesDoesNotDoubleTheRate`). A duplicate with a DIFFERENT value keeps the first copy, is counted, and is logged at Debug — never escalated.
-  - **Required legs fail closed** (D6). Any backend error fails the query, naming the backend; a partial fan-out is indistinguishable from a smaller estate and renders as a plausible, smaller, wrong graph. Already-optional legs (Harvest, kubelet, `kube_replicaset_annotations`, `kube_job_annotations`) keep degrading. A requested zone NO backend declares is the one non-error miss: empty vector + a Warn naming the family and the zone values.
-  - **Parsing lives in `pkg/promql/backendsfile`, never in `pkg/promql` itself** (D3/D14). `pkg/promql` receives an already-validated `Table` and stays free of file I/O and of any parser dependency — pinned by `make check-parser-containment`. The parser sits in a `pkg/` subpackage rather than `internal/config` because the engine is importable: an external module cannot reach `internal/*`, so a parser there would force every embedder to hand-roll the schema, the validation and the credential rules. `internal/config`'s `ReadBackendsFile` / `ParseBackendsFile` / `SingleBackendTable` are delegations. The embedder surface is `backendsfile.Read` / `.Parse`, `backendsfile.Reloader` / `Start` (optional logger + metrics; nil means silent and unrecorded), `promql.SingleBackendTable`, and `kubegraph.NewRouted`. The file is read with `sigs.k8s.io/yaml` (already in the module graph via istio — promoting it to direct adds NO new module), so one struct with json tags accepts YAML and JSON alike. Parsing is STRICT: an unknown field is an error, because a misspelled `zone:` for `zones:` would silently turn a zone-scoped backend into a catch-all.
-  - **Compatibility is an implicit table, not a branch** (D9). No `--backends-file` ⇒ one backend named `default` at `--prom-url` serving all six families with no zones. Every existing unit, component, golden and integration test therefore exercises the router in its degenerate configuration — the byte-identical claim is tested, not asserted.
-  - **Reload is a ticker + atomic pointer swap** (D7), mirroring `--api-keys-file`. A file that fails to read/parse/validate is rejected WHOLESALE and re-reported every tick (the content digest is deliberately not advanced); an invalid file at STARTUP is fatal instead, since there is no previously-good table to fall back to. Clients are keyed by `(url, username, password)` and reused across a swap; retired ones get `CloseIdleConnections()`.
-  - **Credentials never live in the routing file.** A backend names env vars (`usernameEnv` / `passwordEnv`); a literal `username`/`password` field is rejected, a half-declared pair is rejected, and a named-but-UNSET variable is a load failure rather than a quiet fallback — a typo would otherwise become 401s from one store, which under D6 fails the build pointing at the wrong thing. `Backend.String()` / `Table.String()` report `auth=true|false` and never a value.
-  - **New self-metrics rather than new labels** (D10). `kube_state_graph_upstream_query_duration_seconds` / `..._failures_total` keep their `query`-only label sets; per-backend detail is `kube_state_graph_upstream_backends`, `..._backend_config_reload_total{result}`, `..._backend_query_failures_total{backend}`. `promql.Metrics` is likewise NOT widened — `promql.RouterMetrics` is a third optional upgrade interface, type-asserted. The backend name rides on the existing `prometheus.query` span as `kube_state_graph.backend`, omitted when unrouted. `kube_state_graph_upstream_query_result_series{query}` (histogram, buckets 1024 … 1048576) is recorded by `Client.Instant` through yet another optional upgrade, `promql.SeriesMetrics`, from the same `len(vec)` as the span's `result_series_count` — one observation per successful query, chunk and backend — so an operator sees a leg approach `-search.maxUniqueTimeseries` before it is rejected; both build log lines also name the `largest_leg`.
-  - **`/readyz` and the retention probe are multi-backend.** `promql.Prober` (a fourth optional upgrade) makes `Router.ProbeAll` ask every probe-serving backend concurrently under the one `--api-timeout` budget WITHOUT cancelling on first failure — a probe that stopped early could only ever name one backend. The 503 body carries `promql.ProbeError.Failed`: operator-chosen backend NAMES only, never a URL/host/IP, since `/readyz` is unauthenticated. The retention `up{}` probe rides the build's own bound querier, so a backend that did not answer suppresses the `outside_retention` classification (an empty graph stays an empty graph).
-
-- **No configurable metric-name prefix.** `--metric-prefix` / `KSG_METRIC_PREFIX` / `Renderer.Prefix` are removed. Every series is queried at its bare name (`promql.Render(q, window)`). A deployment whose KSM series ARE prefixed silently returns an empty graph — see `docs/BREAKING.md`. The D29 endpointslice → service join still reads `kube_endpointslice_labels{label_kubernetes_io_service_name}`, which KSM only emits when `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` is set. The metric-name suffix and the label-name set per series are a fixed contract any compatible exporter MUST honour.
 
 ### Reusable `pkg/` graph engine (D32)
 
@@ -1132,7 +193,7 @@ with no-op defaults, so an embedder does not inherit ksg's `kube_state_graph_*`
 self-metrics; the concrete `*observability.Metrics` satisfies
 `build.Metrics` / `promql.Metrics` structurally via wrappers in
 `internal/observability/adapters.go`. The upstream load controls (limit, cache,
-end alignment) are ON for an embedder by default — see "Upstream load controls";
+end alignment) are ON for an embedder by default — see `.claude/rules/upstream-queries.md`;
 `kubegraph.Options` gains `EndAlign`, `MaxConcurrency`, `QueryCacheMaxSeries`,
 `QueryCacheTTL` (zero ⇒ default, negative ⇒ off) and `promql` exports `Guard`,
 `RouterOption`, `WithMaxConcurrency`, `WithQueryCache`, `WithGuardMetrics`.
@@ -1141,38 +202,10 @@ end alignment) are ON for an embedder by default — see "Upstream load controls
 
 `graph.GraphNode` is a sealed interface (`isGraphNode()` unexported). Concrete
 types: `PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`,
-`NetAppAggrNode`, `NetAppNode`, `NetAppSVMNode`. All
-expose `ID()`, `Name()`, `Type()`, `Labels()`, `IPAddress()`, `Owner()`,
-`Application()`, `Containers()`, `ReadyStatus()`, `Health()`, `Usage()`,
-`StorageClass()`, `QoS()`, `Hardware()`, `Perf()`, `Alerts()`, `Status()`. Serialisation
-goes through these methods — never through type switches in the serialiser.
-`IPAddress()` returns nil for `PVCNode` / `ExternalNode`; `PodNode` returns
-`[pod_ip]` when known;
-`K8sNode` returns `[external_ip]` when known; `ServiceNode` returns
-`[cluster_ip]` when known (nil when headless `cluster_ip="None"`).
-`Owner() *graph.Owner` returns the controller owner (`{Kind, Name}`) for
-`PodNode` when known and nil for every other node kind and for ownerless pods
-(D34) — serialised as the `omitempty` `data.owner` object.
-`Application() string` returns the ArgoCD Application of a `PodNode`,
-`ServiceNode`, or `PVCNode` (`""` for `K8sNode` / `ExternalNode` /
-`NetAppAggrNode` / `NetAppNode` and for ArgoCD-less pods/services/pvcs) and
-`Containers() []graph.Container` returns a `PodNode`'s ordered `{name, image}`
-list (`nil` for every other node kind) — serialised as the `omitempty`
-`data.application` / `data.containers` attributes.
-`ReadyStatus() string` returns a `K8sNode`'s Kubernetes Ready-condition status
-(`"Ready"` / `"NotReady"` / `"Unknown"`; `""` for every other node kind and for
-nodes with no Ready data) — serialised as the `omitempty` `data.ready_status`
-attribute. `""` (omitted) is distinct from `"Unknown"` (kubelet lost contact).
-`Health() string` returns `"online"` / `"degraded"` for NetApp types (`""` otherwise;
-absence ≠ degraded). `Usage() *UsageBytes` returns kubelet/Harvest used+capacity
-bytes for PVC and aggregate nodes. `StorageClass() string` is the PVC's own
-policy name (`data.storageclass`). `QoS() *graph.QoSCeiling` returns a PVC's
-declared throughput ceiling `{PolicyGroup, MaxIOPS, MaxBytesPerSec}` (`nil` for
-every other node kind and for a PVC whose ceiling did not resolve; non-nil
-implies at least one figure) — serialised as the `omitempty` `data.qos` object,
-both figures rounded like the edge's. `Status() string` returns the baked
-`"normal"` / `"warning"` / `"critical"` verdict for pods, K8s nodes, PVCs,
-NetApp controllers, and aggregates, and `""` for services, externals, and SVMs.
+`NetAppAggrNode`, `NetAppNode`, `NetAppSVMNode`. Every attribute is a method on
+the interface returning its zero value for the kinds it does not apply to;
+serialisation goes through these methods — never through type switches in the
+serialiser. Per-method semantics: `.claude/rules/graph-model.md`.
 
 ### Test stack layers
 
@@ -1265,8 +298,8 @@ changes, start a new change and write its delta specs under
   OpenTelemetry Go SDK family (`go.opentelemetry.io/otel`, `sdk`, `sdk/log`,
   OTLP gRPC + HTTP exporters for `otlptrace` and `otlplog`, `semconv/v1.27.0`,
   `contrib/...otelgin`, `contrib/...otelhttp`, `contrib/bridges/otelslog`),
-  and — **contained to `pkg/route` + `cmd/` only** (see the route-resolution
-  bullet) — `istio.io/istio` + `istio.io/api` (pinned; in-process istiod
+  and — **contained to `pkg/route` + `cmd/` only** (see
+  `.claude/rules/route-resolution.md`) — `istio.io/istio` + `istio.io/api` (pinned; in-process istiod
   translation), `ClickHouse/clickhouse-go/v2` (route store),
   `envoyproxy/go-control-plane/envoy` (RouteConfiguration protos), and
   `google.golang.org/protobuf`.
