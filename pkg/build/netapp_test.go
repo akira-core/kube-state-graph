@@ -73,7 +73,7 @@ func (f netappFixture) vectors() topologyVectors {
 }
 
 func (f netappFixture) run() netappResult {
-	return resolveNetAppStorage(f.claims, f.vectors())
+	return resolveNetAppStorage(f.claims, f.vectors(), promql.LabelKeys{})
 }
 
 func claim1() []pvcVolume { return []pvcVolume{{id: "c/db/data", volumeName: "pvc-x"}} }

@@ -357,3 +357,31 @@ func TestSortAlerts_SortsAndDeduplicates(t *testing.T) {
 
 	assert.Nil(t, SortAlerts(nil))
 }
+
+// TestQoS_OnlyPVCsCarryIt — QoS() returns the resolved ceiling for a PVC and
+// nil for every other node kind and for a PVC with no resolved ceiling. It is
+// consumed only by the Cytoscape serialiser as the typed data.qos attribute,
+// never a label.
+func TestQoS_OnlyPVCsCarryIt(t *testing.T) {
+	iops, bps := 5000.0, 262144000.0
+	want := &QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: &iops, MaxBytesPerSec: &bps}
+	pvc := &PVCNode{IDValue: "c/n/claim", NameValue: "claim", QoSValue: want}
+	assert.Same(t, want, pvc.QoS())
+
+	unresolved := &PVCNode{IDValue: "c/n/claim2", NameValue: "claim2"}
+	assert.Nil(t, unresolved.QoS(), "PVC with no resolved ceiling returns nil")
+
+	others := []GraphNode{
+		&PodNode{IDValue: "c/u"},
+		&K8sNode{IDValue: "c/w"},
+		&ServiceNode{IDValue: "c/n/s"},
+		&ExternalNode{IDValue: "external/x"},
+		&NetAppAggrNode{IDValue: NetAppAggrID("oc", "a1")},
+		&NetAppNode{IDValue: NetAppNodeID("oc", "n1")},
+		&NetAppSVMNode{IDValue: NetAppSVMID("oc", "svm1")},
+	}
+	require.Len(t, others, 7, "every non-PVC node type is covered")
+	for _, n := range others {
+		assert.Nilf(t, n.QoS(), "%T must return nil QoS", n)
+	}
+}

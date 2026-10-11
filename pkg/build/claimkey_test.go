@@ -14,7 +14,7 @@ import (
 // cluster label and a literal "unknown" are one cluster to the parse
 // (bucketCluster), so a binding row of either survives a filter built from a
 // seed row of the other; another cluster or namespace does not.
-func TestKeepClaimBindings_BucketsTheClusterAsTheParseDoes(t *testing.T) {
+func TestClaimKeyOf_BucketsTheClusterAsTheParseDoes(t *testing.T) {
 	keys := promql.LabelKeys{}.OrDefault()
 	row := func(pairs ...string) *model.Sample {
 		m := model.Metric{"az": "zone-a", "env": "prod", "persistentvolumeclaim": "data"}
@@ -30,7 +30,11 @@ func TestKeepClaimBindings_BucketsTheClusterAsTheParseDoes(t *testing.T) {
 		row("namespace", "platform", "pod", "api-0"),
 	}
 
-	got := keepClaimBindings(byClaim, trackedClaimKeys(seed, keys), keys)
+	tracked := trackedClaimKeys(seed, keys)
+	got := keepRows(byClaim, func(m model.Metric) bool {
+		_, ok := tracked[claimKeyOf(m, keys, bindingClaim(m))]
+		return ok
+	})
 	require.Len(t, got, 1)
 	assert.Equal(t, model.LabelValue("unknown"), got[0].Metric["cluster"])
 }
@@ -45,6 +49,9 @@ func TestAnnotatedClaimKeys(t *testing.T) {
 		planKSM("namespace", "shop", trackingLabel, "billing:/PersistentVolumeClaim:shop/nameless"),
 	}
 	got := annotatedClaimKeys(rows, []string{"billing", ""}, keys)
-	assert.Equal(t, []string{"ledger-data"}, claimNamesFromKeys(got))
+	require.Len(t, got, 1)
+	for k := range got {
+		assert.Equal(t, "ledger-data", k.claim)
+	}
 	assert.Nil(t, annotatedClaimKeys(rows, nil, keys), "no root tracks no claim")
 }

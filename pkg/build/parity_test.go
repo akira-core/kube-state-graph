@@ -55,6 +55,8 @@ func TestStorageParityHarness(t *testing.T) {
 				graph.StorageRootSVM:          "svm_shop",
 				graph.StorageRootNode:         "worker-1",
 				graph.StorageRootPod:          "shop/orders-0",
+				graph.StorageRootPVC:          "shop/orders-data",
+				graph.StorageRootPV:           "pvc-orders",
 				graph.StorageRootApplication:  "shop-orders",
 			}),
 			check: func(t *testing.T, root parityRoot, body cytoscape.Body) {
@@ -76,6 +78,8 @@ func TestStorageParityHarness(t *testing.T) {
 				graph.StorageRootSVM:          "svm_shop",
 				graph.StorageRootNode:         "worker-1",
 				graph.StorageRootPod:          "shop/orders-0",
+				graph.StorageRootPVC:          "shop/orders-data",
+				graph.StorageRootPV:           "pvc-orders",
 				graph.StorageRootApplication:  "shop-orders",
 			}),
 			check: func(t *testing.T, root parityRoot, body cytoscape.Body) {
@@ -101,6 +105,8 @@ func TestStorageParityHarness(t *testing.T) {
 				graph.StorageRootSVM:          "svm_lab",
 				graph.StorageRootNode:         "worker-1",
 				graph.StorageRootPod:          "shop/orders-0",
+				graph.StorageRootPVC:          "shop/orders-data",
+				graph.StorageRootPV:           "pvc-orders",
 				graph.StorageRootApplication:  "shop-orders",
 			}),
 			check: func(t *testing.T, root parityRoot, body cytoscape.Body) {
@@ -122,6 +128,8 @@ func TestStorageParityHarness(t *testing.T) {
 				graph.StorageRootSVM:          "svm_shop",
 				graph.StorageRootNode:         "worker-1",
 				graph.StorageRootPod:          "shop/beta-rwx-0",
+				graph.StorageRootPVC:          "shop/shared-beta",
+				graph.StorageRootPV:           "pvc-sharedbeta",
 				graph.StorageRootApplication:  "beta",
 			}),
 			check: func(t *testing.T, root parityRoot, body cytoscape.Body) {
@@ -170,6 +178,8 @@ func TestStorageParityHarness(t *testing.T) {
 				graph.StorageRootSVM:          "svm_fg",
 				graph.StorageRootNode:         "worker-1",
 				graph.StorageRootPod:          "shop/web-0",
+				graph.StorageRootPVC:          "shop/fg-data",
+				graph.StorageRootPV:           "pvc-fg",
 				graph.StorageRootApplication:  "storefront",
 			}),
 			check: func(t *testing.T, root parityRoot, body cytoscape.Body) {
@@ -196,6 +206,8 @@ func TestStorageParityHarness(t *testing.T) {
 					graph.StorageRootSVM:          "netapp/ontap-prod/svm/svm_lonely",
 					graph.StorageRootNode:         "zone-a-prod-c1/worker-3",
 					graph.StorageRootPod:          "zone-a-prod-c1/uid-w0",
+					graph.StorageRootPVC:          "zone-a-prod-c1/platform/cache-data",
+					graph.StorageRootPV:           "zone-a-prod-c1/platform/cache-data",
 					graph.StorageRootApplication:  "zone-a-prod-c1/uid-w0",
 				}
 				assert.True(t, parityHasID(body, want[root.kind]), "kind %s draws its flowless root", root.kind)
@@ -239,6 +251,8 @@ func parityOrdersRoots() map[graph.StorageRootKind]string {
 		graph.StorageRootSVM:          "svm_shop",
 		graph.StorageRootNode:         "worker-2",
 		graph.StorageRootPod:          "shop/orders-0",
+		graph.StorageRootPVC:          "shop/orders-data",
+		graph.StorageRootPV:           "pvc-orders",
 		graph.StorageRootApplication:  "shop-orders",
 	}
 }
@@ -251,6 +265,8 @@ func parityFlowlessRoots() map[graph.StorageRootKind]string {
 		graph.StorageRootSVM:          "svm_lonely",
 		graph.StorageRootNode:         "worker-3",
 		graph.StorageRootPod:          "shop/web-0",
+		graph.StorageRootPVC:          "platform/cache-data",
+		graph.StorageRootPV:           "pvc-cache",
 		graph.StorageRootApplication:  "storefront",
 	}
 }

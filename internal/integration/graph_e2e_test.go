@@ -1427,19 +1427,29 @@ kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namesp
 
 // TestPVCNetAppHarvestJoin — ingest a PVC binding, kube_persistentvolumeclaim_info
 // with volumename, Harvest volume/aggr/node series, and kubelet usage against
-// VictoriaMetrics; assert svm, pvc-to-netapp-aggr, health, usage, and nesting.
+// VictoriaMetrics; assert svm, pvc-to-netapp-aggr, health, usage, nesting, and
+// the PVC node's data.qos ceiling (which equals the edge's on a measured claim
+// and is independent of it for a FlexGroup or LUN-only claim).
 func (s *GraphSuite) TestPVCNetAppHarvestJoin() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_spec_volumes_persistentvolumeclaims_info dummy
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="netapp-data",volume="data",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="qosless-data",volume="archive",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="flex-data",volume="flex",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="checkout",persistentvolumeclaim="lunonly-data",volume="san",test=%[1]q} 1 %[2]d
 # HELP kube_persistentvolumeclaim_info dummy
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="netapp-data",storageclass="netapp-nas",volumename="pvc-9f3a",test=%[1]q} 1 %[2]d
 kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="qosless-data",storageclass="netapp-nas",volumename="pvc-noqos",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="flex-data",storageclass="netapp-nas",volumename="pvc-flex",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="lunonly-data",storageclass="netapp-san",volumename="pvc-lunonly",test=%[1]q} 1 %[2]d
 # HELP volume_labels dummy
 volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_9f3a",test=%[1]q} 1 %[2]d
 volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_noqos",test=%[1]q} 1 %[2]d
+# A FlexGroup volume: it spans aggregates, so the series carries no aggr label
+# and no pvc-to-netapp-aggr edge can be drawn — the svm still resolves.
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",svm="svm-prod",volume="trident_pvc_flex",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr1",svm="svm-prod",volume="trident_pvc_lunonly",test=%[1]q} 1 %[2]d
 # HELP qos_read_ops dummy
 # The ontap-san shape. Hop C keys on (cluster, svm, policy_group): cluster and
 # svm come from the volume_labels match above, policy_group from the workload
@@ -1457,6 +1467,12 @@ qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume
 # pkg/build TestReadScopedQoS_RestrictedToMatchedVolumes), and it must not
 # reach any edge even if it were fetched.
 qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume="root_vol",test=%[1]q} 9999 %[2]d
+# The FlexGroup claim's workload names bronze-tier, so its node ceiling is
+# bronze's own figures — a per-claim resolution, never the svm's other policy.
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="bronze-tier",volume="trident_pvc_flex",test=%[1]q} 10 %[2]d
+# A LUN-only claim: the only workload row is LUN-level, so the edge measures
+# nothing (the LUN row is never summed) while the row still names the policy.
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",policy_group="gold-tier",volume="trident_pvc_lunonly",lun="/vol/pvc_lunonly/lun0",test=%[1]q} 20 %[2]d
 # HELP qos_read_data dummy
 qos_read_data{cluster="ontap-prod",svm="svm-prod",volume="trident_pvc_9f3a",test=%[1]q} 5242880 %[2]d
 # HELP qos_write_data dummy
@@ -1535,14 +1551,20 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 		s.NotEqual("ontap-prod", c)
 	}
 
-	var found, foundQoSless bool
+	var found, foundQoSless, foundLUNOnly bool
+	var measured *cytoscape.EdgeMetricsDTO
 	for _, e := range body.Elements.Edges {
+		if e.Data.Type == "pvc-to-netapp-aggr" {
+			s.NotEqual("cluster-alpha/shop/flex-data", e.Data.Source,
+				"a FlexGroup claim resolved no aggregate, so it draws no pvc-to-netapp-aggr edge")
+		}
 		if e.Data.Type != "pvc-to-netapp-aggr" || e.Data.Target != "netapp/ontap-prod/aggr/aggr1" {
 			continue
 		}
 		switch e.Data.Source {
 		case "cluster-alpha/shop/netapp-data":
 			found = true
+			measured = e.Data.Metrics
 			s.Equal(pvc.Labels["aggr"], e.Data.Target, "labels.aggr must equal the pvc-to-netapp-aggr edge target")
 			s.Require().NotNil(e.Data.Metrics)
 			s.Require().NotNil(e.Data.Metrics.ReadOps)
@@ -1567,10 +1589,58 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 		case "cluster-alpha/shop/qosless-data":
 			foundQoSless = true
 			s.Nil(e.Data.Metrics, "no QoS workload ⇒ no metrics key, ceiling included")
+		case "cluster-alpha/shop/lunonly-data":
+			foundLUNOnly = true
+			s.Nil(e.Data.Metrics, "the LUN row is never summed ⇒ no measurement, so no ceiling on the edge")
 		}
 	}
 	s.True(found, "expected a pvc-to-netapp-aggr edge")
 	s.True(foundQoSless, "expected the qos-less claim to keep its aggregate edge")
+	s.True(foundLUNOnly, "expected the LUN-only claim to keep its aggregate edge")
+
+	// data.qos — the claim's declared ceiling as a typed PVC attribute, never a
+	// label. On a measured claim it carries the edge's own figures.
+	s.Require().NotNil(pvc.QoS, "the measured claim's node must carry its ceiling")
+	s.Equal("gold-tier", pvc.QoS.PolicyGroup)
+	s.Require().NotNil(measured)
+	s.Require().NotNil(pvc.QoS.MaxIOPS)
+	s.Require().NotNil(measured.MaxIOPS)
+	s.InDelta(*measured.MaxIOPS, *pvc.QoS.MaxIOPS, 1e-9, "node and edge agree")
+	s.InDelta(5000.0, *pvc.QoS.MaxIOPS, 1e-9)
+	s.Require().NotNil(pvc.QoS.MaxBytesPerSec)
+	s.Require().NotNil(measured.MaxBytesPerSec)
+	s.InDelta(*measured.MaxBytesPerSec, *pvc.QoS.MaxBytesPerSec, 1e-9, "node and edge agree")
+	s.InDelta(262144000.0, *pvc.QoS.MaxBytesPerSec, 1e-9)
+	for _, k := range []string{"policy_group", "max_iops", "max_bytes_per_sec"} {
+		s.NotContains(pvc.Labels, k, "the ceiling is a typed attribute, never a label")
+	}
+
+	// No workload series ⇒ no policy group to key on ⇒ no ceiling, even though
+	// the svm holds fixed-policy series.
+	s.Nil(qosless.QoS)
+
+	// A LUN-only claim: the edge carries no metrics, the node still carries the
+	// ceiling its LUN workload's policy group resolves.
+	lunOnly, ok := byID["cluster-alpha/shop/lunonly-data"]
+	s.Require().True(ok, "LUN-only pvc node must be present")
+	s.Require().NotNil(lunOnly.QoS, "the ceiling does not depend on a measurement")
+	s.Equal("gold-tier", lunOnly.QoS.PolicyGroup)
+	s.Require().NotNil(lunOnly.QoS.MaxIOPS)
+	s.InDelta(5000.0, *lunOnly.QoS.MaxIOPS, 1e-9)
+
+	// A FlexGroup claim: an svm but no aggregate, hence no edge — and still a
+	// ceiling, resolved from ITS workload's policy group.
+	flex, ok := byID["cluster-alpha/shop/flex-data"]
+	s.Require().True(ok, "FlexGroup pvc node must be present")
+	s.Equal("svm-prod", flex.Labels["svm"])
+	s.NotContains(flex.Labels, "aggr")
+	s.Require().NotNil(flex.QoS, "a FlexGroup claim carries a ceiling without an edge")
+	s.Equal("bronze-tier", flex.QoS.PolicyGroup)
+	s.Require().NotNil(flex.QoS.MaxIOPS)
+	s.InDelta(100.0, *flex.QoS.MaxIOPS, 1e-9, "bronze's own figure, not gold's")
+	s.Require().NotNil(flex.QoS.MaxBytesPerSec)
+	// 400 MB/s = 419430400 B/s, rounded to 6 significant digits on the wire.
+	s.InDelta(419430000.0, *flex.QoS.MaxBytesPerSec, 1e-6)
 }
 
 // TestPVCNetAppHarvestAbsent — a PVC with volumename but no Harvest series

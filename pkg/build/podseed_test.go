@@ -53,6 +53,21 @@ func TestPodSeed_ReadsBindingsByReference(t *testing.T) {
 		assert.True(t, restricted, "every binding query is restricted: %s", query)
 	}
 
+	// Mounter completion and the claim families read the tracked claims by
+	// (namespace, claim), one query per namespace, so a same-named claim in
+	// another namespace is never read.
+	assert.Contains(t, bindings,
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1m])`)
+	assert.Contains(t, bindings,
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="platform",persistentvolumeclaim="redis-data"}[1m])`)
+	for _, fam := range promql.ClaimScopedQueries {
+		for _, query := range q.QueriesFor(fam) {
+			if strings.Contains(query, `persistentvolumeclaim=`) {
+				assert.Contains(t, query, `,namespace="`, "%s is read per namespace: %s", fam, query)
+			}
+		}
+	}
+
 	// The pod wave reads the roots by (namespace, pod), one query per namespace,
 	// so neither cross pair (shop/redis-0, platform/orders-0) is fetched.
 	assert.ElementsMatch(t, []string{

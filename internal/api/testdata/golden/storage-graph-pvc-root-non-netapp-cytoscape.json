@@ -1,0 +1,42 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/scratch-data",
+          "name": "scratch-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "volumename": "pvc-scratch"
+          }
+        }
+      }
+    ],
+    "edges": []
+  }
+}

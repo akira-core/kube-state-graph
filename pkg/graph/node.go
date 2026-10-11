@@ -80,6 +80,13 @@ type GraphNode interface {
 	// and does not materialise a node or edge. Only PVCs carry one; every
 	// other node kind, and a PVC with no resolved StorageClass, returns "".
 	StorageClass() string
+	// QoS is a PVC's declared QoS throughput ceiling — the fixed-policy figures
+	// of the policy group governing the claim's volume, resolved once per claim
+	// by the NetApp join. Surfaced as the top-level data.qos attribute, never
+	// inside Labels. Only PVCs carry one; every other node kind, and a PVC
+	// whose ceiling did not resolve, returns nil. Non-nil implies at least one
+	// of MaxIOPS / MaxBytesPerSec is set.
+	QoS() *QoSCeiling
 	// Hardware is an ONTAP controller's hardware identity, resolved from the
 	// Harvest `node_labels` info series. Surfaced as a top-level attribute,
 	// never inside Labels. Only NetAppNode carries one; every other node kind,
@@ -128,6 +135,22 @@ type Owner struct {
 type Container struct {
 	Name  string `json:"name"`
 	Image string `json:"image"`
+}
+
+// QoSCeiling is the declared throughput ceiling of the QoS policy group that
+// governs a PVC's volume. PolicyGroup names the group the ceiling was keyed on
+// and is never empty; each figure is nil when its own fixed-policy family held
+// no series for the claim's (ONTAP cluster, SVM, policy group) triple. A
+// resolved ceiling always carries at least one figure — an unresolved one is
+// represented by a nil *QoSCeiling, never an empty struct or a zero figure.
+//
+// MaxBytesPerSec is the policy's MB/s figure converted to bytes, the unit of
+// the edge's read/write_bytes_per_sec. Emitted as the `qos` object on a PVC's
+// Cytoscape data, omitted when nil.
+type QoSCeiling struct {
+	PolicyGroup    string
+	MaxIOPS        *float64
+	MaxBytesPerSec *float64
 }
 
 // UsageBytes is used/capacity storage usage in bytes. Either field may be
@@ -305,6 +328,7 @@ func (p *PodNode) ReadyStatus() string       { return "" }
 func (p *PodNode) Health() string            { return "" }
 func (p *PodNode) Usage() *UsageBytes        { return nil }
 func (p *PodNode) StorageClass() string      { return "" }
+func (p *PodNode) QoS() *QoSCeiling          { return nil }
 func (p *PodNode) Hardware() *Hardware       { return nil }
 func (p *PodNode) Perf() *NodePerf           { return nil }
 func (p *PodNode) Alerts() []Alert           { return p.AlertsValue }
@@ -337,6 +361,7 @@ func (n *K8sNode) ReadyStatus() string       { return n.ReadyStatusValue }
 func (n *K8sNode) Health() string            { return "" }
 func (n *K8sNode) Usage() *UsageBytes        { return nil }
 func (n *K8sNode) StorageClass() string      { return "" }
+func (n *K8sNode) QoS() *QoSCeiling          { return nil }
 func (n *K8sNode) Hardware() *Hardware       { return nil }
 func (n *K8sNode) Perf() *NodePerf           { return nil }
 func (n *K8sNode) Alerts() []Alert           { return n.AlertsValue }
@@ -346,7 +371,8 @@ func (n *K8sNode) isGraphNode()              {}
 // PVCNode represents a PersistentVolumeClaim entity. StorageClassValue is the
 // PVC's resolved StorageClass name (from kube_persistentvolumeclaim_info),
 // serialised as data.storageclass. UsageValue is kubelet volume-stats usage
-// (used/capacity bytes). Empty / nil when unresolved.
+// (used/capacity bytes). QoSValue is the declared throughput ceiling resolved
+// by the NetApp join, serialised as data.qos. Empty / nil when unresolved.
 type PVCNode struct {
 	IDValue           string
 	NameValue         string
@@ -354,6 +380,7 @@ type PVCNode struct {
 	StorageClassValue string
 	ApplicationValue  string
 	UsageValue        *UsageBytes
+	QoSValue          *QoSCeiling
 	AlertsValue       []Alert
 	StatusValue       string
 }
@@ -370,6 +397,7 @@ func (p *PVCNode) ReadyStatus() string       { return "" }
 func (p *PVCNode) Health() string            { return "" }
 func (p *PVCNode) Usage() *UsageBytes        { return p.UsageValue }
 func (p *PVCNode) StorageClass() string      { return p.StorageClassValue }
+func (p *PVCNode) QoS() *QoSCeiling          { return p.QoSValue }
 func (p *PVCNode) Hardware() *Hardware       { return nil }
 func (p *PVCNode) Perf() *NodePerf           { return nil }
 func (p *PVCNode) Alerts() []Alert           { return p.AlertsValue }
@@ -402,6 +430,7 @@ func (s *ServiceNode) ReadyStatus() string       { return "" }
 func (s *ServiceNode) Health() string            { return "" }
 func (s *ServiceNode) Usage() *UsageBytes        { return nil }
 func (s *ServiceNode) StorageClass() string      { return "" }
+func (s *ServiceNode) QoS() *QoSCeiling          { return nil }
 func (s *ServiceNode) Hardware() *Hardware       { return nil }
 func (s *ServiceNode) Perf() *NodePerf           { return nil }
 func (s *ServiceNode) Alerts() []Alert           { return nil }
@@ -430,6 +459,7 @@ func (e *ExternalNode) ReadyStatus() string       { return "" }
 func (e *ExternalNode) Health() string            { return "" }
 func (e *ExternalNode) Usage() *UsageBytes        { return nil }
 func (e *ExternalNode) StorageClass() string      { return "" }
+func (e *ExternalNode) QoS() *QoSCeiling          { return nil }
 func (e *ExternalNode) Hardware() *Hardware       { return nil }
 func (e *ExternalNode) Perf() *NodePerf           { return nil }
 func (e *ExternalNode) Alerts() []Alert           { return nil }
@@ -461,6 +491,7 @@ func (n *NetAppAggrNode) ReadyStatus() string       { return "" }
 func (n *NetAppAggrNode) Health() string            { return n.HealthValue }
 func (n *NetAppAggrNode) Usage() *UsageBytes        { return n.UsageValue }
 func (n *NetAppAggrNode) StorageClass() string      { return "" }
+func (n *NetAppAggrNode) QoS() *QoSCeiling          { return nil }
 func (n *NetAppAggrNode) Hardware() *Hardware       { return nil }
 func (n *NetAppAggrNode) Perf() *NodePerf           { return nil }
 func (n *NetAppAggrNode) Alerts() []Alert           { return n.AlertsValue }
@@ -494,6 +525,7 @@ func (n *NetAppNode) ReadyStatus() string       { return "" }
 func (n *NetAppNode) Health() string            { return n.HealthValue }
 func (n *NetAppNode) Usage() *UsageBytes        { return nil }
 func (n *NetAppNode) StorageClass() string      { return "" }
+func (n *NetAppNode) QoS() *QoSCeiling          { return nil }
 func (n *NetAppNode) Hardware() *Hardware       { return n.HardwareValue }
 func (n *NetAppNode) Perf() *NodePerf           { return n.PerfValue }
 func (n *NetAppNode) Alerts() []Alert           { return n.AlertsValue }
@@ -528,6 +560,7 @@ func (n *NetAppSVMNode) ReadyStatus() string       { return "" }
 func (n *NetAppSVMNode) Health() string            { return "" }
 func (n *NetAppSVMNode) Usage() *UsageBytes        { return nil }
 func (n *NetAppSVMNode) StorageClass() string      { return "" }
+func (n *NetAppSVMNode) QoS() *QoSCeiling          { return nil }
 func (n *NetAppSVMNode) Hardware() *Hardware       { return nil }
 func (n *NetAppSVMNode) Perf() *NodePerf           { return nil }
 func (n *NetAppSVMNode) Alerts() []Alert           { return nil }

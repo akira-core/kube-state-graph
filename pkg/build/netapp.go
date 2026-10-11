@@ -38,6 +38,9 @@ type volumeLabelCandidate struct {
 	node         string
 	aggr         string
 	svm          string
+	// zone is the (az, env) pair the series carries; the zero zone (either
+	// label absent) is unknown, which the zone-agreement rule never excludes.
+	zone zone
 }
 
 // qosCandidate is one Harvest QoS workload sample — hop B. It carries no
@@ -61,14 +64,25 @@ type qosCandidate struct {
 	value  float64
 }
 
-// pvcVolume is a PVC that carries a non-empty volumename (the join key).
+// pvcVolume is a PVC that carries a non-empty volumename (the join key). Its
+// zone is the (az, env) pair its kube_persistentvolumeclaim_info series carries
+// (the zero zone when either label is absent): a claim joins only FlexVols of
+// its own zone (accept-multi-zone-storage-graph).
 type pvcVolume struct {
 	id, volumeName string
+	zone           zone
 }
 
 // netappResult is the demand-driven output of resolveNetAppStorage.
 type netappResult struct {
 	svmByPVC map[string]SVMRef
+	// qosByPVC is each claim's resolved declared throughput ceiling, present
+	// only for a claim whose ceiling resolved. It is resolved BEFORE the
+	// aggregate gate, so a FlexGroup claim (an SVM but no aggregate, hence no
+	// edge) and a claim whose edge carries no measurement still have one; the
+	// edge copies its figures from the same value, so node and edge cannot
+	// disagree. Stamped onto PVCNode.QoSValue at topology assembly.
+	qosByPVC map[string]*graph.QoSCeiling
 	aggrs    []*graph.NetAppAggrNode
 	nodes    []*graph.NetAppNode
 	edges    []*graph.Edge
@@ -159,11 +173,19 @@ func aggrKeyOf(m model.Metric) (aggrKey, bool) {
 // The hops degrade independently: a hop-B miss leaves a valid measurement-less
 // edge rather than erasing the claim's storage topology. Pure except for the
 // two aggregated coverage warnings (D8).
+//
+// A claim's candidate set — the matched series every pick runs over — holds only
+// series whose zone agrees with the claim's (zonesAgree: an unknown zone on
+// either side never excludes). The exclusion narrows a claim's candidates ONLY:
+// volIndex and allByAggr stay unfiltered, so the owner vote and the inventory
+// see every series. keys are the configured az / env label names.
+//
 // The Harvest vectors arrive as the topologyVectors bundle rather than as a
 // positional list. Nineteen same-typed model.Vector parameters are trivially
 // transposable and the compiler cannot catch it; the bundle names every one at
 // the call site and makes adding a family a one-field edit.
-func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
+func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.LabelKeys) netappResult {
+	keys = keys.OrDefault()
 	rw := v.volumeKey()
 	volumeLabels := v.VolumeLabels
 	readOps, writeOps := v.QoSReadOps, v.QoSWriteOps
@@ -171,7 +193,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 	readData, writeData := v.QoSReadData, v.QoSWriteData
 	policyMaxIOPS, policyMaxMBps := v.QoSPolicyMaxIOPS, v.QoSPolicyMaxMBps
 
-	out := netappResult{svmByPVC: map[string]SVMRef{}}
+	out := netappResult{svmByPVC: map[string]SVMRef{}, qosByPVC: map[string]*graph.QoSCeiling{}}
 
 	// One pass over the Harvest vector resolves every claim. The join is
 	// derive-then-match, not equality: ONTAP volume names admit no `-`, so a
@@ -189,15 +211,20 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		if vol == "" || oc == "" {
 			continue
 		}
+		cz, _ := zoneOf(s.Metric, keys)
 		cand := volumeLabelCandidate{
 			ontapCluster: oc,
 			node:         string(s.Metric["node"]),
 			aggr:         string(s.Metric["aggr"]),
 			svm:          string(s.Metric["svm"]),
+			zone:         cz,
 		}
 		volIndex[vol] = append(volIndex[vol], cand)
 		matched = matcher.match(vol, matched)
 		for _, ci := range matched {
+			if !zonesAgree(claims[ci].zone, cand.zone) {
+				continue
+			}
 			candsByClaim[ci] = append(candsByClaim[ci], cand)
 			if volSeenByClaim[ci] == nil {
 				volSeenByClaim[ci] = map[string]bool{}
@@ -272,27 +299,41 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors) netappResult {
 		if svm != "" {
 			out.svmByPVC[c.id] = SVMRef{ONTAPCluster: svmOC, SVM: svm}
 		}
+		// The ceiling is resolved for EVERY claim, before the aggregate gate: it
+		// is a property of the claim's volume (which policy group governs it),
+		// not of the edge, so a FlexGroup claim — an SVM but no aggregate — gets
+		// one too. Its ONTAP cluster then comes from the SVM pick itself; with an
+		// aggregate resolved that is oc by construction (pickSVM's scope), so the
+		// key is the one the edge has always used.
+		//
+		// The key is assembled from BOTH topology hops: hop A owns the filer and
+		// the SVM, hop B owns the policy group (the only upstream statement of
+		// which policy governs this FlexVol). A claim with no in-scope workload
+		// series therefore still resolves no ceiling.
+		qcands := qosCandidatesFor(volsByClaim[i], qosIndex)
+		keyOC := oc
+		if keyOC == "" {
+			keyOC = svmOC
+		}
+		ceiling := resolveCeiling(qcands, policyIndex, keyOC, svm)
+		if ceiling != nil {
+			out.qosByPVC[c.id] = ceiling
+		}
 		if oc == "" || aggr == "" {
 			if countsMiss(cands) {
 				topoMisses++
 			}
 			continue
 		}
-		qcands := qosCandidatesFor(volsByClaim[i], qosIndex)
 		io := sumQoSIO(qcands, oc, svm)
 		if io == nil {
 			if qosPresent {
 				qosMisses++
 			}
 		} else {
-			// The ceiling key is assembled from BOTH topology hops: hop A owns
-			// the filer and the SVM (so it follows the aggregate this edge
-			// points at), hop B owns the policy group (the only upstream
-			// statement of which policy governs this FlexVol). Attaching it
-			// only inside this branch is therefore belt-and-braces: the policy
-			// rides on a matched workload series, so a ceiling cannot exist
-			// without a measurement in the first place (design.md D9).
-			applyCeiling(io, policyIndex, policyKey{oc, svm, pickPolicy(qcands, policyIndex, oc, svm)})
+			// The edge keeps its own rule: a ceiling rides only on an edge that
+			// carries a measurement, copied from the value the node carries.
+			applyCeiling(io, ceiling)
 		}
 		hits[c.id] = joinHit{oc: oc, aggr: aggr, io: io}
 	}
@@ -619,23 +660,49 @@ func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOM
 	return out
 }
 
-// applyCeiling copies the resolved ceiling onto io. An incomplete key (hop A
-// resolved no serving SVM, or no in-scope workload carried a policy group) or a
-// triple with no fixed-policy series leaves both fields absent — absence means
-// "no declared ceiling" and is never rendered as a number.
+// resolveCeiling resolves one claim's declared throughput ceiling: the
+// fixed-policy figures of the policy group hop B names, looked up under the
+// (ONTAP cluster, SVM, policy group) triple. It returns nil unless at least one
+// figure resolved, which is what makes "the node carries a ceiling iff a field
+// resolved" a structural property rather than a serialiser check.
 //
-// The floats are copied, not aliased: one index entry now serves EVERY claim in
-// the SVM (D9 widened the key from a policy group to the pair), so handing out
-// the index's own pointers would make all of them one shared mutable cell.
-func applyCeiling(io *graph.IOMetrics, index map[policyKey]*graph.IOMetrics, k policyKey) {
-	// An incomplete key is IGNORED, never widened: no hop-A svm, or no policy
-	// group on any in-scope workload, leaves the ceiling absent rather than
-	// borrowing another policy group's figure from the same SVM (design.md D9).
-	if k.svm == "" || k.policy == "" {
-		return
+// An incomplete key (no ONTAP cluster, no serving SVM, or no in-scope workload
+// carrying a policy group) or a triple with no fixed-policy series resolves
+// nothing — absence means "no declared ceiling" and is never rendered as a
+// number. The key is IGNORED when incomplete, never widened: borrowing another
+// policy group's figure from the same SVM would name a limit this volume does
+// not have (design.md D9).
+//
+// The floats are copied, not aliased: one index entry serves EVERY claim in the
+// SVM (D9 widened the key from a policy group to the pair), so handing out the
+// index's own pointers would make all of them one shared mutable cell.
+func resolveCeiling(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, svm string) *graph.QoSCeiling {
+	if oc == "" || svm == "" {
+		return nil
 	}
-	c, ok := index[k]
-	if !ok {
+	policy := pickPolicy(cands, index, oc, svm)
+	if policy == "" {
+		return nil
+	}
+	c, ok := index[policyKey{oc, svm, policy}]
+	if !ok || (c.MaxIOPS == nil && c.MaxBytesPerSec == nil) {
+		return nil
+	}
+	out := &graph.QoSCeiling{PolicyGroup: policy}
+	if c.MaxIOPS != nil {
+		out.MaxIOPS = new(*c.MaxIOPS)
+	}
+	if c.MaxBytesPerSec != nil {
+		out.MaxBytesPerSec = new(*c.MaxBytesPerSec)
+	}
+	return out
+}
+
+// applyCeiling copies a resolved ceiling onto io — the edge's copy of the
+// figures the PVC node carries. A nil ceiling attaches nothing. The floats are
+// copied so the edge and the node never share a cell.
+func applyCeiling(io *graph.IOMetrics, c *graph.QoSCeiling) {
+	if c == nil {
 		return
 	}
 	if c.MaxIOPS != nil {
@@ -679,22 +746,23 @@ func pickOwner(cands []volumeLabelCandidate, oc, aggr string) string {
 // two filers sharing one VictoriaMetrics (the fifth blind spot in
 // docs/netapp-harvest-preconditions.md), and the resolved SVM is paired with
 // the picked aggregate's ONTAP cluster twice over: qosInScope rejects every
-// workload whose svm differs, and applyCeiling keys the ceiling on the
+// workload whose svm differs, and resolveCeiling keys the ceiling on the
 // (ontap cluster, svm) pair. An unscoped pick could hand the other filer's SVM
 // to both — losing the edge's I/O outright, and attaching an unrelated tenant's
 // ceiling if the picked filer happens to host a same-named SVM.
 //
 // An empty oc means no aggregate resolved (the FlexGroup shape, or no candidate
-// carrying both labels): there is then neither an edge nor a ceiling, so there
-// is no filer to scope to and the pick stays over every candidate — a FlexGroup
-// claim still gains its `svm` label.
+// carrying both labels): there is then no edge and no aggregate's filer to scope
+// to, so the pick stays over every candidate — a FlexGroup claim still gains its
+// `svm` label.
 // It returns the SVM together with the ONTAP cluster the winning candidate sat
 // on. When oc is non-empty that is oc by construction (the scope guarantees
 // it); when it is empty — the FlexGroup shape — the returned cluster is the
 // lexically-smallest one among the candidates carrying the winning SVM name.
-// The storage-flow graph needs it: an SVM node id is cluster-qualified, and a
-// FlexGroup claim enters the chain AT the SVM, so there is no aggregate to
-// borrow the cluster from.
+// Two consumers need it: the storage-flow graph, whose SVM node id is
+// cluster-qualified and which a FlexGroup claim enters AT the SVM, and the
+// FlexGroup claim's ceiling, whose key needs an ONTAP cluster and has no
+// aggregate to borrow one from.
 func pickSVM(cands []volumeLabelCandidate, oc string) (string, string) {
 	var svm, svmOC string
 	for _, c := range cands {
@@ -730,7 +798,7 @@ func pickSVM(cands []volumeLabelCandidate, oc string) (string, string) {
 // The pick therefore PREFERS a policy the fixed-policy index actually holds,
 // falling back to the lexically-smallest non-empty value when none resolves —
 // which is the honest answer (the volume really is in that class) and leaves
-// applyCeiling attaching nothing, exactly as before. Both passes take the
+// resolveCeiling resolving nothing, exactly as before. Both passes take the
 // lexically-smallest candidate, so the result is order-free (D6). The rule is
 // data-driven rather than a hardcoded list of ONTAP's built-in class names,
 // which vary by release.
