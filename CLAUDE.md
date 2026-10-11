@@ -44,7 +44,7 @@ go test ./internal/api/ -update -run Golden               # refresh goldens afte
 through `go tool` (go.mod `tool` directive) — no separate install. Generated
 files (`<pkg>/mocks/*.go`, `docs/swagger.{json,yaml}`) are never hand-edited.
 
-Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.26 (`go.mod`); build toolchain pinned to `go1.26.6` via the `toolchain` directive.
+Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.26 (`go.mod`); build toolchain pinned to `go1.26.9` via the `toolchain` directive.
 
 ## Architecture
 
