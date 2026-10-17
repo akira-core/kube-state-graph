@@ -58,7 +58,7 @@ Each of the six SHALL be queried with the fixed, request-invariant matcher `anno
 - `kube_job_annotations{cluster, namespace, job_name, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
 - `kube_cronjob_annotations{cluster, namespace, cronjob, annotation_argocd_argoproj_io_tracking_id!="", ...}` **[AECN]**
 
-The kubelet volume-stats series of the "PVC usage from kubelet volume stats" requirement are **[AECN]**. The NetApp Harvest series of the `netapp-storage-graph` capability receive the `az` and `env` matchers and no other request-scoped matcher (that capability's "Harvest legs carry the request zone and environment"); the `az` dimension additionally selects their backends (the `upstream-backend-routing` capability's zone rule).
+The kubelet volume-stats series of the "PVC usage from kubelet volume stats" requirement are **[AECN]**. The NetApp Harvest series of the `netapp-storage-graph` capability receive **no** request-scoped matcher (that capability's "Harvest legs are zone-routed and carry no request matcher"); the `az` dimension still selects their backends (the `upstream-backend-routing` capability's zone rule).
 
 Every series above SHALL be queried at its bare (unprefixed) name — there is no configurable metric-name prefix. A request with no selector-level filter SHALL issue each query exactly as listed, with no request-scoped matcher.
 
@@ -798,10 +798,10 @@ Both series are OPTIONAL and per-field independent: `used_bytes` resolves from t
 
 The build SHALL accept four request-scoped selector dimensions — `az`, `env`, `cluster`, `namespace` — each a set of values, and SHALL render them into the upstream PromQL queries as label matchers composed **with** (never replacing) each query's fixed, request-invariant selectors (`type=~"ExternalIP|InternalIP"`, `condition="Ready"`, `lun=""`, `owner_kind="CronJob",owner_is_controller="true"` on `kube_job_owner`, `annotation_argocd_argoproj_io_tracking_id!=""` on each of the six controller-annotation families, the service-graph sentinel and `edge_relation!="link"` matchers). Which dimensions reach which series is a hardcoded contract with no configuration surface:
 
-- `az` and `env`: every kube-state-metrics, kubelet and NetApp Harvest series. On Harvest they are the ONLY request-scoped matchers, and they render on every Harvest query — including the data- and root-derived restricted reads of the `netapp-storage-graph` and `storage-graph-api` capabilities — ahead of that query's own restriction.
+- `az` and `env`: every kube-state-metrics and kubelet series. **Never** a NetApp Harvest series — the `harvest` store is the zone boundary for the `az` it is routed by (see "Backend routing composes with request-scoped selectors"), and a Harvest series is not required to carry either label — and never a service-graph series.
 - `cluster`: every kube-state-metrics and kubelet series. **Never** a Harvest series — Harvest's `cluster` label names the ONTAP cluster, not a Kubernetes cluster — and never a service-graph series.
 - `namespace`: every kube-state-metrics and kubelet series that carries a `namespace` label — the pod-, claim-, Service-, EndpointSlice-, and **controller**-scoped series (the six controller-annotation families and `kube_job_owner` are namespaced like every other workload family). Never a node series, never a Harvest series, never a service-graph series.
-- The three `traces_service_graph_*` series and the `up{}` probe SHALL carry **no** request-scoped matcher under any request, and a NetApp Harvest series none beyond `az` and `env`. The `qos_*` families keep their fixed `lun=""` selector.
+- The three `traces_service_graph_*` series and the `up{}` probe SHALL carry **no** request-scoped matcher under any request, and neither SHALL a NetApp Harvest series. The `qos_*` families keep their fixed `lun=""` selector.
 
 Rendering SHALL be a pure function of the sorted, de-duplicated value set: one value renders `<key>="<value>"` (with `"` and `\` escaped); two or more render one fully-anchored alternation `<key>=~"<v1>|<v2>"` whose alternatives are regex-quoted and THEN string-escaped (a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence); an empty set renders nothing. Matchers inside a selector SHALL appear in a fixed order (fixed selectors first, then `az`, `env`, `cluster`, `namespace`). The `cluster` value `unknown` renders `cluster=~"unknown|"` (see "Series missing the cluster label"), the one value that is not rendered as a plain literal. Series families that carry no request-scoped matcher for a dimension are narrowed by **reference** instead — a node is emitted only when a loaded pod is scheduled on it, an aggregate only when a loaded claim's `volumename` joins to it — as specified by the `graph-api` retention requirements.
 
@@ -830,7 +830,7 @@ A build with every dimension empty SHALL add **no** request-scoped matcher to an
 #### Scenario: Harvest receives the zone and environment only
 
 - **WHEN** a build runs with `az={zone-a}`, `env={prod}`, `cluster={cluster-alpha}`, `namespace={shop}`
-- **THEN** every Harvest query (`volume_labels`, the `qos_*` families, `qos_policy_fixed_max_throughput_*`, `aggr_*`, the `node_*` families) carries `<az-key>="zone-a",<env-key>="prod"` ahead of any restriction of its own and no `cluster` or `namespace` matcher; the `aggr_new_status` query is issued as `last_over_time(aggr_new_status{<az-key>="zone-a",<env-key>="prod"}[<window>])`
+- **THEN** no Harvest query (`volume_labels`, the `qos_*` families, `qos_policy_fixed_max_throughput_*`, `aggr_*`, the `node_*` families) carries any of the four as a matcher — the `aggr_new_status` query is `last_over_time(aggr_new_status[<window>])`, exactly as in an unfiltered build — and of the four only `az` acts on Harvest directly, by selecting which `harvest` backends are asked; `env`, `cluster` and `namespace` reach it solely through the claims they load
 
 #### Scenario: Service-graph series are never narrowed
 
@@ -885,7 +885,7 @@ The same two keys SHALL name the labels the reader composes a cluster's identity
 
 ### Requirement: Backend routing composes with request-scoped selectors
 
-Backend selection and PromQL matcher rendering SHALL be independent, composed mechanisms. The `az` dimension SHALL continue to be rendered as a label matcher on every query that accepts it — exactly as specified by "Request-scoped upstream selectors" — **in addition to** selecting which backends the query is issued to. Neither mechanism SHALL substitute for the other: routing narrows which store is asked, the matcher narrows what that store returns. Every zone-routed family — `ksm`, `kubelet`, `alerts` and `harvest` — takes the matcher; no family is routed by zone without it.
+Backend selection and PromQL matcher rendering SHALL be independent, composed mechanisms. The `az` dimension SHALL continue to be rendered as a label matcher on every query that accepts it — exactly as specified by "Request-scoped upstream selectors" — **in addition to** selecting which backends the query is issued to. For those families neither mechanism substitutes for the other: routing narrows which store is asked, the matcher narrows what that store returns. Every zone-routed family except `harvest` — `ksm`, `kubelet` and `alerts` — takes the matcher. `harvest` is zone-routed WITHOUT it: the store a Harvest query is routed to is that zone's filter, and the query string carries no `az` (or `env`) matcher.
 
 The rendered query string for a given query SHALL be identical across every backend the query is fanned out to. A per-backend query variant SHALL NOT exist.
 
@@ -895,6 +895,11 @@ The `env`, `cluster`, and `namespace` dimensions SHALL play no part in backend s
 
 - **WHEN** a request carries `az=zone-a` and the routing table sends `ksm` queries for that zone only to backend `zone-a`
 - **THEN** the query issued to `zone-a` still carries the `az="zone-a"` matcher
+
+#### Scenario: Harvest routed by zone without a matcher
+
+- **WHEN** a request carries `az=zone-a` and the routing table sends `harvest` queries for that zone only to backend `netapp-a`
+- **THEN** `netapp-a` receives each Harvest query as the same string an unfiltered build issues, carrying no `az` matcher
 
 #### Scenario: Identical query string across backends
 
