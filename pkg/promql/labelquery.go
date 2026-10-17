@@ -69,6 +69,12 @@ type LabelQuery struct {
 // the same core Instant uses (zone selection, identical-string fan-out,
 // fingerprint merge, fail-closed). An unserved family is an error here —
 // unlike the server's optional alerts leg, this call is deliberate.
+//
+// AZ routes a zone-routed family. It is also a matcher only when the family
+// renders az (Family.RendersAZ). Harvest is zone-routed without the matcher:
+// an AZ value selects the harvest backends and the rendered query carries no
+// az matcher. The same is true of the (keys, sel) arguments on every Harvest
+// renderer — they render no request matcher.
 func (r *Router) QueryLabels(ctx context.Context, req LabelQuery) ([]map[string]string, error) {
 	fam, err := req.validate()
 	if err != nil {

@@ -277,16 +277,15 @@ func (s *FilterSuite) TestUnfilteredRequestKeepsRealCrossClusterPartner() {
 	s.ElementsMatch([]string{"zone-a-prod-cluster-alpha", "zone-b-prod-cluster-beta"}, s.fetch(srv.URL, nil).Clusters)
 }
 
-// Harvest carries the request's env matcher (read-storage-roots-through-volume-hub
-// D13): a claim whose only Harvest series carries a DIFFERENT env value draws
-// no storage chain under `?env=prod` — the spec's "Environment filter reaches
-// Harvest" scenario. The claim itself is still loaded.
-func (s *FilterSuite) TestHarvestOfAnotherEnvDoesNotJoin() {
+// A claim whose only Harvest series carries a different env still joins it:
+// Harvest queries carry no env matcher, and with no agreeing series the join
+// falls back to every match (drop-harvest-zone-matchers D2).
+func (s *FilterSuite) TestHarvestOfAnotherEnvJoinsByFallback() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
 	// A second claim whose ONLY Harvest series carries a different env value.
 	// Its pod and claim keep the suite's stamped labels and are loaded
-	// normally; the Harvest leg carries env="prod" and so never sees it.
+	// normally; the Harvest series is returned because the query has no matcher.
 	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
 kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="lonely",uid="alpha-9",node="worker-0",test=%[1]q} 1 %[2]d
 kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="lonely",persistentvolumeclaim="lonely-data",volume="data",test=%[1]q} 1 %[2]d
@@ -304,13 +303,53 @@ volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-pr
 	})
 	ids := nodeIDs(body)
 
-	s.Contains(ids, "zone-a-prod-cluster-alpha/shop/lonely-data", "the claim itself is still loaded")
-	s.NotContains(ids, "netapp/ontap-prod/aggr/aggr9", "the other environment's aggregate is never read")
-
+	const claim = "zone-a-prod-cluster-alpha/shop/lonely-data"
+	const aggr = "netapp/ontap-prod/aggr/aggr9"
+	s.Contains(ids, claim, "the claim itself is still loaded")
+	s.Contains(ids, aggr, "no own-zone series, so the other environment's aggregate is joined")
+	joined := false
 	for _, e := range body.Elements.Edges {
-		s.False(e.Data.Source == "zone-a-prod-cluster-alpha/shop/lonely-data" && e.Data.Target == "netapp/ontap-prod/aggr/aggr9",
-			"no pvc-to-netapp-aggr edge from a Harvest series of another environment")
+		if e.Data.Source == claim && e.Data.Target == aggr {
+			joined = true
+		}
 	}
+	s.True(joined, "the fallback join draws the pvc-to-netapp-aggr edge")
+}
+
+// A catch-all store holds one QoS workload twice: once with no pair and once
+// under another zone's. The edge reports it once, from the row with no pair,
+// which agrees with the claim (drop-harvest-zone-matchers D3).
+func (s *FilterSuite) TestCatchAllHarvestQoSIsCountedOnce() {
+	disc := s.T().Name()
+	t1 := fixedNow.Unix() * 1000
+	s.IngestExpFmt(fmt.Sprintf(`# HELP kube_pod_info dummy
+kube_pod_info{cluster="cluster-alpha",namespace="shop",pod="qosonce",uid="alpha-qos",node="worker-0",test=%[1]q} 1 %[2]d
+kube_pod_spec_volumes_persistentvolumeclaims_info{cluster="cluster-alpha",namespace="shop",pod="qosonce",persistentvolumeclaim="qos-data",volume="data",test=%[1]q} 1 %[2]d
+kube_persistentvolumeclaim_info{cluster="cluster-alpha",namespace="shop",persistentvolumeclaim="qos-data",storageclass="netapp-nas",volumename="pvc-qosonce",test=%[1]q} 1 %[2]d
+volume_labels{cluster="ontap-prod",node="ontap-prod-01",aggr="aggr-qos",svm="svm-prod",volume="trident_pvc_qosonce",test=%[1]q} 1 %[2]d
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",volume="trident_pvc_qosonce",policy_group="gold",test=%[1]q} 100 %[2]d
+qos_read_ops{cluster="ontap-prod",svm="svm-prod",volume="trident_pvc_qosonce",policy_group="gold",az="zone-b",env="prod",test=%[1]q} 90 %[2]d
+`, disc, t1))
+	s.Require().True(
+		s.WaitForSeries(`qos_read_ops{volume="trident_pvc_qosonce",az="zone-b",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
+		"VM did not observe both zone copies of the QoS workload")
+
+	srv := s.StartAPIServer(nil)
+	body := s.fetch(srv.URL, func(q url.Values) {
+		q.Set("az", "zone-a")
+		q.Set("env", "prod")
+		q.Set("prune", "false")
+	})
+	const claim = "zone-a-prod-cluster-alpha/shop/qos-data"
+	var got *float64
+	for _, e := range body.Elements.Edges {
+		if e.Data.Source == claim && e.Data.Target == "netapp/ontap-prod/aggr/aggr-qos" {
+			s.Require().NotNil(e.Data.Metrics)
+			got = e.Data.Metrics.ReadOps
+		}
+	}
+	s.Require().NotNil(got, "the claim's storage edge carries the measurement")
+	s.InDelta(100.0, *got, 1e-9, "one row of the workload — the one with no pair, not zone-b's 90 and not a sum of 190")
 }
 
 // A rebound label key changes the MATCHER, never the request parameter name.

@@ -59,9 +59,10 @@ func (k LabelKeys) OrDefault() LabelKeys {
 //
 // WHICH dimension reaches WHICH series is the hardcoded queryDims contract in
 // queries.go — not a property of this value. Notably the three
-// traces_service_graph_* queries and the up{} probe accept NO dimension at all,
-// and the NetApp Harvest queries accept only az and env: their `cluster` label
-// names an ONTAP cluster, not a Kubernetes one, and they carry no namespace.
+// traces_service_graph_* queries, the up{} probe and every NetApp Harvest
+// query accept NO dimension at all. Harvest is still zone-routed: `az` selects
+// its backends and is not rendered as a matcher. Its `cluster` label names an
+// ONTAP cluster, not a Kubernetes one, and it carries no namespace.
 //
 // The zero value is the unfiltered build: every query renders exactly the
 // string it rendered before request-scoped selectors existed.
@@ -111,6 +112,12 @@ const (
 	// STRICTER than the reader and silently strip those nodes of their
 	// alerts under `?namespace=`. Reaches treats it exactly as dimNamespace.
 	dimNamespaceOrAbsent
+	// dimAZRoute marks a query that is zone-ROUTED without rendering an `az`
+	// matcher. render and Reaches ignore it; familyAcceptsAZ is the only
+	// reader. Harvest is the only user: the store a request's `az` selects is
+	// the zone boundary, and a Harvest series is not required to carry the
+	// label (drop-harvest-zone-matchers D1).
+	dimAZRoute
 )
 
 const (
@@ -119,15 +126,14 @@ const (
 	// namespace labels describe only the caller's own view) and the up{}
 	// probe (which measures the store, not the data).
 	dimsNone dims = 0
-	// dimsHarvest: NetApp Harvest series carry neither a Kubernetes `cluster`
-	// nor a `namespace` label, but they DO carry the zone and environment
-	// (read-storage-roots-through-volume-hub D13): a request queries only its
-	// own az / env, so a catch-all store or one holding several environments
-	// must not answer with another's filers. Every Harvest series must
-	// therefore carry the configured az / env labels. `cluster` / `namespace`
-	// narrow Harvest by reference instead (an aggregate materialises only when
-	// a loaded claim joins it).
-	dimsHarvest = dimAZ | dimEnv
+	// dimsHarvest: NetApp Harvest series carry no request matcher. `az` still
+	// routes them (dimAZRoute — the store is the zone boundary) and `env`,
+	// `cluster` and `namespace` do not. A series is not required to carry the
+	// configured az / env labels; a series that does is used for zone
+	// preference in the reader, never for exclusion at the query. `cluster` /
+	// `namespace` narrow Harvest by reference (an aggregate materialises only
+	// when a loaded claim joins it).
+	dimsHarvest = dimAZRoute
 	// dimsClusterScoped: series keyed by cluster but not by namespace
 	// (the kube_node_* family).
 	dimsClusterScoped = dimAZ | dimEnv | dimCluster

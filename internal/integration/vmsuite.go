@@ -11,9 +11,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -348,7 +350,54 @@ type apiOptions struct {
 	clk                 clock.Clock
 	routeResolver       build.RouteResolver
 	routeResolveTimeout time.Duration
+	queries             *queryLog
 }
+
+// queryLog records every upstream query a wrapped querier issued.
+type queryLog struct {
+	mu    sync.Mutex
+	items []loggedQuery
+}
+
+type loggedQuery struct {
+	backend string
+	name    string
+	query   string
+}
+
+type loggingQuerier struct {
+	backend string
+	inner   promql.Querier
+	log     *queryLog
+}
+
+func (q loggingQuerier) Instant(ctx context.Context, name, query string, ts time.Time) (model.Vector, error) {
+	q.log.mu.Lock()
+	q.log.items = append(q.log.items, loggedQuery{backend: q.backend, name: name, query: query})
+	q.log.mu.Unlock()
+	return q.inner.Instant(ctx, name, query, ts)
+}
+
+func (l *queryLog) wrap(b promql.Backend, q promql.Querier) promql.Querier {
+	return loggingQuerier{backend: b.Name(), inner: q, log: l}
+}
+
+// harvestQueries returns the recorded Harvest queries.
+func (l *queryLog) harvestQueries() []loggedQuery {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []loggedQuery
+	for _, item := range l.items {
+		fam, ok := promql.FamilyOf(promql.Query(item.name))
+		if ok && fam == promql.FamilyHarvest {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// WithQueryLog records the queries the in-process server issues.
+func WithQueryLog(l *queryLog) APIOption { return func(o *apiOptions) { o.queries = l } }
 
 // WithClock pins the server's Clock dependency. nil falls back to clock.System.
 func WithClock(clk clock.Clock) APIOption { return func(o *apiOptions) { o.clk = clk } }
@@ -389,8 +438,12 @@ func (s *VMSuite) StartAPIServer(configure func(*config.Config), opts ...APIOpti
 	if cfg.PromUsername != "" {
 		promOpts = append(promOpts, promql.WithBasicAuth(cfg.PromUsername, cfg.PromPassword))
 	}
-	prom, err := promql.New(cfg.PromURL, metrics, promOpts...)
+	client, err := promql.New(cfg.PromURL, metrics, promOpts...)
 	s.Require().NoError(err)
+	var prom promql.Querier = client
+	if o.queries != nil {
+		prom = loggingQuerier{inner: client, log: o.queries}
+	}
 
 	ks := auth.NewKeySet()
 	if cfg.APIKeys != "" {

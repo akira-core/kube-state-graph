@@ -383,7 +383,7 @@ hardcoded (`pkg/promql/queryDims`):
 |---|---|---|---|---|
 | namespaced KSM (pod / owner / claim / Service / EndpointSlice / ReplicaSet — every `kube_*` series except the `kube_node_*` family) + kubelet volume stats | yes | yes | yes | yes |
 | `kube_node_*` | yes | yes | yes | no (nodes have no namespace; they follow **by reference** from scheduled pods) |
-| NetApp Harvest | yes (also routes) | yes | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
+| NetApp Harvest | routes only — no matcher | no | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
 | `ALERTS` | yes (also routes) | yes | **no** — an alert expression does not reliably keep `cluster`; matching uses the label through the identity ladder when present, else unique-in-estate | yes |
 | `traces_service_graph_*`, `up` | no | no | no | no |
 
@@ -392,8 +392,9 @@ topology family that a live dimension actually reaches must carry those labels;
 a family that does not matches nothing, and the default connectivity prune can
 then empty the graph. A `selector_family_empty` warning fires when KSM matched
 but a kubelet family that the selector *can* narrow returned nothing. Harvest
-carries `az` / `env` and needs both labels, but is never named by that warning:
-an empty Harvest read is also what a deployment without NetApp storage returns
+is zone-routed and carries no `az` / `env` matcher, so a series is not required
+to carry the labels, and it is never named by that warning: an empty Harvest
+read is also what a deployment without NetApp storage returns
 (see `netapp-harvest-preconditions.md`).
 
 The `cluster` value `unknown` is rendered `cluster=~"unknown|"` (literal plus
@@ -460,11 +461,11 @@ Helm values are in
 ## NetApp Harvest (18)
 
 All 18 are OPTIONAL (log-and-continue). Harvest `cluster` is the ONTAP cluster
-and is **never** used as a Kubernetes `?cluster=` matcher. The family carries the
-`?az=` / `?env=` matchers on every query — the unrestricted legs and every
-restricted `volume_labels` / `qos_*` read, ahead of the restriction — and
-`?az=` also routes it to the zone's `harvest` backend. Every Harvest series must
-carry both labels.
+and is **never** used as a Kubernetes `?cluster=` matcher. No Harvest query
+carries an `az` or `env` matcher — the unrestricted legs and every restricted
+`volume_labels` / `qos_*` / `aggr_*` / `node_*` read alike. `?az=` still routes
+the family to the zone's `harvest` backend. A series is not required to carry
+either label.
 
 The storage join is three independently-degrading hops. Hops A and B are keyed
 by the STOCK Harvest `volume` label (the ONTAP FlexVol name), matched against a

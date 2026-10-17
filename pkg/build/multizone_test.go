@@ -52,6 +52,13 @@ func TestBuildStorage_MultiZoneSelectorReachesEveryFamilyAndBackend(t *testing.T
 		issued := store.Issued()
 		require.NotEmpty(t, issued, "%s is asked: the request selects its zone", name)
 		for _, is := range issued {
+			fam, ok := promql.FamilyOf(promql.Query(is.Name))
+			require.True(t, ok, is.Name)
+			if fam == promql.FamilyHarvest {
+				assert.NotContains(t, is.Query, `az=`, "%s / %s carries no request matcher", name, is.Name)
+				assert.NotContains(t, is.Query, `env=`, "%s / %s carries no request matcher", name, is.Name)
+				continue
+			}
 			assert.Contains(t, is.Query, zones, "%s / %s carries the zone set", name, is.Name)
 		}
 	}

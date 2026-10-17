@@ -59,15 +59,34 @@ type qosCandidate struct {
 	// workload falls into ONTAP's built-in `User-Best_effort` class, which
 	// declares no ceiling. Measurement therefore reads volume-level candidates
 	// only while the policy pick reads every one (design.md D11).
-	lun    string
+	lun string
+	// volume is the FlexVol name the row was indexed under; with the fields
+	// above and the family it names one workload apart from its zone.
+	volume string
 	family ioFamily
 	value  float64
+	// zone is the (az, env) pair the series carries. The zero zone is unknown.
+	// Hop B keeps one zone per workload so a workload labelled under several
+	// pairs is counted once (drop-harvest-zone-matchers D3).
+	zone zone
+}
+
+// qosWorkload is a QoS row's identity minus its zone: two rows with the same
+// key are one workload seen under different (az, env) pairs.
+type qosWorkload struct {
+	ontapCluster, svm, volume, lun string
+	family                         ioFamily
+}
+
+func (c qosCandidate) workload() qosWorkload {
+	return qosWorkload{ontapCluster: c.ontapCluster, svm: c.svm, volume: c.volume, lun: c.lun, family: c.family}
 }
 
 // pvcVolume is a PVC that carries a non-empty volumename (the join key). Its
 // zone is the (az, env) pair its kube_persistentvolumeclaim_info series carries
-// (the zero zone when either label is absent): a claim joins only FlexVols of
-// its own zone (accept-multi-zone-storage-graph).
+// (the zero zone when either label is absent). A claim prefers FlexVols of its
+// own zone and falls back to every matched series when none agree
+// (drop-harvest-zone-matchers D2).
 type pvcVolume struct {
 	id, volumeName string
 	zone           zone
@@ -174,11 +193,12 @@ func aggrKeyOf(m model.Metric) (aggrKey, bool) {
 // edge rather than erasing the claim's storage topology. Pure except for the
 // two aggregated coverage warnings (D8).
 //
-// A claim's candidate set — the matched series every pick runs over — holds only
-// series whose zone agrees with the claim's (zonesAgree: an unknown zone on
-// either side never excludes). The exclusion narrows a claim's candidates ONLY:
-// volIndex and allByAggr stay unfiltered, so the owner vote and the inventory
-// see every series. keys are the configured az / env label names.
+// A claim's candidate set — the matched series every pick runs over — is its
+// agreeing matches when it has any, and every match otherwise (zonesAgree: an
+// unknown zone on either side agrees). The preference narrows a claim's
+// candidates ONLY: volIndex and allByAggr stay unfiltered, so the owner vote
+// and the inventory see every series. keys are the configured az / env label
+// names.
 //
 // The Harvest vectors arrive as the topologyVectors bundle rather than as a
 // positional list. Nineteen same-typed model.Vector parameters are trivially
@@ -202,9 +222,15 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	// suffix mode — see volumeMatcher).
 	matcher := newVolumeMatcher(rw, claims)
 	volIndex := map[string][]volumeLabelCandidate{}
-	candsByClaim := make([][]volumeLabelCandidate, len(claims))
-	volsByClaim := make([][]string, len(claims))
-	volSeenByClaim := make([]map[string]bool, len(claims))
+	// Each match keeps its agreement bit. After the pass a claim keeps the
+	// agreeing matches when it has any, and every match otherwise — a filer
+	// labelled with another pair still joins (drop-harvest-zone-matchers D2).
+	type claimMatch struct {
+		cand   volumeLabelCandidate
+		vol    string
+		agrees bool
+	}
+	matchesByClaim := make([][]claimMatch, len(claims))
 	var matched []int
 	for _, s := range volumeLabels {
 		vol, oc := string(s.Metric[promql.HarvestVolumeLabel]), string(s.Metric["cluster"])
@@ -222,17 +248,31 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 		volIndex[vol] = append(volIndex[vol], cand)
 		matched = matcher.match(vol, matched)
 		for _, ci := range matched {
-			if !zonesAgree(claims[ci].zone, cand.zone) {
+			matchesByClaim[ci] = append(matchesByClaim[ci], claimMatch{
+				cand:   cand,
+				vol:    vol,
+				agrees: zonesAgree(claims[ci].zone, cand.zone),
+			})
+		}
+	}
+	candsByClaim := make([][]volumeLabelCandidate, len(claims))
+	volsByClaim := make([][]string, len(claims))
+	for ci, matches := range matchesByClaim {
+		if len(matches) == 0 {
+			continue
+		}
+		prefer := slices.ContainsFunc(matches, func(m claimMatch) bool { return m.agrees })
+		seen := map[string]struct{}{}
+		for _, m := range matches {
+			if prefer && !m.agrees {
 				continue
 			}
-			candsByClaim[ci] = append(candsByClaim[ci], cand)
-			if volSeenByClaim[ci] == nil {
-				volSeenByClaim[ci] = map[string]bool{}
+			candsByClaim[ci] = append(candsByClaim[ci], m.cand)
+			if _, ok := seen[m.vol]; ok {
+				continue
 			}
-			if !volSeenByClaim[ci][vol] {
-				volSeenByClaim[ci][vol] = true
-				volsByClaim[ci] = append(volsByClaim[ci], vol)
-			}
+			seen[m.vol] = struct{}{}
+			volsByClaim[ci] = append(volsByClaim[ci], m.vol)
 		}
 	}
 	// A claim matching several FlexVol names gathers its QoS candidates in
@@ -246,12 +286,12 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	// Keyed by the same stock `volume` label the topology family carries, so a
 	// claim looks its QoS candidates up through the FlexVol names it matched.
 	qosIndex := map[string][]qosCandidate{}
-	indexQoSFamily(qosIndex, readOps, ioReadOps)
-	indexQoSFamily(qosIndex, writeOps, ioWriteOps)
-	indexQoSFamily(qosIndex, readLat, ioReadLat)
-	indexQoSFamily(qosIndex, writeLat, ioWriteLat)
-	indexQoSFamily(qosIndex, readData, ioReadData)
-	indexQoSFamily(qosIndex, writeData, ioWriteData)
+	indexQoSFamily(qosIndex, readOps, ioReadOps, keys)
+	indexQoSFamily(qosIndex, writeOps, ioWriteOps, keys)
+	indexQoSFamily(qosIndex, readLat, ioReadLat, keys)
+	indexQoSFamily(qosIndex, writeLat, ioWriteLat, keys)
+	indexQoSFamily(qosIndex, readData, ioReadData, keys)
+	indexQoSFamily(qosIndex, writeData, ioWriteData, keys)
 
 	policyIndex := indexPolicyCeilings(policyMaxIOPS, policyMaxMBps)
 
@@ -310,11 +350,14 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 		// the SVM, hop B owns the policy group (the only upstream statement of
 		// which policy governs this FlexVol). A claim with no in-scope workload
 		// series therefore still resolves no ceiling.
-		qcands := qosCandidatesFor(volsByClaim[i], qosIndex)
 		keyOC := oc
 		if keyOC == "" {
 			keyOC = svmOC
 		}
+		// The in-scope rows, one zone per workload, supply both the ceiling and
+		// the I/O sums. A new slice: the index is shared across claims and must
+		// not be mutated (drop-harvest-zone-matchers D3).
+		qcands := preferQoSZone(qosCandidatesFor(volsByClaim[i], qosIndex), c.zone, keyOC, svm)
 		ceiling := resolveCeiling(qcands, policyIndex, keyOC, svm)
 		if ceiling != nil {
 			out.qosByPVC[c.id] = ceiling
@@ -325,7 +368,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 			}
 			continue
 		}
-		io := sumQoSIO(qcands, oc, svm)
+		io := sumQoSIO(qcands)
 		if io == nil {
 			if qosPresent {
 				qosMisses++
@@ -592,22 +635,59 @@ func qosCandidatesFor(volumes []string, index map[string][]qosCandidate) []qosCa
 	return out
 }
 
-func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily) {
+func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily, keys promql.LabelKeys) {
 	for _, s := range vec {
 		vol := string(s.Metric[promql.HarvestVolumeLabel])
 		oc := string(s.Metric["cluster"])
 		if vol == "" || oc == "" {
 			continue
 		}
+		z, _ := zoneOf(s.Metric, keys)
 		dst[vol] = append(dst[vol], qosCandidate{
 			ontapCluster: oc,
 			svm:          string(s.Metric["svm"]),
 			policyGroup:  string(s.Metric["policy_group"]),
 			lun:          string(s.Metric["lun"]),
+			volume:       vol,
 			family:       fam,
 			value:        float64(s.Value),
+			zone:         z,
 		})
 	}
+}
+
+// preferQoSZone returns a new slice of the candidates that pass qosInScope,
+// keeping for each workload (qosWorkload) the rows of exactly one zone — the
+// one claim.prefers. Distinct workloads (another FlexVol the claim matched, a
+// LUN beside its volume, another family) are each kept, so a zone choice never
+// drops another workload's I/O, and a workload visible under two pairs is
+// counted once. Choosing among in-scope rows only means a zone present only on
+// another filer cannot win. The kept rows stay in input order, and the choice
+// is a strict order, so the result does not depend on vector order.
+// Measurement and the policy-group pick both read the result.
+func preferQoSZone(cands []qosCandidate, claim zone, oc, svm string) []qosCandidate {
+	if len(cands) == 0 {
+		return nil
+	}
+	chosen := map[qosWorkload]zone{}
+	for _, c := range cands {
+		if !qosInScope(c, oc, svm) {
+			continue
+		}
+		k := c.workload()
+		if z, ok := chosen[k]; !ok || claim.prefers(c.zone, z) {
+			chosen[k] = c.zone
+		}
+	}
+	var out []qosCandidate
+	for _, c := range cands {
+		// The key carries the ONTAP cluster and the svm, which are all
+		// qosInScope reads, so a row whose key was chosen is in scope.
+		if z, ok := chosen[c.workload()]; ok && c.zone == z {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // indexPolicyCeilings keys the hop-C vectors by (ontap cluster, svm, policy).
@@ -805,11 +885,11 @@ func pickSVM(cands []volumeLabelCandidate, oc string) (string, string) {
 //
 // A candidate with no `svm` label of its own still contributes: the key's svm
 // comes from hop A, so such a series measures the edge AND reaches hop C
-// (design.md D9).
+// (design.md D9). cands are preferQoSZone's output, so every one is in scope.
 func pickPolicy(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, svm string) string {
 	var resolving, any string
 	for _, c := range cands {
-		if !qosInScope(c, oc, svm) || c.policyGroup == "" {
+		if c.policyGroup == "" {
 			continue
 		}
 		if any == "" || c.policyGroup < any {
@@ -842,10 +922,11 @@ func qosInScope(c qosCandidate, oc, svm string) bool {
 	return svm == "" || c.svm == "" || c.svm == svm
 }
 
-// sumQoSIO sums each I/O family over the in-scope QoS candidates for one
-// claim. nil means no family matched at all — the edge is still emitted, it
-// simply carries no metrics, and the claim counts toward netapp_qos_join_miss.
-func sumQoSIO(cands []qosCandidate, oc, svm string) *graph.IOMetrics {
+// sumQoSIO sums each I/O family over one claim's QoS candidates —
+// preferQoSZone's output, already in scope and one zone per workload. nil
+// means no family matched at all — the edge is still emitted, it simply
+// carries no metrics, and the claim counts toward netapp_qos_join_miss.
+func sumQoSIO(cands []qosCandidate) *graph.IOMetrics {
 	var readOps, writeOps, readLat, writeLat, readData, writeData []float64
 	for _, c := range cands {
 		// Volume granularity. ONTAP collects a workload per LUN as well as per
@@ -854,7 +935,7 @@ func sumQoSIO(cands []qosCandidate, oc, svm string) *graph.IOMetrics {
 		// in the query selector because the policy pick below needs the LUN
 		// rows, and because a Harvest template that omits `lun` on a LUN
 		// workload would slip past a `lun=""` matcher but not past this.
-		if c.lun != "" || !qosInScope(c, oc, svm) {
+		if c.lun != "" {
 			continue
 		}
 		switch c.family {

@@ -92,13 +92,14 @@ backend serving them. Narrowing them would drop edges whose series happen to
 live in another zone's store, and the connectivity prune would then delete the
 pods on both ends.
 
-`harvest` is routed by zone like `ksm` and `kubelet`, and — like them — carries
-the `az` and `env` matchers on every query (the `qos_*` families and the
-restricted `volume_labels` reads add their data- or root-derived scope after
-them). A catch-all `harvest` backend (no `zones`) under `?az=` therefore returns
-the requested zone's series only, and `?env=` narrows Harvest too. Every Harvest
-series must carry the configured `az` / `env` labels; see
-`netapp-harvest-preconditions.md`.
+`harvest` is routed by zone like `ksm` and `kubelet`, and — unlike them —
+carries no `az` or `env` matcher. The `qos_*` families and the restricted
+`volume_labels` reads add only their data- or root-derived scope. A catch-all
+`harvest` backend (no `zones`) under `?az=` therefore returns every zone's
+series, and `?env=` does not narrow Harvest. A series is not required to carry
+the configured `az` / `env` labels; see `netapp-harvest-preconditions.md`.
+Operators who need the old isolation give each environment its own `harvest`
+backend with `zones`.
 
 ## Backend selection
 
@@ -114,7 +115,8 @@ Routing composes **with** the PromQL matchers, never instead of them: an `az`
 value that selects a backend is still rendered as a label matcher on every query
 that accepts it. Routing narrows *which store is asked*; the matcher narrows
 *what that store returns*. `env`, `cluster` and `namespace` play no part in
-backend selection. No family is routed by zone without the matcher.
+backend selection. `harvest` is the one family routed by zone without the
+matcher: the store is its zone filter.
 
 **A storage seed routes like every other storage build.** A
 `/v1/storage-graph` request reads claims FROM the rooted filer's rows, or from

@@ -266,14 +266,13 @@ func TestChunkScopeWithOverhead(t *testing.T) {
 	})
 }
 
-// TestVolumeLabelsRenderers_LeaveTheDimensionTableAlone pins the contract that
-// makes a root-derived restriction a different mechanism from a selector-level
-// dimension: Harvest keeps its routing-only bit, and no request dimension
-// reaches the family.
-// Every restricted Harvest renderer carries the request's az / env ahead of
-// its own restriction, and never cluster / namespace
-// (read-storage-roots-through-volume-hub D13).
-func TestHarvestRenderers_CarryTheRequestZone(t *testing.T) {
+// TestHarvestRenderers_CarryNoRequestMatcher pins the contract that makes a
+// root-derived restriction a different mechanism from a selector-level
+// dimension: Harvest is zone-routed and no request dimension reaches the
+// family. Every restricted Harvest renderer emits its own restriction and
+// never az, env, a Kubernetes cluster or a namespace
+// (drop-harvest-zone-matchers D1).
+func TestHarvestRenderers_CarryNoRequestMatcher(t *testing.T) {
 	t.Parallel()
 
 	full := Selector{
@@ -288,30 +287,33 @@ func TestHarvestRenderers_CarryTheRequestZone(t *testing.T) {
 	for name, tc := range map[string]struct{ got, want string }{
 		"phase 1, aggregate group": {
 			render(RenderVolumeLabelsRooted(time.Minute, keys, full, []string{"ontap-prod"}, []string{"aggr1"})),
-			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
+			`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr1"}[1m])`,
 		},
 		"phase 1, SVM group": {
 			render(RenderVolumeLabelsSVMRooted(time.Minute, keys, full, nil, []string{"svm_a"})),
-			`last_over_time(volume_labels{zone="zone-a",tier="prod",svm="svm_a"}[1m])`,
+			`last_over_time(volume_labels{svm="svm_a"}[1m])`,
 		},
 		"owner completion": {
 			render(RenderVolumeLabelsOwnerCompletion(time.Minute, keys, full, "ontap-prod", []string{"aggr1"})),
-			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster="ontap-prod",aggr="aggr1"}[1m])`,
+			`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr1"}[1m])`,
 		},
 		"phase 2": {
 			render(RenderVolumeLabelsTokenScoped(time.Minute, keys, full, []string{"pvc_a"}, true, []string{"ontap-prod"})),
-			`last_over_time(volume_labels{zone="zone-a",tier="prod",cluster!~"ontap-prod",volume=~".*pvc_a"}[1m])`,
+			`last_over_time(volume_labels{cluster!~"ontap-prod",volume=~".*pvc_a"}[1m])`,
 		},
 		"QoS chunk": {
 			render(RenderQoSVolumeScoped(QQoSReadOps, time.Minute, keys, full, []string{"trident_pvc_a"})),
-			`last_over_time(qos_read_ops{zone="zone-a",tier="prod",volume="trident_pvc_a"}[1m])`,
+			`last_over_time(qos_read_ops{volume="trident_pvc_a"}[1m])`,
 		},
 		"by ONTAP controller": {
 			render(RenderVolumeLabelsByNode(time.Minute, keys, full, []string{"na-02", "na-01"})),
-			`last_over_time(volume_labels{zone="zone-a",tier="prod",node=~"na-01|na-02"}[1m])`,
+			`last_over_time(volume_labels{node=~"na-01|na-02"}[1m])`,
 		},
 	} {
 		assert.Equal(t, tc.want, tc.got, name)
+		assert.NotContains(t, tc.got, `zone=`, name)
+		assert.NotContains(t, tc.got, `tier=`, name)
+		assert.NotContains(t, tc.got, `namespace=`, name)
 	}
 
 	got, ok := RenderVolumeLabelsRooted(time.Minute, keys, Selector{}, nil, []string{"aggr1"})
@@ -345,10 +347,15 @@ func TestRenderVolumeLabelsByNode(t *testing.T) {
 func TestRequestMatcherCost(t *testing.T) {
 	t.Parallel()
 
-	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: []string{"shop"}}
-	assert.Equal(t, len(`az="zone-a",env="prod"`)+1, RequestMatcherCost(QVolumeLabels, LabelKeys{}, sel),
-		"Harvest carries az and env only")
-	assert.Equal(t, len(`az="zone-a",env="prod",namespace="shop"`)+1,
+	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: []string{"shop"}, Cluster: []string{"c1"}}
+	for q, fam := range queryFamily {
+		if fam != FamilyHarvest {
+			continue
+		}
+		assert.Zero(t, RequestMatcherCost(q, LabelKeys{}, sel),
+			"%s renders no request matcher, so a chunker charges nothing", q)
+	}
+	assert.Equal(t, len(`az="zone-a",env="prod",cluster="c1",namespace="shop"`)+1,
 		RequestMatcherCost(QPVCInfo, LabelKeys{}, sel))
 	assert.Zero(t, RequestMatcherCost(QVolumeLabels, LabelKeys{}, Selector{}),
 		"nothing rendered, nothing charged")

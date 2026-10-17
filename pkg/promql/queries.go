@@ -261,9 +261,9 @@ const (
 //   - dimsHarvest — every NetApp Harvest series. Their `cluster` label is the
 //     ONTAP cluster name, NOT a Kubernetes cluster, so pushing a Kubernetes
 //     cluster value into it would match nothing; they carry no namespace
-//     either. They DO take the az / env matchers, and az also routes them.
-//     Narrowed by reference, beyond that, through the loaded claims'
-//     volumename join.
+//     either. They take NO request matcher. `az` still routes them
+//     (dimAZRoute): the store is the zone boundary. Narrowed by reference,
+//     beyond that, through the loaded claims' volumename join.
 //   - dimsNone — the three traces_service_graph_* series (read in full for
 //     every request: their `cluster` label is the unreliable trace-source
 //     cluster and their namespace labels describe only the caller's own view,
@@ -306,7 +306,7 @@ var queryDims = map[Query]dims{
 	QNodeLabels:          dimsClusterScoped,
 	QNodeStatusCondition: dimsClusterScoped,
 
-	// NetApp Harvest — az / env only (zone-routed and matched), never cluster / namespace.
+	// NetApp Harvest — zone-routed (dimAZRoute), no request matcher.
 	QVolumeLabels:           dimsHarvest,
 	QQoSReadOps:             dimsHarvest,
 	QQoSWriteOps:            dimsHarvest,
@@ -504,8 +504,9 @@ func FamilyOf(q Query) (Family, bool) {
 }
 
 // familyAcceptsAZ is derived from queryDims once, at package initialisation:
-// a family is zone-routable iff EVERY query in it carries dimAZ (az rendered
-// as a matcher AND routed).
+// a family is zone-routable iff EVERY query in it carries dimAZ or the
+// routing-only dimAZRoute bit. Harvest carries dimAZRoute only, so it is
+// routed and not matched (drop-harvest-zone-matchers D1).
 //
 // Deriving it (rather than restating it) is what keeps backend selection and
 // matcher rendering reading the same table. The service-graph and probe
@@ -516,7 +517,7 @@ func FamilyOf(q Query) (Family, bool) {
 // A family whose queries disagreed would resolve to false (not zone-routable,
 // so fanned out to every backend serving it), which is the safe direction.
 // TestFamilyAcceptsAZ_HomogeneousWithinFamily fails on such a disagreement.
-var familyAcceptsAZ = buildFamilyDim(dimAZ)
+var familyAcceptsAZ = buildFamilyDim(dimAZ | dimAZRoute)
 
 // buildFamilyDim folds queryDims into a per-family bit: a family carries the
 // bit iff EVERY query in it does. A family whose queries disagreed resolves to
@@ -544,9 +545,9 @@ func buildFamilyDim(mask dims) map[Family]bool {
 func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
 
 // familyRendersAZ is derived from queryDims once, at package initialisation:
-// a family renders an `az` matcher iff EVERY query in it carries dimAZ. Since
-// read-storage-roots-through-volume-hub D13 it equals familyAcceptsAZ for
-// every family: nothing is routed by zone without the matcher.
+// a family renders an `az` matcher iff EVERY query in it carries dimAZ.
+// dimAZRoute does not count, so Harvest is zone-routed (AcceptsAZ) without
+// the matcher (drop-harvest-zone-matchers D1).
 //
 // QueryLabels reads this bit for an arbitrary metric that has no queryDims
 // entry of its own: the family's queries are the only honest statement of
@@ -554,9 +555,10 @@ func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
 // fails the build if a family's queries disagree.
 var familyRendersAZ = buildFamilyDim(dimAZ)
 
-// RendersAZ reports whether a query in family f carries the `az` matcher. It
-// agrees with AcceptsAZ for every family today; the two stay separate methods
-// because they answer different questions (does az route / does az render).
+// RendersAZ reports whether a query in family f carries the `az` matcher.
+// It agrees with AcceptsAZ for every family except harvest, which is routed
+// by az and renders no matcher. The two stay separate methods because they
+// answer different questions (does az route / does az render).
 func (f Family) RendersAZ() bool { return familyRendersAZ[f] }
 
 // HarvestVolumeLabel is the STOCK Harvest label naming the ONTAP FlexVol, on

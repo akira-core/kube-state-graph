@@ -21,14 +21,18 @@ func TestRenderHarvestPair(t *testing.T) {
 	aggr, ok := RenderHarvestPair(QAggrStatus, time.Minute, keys, sel, "ontap-prod", []string{"aggr2", "aggr1", "aggr1"})
 	require.True(t, ok)
 	assert.Equal(t,
-		`last_over_time(aggr_new_status{zone="zone-a",tier="prod",cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])`,
-		aggr, "Kubernetes cluster and namespace never reach a Harvest family")
+		`last_over_time(aggr_new_status{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])`,
+		aggr, "no request matcher reaches a Harvest family")
+	assert.NotContains(t, aggr, `zone=`)
+	assert.NotContains(t, aggr, `tier=`)
 
 	node, ok := RenderHarvestPair(QNetAppNodeCPUBusy, time.Minute, LabelKeys{}, sel, "ontap-prod", []string{"na-02", "na-01"})
 	require.True(t, ok)
 	assert.Equal(t,
-		`last_over_time(node_cpu_busy{az="zone-a",env="prod",cluster="ontap-prod",node=~"na-01|na-02"}[1m])`,
+		`last_over_time(node_cpu_busy{cluster="ontap-prod",node=~"na-01|na-02"}[1m])`,
 		node)
+	assert.NotContains(t, node, `az=`)
+	assert.NotContains(t, node, `env=`)
 
 	policy, ok := RenderHarvestPair(QQoSPolicyFixedMaxMBps, time.Minute, LabelKeys{}, Selector{}, "ontap-prod", []string{"svm_a"})
 	require.True(t, ok)
@@ -75,8 +79,9 @@ func TestRenderHarvestByNameAndCluster(t *testing.T) {
 	byName, ok := RenderHarvestByName(QAggrStatus, time.Minute, LabelKeys{}, sel, []string{"aggr9", "aggr00"})
 	require.True(t, ok)
 	assert.Equal(t,
-		`last_over_time(aggr_new_status{az="zone-a",env="prod",aggr=~"aggr00|aggr9"}[1m])`,
+		`last_over_time(aggr_new_status{aggr=~"aggr00|aggr9"}[1m])`,
 		byName)
+	assert.NotContains(t, byName, `az=`)
 
 	one, ok := RenderHarvestByName(QNetAppNodeLabels, time.Minute, LabelKeys{}, Selector{}, []string{"ontap-prod-03"})
 	require.True(t, ok)
@@ -85,8 +90,9 @@ func TestRenderHarvestByNameAndCluster(t *testing.T) {
 	byCluster, ok := RenderHarvestByCluster(QNetAppNodeStatus, time.Minute, LabelKeys{}, sel, []string{"ontap-b", "ontap-a"})
 	require.True(t, ok)
 	assert.Equal(t,
-		`last_over_time(node_new_status{az="zone-a",env="prod",cluster=~"ontap-a|ontap-b"}[1m])`,
+		`last_over_time(node_new_status{cluster=~"ontap-a|ontap-b"}[1m])`,
 		byCluster)
+	assert.NotContains(t, byCluster, `az=`)
 
 	_, ok = RenderHarvestByName(QPodInfo, time.Minute, LabelKeys{}, Selector{}, []string{"aggr1"})
 	assert.False(t, ok)
@@ -112,15 +118,14 @@ func TestChunkHarvestPairs(t *testing.T) {
 		}, got)
 	})
 
-	t.Run("charges the request matchers", func(t *testing.T) {
+	t.Run("a request selector charges nothing", func(t *testing.T) {
 		t.Parallel()
-		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
-		budget := RequestMatcherCost(QAggrStatus, LabelKeys{}, sel) + OwnerCompletionClusterCost("oc") + nameBudget
+		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
+		assert.Zero(t, RequestMatcherCost(QAggrStatus, LabelKeys{}, sel))
+		budget := OwnerCompletionClusterCost("oc") + nameBudget
 		got := ChunkHarvestPairs(QAggrStatus, LabelKeys{}, sel, map[string][]string{"oc": names}, budget)
-		assert.Equal(t, []HarvestNameChunk{
-			{Cluster: "oc", Names: []string{"a", "b", "c"}},
-			{Cluster: "oc", Names: []string{"d"}},
-		}, got, "forgetting the request matchers would leave room for every name in one chunk")
+		bare := ChunkHarvestPairs(QAggrStatus, LabelKeys{}, Selector{}, map[string][]string{"oc": names}, budget)
+		assert.Equal(t, bare, got, "Harvest renders no request matcher, so the selector cannot move a chunk boundary")
 	})
 
 	t.Run("charges the escaped cluster equality", func(t *testing.T) {

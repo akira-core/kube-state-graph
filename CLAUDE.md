@@ -76,7 +76,7 @@ HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>
 kubegraph.ParseStorageValues  ── az/env required and repeatable; one root kind (missing_root / invalid_scope)
    ▼
 Builder.BuildStorage(…, roots) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
-                                  no ReadServiceGraph, no up{} probe; fails closed; never leaves the request's zones
+                                  no ReadServiceGraph, no up{} probe; fails closed; Kubernetes queries never leave the request's zones; Harvest is routed by az
    ▼
 graph.ProjectStorage → cytoscape.Serialise
 ```
@@ -94,7 +94,7 @@ code in it**; the one-liner is a reminder, not the rule.
 |---|---|
 | `pkg/build/servicegraph*.go`, `redmetrics.go`, `histogram.go`; any `pod-calls-*` / `service-selects-pod` edge, `data.metrics`, `traces_service_graph_*` | `.claude/rules/service-graph-resolution.md` — endpoint resolution ladder (D27 / D29 / D30 / D33), unknown-server peer enrichment, span-link marking, RED scope, filtered-build admission |
 | `pkg/route/**`, `pkg/build/route*.go`, `--route-store-dsn` | `.claude/rules/route-resolution.md` — Istio route engine, ingress-cluster pick, LB-Service fallback, ingress chain, containment |
-| `pkg/build/{netapp,qosscope,volumekey,volumelabelscope,claimscope,zone}.go`, `pkg/promql/{qosscope,volumelabels,harvestpair}.go`; Harvest series, `pvc-to-netapp-aggr`, `data.qos` | `.claude/rules/netapp-storage-join.md` — hops A / B / C, zone agreement, rooted `volume_labels` read, scoped QoS wave, ceiling key |
+| `pkg/build/{netapp,qosscope,volumekey,volumelabelscope,claimscope,zone}.go`, `pkg/promql/{qosscope,volumelabels,harvestpair}.go`; Harvest series, `pvc-to-netapp-aggr`, `data.qos` | `.claude/rules/netapp-storage-join.md` — hops A / B / C, zone preference, rooted `volume_labels` read, scoped QoS wave, ceiling key |
 | `/v1/storage-graph`: `pkg/build/{topologyplan,claimseed,*seed,*scope,expansion,storageflow}.go`, `pkg/graph/{storagescope,project_storage}.go`, `kubegraph.ParseStorageValues` | `.claude/rules/storage-graph.md` — build lifecycle, root kinds, qualified roots, claim seed, multi-zone union |
 | `pkg/promql/**`, `pkg/kubegraph/align.go`; a new `Query` constant, a selector, the cache, the routing table | `.claude/rules/upstream-queries.md` — per-store guard, end alignment, `queryDims` / `queryFamily`, selector rendering, backend routing |
 | `pkg/graph/**`, `pkg/cytoscape/**`, `pkg/build/{topology*,clusteridentity,status,alerts}.go`; a node attribute, a node / edge type, projection, goldens | `.claude/rules/graph-model.md` — connectivity prune, cluster identity, `EdgeTypes`, typed attributes, compound nodes, sealed node types |
@@ -129,7 +129,7 @@ capability specs live under `openspec/specs/`.
 
 - **`/v1/graph` takes `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`**; unknown parameters (including the withdrawn `name` / `root` / `depth` / `direction` / `edge_type`) are ignored without error. `GET /v1/clusters` is removed.
 - **Only `end > start` is validated** — no window cap, no future-time guard. `kubegraph.AlignWindow` floors `end` to `--end-align` in exactly two places (`internal/api` `runBuild`, `Engine.BuildFromValues` / `BuildStorageFromValues`), never inside the parsers.
-- **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries and `up` take NO request matcher. Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
+- **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries, `up`, and every NetApp Harvest query take NO request matcher. Harvest stays zone-routed: `az` selects its backends and is not rendered (`dimAZRoute`). Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
 - **A filtered build NEVER synthesises a pod**, admits a service-graph series only when a resolved endpoint names loaded topology, and returns an empty 200 (never `outside_retention`) when nothing matched.
 - **Every upstream query passes a per-store guard** — result cache → miss coalescing → concurrency slot — ON by default for server and library. Cached vectors are shared: **readers in `pkg/build` MUST NOT mutate a sample or its `Metric` map**. `pkg/build.New` stays unguarded (the test seam).
 - **Upstream is a routed table of backends** (`promql.Router`; no `--backends-file` ⇒ one implicit `default` backend). `queryFamily` is exhaustive beside `queryDims`; the cross-backend merge MUST de-duplicate by label-set fingerprint (readers sum); required legs fail closed; credentials are env-var names, never literals; file parsing lives in `pkg/promql/backendsfile`, never `pkg/promql`.
@@ -146,8 +146,8 @@ capability specs live under `openspec/specs/`.
 **Storage**
 
 - **The NetApp join is three independently-degrading hops** keyed on the PVC's `volumename` rewritten to a token and suffix-matched against the stock Harvest `volume` label — never a label equality. `volume_labels` is the sole topology source; a QoS miss leaves a measurement-less edge; an incomplete ceiling key is ignored, never widened.
-- **`/v1/storage-graph` requires `az` + `env` and exactly one root kind, fails closed on any query error (except `ALERTS`), and never reads a zone the request did not select.** A request-derived scope past the chunk cap is 400 `invalid_scope` before any query; a data-derived scope is chunked, never widened. A multi-zone body is the union of its zones.
-- **Every Harvest series must carry the configured `az` / `env` labels**; ONTAP cluster and controller names are unique across the estate, aggregate and SVM names are not (hence the qualified `<ontap_cluster>/<name>` root).
+- **`/v1/storage-graph` requires `az` + `env` and exactly one root kind, fails closed on any query error (except `ALERTS`), and never reads a Kubernetes zone the request did not select.** Harvest is routed by `az` and carries no request matcher. A request-derived scope past the chunk cap is 400 `invalid_scope` before any query; a data-derived scope is chunked, never widened. A multi-zone body is the union of its zones, except for a claim whose matching Harvest rows (or a colliding FlexVol) sit in another selected zone's `harvest` store — see `.claude/rules/storage-graph.md`.
+- **A Harvest series is not required to carry the configured `az` / `env` labels**; a series that does is used for zone preference and the zone-agreeing alert match. ONTAP cluster and controller names are unique across the estate, aggregate and SVM names are not (hence the qualified `<ontap_cluster>/<name>` root).
 
 **Operations**
 

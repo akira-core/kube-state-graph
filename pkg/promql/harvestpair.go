@@ -45,12 +45,13 @@ func harvestPairLabel(q Query) (string, bool) {
 // RenderHarvestPair renders one pair-keyed Harvest family restricted to names
 // of a single ONTAP cluster:
 //
-//	last_over_time(aggr_space_used{az="zone-a",cluster="ontap-prod",aggr=~"aggr1|aggr2"}[5m])
+//	last_over_time(aggr_space_used{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[5m])
 //
 // The cluster equality is always rendered, including when cluster is empty, so
 // a query never spans filers and a series carrying no cluster label still
-// matches its own bucket. Request matchers (az / env) precede the pair. These
-// families have no fixed selector.
+// matches its own bucket. keys and sel render no matcher on a Harvest query —
+// az routes the family and is not a matcher — so the pair is the whole
+// selector. These families have no fixed selector.
 //
 // ok is false when q is not a pair-keyed family or names holds no non-empty
 // value. The caller MUST skip the query rather than fall back to an unscoped
@@ -73,7 +74,7 @@ func RenderHarvestPair(q Query, window time.Duration, keys LabelKeys, sel Select
 // RenderHarvestByName renders a pair-keyed family restricted on its name
 // label alone, with no cluster matcher:
 //
-//	last_over_time(aggr_new_status{az="zone-a",aggr=~"aggr9"}[5m])
+//	last_over_time(aggr_new_status{aggr=~"aggr9"}[5m])
 //
 // A bare aggr= or ontap_node= root names a component on every filer, and the
 // cluster is not known until the rows come back. ok is false when q is not
@@ -90,7 +91,7 @@ func RenderHarvestByName(q Query, window time.Duration, keys LabelKeys, sel Sele
 // cluster alone, so one filer's whole aggregate or controller inventory is
 // read:
 //
-//	last_over_time(node_new_status{az="zone-a",cluster=~"ontap-a|ontap-b"}[5m])
+//	last_over_time(node_new_status{cluster=~"ontap-a|ontap-b"}[5m])
 //
 // ok is false when q is not pair-keyed or clusters is empty.
 func RenderHarvestByCluster(q Query, window time.Duration, keys LabelKeys, sel Selector, clusters []string) (string, bool) {

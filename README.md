@@ -105,7 +105,7 @@ are AND-combined.
 |---|---|---|---|---|
 | pod / claim / Service / EndpointSlice KSM series, kubelet volume stats | ✅ | ✅ | ✅ | ✅ |
 | `kube_node_*` | ✅ | ✅ | ✅ | — (no such label) |
-| NetApp Harvest (`volume_labels`, `qos_*`, `aggr_*`, `node_new_status`) | ✅ | ✅ | — (its `cluster` is the **ONTAP** cluster) | — |
+| NetApp Harvest (`volume_labels`, `qos_*`, `aggr_*`, `node_new_status`) | routes only — no matcher | — | — (its `cluster` is the **ONTAP** cluster) | — |
 | `traces_service_graph_*`, `up` | — | — | — | — |
 
 The service-graph family is read **in full for every request**: its `cluster`
@@ -125,13 +125,14 @@ filter appears as an `external` node rather than a real pod — the request's
 inbound and outbound dependencies stay visible without loading the rest of the
 estate.
 
-> **Operator precondition.** The kube-state-metrics, kubelet and NetApp Harvest
-> families must carry the configured `az` / `env` labels. A family that does not
-> simply matches nothing under those filters, and because the default projection
-> keeps only connectivity-connected workload, a missing label can turn a filtered
-> request into an empty graph rather than a partial one. Harvest carries `az` /
-> `env` only — its `cluster` is the ONTAP cluster — and `?az=` also selects
-> which `harvest` backend of the routing table is asked.
+> **Operator precondition.** The kube-state-metrics and kubelet families must
+> carry the configured `az` / `env` labels. A family that does not simply matches
+> nothing under those filters, and because the default projection keeps only
+> connectivity-connected workload, a missing label can turn a filtered request
+> into an empty graph rather than a partial one. Harvest is not required to
+> carry them: `?az=` selects which `harvest` backend is asked and the query
+> carries no matcher. A series that does carry the labels takes part in zone
+> preference. Its `cluster` is the ONTAP cluster.
 
 ## Upstream metrics consumed
 
@@ -173,9 +174,10 @@ controller-annotation families only for the owner names those pods' resolved
 owners carry. A request rooted at `ontap_cluster=`, `aggr=` or `svm=` is read
 through the **volume hub**: the claim families are read FROM the rooted
 `volume_labels` rows (a FlexVol name embedding `pvc_<uid>` names the PV
-`pvc-<uid>`), under the same `az` / `env` matchers and the same zone routing as
-every other storage request — no query reaches a store of another zone, so a
-filer shared across zones is drawn with the requested zone's claims only. A
+`pvc-<uid>`). The claim queries carry the request's `az` / `env` matchers;
+Harvest is routed by `az` and carries none. No query reaches a store of
+another zone, so a filer shared across zones is drawn with the requested
+zone's claims only. A
 statically provisioned PV is not
 reached from a storage root — see
 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md).

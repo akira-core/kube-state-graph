@@ -57,15 +57,15 @@ func TestSelector_Render(t *testing.T) {
 			`cluster="c1"`,
 		},
 		{
-			// Harvest takes az and env only: its `cluster` is an ONTAP
-			// cluster and it carries no namespace (D13).
-			"harvest query renders the zone and environment only",
+			// Harvest is zone-routed and renders no request matcher. Its
+			// `cluster` is an ONTAP cluster and it carries no namespace.
+			"harvest query renders no request matcher",
 			Selector{
 				AZ: []string{"zone-a"}, Env: []string{"prod"},
 				Cluster: []string{"c1"}, Namespace: []string{"shop"},
 			},
 			LabelKeys{}, dimsHarvest,
-			`az="zone-a",env="prod"`,
+			``,
 		},
 		{
 			// Both spellings of the bucket must match: a series with no
@@ -214,34 +214,33 @@ func TestQueryDims_UnfilteredFamilies(t *testing.T) {
 	}
 }
 
-// TestQueryDims_HarvestCarriesZoneOnly pins the Harvest rule
-// (read-storage-roots-through-volume-hub D13): every Harvest query carries the
-// request's az and env, like a kube-state-metrics query, so no other zone's or
-// environment's filer reaches a filtered build. Its `cluster` label is the
-// ONTAP cluster name, so a Kubernetes cluster value would match nothing, and
-// it carries no namespace — those two never reach it.
-func TestQueryDims_HarvestCarriesZoneOnly(t *testing.T) {
+// TestQueryDims_HarvestCarriesNoRequestMatcher pins the Harvest rule
+// (drop-harvest-zone-matchers D1): every Harvest query is zone-routed and
+// renders no request matcher. Its `cluster` label is the ONTAP cluster name,
+// so a Kubernetes cluster value would match nothing, and it carries no
+// namespace — those two never reach it, and neither do az or env as matchers.
+func TestQueryDims_HarvestCarriesNoRequestMatcher(t *testing.T) {
 	for q, fam := range queryFamily {
 		if fam != FamilyHarvest {
 			continue
 		}
 		assert.Equal(t, dimsHarvest, queryDims[q], "%s", q)
-		assert.Equal(t, dimAZ|dimEnv, queryDims[q], "%s carries az and env", q)
-		assert.Zero(t, queryDims[q]&(dimCluster|dimNamespace|dimNamespaceOrAbsent),
-			"%s never carries cluster or namespace", q)
+		assert.Equal(t, dimAZRoute, queryDims[q], "%s is routed by az and matched by nothing", q)
+		assert.Zero(t, queryDims[q]&(dimAZ|dimEnv|dimCluster|dimNamespace|dimNamespaceOrAbsent),
+			"%s never renders a request matcher", q)
 	}
 	sel := Selector{
 		AZ: []string{"zone-a"}, Env: []string{"prod"},
 		Cluster: []string{"c1"}, Namespace: []string{"shop"},
 	}
-	assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod"}[1m])`,
+	assert.Equal(t, `last_over_time(volume_labels[1m])`,
 		Render(QVolumeLabels, time.Minute, LabelKeys{}, sel))
-	assert.Equal(t, `last_over_time(qos_read_ops{az="zone-a",env="prod"}[1m])`,
+	assert.Equal(t, `last_over_time(qos_read_ops[1m])`,
 		Render(QQoSReadOps, time.Minute, LabelKeys{}, sel),
-		"no lun matcher (D11), and no cluster / namespace")
-	assert.Equal(t, `last_over_time(aggr_new_status{zone="zone-a",tier="prod"}[1m])`,
+		"no lun matcher (D11), and no request matcher")
+	assert.Equal(t, `last_over_time(aggr_new_status[1m])`,
 		Render(QAggrStatus, time.Minute, LabelKeys{AZ: "zone", Env: "tier"}, sel),
-		"the configured keys, as on every other family")
+		"configured keys render nothing on a Harvest query")
 }
 
 // TestQueryDims_ControllerAnnotationFamiliesAreNamespaced pins the third
@@ -293,8 +292,8 @@ func TestRender_ComposesFixedSelectorFirst(t *testing.T) {
 			`last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",cluster="cluster-alpha"}[1m])`},
 		"node condition": {QNodeStatusCondition,
 			`last_over_time(kube_node_status_condition{condition="Ready",az="zone-a",cluster="cluster-alpha"}[1m])`},
-		"qos workload (Harvest takes az / env, never cluster)": {QQoSReadOps,
-			`last_over_time(qos_read_ops{az="zone-a"}[1m])`},
+		"qos workload (Harvest takes no request matcher)": {QQoSReadOps,
+			`last_over_time(qos_read_ops[1m])`},
 		"job owner cronjob": {QJobOwner,
 			`last_over_time(kube_job_owner{owner_kind="CronJob",owner_is_controller="true",az="zone-a",cluster="cluster-alpha",namespace="shop"}[1m])`},
 		"deployment annotations": {QDeploymentAnnotations,
@@ -371,9 +370,9 @@ func TestSelector_Reaches(t *testing.T) {
 		"cluster reaches node info":         {Selector{Cluster: []string{"a"}}, QNodeInfo, true},
 		"cluster misses Harvest":            {Selector{Cluster: []string{"a"}}, QVolumeLabels, false},
 		"namespace misses Harvest":          {Selector{Namespace: []string{"ns"}}, QVolumeLabels, false},
-		"az reaches Harvest":                {Selector{AZ: []string{"z"}}, QVolumeLabels, true},
-		"env reaches Harvest":               {Selector{Env: []string{"prod"}}, QVolumeLabels, true},
-		"az reaches QoS":                    {Selector{AZ: []string{"z"}}, QQoSReadOps, true},
+		"az misses Harvest":                 {Selector{AZ: []string{"z"}}, QVolumeLabels, false},
+		"env misses Harvest":                {Selector{Env: []string{"prod"}}, QVolumeLabels, false},
+		"az misses QoS":                     {Selector{AZ: []string{"z"}}, QQoSReadOps, false},
 		"az reaches kubelet":                {Selector{AZ: []string{"z"}}, QKubeletVolumeUsedBytes, true},
 		"nothing reaches the service graph": {Selector{AZ: []string{"z"}, Cluster: []string{"a"}}, QServiceGraphTotal, false},
 		"nothing reaches the up probe":      {Selector{Env: []string{"prod"}}, QUpProbe, false},

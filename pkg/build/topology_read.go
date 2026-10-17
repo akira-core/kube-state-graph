@@ -429,13 +429,12 @@ func readTopology(
 // selector demonstrably matches the deployment's labelling, yet a kubelet
 // family came back empty. A family is reported ONLY when a dimension the
 // request actually carries reaches it (promql.Selector.Reaches). In practice
-// that is the kubelet pair alone. The Harvest families DO carry az / env now
-// (read-storage-roots-through-volume-hub D13), so Reaches is true for them,
-// but an empty volume_labels is also the ordinary state of a deployment with
-// no NetApp storage — reporting it would fire this Warn on every filtered
-// request of every such deployment, and nothing in the build can tell the
-// two apart. They are excluded by an explicit rule below; QVolumeLabels stays
-// in the list so the exclusion is a rule rather than an omission.
+// that is the kubelet pair alone. The Harvest families carry no request
+// matcher — az only routes them (drop-harvest-zone-matchers D1) — so Reaches
+// is false for them and an empty volume_labels, which is also the ordinary
+// state of a deployment with no NetApp storage, is never named. QVolumeLabels
+// stays in the list so that exclusion is pinned through Reaches rather than
+// through an omission.
 //
 // An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
 // on a DIFFERENT axis, and it needs its own rule because Reaches cannot
@@ -458,7 +457,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
 		promql.QAlerts,
 	} {
-		if fam, ok := promql.FamilyOf(q); ok && (fam.Optional() || fam == promql.FamilyHarvest) {
+		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
 			continue
 		}
 		// Present-and-zero only: a family absent from the tally was never

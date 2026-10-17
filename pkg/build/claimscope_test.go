@@ -501,7 +501,7 @@ func TestVolumeHub_CompletionRowsAreNeverACandidateSource(t *testing.T) {
 			completion = append(completion, qy)
 		}
 	}
-	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr3"}[1m])`}, completion,
+	assert.Equal(t, []string{`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr3"}[1m])`}, completion,
 		"owner completion re-reads the touched aggregate whole")
 	assert.Equal(t, [][]string{{"pvc-shop"}}, q.ScopeValues(promql.QPVCInfo, promql.VolumeNameLabel),
 		"trident_pvc_other came back through completion, never a candidate")

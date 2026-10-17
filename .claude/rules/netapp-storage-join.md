@@ -36,20 +36,22 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     `pvc-to-netapp-aggr` edge, the `netapp-aggr` / `netapp-node` entities, and
     the PVC `svm` label. An **info series**: its sample value is discarded, only
     its labels (`cluster` = ONTAP cluster, `node`, `aggr`, `svm`) are read.
-    **Zone agreement** (accept-multi-zone-storage-graph): a claim's CANDIDATE set —
+    **Zone preference** (drop-harvest-zone-matchers D2): a claim's CANDIDATE set —
     the matched series every pick runs over (aggregate, SVM, the owner the edge
-    names, the QoS scope, the ceiling key) — holds only series whose zone agrees
-    with the claim's: `pvcVolume.zone` is the `(az, env)` pair of the claim's
+    names, the QoS scope, the ceiling key) — is the series whose zone agrees
+    with the claim's WHEN AT LEAST ONE agrees, and every matched series
+    otherwise. `pvcVolume.zone` is the `(az, env)` pair of the claim's
     `kube_persistentvolumeclaim_info` series and `volumeLabelCandidate.zone` the
     series' own, both read through the configured label keys by `zoneOf` (the
     shared `zone` type in `pkg/build/zone.go`, which alerts use too), and
-    `zonesAgree` excludes a series only when BOTH sides carry a complete pair and
-    the pairs differ — an unknown zone never excludes. `volIndex` / `allByAggr`
-    are NOT filtered, so the owner vote and the inventory see every series. It
-    makes a cross-zone FlexVol-token collision (a Trident clone, a hand-chosen
-    naming scheme) resolve within each claim's own zone; it applies to the shared
-    join, so an unfiltered `/v1/graph` changes only in an estate holding such a
-    collision.
+    `zonesAgree` is false only when BOTH sides carry a complete pair and the
+    pairs differ — an unknown zone agrees. `volIndex` / `allByAggr` are NOT
+    filtered, so the owner vote and the inventory see every series. A
+    cross-zone FlexVol-token collision (a Trident clone, a hand-chosen naming
+    scheme) therefore stays inside the claim's own zone while such a series
+    exists, and a claim none of whose matches agree still joins. It applies to
+    the shared join, so an unfiltered `/v1/graph` changes only in an estate
+    holding such a collision.
     **Rooted read** (scope-volume-labels-by-storage-root,
     read-storage-roots-through-volume-hub): a `/v1/storage-graph` request rooted
     at `ontap_cluster=`, `aggr=` and/or `svm=` reads it restricted. Phase 1 is up
@@ -104,13 +106,15 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     filtered to the loaded `(az, env, cluster, namespace, claim)` keys. A data-derived scope is chunked however large it is and never replaced
     by a read across the zone. `storage_root_claim_miss` (`no_pv_candidate` /
     `no_claim`) reports a seed that found nothing (`no_claim` drops to Debug under
-    a `cluster=` / `namespace=` filter). **The build stays in the request's zones**
+    a `cluster=` / `namespace=` filter). **The Kubernetes side stays in the request's zones**
     (D7): `buildStorage` renders the request's FULL selector and binds
-    `QuerierFor(sel)`, so no query reaches the store of a zone the request did
-    not select and a filer shared across zones draws the selected zones' claims
-    only — operators require that a request queries only its own az / env
-    backends. Do NOT
-    reintroduce an az/env-relaxed or per-family-zone-routed read. Alert
+    `QuerierFor(sel)`, so no kube-state-metrics, kubelet or `ALERTS` query
+    reaches the store of a zone the request did not select, and a filer shared
+    across zones draws the selected zones' claims only. Harvest is zone-routed
+    and carries no request matcher: a zone-declared `harvest` backend is still
+    the only store asked, and a catch-all returns every zone's series, which
+    the reader prefers by the claim's zone. Do NOT reintroduce an az/env
+    matcher on Harvest, or an az/env-relaxed Kubernetes read. Alert
     matching also AGREES ON ZONE (D11, `pkg/build/alerts.go`), for the builds
     that do hold several zones (unfiltered `/v1/graph`, a multi-zone `/v1/storage-graph`, catch-all backends): an alert's `az`/`env` pair must agree with the
     candidate's zone — a Kubernetes object's composed identity, a NetApp
@@ -138,6 +142,19 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     `RenderQoSVolumeScoped`. Candidates are further scoped in
     Go to the picked aggregate's ONTAP cluster (and its `svm` when both sides
     resolve one) so a colliding FlexVol name across two filers cannot merge.
+    **One zone per workload** (drop-harvest-zone-matchers D3): the queries
+    carry no `az` / `env` matcher, so the same workload can return once per
+    pair. `preferQoSZone` keys the in-scope rows by `qosWorkload`
+    (`ontap_cluster`, `svm`, `volume`, `lun`, family) and keeps, per key, the
+    rows of ONE zone — `zone.prefers`: the claim's zone, else rows carrying no
+    pair (they agree with every claim, as in hop A), else the lexically-smallest
+    complete pair (`zone.compare`). Both `resolveCeiling` and `sumQoSIO` read
+    that slice, which is why neither re-tests `qosInScope`. The choice is per
+    workload, NEVER per claim: a claim matching two FlexVols, or holding a LUN
+    row in its own zone beside a volume row in another, keeps every workload's
+    rows — a per-claim group would drop real I/O. A zone present only on
+    another filer cannot win. The slice is new and keeps input order; the
+    shared index is never mutated.
     **These six legs are read in a SECOND WAVE** (`pkg/build/qosscope.go`
     `readScopedQoS`), issued only after hop A and restricted to exactly the
     FlexVol names the loaded claims matched

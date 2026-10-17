@@ -34,11 +34,11 @@ const (
 //
 // Like RenderQoSVolumeScoped and RenderScoped the restriction is derived from
 // data the request carries rather than from a selector-level dimension:
-// queryDims is unchanged and Selector.Reaches does not see it. The request's
-// own matchers — az and env, the only ones queryDims grants Harvest — render
-// FIRST, exactly as on the unrestricted read, so the restriction narrows the
-// request's zone rather than replacing it. Values are sorted, de-duplicated
-// and QuoteMeta-escaped, so the string is a pure function of the value SETS.
+// queryDims is unchanged and Selector.Reaches does not see it. keys and sel
+// render no matcher on a Harvest query — az routes the family and is not a
+// matcher — so the restriction is the whole selector. Values are sorted,
+// de-duplicated and QuoteMeta-escaped, so the string is a pure function of
+// the value SETS.
 //
 // ok is false when both sets are empty after normalisation. The caller MUST then
 // issue the unrestricted read instead — an empty restriction is "no root", never
@@ -225,12 +225,12 @@ func RenderVolumeLabelsTokenScoped(window time.Duration, keys LabelKeys, sel Sel
 // RenderVolumeLabelsByNode renders the volume-label family restricted on the
 // ONTAP controller name (`node`):
 //
-//	last_over_time(volume_labels{az="zone-a",node=~"na-01|na-02"}[5m])
+//	last_over_time(volume_labels{node=~"na-01|na-02"}[5m])
 //
 // An ontap_node seed reads every aggregate that names one of those
 // controllers. The label is the stock Harvest `node` label, the same spelling
-// as a Kubernetes node and a different identity. Request matchers — az and
-// env, the only ones queryDims grants Harvest — precede the scope.
+// as a Kubernetes node and a different identity. keys and sel render no
+// matcher on a Harvest query, so the controller scope is the whole selector.
 //
 // ok is false when nodes holds no non-empty value. The caller MUST skip the
 // query rather than fall back to an unscoped read.
