@@ -403,3 +403,23 @@ func TestChunkScope_IsTheQoSChunker(t *testing.T) {
 		}
 	}
 }
+
+// Harvest is zone-routed and carries no request matcher, so a full selector
+// neither changes a Harvest query string nor costs a chunker any bytes.
+func TestHarvestQueries_EmitNoRequestMatcher(t *testing.T) {
+	t.Parallel()
+	sel := Selector{
+		AZ: []string{"zone-a"}, Env: []string{"prod"},
+		Cluster: []string{"c1"}, Namespace: []string{"shop"},
+	}
+	keys := LabelKeys{AZ: "zone", Env: "tier"}
+	for q, fam := range queryFamily {
+		if fam != FamilyHarvest {
+			continue
+		}
+		assert.Zero(t, RequestMatcherCost(q, keys, sel), "%s", q)
+		assert.Equal(t, Render(q, time.Minute, keys, Selector{}), Render(q, time.Minute, keys, sel), "%s", q)
+		assert.NotContains(t, Render(q, time.Minute, keys, sel), "zone=", "%s", q)
+		assert.NotContains(t, Render(q, time.Minute, keys, sel), "tier=", "%s", q)
+	}
+}

@@ -414,7 +414,7 @@ func vlrScope(t *testing.T, kind graph.StorageRootKind, values []string) graph.S
 	return scope
 }
 
-const vlrBare = `last_over_time(volume_labels{az="zone-a",env="prod"}[1m])`
+const vlrBare = `last_over_time(volume_labels[1m])`
 
 // -------------------------------------------------- 7. output preservation
 
@@ -912,7 +912,7 @@ func TestRootedVolumeLabelsChunks_Groups(t *testing.T) {
 		assert.Equal(t, rootedVolumeLabelsQuery{group: groupSVM, clusters: []string{"ontap-prod"}, svms: []string{"svm_b", "svm_a"}}, got[1])
 		q, rok := got[1].render(time.Minute, promql.LabelKeys{}, vlrSel)
 		require.True(t, rok)
-		assert.Equal(t, `last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",svm=~"svm_a|svm_b"}[1m])`, q)
+		assert.Equal(t, `last_over_time(volume_labels{cluster="ontap-prod",svm=~"svm_a|svm_b"}[1m])`, q)
 	})
 
 	t.Run("svm alone is the SVM group alone", func(t *testing.T) {
@@ -966,11 +966,12 @@ func TestOwnerCompletionTargets(t *testing.T) {
 // completionQueries are the owner-completion reads a build issued: the
 // volume-label queries carrying a cluster EQUALITY beside an aggr matcher and
 // no svm or volume matcher. Only a root set with no ontap_cluster= keeps them
-// apart from phase 1's aggregate group, so the callers root that way.
+// apart from phase 1's aggregate group, so the callers root that way. The
+// cluster equality is the first matcher — Harvest renders no request matcher.
 func completionQueries(q *promqlfake.Querier) []string {
 	var out []string
 	for _, s := range q.QueriesFor(promql.QVolumeLabels) {
-		if strings.Contains(s, `,cluster="`) && strings.Contains(s, "aggr") &&
+		if strings.Contains(s, `cluster="`) && strings.Contains(s, "aggr") &&
 			!strings.Contains(s, "svm") && !strings.Contains(s, "volume=") {
 			out = append(out, s)
 		}
@@ -989,8 +990,8 @@ func TestRootedVolumeLabels_SVMRootCompletesEveryTouchedAggregate(t *testing.T) 
 	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
-	assert.Contains(t, restricted.QueriesFor(promql.QVolumeLabels), `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
-	assert.Equal(t, []string{`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr=~"aggr03|aggr07"}[1m])`},
+	assert.Contains(t, restricted.QueriesFor(promql.QVolumeLabels), `last_over_time(volume_labels{svm="svm_shop"}[1m])`)
+	assert.Equal(t, []string{`last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr03|aggr07"}[1m])`},
 		completionQueries(restricted), "one completion query per ONTAP cluster, restricted to the touched aggregates")
 	assert.True(t, vlrIDs(body)["zone-a-prod-c1/uid-o0"], "the svm_shop claim is drawn")
 	for _, s := range restricted.QueriesFor(promql.QVolumeLabels) {
@@ -1009,7 +1010,7 @@ func TestRootedVolumeLabels_AggregateAndSVMRootsAreUnioned(t *testing.T) {
 	restricted, _, body := vlrParity(t, fx, scope, Options{})
 
 	vl := restricted.QueriesFor(promql.QVolumeLabels)
-	assert.Contains(t, vl, `last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`)
+	assert.Contains(t, vl, `last_over_time(volume_labels{svm="svm_shop"}[1m])`)
 	ids := vlrIDs(body)
 	assert.True(t, ids["zone-a-prod-c1/uid-o0"], "the aggr09 claim is retained through its SVM")
 	assert.False(t, ids["zone-a-prod-c1/uid-r0"], "redis sits on svm_platform, which this root does not name")
@@ -1064,8 +1065,8 @@ func TestRootedVolumeLabels_SVMRootCompletesPhaseTwoOnlyAggregates(t *testing.T)
 	assert.True(t, ids["netapp/ontap-prod/ontap-prod-01"], "aggr0's owner is voted over every aggr0 series")
 	assert.False(t, ids["netapp/ontap-prod/ontap-prod-05"], "not over the clone alone")
 	assert.Equal(t, []string{
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr9"}[1m])`,
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr0"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr9"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr0"}[1m])`,
 	}, completionQueries(restricted), "aggr9 completed after phase 1, aggr0 after phase 2")
 
 	t.Run("no svm root, no phase-2 completion", func(t *testing.T) {
@@ -1097,7 +1098,7 @@ func TestRootedVolumeLabels_OwnerCompletionFailureFailsTheBuild(t *testing.T) {
 	scope := vlrScope(t, graph.StorageRootSVM, []string{"svm_shop"})
 	q := promqlfake.New(vlrMultiFiler())
 	q.Fail = func(name, query string) error {
-		if name == string(promql.QVolumeLabels) && strings.Contains(query, `,cluster="`) {
+		if name == string(promql.QVolumeLabels) && strings.Contains(query, `cluster="`) && strings.Contains(query, "aggr") {
 			return errors.New("upstream said no")
 		}
 		return nil

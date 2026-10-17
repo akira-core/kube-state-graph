@@ -51,7 +51,8 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 		s.WaitForSeries(`volume_labels{volume="trident_pvc_catalog",test=`+strconv.Quote(disc)+`}`, fixedNow, 30*time.Second),
 		"VM did not observe the second SVM-sharing volume_labels series")
 
-	srv := s.StartAPIServer(func(cfg *config.Config) {})
+	queries := &queryLog{}
+	srv := s.StartAPIServer(func(cfg *config.Config) {}, WithQueryLog(queries))
 
 	aggrBody := s.fetchStorageGraph(srv.URL, func(q url.Values) { q.Set("aggr", "aggr1") })
 	s.assertStorageConservation(aggrBody)
@@ -126,6 +127,12 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.Contains(nodesByID(idle), ident+"/uid-idle-0", "a claimless pod root is still read and drawn")
 	s.Empty(idle.Elements.Edges)
 	s.NotContains(nodesByID(podBody), ident+"/uid-idle-0", "a claimless pod that is not a root is never drawn")
+	harvest := queries.harvestQueries()
+	s.NotEmpty(harvest, "the storage build issued Harvest queries")
+	for _, q := range harvest {
+		s.NotContains(q.query, "az=", "%s carries no az matcher: %s", q.name, q.query)
+		s.NotContains(q.query, "env=", "%s carries no env matcher: %s", q.name, q.query)
+	}
 	// Pod-only roots derive the namespace selector; the body must equal the same
 	// request with that namespace given explicitly.
 	explicit := s.fetchStorageGraph(srv.URL, func(q url.Values) {

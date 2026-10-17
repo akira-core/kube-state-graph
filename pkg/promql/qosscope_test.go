@@ -60,12 +60,15 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 	})
 
 	t.Run("the volume scope is the only matcher", func(t *testing.T) {
+		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
 		for _, q := range QoSWorkloadQueries {
-			got, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"})
+			got, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, sel, []string{"v"})
 			require.True(t, ok)
 			assert.NotContains(t, got, "lun",
 				"volume granularity is the reader's rule, never a matcher (D11)")
-			assert.Contains(t, got, `volume="v"`)
+			assert.NotContains(t, got, `az=`)
+			assert.NotContains(t, got, `env=`)
+			assert.Equal(t, `last_over_time(`+string(q)+`{volume="v"}[1m])`, got)
 		}
 	})
 }

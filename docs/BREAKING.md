@@ -1,3 +1,38 @@
+# BREAKING — NetApp Harvest queries carry no `az` / `env` matcher
+
+*Supersedes "NetApp Harvest queries carry the request's `az` / `env`" below.*
+
+**What changed.** Every NetApp Harvest query — `volume_labels`, the `qos_*`
+families, `qos_policy_fixed_max_throughput_*`, `aggr_*` and the controller
+families, including every restricted `volume_labels` / `qos_*` / `aggr_*` /
+`node_*` read — is zone-routed and carries no request matcher. `?az=` still
+selects which `harvest` backends are asked. `?env=`, `?cluster=` and
+`?namespace=` do not reach Harvest as matchers. A claim prefers `volume_labels`
+series of its own zone and falls back to every matched series when none agree.
+QoS workload series that differ only by `(az, env)` are counted once: each
+workload keeps one zone's rows (the claim's own, else rows with no pair, else
+the lexically-smallest pair).
+
+**In-process embedders.** `Router.QueryLabels` with family `harvest` and an
+`AZ` still routes by that zone but no longer renders an `az` matcher, so against
+a catch-all `harvest` backend it returns every zone's rows. The restricted
+renderers (`RenderVolumeLabels*`, `RenderQoSVolumeScoped`, the Harvest pair
+renderers) keep their `(keys, sel)` signatures and render no request matcher.
+Filter the returned rows on `az` / `env` in the caller if one zone is needed.
+
+**Who is affected.** A catch-all or multi-environment `harvest` store. It now
+answers every Harvest query with all of its rows, so a filer labelled with
+another `(az, env)` can join a claim of the requested zone when no series of
+the claim's own zone exists. An estate whose Harvest labels agree with
+kube-state-metrics produces the same bodies as before.
+
+**Migration.** Operators who relied on the matcher to keep a shared store from
+answering with another environment's filers give that environment its own
+`harvest` backend with `zones`. No flag and no persisted state. Rollback is a
+revert.
+
+---
+
 # BREAKING — a storage-graph request carries exactly one root kind
 
 `GET /v1/storage-graph` no longer serves the whole selected estate and no
@@ -280,10 +315,14 @@ Additive on the wire, with one narrow body change on the shared join.
   qualified set is read one `volume_labels` query per ONTAP cluster, so a root
   set spanning more ONTAP clusters than the chunk cap (sixteen queries in
   total, bare groups included) is 400 `invalid_scope` before any query.
-- **A claim joins only FlexVols of its own zone.** A claim's `volume_labels`
-  candidates are restricted to series whose `az` / `env` agree with the claim's
-  (an unknown zone on either side never excludes). This is what makes the union
-  hold, and it is part of the SHARED join, so it applies to every build path.
+- **A claim's `volume_labels` candidates were confined to its own zone.**
+  Superseded by "NetApp Harvest queries carry no `az` / `env` matcher" above:
+  the claim now prefers series of its own zone and falls back to every match
+  when none agree. At the time of this entry the candidates were restricted to
+  series whose `az` / `env` agree with the claim's (an unknown zone on either
+  side never excludes). That preference is what makes the union hold for a
+  claim that has a series of its own zone, and it is part of the SHARED join,
+  so it applies to every build path.
   **Body change:** an estate in which the same FlexVol token — a clone, or a
   hand-chosen naming scheme — appears on filers of two zones used to attach a
   claim to the lexically-smallest `(ontap_cluster, aggr)` across both; it now

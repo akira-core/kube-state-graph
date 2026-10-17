@@ -22,14 +22,13 @@ func isQoSWorkloadQuery(q Query) bool {
 }
 
 // RenderQoSVolumeScoped renders one QoS workload query restricted to a known
-// set of ONTAP FlexVol names, after the request's az / env matchers (the only
-// request dimensions a Harvest query takes). That scope is its ONLY other
-// matcher — volume
-// granularity is enforced by the reader, not here, because the LUN rows a
-// `lun=""` matcher would drop are the only ones naming the QoS policy on a SAN
-// backend (design.md D11):
+// set of ONTAP FlexVol names. keys and sel render no matcher on a Harvest
+// query — az routes the family and is not a matcher — so the volume scope is
+// the query's ONLY matcher. Volume granularity is enforced by the reader, not
+// here, because the LUN rows a `lun=""` matcher would drop are the only ones
+// naming the QoS policy on a SAN backend (design.md D11):
 //
-//	last_over_time(qos_read_ops{az="zone-a",env="prod",volume=~"trident_pvc_a|trident_pvc_b"}[5m])
+//	last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //
 // The values are FlexVol names the volume-object family already returned, so
 // the restriction is EXACT: pkg/build's derive-then-suffix runs once, in Go,

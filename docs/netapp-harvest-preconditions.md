@@ -184,29 +184,25 @@ The operator-configured rewrite rules do not change the extraction: an ordered
 list of regexps cannot be inverted, so a custom rule set can make a
 storage-rooted request find fewer claims, never attach a wrong one.
 
-## Zone and environment labels are REQUIRED on Harvest
+## Zone and environment labels are optional on Harvest
 
-Every Harvest series MUST carry the configured `az` / `env` labels (default
-`az` / `env`, see `--az-label` / `--env-label`) — the same two labels
-kube-state-metrics carries. The `az` / `env` request filters (repeatable on
-`/v1/storage-graph`, as on `/v1/graph`) are pushed down as
-PromQL matchers on every Harvest query exactly as on the kube-state-metrics and
-kubelet families, and `?az=` also selects which `harvest` backend of the
-routing table is asked (see `upstream-backend-routing.md`). A request therefore
-reads only its own zone's and environment's filers, even from a catch-all
-`harvest` backend or a store holding several environments. `cluster` and
-`namespace` never reach Harvest.
+A Harvest series is not required to carry the configured `az` / `env` labels
+(default `az` / `env`, see `--az-label` / `--env-label`). No Harvest query
+renders them as matchers. `?az=` still selects which `harvest` backend is asked
+(see `upstream-backend-routing.md`); `env`, `cluster` and `namespace` never
+reach a Harvest query. A catch-all `harvest` backend therefore returns every
+zone's series. Operators who need a shared store to answer with only one
+environment's filers give that environment its own `harvest` backend with
+`zones`.
 
-A Harvest series WITHOUT the labels matches nothing under any `az` / `env`
-filter — and `/v1/storage-graph` always carries both — so its filer drops out
-of every filtered body with no error. No warning can flag it: an empty Harvest
-read is also what a deployment without NetApp storage returns. Stamp the labels
-in Harvest's own configuration (per-poller `labels`) or in the collector that
-ships the series. To find unlabelled series:
-
-```promql
-count by (__name__) ({__name__=~"volume_labels|aggr_.*|node_.*|qos_.*", az=""})
-```
+A series that does carry the labels takes part in zone preference and in the
+zone-agreeing alert match. A claim's `volume_labels` candidates are the series
+whose zone agrees with the claim's when at least one does, and every matched
+series otherwise. QoS workload rows that differ only by zone are counted once:
+for each workload (ONTAP cluster, SVM, FlexVol, LUN and family) one zone's rows
+are kept — the claim's own zone, else the rows that carry no pair, else the
+lexically-smallest complete pair. Different workloads of one claim are never
+dropped in favour of one another.
 
 The labels also scope alert matching. Each ONTAP cluster collects the `az` / `env` pairs carried by its
 entity-naming series (`volume_labels`, `aggr_*`, `node_*`, `system_node_*` — not

@@ -88,6 +88,10 @@ func assertOnlyZoneA(t *testing.T, f hubZonesFixture) {
 	for _, is := range f.k8sA.Issued() {
 		assert.Contains(t, is.Query, `az="zone-a",env="prod"`, is.Name)
 	}
+	for _, is := range f.netappA.Issued() {
+		assert.NotContains(t, is.Query, `az=`, "%s is routed to zone-a and carries no matcher", is.Name)
+		assert.NotContains(t, is.Query, `env=`, "%s is routed to zone-a and carries no matcher", is.Name)
+	}
 }
 
 // Spec: "Hub mode reads only the request's zone". The rooted filer serves a

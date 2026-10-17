@@ -10,9 +10,9 @@ Serves a storage-rooted flow graph — NetApp controller → aggregate → SVM �
 
 The server SHALL expose `GET /v1/storage-graph` returning a storage-flow graph for a caller-specified `[start, end]` window, in the same `{ apiVersion, clusters, elements: { nodes, edges } }` Cytoscape.js shape as `GET /v1/graph`. `start` and `end` SHALL be required and validated exactly as for `/v1/graph` (RFC 3339 or Unix seconds; `end > start`; `missing_start` / `missing_end` / `invalid_start` / `invalid_end` / `invalid_range`). The endpoint SHALL sit behind the same API-key authentication, the same per-build timeout (`--build-timeout` → 504 `timeout`), and the same upstream / outside-retention / cancelled error mapping as `/v1/graph`, and SHALL be described in the served OpenAPI document.
 
-`az` and `env` SHALL be **required** and **repeatable**: a request carrying no non-empty value of either SHALL be rejected 400 with `reason: "missing_az"` / `reason: "missing_env"`; a request MAY carry several values of each. The selected zones are the **Cartesian product** of the `az` and `env` values; a combination the estate does not hold contributes nothing. Exactly one root kind SHALL be required, as "One root kind per request" defines: a request carrying none SHALL be rejected 400 with `reason: "missing_root"`, and a request carrying two or more root kinds SHALL be rejected 400 with `reason: "invalid_scope"`. The window, `az` and `env` SHALL be validated before the roots, so a request failing several checks reports the first of them in that order. The `az` / `env` values SHALL be pushed upstream exactly as the `/v1/graph` selector-level `az` / `env` dimensions are — sorted and de-duplicated, a single value rendered as an equality and several as one anchored alternation, as matchers on every kube-state-metrics, kubelet, Harvest and `ALERTS` family, and backend selection by the `az` SET for every zone-routed family.
+`az` and `env` SHALL be **required** and **repeatable**: a request carrying no non-empty value of either SHALL be rejected 400 with `reason: "missing_az"` / `reason: "missing_env"`; a request MAY carry several values of each. The selected zones are the **Cartesian product** of the `az` and `env` values; a combination the estate does not hold contributes nothing. Exactly one root kind SHALL be required, as "One root kind per request" defines: a request carrying none SHALL be rejected 400 with `reason: "missing_root"`, and a request carrying two or more root kinds SHALL be rejected 400 with `reason: "invalid_scope"`. The window, `az` and `env` SHALL be validated before the roots, so a request failing several checks reports the first of them in that order. The `az` / `env` values SHALL be pushed upstream exactly as the `/v1/graph` selector-level `az` / `env` dimensions are — sorted and de-duplicated, a single value rendered as an equality and several as one anchored alternation, as matchers on every kube-state-metrics, kubelet and `ALERTS` family — the NetApp Harvest families carry neither — and backend selection by the `az` SET for every zone-routed family, Harvest included.
 
-**The body is the union of its zones.** For a fixed root, cluster / namespace filter and window, the body of a request selecting several `(az, env)` combinations SHALL equal the union of the bodies of the single-combination requests: no node SHALL merge two objects of different zones or environments, no flow weight SHALL sum claims of different zones or environments onto one edge unless those claims genuinely share that storage entity, and every alert SHALL match zone-agreeingly as the `alert-overlay` capability defines. Kubernetes ids are composed from the cluster identity `<az>-<env>-<cluster>`, and NetApp ids are qualified by the ONTAP cluster, which the operator guarantees unique across the estate (together with ONTAP controller names); a claim joins only FlexVols of its own zone ("PVC-to-NetApp-aggregate edge join", `netapp-storage-graph`). Wherever this capability matches an upstream row to a pod or claim the build already read by its `cluster`, the key SHALL be the cluster identity — the `(az, env, cluster)` triple under the configured label keys — never the raw `cluster` label alone, so a cluster name reused in two selected zones is two clusters. `cluster` and `namespace` SHALL be accepted as optional, repeatable narrowing filters with `/v1/graph` semantics. `prune` SHALL be ignored (this endpoint applies its own reachability projection, never the connectivity prune). `edge_type` — withdrawn from `/v1/graph` as well, so no longer a parameter of any endpoint — and any other unknown parameter SHALL be ignored without error, whatever value they carry.
+**The body is the union of its zones.** For a fixed root, cluster / namespace filter and window, the body of a request selecting several `(az, env)` combinations SHALL equal the union of the bodies of the single-combination requests: no node SHALL merge two objects of different zones or environments, no flow weight SHALL sum claims of different zones or environments onto one edge unless those claims genuinely share that storage entity, and every alert SHALL match zone-agreeingly as the `alert-overlay` capability defines. Kubernetes ids are composed from the cluster identity `<az>-<env>-<cluster>`, and NetApp ids are qualified by the ONTAP cluster, which the operator guarantees unique across the estate (together with ONTAP controller names); a claim joins the FlexVols, and reads the QoS workload rows, of its own zone in preference to any other ("PVC-to-NetApp-aggregate edge join" and "Harvest QoS workload series as the I/O source", `netapp-storage-graph`). Because Harvest queries carry no request matcher, the union is exact for every claim whose matching Harvest rows all live in its own zone's `harvest` backends; when a backend of another selected zone holds a row the claim also accepts (a colliding FlexVol, or any row for a claim with no row of its own zone), the multi-zone body MAY pick among more candidates than any single-zone body. Wherever this capability matches an upstream row to a pod or claim the build already read by its `cluster`, the key SHALL be the cluster identity — the `(az, env, cluster)` triple under the configured label keys — never the raw `cluster` label alone, so a cluster name reused in two selected zones is two clusters. `cluster` and `namespace` SHALL be accepted as optional, repeatable narrowing filters with `/v1/graph` semantics. `prune` SHALL be ignored (this endpoint applies its own reachability projection, never the connectivity prune). `edge_type` — withdrawn from `/v1/graph` as well, so no longer a parameter of any endpoint — and any other unknown parameter SHALL be ignored without error, whatever value they carry.
 
 The top-level `clusters` array SHALL list the Kubernetes cluster identities present on emitted `pod` / `node` / `pvc` nodes and never an ONTAP cluster name.
 
@@ -29,7 +29,7 @@ The top-level `clusters` array SHALL list the Kubernetes cluster identities pres
 #### Scenario: Repeated env
 
 - **WHEN** a client sends `GET /v1/storage-graph?start=...&end=...&az=zone-a&env=prod&env=dev&aggr=aggr1`
-- **THEN** the server returns 200, and every kube-state-metrics, kubelet, Harvest and `ALERTS` query carries `<az-key>="zone-a",<env-key>=~"dev|prod"`
+- **THEN** the server returns 200, every kube-state-metrics, kubelet and `ALERTS` query carries `<az-key>="zone-a",<env-key>=~"dev|prod"`, and no Harvest query carries an `<az-key>` or `<env-key>` matcher
 
 #### Scenario: Several zones are a Cartesian product
 
@@ -49,7 +49,12 @@ The top-level `clusters` array SHALL list the Kubernetes cluster identities pres
 #### Scenario: Zone and environment reach upstream
 
 - **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr1`
-- **THEN** every kube-state-metrics, kubelet, Harvest and `ALERTS` query carries `<az-key>="zone-a",<env-key>="prod"`, every Harvest query is issued only to the `harvest` backends whose `zones` include `zone-a` (or catch-alls), and no series from another zone or environment contributes to the body
+- **THEN** every kube-state-metrics, kubelet and `ALERTS` query carries `<az-key>="zone-a",<env-key>="prod"`, every Harvest query is issued only to the `harvest` backends whose `zones` include `zone-a` (or catch-alls) and carries neither matcher, and no Kubernetes object of another zone or environment contributes to the body
+
+#### Scenario: The Harvest side is not zone-matched
+
+- **WHEN** one catch-all `harvest` backend holds `volume_labels` series stamped `az="zone-a"` and `az="zone-b"`, and a client sends `?az=zone-a&env=prod&aggr=aggr1`
+- **THEN** no Harvest query carries an `<az-key>` or `<env-key>` matcher, the `aggr1` rows of both zones are read, and each loaded `zone-a` claim joins its own zone's series when it has one — the `zone-b` claims are never loaded, because every claim query carries `<az-key>="zone-a"`
 
 #### Scenario: Unauthenticated request rejected when keys configured
 
@@ -231,7 +236,7 @@ For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info`
 
 **Coverage signal.** When a storage-side root's contributing rows carry a `volume` and none produced a candidate, the build SHALL log one aggregated warning `storage_root_claim_miss` with `reason="no_pv_candidate"` and the volume count. When candidates were produced and the claim-info read returned no claim, it SHALL log `storage_root_claim_miss` with `reason="no_claim"` and the candidate count. `no_claim` SHALL be logged at Debug instead when the request carries a `cluster` or `namespace` filter, which can legitimately exclude every candidate. Neither changes the response status.
 
-**Zone.** Every query the build issues SHALL carry the request-scoped matchers its family accepts and SHALL be dispatched only to the backends the request's `az` values select. A claim on a rooted filer that lives in a zone or environment the request did not select is therefore not loaded and SHALL NOT be drawn; a claim of a selected zone joins only FlexVols of its own zone.
+**Zone.** Every query the build issues SHALL carry the request-scoped matchers its family accepts and SHALL be dispatched only to the backends the request's `az` values select. A claim on a rooted filer that lives in a zone or environment the request did not select is therefore not loaded and SHALL NOT be drawn; a claim of a selected zone joins the FlexVols of its own zone in preference to any other.
 
 #### Scenario: Rooted volumes name their claims
 
@@ -326,7 +331,7 @@ For both kinds the seed read IS the claim-side `kube_persistentvolumeclaim_info`
 #### Scenario: A qualified aggregate root reads one filer's aggregate
 
 - **WHEN** a client sends `?az=zone-a&env=prod&aggr=ontap-prod/aggr1&aggr=ontap-prod/aggr2&aggr=ontap-lab/aggr1&aggr=aggr9`
-- **THEN** the phase-1 `volume_labels` reads are `{aggr="aggr9"}`, `{cluster="ontap-lab",aggr="aggr1"}` and `{cluster="ontap-prod",aggr=~"aggr1|aggr2"}` beside the request matchers, and no query reads `aggr1` of any other filer for the root
+- **THEN** the phase-1 `volume_labels` reads are `{aggr="aggr9"}`, `{cluster="ontap-lab",aggr="aggr1"}` and `{cluster="ontap-prod",aggr=~"aggr1|aggr2"}` with no `<az-key>` or `<env-key>` matcher beside them, and no query reads `aggr1` of any other filer for the root
 
 #### Scenario: A storage root stays in the request's zone
 
@@ -446,7 +451,7 @@ So the body SHALL be byte-identical to the body an unrestricted read would produ
 #### Scenario: Only ALERTS is read across the zone
 
 - **WHEN** a client sends `?az=zone-a&env=prod&pod=shop/orders-0`
-- **THEN** every issued query except `ALERTS` carries a restriction on its family's identity label beyond `<az-key>="zone-a",<env-key>="prod"`, and `ALERTS` carries the request-scoped matchers alone
+- **THEN** every issued query except `ALERTS` carries a restriction on its family's identity label beyond the request-scoped matchers its family carries (`<az-key>="zone-a",<env-key>="prod"` on a kube-state-metrics or kubelet family, none on a Harvest family), and `ALERTS` carries the request-scoped matchers alone
 
 #### Scenario: Harvest gauges are read for the reached components only
 

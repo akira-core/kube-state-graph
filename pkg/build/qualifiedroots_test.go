@@ -91,9 +91,9 @@ func TestRootedVolumeLabels_QualifiedAggregateSeedQueries(t *testing.T) {
 		got = append(got, r.rendered)
 	}
 	assert.Equal(t, []string{
-		`last_over_time(volume_labels{az="zone-a",env="prod",aggr="aggr9"}[1m])`,
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-lab",aggr="aggr1"}[1m])`,
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])`,
+		`last_over_time(volume_labels{aggr="aggr9"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-lab",aggr="aggr1"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])`,
 	}, got, "bare group first, then one query per ONTAP cluster in sorted order")
 }
 
@@ -108,9 +108,9 @@ func TestRootedVolumeLabels_QualifiedSVMSeedQueries(t *testing.T) {
 		got = append(got, r.rendered)
 	}
 	assert.Equal(t, []string{
-		`last_over_time(volume_labels{az="zone-a",env="prod",svm="svm_shop"}[1m])`,
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-lab",svm="svm_lab"}[1m])`,
-		`last_over_time(volume_labels{az="zone-a",env="prod",cluster="ontap-prod",svm="svm0"}[1m])`,
+		`last_over_time(volume_labels{svm="svm_shop"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-lab",svm="svm_lab"}[1m])`,
+		`last_over_time(volume_labels{cluster="ontap-prod",svm="svm0"}[1m])`,
 	}, got)
 }
 
@@ -188,7 +188,7 @@ func TestFlowless_QualifiedAggregateReadsThatFilersGaugesOnly(t *testing.T) {
 
 	gauge := q.QueriesFor(promql.QAggrStatus)
 	require.Len(t, gauge, 1)
-	assert.Equal(t, `last_over_time(aggr_new_status{az="zone-a",env="prod",cluster="ontap-prod",aggr="aggr9"}[1m])`, gauge[0])
+	assert.Equal(t, `last_over_time(aggr_new_status{cluster="ontap-prod",aggr="aggr9"}[1m])`, gauge[0])
 	for _, fam := range promql.AggrPairQueries {
 		for _, query := range q.QueriesFor(fam) {
 			assert.NotContains(t, query, "ontap-lab", "%s never reads the other filer", fam)

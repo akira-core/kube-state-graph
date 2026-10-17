@@ -344,7 +344,8 @@ func (s *MultiBackendSuite) TestZoneRoutingSelectsTheBackend() {
 			[]promql.Family{promql.FamilyKSM, promql.FamilyKubelet, promql.FamilyHarvest},
 			[]string{"zone-b"}, "", ""),
 	}
-	srv := s.startRoutedAPI(backends)
+	log := &queryLog{}
+	srv := s.startRoutedAPIWith(backends, log.wrap)
 
 	zoneA := s.fetchGraph(srv, func(q url.Values) {
 		inventory(q)
@@ -352,13 +353,13 @@ func (s *MultiBackendSuite) TestZoneRoutingSelectsTheBackend() {
 	})
 	s.True(hasPod(zoneA, "mb-alpha/mb-uid-1"), "the zone-a pod is served by the zone-a store")
 
-	// Harvest is zone-routed AND matched. Both stores hold the claim's PV
-	// name, each stamped with its own zone, and only the zone-a store's copy
-	// may join.
+	// Harvest is zone-routed and carries no matcher. Both stores hold the
+	// claim's PV name; only the zone-a store is asked.
 	s.Equal([]string{"netapp/ontap-mb-shadow/aggr/aggr-shadow"}, storageTargets(zoneA),
 		"the zone-a claim joins the zone-a store's Harvest series")
 	s.NotContains(nodeIDs(zoneA), "netapp/ontap-mb/aggr/aggr-mb",
 		"the zone-b store's colliding volume_labels is not loaded under ?az=zone-a")
+	s.assertHarvestRoutedWithoutAMatcher(log, "zone-b")
 
 	zoneB := s.fetchGraph(srv, func(q url.Values) {
 		inventory(q)
@@ -578,13 +579,14 @@ volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="onta
 	s.Require().True(s.waitForSeriesAt(s.secondURL, `volume_labels{cluster="ontap-aaa-zoneb"}`, hubNow, 30*time.Second))
 
 	k8s := []promql.Family{promql.FamilyKSM, promql.FamilyKubelet}
-	srv := s.startRoutedAPI([]promql.Backend{
+	log := &queryLog{}
+	srv := s.startRoutedAPIWith([]promql.Backend{
 		promql.NewBackend("k8s-a", s.VMURL(),
 			slices.Concat(k8s, []promql.Family{promql.FamilyServiceGraph, promql.FamilyProbe}), []string{"zone-a"}, "", ""),
 		promql.NewBackend("k8s-b", s.secondURL, k8s, []string{"zone-b"}, "", ""),
 		promql.NewBackend("netapp-a", s.VMURL(), []promql.Family{promql.FamilyHarvest}, []string{"zone-a"}, "", ""),
 		promql.NewBackend("netapp-b", s.secondURL, []promql.Family{promql.FamilyHarvest}, []string{"zone-b"}, "", ""),
-	})
+	}, log.wrap)
 
 	q := url.Values{}
 	q.Set("start", strconv.FormatInt(hubNow.Add(-5*time.Minute).Unix(), 10))
@@ -616,6 +618,7 @@ volume_labels{volume="trident_pvc_hub_bbbb",cluster="ontap-aaa-zoneb",node="onta
 		}
 	}
 	s.Positive(flows, "the zone-a claim's path is drawn end to end")
+	s.assertHarvestRoutedWithoutAMatcher(log, "netapp-b")
 }
 
 // zonesNow dates the multi-zone fixtures four hours after fixedNow, clear of
@@ -704,7 +707,8 @@ func (s *MultiBackendSuite) elementJSON(body cytoscape.Body) (nodes, edges map[s
 // name, an aggregate name, a FlexVol name and a claim name.
 func (s *MultiBackendSuite) TestStorageGraphMultiZoneIsTheUnionOfItsZones() {
 	s.zonesFixture()
-	srv := s.startRoutedAPI(s.zonesBackends())
+	log := &queryLog{}
+	srv := s.startRoutedAPIWith(s.zonesBackends(), log.wrap)
 
 	a := s.storageBody(srv, []string{"zone-a"}, "aggr", "aggr1")
 	b := s.storageBody(srv, []string{"zone-b"}, "aggr", "aggr1")
@@ -747,6 +751,23 @@ func (s *MultiBackendSuite) TestStorageGraphMultiZoneIsTheUnionOfItsZones() {
 	}
 	s.InDelta(100.0, reads["zone-a-prod-zn-c1/shop/orders-data"], 1e-9, "each claim carries its own zone's measurement")
 	s.InDelta(900.0, reads["zone-b-prod-zn-c1/shop/orders-data"], 1e-9, "and the two are never summed")
+	s.assertHarvestRoutedWithoutAMatcher(log, "")
+}
+
+// assertHarvestRoutedWithoutAMatcher checks that every recorded Harvest query
+// carries no az / env matcher. excluded is a backend that must not have been
+// asked; empty skips that check.
+func (s *MultiBackendSuite) assertHarvestRoutedWithoutAMatcher(log *queryLog, excluded string) {
+	s.T().Helper()
+	got := log.harvestQueries()
+	s.NotEmpty(got, "the build issued Harvest queries")
+	for _, q := range got {
+		s.NotContains(q.query, "az=", "%s carries no az matcher: %s", q.name, q.query)
+		s.NotContains(q.query, "env=", "%s carries no env matcher: %s", q.name, q.query)
+		if excluded != "" {
+			s.NotEqual(excluded, q.backend, "Harvest for this request is not routed to %s", excluded)
+		}
+	}
 }
 
 // A qualified `aggr=<ontap_cluster>/<name>` roots one filer's aggregate although

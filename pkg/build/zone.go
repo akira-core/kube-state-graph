@@ -50,3 +50,25 @@ func zonesAgree(a, b zone) bool {
 func (z zone) compare(o zone) int {
 	return cmp.Or(cmp.Compare(z.az, o.az), cmp.Compare(z.env, o.env))
 }
+
+// prefers reports whether a series in zone a beats one in zone b when read for
+// a claim in zone claim: the claim's own zone first, then no zone (which agrees
+// with every claim, the zonesAgree rule hop A prefers by), then any other
+// complete pair in compare order. It is a strict order, so a choice among
+// several is order-free (drop-harvest-zone-matchers D3).
+func (claim zone) prefers(a, b zone) bool {
+	if ra, rb := claim.rank(a), claim.rank(b); ra != rb {
+		return ra < rb
+	}
+	return a.compare(b) < 0
+}
+
+func (claim zone) rank(z zone) int {
+	switch {
+	case claim.known() && z == claim:
+		return 0
+	case !z.known():
+		return 1
+	}
+	return 2
+}

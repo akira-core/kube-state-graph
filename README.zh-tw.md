@@ -67,7 +67,7 @@ curl "http://localhost:8080/v1/graph?start=${start}&end=${end}&az=eu-west-1a&env
 |---|---|---|---|---|
 | pod／claim／Service／EndpointSlice KSM 系列、kubelet volume stats | ✅ | ✅ | ✅ | ✅ |
 | `kube_node_*` | ✅ | ✅ | ✅ | —（無此 label） |
-| NetApp Harvest（`volume_labels`、`qos_*`、`aggr_*`、`node_new_status`） | ✅ | ✅ | —（其 `cluster` 是 **ONTAP** 叢集） | — |
+| NetApp Harvest（`volume_labels`、`qos_*`、`aggr_*`、`node_new_status`） | 只做 routing，不帶 matcher | — | —（其 `cluster` 是 **ONTAP** 叢集） | — |
 | `traces_service_graph_*`、`up` | — | — | — | — |
 
 service-graph 系列**每次請求都完整讀取**：其 `cluster` label 常缺漏且來自 trace 來源端，namespace label 也只描述呼叫端自身視角，在此收斂會丟掉已載入拓樸仍需要的邊。取而代之，帶過濾參數的建圖套用兩條規則：
@@ -77,13 +77,13 @@ service-graph 系列**每次請求都完整讀取**：其 `cluster` label 常缺
 
 可見後果：帶 `?cluster=` 或 `?namespace=` 時，過濾範圍外的 peer 會以 `external` 節點呈現而非真實 pod——不必載入其餘估整體，也能看見該範圍的進出相依。
 
-> **部署前提**：所有拓樸系列族（kube-state-metrics、kubelet、Harvest）都必須帶上所設定的 `az` / `env` label。缺少者在該過濾條件下不會匹配到任何資料；又因預設 projection 只保留有連線的工作負載，缺 label 可能讓帶過濾參數的請求回傳空圖而非部分圖。
+> **部署前提**：kube-state-metrics 與 kubelet 系列族必須帶上所設定的 `az` / `env` label。缺少者在該過濾條件下不會匹配到任何資料；又因預設 projection 只保留有連線的工作負載，缺 label 可能讓帶過濾參數的請求回傳空圖而非部分圖。Harvest 不需要這兩個 label：`?az=` 只選擇要問的 `harvest` backend，查詢本身不帶 matcher。系列若有這兩個 label，則參與 zone preference。其 `cluster` 是 ONTAP 叢集。
 
 ## 上游指標
 
 完整營運者目錄（全部 **41** 條系列、PromQL 包裝、固定 selector、query 失敗 vs 空向量、每次請求的 fan-out）見 [`docs/upstream-metrics.md`](docs/upstream-metrics.md)（英文）。
 
-摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；13 條 Harvest + 2 條 kubelet 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。v1 無結果快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），並改依參照讀 pod、Kubernetes node 與 controller：`kube_pod_info`／`kube_pod_owner` 只讀 claim binding、`pod=` root，或（請求以 `application=<argo-app>` 為 root 時）該 Application 的 recovery 讀回的 pod——即使這些 pod 沒有掛載任何 claim 也會載入。`application=` 是 workload 側 root：路徑上的 pod 或 claim 帶有該 Application 就保留，而且會抑制「只有 pod root 才推導 namespace」。其餘依參照讀取不變：四條 `kube_node_*` 只讀這些 pod 排程所在的節點或 `node=` root 點名的節點；八條 controller-owner／controller-annotation 只讀這些 pod 解析出的 owner 名稱。以 `ontap_cluster=`、`aggr=` 或 `svm=` 為 root 的請求改走 **volume hub**：claim 系列改從被指名元件的 `volume_labels` rows 反查（FlexVol 名稱內嵌的 `pvc_<uid>` 即 PV `pvc-<uid>`），且與其他 storage 請求一樣帶 `az`／`env` matcher、依 zone 路由——查詢不會送到其他 zone 的 store，因此跨 zone 共用的 filer 只畫出所請求 zone 的 claim。靜態佈建的 PV 無法從 storage root 找到，詳見 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)。
+摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；13 條 Harvest + 2 條 kubelet 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。v1 無結果快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），並改依參照讀 pod、Kubernetes node 與 controller：`kube_pod_info`／`kube_pod_owner` 只讀 claim binding、`pod=` root，或（請求以 `application=<argo-app>` 為 root 時）該 Application 的 recovery 讀回的 pod——即使這些 pod 沒有掛載任何 claim 也會載入。`application=` 是 workload 側 root：路徑上的 pod 或 claim 帶有該 Application 就保留，而且會抑制「只有 pod root 才推導 namespace」。其餘依參照讀取不變：四條 `kube_node_*` 只讀這些 pod 排程所在的節點或 `node=` root 點名的節點；八條 controller-owner／controller-annotation 只讀這些 pod 解析出的 owner 名稱。以 `ontap_cluster=`、`aggr=` 或 `svm=` 為 root 的請求改走 **volume hub**：claim 系列改從被指名元件的 `volume_labels` rows 反查（FlexVol 名稱內嵌的 `pvc_<uid>` 即 PV `pvc-<uid>`）。claim 查詢帶請求的 `az`／`env` matcher；Harvest 依 `az` routing、不帶 matcher。查詢不會送到其他 zone 的 store，因此跨 zone 共用的 filer 只畫出所請求 zone 的 claim。靜態佈建的 PV 無法從 storage root 找到，詳見 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)。
 
 K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫入的 `cluster` 標籤。Harvest 的 `cluster` 是 **ONTAP** 叢集，不用來當 `?cluster=`。
 

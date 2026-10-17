@@ -29,8 +29,9 @@ func planKSM(pairs ...string) *model.Sample {
 }
 
 // planHarvest is one Harvest series: no Kubernetes cluster, stamped with the
-// fixture zone (az / env) every Harvest series must carry
-// (read-storage-roots-through-volume-hub D13); a pair overrides it.
+// fixture zone (az / env) an estate that labels Harvest gives it — read for zone
+// preference, never matched on (drop-harvest-zone-matchers D1); a pair
+// overrides it.
 func planHarvest(pairs ...string) *model.Sample {
 	m := model.Metric{"az": "zone-a", "env": "prod"}
 	for i := 0; i+1 < len(pairs); i += 2 {
