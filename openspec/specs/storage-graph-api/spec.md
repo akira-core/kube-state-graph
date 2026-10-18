@@ -530,9 +530,9 @@ So the body SHALL be byte-identical to the body an unrestricted read would produ
 
 ### Requirement: Application roots are tracked through their controllers and claims
 
-When a `/v1/storage-graph` request's root kind is `application`, the build SHALL track two sets:
+When a `/v1/storage-graph` request's root kind is `application`, the build SHALL track two sets, the first fed by two candidate sources:
 
-- the pods owned by a controller whose ArgoCD tracking-id names one of the root Applications, recovered in the three stages below;
+- the pods owned by a controller whose ArgoCD tracking-id names one of the root Applications, recovered in the three stages below, together with — when the `app-metadata-source` metric is configured and served — the `(cluster, namespace, pod)` of every application-metadata row whose `app` equals a root value;
 - the claims carrying a root Application of their own, read from `kube_persistentvolumeclaim_annotations` restricted on `annotation_argocd_argoproj_io_tracking_id` exactly as stage 1 restricts the controller families.
 
 The claim-binding family SHALL be read restricted to the recovered pods' `(namespace, pod)` pairs — the namespace the recovering `kube_pod_owner` row carries, one query per namespace — keeping only rows whose `(cluster, namespace, pod)` is a recovered pod, so a same-named pod elsewhere contributes no claim. The claims those rows bind, together with the own-annotated claims, SHALL form the tracked claim set of "Every root kind is tracked from its own tier to its claims". Every mounter of a tracked claim is then loaded by the mounter completion of "The tracked claims expand to both ends of the chain".
@@ -556,7 +556,9 @@ The recovered `pod` labels are the recovered pods.
 
 Every restriction SHALL be chunked deterministically under the shared byte budget, one query per chunk, results merged in chunk order, each chunk issued under the bare family name. A chunk error on any recovery family — the six controller-annotation families, `kube_persistentvolumeclaim_annotations`, `kube_replicaset_owner`, `kube_job_owner` and `kube_pod_owner` — SHALL fail the build, as "Storage build fails closed on upstream query errors" requires. Caller-originated cancellation fails the request whatever the family.
 
-**Stage 1 and the claim-annotation read are request-derived.** When either would take more than the fixed maximum number of queries, the request SHALL be rejected 400 with `reason: "invalid_scope"` before any upstream query is issued, as "Every root kind is tracked from its own tier to its claims" requires of every root set. Stages 2 and 3 are derived from upstream data and SHALL NOT be bounded.
+**Application-metadata seed.** When the metric is configured and served, one application-metadata query SHALL be issued in parallel with stage 1, restricted on the configured `app` label to the sorted, de-duplicated, escaped root values (an exact match — the value is not a tracking-id), composed with the request-scoped matchers and chunked under the shared byte budget. Its pods SHALL be unioned with stage 3's before the claim-binding and pod reads. Like the recovery it is a candidate generator: a seeded pod is a root only if its resolved Application is a root value. A chunk error SHALL fail the build.
+
+**Stage 1, the claim-annotation read and the application-metadata seed are request-derived.** When any of them would take more than the fixed maximum number of queries, the request SHALL be rejected 400 with `reason: "invalid_scope"` before any upstream query is issued, as "Every root kind is tracked from its own tier to its claims" requires of every root set. Stages 2 and 3 are derived from upstream data and SHALL NOT be bounded.
 
 **Tally.** Series a stage returns SHALL be counted under the family's name in the build's per-family tally, added to what the by-reference read of the same family contributes.
 
@@ -585,8 +587,8 @@ An empty stage yields nothing downstream. When no controller and no claim carrie
 
 #### Scenario: No controller or claim carries the Application
 
-- **WHEN** a client sends `?application=typo` and no controller-annotation or claim-annotation series in the selected estate carries a tracking-id naming `typo`
-- **THEN** stage 1 and the claim-annotation read issue their queries, no stage-2, stage-3, claim-binding or pod query is issued, and the body is empty
+- **WHEN** a client sends `?application=typo`, no controller-annotation or claim-annotation series in the selected estate carries a tracking-id naming `typo`, and no application-metadata row carries `app="typo"`
+- **THEN** stage 1, the claim-annotation read and the application-metadata seed issue their queries, no stage-2, stage-3, claim-binding or pod query is issued, and the body is empty
 
 #### Scenario: Only the recovered pods' bindings are read
 
@@ -631,7 +633,7 @@ An empty stage yields nothing downstream. When no controller and no claim carrie
 #### Scenario: A request with another root kind issues no recovery
 
 - **WHEN** a client sends `?az=zone-a&env=prod&aggr=aggr1`
-- **THEN** no query restricted on `annotation_argocd_argoproj_io_tracking_id` or on `owner_name` is issued
+- **THEN** no query restricted on `annotation_argocd_argoproj_io_tracking_id` or on `owner_name`, and no application-metadata query restricted on the `app` label, is issued
 
 #### Scenario: The recovery is tallied under the family name
 
@@ -642,6 +644,21 @@ An empty stage yields nothing downstream. When no controller and no claim carrie
 
 - **WHEN** a stage-1 `kube_job_annotations` chunk fails with an upstream error while every other query succeeds
 - **THEN** the build returns an error, the request is mapped as an upstream failure naming `kube_job_annotations`, and no body is returned
+
+#### Scenario: A pod named only by the metric is seeded and drawn
+
+- **WHEN** the metric is configured, a client sends `?application=canary-app`, no controller carries a tracking-id naming `canary-app`, and an application-metadata row carries `app="canary-app"` for pod `shop/canary-0` (owned by a `Rollout`), which mounts claim `shop/canary-data`
+- **THEN** the seed returns `shop/canary-0`, its claim is tracked, and the body contains `canary-0` with `data.application="canary-app"` and its complete storage path
+
+#### Scenario: A seeded pod whose resolved Application differs is dropped
+
+- **WHEN** a client sends `?application=x`, and pod `shop/web-0` has application-metadata rows with `app` values `x` and `w` in the window
+- **THEN** the seed loads `web-0`, it resolves `data.application="w"` (the lexically-smallest value), it is not a root, and the body equals the same request against an estate where its only row carries `app="w"`
+
+#### Scenario: Unserved metric issues no seed
+
+- **WHEN** the metric is configured but no backend serves `appmeta`, and a client sends `?application=checkout`
+- **THEN** no application-metadata query is issued and the body equals that of a deployment with the metric unset
 
 ### Requirement: Roots are always materialised when the upstream knows them
 
@@ -784,7 +801,7 @@ The body SHALL retain a node iff it lies on a **complete** storage-flow path (`n
 
 ### Requirement: Attributes and compound groups carry over
 
-Every retained real node SHALL carry the same `data` attributes it carries in `/v1/graph` — including `ipaddress`, `owner`, `application`, `ready_status`, `health`, `usage`, `storageclass`, `qos`, `hardware`, `perf`, `alerts` and `status` — and the body SHALL include the same synthesised compound groups with the same `data.parent` rules (`cluster > namespace > application > controller > pod`, `cluster > namespace > [application >] pvc`, `cluster > node`, `storage-cluster > netapp-node > netapp-aggr`, `storage-cluster > netapp-svm`). Namespace and ArgoCD Application SHALL NOT be tiers of the flow; a consumer derives a namespace- or Application-level Sankey by walking `data.parent` and summing the conserved weights.
+Every retained real node SHALL carry the same `data` attributes it carries in `/v1/graph` — including `ipaddress`, `owner`, `application`, `ready_status`, `health`, `usage`, `storageclass`, `qos`, `hardware`, `perf`, `alerts` and `status` — and the body SHALL include the same synthesised compound groups with the same `data.parent` rules and the same `namespace_owner` / `deployed_by` values (graph-api "Namespace and application group metadata") (`cluster > namespace > application > controller > pod`, `cluster > namespace > [application >] pvc`, `cluster > node`, `storage-cluster > netapp-node > netapp-aggr`, `storage-cluster > netapp-svm`). Namespace and ArgoCD Application SHALL NOT be tiers of the flow; a consumer derives a namespace- or Application-level Sankey by walking `data.parent` and summing the conserved weights.
 
 A PVC's `qos` attribute is independent of its flow: it SHALL be carried whenever the claim's ceiling resolved, including when the claim's `svm-pvc` edge carries no `metrics` (no flow and no latency to report) and when the claim enters the chain at the SVM (the FlexGroup shape). Whenever the `svm-pvc` edge carries `max_iops` / `max_bytes_per_sec`, the PVC's `data.qos` carries the same values.
 
@@ -814,6 +831,11 @@ A storage-graph pod SHALL NOT carry `data.containers`: the storage build does no
 
 - **WHEN** a retained claim enters the chain at `netapp/ontap-prod/svm/svm_big` (no aggregate) and its ceiling resolved
 - **THEN** the PVC node carries `data.qos` with the resolved fields, exactly as it does in `/v1/graph`
+
+#### Scenario: Group metadata matches the graph endpoint
+
+- **WHEN** `/v1/graph` and `/v1/storage-graph` for the same window and zone both render namespace group `us-dev-c1/namespace/shop` and application group `us-dev-c1/namespace/shop/application/checkout`
+- **THEN** both bodies carry the same `data.namespace_owner` on the namespace group and the same `data.deployed_by` on the application group
 
 ### Requirement: Each claim names its aggregate
 
@@ -866,7 +888,7 @@ The reusable graph engine SHALL expose the storage-graph build in-process with t
 
 ### Requirement: Storage build fails closed on upstream query errors
 
-A `/v1/storage-graph` build SHALL fail when ANY upstream query it issues returns an error — whatever the family, and whichever chunk, phase, stage or backend of that family failed — with the single exception of `ALERTS`. This covers every family `/v1/graph` reads as OPTIONAL or degrading: `volume_labels` (every read), the six `qos_*` workload families (every chunk), the two `qos_policy_fixed_max_throughput_*` families, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status`, `node_labels`, `node_cpu_busy`, `node_total_ops`, `node_total_latency`, `node_total_data`, `kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes`, `kube_replicaset_annotations` and `kube_job_annotations` (by-reference read and application recovery alike). The per-family log-and-continue, per-chunk degrade and degraded-family hop-suppression rules of the `netapp-storage-graph` and `cluster-topology-source` capabilities SHALL apply to `/v1/graph` builds only. A storage body with a silently missing family is indistinguishable from a smaller estate — a filer with no flow, an aggregate with no I/O — so the endpoint SHALL NOT return one.
+A `/v1/storage-graph` build SHALL fail when ANY upstream query it issues returns an error — whatever the family, and whichever chunk, phase, stage or backend of that family failed — with the single exception of `ALERTS`. This covers every family `/v1/graph` reads as OPTIONAL or degrading: `volume_labels` (every read), the six `qos_*` workload families (every chunk), the two `qos_policy_fixed_max_throughput_*` families, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status`, `node_labels`, `node_cpu_busy`, `node_total_ops`, `node_total_latency`, `node_total_data`, `kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes`, `kube_replicaset_annotations` and `kube_job_annotations` (by-reference read and application recovery alike), and `app_metadata` (the namespace-restricted read and the application seed alike). The per-family log-and-continue, per-chunk degrade and degraded-family hop-suppression rules of the `netapp-storage-graph` and `cluster-topology-source` capabilities SHALL apply to `/v1/graph` builds only. A storage body with a silently missing family is indistinguishable from a smaller estate — a filer with no flow, an aggregate with no I/O — so the endpoint SHALL NOT return one.
 
 The failure SHALL be mapped exactly as a required-leg failure is: HTTP 502 with `reason: "upstream"`. The `message` SHALL name the family whose query failed (`upstream query failed: <family>`, the bare family name) and SHALL NOT carry an upstream URL, host, address or credential. A build that exceeds `--build-timeout` SHALL still map to 504 `timeout`, and caller cancellation to the existing `canceled` mapping. Every failed query SHALL still be logged server-side with its full error and counted on `kube_state_graph_upstream_query_failures_total{query}`. The in-process storage-graph engine surface SHALL return the same typed upstream error, carrying the family name.
 
@@ -916,6 +938,11 @@ The following SHALL NOT fail the build, because no query failed: a query that re
 - **WHEN** a client sends `GET /v1/graph` and the `volume_labels` query fails with an upstream error
 - **THEN** the server returns 200 exactly as before this requirement, with no `pvc-to-netapp-aggr` edge
 
+#### Scenario: An application-metadata failure fails the storage request
+
+- **WHEN** the metric is configured and a chunk of the namespace-restricted application-metadata read fails
+- **THEN** the server returns 502 with `reason: "upstream"` and `message: "upstream query failed: app_metadata"`, naming neither the configured metric nor a backend URL
+
 ### Requirement: Storage-graph end-time alignment
 
 `GET /v1/storage-graph` SHALL apply the same end-time alignment as `GET /v1/graph` ("Time-window passthrough" in the `graph-api` capability): with a non-zero `--end-align` grid, `end` is floored to the grid and `start` shifted by the same amount before any upstream query is rendered, and the alignment SHALL happen after `start` / `end` validation, so validation errors are unchanged.
@@ -924,3 +951,32 @@ The following SHALL NOT fail the build, because no query failed: a query that re
 
 - **WHEN** `--end-align=30s` and a client sends `GET /v1/storage-graph?start=2026-05-01T12:00:10Z&end=2026-05-01T12:05:10Z&az=zone-a&env=prod`
 - **THEN** every upstream query is evaluated at `2026-05-01T12:05:00Z` over a 5m window
+
+### Requirement: Storage build reads the application-metadata metric by namespace
+
+When the `app-metadata-source` metric is configured and served, every storage build SHALL read it, after pods and claims are loaded, once per loaded cluster: restricted to that cluster and, on the configured `namespace` label, to the namespaces its loaded pods and claims carry, composed with the request matchers. A namespace SHALL NOT be read in a cluster that did not load it. The restriction is data-derived: chunked, never widened, never rejected.
+
+#### Scenario: Namespaces of pods and claims are read whole
+
+- **WHEN** a storage build loads pods in namespace `shop` and an unmounted root claim in namespace `archive`
+- **THEN** one application-metadata read carries that cluster's `cluster` matcher and the configured namespace label restricted to `archive|shop`, and returns every row of those namespaces in that cluster, including rows of pods the build did not load
+
+#### Scenario: A namespace is read only in the cluster that loaded it
+
+- **WHEN** a storage build loads pods in namespace `shop` of cluster `c1` and namespace `pay` of cluster `c2`, and cluster `c2` also has a namespace `shop`
+- **THEN** one read carries `cluster="c1"` restricted to `shop`, another carries `cluster="c2"` restricted to `pay`, and no row of `c2`'s `shop` namespace is read
+
+#### Scenario: Pod Application and group metadata come from the read
+
+- **WHEN** the read returns a row naming Application `shop-v2`, owner `team-a` and user `alice` for loaded pod `shop/web-0`
+- **THEN** `web-0` carries `data.application="shop-v2"`, the `shop` namespace group carries `data.namespace_owner="team-a"` and the `shop-v2` application group carries `data.deployed_by="alice"`
+
+#### Scenario: No loaded namespace issues no read
+
+- **WHEN** a storage build loads no pod and no claim
+- **THEN** no application-metadata query is issued
+
+#### Scenario: Unset or unserved metric issues no read
+
+- **WHEN** the metric is unset, or no backend serves `appmeta`
+- **THEN** no application-metadata query is issued and every pod resolves its Application through the controller chain
