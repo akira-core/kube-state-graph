@@ -123,12 +123,17 @@ The application-metadata query SHALL be dispatched to the backends serving the `
 
 ### Requirement: Self-metrics name the query logically
 
-Every self-metric, span and log line that names an upstream query SHALL name the application-metadata query `app_metadata`, never the configured metric name, so the self-metric label value set does not depend on configuration.
+On the graph builds, the query name that upstream self-metric `query` labels, span query-name attributes, tally keys and log lines carry SHALL be `app_metadata`, never the configured metric name. The rendered PromQL text is not a query name. No self-metric label value SHALL depend on the configured metric name.
 
 #### Scenario: Configured name does not leak into self-metric labels
 
 - **WHEN** the metric is configured as `argocd_app_pod_info` and a build issues its query
 - **THEN** `kube_state_graph_upstream_query_duration_seconds` records it under `query="app_metadata"` and no series carries `query="argocd_app_pod_info"`
+
+#### Scenario: The lookup keeps the label-query name
+
+- **WHEN** the metric is configured as `argocd_app_pod_info` and a pod Application lookup issues its `appmeta` query
+- **THEN** the query is recorded under the label-query path's fixed `query` value, and no series carries `query="argocd_app_pod_info"`
 
 ### Requirement: Graph-build degrade on the metric
 

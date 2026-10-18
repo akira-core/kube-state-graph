@@ -245,7 +245,13 @@ func readTopology(
 	// svmRows are phase 1's SVM-group rows, kept apart for owner completion.
 	// Written by the phase-1 leg before volumeLabelsDone closes.
 	var svmRows model.Vector
-	legs := topologyLegs(&v, opts.AppMetadata)
+	// An unserved appmeta family is the unset metric: the leg is not added,
+	// so no query is issued and nothing is tallied.
+	legSrc := opts.AppMetadata
+	if !appMetadataServed(q) {
+		legSrc = nil
+	}
+	legs := topologyLegs(&v, legSrc)
 	start := func(l topologyLeg) {
 		var run func() error
 		switch {

@@ -268,6 +268,32 @@ func TestParse_AppMetadataPartialOverrideKeepsDefaults(t *testing.T) {
 	}, src)
 }
 
+// Spec "Configured metric is read", through the environment alone.
+func TestParse_AppMetadataFromEnvOnly(t *testing.T) {
+	lookup := func(k string) (string, bool) {
+		switch k {
+		case "KSG_APP_METADATA_METRIC":
+			return "argocd_app_pod_info", true
+		case "KSG_APP_METADATA_LABELS":
+			return "ns_owner=team", true
+		default:
+			return "", false
+		}
+	}
+	cfg, err := Parse(nil, lookup)
+	require.NoError(t, err)
+	src, err := cfg.AppMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, &promql.AppMetadataSource{
+		Metric:    "argocd_app_pod_info",
+		App:       promql.DefaultAppMetadataAppLabel,
+		User:      promql.DefaultAppMetadataUserLabel,
+		NSOwner:   "team",
+		Namespace: promql.DefaultAppMetadataNamespaceLabel,
+		Pod:       promql.DefaultAppMetadataPodLabel,
+	}, src)
+}
+
 func TestParse_AppMetadataFlagOverridesEnv(t *testing.T) {
 	lookup := func(k string) (string, bool) {
 		switch k {

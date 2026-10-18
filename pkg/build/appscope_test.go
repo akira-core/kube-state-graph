@@ -247,6 +247,29 @@ func TestReadScopedApplications_NoControllerMatches(t *testing.T) {
 	assert.Contains(t, f.QueriesFor(promql.QPVCAnnotations)[0], trackingLabel+`=~`)
 }
 
+// Spec: "No controller or claim carries the Application", with the metric
+// configured: the seed is still issued in the stage-1 wave, and with no row
+// naming the Application nothing downstream is read.
+func TestReadScopedApplications_NoControllerMatchesStillSeeds(t *testing.T) {
+	f := promqlfake.New(map[promql.Query]model.Vector{
+		promql.QDeploymentAnnotations: {
+			planKSM("namespace", "shop", "deployment", "web", trackingLabel, "other:apps/Deployment:shop/web"),
+		},
+	})
+	opts := appMetadataOpts()
+	names, _, err := recoverNames(t, f, opts, promql.Selector{}, []string{"typo"})
+	require.NoError(t, err)
+	assert.Empty(t, names)
+	seed := f.QueriesFor(promql.QAppMetadata)
+	require.Len(t, seed, 1)
+	assert.Contains(t, seed[0], opts.AppMetadata.App+`="typo"`)
+	assert.Empty(t, f.QueriesFor(promql.QReplicaSetOwner))
+	assert.Empty(t, f.QueriesFor(promql.QJobOwner))
+	assert.Empty(t, f.QueriesFor(promql.QPodOwner))
+	assert.Empty(t, f.QueriesFor(promql.QPVCBindings))
+	assert.Empty(t, f.QueriesFor(promql.QPodInfo))
+}
+
 func TestReadScopedApplications_NamespaceFilterNarrows(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QDeploymentAnnotations: {

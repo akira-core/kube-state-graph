@@ -50,6 +50,17 @@ func TestReadTopology_ConfiguredAppMetadataIssuesOneLogicalQuery(t *testing.T) {
 		}
 	})
 
+	t.Run("unserved issues no query and leaves no tally", func(t *testing.T) {
+		inner := promqlfake.New(map[promql.Query]model.Vector{
+			promql.QAppMetadata: {sample},
+		})
+		tp, err := ReadTopology(t.Context(), appMetaUnserved{inner}, window, end, Options{AppMetadata: &src}, promql.Selector{})
+		require.NoError(t, err)
+		assert.Empty(t, inner.QueriesFor(promql.QAppMetadata))
+		assert.NotContains(t, tp.RawSeriesCount, string(promql.QAppMetadata))
+		assert.Nil(t, tp.NamespaceOwners)
+	})
+
 	t.Run("empty labels read their defaults", func(t *testing.T) {
 		f := promqlfake.New(map[promql.Query]model.Vector{
 			promql.QAppMetadata: {sample},
@@ -126,11 +137,58 @@ func TestBuild_AppMetadataGroupIndexes(t *testing.T) {
 			}
 			return nil
 		}
-		g, err := New(f, Options{AppMetadata: &src}, nil, nil).Build(t.Context(), window, end, sel)
-		require.NoError(t, err)
+		var g *graph.Graph
+		recs := captureDebugRecords(t, func() {
+			var err error
+			g, err = New(f, Options{AppMetadata: &src}, nil, nil).Build(t.Context(), window, end, sel)
+			require.NoError(t, err)
+		})
 		assert.Nil(t, g.NamespaceOwners)
 		assert.Nil(t, g.ApplicationDeployers)
+		logged := false
+		for _, r := range recs {
+			if r["msg"] == "optional topology query failed; continuing with empty vector" && r["query"] == string(promql.QAppMetadata) {
+				logged = true
+			}
+		}
+		assert.True(t, logged, "the degrade is logged naming app_metadata")
 	})
+}
+
+// Spec: "A row without zone labels is ignored under a zone matcher". The
+// pod's kube-state-metrics series carry az / env; the metric row does not. A
+// zone filter excludes the row upstream and the controller chain resolves the
+// pod. Without the filter the cluster ladder adopts the row.
+func TestBuild_AppMetadataRowWithoutZoneLabels(t *testing.T) {
+	end := time.Unix(1, 0).UTC()
+	src := defaultAppMetadata()
+	zoned := func(kv ...string) *model.Sample {
+		m := model.Metric{"az": "us", "env": "dev", "cluster": "c1", "namespace": "shop"}
+		for i := 0; i < len(kv); i += 2 {
+			m[model.LabelName(kv[i])] = model.LabelValue(kv[i+1])
+		}
+		return &model.Sample{Metric: m, Value: 1}
+	}
+	fixtures := map[promql.Query]model.Vector{
+		promql.QPodInfo:  {zoned("pod", "web-1", "uid", "u1", "node", "w0")},
+		promql.QNodeInfo: {zoned("node", "w0")},
+		promql.QPodOwner: {zoned("pod", "web-1", "owner_kind", "Deployment", "owner_name", "web", "owner_is_controller", "true")},
+		promql.QDeploymentAnnotations: {zoned("deployment", "web",
+			"annotation_argocd_argoproj_io_tracking_id", "chain-app:apps/Deployment:shop/web")},
+		promql.QAppMetadata: {appMetaSample(map[string]string{
+			"cluster": "c1", "namespace": "shop", "pod": "web-1", "argocd_app": "metric-app",
+		}, 1)},
+	}
+	appOf := func(t *testing.T, sel promql.Selector) string {
+		t.Helper()
+		g, err := New(promqlfake.New(fixtures), Options{AppMetadata: &src}, nil, nil).Build(t.Context(), time.Minute, end, sel)
+		require.NoError(t, err)
+		pod := g.NodesByID["us-dev-c1/u1"]
+		require.NotNil(t, pod)
+		return pod.Application()
+	}
+	assert.Equal(t, "chain-app", appOf(t, promql.Selector{AZ: []string{"us"}}), "the zone matcher excludes the row")
+	assert.Equal(t, "metric-app", appOf(t, promql.Selector{}), "an unfiltered build adopts the row")
 }
 
 func TestBuildStorage_ConfiguredAppMetadataSkipsUnscopedLeg(t *testing.T) {

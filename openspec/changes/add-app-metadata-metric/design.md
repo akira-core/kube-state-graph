@@ -115,7 +115,9 @@ a filter).
 `Families` gains `FamilyAppMeta = "appmeta"`; `requiredFamilies` is unchanged,
 so `Family.Optional()` is true and the `alerts` behaviour applies verbatim: the
 implicit single-backend table serves it; a backends file not listing it is
-valid and the leg returns an empty vector at Debug. The family is zone-routed
+valid. Unlike `alerts`, the build consults `FamilyServer` first and does not
+add the leg at all when `appmeta` is unserved, so the spec's "issues no
+query" holds literally and nothing is tallied. The family is zone-routed
 and zone-matched (`dimAZ | dimEnv | dimCluster | dimNamespace`), so it is
 homogeneous for `AcceptsAZ` / `RendersAZ`.
 
@@ -243,8 +245,10 @@ and gives a PVC-only namespace no owner.
 
 ### D8 — `/v1/graph`: one optional first-wave leg
 
-Added to `topologyLegs` only when `Options.AppMetadata` is non-nil, as a
-`fetchOptional` leg: a query error, an unserved family or an empty result each
+Added to `topologyLegs` only when `Options.AppMetadata` is non-nil and the
+bound querier does not report `appmeta` unserved (`appMetadataServed`: a
+querier without `FamilyServer` counts as served), as a `fetchOptional` leg:
+a query error or an empty result each
 leave every pod on the controller chain and every group without the two
 fields, and never fail the build. It carries the request's selector-level
 matchers and nothing else (no data-derived scope), so it runs beside the

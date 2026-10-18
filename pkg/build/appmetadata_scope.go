@@ -75,9 +75,10 @@ func rejectWideAppMetadataSeed(plan topologyPlan, opts Options, sel promql.Selec
 // appMetadataServed reports whether this build should issue the metric.
 //
 // A querier that does not implement FamilyServer is treated as served. The
-// storage build then issues whenever a namespace was loaded — the same rule
-// as the /v1/graph leg, which has no routing table to consult. An explicit
-// Serves(FamilyAppMeta) == false is the unserved table, and that build skips.
+// storage build then issues whenever a namespace was loaded, and the
+// /v1/graph leg is added, since neither has a routing table to consult. An
+// explicit Serves(FamilyAppMeta) == false is the unserved table: both builds
+// skip the metric.
 // The on-demand lookup uses the opposite default (design D11) and must not
 // share this helper.
 func appMetadataServed(q promql.Querier) bool {

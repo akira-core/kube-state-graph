@@ -287,6 +287,22 @@ func (s *AppMetadataSuite) TestDedicatedBackendDrivesGraphAndStorage() {
 	srv := s.startAPI("argocd_app_pod_info", true)
 	s.assertMetric(s.graphBody(srv))
 	s.assertMetric(s.storageBody(srv))
+
+	// Spec "Configured name does not leak into self-metric labels": the
+	// upstream-query histogram records the logical name only.
+	exposition := s.metricsText(srv)
+	s.Contains(exposition, `kube_state_graph_upstream_query_duration_seconds_count{query="app_metadata"}`)
+	s.NotContains(exposition, `query="argocd_app_pod_info"`)
+}
+
+func (s *AppMetadataSuite) metricsText(srv *httptest.Server) string {
+	s.T().Helper()
+	resp := s.httpGet(srv.URL + "/metrics")
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	s.Require().NoError(err)
+	s.Require().Equal(http.StatusOK, resp.StatusCode)
+	return string(raw)
 }
 
 // A backends file that leaves appmeta unserved, with the metric still

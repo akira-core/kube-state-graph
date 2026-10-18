@@ -35,7 +35,7 @@
 
 ## 6. On-demand lookup (`pkg/build/podapplication.go`)
 
-- [x] 6.1 Add the `FamilyServer` optional interface (`Serves(promql.Family) bool`), implement it on `*promql.Router`, register it in `.mockery.yaml` and run `make mocks` (design D11). Verify `make verify-mocks` passes and a `pkg/promql` test pins `Serves` against a table with and without `appmeta`.
+- [x] 6.1 Add the `FamilyServer` optional interface (`Serves(promql.Family) bool`), implement it on `*promql.Router` (design D11). It is not registered in `.mockery.yaml`: its consumers are type assertions, and tests use small in-package fakes, so a generated mock would be unused. Verify `make verify-mocks` passes and a `pkg/promql` test pins `Serves` against a table with and without `appmeta`.
 - [x] 6.2 Add `AppMetadata` to `PodApplicationRequest`; after the pod-owner query, issue one `appmeta` label query filtered on `cluster`, the configured namespace and pod labels, with the pinned zone, and return the lexically-smallest non-empty `app`; skip when the source is nil or `appmeta` unserved; when the pod-owner query returns no rows, still issue the metric query unpinned and apply the single-combination pinning rule to its rows (spec `pod-application-lookup`). Verify `pkg/build/podapplication_test.go` covers: routed `appmeta` query shape, metric wins, no row falls back, unserved skips without error, ownerless pod resolves from the metric, pinned zone carries over, ownerless ambiguity error, metric query error fails the call.
 - [x] 6.3 Extend design D11 with the ownerless-pod path the spec now requires, and update `docs/pod-application-lookup.zh-tw.md`. Verify the design and the doc both describe the unpinned metric query and its ambiguity rule.
 

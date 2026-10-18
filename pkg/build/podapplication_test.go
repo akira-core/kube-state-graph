@@ -270,7 +270,37 @@ func TestResolvePodApplication_Validation(t *testing.T) {
 // topology build's resolver chain and to the on-demand lookup, and requires
 // the same Application for every pod.
 func TestResolvePodApplication_MatchesBatchResolver(t *testing.T) {
-	s := podAppFixture()
+	t.Run("controller chain", func(t *testing.T) {
+		assertLookupMatchesBatch(t, podAppFixture(), nil)
+	})
+	t.Run("application-metadata metric", func(t *testing.T) {
+		// One pod gets metric rows (the smallest non-empty app must win on
+		// both sides); every other pod keeps the controller chain.
+		s := podAppFixture()
+		src := appMetaLookupSource()
+		pod := ""
+		for _, labels := range s.series["kube_pod_owner"] {
+			if labels["cluster"] == "c1" && (pod == "" || labels["pod"] < pod) {
+				pod = labels["pod"]
+			}
+		}
+		require.NotEmpty(t, pod)
+		for _, app := range []string{"metric-b", "", "metric-a"} {
+			s.add(src.Metric, appMetaPodRow(pod, app, "zone-a"))
+		}
+		got := assertLookupMatchesBatch(t, s, &src)
+		mc := newClusterResolver(promql.LabelKeys{})
+		key := podNameKey{mc.bucket(promql.QPodOwner, model.Metric{"az": "zone-a", "env": "prod", "cluster": "c1"}), "shop", pod}
+		assert.Equal(t, "metric-a", got[key], "the metric wins on both sides")
+	})
+}
+
+// assertLookupMatchesBatch feeds one fixture to the topology build's resolver
+// chain and to the on-demand lookup, and requires the same Application for
+// every c1 pod, with and without a requested zone. src nil leaves the metric
+// out of both sides. It returns the batch picks.
+func assertLookupMatchesBatch(t *testing.T, s *labelStore, src *promql.AppMetadataSource) map[podNameKey]string {
+	t.Helper()
 	vec := func(metric string) model.Vector {
 		out := make(model.Vector, 0, len(s.series[metric]))
 		for _, labels := range s.series[metric] {
@@ -291,8 +321,12 @@ func TestResolvePodApplication_MatchesBatchResolver(t *testing.T) {
 		CronJobAnnotations:     vec("kube_cronjob_annotations"),
 	}
 	mc := newClusterResolver(promql.LabelKeys{})
+	var metricApps map[podNameKey]string
+	if src != nil {
+		metricApps = resolveAppMetadata(vec(src.Metric), *src, mc).podApps
+	}
 	batch := resolvePodApplications(
-		nil,
+		metricApps,
 		resolvePodOwners(vec("kube_pod_owner"), vec("kube_replicaset_owner"), mc),
 		resolveControllerApplications(v, mc),
 		resolveJobCronJobOwners(vec("kube_job_owner"), mc),
@@ -311,13 +345,15 @@ func TestResolvePodApplication_MatchesBatchResolver(t *testing.T) {
 		for _, az := range []string{"zone-a", ""} {
 			req := podAppRequest(pod)
 			req.AZ = az
-			got, err := ResolvePodApplication(t.Context(), &labelStore{series: s.series}, req)
+			req.AppMetadata = src
+			got, err := ResolvePodApplication(t.Context(), servedAppMeta(&labelStore{series: s.series}), req)
 			require.NoError(t, err)
 			assert.Equal(t, want, got, "pod %s az %q", pod, az)
 		}
 		checked++
 	}
 	require.NotZero(t, checked)
+	return batch
 }
 
 // inZone moves a fixture series to another zone.

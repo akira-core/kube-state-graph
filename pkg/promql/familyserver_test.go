@@ -2,6 +2,7 @@ package promql
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -53,4 +54,33 @@ func assertServes(t *testing.T, q Querier, fam Family, want bool) {
 	fs, ok := q.(FamilyServer)
 	require.True(t, ok, "the querier a Router binds must satisfy FamilyServer")
 	assert.Equal(t, want, fs.Serves(fam))
+}
+
+// Spec: "Dedicated store" / "Application metadata separable from
+// kube-state-metrics". A zone-scoped appmeta backend receives the
+// application-metadata query and nothing else, and no other backend receives
+// it: not the kube-state-metrics store, and not an appmeta store of another
+// zone.
+func TestFanout_AppMetaReachesOnlyItsOwnBackend(t *testing.T) {
+	tbl, err := NewTable([]Backend{
+		be("k8s", "http://vm:8428", []Family{FamilyKSM, FamilyKubelet, FamilyHarvest, FamilyServiceGraph, FamilyProbe}),
+		be("meta-a", "http://meta-a:8428", []Family{FamilyAppMeta}, "zone-a"),
+		be("meta-b", "http://meta-b:8428", []Family{FamilyAppMeta}, "zone-b"),
+	})
+	require.NoError(t, err)
+	k8s, metaA, metaB := &fakeBackend{}, &fakeBackend{}, &fakeBackend{}
+	r := routerWithFakes(t, tbl, map[string]*fakeBackend{"k8s": k8s, "meta-a": metaA, "meta-b": metaB}, nil)
+
+	q := r.QuerierFor(Selector{AZ: []string{"zone-a"}})
+	_, err = q.Instant(t.Context(), string(QAppMetadata), "meta-q", time.Unix(0, 0))
+	require.NoError(t, err)
+	_, err = q.Instant(t.Context(), string(QPodInfo), "ksm-q", time.Unix(0, 0))
+	require.NoError(t, err)
+
+	_, aQueries := metaA.seen()
+	_, bQueries := metaB.seen()
+	_, ksmQueries := k8s.seen()
+	assert.Equal(t, []string{"meta-q"}, aQueries)
+	assert.Empty(t, bQueries)
+	assert.Equal(t, []string{"ksm-q"}, ksmQueries)
 }

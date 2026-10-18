@@ -179,6 +179,7 @@ func TestGraphEndpoint_AppMetadataLeg(t *testing.T) {
 	assert.Equal(t, graph.Owner{Kind: "Deployment", Name: "web"}, *errPod.Owner)
 	assert.NotContains(t, string(errRaw), "namespace_owner")
 	assert.NotContains(t, string(errRaw), "deployed_by")
+	assert.Equal(t, string(unsetRaw), string(errRaw), "a degraded build equals the metric-unset body")
 	assert.Equal(t, 1, countNamed(recordedInstants(errQ), string(promql.QAppMetadata)))
 }
 

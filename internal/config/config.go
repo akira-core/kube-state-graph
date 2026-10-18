@@ -414,11 +414,6 @@ func (c Config) Validate() error {
 // labelNameRE is the PromQL label-name grammar.
 var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-// metricNameRE is the Prometheus metric-name grammar, the same pattern
-// pkg/promql uses for LabelQuery. A colon is legal in a metric name and
-// illegal in a label name.
-var metricNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
-
 // appMetadataDefaults are the five field=label bindings an operator keeps
 // by omitting them from --app-metadata-labels.
 var appMetadataDefaults = []struct{ field, label string }{
@@ -438,9 +433,6 @@ func (c Config) AppMetadata() (*promql.AppMetadataSource, error) {
 			return nil, errors.New("app-metadata-labels (KSG_APP_METADATA_LABELS) requires app-metadata-metric (KSG_APP_METADATA_METRIC)")
 		}
 		return nil, nil
-	}
-	if !metricNameRE.MatchString(c.AppMetadataMetric) {
-		return nil, fmt.Errorf("app-metadata-metric (KSG_APP_METADATA_METRIC) is not a valid Prometheus metric name: %q", c.AppMetadataMetric)
 	}
 	labels := make(map[string]string, len(appMetadataDefaults))
 	for _, d := range appMetadataDefaults {
@@ -483,7 +475,7 @@ func (c Config) AppMetadata() (*promql.AppMetadataSource, error) {
 		Pod:       labels["pod"],
 	}
 	if err := src.Validate(promql.LabelKeys{AZ: c.AZLabel, Env: c.EnvLabel}); err != nil {
-		return nil, fmt.Errorf("app-metadata-labels: %w", err)
+		return nil, fmt.Errorf("app-metadata (KSG_APP_METADATA_METRIC / KSG_APP_METADATA_LABELS): %w", err)
 	}
 	return src, nil
 }
