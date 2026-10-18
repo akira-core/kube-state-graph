@@ -45,7 +45,7 @@ var (
 // arbitrary metric, one declared family, optional single zone, and a set of
 // exact label equalities. Sample values are never returned.
 //
-// Family is required and must be one of the six declared families. AZ is the
+// Family is required and must be one of the seven declared families. AZ is the
 // only named dimension because it decides which store is asked; every other
 // label is a filter. At is required — pkg/promql holds no clock, and a zero
 // instant is a caller bug rather than "now".
@@ -68,7 +68,7 @@ type LabelQuery struct {
 // what lets an arbitrary metric reach the right store. Dispatch itself is
 // the same core Instant uses (zone selection, identical-string fan-out,
 // fingerprint merge, fail-closed). An unserved family is an error here —
-// unlike the server's optional alerts leg, this call is deliberate.
+// unlike the server's optional-family Instant leg, this call is deliberate.
 //
 // AZ routes a zone-routed family. It is also a matcher only when the family
 // renders az (Family.RendersAZ). Harvest is zone-routed without the matcher:

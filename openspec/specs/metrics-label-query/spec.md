@@ -11,7 +11,7 @@ Gives a Go consumer of the graph engine a routed, family-scoped way to ask one u
 The engine SHALL expose a label query that a Go consumer issues against the live routing table. Its request SHALL carry:
 
 - a **metric name** — any Prometheus metric name, not restricted to the query set the graph build issues;
-- a **query family** — exactly one of the six declared families, supplied by the caller;
+- a **query family** — exactly one of the seven declared families, supplied by the caller;
 - an optional **availability zone** — at most one value;
 - an optional set of **label filters** — label key to label value, matched for equality;
 - a required **evaluation instant**;
@@ -41,11 +41,16 @@ An absent lookback window SHALL issue a bare instant selector at that instant. A
 - **WHEN** a caller wants label sets from `zone-a` and `zone-b`
 - **THEN** the caller issues one query per zone and receives two independent results; the request type admits no second zone value
 
+#### Scenario: Application-metadata family accepted
+
+- **WHEN** a caller requests metric `argocd_app_pod_info`, family `appmeta`, against a table serving `appmeta`
+- **THEN** the query is issued to every backend serving `appmeta` and the matching series' label sets are returned
+
 ### Requirement: Caller-declared family selects the backends
 
 The label query SHALL select its backends by the **caller-declared** family, applying the routing capability's existing rules unchanged: candidates serve the family; a zone-routed family is further restricted to backends whose zones set is empty or contains the requested zone; a family that is not zone-routed ignores zones entirely.
 
-The declared family SHALL be validated against the six declared family names. An unrecognised family SHALL be a request error, never a fan-out to every backend.
+The declared family SHALL be validated against the seven declared family names. An unrecognised family SHALL be a request error, never a fan-out to every backend.
 
 The identical query string SHALL be issued to every selected backend. Routing SHALL decide which store is asked and the rendered matchers SHALL decide what it returns; the two SHALL compose rather than substitute for one another.
 
@@ -73,7 +78,7 @@ The identical query string SHALL be issued to every selected backend. Routing SH
 
 When a zone is supplied, it SHALL be applied exactly as the routing capability applies the `az` dimension to that family:
 
-- `ksm`, `kubelet` and `alerts` are routed by zone AND carry an `az` matcher, rendered with the deployment's configured `az` label key.
+- `ksm`, `kubelet`, `alerts` and `appmeta` are routed by zone AND carry an `az` matcher, rendered with the deployment's configured `az` label key.
 - `harvest` is routed by zone and carries **no** `az` matcher — the per-zone store boundary is the zone filter.
 - `servicegraph` and `probe` are not zone-routed and carry no `az` matcher. A zone supplied for either SHALL be a request error naming the family; it SHALL NEVER be silently discarded, because a caller who asked to narrow and received unnarrowed data has no way to tell.
 
@@ -100,6 +105,11 @@ An absent zone SHALL apply no restriction and render no `az` matcher.
 
 - **WHEN** the deployment binds the `az` dimension to the upstream label `zone` and a caller issues a label query naming family `ksm` and zone `zone-a`
 - **THEN** the issued query carries the matcher `zone="zone-a"`, not `az="zone-a"`
+
+#### Scenario: Zone rendered as a matcher on application metadata
+
+- **WHEN** a caller issues a label query naming family `appmeta` and zone `zone-a`
+- **THEN** the query is issued only to the `appmeta` backends covering `zone-a`, and the query string carries the `az` matcher for `zone-a`
 
 ### Requirement: Label filters are exact matches only
 

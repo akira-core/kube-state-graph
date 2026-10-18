@@ -1,0 +1,66 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "us-dev-c1"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/us-dev-c1",
+          "name": "us-dev-c1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/us-dev-c1",
+          "namespace_owner": "team-a",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/namespace/shop/application/checkout",
+          "name": "checkout",
+          "type": "application",
+          "parent": "us-dev-c1/namespace/shop",
+          "deployed_by": "alice",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/namespace/shop/application/checkout/controller/Deployment/web",
+          "name": "web",
+          "type": "controller",
+          "parent": "us-dev-c1/namespace/shop/application/checkout",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "us-dev-c1/p1",
+          "name": "web",
+          "type": "pod",
+          "parent": "us-dev-c1/namespace/shop/application/checkout/controller/Deployment/web",
+          "owner": {
+            "kind": "Deployment",
+            "name": "web"
+          },
+          "application": "checkout",
+          "status": "normal",
+          "labels": {
+            "cluster": "us-dev-c1",
+            "namespace": "shop"
+          }
+        }
+      }
+    ],
+    "edges": []
+  }
+}

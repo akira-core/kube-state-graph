@@ -18,8 +18,9 @@ import (
 // plan keeps each family's own class (fail-storage-graph-on-any-leg-error).
 func TestTopologyPlan_FailsClosed(t *testing.T) {
 	storage := storagePlan(graph.StorageRoots{})
+	src := defaultAppMetadata()
 	var v topologyVectors
-	for _, l := range topologyLegs(&v) {
+	for _, l := range topologyLegs(&v, &src) {
 		assert.False(t, fullPlan.failsClosed(l.query), "fullPlan keeps %s's own class", l.query)
 		assert.Equal(t, l.query != promql.QAlerts, storage.failsClosed(l.query), "storagePlan / %s", l.query)
 	}

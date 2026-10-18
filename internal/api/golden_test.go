@@ -36,6 +36,7 @@ func TestGolden_GraphResponses(t *testing.T) {
 		"link-relation":        buildLinkRelation(),
 		"with-red-metrics":     buildWithREDMetrics(),
 		"cluster-identity":     buildClusterIdentity(),
+		"with-app-metadata":    buildWithAppMetadata(),
 	}
 
 	// Scenarios whose clusters were composed from az/env labels also need the
@@ -53,9 +54,11 @@ func TestGolden_GraphResponses(t *testing.T) {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
 			stampFixtureStatuses(view.Nodes)
 			g := &graph.Graph{
-				BuiltAt:           time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
-				NodesByID:         map[string]graph.GraphNode{},
-				ClusterIdentities: identities[name],
+				BuiltAt:              time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
+				NodesByID:            map[string]graph.GraphNode{},
+				ClusterIdentities:    identities[name],
+				NamespaceOwners:      appMetadataOwners[name],
+				ApplicationDeployers: appMetadataDeployers[name],
 			}
 			for _, n := range view.Nodes {
 				g.NodesByID[n.ID()] = n
@@ -172,6 +175,35 @@ func compareGolden(t *testing.T, file string, body any) {
 	want, err := os.ReadFile(path)
 	require.NoErrorf(t, err, "read golden (run with -update)")
 	assert.Truef(t, bytes.Equal(want, got), "golden mismatch for %s\n--- want\n%s\n--- got\n%s", file, want, got)
+}
+
+// appMetadataOwners / appMetadataDeployers are the group-metadata tables of
+// the one scenario that models a configured application-metadata metric.
+// Every other scenario leaves them nil, which is the metric-unset body.
+var appMetadataOwners = map[string]map[graph.NamespaceRef]string{
+	"with-app-metadata": {
+		{Cluster: "us-dev-c1", Namespace: "shop"}: "team-a",
+	},
+}
+
+var appMetadataDeployers = map[string]map[graph.ApplicationRef]string{
+	"with-app-metadata": {
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: "alice",
+	},
+}
+
+// buildWithAppMetadata is a pod whose Application the controller chain would
+// resolve, decorated by the metric's namespace owner and deployer. The pod
+// itself carries neither group field.
+func buildWithAppMetadata() graph.View {
+	pod := &graph.PodNode{
+		IDValue:          "us-dev-c1/p1",
+		NameValue:        "web",
+		LabelsValue:      map[string]string{"cluster": "us-dev-c1", "namespace": "shop"},
+		ApplicationValue: "checkout",
+		OwnerValue:       &graph.Owner{Kind: "Deployment", Name: "web"},
+	}
+	return graph.View{Nodes: []graph.GraphNode{pod}}
 }
 
 // ----- canned scenarios -----------------------------------------------------

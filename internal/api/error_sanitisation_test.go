@@ -139,6 +139,26 @@ func TestStorageGraphEndpoint_FailsClosedNamingFamily(t *testing.T) {
 		})
 	}
 
+	t.Run("app_metadata", func(t *testing.T) {
+		// The loaded claim's namespace is what the application-metadata read
+		// is restricted to, so the read is issued and its failure is fatal.
+		s := newServerWithAppMetadata(t, claimThenFailQuerier(t, "app_metadata", upstreamDialErr()), appMetadataSource())
+		srv := httptest.NewServer(s.Handler())
+		t.Cleanup(srv.Close)
+
+		resp, err := http.Get(srv.URL + path)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+
+		var body errReason
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		assert.Equal(t, "upstream", body.Error.Reason)
+		assert.Equal(t, "upstream query failed: app_metadata", body.Error.Message)
+		assert.NotContains(t, body.Error.Message, "argocd_app_pod_info")
+		assertNoUpstreamLeak(t, body.Error.Message)
+	})
+
 	t.Run("ALERTS", func(t *testing.T) {
 		s := newServerWithMocks(t, nameFailQuerier(t, "ALERTS", upstreamDialErr()), nil)
 		srv := httptest.NewServer(s.Handler())

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"slices"
 
 	"github.com/akira-core/kube-state-graph/internal/config"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
@@ -22,6 +23,7 @@ func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, looku
 		return nil, err
 	}
 	logUnservedFamilies(table, logger)
+	warnUnservedAppMetadata(cfg, table, logger)
 	// Values are passed explicitly — config.Defaults() already carries the
 	// library defaults — so an operator's 0 disables rather than defaulting.
 	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m),
@@ -58,6 +60,20 @@ func logUnservedFamilies(table *promql.Table, logger *slog.Logger) {
 			)
 		}
 	}
+}
+
+// warnUnservedAppMetadata logs when the operator named a metric whose family
+// the loaded table does not serve. It is a Warn, and it is not fatal: the
+// routing table hot-reloads and may gain an appmeta backend later. The Info
+// from logUnservedFamilies still reports the family itself. An unset metric
+// stays silent — leaving the family unserved is then an ordinary choice.
+func warnUnservedAppMetadata(cfg config.Config, table *promql.Table, logger *slog.Logger) {
+	if cfg.AppMetadataMetric == "" || !slices.Contains(table.Unserved(), promql.FamilyAppMeta) {
+		return
+	}
+	logger.Warn("application-metadata metric is configured but no backend serves the appmeta family",
+		"family", string(promql.FamilyAppMeta),
+	)
 }
 
 func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEnvFunc) (*promql.Table, error) {

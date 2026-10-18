@@ -98,6 +98,7 @@ type Router struct {
 var (
 	_ Querier       = (*Router)(nil)
 	_ QuerierSource = (*Router)(nil)
+	_ FamilyServer  = (*Router)(nil)
 )
 
 // NewRouter constructs a Router serving table t. factory may be nil, in which
@@ -225,6 +226,35 @@ func closeIdle(q Querier) {
 	if c, ok := q.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
 	}
+}
+
+// FamilyServer is the optional upgrade a querier may satisfy to say which
+// upstream families its table serves. A *Router and the fanoutQuerier it
+// binds to one build do. A plain *Client or a test fake does not, so a
+// caller that type-asserts for it and finds nothing keeps its own default.
+//
+// Serves ignores the request's zones. False means no backend serves the
+// family at all. A requested zone no backend declares is still served:
+// Instant returns the empty vector for that miss.
+type FamilyServer interface {
+	Serves(Family) bool
+}
+
+// familyServed is the unrestricted "who serves f" test Table.Unserved uses.
+func familyServed(table *Table, f Family) bool {
+	return table != nil && len(table.Select(f, nil)) > 0
+}
+
+// Serves reports whether the loaded table has any backend for f.
+func (r *Router) Serves(f Family) bool {
+	if r == nil {
+		return false
+	}
+	st := r.state.Load()
+	if st == nil {
+		return false
+	}
+	return familyServed(st.table, f)
 }
 
 // QuerierFor returns the Querier this build must dispatch through. The routing

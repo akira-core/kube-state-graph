@@ -157,11 +157,19 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("netapp volume key derivation: %w", err)
 	}
+	// Already proven by cfg.Validate(); re-checked so a future validation
+	// change cannot hand the builder a nil source and silently disable the
+	// metric the operator named.
+	appMetadata, err := cfg.AppMetadata()
+	if err != nil {
+		return fmt.Errorf("application metadata: %w", err)
+	}
 	builder := build.New(promRouter, build.Options{
 		APITimeout:          cfg.APITimeout,
 		RouteResolver:       routeResolver,
 		RouteResolveTimeout: cfg.RouteResolveTimeout,
 		LabelKeys:           promql.LabelKeys{AZ: cfg.AZLabel, Env: cfg.EnvLabel},
+		AppMetadata:         appMetadata,
 		VolumeKey:           volumeKey,
 		QoSScopeBatchBytes:  cfg.NetAppQoSScopeBatchBytes,
 	}, metrics, nil)

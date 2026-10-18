@@ -267,7 +267,7 @@ func TestQueryLabels_HarvestAZRoutesWithoutAMatcher(t *testing.T) {
 
 func TestQueryLabels_AZMatcherUsesConfiguredKey(t *testing.T) {
 	tbl := twoZoneTable(t)
-	for _, fam := range []Family{FamilyKSM, FamilyKubelet, FamilyAlerts} {
+	for _, fam := range []Family{FamilyKSM, FamilyKubelet, FamilyAlerts, FamilyAppMeta} {
 		t.Run(string(fam), func(t *testing.T) {
 			fakes := fakesFor(tbl)
 			r := routerForTable(t, tbl, fakes)
@@ -277,6 +277,9 @@ func TestQueryLabels_AZMatcherUsesConfiguredKey(t *testing.T) {
 			}
 			if fam == FamilyAlerts {
 				metric = "ALERTS"
+			}
+			if fam == FamilyAppMeta {
+				metric = "app_metadata"
 			}
 			q := labelQueryAt(fam, metric)
 			q.AZ = "zone-a"
@@ -300,6 +303,7 @@ func TestQueryLabels_EmptyAZAppliesNoRestriction(t *testing.T) {
 		FamilyServiceGraph: "traces_service_graph_request_total",
 		FamilyProbe:        "up",
 		FamilyAlerts:       "ALERTS",
+		FamilyAppMeta:      "app_metadata",
 	}
 	for _, fam := range Families {
 		t.Run(string(fam), func(t *testing.T) {
@@ -512,7 +516,7 @@ func TestQueryLabels_DuplicateAcrossCatchAllAndZoneAppearsOnce(t *testing.T) {
 
 func TestQueryLabels_UnservedFamilyErrorsWithoutCall(t *testing.T) {
 	tbl := ksmTable(t)
-	require.Equal(t, []Family{FamilyAlerts}, tbl.Unserved())
+	require.Equal(t, []Family{FamilyAlerts, FamilyAppMeta}, tbl.Unserved())
 	fakes := fakesFor(tbl)
 	r := routerForTable(t, tbl, fakes)
 

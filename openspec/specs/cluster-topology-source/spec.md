@@ -476,7 +476,9 @@ Note (design.md D-A4): the latest-image pick is reliable only for query windows 
 
 ### Requirement: Pod ArgoCD Application attribute
 
-The topology reader SHALL resolve each pod's **ArgoCD Application** from the `annotation_argocd_argoproj_io_tracking_id` label carried on the annotation series of the pod's **controller**, and surface it on the pod entity as a typed, nullable `application` attribute (a string), serialised as `data.application` (`omitempty`) and **never inside `labels`**. ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on the pods a controller spawns, so the controller is the only place the value exists; the reader SHALL NOT read any `argocd_tracking_id` label from `kube_pod_owner`.
+The topology reader SHALL resolve each pod's **ArgoCD Application** from the `annotation_argocd_argoproj_io_tracking_id` label carried on the annotation series of the pod's **controller**, and surface it on the pod entity as a typed, nullable `application` attribute (a string), serialised as `data.application` (`omitempty`) and **never inside `labels`**. ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on the pods a controller spawns, so the controller is the only place the annotation exists; the reader SHALL NOT read any `argocd_tracking_id` label from `kube_pod_owner`.
+
+**Application-metadata metric first.** When the `app-metadata-source` capability yields a non-empty Application for the pod's `(cluster, namespace, pod)`, that value SHALL be the pod's Application and the controller chain below SHALL NOT be consulted for it. Every other pod — including every pod when the metric is unset, unserved, or its `/v1/graph` query failed — SHALL resolve through the controller chain exactly as specified below. The controller-chain queries SHALL still be issued when the metric is configured.
 
 **Controller key.** The lookup key SHALL be the pod's own resolved controller owner from "Pod controller-owner attribute with ReplicaSet skip" — `(cluster, namespace, owner_kind, owner_name)` — so a pod owned through a ReplicaSet is looked up against its already-resolved **Deployment**, and no additional owner hop is needed for that case. A pod with no controller owner SHALL resolve no Application.
 
@@ -557,7 +559,7 @@ This requirement introduces NO new node or edge type — the Application is a ty
 
 #### Scenario: Pod with no controller owner
 
-- **WHEN** no `kube_pod_owner` series with `owner_is_controller="true"` exists for a pod
+- **WHEN** no `kube_pod_owner` series with `owner_is_controller="true"` exists for a pod and the application-metadata metric names no Application for it
 - **THEN** the emitted pod entity has a nil `application` and no controller-annotation lookup is attempted
 
 #### Scenario: Owner kind with no annotation family
@@ -569,6 +571,27 @@ This requirement introduces NO new node or edge type — the Application is a ty
 
 - **WHEN** the upstream contains `kube_pod_owner` series but none of the six controller-annotation families for the window
 - **THEN** the reader produces a valid topology with no `application` on any pod and does not fail the build
+
+
+#### Scenario: Metric Application wins over the controller annotation
+
+- **WHEN** the application-metadata metric names Application `shop-v2` for pod `checkout-1` and the pod's Deployment carries tracking-id `storefront:apps/Deployment:shop/checkout`
+- **THEN** the emitted pod entity has `application="shop-v2"` and its `owner` is still `{kind:"Deployment", name:"checkout"}`
+
+#### Scenario: Pod without a metric row falls back to its controller
+
+- **WHEN** the application-metadata metric is configured but carries no row for pod `checkout-2`, whose Deployment carries tracking-id `storefront:apps/Deployment:shop/checkout`
+- **THEN** the emitted pod entity has `application="storefront"`
+
+#### Scenario: Metric resolves a pod the controller chain cannot
+
+- **WHEN** a pod's resolved owner is `{kind:"Rollout", name:"canary"}` and the application-metadata metric names Application `canary-app` for it
+- **THEN** the emitted pod entity has `application="canary-app"`
+
+#### Scenario: PVC inheritance follows the metric value
+
+- **WHEN** PVC `data-1` carries no Application of its own and is mounted only by a pod whose Application the metric resolves to `shop-v2`
+- **THEN** the PVC inherits `application="shop-v2"`
 
 ### Requirement: K8s node Ready-status attribute
 

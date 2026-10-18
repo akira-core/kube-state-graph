@@ -81,31 +81,45 @@ func TestFamilyAlerts_AcceptsAZ(t *testing.T) {
 	assert.Equal(t, FamilyAlerts, fam)
 }
 
-// alerts is the ONE family a valid table may leave unserved. Every other
-// family stays mandatory.
+// alerts and appmeta are the optional families. Every other family stays
+// mandatory.
 func TestFamilyOptional(t *testing.T) {
 	assert.True(t, FamilyAlerts.Optional())
+	assert.True(t, FamilyAppMeta.Optional())
 	for _, f := range RequiredFamilies() {
 		assert.False(t, f.Optional(), "family %q must stay required", f)
 	}
-	assert.Len(t, Families, 6)
+	assert.Len(t, Families, 7)
 	assert.Len(t, RequiredFamilies(), 5)
 
 	_, ok := ParseFamily("alerts")
 	assert.True(t, ok, "the routing file must accept the name")
+	got, ok := ParseFamily("appmeta")
+	assert.True(t, ok, "the routing file must accept the appmeta family")
+	assert.Equal(t, FamilyAppMeta, got)
 }
 
 // --- table validation ------------------------------------------------------
 
-// Requiring `alerts` would have invalidated every backends file written before
-// the overlay existed, so an unserved alerts family loads.
+// Requiring `alerts` or `appmeta` would invalidate a backends file that never
+// declared them, so a table that serves neither optional family still loads.
 func TestNewTable_AcceptsUnservedOptionalFamily(t *testing.T) {
 	tbl, err := NewTable([]Backend{
 		be("k8s", "http://vm:8428", []Family{FamilyKSM, FamilyKubelet, FamilyServiceGraph, FamilyProbe}),
 		be("netapp", "http://vm-netapp:8428", []Family{FamilyHarvest}),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []Family{FamilyAlerts}, tbl.Unserved())
+	assert.Equal(t, []Family{FamilyAlerts, FamilyAppMeta}, tbl.Unserved())
+}
+
+// Omitting only appmeta is valid. Unserved lists that family and no other.
+func TestNewTable_AcceptsUnservedAppMetaFamily(t *testing.T) {
+	tbl, err := NewTable([]Backend{
+		be("k8s", "http://vm:8428", []Family{FamilyKSM, FamilyKubelet, FamilyServiceGraph, FamilyProbe, FamilyAlerts}),
+		be("netapp", "http://vm-netapp:8428", []Family{FamilyHarvest}),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []Family{FamilyAppMeta}, tbl.Unserved())
 }
 
 func TestTable_UnservedIsEmptyWhenAlertsServed(t *testing.T) {

@@ -10,11 +10,14 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// maxApplicationRootChunks bounds stage 1 of the application recovery and the
-// claim-annotation read beside it. The parser limits each application=
-// value's length, never the count, so the client can inflate the restriction;
-// past this many chunks the request is rejected before any query. The cap
-// matches the volume-label restriction and the wave's own concurrency.
+// maxApplicationRootChunks bounds stage 1 of the application recovery, the
+// claim-annotation read beside it, and the application-metadata seed issued
+// in parallel with them. The parser limits each application= value's length,
+// never the count, so the client can inflate the restriction; past this many
+// chunks the request is rejected before any query. The cap matches the
+// volume-label restriction and the wave's own concurrency. The metric seed
+// counts toward it only when the metric is configured and served: its wrapper
+// is wider than the tracking-id wrapper, so the two checks are separate.
 const maxApplicationRootChunks = scopeConcurrency
 
 // applicationRootChunks splits root Applications under the byte budget with
@@ -54,9 +57,12 @@ func annotationRecoveryFamilies() []annotationRecovery {
 
 // readScopedApplications recovers the pods owned by controllers whose
 // tracking-id names a root Application, as the (cluster, namespace, pod) their
-// kube_pod_owner rows carry. It returns identities only: the pods are read by
-// the existing by-reference waves, and the projection decides which of them are
-// roots. An empty root set returns nothing and issues nothing.
+// kube_pod_owner rows carry, and unions the pods an application-metadata row
+// names with the same app (design D10). It returns identities only: the pods
+// are read by the existing by-reference waves, and the projection decides
+// which of them are roots. An empty root set returns nothing and issues
+// nothing. The metric seed is a candidate generator: its rows land in a local
+// vector, and the namespace read remains the source of the D6 picks.
 func readScopedApplications(
 	ctx context.Context,
 	q promql.Querier,
@@ -84,7 +90,7 @@ func readScopedApplications(
 	families := annotationRecoveryFamilies()
 	namesByKind := map[string][]string{}
 	dsts := make([]model.Vector, len(families))
-	scoped := make([]scopedFamily, len(families), len(families)+1)
+	scoped := make([]scopedFamily, len(families), len(families)+2)
 	for i, f := range families {
 		scoped[i] = scopedFamily{
 			query:         f.query,
@@ -108,12 +114,33 @@ func readScopedApplications(
 			return promql.RenderTrackingIDScoped(promql.QPVCAnnotations, window, keys, sel, chunk)
 		},
 	})
+	// The metric seed runs in this same wave, so it is in parallel with stage
+	// 1 and the claim-annotation read. Its rows stay off v.AppMetadata: the
+	// namespace read owns that vector, and a root of x whose other row is w
+	// must still resolve to w. The tally adds the seed's series to that read.
+	var seeded model.Vector
+	seedMetric := appMetadataSeedActive(opts.AppMetadata, q)
+	if seedMetric {
+		src := *opts.AppMetadata
+		scoped = append(scoped, scopedFamily{
+			query:         promql.QAppMetadata,
+			dst:           &seeded,
+			scope:         roots,
+			budgetReserve: appMetadataRestrictionReserve(src.App, promql.AppMetadataMatcherCost(src, keys, sel)),
+			render: func(chunk []string) (string, bool) {
+				return promql.RenderAppMetadataByApp(src, window, keys, sel, chunk)
+			},
+		})
+	}
 	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, scoped); err != nil {
 		return nil, err
 	}
 	for i, f := range families {
 		addExtraSeries(v, scopeMu, f.query, len(dsts[i]))
 		namesByKind[f.kind] = namesFromTracking(dsts[i], f.label, apps)
+	}
+	if seedMetric {
+		addExtraSeries(v, scopeMu, promql.QAppMetadata, len(seeded))
 	}
 
 	var rsVec, jobVec model.Vector
@@ -188,6 +215,9 @@ func readScopedApplications(
 		}
 	}
 	pods := podKeysOf(owned, opts.LabelKeys.OrDefault())
+	if seedMetric {
+		pods = unionPodSeriesKeys(pods, appMetadataPodKeys(seeded, *opts.AppMetadata, apps, opts.LabelKeys))
+	}
 	if err := readApplicationBindings(ctx, q, window, end, opts, sel, pods, roots, v, scopeMu); err != nil {
 		return nil, err
 	}

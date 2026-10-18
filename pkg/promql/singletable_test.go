@@ -27,10 +27,12 @@ func TestSingleBackendTable(t *testing.T) {
 	b := tbl.Backends()[0]
 	assert.Equal(t, DefaultBackendName, b.Name())
 	assert.Equal(t, "http://vm.example:8428", b.URL())
-	assert.Len(t, b.Families(), 6,
-		"the implicit backend serves every family — the five required plus the optional alerts")
+	assert.Len(t, b.Families(), 7,
+		"the implicit backend serves every family — the five required plus the optional alerts and appmeta")
 	assert.Contains(t, b.Families(), FamilyAlerts,
 		"a deployment with no routing file gets the alert overlay for free")
+	assert.Contains(t, b.Families(), FamilyAppMeta,
+		"a deployment with no routing file serves the appmeta family")
 	assert.Empty(t, b.Zones(), "the implicit backend is a catch-all")
 
 	// Every family resolves to exactly one destination, zone-scoped or not.

@@ -62,7 +62,7 @@ kubegraph.AlignWindow(start, end, --end-align)  ── runBuild, AFTER validatio
    ▼
 context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; deadline exceeded → 504 timeout
    └─ Builder.Build(ctx, window, end, sel)
-         ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43)
+         ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43; a configured application-metadata metric adds one more `fetchOptional` leg, `app_metadata`, so 38 / 44)
          ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector — D30; joined with topology)
          └─ assemble → attachAlerts → attachStatus → graph.NewGraph (immutable)
    (every upstream query passes its store's guard: query-result cache → miss coalescing → per-store slot, see .claude/rules/upstream-queries.md)
@@ -112,7 +112,7 @@ capability specs live under `openspec/specs/`.
 **Wire contract**
 
 - **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`, and every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values (so `?az=b&az=a` and `?az=a&az=b` issue identical queries): node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Every golden carrying a pod / K8s node / PVC / NetApp controller / aggregate intentionally carries an explicit `data.status`; hand-built golden fixtures must stamp the same `FoldStatus` result the builder bakes before `graph.NewGraph`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
-- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, and edge `metrics`.
+- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, `namespace_owner`, `deployed_by`, and edge `metrics`. `namespace_owner` and `deployed_by` appear only on synthesised `namespace` and `application` groups.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
   and the canonical input `<type>|<source>|<target>`. Stable across rebuilds —
   required for golden tests. Bumping the namespace UUID is a v2 break.
@@ -122,7 +122,7 @@ capability specs live under `openspec/specs/`.
 - **`<cluster>` is the composed identity `<az>-<env>-<cluster>`**, composed at the ONE point a series' `cluster` label is read (`build.clusterResolver`, `bucket(query, metric)`); nothing downstream knows about zones. **`?cluster=` is the RAW name at both layers; `clusters[]` is the identity** — a `clusters[]` value sent back as `?cluster=` is an empty 200, deliberately.
 - **Default projection is the connectivity-connected subgraph**: a pod is kept iff it is an endpoint of a connectivity edge, and infra hangs off kept pods. `?prune=false` is the only escape hatch; `cluster` / `namespace` / `az` / `env` never disable the prune. The prune is a projection concern and a pure function of the built graph.
 - **`graph.EdgeTypes` is the single edge-type registry**: adding an edge type means updating the builder AND the registry in the same change. `GraphNode` is sealed; serialisation goes through its methods, never a type switch.
-- **Compound nodes (`cluster` / `namespace` / `application` / `controller` / `storage-cluster`) are presentation-only**, synthesised in `pkg/cytoscape`. NetApp nodes belong to no Kubernetes cluster and stay out of `clusters[]`.
+- **Compound nodes (`cluster` / `namespace` / `application` / `controller` / `storage-cluster`) are presentation-only**, synthesised in `pkg/cytoscape`. A `namespace` group may carry omitempty `data.namespace_owner` and an `application` group omitempty `data.deployed_by`, looked up from `Graph.NamespaceOwners` / `Graph.ApplicationDeployers` at serialise time and never placed inside `labels` (which stay `{}`); both are omitted when the optional application-metadata metric is unset or did not resolve a value. NetApp nodes belong to no Kubernetes cluster and stay out of `clusters[]`.
 - **`data.status` is always present** on pods, K8s nodes, PVCs, NetApp controllers and aggregates (`graph.FoldStatus`, baked before `graph.NewGraph`); hand-built golden fixtures must stamp it too. `"normal"` means no negative signal, not full coverage.
 
 **Request and upstream**
@@ -205,7 +205,11 @@ types: `PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`,
 `NetAppAggrNode`, `NetAppNode`, `NetAppSVMNode`. Every attribute is a method on
 the interface returning its zero value for the kinds it does not apply to;
 serialisation goes through these methods — never through type switches in the
-serialiser. Per-method semantics: `.claude/rules/graph-model.md`.
+serialiser. `namespace_owner` and `deployed_by` are not `GraphNode` methods.
+They live only on synthesised Cytoscape `namespace` and `application` groups,
+filled by `cytoscape.Serialise` from `Graph.NamespaceOwners` (`NamespaceRef`)
+and `Graph.ApplicationDeployers` (`ApplicationRef`). Per-method semantics:
+`.claude/rules/graph-model.md`.
 
 ### Test stack layers
 

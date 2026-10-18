@@ -233,15 +233,24 @@ const (
 
 	// QAlerts is the Prometheus / vmalert ALERTS series — the alert overlay's
 	// single leg (the alert-overlay capability). It is the sole member of the
-	// FamilyAlerts family, which is the ONE family a valid routing table may
-	// leave unserved: the alerting store is commonly a different installation
-	// from the one holding kube_*, and requiring it would invalidate every
-	// existing backends file.
+	// FamilyAlerts family. FamilyAlerts is one of the two OPTIONAL families a
+	// valid routing table may leave unserved (the other is FamilyAppMeta):
+	// the alerting store is commonly a different installation from the one
+	// holding kube_*, and requiring it would invalidate every existing
+	// backends file.
 	//
 	// OPTIONAL in every direction: an unserved family, a query error, or an
 	// empty vector each leave every node without `data.alerts` and never fail
 	// the build.
 	QAlerts Query = "ALERTS"
+
+	// QAppMetadata is the LOGICAL name of the operator-configured per-pod
+	// application-metadata metric. It is the queryDims and queryFamily key,
+	// the self-metric `query` label, the span query_name and the tally key.
+	// It is never sent upstream as a metric name: the build issues
+	// RenderAppMetadata, which substitutes the configured metric. Render
+	// returns "" for it.
+	QAppMetadata Query = "app_metadata"
 )
 
 // queryDims is the hardcoded "which request dimension reaches which series"
@@ -329,6 +338,10 @@ var queryDims = map[Query]dims{
 	// Alerting store — az / env / namespace, but deliberately NOT cluster.
 	QAlerts: dimsAlerts,
 
+	// Application metadata — az / env / cluster / namespace. The issued
+	// metric name is configured; this entry is the logical query.
+	QAppMetadata: dimsNamespaced,
+
 	// Read unfiltered for every request.
 	QServiceGraphTotal:               dimsNone,
 	QServiceGraphFailedTotal:         dimsNone,
@@ -363,11 +376,16 @@ const (
 	FamilyServiceGraph Family = "servicegraph"
 	// FamilyProbe is the up{} store-health probe.
 	FamilyProbe Family = "probe"
-	// FamilyAlerts is the ALERTS series of the alert overlay. It is the only
-	// OPTIONAL family: a routing table serving it on no backend is valid, the
-	// leg is simply not issued, and no node carries `data.alerts`. Requiring
-	// it would break every backends file written before the overlay existed.
+	// FamilyAlerts is the ALERTS series of the alert overlay. It is OPTIONAL:
+	// a routing table serving it on no backend is valid, the leg is simply
+	// not issued, and no node carries `data.alerts`. Requiring it would break
+	// every backends file written before the overlay existed.
 	FamilyAlerts Family = "alerts"
+	// FamilyAppMeta is the operator-named per-pod application-metadata metric.
+	// It is OPTIONAL, like FamilyAlerts: a table serving it on no backend is
+	// valid, and the feature stays off until a metric is configured and a
+	// backend serves the family.
+	FamilyAppMeta Family = "appmeta"
 )
 
 // Families lists every declared family in a fixed order. It is the set a
@@ -375,7 +393,7 @@ const (
 // SingleBackendTable serves in full.
 //
 // It is NOT the set a table must cover — that is requiredFamilies. The two
-// differ by exactly FamilyAlerts.
+// differ by exactly FamilyAlerts and FamilyAppMeta.
 var Families = []Family{
 	FamilyKSM,
 	FamilyKubelet,
@@ -383,6 +401,7 @@ var Families = []Family{
 	FamilyServiceGraph,
 	FamilyProbe,
 	FamilyAlerts,
+	FamilyAppMeta,
 }
 
 // requiredFamilies is the subset of Families a routing table MUST cover. A
@@ -390,8 +409,9 @@ var Families = []Family{
 // queries would have nowhere to go and the resulting empty vector is
 // indistinguishable from a genuinely empty estate.
 //
-// FamilyAlerts is deliberately absent: an unserved alert family is the
-// documented normal state, not a misconfiguration (design D8).
+// FamilyAlerts and FamilyAppMeta are deliberately absent: an unserved
+// optional family is the documented normal state, not a misconfiguration.
+
 var requiredFamilies = []Family{
 	FamilyKSM,
 	FamilyKubelet,
@@ -492,6 +512,9 @@ var queryFamily = map[Query]Family{
 
 	// Alert overlay.
 	QAlerts: FamilyAlerts,
+
+	// Application metadata. The logical query name, not the configured metric.
+	QAppMetadata: FamilyAppMeta,
 }
 
 // FamilyOf returns the family query q belongs to. The bool reports whether q
@@ -854,6 +877,10 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// alertstate="firing" selector is rendered first, so a request matcher
 		// composes with it rather than replacing it.
 		return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, fx, w)
+	case QAppMetadata:
+		// Logical name only: the issued query names the configured metric
+		// and goes through RenderAppMetadata, never through Render.
+		return ""
 	case QUpProbe:
 		return `up`
 	}

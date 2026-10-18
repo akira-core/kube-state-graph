@@ -38,8 +38,8 @@ type topologyLeg struct {
 // per plan, which of the legs below actually launch; a family a plan does not
 // launch here has no topologyVectors slot written until its own second wave
 // runs (or stays nil if its scope came out empty).
-func topologyLegs(v *topologyVectors) []topologyLeg {
-	return []topologyLeg{
+func topologyLegs(v *topologyVectors, src *promql.AppMetadataSource) []topologyLeg {
+	legs := []topologyLeg{
 		{query: promql.QPodInfo, dst: &v.Pod},
 		{query: promql.QNodeInfo, dst: &v.Node},
 		{query: promql.QNodeAddresses, dst: &v.Addr},
@@ -98,6 +98,15 @@ func topologyLegs(v *topologyVectors) []topologyLeg {
 		{query: promql.QKubeletVolumeUsedBytes, dst: &v.KubeletVolumeUsed, optional: true},
 		{query: promql.QKubeletVolumeCapacityBytes, dst: &v.KubeletVolumeCapacity, optional: true},
 	}
+	// The application-metadata leg exists only when the operator named a
+	// metric. An unset source leaves the fan-out — and therefore every body —
+	// byte-identical. /v1/storage-graph skips it (storageSkippedLegs): that
+	// endpoint reads the metric through the namespace-restricted wave, never
+	// as this unscoped first-wave leg.
+	if src != nil {
+		legs = append(legs, topologyLeg{query: promql.QAppMetadata, dst: &v.AppMetadata, optional: true})
+	}
+	return legs
 }
 
 // topologyPlan is the endpoint-dependent part of a topology read: which
@@ -214,6 +223,9 @@ var storageSkippedLegs = map[promql.Query]bool{
 	promql.QEndpointSliceEndpoints: true,
 	promql.QEndpointSliceLabels:    true,
 	promql.QServiceAnnotations:     true,
+	// The unscoped graph leg. Storage reads this family from the loaded
+	// namespaces (readScopedAppMetadata), so the first-wave copy must not run.
+	promql.QAppMetadata: true,
 }
 
 // storagePlan is the /v1/storage-graph read for one request's root kind.
@@ -684,9 +696,13 @@ func tallySeries(legs []topologyLeg, plan topologyPlan, v *topologyVectors) map[
 	for _, l := range legs {
 		// A flowless gauge read is issued beside the first wave but lands
 		// through the scoped writer, so it is tallied from ScopeIssued rather
-		// than from the beside-seed bit.
+		// than from the beside-seed bit. ExtraSeriesCount adds a read that
+		// landed in a local vector — the application-metadata seed, whose
+		// namespace read owns the leg's own slot; the seed's own scoped write
+		// marks the family issued. Families a later target loop owns are
+		// overwritten there with the same sum.
 		if plan.issuesFirstWave(l.query) || plan.issuesBesideSeed(l.query) || v.ScopeIssued[l.query] {
-			raw[string(l.query)] = len(*l.dst)
+			raw[string(l.query)] = len(*l.dst) + v.ExtraSeriesCount[l.query]
 		}
 	}
 	for _, targets := range [][]scopedTarget{qosTargets(v), podTargets(v), nodeTargets(v), controllerTargets(v), claimTargets(v)} {

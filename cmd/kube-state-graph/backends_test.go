@@ -101,8 +101,9 @@ func TestInitialTable_ImplicitSingleBackend(t *testing.T) {
 	b := tbl.Backends()[0]
 	assert.Equal(t, config.DefaultBackendName, b.Name())
 	assert.Equal(t, "http://vm.example:8428", b.URL())
-	assert.Len(t, b.Families(), 6,
-		"the implicit backend serves every family — the five required plus the optional alerts")
+	assert.Len(t, b.Families(), 7,
+		"the implicit backend serves every family — the five required plus the optional alerts and appmeta")
+	assert.Contains(t, b.Families(), promql.FamilyAppMeta)
 	assert.Empty(t, b.Zones())
 }
 
@@ -145,6 +146,52 @@ func TestInitialTable_MissingFileIsFatal(t *testing.T) {
 	_, err := initialTable(cfg, quietLogger(), noEnv)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "absent.yaml")
+}
+
+// A configured metric whose family no backend serves is a Warn, not a
+// startup failure: the routing table hot-reloads and may gain the backend.
+// The existing Info for an unserved optional family still fires beside it.
+func TestBuildRouter_WarnsWhenAppMetadataUnserved(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.AppMetadataMetric = "argocd_app_pod_info"
+	cfg.BackendsFile = writeTable(t, twoBackends)
+
+	var buf bytes.Buffer
+	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	require.Equal(t, 2, r.Table().Len(), "startup proceeds on the loaded table")
+
+	log := buf.String()
+	assert.Contains(t, log, `"level":"WARN"`)
+	assert.Contains(t, log, "application-metadata metric is configured but no backend serves the appmeta family")
+	assert.Contains(t, log, `"family":"appmeta"`)
+	assert.Contains(t, log, "optional upstream family is served by no backend")
+}
+
+// An unset metric leaves an unserved appmeta family as the ordinary Info.
+func TestBuildRouter_NoAppMetadataWarnWhenUnset(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.BackendsFile = writeTable(t, twoBackends)
+
+	var buf bytes.Buffer
+	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.NotContains(t, buf.String(), "application-metadata metric is configured")
+}
+
+// The implicit single backend serves appmeta, so a configured metric is quiet.
+func TestBuildRouter_NoAppMetadataWarnWhenFamilyServed(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.AppMetadataMetric = "argocd_app_pod_info"
+	cfg.PromURL = "http://vm.example:8428"
+
+	var buf bytes.Buffer
+	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.NotContains(t, buf.String(), "application-metadata metric is configured")
 }
 
 func TestBuildRouter_ImplicitBackendRoutesEveryFamily(t *testing.T) {

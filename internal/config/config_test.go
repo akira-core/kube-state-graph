@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/build"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 func TestParse_DefaultsValid(t *testing.T) {
@@ -237,6 +238,150 @@ func TestParse_LabelKeysRejected(t *testing.T) {
 			_, err := Parse(tc.args, noEnv)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestParse_AppMetadataUnset(t *testing.T) {
+	cfg, err := Parse(nil, func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	src, err := cfg.AppMetadata()
+	require.NoError(t, err)
+	assert.Nil(t, src)
+}
+
+func TestParse_AppMetadataPartialOverrideKeepsDefaults(t *testing.T) {
+	cfg, err := Parse([]string{
+		"--app-metadata-metric=argocd_app_pod_info",
+		"--app-metadata-labels=app=application,user=deployer",
+	}, func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	src, err := cfg.AppMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, &promql.AppMetadataSource{
+		Metric:    "argocd_app_pod_info",
+		App:       "application",
+		User:      "deployer",
+		NSOwner:   "owner",
+		Namespace: "namespace",
+		Pod:       "pod",
+	}, src)
+}
+
+// Spec "Configured metric is read", through the environment alone.
+func TestParse_AppMetadataFromEnvOnly(t *testing.T) {
+	lookup := func(k string) (string, bool) {
+		switch k {
+		case "KSG_APP_METADATA_METRIC":
+			return "argocd_app_pod_info", true
+		case "KSG_APP_METADATA_LABELS":
+			return "ns_owner=team", true
+		default:
+			return "", false
+		}
+	}
+	cfg, err := Parse(nil, lookup)
+	require.NoError(t, err)
+	src, err := cfg.AppMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, &promql.AppMetadataSource{
+		Metric:    "argocd_app_pod_info",
+		App:       promql.DefaultAppMetadataAppLabel,
+		User:      promql.DefaultAppMetadataUserLabel,
+		NSOwner:   "team",
+		Namespace: promql.DefaultAppMetadataNamespaceLabel,
+		Pod:       promql.DefaultAppMetadataPodLabel,
+	}, src)
+}
+
+func TestParse_AppMetadataFlagOverridesEnv(t *testing.T) {
+	lookup := func(k string) (string, bool) {
+		switch k {
+		case "KSG_APP_METADATA_METRIC":
+			return "from_env", true
+		case "KSG_APP_METADATA_LABELS":
+			return "app=from_env", true
+		default:
+			return "", false
+		}
+	}
+	cfg, err := Parse([]string{
+		"--app-metadata-metric=from_flag",
+		"--app-metadata-labels=pod=workload",
+	}, lookup)
+	require.NoError(t, err)
+	src, err := cfg.AppMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, "from_flag", src.Metric)
+	assert.Equal(t, "workload", src.Pod)
+	assert.Equal(t, "argocd_app", src.App)
+}
+
+func TestParse_AppMetadataRejected(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "illegal metric name",
+			args: []string{"--app-metadata-metric=9bad"},
+			want: []string{"KSG_APP_METADATA_METRIC", "9bad"},
+		},
+		{
+			name: "illegal label name",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=app=foo.bar"},
+			want: []string{"app", "foo.bar"},
+		},
+		{
+			name: "unknown field",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=application=argocd_app"},
+			want: []string{"application"},
+		},
+		{
+			name: "repeated field",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=app=a,app=b"},
+			want: []string{"app", "repeated"},
+		},
+		{
+			name: "duplicate labels",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=app=shared,user=shared"},
+			want: []string{"shared", "app", "user"},
+		},
+		{
+			name: "label collides with cluster",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=pod=cluster"},
+			want: []string{"pod", "cluster"},
+		},
+		{
+			name: "label collides with the zone key",
+			args: []string{"--az-label=zone", "--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=ns_owner=zone"},
+			want: []string{"ns_owner", "zone"},
+		},
+		{
+			name: "default namespace-owner label collides with the zone key",
+			args: []string{"--az-label=owner", "--app-metadata-metric=argocd_app_pod_info"},
+			want: []string{"ns_owner", "owner"},
+		},
+		{
+			name: "label collides with the env key",
+			args: []string{"--env-label=tier", "--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=user=tier"},
+			want: []string{"user", "tier"},
+		},
+		{
+			name: "labels without a metric",
+			args: []string{"--app-metadata-labels=app=application"},
+			want: []string{"KSG_APP_METADATA_LABELS", "KSG_APP_METADATA_METRIC"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.args, noEnv)
+			require.Error(t, err)
+			for _, want := range tc.want {
+				assert.Contains(t, err.Error(), want)
+			}
 		})
 	}
 }

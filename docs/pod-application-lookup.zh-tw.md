@@ -13,16 +13,20 @@
 ## 1. 這個功能做什麼
 
 `build.ResolvePodApplication` 會針對**一個**已知名稱的 pod，透過
-`promql.Router.QueryLabels` 對上游 VictoriaMetrics 發出 2～4 條（依 owner
-種類而定）循序的 `ksm` family label query，算出該 pod 的 ArgoCD Application
-名稱。
+`promql.Router.QueryLabels` 對上游 VictoriaMetrics 發出循序的 label query，
+算出該 pod 的 ArgoCD Application 名稱。Controller chain 是 2～4 條 `ksm`
+family query（依 owner 種類而定）。請求若帶了 application-metadata source，
+且路由表有 backend 服務 `appmeta`，會在 chain 之前多一條 `appmeta` query。
 
 - **不需要跑整個 graph build**，也不需要 HTTP server。
-- 解析規則與 graph build 為 `PodNode.Application()` 套用的規則**完全相同**
-  （兩條路徑共用同一份程式碼：`resolveOwnerApplication`、`ownerLess`、
-  `betterTrackingID`、`controllerAnnotationFamilies`），所以兩邊對同一份上游
-  資料得到的結果一致（由 `TestResolvePodApplication_MatchesBatchResolver` 釘住）。
+- Controller chain 與 graph build 為 `PodNode.Application()` 套用的規則相同
+  （兩條路徑共用 `resolveOwnerApplication`、`ownerLess`、`betterTrackingID`、
+  `controllerAnnotationFamilies`）。Metric 步驟另取該 pod 列上字典序最小的
+  非空 `app`，原值使用、不切 `:`，與 build 的 D6 挑選相同；有值就勝出，
+  沒有才走 chain。
 - 與 build 不同：**任何一條上游 query 失敗，整個查詢就失敗**，不會降級成空值。
+  沒有 `FamilyServer`、或 `appmeta` 沒有 backend 時，lookup **略過** metric
+  步驟、不報錯；graph build 對「沒有 `FamilyServer` 的 querier」則視為有服務。
 
 ---
 
@@ -60,7 +64,11 @@ import (
 
 ## 3. 前置條件（上游資料）
 
-這個 API 只讀 kube-state-metrics（KSM）的 series，全部走 `ksm` family：
+Controller chain 只讀 kube-state-metrics（KSM）的 series，走 `ksm` family。
+Application-metadata 列是另一條 series，走 `appmeta` family，metric 名稱與
+五個 label 名稱由 `PodApplicationRequest.AppMetadata` 指定（沒有這個欄位就
+不讀）。`cluster` 固定；az / env 用第 8 節的 `LabelKeys`。預設 label 為
+`argocd_app`、`user`、`owner`、`namespace`、`pod`，可各別覆寫。
 
 | Series | 用途 | 需要額外設定？ |
 |---|---|---|
@@ -82,11 +90,18 @@ KSM allowlist 範例（只開你需要的 resource 即可，per-resource 生效�
 
 KSM 會把 annotation 轉成 label `annotation_argocd_argoproj_io_tracking_id`。
 
-另外，**所有上述 series 必須帶有相同的 `cluster`、`namespace`，以及相同的
-az / env label**（預設名稱 `az`、`env`，可替換，見第 7 節）。第二條以後的
-query 都會用第一條 `kube_pod_owner` 讀到的 az / env 值做精確比對；若某個
-controller annotation family 的 az / env label 與 `kube_pod_owner` 不一致，
+另外，**controller chain 的 series 必須帶有相同的 `cluster`、`namespace`，以及相同的
+az / env label**（預設名稱 `az`、`env`，可替換，見第 8 節）。有 owner 時，
+第二條以後的 query（含已釘住的 appmeta query）都用 `kube_pod_owner` 讀到的
+az / env 做精確比對；controller annotation family 的 az / env 與它不一致時，
 該 family 在這裡會查不到東西（graph build 在未過濾時可能還能 adopt，這裡不會）。
+application-metadata metric 也一樣：metric 列沒帶 az / env 時，釘住的 appmeta
+query 查不到它，lookup 會退回 controller chain；未過濾的 `/v1/graph` 卻可能 adopt
+到 metric 的值，兩邊結果不同。這是 operator 的前置條件，見
+`docs/upstream-metrics.md` 的 Application metadata 一節。
+**沒有 owner 時的 appmeta query 是未釘選的**：請求省略的 az / env 不帶 matcher，
+同一套「只能有一組 (az, env)」的規則改套在 metric 列上，多組就回
+`ErrAmbiguousPod` 且不再發 query。
 
 ---
 
@@ -105,8 +120,9 @@ if err != nil {
 }
 ```
 
-`SingleBackendTable` 產生一個名為 `default`、服務全部六個 family、不分 zone
-的 backend。Basic auth 帶在第二、三個參數。
+`SingleBackendTable` 產生一個名為 `default`、服務全部七個 family（含選用的
+`appmeta`）、不分 zone 的 backend。Basic auth 帶在第二、三個參數。路由表若
+沒有 backend 服務 `appmeta`，metric 步驟略過、不報錯，改走 controller chain。
 
 ### 4.2 多 backend（依 zone 路由）
 
@@ -199,6 +215,7 @@ query 會 fan-out 到所有服務 `ksm` 的 backend。
 | `AZ` | ❌ | 可用區。有值時所有 query 都路由到該 zone 並帶 az matcher；留空時從 pod-owner series 讀出並釘住。 |
 | `Env` | ❌ | 環境。有值時所有 query 帶 env 等式；留空時從 pod-owner series 讀出並釘住。 |
 | `LabelKeys` | ❌ | 上游 az / env **label 名稱**，零值 = `az` / `env`。見第 8 節。 |
+| `AppMetadata` | ❌ | Application-metadata source（metric 名稱與五個 label 名稱）。`nil` 不讀 metric。有值時還要 querier 實作 `promql.FamilyServer` 且 `Serves(appmeta)` 為真，否則同樣略過。 |
 
 `Cluster` / `Namespace` / `Pod` 任一為空、`At` 為零、`Window <= 0`，都會在
 **發出任何上游 query 之前**回錯，例如
@@ -212,8 +229,19 @@ query 會 fan-out 到所有服務 `ksm` 的 backend。
 
 ```text
 (1) kube_pod_owner{pod, owner_is_controller="true"}
-      │  0 筆 → 回傳 ""（查無 owner）
-      │  讀出 az / env 並釘住（多組 → ErrAmbiguousPod）
+      │  多組 az/env → ErrAmbiguousPod，不再發 query（含 metric）
+      │  有 owner → 釘住 az / env
+      │      metric 步驟有開：
+      │        (1b) appmeta query，帶已釘住的 zone
+      │        非空 app（字典序最小、原值、不切 ':'）→ 回傳，不走 chain
+      │        沒有 → 繼續下面的 chain
+      │  0 筆 owner：
+      │      metric 步驟沒開 → 回傳 ""
+      │      metric 步驟有開 → (1b) 未釘選的 appmeta query：
+      │        請求省略的 az / env 不帶 matcher；請求有帶的維度仍套用
+      │        列上出現多組 (az, env) → ErrAmbiguousPod，不再發 query
+      │        單一一組且 app 非空 → 回傳該 app
+      │        否則 → 回傳 ""（沒有 controller 可再查）
       ▼
     取 controller owner：
       ReplicaSet → (2) kube_replicaset_owner{replicaset, owner_kind="Deployment"}
@@ -257,8 +285,12 @@ family → 回傳 `""`、不報錯、**不發** annotation query。
 | 裸 ReplicaSet | pod_owner → replicaset_owner → replicaset_annotations | 3 |
 | Job，Job 本身有 tracking-id | pod_owner → job_annotations | 2 |
 | Job，由 CronJob 管理 | pod_owner → job_annotations → job_owner → cronjob_annotations | 4 |
-| 無 controller owner | pod_owner | 1 |
-| 同名 pod 在多個 az/env | pod_owner（之後回 `ErrAmbiguousPod`） | 1 |
+| 無 controller owner，且沒開 metric | pod_owner | 1 |
+| 無 controller owner，metric 有 `app` | pod_owner → 未釘選的 appmeta query | 2 |
+| 無 controller owner，metric 列上多組 az/env | pod_owner → 未釘選的 appmeta query（之後回 `ErrAmbiguousPod`） | 2 |
+| metric 的 `app` 勝出 | pod_owner → 已釘住 zone 的 appmeta query | 2 |
+| metric 沒有列，再走 chain | 上表再加前面那條 appmeta query | +1 |
+| 同名 pod 在多個 az/env | pod_owner（之後回 `ErrAmbiguousPod`，不發 metric） | 1 |
 
 每一步依賴前一步結果，所以**必定循序**執行，不會並行。
 
@@ -277,8 +309,10 @@ family → 回傳 `""`、不報錯、**不發** annotation query。
 
 ### 8.2 每條 query 帶的 label
 
-所有 query 都固定帶：`cluster`、`namespace`，以及 az / env（規則見 8.3）。
-各 query 額外帶：
+`ksm` query 都固定帶：`cluster`、`namespace`，以及 az / env（規則見 8.3）。
+`appmeta` query 改帶 `cluster`、source 設定的 namespace label、source 設定的
+pod label（不是寫死的 `namespace` / `pod`），family 是 `appmeta`，metric
+名稱是 source 的 metric，不是邏輯名 `app_metadata`。各 query 額外帶：
 
 | Query | 額外 label 等式 |
 |---|---|
@@ -286,6 +320,7 @@ family → 回傳 `""`、不報錯、**不發** annotation query。
 | `kube_replicaset_owner` | `replicaset=<RS 名稱>`、`owner_kind="Deployment"` |
 | `kube_<kind>_annotations` | `<名稱 label>=<controller 名稱>`（見 7.2） |
 | `kube_job_owner` | `job_name=<Job 名稱>`、`owner_kind="CronJob"`、`owner_is_controller="true"` |
+| application-metadata | `<namespace label>=<Namespace>`、`<pod label>=<Pod>`；讀 `<app label>` |
 
 讀取的結果 label：`owner_kind`、`owner_name`、`annotation_argocd_argoproj_io_tracking_id`，
 以及 az / env（僅第一條 query，用於釘住）。
@@ -300,7 +335,9 @@ family → 回傳 `""`、不報錯、**不發** annotation query。
 | 請求帶 `Env="prod"` | `env="prod"` | `env="prod"` |
 | 請求沒帶 Env，owner series 帶 `env="prod"` | 不帶 env | `env="prod"` |
 | 請求沒帶 Env，owner series 沒有 env label | 不帶 env | `env=""` |
-| 請求沒帶 AZ/Env，owner series 出現多組 (az, env) | — | 不再發 query，回 `ErrAmbiguousPod` |
+| 請求沒帶 AZ/Env，owner series 出現多組 (az, env) | — | 不再發 query（也不發 metric），回 `ErrAmbiguousPod` |
+| 請求沒帶 AZ，有 owner，metric 步驟有開 | 不帶 az | appmeta query 路由到釘住的 zone，並帶 az matcher |
+| 0 筆 owner，請求沒帶 AZ/Env，metric 步驟有開 | 不帶 az / env | **未釘選**的 appmeta query：省略的維度不帶 matcher。列上單一一組就採用；多組 (az, env) 回 `ErrAmbiguousPod`，不再發 query |
 
 「釘住」的目的：避免另一個 zone / env 裡**同名**的 Deployment 或 CronJob
 被讀進來。
@@ -390,11 +427,11 @@ last_over_time(kube_replicaset_owner{zone="zone-a",cluster="c1",namespace="shop"
 
 | 結果 | 意義 |
 |---|---|
-| `"<app>", nil` | 成功。值為 tracking-id 第一個 `:` 之前的片段（無 `:` 則原值）。 |
-| `"", nil` | 查無 Application：無 controller owner、owner kind 沒有 annotation family、或 controller 無可用 tracking-id。 |
-| `"", build.ErrAmbiguousPod` | 未帶 AZ/Env，且同一 `(cluster, namespace, pod)` 出現在多組 (az, env)。用 `errors.Is` 判斷，補 `AZ` / `Env` 重查。 |
+| `"<app>", nil` | 成功。Metric 勝出時是 `app` label 的原值（不切 `:`）。否則是 tracking-id 第一個 `:` 之前的片段（無 `:` 則原值）。 |
+| `"", nil` | 查無 Application：metric 沒有非空 `app`，且無 controller owner、owner kind 沒有 annotation family、或 controller 無可用 tracking-id。 |
+| `"", build.ErrAmbiguousPod` | 未帶 AZ/Env，且 pod-owner 列或（ownerless 時）未釘選 metric query 的列出現多組 (az, env)。用 `errors.Is` 判斷，補 `AZ` / `Env` 重查。 |
 | `"", 請求錯誤` | `Cluster/Namespace/Pod is required`、`evaluation instant is required`、`window must be positive`；未發出任何 query。 |
-| `"", 上游錯誤` | 格式 `pod application lookup: <metric>: <原錯誤>`，例如某個 backend 失敗（fail-closed）、family 無 backend、結果超過 `promql.DefaultLabelQueryLimit`（10000）筆、值超過 1024 bytes 等。 |
+| `"", 上游錯誤` | 格式 `pod application lookup: <metric>: <原錯誤>`。Metric query 失敗時 `<metric>` 是邏輯名 `app_metadata`，不是設定的 metric 名稱。其餘例如某個 backend 失敗（fail-closed）、family 無 backend、結果超過 `promql.DefaultLabelQueryLimit`（10000）筆、值超過 1024 bytes 等。 |
 
 tracking-id 挑選規則（與 build 相同）：
 

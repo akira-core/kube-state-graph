@@ -18,7 +18,8 @@ import (
 // and at least one chunk reached the upstream. mu MUST be the one *sync.Mutex
 // shared by every second-wave goroutine of this read (readTopology creates it
 // and threads it through readScopedQoS / readScopedPods / readScopedNodes /
-// readScopedControllers): the QoS, pod, node and controller waves run
+// readScopedControllers / readScopedAppMetadata): the QoS, pod, node,
+// controller and application-metadata waves run
 // concurrently and each may call this for its own families, and Go maps are
 // not safe for concurrent writes even to disjoint keys.
 func markScopeIssued(v *topologyVectors, mu *sync.Mutex, q promql.Query) {
@@ -40,6 +41,17 @@ func addExtraSeries(v *topologyVectors, mu *sync.Mutex, q promql.Query, n int) {
 		v.ExtraSeriesCount = make(map[promql.Query]int)
 	}
 	v.ExtraSeriesCount[q] += n
+}
+
+// renderTopologyQuery is promql.Render for every leg except the
+// application-metadata one. That leg's PromQL names the configured metric;
+// the Instant query name stays the logical app_metadata, which is what
+// self-metrics, spans and the tally record.
+func renderTopologyQuery(name promql.Query, src *promql.AppMetadataSource, window time.Duration, keys promql.LabelKeys, sel promql.Selector) string {
+	if name == promql.QAppMetadata && src != nil {
+		return promql.RenderAppMetadata(*src, window, keys, sel)
+	}
+	return promql.Render(name, window, keys, sel)
 }
 
 // ReadTopology runs the topology queries in parallel and assembles the
@@ -84,6 +96,7 @@ func readTopology(
 	sel promql.Selector,
 	plan topologyPlan,
 ) (Topology, error) {
+	opts = opts.withAppMetadataDefaults()
 	keys := opts.LabelKeys
 	// Each goroutine writes a distinct field, so concurrent writes to v are
 	// race-free (no overlapping memory); g.Wait() establishes the happens-before
@@ -92,6 +105,7 @@ func readTopology(
 	// The parse must derive claim tokens exactly as the scope computation below
 	// did, or a claim could be fetched for and then not joined.
 	v.VolumeKey = opts.volumeKey()
+	v.AppMetadataSource = opts.AppMetadata
 	// Whether this build is in hub mode: the volume-label family read
 	// restricted to the rooted components, and the claim families read FROM
 	// those rows. A plan property and a configuration property (the byte
@@ -102,6 +116,13 @@ func readTopology(
 	plan, prepErr := plan.prepare(window, opts.qosScopeBatchBytes(), opts.LabelKeys, sel)
 	if prepErr != nil {
 		return Topology{}, prepErr
+	}
+	// The metric seed's chunk cap needs the querier (an unserved family does
+	// not count), so prepare cannot apply it. It fails here, before any
+	// goroutine, so no query is issued; classifyReadError passes the
+	// invalid_scope through unchanged.
+	if err := rejectWideAppMetadataSeed(plan, opts, sel, q); err != nil {
+		return Topology{}, err
 	}
 	v.VolumeLabelsRestricted = plan.rootedClaims()
 	v.MaterialiseUnboundClaims = plan.claimSeeded()
@@ -136,7 +157,7 @@ func readTopology(
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, err := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
+			out, err := q.Instant(ctx, string(name), renderTopologyQuery(name, opts.AppMetadata, window, keys, sel), end)
 			*dst = out
 			return wrapQueryError(name, err)
 		}
@@ -162,7 +183,7 @@ func readTopology(
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
+			out, qerr := q.Instant(ctx, string(name), renderTopologyQuery(name, opts.AppMetadata, window, keys, sel), end)
 			if qerr != nil {
 				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
 					return cerr
@@ -224,7 +245,13 @@ func readTopology(
 	// svmRows are phase 1's SVM-group rows, kept apart for owner completion.
 	// Written by the phase-1 leg before volumeLabelsDone closes.
 	var svmRows model.Vector
-	legs := topologyLegs(&v)
+	// An unserved appmeta family is the unset metric: the leg is not added,
+	// so no query is issued and nothing is tallied.
+	legSrc := opts.AppMetadata
+	if !appMetadataServed(q) {
+		legSrc = nil
+	}
+	legs := topologyLegs(&v, legSrc)
 	start := func(l topologyLeg) {
 		var run func() error
 		switch {
@@ -355,7 +382,11 @@ func readTopology(
 	// what the LOADED pods name, issued once the pod wave has landed (podsDone
 	// closes on every return path of readScopedPods, success or failure, so
 	// the two later waves compute an empty scope and issue nothing rather
-	// than block forever when the pod wave fails).
+	// than block forever when the pod wave fails). The application-metadata
+	// read is one more wave beside the controllers: it waits on that same pod
+	// wave and on the claim-info read, then restricts the metric to the union
+	// of their namespaces. storageSkippedLegs keeps the unscoped first-wave
+	// copy from running; this wave does not consult that skip set.
 	switch plan.kind {
 	case graph.StorageRootNode:
 		if len(plan.nodeRoots) > 0 {
@@ -408,6 +439,9 @@ func readTopology(
 		g.Go(func() error {
 			return readScopedControllers(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
 		})
+		g.Go(func() error {
+			return readScopedAppMetadata(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone, pvcInfoDone)
+		})
 	}
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)
@@ -436,16 +470,18 @@ func readTopology(
 // stays in the list so that exclusion is pinned through Reaches rather than
 // through an omission.
 //
-// An OPTIONAL family (Family.Optional — today only FamilyAlerts) is excluded
+// An OPTIONAL family (Family.Optional — FamilyAlerts and FamilyAppMeta) is excluded
 // on a DIFFERENT axis, and it needs its own rule because Reaches cannot
 // express it: ALERTS does carry az / env / namespace, so Reaches is true for
 // exactly the dimensions this Warn tests. What makes it wrong to report is
 // that an empty alert vector is the HEALTHY estate — the normal, desired
 // outcome — not evidence of a labelling mistake. The family is also the one a
 // table may legitimately leave unserved, in which case the router hands back
-// an empty vector by design. QAlerts stays in the candidate list for the same
-// reason QVolumeLabels does: the exclusion is enforced by an explicit rule
-// rather than by omission from a list.
+// an empty vector by design. QAlerts and QAppMetadata stay in the candidate
+// list for the same reason QVolumeLabels does: the exclusion is enforced by
+// an explicit rule rather than by omission from a list. An unset metric
+// leaves QAppMetadata out of the tally, so the present-and-zero check never
+// sees it.
 //
 // It is a Warn, not an error, and stays quiet for every unfiltered build.
 func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys promql.LabelKeys, raw map[string]int) {
@@ -455,7 +491,7 @@ func warnSelectorFamilyEmpty(ctx context.Context, sel promql.Selector, keys prom
 	var empty []string
 	for _, q := range []promql.Query{
 		promql.QKubeletVolumeUsedBytes, promql.QKubeletVolumeCapacityBytes, promql.QVolumeLabels,
-		promql.QAlerts,
+		promql.QAlerts, promql.QAppMetadata,
 	} {
 		if fam, ok := promql.FamilyOf(q); ok && fam.Optional() {
 			continue
