@@ -138,15 +138,16 @@ backends:
 	assert.Equal(t, []string{"vmalert-a"},
 		backendNamesOf(tbl.Select(promql.FamilyAlerts, []string{"zone-a"})),
 		"the alerts family is zone-routed like ksm")
-	assert.Empty(t, tbl.Unserved())
+	assert.Equal(t, []promql.Family{promql.FamilyAppMeta}, tbl.Unserved(),
+		"serving alerts leaves only the unlisted appmeta family unserved")
 }
 
 // A file written before the alert overlay existed must keep loading: the
-// five required families are covered and alerts is served by nobody.
+// five required families are covered and both optional families are unserved.
 func TestParse_PreOverlayFileStillLoads(t *testing.T) {
 	tbl, err := Parse([]byte(yamlTable), noEnv())
 	require.NoError(t, err)
-	assert.Equal(t, []promql.Family{promql.FamilyAlerts}, tbl.Unserved())
+	assert.Equal(t, []promql.Family{promql.FamilyAlerts, promql.FamilyAppMeta}, tbl.Unserved())
 	assert.Empty(t, tbl.Select(promql.FamilyAlerts, nil))
 }
 

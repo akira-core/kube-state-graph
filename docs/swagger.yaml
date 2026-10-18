@@ -137,6 +137,12 @@ components:
             $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Container'
           type: array
           uniqueItems: false
+        deployed_by:
+          description: |-
+            DeployedBy is set only on a synthesised application group, from the
+            application-metadata metric. Omitted on every other node and when the
+            metric did not resolve a deployer.
+          type: string
         hardware:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.HardwareDTO'
         health:
@@ -153,6 +159,12 @@ components:
             type: string
           type: object
         name:
+          type: string
+        namespace_owner:
+          description: |-
+            NamespaceOwner is set only on a synthesised namespace group, from the
+            application-metadata metric. Omitted on every other node and when the
+            metric did not resolve an owner.
           type: string
         owner:
           $ref: '#/components/schemas/github_com_akira-core_kube-state-graph_pkg_graph.Owner'
@@ -345,6 +357,8 @@ paths:
         **Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 
         **Node types**: `pod`, `node`, `pvc`, `service`, `external`, `netapp-aggr`, `netapp-node`, plus the presentation-only `cluster`, `storage-cluster`, `namespace`, `application` and `controller` compound group nodes synthesised by the Cytoscape serialiser (`cluster > namespace > application > controller > pod`, with absent levels skipped; `cluster > namespace > [application >] {service, pvc}`; `cluster > node`; `storage-cluster > netapp-node > netapp-aggr`, where the real `netapp-node` is the compound parent of its aggregates). **Edge types**: `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`, `pod-to-node`, `pvc-to-netapp-aggr`. An ingress entry-point `service` node additionally carries `labels.role` — `ingress-gateway` (a routed hit's chain entry; gateway pods and a synthesized `pod-calls-service` hop to the backend exist behind it) or `ingress-lb` (the ingress LB fallback destination; no routed backend). The key is absent on every other service node.
+
+        **Group metadata** (`namespace_owner`, `deployed_by`): omitempty strings, never inside `labels` (which stay `{}` on every compound group). `namespace_owner` appears only on a synthesised `namespace` group; `deployed_by` only on a synthesised `application` group. Both come from the optional application-metadata metric and are omitted when it is unset or did not resolve a value, so a deployment without the metric keeps the previous body shape. No pod, service, PVC, node, external or NetApp node carries either field.
 
         **Edge `data.metrics`**: a union of two disjoint families. RED (trace-derived call edges): `rate` (req/s, required within the family), `error_rate`, `p90_server_ms`. I/O (`pvc-to-netapp-aggr` edges): `read_ops`, `write_ops`, `read_latency_us`, `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec` from Harvest, verbatim. Schema-level every field is optional (rate moved off `required`); a RED object always carries a positive `rate`. All values are JSON numbers rounded to 6 significant digits and MAY appear in exponent form. The key is omitted entirely when the edge has no measurements.
 

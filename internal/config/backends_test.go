@@ -99,8 +99,9 @@ func TestSingleBackendTable_DelegatesToPromQL(t *testing.T) {
 	assert.Equal(t, DefaultBackendName, b.Name())
 	assert.Equal(t, promql.DefaultBackendName, DefaultBackendName)
 	assert.Equal(t, "http://vm.example:8428", b.URL())
-	assert.Len(t, b.Families(), 6,
-		"the implicit backend serves every family — the five required plus the optional alerts")
+	assert.Len(t, b.Families(), 7,
+		"the implicit backend serves every family — the five required plus the optional alerts and appmeta")
+	assert.Contains(t, b.Families(), promql.FamilyAppMeta)
 	assert.Contains(t, b.Families(), promql.FamilyAlerts,
 		"a deployment with no routing file gets the alert overlay for free")
 	assert.Empty(t, b.Zones(), "the implicit backend is a catch-all")

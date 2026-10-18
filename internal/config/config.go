@@ -73,6 +73,15 @@ type Config struct {
 	// and required to differ.
 	AZLabel  string
 	EnvLabel string
+	// AppMetadataMetric names the per-pod application-metadata series
+	// (--app-metadata-metric / KSG_APP_METADATA_METRIC). Empty disables the
+	// feature: no query is issued.
+	AppMetadataMetric string
+	// AppMetadataLabels is a comma-separated field=label list overriding any
+	// subset of the five default bindings (--app-metadata-labels /
+	// KSG_APP_METADATA_LABELS). Empty keeps every default. It is an error
+	// without AppMetadataMetric.
+	AppMetadataLabels string
 	// NetAppVolumeKeyRewrite is the ordered list of `<pattern>=<replacement>`
 	// rewrite rules deriving the Harvest match token from a PVC's bound
 	// PersistentVolume name (--netapp-volume-key-rewrite, repeatable;
@@ -186,6 +195,8 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.DurationVar(&cfg.BackendsReloadInterval, "backends-reload-interval", cfg.BackendsReloadInterval, "How often to re-read --backends-file. Set to 0 to disable hot reload.")
 	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
+	fs.StringVar(&cfg.AppMetadataMetric, "app-metadata-metric", cfg.AppMetadataMetric, "Per-pod application-metadata metric. Empty disables the feature.")
+	fs.StringVar(&cfg.AppMetadataLabels, "app-metadata-labels", cfg.AppMetadataLabels, "Comma-separated field=label overrides for the application-metadata metric. Fields: app, user, ns_owner, namespace, pod. Omitted fields keep their defaults.")
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
@@ -261,6 +272,8 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	getStr("KSG_LOG_LEVEL", &cfg.LogLevel)
 	getStr("KSG_AZ_LABEL", &cfg.AZLabel)
 	getStr("KSG_ENV_LABEL", &cfg.EnvLabel)
+	getStr("KSG_APP_METADATA_METRIC", &cfg.AppMetadataMetric)
+	getStr("KSG_APP_METADATA_LABELS", &cfg.AppMetadataLabels)
 	// Semicolon-separated, not comma-separated: a regular expression may
 	// legitimately contain a comma (`a{2,3}`) but a semicolon is far rarer, and
 	// the flag form exists for anything the separator cannot express.
@@ -392,11 +405,88 @@ func (c Config) Validate() error {
 			"netapp-qos-scope-batch-bytes (KSG_NETAPP_QOS_SCOPE_BATCH_BYTES) must be > 0, got %d",
 			c.NetAppQoSScopeBatchBytes)
 	}
+	if _, err := c.AppMetadata(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // labelNameRE is the PromQL label-name grammar.
 var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// metricNameRE is the Prometheus metric-name grammar, the same pattern
+// pkg/promql uses for LabelQuery. A colon is legal in a metric name and
+// illegal in a label name.
+var metricNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
+
+// appMetadataDefaults are the five field=label bindings an operator keeps
+// by omitting them from --app-metadata-labels.
+var appMetadataDefaults = []struct{ field, label string }{
+	{"app", promql.DefaultAppMetadataAppLabel},
+	{"user", promql.DefaultAppMetadataUserLabel},
+	{"ns_owner", promql.DefaultAppMetadataNSOwnerLabel},
+	{"namespace", promql.DefaultAppMetadataNamespaceLabel},
+	{"pod", promql.DefaultAppMetadataPodLabel},
+}
+
+// AppMetadata resolves the application-metadata source. A nil source with a
+// nil error means the feature is off. Parsing lives here: an embedder
+// constructs promql.AppMetadataSource directly and never reads these flags.
+func (c Config) AppMetadata() (*promql.AppMetadataSource, error) {
+	if c.AppMetadataMetric == "" {
+		if strings.TrimSpace(c.AppMetadataLabels) != "" {
+			return nil, errors.New("app-metadata-labels (KSG_APP_METADATA_LABELS) requires app-metadata-metric (KSG_APP_METADATA_METRIC)")
+		}
+		return nil, nil
+	}
+	if !metricNameRE.MatchString(c.AppMetadataMetric) {
+		return nil, fmt.Errorf("app-metadata-metric (KSG_APP_METADATA_METRIC) is not a valid Prometheus metric name: %q", c.AppMetadataMetric)
+	}
+	labels := make(map[string]string, len(appMetadataDefaults))
+	for _, d := range appMetadataDefaults {
+		labels[d.field] = d.label
+	}
+	if strings.TrimSpace(c.AppMetadataLabels) != "" {
+		seen := make(map[string]struct{}, len(appMetadataDefaults))
+		for _, part := range strings.Split(c.AppMetadataLabels, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				return nil, errors.New("app-metadata-labels: empty entry")
+			}
+			field, label, ok := strings.Cut(part, "=")
+			field = strings.TrimSpace(field)
+			label = strings.TrimSpace(label)
+			if !ok || field == "" {
+				return nil, fmt.Errorf("app-metadata-labels: entry %q has no field=label separator", part)
+			}
+			if _, known := labels[field]; !known {
+				return nil, fmt.Errorf("app-metadata-labels: unknown field %q", field)
+			}
+			if _, dup := seen[field]; dup {
+				return nil, fmt.Errorf("app-metadata-labels: field %q is repeated", field)
+			}
+			seen[field] = struct{}{}
+			labels[field] = label
+		}
+	}
+	for _, d := range appMetadataDefaults {
+		if labels[d.field] == "" {
+			return nil, fmt.Errorf("app-metadata-labels: field %q has an empty label", d.field)
+		}
+	}
+	src := &promql.AppMetadataSource{
+		Metric:    c.AppMetadataMetric,
+		App:       labels["app"],
+		User:      labels["user"],
+		NSOwner:   labels["ns_owner"],
+		Namespace: labels["namespace"],
+		Pod:       labels["pod"],
+	}
+	if err := src.Validate(promql.LabelKeys{AZ: c.AZLabel, Env: c.EnvLabel}); err != nil {
+		return nil, fmt.Errorf("app-metadata-labels: %w", err)
+	}
+	return src, nil
+}
 
 // volumeKeyRewriteFlag collects repeated --netapp-volume-key-rewrite values in
 // declaration order. The FIRST occurrence discards the default (nil) rather

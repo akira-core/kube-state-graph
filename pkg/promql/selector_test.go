@@ -345,6 +345,12 @@ func TestRender_EmptySelectorMatchesBaseline(t *testing.T) {
 
 	got := map[Query]string{}
 	for q := range queryDims {
+		if q == QAppMetadata {
+			// A logical name: the issued query names the configured metric and
+			// is pinned by the RenderAppMetadata tests, so Render returns "".
+			assert.Empty(t, Render(q, 5*time.Minute, LabelKeys{}, Selector{}))
+			continue
+		}
 		got[q] = Render(q, 5*time.Minute, LabelKeys{}, Selector{})
 	}
 	assert.Equal(t, want, got,

@@ -45,7 +45,7 @@ func TestClaimSeed_PlanShape(t *testing.T) {
 	for name, p := range map[string]topologyPlan{"pvc": pvc, "pv": pv} {
 		t.Run(name, func(t *testing.T) {
 			assert.True(t, p.issuesFirstWave(promql.QAlerts))
-			for _, l := range topologyLegs(&topologyVectors{}) {
+			for _, l := range topologyLegs(&topologyVectors{}, nil) {
 				if l.query != promql.QAlerts {
 					assert.False(t, p.issuesFirstWave(l.query), "%s is not a first-wave leg", l.query)
 				}

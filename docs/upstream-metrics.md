@@ -4,16 +4,20 @@ This is the operator catalog of every PromQL series `kube-state-graph` reads
 from VictoriaMetrics when it builds a `/v1/graph` response.
 
 The upstream is **one or more** installations. Each series below belongs to one
-query family (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`, `alerts`), and a
-routing table decides which installation answers it — see
+query family (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe`, `alerts`,
+`appmeta`), and a routing table decides which installation answers it — see
 [`upstream-backend-routing.md`](upstream-backend-routing.md). With no routing
 table configured every family is served by the single `--prom-url` endpoint and
-the queries below are issued exactly as written.
+the queries below are issued exactly as written. `alerts` and `appmeta` are
+optional: a table that lists neither is valid.
 
 The names are the `Query` constants in `pkg/promql/queries.go`. There is **no
 configurable metric-name prefix**: every series is queried at its **bare**
 name. A scrape path that publishes `kube_*` (or Harvest) under an organisational
-prefix silently yields an empty graph — see [`BREAKING.md`](BREAKING.md).
+prefix silently yields an empty graph — see [`BREAKING.md`](BREAKING.md). The
+one scoped exception is the application-metadata metric: its name comes from
+`--app-metadata-metric` / `KSG_APP_METADATA_METRIC`, and an unset name issues
+no query. See [Application metadata](#application-metadata).
 
 Install-side companions:
 
@@ -34,6 +38,8 @@ Install-side companions:
 | probe | 1 | Prometheus `up` |
 
 `up` is a diagnostic, not graph data. The other 46 series are the graph inputs.
+The application-metadata metric is **not** in this inventory: its name is
+operator-configured, and it is absent unless that name is set.
 
 ## Fan-out per `/v1/graph` request
 
@@ -65,6 +71,12 @@ GET /v1/graph?start=&end=&…
               mistyped filter would otherwise scan the whole estate)
 ```
 
+When `--app-metadata-metric` is set, `ReadTopology` adds one optional
+`app_metadata` query (log-and-continue). Unset, that query is not issued and
+the counts above are unchanged. A query error falls back to the
+controller-annotation Application and emits no `namespace_owner` or
+`deployed_by`. See [Application metadata](#application-metadata).
+
 v1 has no result cache: this fan-out runs on every request.
 
 ### Wrappers
@@ -73,6 +85,7 @@ v1 has no result cache: this fan-out runs on every request.
 |---|---|
 | kube-state-metrics, Harvest, kubelet | `last_over_time(<metric>[<window>])` evaluated at `end` |
 | `kube_pod_container_info` only | `tlast_over_time(...)` so each per-image series carries its last-sample timestamp |
+| application metadata (`app_metadata`) | `tlast_over_time(<configured metric>{…}[<window>])`. The logical query name stays `app_metadata`; the configured metric name is never a self-metric label |
 | `traces_service_graph_*` | `rate(<metric>[<window>])` evaluated at `end` |
 | `up` | bare `up` (no window) |
 
@@ -386,6 +399,7 @@ hardcoded (`pkg/promql/queryDims`):
 | NetApp Harvest | routes only — no matcher | no | **no** (Harvest `cluster` is the **ONTAP** cluster name) | no |
 | `ALERTS` | yes (also routes) | yes | **no** — an alert expression does not reliably keep `cluster`; matching uses the label through the identity ladder when present, else unique-in-estate | yes |
 | `traces_service_graph_*`, `up` | no | no | no | no |
+| application metadata | yes (also routes to `appmeta`) | yes | yes (`cluster` is the fixed label `cluster`; `unknown` renders `cluster=~"unknown\|"`) | yes, on the **configured** namespace label (default `namespace`), not a hardcoded key |
 
 `az` / `env` match `--az-label` / `--env-label` (defaults `az` / `env`). Every
 topology family that a live dimension actually reaches must carry those labels;
@@ -630,6 +644,50 @@ carry one of `normal`, `warning`, or `critical`. `normal` means only **no
 negative signal was observed**; it is not proof that the `alerts` family or
 every optional health series was available. Services, externals, SVMs, and
 synthesised compound groups carry no `status` key.
+
+## Application metadata
+
+Optional, and absent from the 47-series inventory. Issued only when
+`--app-metadata-metric` / `KSG_APP_METADATA_METRIC` names it. The series is one
+row per pod. Routing family `appmeta`: a table that serves it on no backend is
+valid; startup then logs one Warn naming `appmeta` and every build behaves as
+if the metric were unset. Self-metrics, spans and the tally name the query
+`app_metadata`, never the configured metric name.
+
+`--app-metadata-labels` / `KSG_APP_METADATA_LABELS` is a comma-separated
+`field=label` list. A field it omits keeps its default. The labels setting
+without the metric setting is a startup error. `cluster` is not a field: it is
+always the label `cluster`. Availability zone and environment use
+`--az-label` / `--env-label`, the same keys as kube-state-metrics, so a row
+composes the same `<az>-<env>-<cluster>` identity as the pod it decorates.
+
+Operator precondition: every row MUST carry the same `az` / `env` labels as the
+kube-state-metrics series of its pod. A row without them is not rejected, but
+it is matched inconsistently. Any `?az=` / `?env=` filter, every
+`/v1/storage-graph` build (which always carries both) and the on-demand
+`ResolvePodApplication` lookup (which pins the zone from `kube_pod_owner`)
+render the zone matchers, so the row is not read and the pod falls back to its
+controller chain. An unfiltered `/v1/graph` reads it and may still attach it,
+through the cluster ladder's adopt step, when the raw `cluster` name maps to
+exactly one identity in that build. The same pod can therefore show the
+metric's Application on one request and the controller chain's on another.
+
+| Field | Default label | Pick |
+|---|---|---|
+| `app` | `argocd_app` | Lexically-smallest non-empty value per `(cluster, namespace, pod)`. An empty `app` or an empty `pod` does not contribute. The value is used verbatim — it is not split on `:`. When non-empty it wins over that pod's controller-annotation Application; a pod with no row keeps the controller chain. |
+| `ns_owner` | `owner` | Latest-seen non-empty value per `(cluster, namespace)`; the lexically-smallest value breaks an exact timestamp tie. A row with an empty `pod` still contributes. Surfaces as `namespace_owner` on the synthesised namespace group. |
+| `user` | `user` | Latest-seen non-empty value per `(cluster, namespace, the row's own app)`; lexical tie-break as above. An empty `app` or an empty `user` does not contribute. Surfaces as `deployed_by` on the synthesised application group, keyed by that group's Application whatever resolved it. |
+| `namespace` | `namespace` | The pod's namespace. `?namespace=` is rendered on this label. |
+| `pod` | `pod` | The pod's name. |
+
+The sample value is the last-seen timestamp (`tlast_over_time`) and is read
+only for the latest-seen picks. On `/v1/graph` a query error is log-and-continue:
+Applications fall back to the controller chain and no group carries
+`namespace_owner` or `deployed_by`. On `/v1/storage-graph` the same query is
+fail-closed and is restricted, per cluster, to the namespaces the loaded pods and
+claims carry in that cluster.
+An `application=` root also seeds pods from rows whose `app` label names a
+requested Application.
 
 ## Probe (1)
 

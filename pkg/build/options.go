@@ -37,6 +37,12 @@ type Options struct {
 	// build, where the only honest options would be a silent fallback to a
 	// different estate's naming or a panic.
 	VolumeKey *VolumeKeyRewriter
+	// AppMetadata is the operator-named per-pod application-metadata metric.
+	// Nil (the default) disables the feature: no application-metadata query
+	// is issued, and every response body stays byte-identical to a build
+	// without the capability. An empty label field reads its default
+	// (promql.AppMetadataSource.OrDefault); the value is not validated here.
+	AppMetadata *promql.AppMetadataSource
 	// QoSScopeBatchBytes bounds every data-derived alternation one query
 	// carries — the scoped QoS workload read's `volume`, the storage
 	// build's `pod`, `node` and controller-name (ReplicaSet / Job /
@@ -47,4 +53,14 @@ type Options struct {
 	// upstream's query-length limit. Zero (the default) means
 	// DefaultQoSScopeBatchBytes.
 	QoSScopeBatchBytes int
+}
+
+// withAppMetadataDefaults returns opts with every empty application-metadata
+// label set to its default. The caller's source is copied, never mutated.
+func (o Options) withAppMetadataDefaults() Options {
+	if o.AppMetadata != nil {
+		src := o.AppMetadata.OrDefault()
+		o.AppMetadata = &src
+	}
+	return o
 }

@@ -41,6 +41,10 @@ type Options struct {
 	// LabelKeys names the upstream labels the request's `az` / `env` filter
 	// dimensions are matched against. Zero value ⇒ the defaults (`az`, `env`).
 	LabelKeys promql.LabelKeys
+	// AppMetadata mirrors build.Options.AppMetadata. Nil (the default)
+	// disables the application-metadata metric: no query is issued and every
+	// body stays byte-identical to a build without it.
+	AppMetadata *promql.AppMetadataSource
 
 	// The four knobs below follow one convention: zero ⇒ the exported default
 	// (so an embedder writing no option gets what the server runs with),
@@ -102,6 +106,7 @@ func New(q promql.Querier, opts Options) *Engine {
 		RouteResolver:       opts.RouteResolver,
 		RouteResolveTimeout: opts.RouteResolveTimeout,
 		LabelKeys:           opts.LabelKeys,
+		AppMetadata:         opts.AppMetadata,
 	}, opts.Metrics, clk)
 	return &Engine{builder: b, q: q, clk: clk, endAlign: resolveDuration(opts.EndAlign, DefaultEndAlign)}
 }

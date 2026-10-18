@@ -184,6 +184,10 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// matcher selected on. Nil for an unstamped estate, which degrades the
 	// lookup to the pre-identity comparison.
 	g.ClusterIdentities = topology.ClusterIdentities
+	// Group metadata is not a node attribute. Nil when the metric is unset or
+	// its vector was not read; cytoscape omits the fields in that case.
+	g.NamespaceOwners = topology.NamespaceOwners
+	g.ApplicationDeployers = topology.ApplicationDeployers
 
 	// Cross-cluster status is derived from the resolved endpoint nodes'
 	// `cluster` labels, since edges only carry the trace-source cluster
@@ -317,6 +321,8 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 	attachStatus(nodes)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	g.ClusterIdentities = topology.ClusterIdentities
+	g.NamespaceOwners = topology.NamespaceOwners
+	g.ApplicationDeployers = topology.ApplicationDeployers
 
 	leg, legSeries := largestLeg(topology.RawSeriesCount)
 	slog.InfoContext(ctx, "storage graph built",
@@ -345,8 +351,15 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 // server/upstream fault: it is recorded as a span event but does not set the
 // span Error status, and downstream maps to a 4xx rather than a 5xx so it does
 // not pollute error-rate metrics/traces. DeadlineExceeded (build timeout) and
-// any other upstream error are genuine failures and mark the span Error.
+// any other upstream error are genuine failures and mark the span Error. An
+// invalid_scope rejection raised inside the read (a cap that needs the bound
+// querier, such as the application-metadata seed's) is the caller's fault and
+// passes through unchanged rather than becoming an upstream failure.
 func classifyReadError(span trace.Span, what string, err error) error {
+	if be, ok := errors.AsType[*Error](err); ok && be.Reason == ReasonInvalidScope {
+		span.RecordError(err)
+		return err
+	}
 	if errors.Is(err, context.Canceled) {
 		span.RecordError(err)
 		return NewError(ReasonCanceled, "request canceled", err)

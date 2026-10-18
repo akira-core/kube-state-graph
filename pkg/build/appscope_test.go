@@ -123,6 +123,20 @@ func TestTallySeries_AddsExtraSeries(t *testing.T) {
 	assert.NotContains(t, tallySeries(nil, topologyPlan{}, &topologyVectors{}), "kube_deployment_annotations")
 }
 
+// The application-metadata seed lands in a local vector and is recorded as
+// extra. The leg's own slot is the namespace read. The tally is their sum.
+func TestTallySeries_AppMetadataSeedAddsToTheNamespaceRead(t *testing.T) {
+	src := defaultAppMetadata()
+	v := &topologyVectors{
+		AppMetadata:      model.Vector{&model.Sample{}, &model.Sample{}},
+		ScopeIssued:      map[promql.Query]bool{promql.QAppMetadata: true},
+		ExtraSeriesCount: map[promql.Query]int{promql.QAppMetadata: 3},
+	}
+	plan := storagePlan(graph.StorageRoots{Kind: graph.StorageRootApplication, Names: []string{"checkout"}})
+	got := tallySeries(topologyLegs(v, &src), plan, v)
+	assert.Equal(t, 5, got[string(promql.QAppMetadata)])
+}
+
 func TestReadScopedApplications_DeploymentManagedClaimlessPod(t *testing.T) {
 	f := promqlfake.New(map[promql.Query]model.Vector{
 		promql.QDeploymentAnnotations: {
@@ -450,4 +464,243 @@ func TestReadScopedPods_UnrelatedBindingPodsNotRead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, [][]string{{"orders-0"}}, f.ScopeValues(promql.QPodInfo, "pod"))
 	assert.Equal(t, [][]string{{"orders-0"}}, f.ScopeValues(promql.QPodOwner, "pod"))
+}
+
+// canaryAppEstate is a Rollout pod the controller-annotation chain cannot
+// name: no tracking-id carries canary-app. The metric row is the only seed.
+func canaryAppEstate() map[promql.Query]model.Vector {
+	fx := map[promql.Query]model.Vector{
+		promql.QAppMetadata: {
+			appMetaRow("shop", "canary-0", "canary-app", "team-c", "carol"),
+		},
+		promql.QPodInfo: {
+			planKSM("namespace", "shop", "pod", "canary-0", "uid", "uid-canary", "node", "worker-1"),
+		},
+		promql.QPodOwner: {
+			planKSM("namespace", "shop", "pod", "canary-0", "owner_kind", "Rollout", "owner_name", "canary", "owner_is_controller", "true"),
+		},
+		promql.QPVCBindings: {
+			planKSM("namespace", "shop", "pod", "canary-0", "persistentvolumeclaim", "canary-data"),
+		},
+		promql.QPVCInfo: {
+			claimInfoRow("shop", "canary-data", "pvc-canary"),
+		},
+		promql.QNodeInfo: {planKSM("node", "worker-1")},
+	}
+	for q, rows := range vlrHarvest([]vlrVol{
+		{"pvc_canary", "ontap-prod", "ontap-prod-01", "aggr1", "svm_shop", 10},
+	}) {
+		fx[q] = rows
+	}
+	return fx
+}
+
+func appMetadataOpts() Options {
+	src := defaultAppMetadata()
+	return Options{AppMetadata: &src}
+}
+
+// Spec: "A pod named only by the metric is seeded and drawn".
+func TestApplicationSeed_MetricOnlyRolloutPod(t *testing.T) {
+	opts := appMetadataOpts()
+	names, _, err := recoverNames(t, promqlfake.New(canaryAppEstate()), opts, vlrSel, []string{"canary-app"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"canary-0"}, names)
+
+	scope := vlrScope(t, graph.StorageRootApplication, []string{"canary-app"})
+	q := promqlfake.New(canaryAppEstate())
+	g, err := New(q, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{{"canary-app"}}, q.ScopeValues(promql.QAppMetadata, "argocd_app"),
+		"the seed restricts the configured app label to the root")
+
+	const cluster = "zone-a-prod-c1"
+	body := cytoscape.Serialise(g, graph.ProjectStorage(g, scope))
+	var pod *cytoscape.NodeData
+	for i := range body.Elements.Nodes {
+		if body.Elements.Nodes[i].Data.ID == cluster+"/uid-canary" {
+			pod = &body.Elements.Nodes[i].Data
+		}
+	}
+	require.NotNil(t, pod, "the metric-only pod is drawn")
+	assert.Equal(t, "canary-app", pod.Application)
+	require.NotNil(t, pod.Owner)
+	assert.Equal(t, "Rollout", pod.Owner.Kind)
+	assert.Equal(t, "canary", pod.Owner.Name)
+
+	pvcID := cluster + "/shop/canary-data"
+	tiers := map[string]bool{}
+	var sawPVCPod bool
+	for _, e := range body.Elements.Edges {
+		tier := e.Data.Labels["tier"]
+		tiers[tier] = true
+		if tier == graph.StorageTierPVCPod && e.Data.Source == pvcID && e.Data.Target == pod.ID {
+			sawPVCPod = true
+		}
+	}
+	assert.True(t, sawPVCPod, "the claim is tracked onto the pod")
+	assert.True(t, tiers[graph.StorageTierNodeAggr], "the claim's storage path is drawn")
+	assert.True(t, tiers[graph.StorageTierSVMPVC])
+}
+
+// Spec: "A seeded pod whose resolved Application differs is dropped".
+func TestApplicationSeed_ResolvedApplicationDiffersIsDropped(t *testing.T) {
+	pod := model.Vector{planKSM("namespace", "shop", "pod", "web-0", "uid", "uid-w0", "node", "worker-1")}
+	// 200 is later than 100. The lexically smaller app is w, so a latest-wins
+	// pick would keep the pod and the two bodies would differ.
+	both := model.Vector{
+		appMetaSample(map[string]string{
+			"az": "zone-a", "env": "prod", "cluster": "c1",
+			"namespace": "shop", "pod": "web-0",
+			"argocd_app": "x", "owner": "team-a", "user": "alice",
+		}, 200),
+		appMetaSample(map[string]string{
+			"az": "zone-a", "env": "prod", "cluster": "c1",
+			"namespace": "shop", "pod": "web-0",
+			"argocd_app": "w", "owner": "team-a", "user": "alice",
+		}, 100),
+	}
+	onlyW := model.Vector{both[1]}
+	build := func(rows model.Vector) (cytoscape.Body, *promqlfake.Querier) {
+		t.Helper()
+		scope := vlrScope(t, graph.StorageRootApplication, []string{"x"})
+		q := promqlfake.New(map[promql.Query]model.Vector{
+			promql.QPodInfo:     pod,
+			promql.QAppMetadata: rows,
+		})
+		g, err := New(q, appMetadataOpts(), nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+		require.NoError(t, err)
+		return cytoscape.Serialise(g, graph.ProjectStorage(g, scope)), q
+	}
+	bodyBoth, qBoth := build(both)
+	bodyW, qW := build(onlyW)
+	assert.JSONEq(t, planBodyJSON(t, bodyW), planBodyJSON(t, bodyBoth))
+	assert.NotContains(t, planBodyJSON(t, bodyBoth), "web-0")
+	assert.NotContains(t, planBodyJSON(t, bodyBoth), "uid-w0")
+	assert.Contains(t, strings.Join(qBoth.QueriesFor(promql.QPodInfo), "\n"), "web-0", "the seed loads the pod")
+	assert.NotContains(t, strings.Join(qW.QueriesFor(promql.QPodInfo), "\n"), "web-0")
+}
+
+// Spec: "Unserved metric issues no seed".
+func TestApplicationSeed_UnservedIssuesNoSeed(t *testing.T) {
+	fx := map[promql.Query]model.Vector{
+		promql.QDeploymentAnnotations: {
+			planKSM("namespace", "shop", "deployment", "web", trackingLabel, "checkout:apps/Deployment:shop/web"),
+		},
+		promql.QReplicaSetOwner: {
+			planKSM("namespace", "shop", "replicaset", "web-7d9f", "owner_kind", "Deployment", "owner_name", "web"),
+		},
+		promql.QPodOwner: {
+			planKSM("namespace", "shop", "pod", "web-7d9f-abc", "owner_kind", "ReplicaSet", "owner_name", "web-7d9f", "owner_is_controller", "true"),
+		},
+		promql.QPodInfo: {
+			planKSM("namespace", "shop", "pod", "web-7d9f-abc", "uid", "uid-web", "node", "worker-1"),
+			planKSM("namespace", "shop", "pod", "canary-0", "uid", "uid-canary", "node", "worker-1"),
+		},
+		promql.QAppMetadata: {
+			appMetaRow("shop", "canary-0", "checkout", "team-c", "carol"),
+		},
+	}
+	scope := vlrScope(t, graph.StorageRootApplication, []string{"checkout"})
+	draw := func(q promql.Querier, opts Options) cytoscape.Body {
+		t.Helper()
+		g, err := New(q, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+		require.NoError(t, err)
+		return cytoscape.Serialise(g, graph.ProjectStorage(g, scope))
+	}
+	unsetQ := promqlfake.New(fx)
+	unsetBody := draw(unsetQ, Options{})
+	inner := promqlfake.New(fx)
+	unservedBody := draw(appMetaUnserved{inner}, appMetadataOpts())
+	assert.JSONEq(t, planBodyJSON(t, unsetBody), planBodyJSON(t, unservedBody))
+	assert.Empty(t, unsetQ.QueriesFor(promql.QAppMetadata))
+	assert.Empty(t, inner.QueriesFor(promql.QAppMetadata))
+	assert.Contains(t, planBodyJSON(t, unservedBody), "uid-web")
+	assert.NotContains(t, planBodyJSON(t, unservedBody), "uid-canary")
+}
+
+// Spec: "Stage 1, the claim-annotation read and the application-metadata seed
+// are request-derived" — a set the tracking-id cap accepts and the wider
+// app-label cap rejects is 400 before any query. An unserved family does not
+// count the metric chunks.
+func TestApplicationSeed_OversizedMetricRootSetRejected(t *testing.T) {
+	const budget = 38
+	apps := make([]string, maxApplicationRootChunks+1)
+	for i := range apps {
+		apps[i] = string(rune('a' + i))
+	}
+	src := defaultAppMetadata()
+	tracking := len(applicationRootChunks(apps, budget))
+	metric := len(appMetadataRootChunks(src, promql.LabelKeys{}, vlrSel, apps, budget))
+	require.LessOrEqual(t, tracking, maxApplicationRootChunks, "tracking chunks %d", tracking)
+	require.Greater(t, metric, maxApplicationRootChunks, "metric chunks %d", metric)
+
+	opts := Options{AppMetadata: &src, QoSScopeBatchBytes: budget}
+	scope := vlrScope(t, graph.StorageRootApplication, apps)
+
+	buildQ := promqlfake.New(nil)
+	_, err := New(buildQ, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, buildQ.Issued())
+
+	direct := promqlfake.New(nil)
+	_, err = readTopology(t.Context(), direct, time.Minute, vlrEnd, opts, vlrSel, storagePlan(scope.Roots))
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, direct.Issued())
+
+	inner := promqlfake.New(nil)
+	_, err = New(appMetaUnserved{inner}, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, scope.Roots)
+	require.NoError(t, err)
+	assert.Empty(t, inner.QueriesFor(promql.QAppMetadata))
+	assert.NotEmpty(t, inner.QueriesFor(promql.QDeploymentAnnotations), "annotation recovery still runs")
+}
+
+// Spec: "A request with another root kind issues no recovery" — the namespace
+// read may still run; the app-label seed must not.
+func TestApplicationSeed_OtherRootKindsIssueNoAppRestriction(t *testing.T) {
+	opts := appMetadataOpts()
+	t.Run("pvc", func(t *testing.T) {
+		q := promqlfake.New(appMetaClaimEstate())
+		_, err := New(q, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, appMetaClaimScope(t).Roots)
+		require.NoError(t, err)
+		got := q.QueriesFor(promql.QAppMetadata)
+		require.NotEmpty(t, got, "the namespace read still runs")
+		for _, query := range got {
+			assert.NotContains(t, query, "argocd_app=")
+		}
+	})
+	t.Run("aggr", func(t *testing.T) {
+		fx := claimSeedEstate()
+		fx[promql.QAppMetadata] = model.Vector{appMetaRow("shop", "orders-0", "shop-v2", "team-a", "alice")}
+		q := promqlfake.New(fx)
+		_, err := New(q, opts, nil, nil).BuildStorage(
+			t.Context(), time.Minute, vlrEnd, vlrSel, vlrScope(t, graph.StorageRootAggr, []string{"aggr1"}).Roots)
+		require.NoError(t, err)
+		got := q.QueriesFor(promql.QAppMetadata)
+		require.NotEmpty(t, got, "the namespace read still runs")
+		for _, query := range got {
+			assert.NotContains(t, query, "argocd_app=")
+		}
+	})
+}
+
+// Spec: "A chunk error SHALL fail the build" for the application-metadata seed.
+func TestApplicationSeed_ChunkErrorFailsClosed(t *testing.T) {
+	q := promqlfake.New(canaryAppEstate())
+	q.Fail = func(name, _ string) error {
+		if name == string(promql.QAppMetadata) {
+			return assert.AnError
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := New(q, appMetadataOpts(), nil, nil).BuildStorage(
+		ctx, time.Minute, vlrEnd, vlrSel, vlrScope(t, graph.StorageRootApplication, []string{"canary-app"}).Roots)
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the build returned on the chunk error instead of running into the deadline")
+	be, ok := errors.AsType[*Error](err)
+	require.True(t, ok)
+	assert.Equal(t, ReasonUpstream, be.Reason)
+	assert.Equal(t, string(promql.QAppMetadata), be.Query)
 }

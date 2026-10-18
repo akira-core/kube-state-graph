@@ -28,6 +28,31 @@ type Graph struct {
 	// degrades every value to itself and the request-scoped `cluster` filter
 	// compares raw labels exactly as it did before.
 	ClusterIdentities map[string]ClusterIdentity
+
+	// NamespaceOwners maps a namespace, inside a cluster identity, to the
+	// owner the application-metadata metric resolved. ApplicationDeployers
+	// maps an Application in that namespace to the deployer the same metric
+	// resolved, keyed by the row's own app label. Both are set by the builder
+	// after NewGraph. Nil — a hand-built graph, or a build whose metric was
+	// unset or not read — emits neither group field.
+	NamespaceOwners      map[NamespaceRef]string
+	ApplicationDeployers map[ApplicationRef]string
+}
+
+// NamespaceRef names one namespace inside a cluster identity. It is the key
+// of Graph.NamespaceOwners, matched against a synthesised namespace group.
+type NamespaceRef struct {
+	Cluster   string
+	Namespace string
+}
+
+// ApplicationRef names one Application inside a namespace. It is the key of
+// Graph.ApplicationDeployers, matched against a synthesised application group.
+// Application is the metric's app value verbatim, not a tracking-id parse.
+type ApplicationRef struct {
+	Cluster     string
+	Namespace   string
+	Application string
 }
 
 // ClusterIdentity holds the three components of a composed cluster identity.

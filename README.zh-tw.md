@@ -181,6 +181,8 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 | `--log-level` | `KSG_LOG_LEVEL` | `info` | `debug \| info \| warn \| error`。 |
 | `--az-label` | `KSG_AZ_LABEL` | `az` | `?az=` 參數比對的上游 label。請求參數名稱固定不變，只有 label 綁定會改；必須是合法 PromQL label name 且與 `--env-label` 不同。 |
 | `--env-label` | `KSG_ENV_LABEL` | `env` | `?env=` 參數比對的上游 label。 |
+| `--app-metadata-metric` | `KSG_APP_METADATA_METRIC` | （空） | 選用的 per-pod application-metadata 指標名稱（routing family `appmeta`）。空白代表關閉：不發出查詢，回應內容與未啟用時逐 byte 相同。已設定指標但沒有 backend 服務 `appmeta` 時，啟動會記一則 Warn，行為與未設定相同。 |
+| `--app-metadata-labels` | `KSG_APP_METADATA_LABELS` | （空） | 逗號分隔的 `field=label` 覆寫。欄位：`app`（預設 `argocd_app`）、`user`（`user`）、`ns_owner`（`owner`）、`namespace`（`namespace`）、`pod`（`pod`）。省略的欄位保留預設。必須同時設定 `--app-metadata-metric`。`cluster` 固定讀 label `cluster`；az/env 沿用 `--az-label` / `--env-label`。 |
 
 ## 文件
 

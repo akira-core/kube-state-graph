@@ -19,7 +19,7 @@ import (
 func TestTopologyPlan_FailsClosed(t *testing.T) {
 	storage := storagePlan(graph.StorageRoots{})
 	var v topologyVectors
-	for _, l := range topologyLegs(&v) {
+	for _, l := range topologyLegs(&v, nil) {
 		assert.False(t, fullPlan.failsClosed(l.query), "fullPlan keeps %s's own class", l.query)
 		assert.Equal(t, l.query != promql.QAlerts, storage.failsClosed(l.query), "storagePlan / %s", l.query)
 	}

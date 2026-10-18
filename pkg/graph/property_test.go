@@ -442,6 +442,8 @@ func shuffleStorageGraph(r *rand.Rand, g *Graph) *Graph {
 	r.Shuffle(len(edges), func(i, j int) { edges[i], edges[j] = edges[j], edges[i] })
 	out := NewGraph(nodes, edges, g.BuiltAt)
 	out.ClusterIdentities = g.ClusterIdentities
+	out.NamespaceOwners = g.NamespaceOwners
+	out.ApplicationDeployers = g.ApplicationDeployers
 	return out
 }
 

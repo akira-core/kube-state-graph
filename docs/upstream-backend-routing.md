@@ -16,9 +16,11 @@ point of a cross-cluster graph.
 
 > **Configuring nothing keeps today's behaviour.** With no routing file, an
 > implicit backend named `default` at `--prom-url` serves every family (the five
-> required plus optional `alerts`), every
-> rendered query string is unchanged, and every response body is byte-identical
-> to a deployment from before routing existed.
+> required plus optional `alerts` and `appmeta`). No application-metadata query
+> is issued unless its metric is configured. Every other rendered query string
+> is unchanged, and every response body is byte-identical to a deployment from
+> before routing existed when the store holds no `ALERTS` series and the metric
+> is unset.
 
 ## Configuration
 
@@ -56,19 +58,27 @@ backends:
   - name: netapp
     url: http://vmselect-netapp.monitoring.svc:8481/select/0/prometheus
     families: [harvest]
+
+  - name: appmeta-a
+    url: http://vmselect-appmeta.monitoring.svc:8481/select/0/prometheus
+    families: [appmeta]
+    zones: [zone-a]
 ```
+
+A table that never lists `appmeta` is valid. The application-metadata feature
+stays off: no query is issued, exactly as when the metric name is unset.
 
 | Field | Required | Meaning |
 |---|---|---|
 | `name` | yes | Unique identity. Appears in logs, in `kube_state_graph_backend_query_failures_total{backend=…}`, on query spans, and in the `/readyz` failure body. It is also the **merge order key** — see [Fan-out and merge](#fan-out-and-merge). |
 | `url` | yes | Query endpoint. Must parse as an absolute `http` or `https` URL. |
-| `families` | yes | Non-empty subset of the six families below. `alerts` is optional: a table that serves it on no backend is valid. |
+| `families` | yes | Non-empty subset of the seven families below. `alerts` and `appmeta` are optional: a table that serves either on no backend is valid. Unserved `appmeta` leaves the feature off. |
 | `zones` | no | The `az` values this backend holds. **Omitted or empty means every zone** — a catch-all. |
 | `usernameEnv` / `passwordEnv` | no | **Names** of environment variables holding this backend's basic-auth pair. |
 
 A table is rejected when it is empty, declares a duplicate `name`, declares an
 unparseable or non-HTTP(S) `url`, declares an unknown or empty `families` set,
-declares an empty zone string, **or leaves any required family served by no backend** (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe` — `alerts` may be left unserved). An
+declares an empty zone string, **or leaves any required family served by no backend** (`ksm`, `kubelet`, `harvest`, `servicegraph`, `probe` — `alerts` and `appmeta` may be left unserved). An unserved `appmeta` family does not issue an application-metadata query. An
 unknown field is also rejected: a misspelled `zone:` for `zones:` would silently
 turn a zone-scoped backend into a catch-all.
 
@@ -85,6 +95,7 @@ Every query belongs to exactly one family. The mapping is hardcoded
 | `servicegraph` | the three `traces_service_graph_*` series | **no** |
 | `probe` | the `up{}` store-health probe | **no** |
 | `alerts` | the Prometheus / vmalert `ALERTS` series | yes (matcher AND route). **Optional**: a table serving it on no backend is valid — the overlay is simply off |
+| `appmeta` | the operator-named application-metadata metric, classified as the logical query `app_metadata` whatever metric name is configured. The issued PromQL is `tlast_over_time(<metric>{…}[w])`; `az` / `env` / `cluster` / `namespace` are matchers, and the namespace matcher uses the configured namespace label | yes (matcher AND route). **Optional**: a table serving it on no backend is valid — the feature stays off |
 
 `servicegraph` and `probe` carry no request-scoped matcher of any kind, so they
 are never narrowed by zone: a `?az=`-scoped request still reaches **every**
@@ -424,7 +435,7 @@ rather than a quiet fallback.
 
 1. Ship with no routing file. Verify `kube_state_graph_upstream_backends` is 1.
 2. Mount a **single**-entry file mirroring `--prom-url` (the five required
-   families plus optional `alerts`, no zones). This exercises the file path,
+   families plus optional `alerts` and `appmeta`, no zones). This exercises the file path,
    validation and reload loop with no change in routing outcome.
 3. Split `harvest` onto its own backend. Verify the storage chain still draws:
    `pvc-to-netapp-aggr` edges present, aggregate I/O populated.

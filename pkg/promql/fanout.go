@@ -131,6 +131,18 @@ type fanoutQuerier struct {
 	metrics Metrics
 }
 
+var _ FamilyServer = (*fanoutQuerier)(nil)
+
+// Serves reports whether the snapshot this build closed over has any backend
+// for fam. The bound querier is what a build holds, so the answer has to live
+// here and not only on *Router.
+func (f *fanoutQuerier) Serves(fam Family) bool {
+	if f == nil {
+		return false
+	}
+	return familyServed(f.table, fam)
+}
+
 // Instant resolves the query's family from the hardcoded classification
 // table, then dispatches through issue. An unclassified name fails here
 // rather than silently reaching no store — QueryLabels never takes this

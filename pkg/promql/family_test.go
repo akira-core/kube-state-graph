@@ -81,6 +81,8 @@ func TestQueryFamily_Membership(t *testing.T) {
 	assert.Equal(t, FamilyProbe, f)
 	f, _ = FamilyOf(QPodInfo)
 	assert.Equal(t, FamilyKSM, f)
+	f, _ = FamilyOf(QAppMetadata)
+	assert.Equal(t, FamilyAppMeta, f)
 }
 
 // TestFamilyOf_UnknownQuery pins that an unrecognised query reports not-found
@@ -115,6 +117,7 @@ func TestFamilyAcceptsAZ(t *testing.T) {
 	assert.True(t, FamilyKubelet.AcceptsAZ())
 	assert.True(t, FamilyHarvest.AcceptsAZ())
 	assert.True(t, FamilyAlerts.AcceptsAZ())
+	assert.True(t, FamilyAppMeta.AcceptsAZ())
 	assert.False(t, FamilyServiceGraph.AcceptsAZ())
 	assert.False(t, FamilyProbe.AcceptsAZ())
 	assert.False(t, Family("not-a-family").AcceptsAZ(), "an unknown family is never zone-routable")
@@ -127,6 +130,7 @@ func TestFamilyRendersAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.RendersAZ())
 	assert.True(t, FamilyKubelet.RendersAZ())
 	assert.True(t, FamilyAlerts.RendersAZ())
+	assert.True(t, FamilyAppMeta.RendersAZ())
 	assert.True(t, FamilyHarvest.AcceptsAZ(), "Harvest stays zone-routed")
 	assert.False(t, FamilyHarvest.RendersAZ(), "Harvest renders no az matcher")
 	assert.False(t, FamilyServiceGraph.RendersAZ())

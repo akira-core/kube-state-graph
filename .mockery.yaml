@@ -20,6 +20,7 @@ packages:
   github.com/akira-core/kube-state-graph/pkg/promql:
     interfaces:
       Querier:
+      FamilyServer:
   github.com/akira-core/kube-state-graph/pkg/build:
     interfaces:
       LabelQuerier:

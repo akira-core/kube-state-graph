@@ -24,6 +24,7 @@ func TestClassifyReadError_MapsByCause(t *testing.T) {
 		{"canceled", fmt.Errorf("fan-out: %w", context.Canceled), ReasonCanceled},
 		{"deadline", fmt.Errorf("fan-out: %w", context.DeadlineExceeded), ReasonTimeout},
 		{"upstream", errors.New("dial tcp: connection refused"), ReasonUpstream},
+		{"invalid scope passes through", NewError(ReasonInvalidScope, RootScopeCapMessage, nil), ReasonInvalidScope},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

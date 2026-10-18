@@ -2,6 +2,7 @@
 # One line per Query constant: <query-name>\t<rendered PromQL>, sorted by name.
 # A Query added after the capture is appended here at its unfiltered rendering:
 # the test compares the WHOLE queryDims map, so a new constant with no row fails.
+# app_metadata is the one exception: a logical name Render returns "" for.
 ALERTS	last_over_time(ALERTS{alertstate="firing"}[5m])
 aggr_new_status	last_over_time(aggr_new_status[5m])
 aggr_space_total	last_over_time(aggr_space_total[5m])

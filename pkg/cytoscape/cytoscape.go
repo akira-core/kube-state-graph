@@ -63,7 +63,15 @@ type NodeData struct {
 	Perf         *PerfDTO          `json:"perf,omitempty"`
 	Alerts       []AlertDTO        `json:"alerts,omitempty"`
 	Status       string            `json:"status,omitempty"`
-	Labels       map[string]string `json:"labels"`
+	// NamespaceOwner is set only on a synthesised namespace group, from the
+	// application-metadata metric. Omitted on every other node and when the
+	// metric did not resolve an owner.
+	NamespaceOwner string `json:"namespace_owner,omitempty"`
+	// DeployedBy is set only on a synthesised application group, from the
+	// application-metadata metric. Omitted on every other node and when the
+	// metric did not resolve a deployer.
+	DeployedBy string            `json:"deployed_by,omitempty"`
+	Labels     map[string]string `json:"labels"`
 }
 
 // HardwareDTO is the wire form of graph.Hardware. Every field is omitted when
@@ -341,7 +349,8 @@ type ctrlKey struct{ cluster, ns, app, kind, name string }
 // The view supplies the in-scope nodes and edges; the response `clusters` field
 // is derived from the clusters actually present in that view (see below).
 //
-//nolint:unparam // g is retained for the stable reusable-engine signature (D32); the response clusters now derive from the projected view, not the full graph.
+// Serialise looks namespace and application groups up in g's metadata maps.
+// A nil graph, or nil maps, leaves both fields omitted.
 func Serialise(g *graph.Graph, view graph.View) Body {
 	body := Body{
 		APIVersion: APIVersion,
@@ -419,15 +428,17 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		return cmp.Compare(namespaceParentID(a.cluster, a.ns), namespaceParentID(b.cluster, b.ns))
 	})
 	for _, k := range nsKeys {
-		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
-			namespaceParentID(k.cluster, k.ns), k.ns, nodeTypeNamespace, clusterParentID(k.cluster)))
+		n := groupNode(namespaceParentID(k.cluster, k.ns), k.ns, nodeTypeNamespace, clusterParentID(k.cluster))
+		n.Data.NamespaceOwner = namespaceOwner(g, k.cluster, k.ns)
+		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
 	appKeys := slices.SortedFunc(maps.Keys(appSeen), func(a, b appKey) int {
 		return cmp.Compare(applicationParentID(a.cluster, a.ns, a.app), applicationParentID(b.cluster, b.ns, b.app))
 	})
 	for _, k := range appKeys {
-		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
-			applicationParentID(k.cluster, k.ns, k.app), k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns)))
+		n := groupNode(applicationParentID(k.cluster, k.ns, k.app), k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns))
+		n.Data.DeployedBy = applicationDeployer(g, k.cluster, k.ns, k.app)
+		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
 	ctrlKeys := slices.SortedFunc(maps.Keys(ctrlSeen), func(a, b ctrlKey) int {
 		return cmp.Compare(
@@ -482,6 +493,25 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		})
 	}
 	return body
+}
+
+// namespaceOwner is the metric-resolved owner of one namespace group, or ""
+// when the graph has no table or no entry (a nil map reads as ""). "" is what
+// omitempty drops.
+func namespaceOwner(g *graph.Graph, cluster, ns string) string {
+	if g == nil {
+		return ""
+	}
+	return g.NamespaceOwners[graph.NamespaceRef{Cluster: cluster, Namespace: ns}]
+}
+
+// applicationDeployer is the metric-resolved deployer of one application
+// group, or "" when the graph has no table or no entry.
+func applicationDeployer(g *graph.Graph, cluster, ns, app string) string {
+	if g == nil {
+		return ""
+	}
+	return g.ApplicationDeployers[graph.ApplicationRef{Cluster: cluster, Namespace: ns, Application: app}]
 }
 
 // groupNode builds a synthetic compound group node DTO (labels {}, no ipaddress).

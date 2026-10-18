@@ -182,6 +182,13 @@ type Topology struct {
 	// identity's RAW component. Nil for an estate that stamps no az/env pair.
 	ClusterIdentities map[string]graph.ClusterIdentity
 
+	// NamespaceOwners and ApplicationDeployers are the group-metadata indexes
+	// of one application-metadata read, keyed the way the built graph stores
+	// them. Nil when the metric was unset or its vector was not read; an
+	// empty map means the read contributed nothing.
+	NamespaceOwners      map[graph.NamespaceRef]string
+	ApplicationDeployers map[graph.ApplicationRef]string
+
 	// clusters is the resolver that composed those identities. Carried so the
 	// service-graph reader resolves the trace `cluster` label and the route
 	// store's cluster names through the SAME table — a second resolver could
@@ -231,6 +238,13 @@ type topologyVectors struct {
 	ReplicaSetAnnotations  model.Vector
 	JobAnnotations         model.Vector
 	CronJobAnnotations     model.Vector
+	// AppMetadata is the operator-named per-pod metric, already evaluated as
+	// tlast_over_time. Nil means the metric was not read (unset, unserved, or
+	// the /v1/graph leg degraded). AppMetadataSource is the label binding; a
+	// nil source ignores AppMetadata, which is how an unset metric stays
+	// byte-identical.
+	AppMetadata       model.Vector
+	AppMetadataSource *promql.AppMetadataSource
 	// JobAnnotationsDegraded records that the kube_job_annotations leg came back
 	// empty BECAUSE THE QUERY FAILED, as opposed to genuinely matching nothing.
 	// resolvePodApplications needs the two told apart: its Job → CronJob hop is

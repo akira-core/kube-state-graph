@@ -25,7 +25,7 @@ func TestLargestLeg(t *testing.T) {
 }
 
 func TestTopologyPlans(t *testing.T) {
-	legs := topologyLegs(&topologyVectors{})
+	legs := topologyLegs(&topologyVectors{}, nil)
 	require.Len(t, legs, 37, "the first wave of the /v1/graph read")
 	for _, l := range legs {
 		assert.True(t, fullPlan.issuesFirstWave(l.query), "the full plan issues %s", l.query)
@@ -60,4 +60,26 @@ func TestTopologyPlans(t *testing.T) {
 	}
 	assert.Equal(t, graph.StorageRootPod, p.kind)
 	assert.Equal(t, []graph.PodRef{{Namespace: "a", Name: "x"}, {Namespace: "b", Name: "y"}, {Namespace: "c", Name: "x"}}, p.pods)
+}
+
+func TestTopologyLegs_AppMetadataOnlyWhenConfigured(t *testing.T) {
+	src := defaultAppMetadata()
+	legs := topologyLegs(&topologyVectors{}, &src)
+	require.Len(t, legs, 38, "the configured metric adds exactly one first-wave leg")
+	last := legs[len(legs)-1]
+	assert.Equal(t, promql.QAppMetadata, last.query)
+	assert.True(t, last.optional, "a graph-leg error degrades; it must not fail the build")
+	assert.True(t, fullPlan.issuesFirstWave(last.query), "the graph read launches the unscoped leg")
+
+	// A storage plan that is not tracking by reference would otherwise launch
+	// every non-reference-scoped family beside the seed. The skip keeps the
+	// unscoped copy off both the first wave and that beside-seed path.
+	storage := storagePlan(graph.StorageRoots{})
+	assert.False(t, storage.issuesFirstWave(promql.QAppMetadata))
+	assert.False(t, storage.issuesBesideSeed(promql.QAppMetadata))
+	podScope, err := graph.NewStorageScope(nil, nil, graph.StorageRootPod, []string{"shop/web"})
+	require.NoError(t, err)
+	podPlan := storagePlan(podScope.Roots)
+	assert.False(t, podPlan.issuesFirstWave(promql.QAppMetadata))
+	assert.False(t, podPlan.issuesBesideSeed(promql.QAppMetadata))
 }

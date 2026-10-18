@@ -250,6 +250,9 @@ func TestResolvePodApplication_Validation(t *testing.T) {
 		"pod":       func(r *PodApplicationRequest) { r.Pod = "" },
 		"at":        func(r *PodApplicationRequest) { r.At = time.Time{} },
 		"window":    func(r *PodApplicationRequest) { r.Window = 0 },
+		"app metadata label": func(r *PodApplicationRequest) {
+			r.AppMetadata = &promql.AppMetadataSource{Metric: "argocd_app_pod_info", Pod: `x",y="`}
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -289,6 +292,7 @@ func TestResolvePodApplication_MatchesBatchResolver(t *testing.T) {
 	}
 	mc := newClusterResolver(promql.LabelKeys{})
 	batch := resolvePodApplications(
+		nil,
 		resolvePodOwners(vec("kube_pod_owner"), vec("kube_replicaset_owner"), mc),
 		resolveControllerApplications(v, mc),
 		resolveJobCronJobOwners(vec("kube_job_owner"), mc),
@@ -383,5 +387,206 @@ func TestResolvePodApplication_Zone(t *testing.T) {
 		az, ok := s.reqs[1].Filters["az"]
 		assert.True(t, ok, "absent zone is matched by an az=\"\" filter")
 		assert.Empty(t, az)
+	})
+}
+
+// appMetaQuerier is a labelStore that also answers FamilyServer. servesAppMeta
+// false is an unserved appmeta family. A plain *labelStore does not implement
+// the interface, which the lookup treats as unserved too.
+type appMetaQuerier struct {
+	*labelStore
+	servesAppMeta bool
+}
+
+func (q appMetaQuerier) Serves(f promql.Family) bool {
+	return f == promql.FamilyAppMeta && q.servesAppMeta
+}
+
+func appMetaLookupSource() promql.AppMetadataSource {
+	src := defaultAppMetadata()
+	src.Namespace = "k8s_namespace"
+	src.Pod = "k8s_pod"
+	return src
+}
+
+func appMetaPodRow(pod, app, az string) map[string]string {
+	return map[string]string{
+		"az": az, "env": "prod", "cluster": "c1",
+		"k8s_namespace": "shop", "k8s_pod": pod, "argocd_app": app,
+	}
+}
+
+func servedAppMeta(s *labelStore) appMetaQuerier {
+	return appMetaQuerier{labelStore: s, servesAppMeta: true}
+}
+
+func TestResolvePodApplication_AppMetadata(t *testing.T) {
+	src := appMetaLookupSource()
+
+	t.Run("empty labels read their defaults", func(t *testing.T) {
+		s := &labelStore{}
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &promql.AppMetadataSource{Metric: src.Metric}
+		_, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		require.Len(t, s.reqs, 2)
+		assert.Equal(t, map[string]string{
+			"cluster": "c1", "namespace": "shop", "pod": "web-abc",
+		}, s.reqs[1].Filters)
+		assert.Empty(t, req.AppMetadata.Pod, "the caller's source is not mutated")
+	})
+
+	t.Run("routed query shape", func(t *testing.T) {
+		s := &labelStore{}
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		_, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		require.Len(t, s.reqs, 2)
+		got := s.reqs[1]
+		assert.Equal(t, src.Metric, got.Metric)
+		assert.Equal(t, promql.FamilyAppMeta, got.Family)
+		assert.Equal(t, "zone-a", got.AZ)
+		assert.Equal(t, podAppAt, got.At)
+		assert.Equal(t, map[string]string{
+			"cluster": "c1", "k8s_namespace": "shop", "k8s_pod": "web-abc",
+		}, got.Filters)
+	})
+
+	t.Run("metric wins", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "ReplicaSet", "web-7d9"))
+		s.add("kube_replicaset_owner", scoped("prod", "c1", map[string]string{
+			"replicaset": "web-7d9", "owner_kind": "Deployment", "owner_name": "web",
+		}))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "web-app:apps/Deployment:shop/web"))
+		s.add(src.Metric, appMetaPodRow("web-abc", "shop-b", "zone-a"))
+		s.add(src.Metric, appMetaPodRow("web-abc", "", "zone-a"))
+		s.add(src.Metric, appMetaPodRow("web-abc", "shop-a", "zone-a"))
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		assert.Equal(t, "shop-a", got)
+		assert.Equal(t, []string{"kube_pod_owner", src.Metric}, s.metrics())
+	})
+
+	t.Run("no row falls back", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "ReplicaSet", "web-7d9"))
+		s.add("kube_replicaset_owner", scoped("prod", "c1", map[string]string{
+			"replicaset": "web-7d9", "owner_kind": "Deployment", "owner_name": "web",
+		}))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "shop-app:apps/Deployment:shop/web"))
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		assert.Equal(t, "shop-app", got)
+		assert.Equal(t, []string{
+			"kube_pod_owner", src.Metric, "kube_replicaset_owner", "kube_deployment_annotations",
+		}, s.metrics())
+	})
+
+	t.Run("unserved skips", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "Deployment", "web"))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "web-app"))
+		s.add(src.Metric, appMetaPodRow("web-abc", "metric-app", "zone-a"))
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), appMetaQuerier{labelStore: s, servesAppMeta: false}, req)
+		require.NoError(t, err)
+		assert.Equal(t, "web-app", got)
+		assert.Equal(t, []string{"kube_pod_owner", "kube_deployment_annotations"}, s.metrics())
+	})
+
+	t.Run("querier without FamilyServer skips", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "Deployment", "web"))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "web-app"))
+		s.add(src.Metric, appMetaPodRow("web-abc", "metric-app", "zone-a"))
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), s, req)
+		require.NoError(t, err)
+		assert.Equal(t, "web-app", got)
+		assert.NotContains(t, s.metrics(), src.Metric)
+	})
+
+	t.Run("unset source issues no metric query", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "Deployment", "web"))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "web-app"))
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), podAppRequest("web-abc"))
+		require.NoError(t, err)
+		assert.Equal(t, "web-app", got)
+		assert.NotContains(t, s.metrics(), src.Metric)
+	})
+
+	t.Run("ownerless pod", func(t *testing.T) {
+		s := &labelStore{}
+		s.add(src.Metric, appMetaPodRow("static-1", "infra", "zone-a"))
+		req := podAppRequest("static-1")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		assert.Equal(t, "infra", got)
+		assert.Equal(t, []string{"kube_pod_owner", src.Metric}, s.metrics())
+	})
+
+	t.Run("pinned zone carries into the metric query", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "api-1", "Deployment", "api"))
+		s.add(src.Metric, appMetaPodRow("api-1", "b-app", "zone-a"))
+		s.add(src.Metric, appMetaPodRow("api-1", "a-app", "zone-b"))
+		req := podAppRequest("api-1")
+		req.AZ = ""
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.NoError(t, err)
+		assert.Equal(t, "b-app", got)
+		require.Len(t, s.reqs, 2)
+		assert.Empty(t, s.reqs[0].AZ)
+		assert.Equal(t, promql.FamilyAppMeta, s.reqs[1].Family)
+		assert.Equal(t, "zone-a", s.reqs[1].AZ)
+	})
+
+	t.Run("owner rows in two zones issue no metric query", func(t *testing.T) {
+		s := &labelStore{}
+		s.add("kube_pod_owner", podOwner("prod", "c1", "api-1", "Deployment", "api"))
+		s.add("kube_pod_owner", inZone("zone-b", podOwner("prod", "c1", "api-1", "Deployment", "api")))
+		s.add(src.Metric, appMetaPodRow("api-1", "infra", "zone-a"))
+		req := podAppRequest("api-1")
+		req.AZ = ""
+		req.AppMetadata = &src
+		_, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.ErrorIs(t, err, ErrAmbiguousPod)
+		assert.Equal(t, []string{"kube_pod_owner"}, s.metrics())
+	})
+
+	t.Run("ownerless ambiguity", func(t *testing.T) {
+		s := &labelStore{}
+		s.add(src.Metric, appMetaPodRow("static-1", "infra", "zone-a"))
+		s.add(src.Metric, appMetaPodRow("static-1", "infra", "zone-b"))
+		req := podAppRequest("static-1")
+		req.AZ = ""
+		req.AppMetadata = &src
+		_, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.ErrorIs(t, err, ErrAmbiguousPod)
+		assert.Equal(t, []string{"kube_pod_owner", src.Metric}, s.metrics())
+	})
+
+	t.Run("metric query error", func(t *testing.T) {
+		s := &labelStore{}
+		s.fail = src.Metric
+		s.add("kube_pod_owner", podOwner("prod", "c1", "web-abc", "Deployment", "web"))
+		s.add("kube_deployment_annotations", annotation("prod", "c1", "deployment", "web", "web-app"))
+		req := podAppRequest("web-abc")
+		req.AppMetadata = &src
+		got, err := ResolvePodApplication(t.Context(), servedAppMeta(s), req)
+		require.ErrorContains(t, err, "app_metadata")
+		assert.Empty(t, got)
+		assert.Equal(t, []string{"kube_pod_owner", src.Metric}, s.metrics())
 	})
 }

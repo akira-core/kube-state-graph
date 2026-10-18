@@ -39,6 +39,10 @@ type PodApplicationRequest struct {
 	At        time.Time
 	Window    time.Duration
 	LabelKeys promql.LabelKeys
+	// AppMetadata is the application-metadata source, nil to skip it. Empty
+	// label fields read their defaults, and the value is validated: an
+	// invalid one fails the call before any query.
+	AppMetadata *promql.AppMetadataSource
 }
 
 // ErrAmbiguousPod reports that the raw (cluster, namespace, pod) names pods in
@@ -46,18 +50,28 @@ type PodApplicationRequest struct {
 var ErrAmbiguousPod = errors.New("pod application lookup: pod matches more than one zone or environment; set AZ or Env")
 
 // ResolvePodApplication resolves one pod's ArgoCD Application on demand with
-// the same rules the topology build applies to every pod: controller owner
-// (ReplicaSet collapsed to its Deployment), that controller's tracking-id
-// annotation, and the Job → CronJob hop when the Job carries none of its own.
-// It returns "" and a nil error when the pod resolves no Application. Any
-// upstream error fails the lookup — unlike the build, nothing degrades,
-// because a skipped leg could substitute the CronJob's Application for a Job's.
+// the same rules the topology build applies to every pod. When req.AppMetadata
+// is set and q serves the appmeta family, the lexically-smallest non-empty
+// app on the pod's metric rows wins and the controller chain is not read.
+// Otherwise the chain is unchanged: controller owner (ReplicaSet collapsed to
+// its Deployment), that controller's tracking-id annotation, and the Job →
+// CronJob hop when the Job carries none of its own. It returns "" and a nil
+// error when the pod resolves no Application. Any upstream error fails the
+// lookup — unlike the build, nothing degrades, because a skipped leg could
+// substitute the CronJob's Application for a Job's.
 //
-// Every later query is matched on the (az, env) pinned from the pod-owner rows,
-// so a controller family that does not carry the same az / env labels as
-// kube_pod_owner resolves nothing here, where an unfiltered build could still
-// adopt it into the pod's cluster identity.
+// The pod-owner query runs first. Its rows pin az / env for every later query,
+// including the metric query. When that query returns no rows and the metric
+// step is active, the metric query is issued with the request's own az / env
+// (no matcher for a dimension the request omitted) and the same pinning rule
+// is applied to its rows. A querier that does not implement
+// promql.FamilyServer, or one that does not serve appmeta, skips the metric
+// step — the opposite of a graph build, which treats a plain querier as served.
 func ResolvePodApplication(ctx context.Context, q LabelQuerier, req PodApplicationRequest) (string, error) {
+	if req.AppMetadata != nil {
+		src := req.AppMetadata.OrDefault()
+		req.AppMetadata = &src
+	}
 	if err := req.validate(); err != nil {
 		return "", err
 	}
@@ -76,11 +90,35 @@ func ResolvePodApplication(ctx context.Context, q LabelQuerier, req PodApplicati
 	if err != nil {
 		return "", err
 	}
+	useMetric := lookupUsesAppMetadata(q, req.AppMetadata)
 	if len(owners) == 0 {
-		return "", nil
+		if !useMetric {
+			return "", nil
+		}
+		rows, err := l.appMetadataRows(ctx)
+		if err != nil {
+			return "", err
+		}
+		if len(rows) == 0 {
+			return "", nil
+		}
+		if err := l.pinScope(rows); err != nil {
+			return "", err
+		}
+		app, _ := minLabel(rows, req.AppMetadata.App)
+		return app, nil
 	}
 	if err := l.pinScope(owners); err != nil {
 		return "", err
+	}
+	if useMetric {
+		rows, err := l.appMetadataRows(ctx)
+		if err != nil {
+			return "", err
+		}
+		if app, ok := minLabel(rows, req.AppMetadata.App); ok {
+			return app, nil
+		}
 	}
 
 	kind, name, ok, err := l.controllerOwner(ctx, owners)
@@ -104,6 +142,11 @@ func (r PodApplicationRequest) validate() error {
 	if r.Window <= 0 {
 		return errors.New("pod application lookup: window must be positive")
 	}
+	if r.AppMetadata != nil {
+		if err := r.AppMetadata.Validate(r.LabelKeys); err != nil {
+			return fmt.Errorf("pod application lookup: app metadata: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -124,9 +167,10 @@ type podAppLookup struct {
 	env  pin
 }
 
-// pinScope fixes every unset identity label to the single value the pod-owner
-// rows carry, so later queries cannot read a same-named controller in another
-// zone or environment. An absent label reads as "".
+// pinScope fixes every unset identity label to the single value the rows
+// carry, so later queries cannot read a same-named object in another zone or
+// environment. An absent label reads as "". The rows are the pod-owner series,
+// or the application-metadata series when the pod has no controller owner.
 func (l *podAppLookup) pinScope(owners []map[string]string) error {
 	first := owners[0]
 	for _, s := range owners[1:] {
@@ -152,8 +196,58 @@ func (l *podAppLookup) query(ctx context.Context, metric promql.Query, filters m
 		Window:    l.req.Window,
 		LabelKeys: l.req.LabelKeys,
 	}
-	// A zone value routes and renders its matcher; a zone pinned to "absent"
-	// cannot route, so it is matched as a filter instead.
+	l.applyScope(&req)
+	maps.Copy(req.Filters, filters)
+	sets, err := l.q.QueryLabels(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("pod application lookup: %s: %w", metric, err)
+	}
+	return sets, nil
+}
+
+// lookupUsesAppMetadata reports whether this call reads the metric. A nil
+// source skips it. So does a querier that does not implement FamilyServer, and
+// a querier whose table serves appmeta on no backend. Do not share
+// appMetadataServed: that helper treats a querier without FamilyServer as
+// served, which is the graph build's default and the wrong one here.
+func lookupUsesAppMetadata(q LabelQuerier, src *promql.AppMetadataSource) bool {
+	if src == nil {
+		return false
+	}
+	fs, ok := q.(promql.FamilyServer)
+	return ok && fs.Serves(promql.FamilyAppMeta)
+}
+
+// appMetadataRows issues the one appmeta label query for this pod. The
+// namespace and pod filters use the configured label names. az / env follow
+// the pins already applied, so an ownerless call made before pinScope carries
+// no matcher for a dimension the request omitted.
+func (l *podAppLookup) appMetadataRows(ctx context.Context) ([]map[string]string, error) {
+	src := l.req.AppMetadata
+	req := promql.LabelQuery{
+		Metric: src.Metric,
+		Family: promql.FamilyAppMeta,
+		Filters: map[string]string{
+			"cluster":     l.req.Cluster,
+			src.Namespace: l.req.Namespace,
+			src.Pod:       l.req.Pod,
+		},
+		At:        l.req.At,
+		Window:    l.req.Window,
+		LabelKeys: l.req.LabelKeys,
+	}
+	l.applyScope(&req)
+	sets, err := l.q.QueryLabels(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("pod application lookup: app_metadata: %w", err)
+	}
+	return sets, nil
+}
+
+// applyScope copies the pinned zone and environment onto req. A zone value
+// routes and renders its matcher; a zone pinned to "absent" cannot route, so
+// it is matched as a filter instead.
+func (l *podAppLookup) applyScope(req *promql.LabelQuery) {
 	switch {
 	case l.az.set && l.az.val != "":
 		req.AZ = l.az.val
@@ -163,12 +257,6 @@ func (l *podAppLookup) query(ctx context.Context, metric promql.Query, filters m
 	if l.env.set {
 		req.Filters[l.keys.Env] = l.env.val
 	}
-	maps.Copy(req.Filters, filters)
-	sets, err := l.q.QueryLabels(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("pod application lookup: %s: %w", metric, err)
-	}
-	return sets, nil
 }
 
 // controllerOwner picks the pod's controller owner exactly as resolvePodOwners

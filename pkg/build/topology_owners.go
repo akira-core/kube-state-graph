@@ -260,11 +260,12 @@ func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]s
 }
 
 // resolvePodApplications builds the (cluster, namespace, pod) → ArgoCD
-// Application index by joining each pod's already-resolved controller owner to
-// the controller-annotation index. ArgoCD stamps
-// `argocd.argoproj.io/tracking-id` on the workload objects it applies, never on
-// the pods a controller spawns, so the controller is the only place the value
-// exists — no pod-level label is read.
+// Application index. A non-empty metricApps entry wins for that pod and the
+// controller chain is not consulted for it. Every other pod is joined from
+// its already-resolved controller owner to the controller-annotation index.
+// ArgoCD stamps `argocd.argoproj.io/tracking-id` on the workload objects it
+// applies, never on the pods a controller spawns, so the controller is the
+// only annotation source — no pod-level label is read.
 //
 // Because the D34 ReplicaSet skip has already collapsed a ReplicaSet owner to
 // its Deployment, the Deployment case needs no extra hop. The ONE fallback is
@@ -288,14 +289,23 @@ func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]s
 // is strictly better than reporting the wrong one, and it keeps every degrade
 // in this package subtractive (harden-controller-annotation-legs D3).
 func resolvePodApplications(
+	metricApps map[podNameKey]string,
 	owners map[podNameKey]ownerRef,
 	ctrlApps map[controllerKey]string,
 	jobCronJobs map[jobKey]string,
 	jobAnnotationsDegraded bool,
 ) map[podNameKey]string {
-	out := make(map[podNameKey]string, len(owners))
+	out := make(map[podNameKey]string, len(owners)+len(metricApps))
+	for pod, app := range metricApps {
+		if app != "" {
+			out[pod] = app
+		}
+	}
 	src := indexedOwnerApps{ctrlApps: ctrlApps, jobCronJobs: jobCronJobs, jobAnnotationsDegraded: jobAnnotationsDegraded}
 	for pod, owner := range owners {
+		if out[pod] != "" {
+			continue
+		}
 		src.cluster, src.namespace = pod.cluster, pod.namespace
 		// The index source never errors.
 		if app, _ := resolveOwnerApplication(context.Background(), src, owner.kind, owner.name); app != "" {
