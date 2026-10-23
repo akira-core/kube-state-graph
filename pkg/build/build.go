@@ -174,20 +174,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// pods; and it has to run in the BUILD rather than in a projection because
 	// the attribute must reach every consumer of this graph alike (/v1/graph,
 	// /v1/storage-graph, and any embedder walking GraphNode.Alerts()).
-	attachAlerts(ctx, nodes, topology)
-	attachStatus(nodes)
-	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
-	// The identity table the reader composed. Every cluster-scoped id and label
-	// already carries the identity; the graph needs the table so the
-	// projection-level `cluster` filter can recover each identity's RAW
-	// component — the value the request actually carries and the upstream
-	// matcher selected on. Nil for an unstamped estate, which degrades the
-	// lookup to the pre-identity comparison.
-	g.ClusterIdentities = topology.ClusterIdentities
-	// Group metadata is not a node attribute. Nil when the metric is unset or
-	// its vector was not read; cytoscape omits the fields in that case.
-	g.NamespaceOwners = topology.NamespaceOwners
-	g.ApplicationDeployers = topology.ApplicationDeployers
+	g := b.freeze(ctx, topology, nodes, edges)
 
 	// Cross-cluster status is derived from the resolved endpoint nodes'
 	// `cluster` labels, since edges only carry the trace-source cluster
@@ -295,15 +282,16 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		return nil, err
 	}
 	q := b.querierFor(sel)
-	// Both a storage-side root (phase 1) and a claim root (the claim seed) read
-	// the claim side through the hub's claim-keyed reads.
-	volumeHub := plan.rootedClaims() || plan.claimSeeded()
-	ctx, span := tracer.Start(ctx, "kube-state-graph.build_storage",
+	if plan.kubernetesOnly {
+		q = refuseHarvest(q)
+	}
+	run := plan.run()
+	ctx, span := tracer.Start(ctx, run.span,
 		trace.WithAttributes(
 			attribute.Int64("kube_state_graph.window_seconds", int64(window.Seconds())),
 			attribute.Int64("kube_state_graph.end_unix", end.Unix()),
 			attribute.Bool("kube_state_graph.selector_active", sel.Active()),
-			attribute.Bool("kube_state_graph.volume_hub", volumeHub),
+			run.attr,
 		),
 	)
 	defer span.End()
@@ -313,19 +301,14 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		return nil, classifyReadError(span, "topology read failed", err)
 	}
 
-	nodes, edges := assembleStorageFlow(topology)
+	nodes, edges := run.assemble(topology)
 	// Same "bake before freeze" point as Build: the overlay must reach this
 	// endpoint identically, since it is resolved onto the graph rather than by
 	// a projection.
-	attachAlerts(ctx, nodes, topology)
-	attachStatus(nodes)
-	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
-	g.ClusterIdentities = topology.ClusterIdentities
-	g.NamespaceOwners = topology.NamespaceOwners
-	g.ApplicationDeployers = topology.ApplicationDeployers
+	g := b.freeze(ctx, topology, nodes, edges)
 
 	leg, legSeries := largestLeg(topology.RawSeriesCount)
-	slog.InfoContext(ctx, "storage graph built",
+	slog.InfoContext(ctx, run.message,
 		"clusters", topology.ClustersObserved,
 		"nodes", len(g.NodesByID),
 		"edges", len(g.Edges),
@@ -334,9 +317,9 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		"start", end.Add(-window).UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 		"selector_active", sel.Active(),
-		"volume_hub", volumeHub,
+		run.logKey, run.attr.Value.AsInterface(),
 	)
-	slog.DebugContext(ctx, "storage graph built: series per leg", "raw_series_counts", topology.RawSeriesCount)
+	slog.DebugContext(ctx, run.message+": series per leg", "raw_series_counts", topology.RawSeriesCount)
 
 	span.SetAttributes(
 		attribute.Int("kube_state_graph.cluster_count", len(topology.ClustersObserved)),
@@ -344,6 +327,64 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 		attribute.Int("graph.edge.count", len(g.Edges)),
 	)
 	return g, nil
+}
+
+// planRun is what differs between the two builds on the storage read path:
+// the span and log names, the one attribute that characterises the read (on
+// the span as attr, in the log line under logKey), and the assembler. Everything else — prepare, the bound querier, the read, the
+// error classification and freeze — is buildStorage's own, so the storage and
+// Kubernetes-only builds cannot drift.
+type planRun struct {
+	span, message, logKey string
+	attr                  attribute.KeyValue
+	assemble              func(Topology) ([]graph.GraphNode, []*graph.Edge)
+}
+
+// run names a prepared plan's build. A Kubernetes-only plan assembles with no
+// Harvest and no service graph, which emits only pod-to-node and
+// pod-mounts-pvc edges; a storage plan assembles storage-flow.
+func (p topologyPlan) run() planRun {
+	if p.kubernetesOnly {
+		return planRun{
+			span:    "kube-state-graph.build_k8s",
+			message: "k8s graph built",
+			logKey:  "root_kind",
+			attr:    attribute.String("kube_state_graph.root_kind", string(p.kind)),
+			assemble: func(t Topology) ([]graph.GraphNode, []*graph.Edge) {
+				return assemble(t, ServiceGraphResult{})
+			},
+		}
+	}
+	// Both a storage-side root (phase 1) and a claim root (the claim seed) read
+	// the claim side through the hub's claim-keyed reads.
+	return planRun{
+		span:     "kube-state-graph.build_storage",
+		message:  "storage graph built",
+		logKey:   "volume_hub",
+		attr:     attribute.Bool("kube_state_graph.volume_hub", p.rootedClaims() || p.claimSeeded()),
+		assemble: assembleStorageFlow,
+	}
+}
+
+// freeze bakes the per-node attributes that need the assembled node set
+// (alerts, then the status fold) and freezes the graph, then attaches the
+// table and group metadata the parse produced. Every build path ends here, so
+// the overlay and the groups reach every endpoint identically.
+//
+// The identity table is what lets the projection-level `cluster` filter recover
+// each identity's RAW component — the value the request carries and the
+// upstream matcher selected on; nil for an unstamped estate, which degrades the
+// lookup to the pre-identity comparison. The two group maps are not node
+// attributes: nil when the application-metadata metric is unset or its vector
+// was not read, in which case cytoscape omits the fields.
+func (b *Builder) freeze(ctx context.Context, topology Topology, nodes []graph.GraphNode, edges []*graph.Edge) *graph.Graph {
+	attachAlerts(ctx, nodes, topology)
+	attachStatus(nodes)
+	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
+	g.ClusterIdentities = topology.ClusterIdentities
+	g.NamespaceOwners = topology.NamespaceOwners
+	g.ApplicationDeployers = topology.ApplicationDeployers
+	return g
 }
 
 // classifyReadError maps an upstream read failure to a typed build error and

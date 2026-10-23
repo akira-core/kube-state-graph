@@ -133,7 +133,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		}
 	}
 
-	kind, values, rerr := oneStorageRoot(v)
+	kind, values, rerr := oneStorageRoot(v, storageRootParams, "a storage-graph request requires exactly one root kind")
 	if rerr != nil {
 		return req, rerr
 	}
@@ -154,25 +154,96 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	return req, nil
 }
 
+// K8sRequest is the parsed /v1/k8s-graph request: a build window, the upstream
+// selector (cluster, az and env required, each one or more values), and the
+// projection scope carrying the one pod or node root.
+type K8sRequest struct {
+	Start    time.Time
+	End      time.Time
+	Scope    graph.StorageScope
+	Selector promql.Selector
+}
+
+// k8sRootParams are the root kinds /v1/k8s-graph reads, in the order a
+// mixed-kind error names them. A storage-graph-only kind (`aggr=` and the rest)
+// is not a root here: like any unknown parameter it is ignored, so a request
+// carrying only one is missing_root.
+var k8sRootParams = []string{"node", "pod"}
+
+// ParseK8sValues parses the /v1/k8s-graph query parameters. Window and
+// selector-value validation are the other endpoints' own; cluster, az and env
+// are required and repeatable (missing_cluster, missing_az, missing_env, in that
+// order, after the window and before the root), the selected cluster identities
+// being their Cartesian product with `cluster` the RAW name. Exactly one of
+// `pod` and `node` is required. `namespace` is optional; `prune` and every
+// other parameter are ignored.
+func ParseK8sValues(v url.Values) (K8sRequest, error) {
+	var req K8sRequest
+
+	start, end, err := parseWindow(v)
+	if err != nil {
+		return req, err
+	}
+	req.Start, req.End = start, end
+
+	cluster, err := atLeastOne("cluster", v["cluster"])
+	if err != nil {
+		return req, err
+	}
+	az, err := atLeastOne("az", v["az"])
+	if err != nil {
+		return req, err
+	}
+	env, err := atLeastOne("env", v["env"])
+	if err != nil {
+		return req, err
+	}
+
+	for _, p := range append([]string{"cluster", "namespace", "az", "env"}, k8sRootParams...) {
+		if err := validateSelectorValues(p, v[p]); err != nil {
+			return req, err
+		}
+	}
+
+	kind, values, rerr := oneStorageRoot(v, k8sRootParams, "a k8s-graph request requires exactly one root kind, pod or node")
+	if rerr != nil {
+		return req, rerr
+	}
+	scope, serr := graph.NewStorageScope(cluster, v["namespace"], kind, values)
+	if serr != nil {
+		return req, &ParseError{"invalid_scope", serr.Error()}
+	}
+	req.Scope = scope
+	req.Selector = promql.Selector{
+		AZ:        az,
+		Env:       env,
+		Cluster:   cluster,
+		Namespace: v["namespace"],
+	}
+	return req, nil
+}
+
 // storageRootParams is the root parameters in the order a mixed-kind error
 // names them.
 var storageRootParams = []string{
 	"ontap_cluster", "ontap_node", "aggr", "svm", "node", "pod", "pvc", "pv", "application",
 }
 
-// oneStorageRoot returns the single root kind that carries a non-empty value.
-// Zero kinds is missing_root; two or more is invalid_scope naming those
-// parameters. Empty values do not count, so a bare `?aggr=` is not a root.
-func oneStorageRoot(v url.Values) (graph.StorageRootKind, []string, error) {
+// oneStorageRoot returns the single root kind among params that carries a
+// non-empty value. Zero kinds is missing_root with missingMsg; two or more is
+// invalid_scope naming those parameters. Empty values do not count, so a bare
+// `?aggr=` is not a root. Both root-bearing endpoints share it, so their
+// missing_root / invalid_scope contracts cannot drift.
+func oneStorageRoot(v url.Values, params []string, missingMsg string) (graph.StorageRootKind, []string, error) {
 	var present []string
-	for _, p := range storageRootParams {
+	for _, p := range params {
 		if hasNonEmpty(v[p]) {
 			present = append(present, p)
 		}
 	}
 	switch len(present) {
 	case 0:
-		return "", nil, &ParseError{"missing_root", "a storage-graph request requires exactly one root kind"}
+		return "", nil, &ParseError{"missing_root", missingMsg}
 	case 1:
 		p := present[0]
 		return graph.StorageRootKind(p), v[p], nil

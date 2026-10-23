@@ -3,6 +3,7 @@ package build
 import (
 	"cmp"
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -88,15 +89,28 @@ func readNodeSeed(
 	if err != nil {
 		return err
 	}
-	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation))
 	lk := opts.LabelKeys.OrDefault()
 	onRoot := podsNewestOn(incarnation, plan.nodeRoots, lk)
+	var kept model.Vector
+	if plan.kubernetesOnly {
+		// The pod wave lands these rows in v.Pod, where the tally counts them, so
+		// only the rest of the read is tallied beside it.
+		kept = keepPodRows(incarnation, onRoot, lk)
+	}
+	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation)-len(kept))
 	if len(onRoot) == 0 {
 		return nil
 	}
 	rootKeys := make([]podSeriesKey, 0, len(onRoot))
 	for k := range onRoot {
 		rootKeys = append(rootKeys, k)
+	}
+	if plan.kubernetesOnly {
+		// Every pod on the root is drawn, not only those that mount a claim; the
+		// storage body keeps just the latter, and its plan never sets this.
+		slices.SortFunc(rootKeys, comparePodSeriesKeys)
+		v.RootNodePods = rootKeys
+		v.RootNodePodInfo = kept
 	}
 	byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(rootKeys))
 	if err != nil {
@@ -183,6 +197,18 @@ func podsNewestOn(rows model.Vector, roots []string, keys promql.LabelKeys) map[
 	for k, b := range canon {
 		if _, ok := root[b.node]; ok {
 			out[k] = struct{}{}
+		}
+	}
+	return out
+}
+
+// keepPodRows keeps the rows whose (az, env, cluster, namespace, pod) is in
+// pods, in input order.
+func keepPodRows(rows model.Vector, pods map[podSeriesKey]struct{}, keys promql.LabelKeys) model.Vector {
+	var out model.Vector
+	for _, s := range rows {
+		if _, ok := pods[podSeriesKeyOf(s.Metric, keys)]; ok {
+			out = append(out, s)
 		}
 	}
 	return out

@@ -1,0 +1,300 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "zone-a-prod-c1",
+    "zone-b-prod-c1"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/zone-a-prod-c1",
+          "name": "zone-a-prod-c1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster/zone-b-prod-c1",
+          "name": "zone-b-prod-c1",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/zone-a-prod-c1",
+          "namespace_owner": "team-shop",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-b-prod-c1/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/zone-b-prod-c1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/namespace/shop/application/checkout",
+          "name": "checkout",
+          "type": "application",
+          "parent": "zone-a-prod-c1/namespace/shop",
+          "deployed_by": "alice",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/namespace/shop/application/reports",
+          "name": "reports",
+          "type": "application",
+          "parent": "zone-a-prod-c1/namespace/shop",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/namespace/shop/application/checkout/controller/Deployment/orders",
+          "name": "orders",
+          "type": "controller",
+          "parent": "zone-a-prod-c1/namespace/shop/application/checkout",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/namespace/shop/application/reports/controller/Job/nightly-28901",
+          "name": "nightly-28901",
+          "type": "controller",
+          "parent": "zone-a-prod-c1/namespace/shop/application/reports",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/shop/shared-data",
+          "name": "shared-data",
+          "type": "pvc",
+          "parent": "zone-a-prod-c1/namespace/shop/application/checkout",
+          "application": "checkout",
+          "usage": {
+            "used_bytes": 4096,
+            "capacity_bytes": 16384
+          },
+          "storageclass": "netapp-nas",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-a-prod-c1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/uid-a-nightly",
+          "name": "nightly-x",
+          "type": "pod",
+          "parent": "zone-a-prod-c1/namespace/shop/application/reports/controller/Job/nightly-28901",
+          "owner": {
+            "kind": "Job",
+            "name": "nightly-28901"
+          },
+          "application": "reports",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-a-prod-c1",
+            "namespace": "shop",
+            "node": "zone-a-prod-c1/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/uid-a-orders-0",
+          "name": "orders-0",
+          "type": "pod",
+          "parent": "zone-a-prod-c1/namespace/shop/application/checkout/controller/Deployment/orders",
+          "ipaddress": [
+            "10.244.0.10"
+          ],
+          "owner": {
+            "kind": "Deployment",
+            "name": "orders"
+          },
+          "application": "checkout",
+          "alerts": [
+            {
+              "name": "PodCrashLooping",
+              "state": "firing",
+              "severity": "warning"
+            }
+          ],
+          "status": "warning",
+          "labels": {
+            "cluster": "zone-a-prod-c1",
+            "namespace": "shop",
+            "node": "zone-a-prod-c1/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/uid-a-web-0",
+          "name": "web-0",
+          "type": "pod",
+          "parent": "zone-a-prod-c1/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-a-prod-c1",
+            "namespace": "shop",
+            "node": "zone-a-prod-c1/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/worker-1",
+          "name": "worker-1",
+          "type": "node",
+          "parent": "cluster/zone-a-prod-c1",
+          "ipaddress": [
+            "10.0.0.1"
+          ],
+          "ready_status": "Ready",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-a-prod-c1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-a-prod-c1/worker-9",
+          "name": "worker-9",
+          "type": "node",
+          "parent": "cluster/zone-a-prod-c1",
+          "ipaddress": [
+            "10.0.0.9"
+          ],
+          "ready_status": "NotReady",
+          "status": "critical",
+          "labels": {
+            "cluster": "zone-a-prod-c1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-b-prod-c1/shop/data",
+          "name": "data",
+          "type": "pvc",
+          "parent": "zone-b-prod-c1/namespace/shop",
+          "usage": {
+            "used_bytes": 1024,
+            "capacity_bytes": 8192
+          },
+          "storageclass": "netapp-nas",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-b-prod-c1",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-b-prod-c1/uid-b-orders-0",
+          "name": "orders-0",
+          "type": "pod",
+          "parent": "zone-b-prod-c1/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-b-prod-c1",
+            "namespace": "shop",
+            "node": "zone-b-prod-c1/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "zone-b-prod-c1/worker-1",
+          "name": "worker-1",
+          "type": "node",
+          "parent": "cluster/zone-b-prod-c1",
+          "ipaddress": [
+            "10.1.0.1"
+          ],
+          "ready_status": "Ready",
+          "status": "normal",
+          "labels": {
+            "cluster": "zone-b-prod-c1"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "09b7581c-81bc-5d15-8241-f6f69e430be1",
+          "type": "pod-mounts-pvc",
+          "source": "zone-b-prod-c1/uid-b-orders-0",
+          "target": "zone-b-prod-c1/shop/data",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "93f3f219-2362-5b90-b17c-f126c17fdb9e",
+          "type": "pod-to-node",
+          "source": "zone-a-prod-c1/uid-a-web-0",
+          "target": "zone-a-prod-c1/worker-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "c1bbb7be-9c6b-54f5-a477-72b58180166c",
+          "type": "pod-to-node",
+          "source": "zone-b-prod-c1/uid-b-orders-0",
+          "target": "zone-b-prod-c1/worker-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "d15164f3-f559-56a1-b42b-61c23d8bf2d2",
+          "type": "pod-to-node",
+          "source": "zone-a-prod-c1/uid-a-orders-0",
+          "target": "zone-a-prod-c1/worker-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "e0daf145-639a-55ee-8c04-efb7784fe57d",
+          "type": "pod-to-node",
+          "source": "zone-a-prod-c1/uid-a-nightly",
+          "target": "zone-a-prod-c1/worker-1",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "f8d16cc5-f137-572f-98af-becdffda11e0",
+          "type": "pod-mounts-pvc",
+          "source": "zone-a-prod-c1/uid-a-orders-0",
+          "target": "zone-a-prod-c1/shop/shared-data",
+          "labels": {}
+        }
+      }
+    ]
+  }
+}

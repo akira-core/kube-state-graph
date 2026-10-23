@@ -47,8 +47,8 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   dimensions ARE the identity's components. A value read out of `clusters[]`
   and sent back as `?cluster=` returns an empty 200; that asymmetry is
   deliberate and documented in `docs/BREAKING.md`. The table reaches the graph
-  as `Graph.ClusterIdentities`, assigned in `Builder.Build` right after
-  `graph.NewGraph`; nil (an unstamped estate, a hand-built graph, an older
+  as `Graph.ClusterIdentities`, assigned in `Builder.freeze` (every build path)
+  right after `graph.NewGraph`; nil (an unstamped estate, a hand-built graph, an older
   embedder) degrades every comparison to the pre-identity behaviour, which is
   what keeps every existing golden byte-identical.
 - **The cluster-family key runs over the identity string**, with the unchanged
@@ -85,6 +85,8 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   also carries as `data.qos`), and
   `storage-flow` (the Sankey hop of `GET /v1/storage-graph`; `may_cross_cluster: false`; labels `tier` and `attribution`; `/v1/graph` never emits it).
 
+  **Which endpoint emits which types.** `/v1/graph` emits every node and edge type its reads can build. `/v1/storage-graph` emits `storage-flow` edges over the NetApp, SVM, claim, pod and Kubernetes-node types. `/v1/k8s-graph` emits only the `pod`, `node` and `pvc` node types and the `pod-to-node` and `pod-mounts-pvc` edge types (plus the `cluster` / `namespace` / `application` / `controller` groups): it reads no Harvest, service or service-graph series, so a NetApp type, a `service` / `external` node, a `storage-cluster` group, `data.containers`, `data.qos` and the PVC `labels.aggr` / `labels.svm` never appear on it. The attributes it does carry are resolved by the same code as on the other two endpoints.
+
 ## Node attributes
 
 - **IP addresses live on the typed `ipaddress` attribute, never in `labels`.** `PodNode.IPAddress()` carries `[pod_ip]` from `kube_pod_info` (when present). `K8sNode.IPAddress()` carries `[external_ip]` from `kube_node_status_addresses{type="ExternalIP"}` when present, falling back to `[internal_ip]` from `kube_node_status_addresses{type="InternalIP"}` when the node has no ExternalIP row (ExternalIP always wins over InternalIP regardless of upstream sample order; within each type a duplicate `(cluster, node)` sample resolves to the lexically-smallest address; address types other than `ExternalIP`/`InternalIP` are ignored); omitted only when neither type is present. The selector is the anchored alternation `kube_node_status_addresses{type=~"ExternalIP|InternalIP"}` — a fixed, request-invariant metric-selection contract, not a caller filter. `ServiceNode.IPAddress()` carries `[cluster_ip]` from `kube_service_info` (when present, omitted for headless `cluster_ip="None"`). `PVCNode`, `ExternalNode`, `NetAppAggrNode`, and `NetAppNode` always return nil. `host_ip` from `kube_pod_info` is intentionally dropped — it is the node's IP, surfaced via the node entry instead. The serialiser emits `data.ipaddress` (with `omitempty`); `labels.pod_ip`, `labels.host_ip`, `labels.external_ip`, `labels.internal_ip`, and `labels.cluster_ip` MUST NOT appear.
@@ -96,7 +98,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `NetAppNode`, and `NetAppAggrNode` always carry one of `"normal"`,
   `"warning"`, or `"critical"` in `data.status`; services, externals, SVMs,
   and synthesised compound groups omit it. `attachStatus` runs immediately
-  after `attachAlerts` on both build paths and stores the pure
+  after `attachAlerts` in `Builder.freeze`, which every build path ends in, and stores the pure
   `graph.FoldStatus` result before `graph.NewGraph`: alert severity is compared
   case-insensitively (`critical` → critical; `warning`, empty, or unrecognised
   → warning; `info` / `none` → no effect), `health="degraded"` and

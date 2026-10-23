@@ -24,7 +24,7 @@ func nodeTargets(v *topologyVectors) []scopedTarget {
 }
 
 // nodeScope is the sorted, de-duplicated set of Kubernetes node names a
-// storage body can draw the node families for: every node a loaded pod is
+// storage or Kubernetes-only body can draw the node families for: every node a loaded pod is
 // scheduled on, plus the request's `node=` roots. It mirrors the pod scope's
 // own rule — a root must be drawable even when no pod names it.
 func nodeScope(pods model.Vector, roots []string) []string {
