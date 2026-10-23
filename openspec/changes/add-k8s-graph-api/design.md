@@ -110,31 +110,46 @@ restate the node seed's incarnation completion and the expansion's mounter
 completion, the two rules that keep the body byte-identical to an unrestricted
 read.
 
-### D2 — `Builder.BuildK8s(ctx, window, end, sel, roots)`, assembled with `assemble`
+### D2 — `Builder.BuildK8s(ctx, window, end, sel, roots)` is `buildStorage` under `k8sPlan`
 
-`BuildK8s` prepares `k8sPlan(roots)` (the seed cap rejects before any query),
-binds `querierFor(sel)`, reads, and calls `assemble(topology,
-ServiceGraphResult{})`. It then runs the shared bake-before-freeze sequence
-(`attachAlerts`, `attachStatus`, `graph.NewGraph`, then `ClusterIdentities`,
-`NamespaceOwners`, `ApplicationDeployers`). No `ReadServiceGraph`, no `up{}`
-probe, no `outside_retention`, and none of the three last-build gauges — the
-adapters reset each vector on write, so a k8s build would erase the
-`/v1/graph` series, the reason `BuildStorage` gives. Span
-`kube-state-graph.build_k8s`, log `k8s graph built`.
+`BuildK8s` checks the roots (pod or node, at least one value, every pod ref
+with a namespace and a name — else `ReasonInvalidScope` before a querier is
+bound) and calls `buildStorage(…, k8sPlan(roots))`. There is one storage-path
+lifecycle: prepare the plan (the seed cap rejects before any query), bind
+`querierFor(sel)`, read, assemble, `freeze`. The plan's `run()` supplies the
+only per-endpoint parts — the span (`kube-state-graph.build_k8s`), the log line
+(`k8s graph built`, with `root_kind`) and the assembler,
+`assemble(topology, ServiceGraphResult{})` — so the storage span, log and body
+are unchanged.
 
-The freeze sequence then appears three times. Extracting it into one helper is
-in scope only if both existing bodies stay byte-identical.
+For a `kubernetesOnly` plan the bound querier is wrapped by `refuseHarvest`:
+any Harvest query fails the build before it reaches a store. The plan's gates
+keep the fan-out from issuing one; the wrapper is what guarantees it, so a
+Harvest reader added later without a gate turns the build red. The wrapper
+keeps the wrapped querier's `promql.FamilyServer`, which decides whether
+`appmeta` is read.
+
+`Builder.freeze` is the bake-before-freeze sequence (`attachAlerts`,
+`attachStatus`, `graph.NewGraph`, then `ClusterIdentities`, `NamespaceOwners`,
+`ApplicationDeployers`) that `Build` and `buildStorage` share; the existing
+bodies are byte-identical. No `ReadServiceGraph`, no `up{}` probe, no
+`outside_retention`, and none of the three last-build gauges — the adapters
+reset each vector on write, so a k8s build would erase the `/v1/graph` series,
+the reason `BuildStorage` gives.
 
 ### D3 — `graph.ProjectK8s(g, scope StorageScope)`: pod-centric reachability
 
 A pure function of `(g, scope)`:
 
-1. **Roots.** `node` roots resolve to `K8sNode` ids whose node name is a root
-   value and whose raw cluster passes `scope.Clusters`; `pod` roots to
-   `PodNode`s whose `(namespace, name)` is a root ref and which pass the
-   cluster filter.
-2. **Pods.** A pod is kept iff it is a resolved pod root or its `labels.node`
-   is a resolved node root, AND it passes the cluster / namespace filters.
+1. **Roots.** Resolved by `resolveStorageRoots`, so a `node=` / `pod=` value
+   names the same nodes as on `/v1/storage-graph`: `node` roots are `K8sNode`
+   ids whose node name is a root value, `pod` roots `PodNode`s whose
+   `(namespace, name)` is a root ref. Each must then pass the cluster /
+   namespace filters (`workloadPassesFilters`).
+2. **Pods.** A pod is kept iff it is a resolved pod root or its `pod-to-node`
+   edge targets a resolved node root, AND it passes the cluster / namespace
+   filters. The edge, never `labels.node`, decides: a node name reused by two
+   cluster identities is two nodes.
 3. **Claims.** A PVC is kept iff a kept pod has a `pod-mounts-pvc` edge to it
    (and it passes the filters — always true, since the binding is
    same-cluster, same-namespace).
@@ -182,14 +197,16 @@ namespace, kind, values)`. The selector carries the sorted, de-duplicated
 
 ### D5 — Handler
 
-`handleK8sGraph` = `ParseK8sValues` → `writeParseError` (already maps any
-`ParseError.Reason` to a 400 verbatim, so no `errors.go` entry) →
-`runBuild(…, closure over s.builder.BuildK8s with req.Scope.Roots)` →
-`mapBuildError` (`QueryError` is already 502 `upstream query failed:
-<family>`; `invalid_scope` from the seed cap is already 400) →
-`projectWithSpan("kube-state-graph.project_k8s", graph.ProjectK8s)` →
-`cytoscape.Serialise`. Registered on the authenticated `v1` group, so auth,
-`otelgin` and the request log follow.
+`handleK8sGraph` = `parseK8sGraphRequest` (`ParseK8sValues`, then
+`writeParseError`, which already maps any `ParseError.Reason` to a 400
+verbatim, so no `errors.go` entry) → `serveGraph` with a closure over
+`s.builder.BuildK8s` and `req.Scope.Roots`, the span name
+`kube-state-graph.project_k8s` and `graph.ProjectK8s`. `serveGraph` is the
+body all three graph handlers share: `runBuild` → `mapBuildError`
+(`QueryError` is already 502 `upstream query failed: <family>`;
+`invalid_scope` from the seed cap is already 400) → `projectWithSpan` →
+`cytoscape.Serialise` → write. Registered on the authenticated `v1` group, so
+auth, `otelgin` and the request log follow.
 
 ## Risks / Trade-offs
 

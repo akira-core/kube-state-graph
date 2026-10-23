@@ -203,7 +203,7 @@ The build SHALL walk from the root and read every family by reference as `/v1/st
 #### Scenario: Node root reads its claimless pods
 
 - **WHEN** a client roots at `node=worker-1`, and `web-0` runs there mounting no claim
-- **THEN** the pod-scoped reads (`kube_pod_info`, `kube_pod_owner`) name `web-0` as well as the claim-mounting pods, which a `/v1/storage-graph` request for the same node does not
+- **THEN** the pod wave's `kube_pod_owner` read names `web-0` as well as the claim-mounting pods, which a `/v1/storage-graph` request for the same node does not, and `kube_pod_info` is read for `web-0` once, by incarnation completion
 
 #### Scenario: Zone routing and matchers
 

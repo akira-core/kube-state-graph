@@ -80,6 +80,48 @@ func TestBuildK8sFromValues(t *testing.T) {
 	}
 }
 
+// Spec: "Several values form a product". Two zones each running a cluster c1
+// with a node worker-1: az=zone-a&az=zone-b selects both identities, each node
+// is drawn under its own cluster group, and a third zone and another
+// environment stay out.
+func TestBuildK8sFromValues_ZonesFormAProduct(t *testing.T) {
+	in := func(az, env string, pairs ...string) *model.Sample {
+		s := k8sSample(pairs...)
+		s.Metric["az"], s.Metric["env"] = model.LabelValue(az), model.LabelValue(env)
+		return s
+	}
+	zones := [][2]string{{"zone-a", "prod"}, {"zone-b", "prod"}, {"zone-c", "prod"}, {"zone-a", "dev"}}
+	podInfo := make(model.Vector, 0, len(zones))
+	nodeInfo := make(model.Vector, 0, len(zones))
+	for _, z := range zones {
+		podInfo = append(podInfo, in(z[0], z[1], "namespace", "shop", "pod", "web-0", "uid", "uid-"+z[0]+"-"+z[1], "node", "worker-1"))
+		nodeInfo = append(nodeInfo, in(z[0], z[1], "node", "worker-1"))
+	}
+	eng := kubegraph.New(promqlfake.New(map[promql.Query]model.Vector{
+		promql.QPodInfo:  podInfo,
+		promql.QNodeInfo: nodeInfo,
+	}), kubegraph.Options{})
+	vals := k8sParams()
+	vals["az"] = []string{"zone-b", "zone-a"}
+
+	body, err := eng.BuildK8sFromValues(t.Context(), vals)
+	require.NoError(t, err)
+
+	want := []string{"zone-a-prod-c1", "zone-b-prod-c1"}
+	assert.Equal(t, want, body.Clusters)
+	parents := map[string]string{}
+	for _, n := range body.Elements.Nodes {
+		if n.Data.Type == "node" || n.Data.Type == "pod" {
+			parents[n.Data.ID] = n.Data.Parent
+		}
+	}
+	for _, ident := range want {
+		assert.Equal(t, "cluster/"+ident, parents[graph.K8sNodeID(ident, "worker-1")], "each node sits under its own cluster group")
+		assert.Contains(t, parents, graph.PodID(ident, "uid-"+ident[:6]+"-prod"))
+	}
+	assert.Len(t, parents, 4, "zone-c and env dev are not selected")
+}
+
 // A request lacking a root is a parse error before any upstream query.
 func TestBuildK8sFromValues_MissingRootIssuesNoQuery(t *testing.T) {
 	q := promqlfake.New(k8sFixtures())
