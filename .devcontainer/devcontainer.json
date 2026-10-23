@@ -3,7 +3,7 @@
   "build": {
     "dockerfile": "Dockerfile",
     // Must match the `toolchain` directive in go.mod — bump both together.
-    "args": { "GO_VERSION": "1.26.5" }
+    "args": { "GO_VERSION": "1.27.3" }
   },
 
   // Docker-outside-of-Docker: mount the host daemon socket and install the

@@ -1,7 +1,7 @@
 name: CI
 
-# `lint`, `vuln`, `test`, `docs-drift`, `route-containment`, and `mocks-drift`
-# are separate jobs; they run in parallel (no `needs` edges) so PR feedback
+# `lint`, `vuln`, `embedder-go`, `test`, `docs-drift`, `route-containment`, and
+# `mocks-drift` are separate jobs; they run in parallel (no `needs` edges) so PR feedback
 # latency = max, not sum.
 on:
   pull_request:
@@ -44,6 +44,29 @@ jobs:
 
       - name: Run govulncheck
         run: govulncheck ./...
+
+  # Modules importing pkg/ may be on Go 1.27.1. go.mod's `toolchain` line binds
+  # only this module, never an importer, so pkg/ is built, vetted and tested on
+  # exactly that release with toolchain downloads off: a `go` directive, a
+  # dependency or a language feature needing newer Go fails here.
+  embedder-go:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: true
+
+      - name: Build, vet and test pkg/ on Go 1.27.1
+        run: |
+          go version
+          go build ./pkg/...
+          go vet ./pkg/...
+          go test ./pkg/... -count=1 -race
 
   test:
     runs-on: ubuntu-latest
