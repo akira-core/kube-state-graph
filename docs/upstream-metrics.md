@@ -345,6 +345,48 @@ Debug line `storage graph volume hub` logs volumes / candidates / claims /
 bindings on every hub build. A statically provisioned PV is not reached from a
 storage root — see [netapp-harvest-preconditions.md](netapp-harvest-preconditions.md).
 
+## Fan-out per `/v1/k8s-graph` request
+
+The Kubernetes graph is the storage build with Harvest switched off: the same
+seeds, claim expansion, completions, chunk caps, routing and fail-closed rule
+for a `pod` or `node` root, and none of the NetApp reads. A pod root seeds from
+the claim bindings of its `(namespace, pod)` pairs; a node root seeds from
+`kube_pod_info{node}` plus incarnation completion, and — unlike the storage
+build, which follows only the pods that mount a claim — also loads every other
+pod whose newest incarnation runs on a root node, since the body draws them.
+
+```
+GET /v1/k8s-graph?start=&end=&cluster=&az=&env=&(pod|node)=&…
+        │
+        └─ ReadTopology (k8s plan) — ALERTS in the first wave, then the seed
+           and the storage expansion's Kubernetes half
+              issued, by reference as for /v1/storage-graph: ALERTS; the seed
+                (kube_pod_info{node} + incarnation completion, or the bindings
+                of the root pods); claim bindings by claim (mounter
+                completion); kube_persistentvolumeclaim_info,
+                kube_persistentvolumeclaim_annotations and the two kubelet
+                families per namespace on (namespace, persistentvolumeclaim);
+                kube_pod_info / kube_pod_owner for the loaded pods; the four
+                kube_node_* families for their nodes; the controller-owner and
+                controller-annotation families for their owners; and, when the
+                application-metadata metric is configured and served,
+                app_metadata restricted to the loaded namespaces
+              never issued: every NetApp Harvest family (volume_labels, the
+                aggr_* / node_* / qos_* legs and the six QoS workload legs),
+                kube_pod_container_info, kube_service_info,
+                kube_endpointslice_endpoints, kube_endpointslice_labels,
+                kube_service_annotations, traces_service_graph_*, up
+```
+
+A request-derived root set that would take more than the chunk cap of queries
+is `400 invalid_scope` before any query. **The build fails closed**: a query
+error of any family but `ALERTS` fails the request with HTTP 502
+`upstream query failed: <family>`; an `ALERTS` error yields an alert-less body;
+an empty vector is never a failure. There is no `outside_retention`
+classification, no `up{}` probe, and no last-build gauge is written. The
+per-family counts of the storage build above apply to the Kubernetes families
+of a `pod` or `node` root, minus the pod-wave widening of a node root.
+
 ## Query error vs empty vector
 
 The README **"Required?"** column answers "does an **empty vector** drop this

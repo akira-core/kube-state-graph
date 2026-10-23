@@ -364,9 +364,15 @@ func readTopology(
 		g.Go(signalWhenDone(signalWhenDone(func() error {
 			return readWorkloadClaims(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, bindingsDone, appDone)
 		}, pvcInfoDone), pvcAnnotationsDone))
-		g.Go(signalWhenDone(func() error {
-			return readWorkloadVolumeLabels(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone)
-		}, finalDone))
+		if plan.kubernetesOnly {
+			// No volume-label read follows: closing the signal up front lets the
+			// scoped QoS read compute an empty scope from the nil VolumeLabels.
+			close(finalDone)
+		} else {
+			g.Go(signalWhenDone(func() error {
+				return readWorkloadVolumeLabels(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone)
+			}, finalDone))
+		}
 		volumeLabelsFinal = finalDone
 	}
 	g.Go(func() error {
@@ -414,7 +420,7 @@ func readTopology(
 	} else {
 		close(flowlessDone)
 	}
-	if plan.tracksByReference() {
+	if plan.tracksByReference() && !plan.kubernetesOnly {
 		g.Go(func() error {
 			return readReachedHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone, volumeLabelsFinal, flowlessDone)
 		})

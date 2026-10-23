@@ -28,7 +28,9 @@ cluster N: kube-state-metrics ──┤
   [`docs/upstream-metrics.md`](docs/upstream-metrics.md).
 - Joins them into a multi-cluster graph keyed by cluster-scoped pod UIDs and
   node names.
-- Returns the graph as Cytoscape.js JSON (`/v1/graph`).
+- Returns the graph as Cytoscape.js JSON (`/v1/graph`), a storage-flow
+  view of it (`/v1/storage-graph`), and the Kubernetes-only neighbourhood of a
+  pod or node (`/v1/k8s-graph`).
 - The set of clusters with data is the `clusters` field of any `/v1/graph`
   response.
 - Builds the graph on every request — v1 ships **no in-process result cache**,
@@ -133,6 +135,42 @@ estate.
 > carry them: `?az=` selects which `harvest` backend is asked and the query
 > carries no matcher. A series that does carry the labels takes part in zone
 > preference. Its `cluster` is the ONTAP cluster.
+
+## Kubernetes graph around a pod or node
+
+`GET /v1/k8s-graph` returns the Kubernetes neighbourhood of a pod or a node —
+where the pods run, the claims they mount, and the namespace and ArgoCD
+Application each piece belongs to — in the same `{apiVersion, clusters,
+elements}` body as `/v1/graph`. It reads no NetApp, service or service-graph
+series.
+
+| Parameter | Required | Notes |
+|---|---|---|
+| `start`, `end` | yes | Validated and aligned exactly as on `/v1/graph`. |
+| `cluster` | yes | The **raw** cluster name, repeatable. A `clusters[]` identity sent here selects nothing (empty 200). |
+| `az`, `env` | yes | Repeatable. The selected cluster identities `<az>-<env>-<cluster>` are the Cartesian product of `cluster`, `az` and `env`. |
+| `pod` / `node` | exactly one kind | `pod=<namespace>/<name>`, or `node=<name>` (a Kubernetes node). Repeatable, OR-combined. None is `400 missing_root`; both is `400 invalid_scope`. |
+| `namespace` | no | Repeatable. Narrows the drawn pods and claims. |
+
+`prune` and every other parameter are ignored.
+
+Only what a root reaches is drawn: a pod when it is a root or runs on a root
+node, a claim when a drawn pod mounts it (an unmounted claim never is), a node
+when a drawn pod runs on it or it is a root. The other mounters of a shared
+claim are read — so the claim carries the same `data.application` as on
+`/v1/graph` — but are not drawn. A root no series names is absent, and an
+unmatched request is an empty `200`.
+
+The body carries `pod`, `node` and `pvc` nodes, `pod-to-node` and
+`pod-mounts-pvc` edges and the `cluster` / `namespace` / `application` /
+`controller` groups, with the attributes `/v1/storage-graph` gives them
+(`data.owner`, `data.application`, `data.ready_status`, `data.usage`,
+`data.storageclass`, `data.alerts`, `data.status`, group `namespace_owner` /
+`deployed_by`); there is no `data.containers`, `data.qos` or PVC
+`labels.aggr` / `labels.svm`. The build fails closed like `/v1/storage-graph`
+(`502 upstream query failed: <family>` for any family but `ALERTS`), and a root
+set past the query cap is `400 invalid_scope` before any query. In-process, use
+`kubegraph.Engine.BuildK8sFromValues`.
 
 ## Upstream metrics consumed
 

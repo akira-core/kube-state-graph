@@ -50,8 +50,9 @@ type Options struct {
 	// (so an embedder writing no option gets what the server runs with),
 	// negative ⇒ disabled, positive ⇒ that value.
 
-	// EndAlign is the grid BuildFromValues / BuildStorageFromValues floor a
-	// request's end to (see AlignWindow). Default DefaultEndAlign.
+	// EndAlign is the grid BuildFromValues / BuildStorageFromValues /
+	// BuildK8sFromValues floor a request's end to (see AlignWindow). Default
+	// DefaultEndAlign.
 	EndAlign time.Duration
 	// MaxConcurrency bounds upstream queries in flight when New is handed a
 	// plain Querier. Default promql.DefaultMaxConcurrency. Ignored for a
@@ -188,4 +189,32 @@ func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cyto
 		return cytoscape.Body{}, err
 	}
 	return cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope)), nil
+}
+
+// BuildK8s runs the Kubernetes-only build for [end-window, end] — topology
+// only, no Harvest and no service-graph read. sel carries the request-scoped
+// selector (cluster, az and env are always set for this endpoint). roots are
+// the request's one pod or node root, which seeds the by-reference read; any
+// other kind, or no value, is a build.ReasonInvalidScope error before a query.
+// Pass the SAME roots to graph.ProjectK8s, or the body cannot be scoped to them.
+func (e *Engine) BuildK8s(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots) (*graph.Graph, error) {
+	return e.builder.BuildK8s(ctx, window, end, sel, roots)
+}
+
+// BuildK8sFromValues parses the /v1/k8s-graph query parameters, builds the
+// Kubernetes-only graph, applies the root-reachability projection, and
+// serialises to the Cytoscape body. Parsing failures are *ParseError; build
+// failures propagate the build layer's typed errors. The HTTP handler uses the
+// same parser, so the request contract cannot drift.
+func (e *Engine) BuildK8sFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
+	req, err := ParseK8sValues(v)
+	if err != nil {
+		return cytoscape.Body{}, err
+	}
+	start, end := AlignWindow(req.Start, req.End, e.endAlign)
+	g, err := e.builder.BuildK8s(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots)
+	if err != nil {
+		return cytoscape.Body{}, err
+	}
+	return cytoscape.Serialise(g, graph.ProjectK8s(g, req.Scope)), nil
 }

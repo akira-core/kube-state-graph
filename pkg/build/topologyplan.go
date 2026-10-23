@@ -179,6 +179,11 @@ type topologyPlan struct {
 	// nodes, controllers, the application recovery, the rooted volume-label
 	// read) fails closed unconditionally.
 	failClosed bool
+	// kubernetesOnly switches every Harvest read off: readTopology launches
+	// neither the workload volume-label completion nor the reached-Harvest
+	// wave, and closes the signal the scoped QoS read waits on up front, so that
+	// read computes an empty scope and issues nothing. Only k8sPlan sets it.
+	kubernetesOnly bool
 
 	// phaseOne is the Harvest seed's phase-1 read, rendered, in (group, chunk)
 	// order. Non-empty means this build reads volume_labels from the root and
@@ -226,6 +231,32 @@ var storageSkippedLegs = map[promql.Query]bool{
 	// The unscoped graph leg. Storage reads this family from the loaded
 	// namespaces (readScopedAppMetadata), so the first-wave copy must not run.
 	promql.QAppMetadata: true,
+}
+
+// k8sSkippedLegs are the families a Kubernetes-only body cannot carry: every
+// storage-flow skip plus every Harvest first-wave leg, derived from
+// topologyLegs and promql.FamilyOf so a Harvest leg added there is skipped here
+// with no edit. Under a by-reference plan none of them reaches the first wave
+// anyway; skipping them keeps the plan honest for a caller that clears the seed
+// (the parity control).
+var k8sSkippedLegs = func() map[promql.Query]bool {
+	skip := maps.Clone(storageSkippedLegs)
+	for _, l := range topologyLegs(&topologyVectors{}, nil) {
+		if fam, _ := promql.FamilyOf(l.query); fam == promql.FamilyHarvest {
+			skip[l.query] = true
+		}
+	}
+	return skip
+}()
+
+// k8sPlan is the /v1/k8s-graph read for a pod or node root: the storage plan,
+// so the seeds, the expansion, the chunk caps and the fail-closed rule cannot
+// drift between the two endpoints, with every Harvest read switched off.
+func k8sPlan(roots graph.StorageRoots) topologyPlan {
+	plan := storagePlan(roots)
+	plan.skip = k8sSkippedLegs
+	plan.kubernetesOnly = true
+	return plan
 }
 
 // storagePlan is the /v1/storage-graph read for one request's root kind.

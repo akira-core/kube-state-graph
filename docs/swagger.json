@@ -629,6 +629,182 @@
                 ]
             }
         },
+        "/v1/k8s-graph": {
+            "get": {
+                "description": "Returns the Kubernetes neighbourhood of one or more pods or nodes — the pods, the node they run on and the claims they mount, with their namespace and ArgoCD Application grouping — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`. No NetApp (Harvest), service or call data is read or drawn.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus `cluster`, `az` and `env`, each at least once and repeatable (400 `missing_cluster` / `missing_az` / `missing_env` when absent, checked in that order before the root), plus exactly one root kind, `pod` or `node` (400 `missing_root` when none; 400 `invalid_scope` naming both when both). The selected cluster identities `\u003caz\u003e-\u003cenv\u003e-\u003ccluster\u003e` are the Cartesian product of the three value sets, so `az=a\u0026az=b\u0026cluster=c1\u0026cluster=c2` selects four; to select fewer, send one request per combination. `cluster` is the RAW cluster name, as on `/v1/graph`: a `clusters[]` identity sent back as `cluster` selects nothing and returns an empty 200.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `pod=\u003cnamespace\u003e/\u003cname\u003e` and `node` (a Kubernetes node). Only what a root reaches is drawn: a pod iff it is a root or runs on a root node; a claim iff a drawn pod mounts it (an unmounted claim is never drawn); a node iff a drawn pod runs on it or it is a root. A root the upstream names is drawn even when it reaches nothing else (an unscheduled pod, a node no pod runs on); a root no series names is simply absent, and an unmatched request is an empty 200. The other mounters of a shared claim are read, so the claim carries the same `data.application` as on `/v1/graph`, but are not drawn.\n\n`namespace` is an optional repeatable filter narrowing the drawn pods and claims. The body carries `pod`, `node` and `pvc` nodes, `pod-to-node` and `pod-mounts-pvc` edges and the `cluster` / `namespace` / `application` / `controller` groups, with the attributes `/v1/storage-graph` gives them; no `data.containers`, `data.qos`, or PVC `labels.aggr` / `labels.svm`. `prune` and every other parameter are ignored.\n\n**Fails closed**: a query of any family except `ALERTS` that errors fails the request (502 `upstream query failed: \u003cfamily\u003e`); an `ALERTS` error yields an alert-less body. A root set that would take more queries than the cap is 400 `invalid_scope` before any query. Auth and timeout (504) match `/v1/graph`.",
+                "parameters": [
+                    {
+                        "description": "Window start. RFC 3339 or Unix seconds.",
+                        "example": "2026-05-01T12:00:00Z",
+                        "in": "query",
+                        "name": "start",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "description": "Window end. Must be \u003e start. Floored to the server's --end-align grid, start shifted equally.",
+                        "example": "2026-05-01T12:05:00Z",
+                        "in": "query",
+                        "name": "end",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "description": "RAW Kubernetes cluster name (required, repeatable). Not a `clusters[]` identity. Several values are OR-combined and form a Cartesian product with `az` and `env`.",
+                        "example": "c1",
+                        "in": "query",
+                        "name": "cluster",
+                        "required": true,
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Availability zone (required, repeatable). Narrows every query and selects the backends each is sent to.",
+                        "example": "zone-a",
+                        "in": "query",
+                        "name": "az",
+                        "required": true,
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Environment (required, repeatable). Narrows every query.",
+                        "example": "prod",
+                        "in": "query",
+                        "name": "env",
+                        "required": true,
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Restrict the drawn pods and claims to the listed namespaces (repeatable, OR-combined).",
+                        "in": "query",
+                        "name": "namespace",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: `\u003cnamespace\u003e/\u003cpod-name\u003e`. Not combinable with `node`.",
+                        "example": "shop/orders-0",
+                        "in": "query",
+                        "name": "pod",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "Root kind: Kubernetes node name. Every pod running on it is drawn. Not combinable with `pod`.",
+                        "example": "worker-1",
+                        "in": "query",
+                        "name": "node",
+                        "schema": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "style": "form"
+                    },
+                    {
+                        "description": "API key. Required when the server is started with API keys configured.",
+                        "in": "header",
+                        "name": "X-API-Key",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/github_com_akira-core_kube-state-graph_pkg_cytoscape.Body"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Invalid parameters (missing/invalid start|end, missing_cluster, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Missing or invalid `X-API-Key` (only when API key auth is configured)"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "An upstream query of ANY family except ALERTS returned an error; the message names the family (`upstream query failed: \u003cfamily\u003e`)"
+                    },
+                    "504": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Build exceeded --build-timeout"
+                    }
+                },
+                "security": [
+                    {
+                        "ApiKeyAuth": []
+                    }
+                ],
+                "summary": "Get Kubernetes graph around a pod or node (Cytoscape.js)",
+                "tags": [
+                    "graph"
+                ]
+            }
+        },
         "/v1/storage-graph": {
             "get": {
                 "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus `az` and `env`, each at least once and repeatable (400 `missing_az` / `missing_env` when absent), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. The selected zones are the Cartesian product of the two value sets: every Kubernetes and `ALERTS` query is narrowed to them. Harvest is routed by `az` and carries no request matcher; every query is still sent only to the backends serving the selected `az` values. The body is the union of the single-zone bodies: no node merges across zones, and a claim prefers FlexVols of its own zone, falling back to every matched series when none agree.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (the bare form roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's component; the two forms may be mixed, and `ontap_cluster=` does not qualify them — it is a separate root kind), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `pvc=\u003cnamespace\u003e/\u003cclaim-name\u003e` (a PersistentVolumeClaim, in every cluster of the estate), `pv` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included), `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own. A `pvc` / `pv` root claim that no pod mounts keeps its storage-side path (controller → aggregate → SVM → claim) and its whole measurement rides that path with no `pvc-pod` edge; an unmounted claim that is not a root stays dropped under every root kind.\n\n**Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner` / `deployed_by` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).\n\n`cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",

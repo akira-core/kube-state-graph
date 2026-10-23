@@ -284,6 +284,21 @@ type topologyVectors struct {
 	// addExtraSeries under the same mutex as ScopeIssued.
 	ExtraSeriesCount map[promql.Query]int
 
+	// RootNodePods are the pods whose newest incarnation runs on a node root,
+	// claim-mounting or not. Only a Kubernetes-only build (topologyPlan.
+	// kubernetesOnly) writes it: the storage body draws a pod through the claims
+	// it mounts, so its node seed carries claimless pods no further, but a
+	// Kubernetes graph of a node draws everything that runs there. The pod wave
+	// adds these to its scope. Written by readNodeSeed before bindingsDone
+	// closes and read by readScopedPods after waiting on it, so it needs no lock.
+	RootNodePods []podSeriesKey
+	// RootNodePodInfo are the kube_pod_info rows of RootNodePods, every
+	// incarnation of each, kept from the node seed's incarnation completion. That
+	// read is the pod wave's own query over the same (namespace, pod) pairs, so
+	// the pod wave reuses these rows instead of issuing it again. Written and
+	// read under the same ordering as RootNodePods.
+	RootNodePodInfo model.Vector
+
 	// VolumeKey derives each claim's Harvest match token from its bound PV
 	// name and decides how that token is compared against the stock `volume`
 	// label. Like JobAnnotationsDegraded it is a build-scoped FACT rather than

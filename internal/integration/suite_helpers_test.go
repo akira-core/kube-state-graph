@@ -38,6 +38,22 @@ func (s *VMSuite) storageGraphURL(srv string, configureQuery func(url.Values)) s
 	return srv + "/v1/storage-graph?" + q.Encode()
 }
 
+// k8sGraphURL builds a /v1/k8s-graph URL. cluster, az and env are required by
+// the endpoint and default to c1 / zone-a / prod; configureQuery may override
+// them or add the root.
+func (s *VMSuite) k8sGraphURL(srv string, configureQuery func(url.Values)) string {
+	q := url.Values{}
+	q.Set("start", strconv.FormatInt(fixedNow.Add(-5*time.Minute).Unix(), 10))
+	q.Set("end", strconv.FormatInt(fixedNow.Unix(), 10))
+	q.Set("cluster", "c1")
+	q.Set("az", "zone-a")
+	q.Set("env", "prod")
+	if configureQuery != nil {
+		configureQuery(q)
+	}
+	return srv + "/v1/k8s-graph?" + q.Encode()
+}
+
 // httpGet issues a GET against the API server under test (NOT the VM
 // container — VM traffic goes through vmGet, which authenticates).
 func (s *VMSuite) httpGet(rawURL string) *http.Response {

@@ -83,19 +83,8 @@ func (s *Server) handleGraph(c *gin.Context) {
 	if errBody != nil {
 		return
 	}
-	g, err := s.runBuild(c.Request.Context(), req.start, req.end, req.sel, s.builder.Build)
-	if err != nil {
-		s.mapBuildError(c, err)
-		return
-	}
-
-	view := s.projectWithSpan(c.Request.Context(), "kube-state-graph.project", func() graph.View {
-		return graph.Project(g, req.scope)
-	})
-	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
-		return cytoscape.Serialise(g, view)
-	}, view)
-	s.writeJSON(c, body, "cytoscape")
+	s.serveGraph(c, req.start, req.end, req.sel, s.builder.Build, "kube-state-graph.project",
+		func(g *graph.Graph) graph.View { return graph.Project(g, req.scope) })
 }
 
 // handleStorageGraph returns the storage-flow graph for [start,end].
@@ -140,18 +129,74 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 	if errBody != nil {
 		return
 	}
-	g, err := s.runBuild(c.Request.Context(), req.Start, req.End, req.Selector,
+	s.serveGraph(c, req.Start, req.End, req.Selector,
 		func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
 			// The roots reach the build: a pod root's name joins the pod scope.
 			return s.builder.BuildStorage(ctx, window, end, sel, req.Scope.Roots)
-		})
+		},
+		"kube-state-graph.project_storage",
+		func(g *graph.Graph) graph.View { return graph.ProjectStorage(g, req.Scope) })
+}
+
+// handleK8sGraph returns the Kubernetes-only graph around a pod or node root
+// for [start,end].
+//
+//	@Summary		Get Kubernetes graph around a pod or node (Cytoscape.js)
+//	@Description	Returns the Kubernetes neighbourhood of one or more pods or nodes — the pods, the node they run on and the claims they mount, with their namespace and ArgoCD Application grouping — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`. No NetApp (Harvest), service or call data is read or drawn.
+//	@Description
+//	@Description	**Required**: `start`, `end` (same validation as `/v1/graph`), plus `cluster`, `az` and `env`, each at least once and repeatable (400 `missing_cluster` / `missing_az` / `missing_env` when absent, checked in that order before the root), plus exactly one root kind, `pod` or `node` (400 `missing_root` when none; 400 `invalid_scope` naming both when both). The selected cluster identities `<az>-<env>-<cluster>` are the Cartesian product of the three value sets, so `az=a&az=b&cluster=c1&cluster=c2` selects four; to select fewer, send one request per combination. `cluster` is the RAW cluster name, as on `/v1/graph`: a `clusters[]` identity sent back as `cluster` selects nothing and returns an empty 200.
+//	@Description
+//	@Description	**Roots** (exactly one kind, repeatable values OR-combined): `pod=<namespace>/<name>` and `node` (a Kubernetes node). Only what a root reaches is drawn: a pod iff it is a root or runs on a root node; a claim iff a drawn pod mounts it (an unmounted claim is never drawn); a node iff a drawn pod runs on it or it is a root. A root the upstream names is drawn even when it reaches nothing else (an unscheduled pod, a node no pod runs on); a root no series names is simply absent, and an unmatched request is an empty 200. The other mounters of a shared claim are read, so the claim carries the same `data.application` as on `/v1/graph`, but are not drawn.
+//	@Description
+//	@Description	`namespace` is an optional repeatable filter narrowing the drawn pods and claims. The body carries `pod`, `node` and `pvc` nodes, `pod-to-node` and `pod-mounts-pvc` edges and the `cluster` / `namespace` / `application` / `controller` groups, with the attributes `/v1/storage-graph` gives them; no `data.containers`, `data.qos`, or PVC `labels.aggr` / `labels.svm`. `prune` and every other parameter are ignored.
+//	@Description
+//	@Description	**Fails closed**: a query of any family except `ALERTS` that errors fails the request (502 `upstream query failed: <family>`); an `ALERTS` error yields an alert-less body. A root set that would take more queries than the cap is 400 `invalid_scope` before any query. Auth and timeout (504) match `/v1/graph`.
+//	@Tags			graph
+//	@Produce		json
+//	@Param			start		query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
+//	@Param			end			query		string		true	"Window end. Must be > start. Floored to the server's --end-align grid, start shifted equally."	example(2026-05-01T12:05:00Z)
+//	@Param			cluster		query		[]string	true	"RAW Kubernetes cluster name (required, repeatable). Not a `clusters[]` identity. Several values are OR-combined and form a Cartesian product with `az` and `env`."	collectionFormat(multi)	example(c1)
+//	@Param			az			query		[]string	true	"Availability zone (required, repeatable). Narrows every query and selects the backends each is sent to."	collectionFormat(multi)	example(zone-a)
+//	@Param			env			query		[]string	true	"Environment (required, repeatable). Narrows every query."	collectionFormat(multi)	example(prod)
+//	@Param			namespace	query		[]string	false	"Restrict the drawn pods and claims to the listed namespaces (repeatable, OR-combined)."	collectionFormat(multi)
+//	@Param			pod			query		[]string	false	"Root kind: `<namespace>/<pod-name>`. Not combinable with `node`."	collectionFormat(multi)	example(shop/orders-0)
+//	@Param			node		query		[]string	false	"Root kind: Kubernetes node name. Every pod running on it is drawn. Not combinable with `pod`."	collectionFormat(multi)	example(worker-1)
+//	@Param			X-API-Key	header		string		false	"API key. Required when the server is started with API keys configured."
+//	@Success		200			{object}	cytoscape.Body
+//	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_cluster, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
+//	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
+//	@Failure		502			{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error; the message names the family (`upstream query failed: <family>`)"
+//	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout"
+//	@Security		ApiKeyAuth
+//	@Router			/v1/k8s-graph [get]
+func (s *Server) handleK8sGraph(c *gin.Context) {
+	req, errBody := s.parseK8sGraphRequest(c)
+	if errBody != nil {
+		return
+	}
+	s.serveGraph(c, req.Start, req.End, req.Selector,
+		func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
+			return s.builder.BuildK8s(ctx, window, end, sel, req.Scope.Roots)
+		},
+		"kube-state-graph.project_k8s",
+		func(g *graph.Graph) graph.View { return graph.ProjectK8s(g, req.Scope) })
+}
+
+// serveGraph is everything a graph endpoint does after parsing its request:
+// the build under runBuild, the projection in a span named projectSpan, the
+// Cytoscape serialisation and the write. The endpoints differ only in their
+// build and projection, so the error mapping, spans and metrics cannot drift
+// between them.
+func (s *Server) serveGraph(c *gin.Context, start, end time.Time, sel promql.Selector, run buildFunc,
+	projectSpan string, project func(*graph.Graph) graph.View) {
+	g, err := s.runBuild(c.Request.Context(), start, end, sel, run)
 	if err != nil {
 		s.mapBuildError(c, err)
 		return
 	}
 
-	view := s.projectWithSpan(c.Request.Context(), "kube-state-graph.project_storage", func() graph.View {
-		return graph.ProjectStorage(g, req.Scope)
+	view := s.projectWithSpan(c.Request.Context(), projectSpan, func() graph.View {
+		return project(g)
 	})
 	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
 		return cytoscape.Serialise(g, view)
@@ -159,9 +204,9 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 	s.writeJSON(c, body, "cytoscape")
 }
 
-// projectWithSpan wraps a projection callback (graph.Project or
-// graph.ProjectStorage) in a span of the given name, timing it into the
-// shared ProjectDuration histogram.
+// projectWithSpan wraps a projection callback (graph.Project, ProjectStorage
+// or ProjectK8s) in a span of the given name, timing it into the shared
+// ProjectDuration histogram.
 func (s *Server) projectWithSpan(ctx context.Context, spanName string, project func() graph.View) graph.View {
 	_, span := telemetry.Tracer().Start(ctx, spanName)
 	defer span.End()
@@ -190,8 +235,8 @@ func (s *Server) serialiseWithSpan(ctx context.Context, format string, fn func()
 }
 
 // buildFunc is the shape shared by Builder.Build and a closure binding the
-// request's roots into Builder.BuildStorage, so one runBuild serves both
-// endpoints and the timeout normalisation cannot drift between them.
+// request's roots into Builder.BuildStorage / BuildK8s, so one runBuild serves
+// every graph endpoint and the timeout normalisation cannot drift between them.
 type buildFunc func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error)
 
 // runBuild wraps a build in a per-request build-timeout context. On
@@ -199,8 +244,8 @@ type buildFunc func(ctx context.Context, window time.Duration, end time.Time, se
 // the handler-side mapBuildError surfaces the RFC 9110 §15.6.5 status.
 //
 // start/end arrive already validated; they are aligned to --end-align HERE, the
-// one point both graph endpoints pass through, so validation errors always
-// name the caller's own values and the two endpoints cannot align differently.
+// one point every graph endpoint passes through, so validation errors always
+// name the caller's own values and the endpoints cannot align differently.
 func (s *Server) runBuild(ctx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
 	start, end = kubegraph.AlignWindow(start, end, s.cfg.EndAlign)
 	buildCtx, cancel := context.WithTimeoutCause(ctx, s.cfg.BuildTimeout, errBuildTimeout)
@@ -239,6 +284,18 @@ func (s *Server) parseStorageGraphRequest(c *gin.Context) (kubegraph.StorageRequ
 	if err != nil {
 		writeParseError(c, err)
 		return kubegraph.StorageRequest{}, err
+	}
+	return req, nil
+}
+
+// parseK8sGraphRequest delegates to the shared kubegraph.ParseK8sValues and
+// maps a *kubegraph.ParseError to the HTTP 400 response exactly as
+// parseGraphRequest does.
+func (s *Server) parseK8sGraphRequest(c *gin.Context) (kubegraph.K8sRequest, error) {
+	req, err := kubegraph.ParseK8sValues(c.Request.URL.Query())
+	if err != nil {
+		writeParseError(c, err)
+		return kubegraph.K8sRequest{}, err
 	}
 	return req, nil
 }

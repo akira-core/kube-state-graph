@@ -20,8 +20,8 @@ import (
 // merged vector lands in.
 //
 // There is no per-family error class. Only a by-reference plan — the
-// /v1/storage-graph read — issues these waves, and that endpoint fails
-// closed on every query error but ALERTS (fail-storage-graph-on-any-leg-error),
+// /v1/storage-graph and /v1/k8s-graph reads — issues these waves, and both
+// endpoints fail closed on every query error but ALERTS (fail-storage-graph-on-any-leg-error),
 // so a chunk error of ANY family here fails the build — including
 // kube_replicaset_annotations and kube_job_annotations, which /v1/graph's
 // first wave reads as degrading families.
