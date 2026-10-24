@@ -4,7 +4,7 @@
 
 ### Requirement: Reads by reference, Kubernetes families only
 
-The build SHALL walk from the root and read every family by reference — each read restricted to the names the root or an earlier read carries — with the seeds' first reads, root-set caps, mounter completion and fail-closed rule `/v1/storage-graph` applies to a `pod` or `node` root, and additionally every pod running on a `node` root. It SHALL NOT issue a Harvest, `kube_service_info`, `kube_endpointslice_*`, `kube_service_annotations`, `kube_pod_container_info`, `traces_service_graph_*` or `up` query.
+The build SHALL walk from the root and read every family by reference — each read restricted to the names the root or an earlier read carries — with the seeds' first reads, root-set caps, mounter completion and fail-closed rule `/v1/storage-graph` applies to a `pod` or `node` root, and additionally every pod running on a `node` root. It SHALL NOT issue a Harvest, service-side, container, service-graph or `up` query.
 
 #### Scenario: Node root query set
 
