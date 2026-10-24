@@ -10,8 +10,8 @@ import (
 // Cross-cluster classification must reflect the connection-string + route-
 // engine model: pod-calls-service is registry-declared MayCrossCluster=true
 // (a route-engine-resolved endpoint anchors on the selected ingress cluster,
-// which may be a family sibling), so its edges bucket per-edge by the D9
-// labels.cluster comparison — a D29 connection-string edge (local Service
+// which may be a family sibling), so its edges bucket per-edge by the
+// labels.cluster comparison — a connection-string edge (local Service
 // node) still buckets "false", a route-engine cross-cluster edge buckets
 // "true". service-selects-pod fans out across same-family clusters and MAY
 // cross (registry MayCrossCluster=true). The buckets are registry-driven,
@@ -28,7 +28,7 @@ func TestEdgeCountByType_CrossClusterBuckets(t *testing.T) {
 	edges := []*Edge{
 		// Cross-cluster pod-calls-pod (server pod recovered via UID index).
 		NewEdge(EdgeTypePodCallsPod, clientPod.IDValue, remotePod.IDValue, map[string]string{"cluster": "prod-1"}),
-		// Intra-cluster pod-calls-service: the D29 connection-string path always
+		// Intra-cluster pod-calls-service: the connection-string path always
 		// materialises the Service node in the caller's own cluster.
 		NewEdge(EdgeTypePodCallsService, clientPod.IDValue, localSvc.IDValue, map[string]string{"cluster": "prod-1"}),
 		// Cross-cluster pod-calls-service: a route-engine hit anchored on the

@@ -6,8 +6,8 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/build"
 )
 
-// TestPickIngressCluster drives the full design-D10 decision table plus the
-// multi-IP agreement merge (the plan's T-matrix). caller defaults to
+// TestPickIngressCluster drives the full ingress-cluster decision table plus the
+// multi-IP agreement merge. caller defaults to
 // "prod-01"; family membership follows build.ClusterFamilyKey (digit-run →
 // '0' sentinel), so prod-01/prod-02/prod-03 are one family and staging-01 is
 // another.

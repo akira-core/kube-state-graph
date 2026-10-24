@@ -110,8 +110,8 @@ func TestProject_NamespaceFilter(t *testing.T) {
 	}
 }
 
-// Namespace filter retains a K8sNode iff an in-scope pod is scheduled on it
-// (design.md D31). K8s nodes carry no namespace label of their own, so rather
+// Namespace filter retains a K8sNode iff an in-scope pod is scheduled on it.
+// K8s nodes carry no namespace label of their own, so rather
 // than dropping every node under a namespace filter, a node is kept when some
 // pod that survived the namespace filter is hosted on it (labels.node). This
 // restores the cluster>node>pod nesting for nodes relevant to the filtered
@@ -141,11 +141,11 @@ func TestProject_NamespaceFilter_KeepsHostingK8sNode(t *testing.T) {
 }
 
 // A K8sNode hosting no pod at all can never have an in-scope pod, so it drops
-// under a namespace filter (and, per the generalised D6 rule, under no filter
+// under a namespace filter (and, per the generalised infra-node rule, under no filter
 // too — see TestProject_NoFilter_DropsUnreferencedInfraNodes).
 func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 	// p1 and p2 are connectivity-connected (pod-calls-pod) so they survive the
-	// default prune; the test isolates the D6 podless-node rule.
+	// default prune; the test isolates the podless-node rule.
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
 		&PodNode{IDValue: "c/p2", NameValue: "api", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},
@@ -163,12 +163,12 @@ func TestProject_NamespaceFilter_DropsPodlessK8sNode(t *testing.T) {
 	assert.False(t, ids["c/worker-1"], "podless node drops under a namespace filter")
 }
 
-// Generalised D6: an infra node (K8s node or StorageClass) referenced by NO
+// Generalised infra-node rule: an infra node (K8s node or StorageClass) referenced by NO
 // in-scope element is dropped from EVERY request shape — including the
 // default no-filter view. A node only appears as the host of a pod in the graph.
 func TestProject_NoFilter_DropsUnreferencedInfraNodes(t *testing.T) {
 	// p1 is connectivity-connected (pod-calls-pod with p2) and mounts the `data`
-	// PVC, so both survive the default prune; the test isolates the D6
+	// PVC, so both survive the default prune; the test isolates the
 	// unreferenced-infra rule (worker-1 hosts nothing, `unused` backs nothing).
 	all := []GraphNode{
 		&PodNode{IDValue: "c/p1", NameValue: "web", LabelsValue: map[string]string{"cluster": "c", "namespace": "shop", "node": "c/worker-0"}},

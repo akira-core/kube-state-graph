@@ -91,7 +91,7 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.NotContains(string(rawSVM), `"status"`, "SVM status key must be absent")
 	s.assertNoStrayStorageFlowLabels(aggrBody)
 
-	// expose-claim-aggregate: svm_shop spans aggr1 (shared-data) and aggr2
+	// Claim aggregate: svm_shop spans aggr1 (shared-data) and aggr2
 	// (catalog-data). `?aggr=aggr1` retains only shared-data; `?svm=svm_shop`
 	// retains both claims, each naming its own aggregate.
 	shared := byID[graph.PVCID(ident, "shop", "shared-data")]
@@ -116,7 +116,7 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 	s.Contains(nodesByID(podBody), ident+"/uid-rwx-0")
 	s.NotContains(nodesByID(podBody), ident+"/uid-rwx-1", "the other RWX mounter is not this pod root")
 
-	// harden-topology-read-cardinality: the storage build never reads the
+	// The storage build never reads the
 	// container family, and reads pods by reference.
 	for _, n := range podBody.Elements.Nodes {
 		s.Empty(n.Data.Containers, "a storage-graph node never carries data.containers (%s)", n.Data.ID)
@@ -156,7 +156,7 @@ ALERTS{alertname="NetAppAggregateFilling",alertstate="firing",severity="critical
 // TestStorageGraph_RootedVolumeLabelsMatchTheWholeFilerRead proves, against a
 // real VictoriaMetrics, that restricting the volume-label topology read to the
 // request's rooted components — and recovering each matched claim's candidate
-// set in a second phase — keeps the clone pick (scope-volume-labels-by-storage-root).
+// set in a second phase — keeps the clone pick.
 //
 // The fixture is the hazard the second phase exists for: the claim's token
 // (pvc_rv) ends BOTH trident_pvc_rv on rv-aggr9 and a clone
@@ -276,8 +276,8 @@ func (s *GraphSuite) assertStorageRejected(base string, configure func(url.Value
 	s.Equal(reason, body.Error.Reason)
 }
 
-// TestStorageGraph_ByReferenceControllersAndNodes proves the
-// scope-controller-legs-by-reference waves against a real VictoriaMetrics: a
+// TestStorageGraph_ByReferenceControllersAndNodes proves the by-reference
+// controller and node waves against a real VictoriaMetrics: a
 // `node=` root naming a Kubernetes node no pod is scheduled on is still
 // drawn, and a Job-owned pod with no annotation of its own resolves its
 // ArgoCD Application through kube_job_owner -> kube_cronjob_annotations.

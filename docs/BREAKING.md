@@ -368,7 +368,7 @@ a request with no application root. `ParseStorageValues` fills the field from
 
 ## Non-breaking: a storage-rooted request restricts the `volume_labels` read
 
-*storage-graph-api — Storage-side roots narrow the Harvest topology read (scope-volume-labels-by-storage-root)*
+*storage-graph-api — Storage-side roots narrow the Harvest topology read*
 
 Not a compatibility break: every `/v1/storage-graph` body is byte-identical to
 today's for an estate whose aggregates and controllers are each named by their
@@ -415,7 +415,7 @@ Harvest templates name every one.
 
 ## Non-breaking: storage build reads Kubernetes nodes and controllers by reference
 
-*storage-graph-api — Storage build reads only what it draws (scope-controller-legs-by-reference)*
+*storage-graph-api — Storage build reads only what it draws*
 
 Not a compatibility break: every `/v1/storage-graph` body is byte-identical to
 today's. What changes is which upstream queries the build issues and how they
@@ -565,7 +565,7 @@ ignored `edge_type`.
 
 ## In-process embedder (`pkg/`) signature changes
 
-D32 embedders must update call sites — a silently-ignored argument would
+In-process embedders must update call sites — a silently-ignored argument would
 reproduce in Go the inert control this removal exists to prevent:
 
 | Before | After |
@@ -802,7 +802,7 @@ a live dimension reaches returned nothing.
 
 ## In-process embedder (`pkg/`) signature changes
 
-D32 embedders must update call sites:
+In-process embedders must update call sites:
 
 | Before | After |
 |---|---|
@@ -933,7 +933,7 @@ node type, edge type, `labels` key, request parameter, or HTTP route changes.
 
 # NOT breaking — upstream backend routing
 
-`add-multi-backend-query-routing` lets one process assemble a graph from several
+Multi-backend query routing lets one process assemble a graph from several
 Prometheus-compatible installations, selected by availability zone and by metric
 family. It is recorded here because it changes how the upstream is *configured*
 and adds one operational behaviour change — but **no client-visible contract

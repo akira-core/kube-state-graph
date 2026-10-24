@@ -80,7 +80,7 @@ var edgeNamespace = uuid.MustParse("4f6a3f9c-9d7e-5d8b-9b14-3a3f0a9e2c11")
 // UID-resolved pod-to-pod edge. Numeric values NEVER enter Labels — same
 // precedent as node ipaddress / owner / ready_status.
 //
-// Absent-vs-zero contract (design D2):
+// Absent-vs-zero contract:
 //   - Rate is required and always > 0 when the struct is present (a zero-rate
 //     series never produces an edge).
 //   - ErrorRate is nil when the failure counter could not be read (query
@@ -116,9 +116,9 @@ type Edge struct {
 //
 // MaxIOPS / MaxBytesPerSec can only be set for an edge that already carries at
 // least one measurement. The ceiling is keyed on hop A's (ontap cluster, svm)
-// pair, so it does NOT ride on a workload series any more (design.md D9); the
+// pair, so it does NOT ride on a workload series any more; the
 // invariant is upheld structurally instead — the builder attaches the ceiling
-// only inside its matched-workload branch (design.md D3 hop C).
+// only inside its matched-workload branch (hop C of the storage join).
 // MaxBytesPerSec is the one converted value in the struct — the policy's
 // megabytes-per-second figure scaled to bytes per second so it shares the unit
 // of ReadBytesPerSec / WriteBytesPerSec.

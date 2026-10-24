@@ -12,15 +12,14 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
 ## Route engine
 
 - **Istio route resolution of global FQDN peers**
-  (translate-global-fqdn-to-k8s-service, OPT-IN — off by default): the ONE
+  (OPT-IN — off by default): the ONE
   step added to the unknown-server peer-label enrichment
   (`service-graph-resolution.md`). When `--route-store-dsn` /
   `KSG_ROUTE_STORE_DSN` is set, every point where `resolveUnknownServerPeer`
   would emit an external node first consults an Istio route-resolution engine:
   which Kubernetes Service did the **engine-selected ingress cluster's** Gateway
   + VirtualService config route `(host, "/", port)` to **at the END of the
-  request's own window** (simplify-route-resolution-to-point-in-time D1 — a
-  single as-of instant, never a per-version range; `RouteRequest.At`, the same
+  request's own window** (a single as-of instant, never a per-version range; `RouteRequest.At`, the same
   instant the service-graph samples are evaluated at, so exactly ONE
   configuration state is consulted and ONE outcome produced)? A hit resolves
   through the SAME `resolveServiceLevel` as every
@@ -34,7 +33,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   (3 labels) is *successfully* classified (service `example`, namespace `com`)
   and reaches external via the anchor-lacks-service branch; wiring only the
   unclassifiable branch makes the feature a silent no-op for its motivating
-  case. **(2) I/O stays out of the parse** (D6): `ReadServiceGraph` runs a pure
+  case. **(2) I/O stays out of the parse**: `ReadServiceGraph` runs a pure
   prescan (`collectRouteQueries`, sharing `classifyPeerHost` /
   `lookupClientPod` / `anchorHolds` with the parse — and, in `ReadServiceGraph`,
   the very same `sgResolver` instance, so the two cannot drift and the topology
@@ -47,7 +46,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `routeKey` and independent); it changes only which keys are answered when
   the build deadline fires first, which is wall-clock dependent under any
   schedule. **(3) Listener port
-  precedence** (D5): the `:<port>` on the peer-address value (returned by
+  precedence**: the `:<port>` on the peer-address value (returned by
   `splitPeerAddressPort`) → the optional
   `client_server_port` / `client_net_peer_port` dimension → default **443**
   (a :443-only Gateway or an httpsRedirect :80 stub is the common ingress
@@ -66,11 +65,11 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `no_listener_on_port` and `no_route`) without a translate round-trip —
   istiod builds vhosts from the server-hosts ∩ VS-hosts intersection, so such
   a request could only ever reach an empty `RouteNoRoute`.
-  **(4) The `client_dns_answers` dimension is REQUIRED** (D6 rev): its IPs
+  **(4) The `client_dns_answers` dimension is REQUIRED**: its IPs
   select the ingress cluster and feed the ClickHouse IP 3-hop; no parseable IP
   ⇒ the engine is NEVER consulted (prescan skip, no store read, distinct
   `route_engine_no_ip` reason) — config_only mode and `LoadConfigWindow` were
-  removed. **(4b) Ingress-cluster selection** (D10, `pickIngressCluster` — a
+  removed. **(4b) Ingress-cluster selection** (`pickIngressCluster` — a
   pure function in `pkg/route`): per IP, the store probe
   `ClustersWithIngressIP` (the store's ONLY cross-cluster read) yields the
   candidate clusters G; F = G ∩ caller's family (`build.ClusterFamilyKey`,
@@ -82,7 +81,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
   `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
   The `ClustersWithIngressIP` probe is a pure function of `(ip, at)` (both
-  constant across a build's keys), so it is **memoised per build** (D13): when
+  constant across a build's keys), so it is **memoised per build**: when
   the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
   (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
   drives the whole build through one `scopedResolver` scope that caches the
@@ -124,7 +123,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   binary (`--router-check-bin`; copied into the image from the Envoy tools
   image; ~50–60 ms per config — one translate + one check per resolution, so
   there is no segment loop and no config-signature cache). **Hop 3 is
-  namespace-scoped** (scope-gateway-candidates-to-ingress-namespace): a
+  namespace-scoped**: a
   candidate Gateway must live in the ingress Service's OWN namespace —
   enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1
   nsList, like the deploy hop) and the in-memory hop
@@ -151,7 +150,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   pattern resolve to the **lexically-smallest gateway name**
   (`gwresolve.sortPats` tie-break; `PickHosts`' numeric-index semantics
   unchanged), never to storage row order.
-  **(5b) Ingress LB Service fallback** (ingress-lb-service-fallback change):
+  **(5b) Ingress LB Service fallback**:
   when the pipeline produces no hit AND its miss is exactly
   `RouteNoGateway` (resolution never got past gateway selection — the nginx
   signature: Hop 3 finds no Istio Gateway CR; a DEEPER miss keeps its
@@ -169,15 +168,14 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   materialisation as `resolveServiceLevel` but with a **locked-cluster
   `service-selects-pod` fan-out** (the selected cluster's own endpoints ONLY,
   no family union — an LB IP is a per-cluster address, so a family sibling's
-  same-named Service is not behind it; route-hit-ingress-chain D2)
+  same-named Service is not behind it)
   (dest.Cluster = the locked ingress cluster, topology miss →
   `route_engine_dest_cluster_lacks_service`), with the outcome dimension in
   the success debug log distinguishing the coarser "LB entry point" semantics
   (host/path/port play no part — the fan-out reaches the ingress controller
   pods, e.g. nginx, never a routed backend). An identity that was superseded
-  BEFORE the instant is not a candidate
-  (simplify-route-resolution-to-point-in-time D5).
-  **(5c) RouteHit ingress chain** (route-hit-ingress-chain): on every routed
+  BEFORE the instant is not a candidate.
+  **(5c) RouteHit ingress chain**: on every routed
   hit the resolver ALSO recovers the ingress LB Service identity of the
   destination IPs via the same as-of dedup (shared core
   `ingressServiceIdentity` in `pkg/route/ingresslb.go`; zero new store
@@ -196,7 +194,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   per-caller → backend dependency), and it collapses with any
   trace-derived edge for the same `(caller, backend)` pair via the traced
   pairs map (identical UUIDv5 edge ID — no duplicate possible). **Ingress
-  role marker** (mark-ingress-route-path): the ingress entry-point node
+  role marker**: the ingress entry-point node
   stays `type="service"` (no new node type — `materializeServiceNode` is
   idempotent by id, so a path-dependent type would be arrival-order
   dependent) but its `labels` carry `role` — `ingress-gateway` for the
@@ -205,7 +203,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   behind it). Assignment (`sgResolver.markIngressService`) is set-only and
   MONOTONE: `ingress-gateway` always overwrites, `ingress-lb` writes only
   into an unset value — one Service can be reached by both paths in one
-  build, and the marker must not depend on series arrival order (D6). The
+  build, and the marker must not depend on series arrival order. The
   key is absent (never empty-string) on every non-ingress service node; a
   degrade materialises no ingress node and therefore no marker. Marking
   happens strictly AFTER successful materialisation at the two call sites
@@ -221,11 +219,11 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `route_engine_dest_cluster_lacks_service` external path with the ingress
   never materialised (backend resolves first). Synthesized edges carry
   `labels={"cluster": <ingress cluster>}` (the client side is a pod in that
-  cluster — D9), accumulate in `sgResolver.routeChainEdges`, and dedupe
+  cluster), accumulate in `sgResolver.routeChainEdges`, and dedupe
   **traced-edge-wins** against the parse's `(src, tgt)` pairs (a
   trace-derived `pod-calls-service` edge for the pair is emitted and the
   synthesized hop skipped). No new engine outcome or PromQL change.
-  **(6) Containment** (D1, dependency hygiene, distinct from the client-go
+  **(6) Containment** (dependency hygiene, distinct from the client-go
   rule): `pkg/build` declares only the `RouteResolver` interface and MUST NOT
   import `pkg/route`; only `cmd/` (or an opting-in embedder) links the engine,
   so a plain embedder never inherits istio/ClickHouse —

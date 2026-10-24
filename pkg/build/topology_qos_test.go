@@ -15,8 +15,7 @@ import (
 
 // TestParseTopology_PVCQoSAttribute pins the stamp in parseTopology: the
 // resolved ceiling lands on PVCNode.QoS() before the graph freezes, whether or
-// not the claim drew an edge or carries a measurement
-// (add-pvc-qos-ceiling-attribute D1/D2).
+// not the claim drew an edge or carries a measurement.
 func TestParseTopology_PVCQoSAttribute(t *testing.T) {
 	t.Run("measured claim's node equals its edge", func(t *testing.T) {
 		v := pvcBindingVectors("c", "db", "mongo", "data", "pvc-9f3a")
@@ -96,7 +95,7 @@ func TestParseTopology_PVCQoSAttribute(t *testing.T) {
 	})
 }
 
-// TestParseTopology_PVCQoSIndependentOfVectorOrder pins D6 for the node
+// TestParseTopology_PVCQoSIndependentOfVectorOrder pins determinism for the node
 // attribute: every claim's QoS value is a pure function of the upstream data,
 // however the QoS and fixed-policy vectors happen to be ordered.
 func TestParseTopology_PVCQoSIndependentOfVectorOrder(t *testing.T) {

@@ -103,14 +103,14 @@ func NewGraph(nodes []GraphNode, edges []*Edge, builtAt time.Time) *Graph {
 		// consequence: edges minted against the dropped node's ID (e.g.
 		// pod-calls-service edges whose service node lost to a same-ID PVC)
 		// resolve to the surviving node's type, violating the catalogue's
-		// source/target-type contract for that edge. The D29 cluster-family
+		// source/target-type contract for that edge. The cluster-family
 		// fan-out widens the collision window from the trace-source cluster
 		// to every family cluster — tracked as a v2 ID-grammar fix.
 		// Deterministic dedupe: the FIRST node wins — the input slice order is
 		// deterministic (build's assemble appends authoritative topology nodes
 		// before on-demand service-graph nodes), so the winner is a pure
-		// function of the input, independent of map-iteration order (D6
-		// determinism). NodesByID is the sole node collection — projection and
+		// function of the input, independent of map-iteration order
+		// (determinism). NodesByID is the sole node collection — projection and
 		// serialisation derive their node sets from it — so keep-first here
 		// guarantees the dropped node can never be emitted.
 		if existing, dup := g.NodesByID[n.ID()]; dup {
@@ -178,7 +178,7 @@ var neverCrossCluster = func() map[EdgeType]struct{} {
 // resolved source-node and target-node `cluster` labels (the edge itself only
 // carries the trace-source / client-side cluster) — this covers both
 // pod-calls-pod (server pod recovered via the UID index) and pod-calls-service
-// (service resolved via the D29 cluster-family fan-out). Types the registry
+// (service resolved via the cluster-family fan-out). Types the registry
 // declares always-intra-cluster bucket as "false" without the per-edge node
 // lookups; edges whose endpoints are missing or external are bucketed as
 // "false".

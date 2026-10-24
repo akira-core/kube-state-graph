@@ -9,9 +9,9 @@ import (
 )
 
 // The ceiling is resolved ONCE per claim and surfaces on the PVC node whether
-// or not the claim's edge carries a measurement (add-pvc-qos-ceiling-attribute
-// D1). These tests pin the resolver's per-claim result, `qosByPVC`; the edge's
-// own presence rule is pinned by the ceiling tests in netapp_test.go.
+// or not the claim's edge carries a measurement. These tests pin the resolver's
+// per-claim result, `qosByPVC`; the edge's own presence rule is pinned by the
+// ceiling tests in netapp_test.go.
 
 // Spec: "FlexGroup claim resolves its ceiling on the node" — SVM resolved, no
 // aggregate: no edge, but the ceiling still resolves, keyed on the SVM pick's
@@ -193,8 +193,8 @@ func TestResolveNetAppStorage_FlexGroupCeilingKeyedOnSVMPicksFiler(t *testing.T)
 		"lexically-smallest filer carrying the winning SVM, matching the SVM node the storage graph draws")
 }
 
-// D6: the per-claim result is a pure function of the vectors, not of series
-// order.
+// Determinism: the per-claim result is a pure function of the vectors, not of
+// series order.
 func TestResolveNetAppStorage_CeilingIndependentOfVectorOrder(t *testing.T) {
 	vol := []model.Sample{
 		volLabelSample("pvc-a", "oc", "n1", "a1", "svm"),

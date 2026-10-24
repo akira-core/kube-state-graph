@@ -430,7 +430,7 @@ func TestResolveAlerts_EmptyVector(t *testing.T) {
 	assert.Zero(t, ambiguous)
 }
 
-// --- zone agreement (read-storage-roots-through-volume-hub D11) -----------
+// --- zone agreement --------------------------------------------------------
 
 // zoneResolver has composed c1 in BOTH zones, so each identity's zone is known
 // to the index — the state a hub build that read two zones' kube-state-metrics

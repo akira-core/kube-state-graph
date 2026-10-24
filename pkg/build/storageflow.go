@@ -170,7 +170,7 @@ func podNodeIDs(topology Topology) map[string]string {
 // Each (source, target) pair is emitted at most ONCE however many claims flow
 // through it: two claims on the same aggregate share one node-aggr edge, and
 // the projection then sums their weights onto it. The de-duplication is an
-// insert-only set keyed on the pair, so it is order-free (D6) — and it has to
+// insert-only set keyed on the pair, so it is order-free — and it has to
 // be, because the same pair can be reached from chains in any order.
 //
 // mountersOf is derived from the pod-mounts-pvc bindings /v1/graph already

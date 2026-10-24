@@ -15,14 +15,15 @@ import "strings"
 // equal the sentinel. A non-digit sentinel such as '#' would collide with a
 // cluster name literally containing it ("prod-#" vs "prod-1").
 //
-// The connection-string resolver (D29 Stage 0) uses the family to widen its
-// service lookup beyond the trace-source cluster: a service mesh routes the
-// same Kubernetes Service DNS name to any cluster of the caller's numbered
-// family, never across families. The rule is a hardcoded pure string
-// function — no flag, env var, or config field — so resolution stays a pure
-// function of (series labels, topology) and determinism is preserved.
+// The connection-string resolver (Stage 0 of endpointslice → service
+// resolution) uses the family to widen its service lookup beyond the
+// trace-source cluster: a service mesh routes the same Kubernetes Service DNS
+// name to any cluster of the caller's numbered family, never across families.
+// The rule is a hardcoded pure string function — no flag, env var, or config
+// field — so resolution stays a pure function of (series labels, topology) and
+// determinism is preserved.
 //
-// Exported because pkg/route's ingress-cluster selection (design D10) shares
+// Exported because pkg/route's ingress-cluster selection shares
 // the family rule: the two consumers must agree on what "same family" means,
 // or a cluster the route engine selects could be one the fan-out disowns.
 func ClusterFamilyKey(name string) string {

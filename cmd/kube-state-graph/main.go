@@ -108,7 +108,7 @@ func run() error {
 		return fmt.Errorf("api keys: %w", err)
 	}
 
-	// Route resolution (translate-global-fqdn-to-k8s-service) is opt-in: an
+	// Route resolution is opt-in: an
 	// empty DSN leaves routeResolver nil and the service-graph reader behaves
 	// exactly as before. When set, both the store schema and the
 	// router_check_tool binary are verified here — fail fast at startup, not

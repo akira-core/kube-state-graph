@@ -36,7 +36,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     `pvc-to-netapp-aggr` edge, the `netapp-aggr` / `netapp-node` entities, and
     the PVC `svm` label. An **info series**: its sample value is discarded, only
     its labels (`cluster` = ONTAP cluster, `node`, `aggr`, `svm`) are read.
-    **Zone preference** (drop-harvest-zone-matchers D2): a claim's CANDIDATE set —
+    **Zone preference**: a claim's CANDIDATE set —
     the matched series every pick runs over (aggregate, SVM, the owner the edge
     names, the QoS scope, the ceiling key) — is the series whose zone agrees
     with the claim's WHEN AT LEAST ONE agrees, and every matched series
@@ -52,8 +52,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     exists, and a claim none of whose matches agree still joins. It applies to
     the shared join, so an unfiltered `/v1/graph` changes only in an estate
     holding such a collision.
-    **Rooted read** (scope-volume-labels-by-storage-root,
-    read-storage-roots-through-volume-hub): a `/v1/storage-graph` request rooted
+    **Rooted read**: a `/v1/storage-graph` request rooted
     at `ontap_cluster=`, `aggr=` and/or `svm=` reads it restricted. Phase 1 is up
     to two query GROUPS mirroring the projection, which UNIONS `aggr=` with
     `svm=` and narrows both by `ontap_cluster=`: `{cluster=…,aggr=…}` and
@@ -106,8 +105,8 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     filtered to the loaded `(az, env, cluster, namespace, claim)` keys. A data-derived scope is chunked however large it is and never replaced
     by a read across the zone. `storage_root_claim_miss` (`no_pv_candidate` /
     `no_claim`) reports a seed that found nothing (`no_claim` drops to Debug under
-    a `cluster=` / `namespace=` filter). **The Kubernetes side stays in the request's zones**
-    (D7): `buildStorage` renders the request's FULL selector and binds
+    a `cluster=` / `namespace=` filter). **The Kubernetes side stays in the request's zones**:
+    `buildStorage` renders the request's FULL selector and binds
     `QuerierFor(sel)`, so no kube-state-metrics, kubelet or `ALERTS` query
     reaches the store of a zone the request did not select, and a filer shared
     across zones draws the selected zones' claims only. Harvest is zone-routed
@@ -115,7 +114,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     the only store asked, and a catch-all returns every zone's series, which
     the reader prefers by the claim's zone. Do NOT reintroduce an az/env
     matcher on Harvest, or an az/env-relaxed Kubernetes read. Alert
-    matching also AGREES ON ZONE (D11, `pkg/build/alerts.go`), for the builds
+    matching also AGREES ON ZONE (`pkg/build/alerts.go`), for the builds
     that do hold several zones (unfiltered `/v1/graph`, a multi-zone `/v1/storage-graph`, catch-all backends): an alert's `az`/`env` pair must agree with the
     candidate's zone — a Kubernetes object's composed identity, a NetApp
     controller/aggregate's `ontapZones` set (the pairs its entity-naming Harvest
@@ -128,7 +127,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     `pkg/build/hubrouting_test.go`, `pkg/promql/volumelabels_test.go`,
     `internal/integration` (`TestStorageGraphHubStaysInTheRequestZone`).
   - **hop B `qos_{read,write}_{ops,latency,data}`** — the six measured I/O
-    figures. **Volume granularity is a READER rule, not a matcher** (D11): the
+    figures. **Volume granularity is a READER rule, not a matcher**: the
     queries carry the `volume` scope and nothing else, and `sumQoSIO` skips
     every candidate with a non-empty `lun`. ONTAP collects a workload per LUN as
     well as per volume and a LUN workload carries its FlexVol's `volume`, so the
@@ -142,7 +141,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     `RenderQoSVolumeScoped`. Candidates are further scoped in
     Go to the picked aggregate's ONTAP cluster (and its `svm` when both sides
     resolve one) so a colliding FlexVol name across two filers cannot merge.
-    **One zone per workload** (drop-harvest-zone-matchers D3): the queries
+    **One zone per workload**: the queries
     carry no `az` / `env` matcher, so the same workload can return once per
     pair. `preferQoSZone` keys the in-scope rows by `qosWorkload`
     (`ontap_cluster`, `svm`, `volume`, `lun`, family) and keeps, per key, the
@@ -218,11 +217,11 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   Both `volumename` and `svm` are **plain labels**, set only when non-empty;
   `svm` is impossible without `volumename` and comes from hop A ONLY (hop B's
   own `svm` only SCOPES a workload candidate to the claim's volume in
-  `qosInScope` — it is neither a join key nor a fallback since D9 re-keyed the
-  ceiling's `svm` component onto hop A). The hop-A pick runs `pickAggr` FIRST and scopes
+  `qosInScope` — it is neither a join key nor a fallback since the
+  ceiling's `svm` component is keyed onto hop A). The hop-A pick runs `pickAggr` FIRST and scopes
   `pickSVM` to the ONTAP cluster it landed on, so a cross-filer FlexVol-name
   collision cannot pair one filer's aggregate with another's SVM — which would
-  reject every in-scope workload and key the ceiling on a foreign tenant (D10);
+  reject every in-scope workload and key the ceiling on a foreign tenant;
   with no aggregate resolved (FlexGroup) the pick is unscoped and the claim
   still gains its `svm`. **`volumename` ≠ `volume`**.
   A third plain label, **`aggr`**, is copied verbatim from the `target` of the
@@ -237,7 +236,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   it, stamped once in the shared topology beside `svm` — on `/v1/graph` it
   restates the `pvc-to-netapp-aggr` edge already in the body.
   All 20 Harvest/kubelet legs plus `ALERTS` are OPTIONAL (log-and-continue) on `/v1/graph`.
-  **`/v1/storage-graph` fails closed** (fail-storage-graph-on-any-leg-error): `storagePlan.failClosed`
+  **`/v1/storage-graph` fails closed**: `storagePlan.failClosed`
   makes every first-wave leg and every scoped QoS chunk required except `ALERTS`, and every wave
   only a by-reference plan issues (pods, nodes, controllers, application recovery, the
   seed's `volume_labels` incl. owner completion, and the expansion's claim-keyed reads) is required unconditionally — `scopedFamily` has no error class any more.

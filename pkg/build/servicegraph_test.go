@@ -12,7 +12,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
-// Sentinel-peer exclusion note (design.md D30): the servicegraph connector's
+// Sentinel-peer exclusion note: the servicegraph connector's
 // virtual peers (client / server ∈ {"user", "unknown"}) are dropped at the
 // PromQL QUERY layer via anchored matchers on the QServiceGraphTotal selector
 // (see internal/promql/queries.go + queries_test.go), NOT inside
@@ -43,7 +43,7 @@ func sampleTopology() Topology {
 	}
 }
 
-// sampleTopologyWithServices adds D29 service / endpoint indexes:
+// sampleTopologyWithServices adds the service / endpoint indexes:
 //   - ClusterIP service "payments" (ns shop, cluster_ip 10.0.0.5) → pods pay0, pay1
 //   - headless service "mongo" (ns db, cluster_ip None) → backing pod mongo0
 //   - headless service "redis" (ns db, cluster_ip None) with NO endpointslice
@@ -145,7 +145,7 @@ func TestParseServiceGraph_IntraClusterEdge(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// D29: hardcoded "://" connection-string resolution.
+// Hardcoded "://" connection-string resolution.
 // ---------------------------------------------------------------------------
 
 func TestParseServiceGraph_ConnString_ServiceLevelResolvesToServiceNode(t *testing.T) {
@@ -409,10 +409,10 @@ func TestParseServiceGraph_UIDPresentSkipsConnStringResolution(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// D33: self-loop UID guard — an exporter that stamps the SAME pod UID on both
+// Self-loop UID guard — an exporter that stamps the SAME pod UID on both
 // client and server for a "://" peer must not collapse the URL side onto the
 // caller's own pod. The "://" side's UID is treated as bogus so it falls
-// through to D29 Stage 0 (connection-string resolution).
+// through to Stage 0 (connection-string resolution).
 // ---------------------------------------------------------------------------
 
 func TestParseServiceGraph_SelfLoopUID_ServerConnString_ResolvesToService(t *testing.T) {
@@ -496,7 +496,7 @@ func TestParseServiceGraph_SelfLoopUID_NoConnString_StaysPodSelfLoop(t *testing.
 }
 
 // ---------------------------------------------------------------------------
-// resolve-unknown-server-peer-labels: the D30 server-side matcher is narrowed
+// Unknown-server peer labels: the sentinel matcher's server side is narrowed
 // to server!~"user" (queries_test.go), so a literal server="unknown" now
 // reaches parseServiceGraph. resolveUnknownServerPeer resolves it via the
 // client-recorded client_net_peer_name / client_server_address labels when
@@ -654,7 +654,7 @@ func TestParseServiceGraph_UnknownServerPeerLabel_ClientUnresolved_Dropped(t *te
 	res := parseServiceGraph(vec, sampleTopologyWithServices())
 
 	// The client side ("admin", empty UID) still resolves via the pre-existing,
-	// unrelated D27 fallback regardless of this change. But because that side is
+	// unrelated non-URL fallback regardless of this change. But because that side is
 	// NOT a real topology pod, resolveUnknownServerPeer's trigger condition is
 	// unmet, so the server side never resolves and no edge touches it — the
 	// presence of a peer label does not by itself cause enrichment.
@@ -683,7 +683,7 @@ func TestParseServiceGraph_UnknownServerPeerLabel_ServerUIDPresentButUnresolved(
 
 // sampleTopologyIPFamily gives two family-sibling clusters (prod-1, prod-2,
 // family "prod-0") each deploying their own "payments" service in namespace
-// "shop", at DIFFERENT ClusterIPs — resolve-unknown-server-ip-peer's
+// "shop", at DIFFERENT ClusterIPs — the ClusterIP peer step's
 // anchor-cluster-only IP lookup must never cross this family boundary.
 func sampleTopologyIPFamily() Topology {
 	clientPod := &graph.PodNode{IDValue: "prod-1/abc", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "prod-1", "namespace": "shop"}}
@@ -1176,7 +1176,7 @@ func TestParseServiceGraph_UnknownServerPeerLabel_TruncationPromotesToBareShortN
 }
 
 // ---------------------------------------------------------------------------
-// resolve-unknown-server-pod-ip-peer: an IP-literal peer that matches no
+// Pod-IP peer step: an IP-literal peer that matches no
 // Service ClusterIP is looked up against the anchor cluster's Pod IP set.
 
 // sampleTopologyPodIP extends the service fixture with pod-level addresses:
@@ -1226,7 +1226,7 @@ func sampleTopologyPodIPFamily(extra ...*graph.PodNode) Topology {
 }
 
 // reversePods returns the topology with topology.Pods in reverse order — used
-// to prove the index build and the candidate pick are order-free (D6).
+// to prove the index build and the candidate pick are order-free.
 func reversePods(topo Topology) Topology {
 	out := make([]*graph.PodNode, len(topo.Pods))
 	for i, p := range topo.Pods {
@@ -1337,7 +1337,7 @@ func TestParseServiceGraph_UnknownServerPeerLabel_PodIPFamilySiblingResolves(t *
 		require.Len(t, pcp, 1, "reverse=%v", reverse)
 		assert.Equal(t, "prod-1/abc", pcp[0].Source)
 		assert.Equal(t, "prod-2/sib", pcp[0].Target, "lone family holder resolves across clusters (reverse=%v)", reverse)
-		assert.Equal(t, "prod-1", pcp[0].Labels["cluster"], "edge cluster stays the client side (D9)")
+		assert.Equal(t, "prod-1", pcp[0].Labels["cluster"], "edge cluster stays the client side")
 		assert.Empty(t, res.ExternalNodes)
 		assert.Empty(t, res.ServiceNodes)
 	}
@@ -1479,7 +1479,7 @@ func TestParseServiceGraph_DedupSamePair(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// D27: Missing pod-UID human-label fallback (non-URL labels only).
+// Missing pod-UID human-label fallback (non-URL labels only).
 // ---------------------------------------------------------------------------
 
 func TestParseServiceGraph_MissingClientUID_PromotesToExternal(t *testing.T) {
@@ -1601,10 +1601,11 @@ func TestParseServiceGraph_ConnStringWinsOverMissingUIDFallback(t *testing.T) {
 }
 
 func TestParseServiceGraph_ConnStringAndMissingUIDBothExternal(t *testing.T) {
-	// One parse can produce TWO distinct external nodes: one from an unresolvable
-	// "://" string (connection-string resolution falls back to external) and one
-	// from a non-URL missing-UID label (D27 fallback). Both produce external nodes
-	// with distinct IDs (the verbatim labels differ); no others nodes remain.
+	// One parse can produce TWO distinct external nodes: one from an
+	// unresolvable "://" string (connection-string resolution falls back to
+	// external) and one from a non-URL missing-UID label (non-URL fallback).
+	// Both produce external nodes with distinct IDs (the verbatim labels
+	// differ); no others nodes remain.
 	betaPod := &graph.PodNode{IDValue: "cluster-beta/def", LabelsValue: map[string]string{"cluster": "cluster-beta"}}
 	topo := Topology{Pods: []*graph.PodNode{betaPod}, PodsByUID: map[string]*graph.PodNode{"def": betaPod}}
 	vec := sampleVec(

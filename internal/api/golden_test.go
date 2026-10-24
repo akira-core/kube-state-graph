@@ -225,7 +225,7 @@ func buildTwoClusterCross() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{a, b}, Edges: []*graph.Edge{cross}}
 }
 
-// buildWithService snapshots the D29 connection-string service resolution:
+// buildWithService snapshots the connection-string service resolution:
 // a pod-calls-pod edge whose target is a `type="service"` node (resolved from
 // a `<service>.<namespace>.svc...` string, carrying cluster_ip on ipaddress),
 // plus a `service-selects-pod` edge fanning out to a backing pod.
@@ -240,7 +240,7 @@ func buildWithService() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{pod, svc, pay0}, Edges: edges}
 }
 
-// buildFamilyFanout snapshots the D29 cluster-family fan-out: a client pod in
+// buildFamilyFanout snapshots the cluster-family fan-out: a client pod in
 // prod-1 dials a `<service>.<namespace>.svc` connection string for a Service
 // deployed in BOTH prod-1 and prod-2 (one family: digit runs normalise to
 // "prod-0"). Each family cluster's service node materialises, the single
@@ -628,8 +628,8 @@ func claimRootEstate(base *graph.Graph) *graph.Graph {
 	return graph.NewGraph(nodes, edges, time.Time{})
 }
 
-// buildMissingUIDFallback snapshots the D27 fallback shape: a service-graph
-// series whose client_k8s_pod_uid is empty surfaces as `external/<label>`
+// buildMissingUIDFallback snapshots the missing-UID fallback shape: a
+// service-graph series whose client_k8s_pod_uid is empty surfaces as `external/<label>`
 // with an empty labels map (distinguishable from the pattern-matched
 // external case, which carries labels.pattern). The edge omits
 // labels.cluster because the client side is external.
@@ -640,8 +640,8 @@ func buildMissingUIDFallback() graph.View {
 	return graph.View{Nodes: []graph.GraphNode{pod, ext}, Edges: []*graph.Edge{edge}}
 }
 
-// buildLinkRelation snapshots the span-link relation marking
-// (add-span-link-logical-edges): a logical producer→consumer pod-calls-pod
+// buildLinkRelation snapshots the span-link relation marking: a logical
+// producer→consumer pod-calls-pod
 // edge carries labels.relation="link", the producer's pod→broker
 // pod-calls-service edge carries labels.relation="transport", and the broker's
 // service-selects-pod fan-out carries no relation key (shared edge, never

@@ -186,7 +186,7 @@ func TestReloader_UnreadableFileKeepsTheLiveTable(t *testing.T) {
 
 // An embedder supplying neither a logger nor a recorder inherits neither
 // kube-state-graph's log format nor its self-metrics — and the loop still
-// reloads (design D14).
+// reloads.
 func TestReloader_NilLoggerAndMetricsAreSilentButStillReload(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	tbl, err := Read(path, noEnv())

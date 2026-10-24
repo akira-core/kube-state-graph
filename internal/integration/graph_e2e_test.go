@@ -18,7 +18,7 @@ import (
 )
 
 // fixedNow is the absolute timestamp anchor every fixture and query uses.
-// Per D20 / D5, integration tests MUST NOT use time.Now()-relative values for
+// Integration tests MUST NOT use time.Now()-relative values for
 // time-bucket alignment.
 var fixedNow = time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 
@@ -260,7 +260,7 @@ kube_node_status_condition{cluster="cluster-alpha",node="ready-probe-unknown",co
 		"no Ready series → ready_status omitted, DISTINCT from Unknown")
 }
 
-// TestPodOwnerAttributeSkipReplicaSet — D34. Ingest kube_pod_owner for the
+// TestPodOwnerAttributeSkipReplicaSet — ReplicaSet skip. Ingest kube_pod_owner for the
 // `checkout` pod pointing at a ReplicaSet, plus kube_replicaset_owner mapping
 // that ReplicaSet to a Deployment; assert /v1/graph sets the pod node's typed
 // data.owner = {kind:"Deployment", name:<deployment>} (the ReplicaSet is
@@ -336,7 +336,7 @@ kube_replicaset_owner{cluster="cluster-alpha",namespace="shop",replicaset="check
 // tlast_over_time argmax-by-recency "latest image wins" path — at the suite's
 // fixedNow (~6 weeks before the container's real clock) VM returns only one
 // image-variant per container regardless of rollup, so the multi-image case is
-// unverifiable here (see design.md D-A4). The recency/argmax logic is covered by
+// unverifiable here. The recency/argmax logic is covered by
 // TestParseTopology_PodContainersLatestImageWins / _TieIsDeterministic (unit,
 // deterministic vectors); that tlast_over_time stamps s.Value with the
 // last-sample timestamp was verified by manual probe against VM v1.107.0.
@@ -420,7 +420,7 @@ traces_service_graph_request_total{client="ksg-enriched",server="ksg-bare",clust
 // the first ":", never in labels) and (2) nests both under the synthesised
 // application compound group cluster > namespace > application > {service, pvc}.
 // The objects live in a dedicated namespace ("argons") so they cannot collide
-// with the shared shop fixtures. The service materialises via the D29
+// with the shared shop fixtures. The service materialises via the
 // connection-string path (checkout pod → https://argo-svc.argons.svc...), whose
 // anchor cluster (cluster-alpha, recovered from the client pod UID) holds the
 // same-named service, so the service node is created in cluster-alpha.
@@ -482,9 +482,9 @@ traces_service_graph_request_total{client="argo-pod",server="https://argo-svc.ar
 	s.Equal("cluster-alpha/namespace/argons", grp.Parent, "application group nests under its namespace group")
 }
 
-// TestPVCInheritsApplicationFromMountingPod — D13: a PVC with NO tracking-id
-// annotation of its own inherits the ArgoCD Application of the pod that mounts
-// it (via the pod-mounts-pvc binding), surfacing data.application and nesting
+// TestPVCInheritsApplicationFromMountingPod — PVC Application inheritance: a
+// PVC with NO tracking-id annotation of its own inherits the ArgoCD
+// Application of the pod that mounts it (via the pod-mounts-pvc binding), surfacing data.application and nesting
 // under the inherited application group — indistinguishable from an
 // annotation-sourced value. A PVC carrying its OWN annotation keeps it (own
 // wins over inheritance). Each mounting pod's own Application comes from its
@@ -617,14 +617,15 @@ func (s *GraphSuite) TestConnStringUnresolvableProducesExternalNode() {
 	s.Contains(string(body), `"name":"https://payments.partner.example/api"`)
 }
 
-// TestMissingUIDNonURLClientProducesExternalNode exercises the D27 missing-UID
-// fallback end-to-end against a real VM (tasks §31.E.4): a service-graph series
+// TestMissingUIDNonURLClientProducesExternalNode exercises the missing-UID
+// fallback end-to-end against a real VM: a service-graph series
 // whose client_k8s_pod_uid is EMPTY and whose client label is a plain non-URL
 // human name ("stray-caller", no "://") promotes that endpoint to an
 // external/<label> node (rather than dropping the edge), and the resulting
 // pod-calls-pod edge to the resolved server pod omits labels.cluster because the
 // client side is not a pod. This is the non-URL counterpart to the "://"
-// unresolvable case above — distinct code path (D27, not D29).
+// unresolvable case above — a distinct code path (missing-UID fallback, not
+// connection-string resolution).
 func (s *GraphSuite) TestMissingUIDNonURLClientProducesExternalNode() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
@@ -667,14 +668,14 @@ traces_service_graph_request_total{client="stray-caller",server="checkout",clust
 			sawEdge = true
 			s.Equal("pod-calls-pod", e.Data.Type)
 			s.NotContains(e.Data.Labels, "cluster",
-				"edge omits labels.cluster when the client side is external (D27/D9)")
+				"edge omits labels.cluster when the client side is external")
 		}
 	}
 	s.True(sawEdge, "expected pod-calls-pod edge from external/stray-caller to the resolved server pod")
 }
 
 // TestConnStringServiceResolvesToServiceNodeWithBackingPods exercises the full
-// D29 connection-string pipeline end-to-end against a real VM: kube_service_info
+// connection-string pipeline end-to-end against a real VM: kube_service_info
 // + kube_endpointslice_{labels,endpoints} are read into the topology indexes,
 // a checkout→https://payments-svc.shop.svc.cluster.local/api call (empty server
 // UID) resolves the server to a type="service" node, and a service-selects-pod
@@ -717,8 +718,9 @@ traces_service_graph_request_total{client="checkout",server="https://payments-sv
 		"service-selects-pod edge resolves the backing cart pod via endpointslice targetref")
 }
 
-// TestConnStringHeadlessResolvesToServiceNodeNotPod exercises the D29 unified
-// resolution end-to-end against a real VM: a headless per-pod connection string
+// TestConnStringHeadlessResolvesToServiceNodeNotPod exercises the unified
+// connection-string resolution end-to-end against a real VM: a headless per-pod
+// connection string
 // (checkout→redis://redis-0.redis-svc.shop.svc.cluster.local:6379, empty server
 // UID) drops the leading pod-hostname `redis-0` and resolves to the SERVICE node
 // `cluster-alpha/shop/redis-svc` (NOT the specific pod), fanning out a
@@ -756,15 +758,15 @@ traces_service_graph_request_total{client="checkout",server="redis://redis-0.red
 		"service-selects-pod edge resolves the backing pod via endpointslice targetref")
 }
 
-// TestConnStringSelfLoopUIDResolvesToServiceNode exercises design.md D33
+// TestConnStringSelfLoopUIDResolvesToServiceNode exercises the self-loop UID guard
 // end-to-end against a real VM: a buggy exporter stamps the SAME pod UID on
 // BOTH client_k8s_pod_uid and server_k8s_pod_uid for a "://" peer (the real
 // remote lives only in the server label). Without the self-loop guard the
 // server would collapse onto the caller's own pod (a self-loop pod-calls-pod)
 // and no service node would materialise. The guard clears the bogus colliding
-// UID on the "://" side so it falls through to D29 Stage 0, resolves to the
-// service node, and fans out to the backing pod. A unique service name
-// (selfloop-svc) proves the resolution came from THIS colliding-UID series.
+// UID on the "://" side so it falls through to connection-string resolution
+// Stage 0, resolves to the service node, and fans out to the backing pod. A
+// unique service name (selfloop-svc) proves the resolution came from THIS colliding-UID series.
 func (s *GraphSuite) TestConnStringSelfLoopUIDResolvesToServiceNode() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
@@ -792,7 +794,7 @@ traces_service_graph_request_total{client="checkout",server="https://selfloop-sv
 	bodyStr := string(body)
 
 	// Despite the colliding self-loop UID, the "://" server resolves to its
-	// service node — proves the D33 guard cleared the bogus UID.
+	// service node — proves the self-loop UID guard cleared the bogus UID.
 	s.Contains(bodyStr, `"id":"cluster-alpha/shop/selfloop-svc"`,
 		"colliding self-loop UID must not block service resolution of the '://' side")
 	s.Contains(bodyStr, `"target":"cluster-alpha/shop/selfloop-svc"`,
@@ -802,8 +804,9 @@ traces_service_graph_request_total{client="checkout",server="https://selfloop-sv
 		"resolved service fans out to its backing pod")
 }
 
-// TestConnStringFamilyFanoutCrossCluster exercises the localised D29 model
-// end-to-end against a real VM: the client pod lives in prod-1, which holds the
+// TestConnStringFamilyFanoutCrossCluster exercises the localised
+// connection-string resolution model end-to-end against a real VM: the client
+// pod lives in prod-1, which holds the
 // addressed Service (the mesh precondition), and prod-2 — a same-family cluster
 // (both normalise to "prod-0") — holds the same-named Service with its own
 // backing pod. The "://" resolves to a SINGLE service node in the caller's own
@@ -997,12 +1000,11 @@ traces_service_graph_request_total{client="uffb-admin",server="nats://uffb-svc.u
 		"the non-pod client side stays an external node")
 }
 
-// TestSentinelPeersExcludedAtQueryLayer exercises design.md D30 end-to-end
-// against a real VM: the servicegraph connector's virtual peers are dropped by
+// TestSentinelPeersExcludedAtQueryLayer exercises the sentinel matcher
+// end-to-end against a real VM: the servicegraph connector's virtual peers are dropped by
 // the anchored selector matchers (client!~"user|unknown",server!~"user") —
 // client="user" is excluded upstream at the QUERY layer, so it never reaches
-// the API. server="unknown" is narrower (resolve-unknown-server-peer-labels
-// D1): the series itself now reaches Go, but this fixture carries neither
+// the API. server="unknown" is narrower: the series itself now reaches Go, but this fixture carries neither
 // client_net_peer_name nor client_server_address, so it still resolves to
 // nothing (dropped in Go by resolveUnknownServerPeer) — the SAME observable
 // outcome (no node, no edge) as the old blanket query-layer exclusion.
@@ -1054,13 +1056,13 @@ traces_service_graph_request_total{client="checkout",server="http://user/api",cl
 		"connection string containing (but not equal to) user must survive the anchored matcher")
 }
 
-// TestUnknownServerPeerLabelResolvesToServiceNode exercises the
-// resolve-unknown-server-peer-labels change end-to-end against a real VM: the
-// D30 server-side matcher no longer excludes server="unknown" at the query
+// TestUnknownServerPeerLabelResolvesToServiceNode exercises unknown-server
+// peer-label resolution end-to-end against a real VM: the sentinel
+// server-side matcher does not exclude server="unknown" at the query
 // layer (only server!~"user"), so a series with server="unknown" now reaches
 // Go. Because the client side resolves to a real topology pod (checkout =
 // alpha-1) and the series carries client_net_peer_name, resolveUnknownServerPeer
-// resolves it via the same D29 machinery as connection-string resolution — a
+// resolves it via the same machinery as connection-string resolution — a
 // pod-calls-service edge to the addressed service, with its usual
 // service-selects-pod fan-out — instead of dropping the endpoint.
 func (s *GraphSuite) TestUnknownServerPeerLabelResolvesToServiceNode() {
@@ -1096,8 +1098,8 @@ traces_service_graph_request_total{client="checkout",server="unknown",cluster="c
 	s.NotContains(bodyStr, `"name":"unknown"`)
 }
 
-// TestUnknownServerIPPeerResolvesToServiceNode exercises the
-// resolve-unknown-server-ip-peer change end-to-end against a real VM: a
+// TestUnknownServerIPPeerResolvesToServiceNode exercises unknown-server
+// ClusterIP peer resolution end-to-end against a real VM: a
 // server="unknown" series whose client_server_address is a bare ClusterIP
 // literal (no DNS name) resolves via resolveUnknownServerPeer's new
 // IP-literal classification step — anchor-cluster-only ClusterIP lookup —
@@ -1134,9 +1136,8 @@ traces_service_graph_request_total{client="checkout",server="unknown",cluster="c
 	s.NotContains(bodyStr, `external/10.96.0.77`, "the ClusterIP literal must not leak as an external node")
 }
 
-// TestUnknownServerNetworkPeerAddressResolvesToServiceNode exercises the
-// resolve-unknown-server-network-peer-address change end-to-end against a
-// real VM: a server="unknown" series carrying client_network_peer_address
+// TestUnknownServerNetworkPeerAddressResolvesToServiceNode exercises
+// unknown-server network-peer-address resolution end-to-end against a real VM: a server="unknown" series carrying client_network_peer_address
 // (and neither client_server_address nor client_net_peer_name) resolves via
 // resolveUnknownServerPeer's middle-precedence label to the addressed service
 // node, with its usual service-selects-pod fan-out.
@@ -1173,8 +1174,8 @@ traces_service_graph_request_total{client="checkout",server="unknown",cluster="c
 	s.NotContains(bodyStr, `"name":"unknown"`)
 }
 
-// TestUnknownServerPodIPPeerResolvesToPod exercises the
-// resolve-unknown-server-pod-ip-peer change end-to-end: a server="unknown"
+// TestUnknownServerPodIPPeerResolvesToPod exercises unknown-server Pod-IP peer
+// resolution end-to-end: a server="unknown"
 // series whose client_server_address is a bare Pod IP literal — matching no
 // Service ClusterIP — resolves via the new Pod-IP classification step to the
 // topology pod that holds the address, producing a pod-calls-pod edge instead
@@ -1527,8 +1528,7 @@ kubelet_volume_stats_capacity_bytes{cluster="cluster-alpha",namespace="shop",per
 	s.Contains(byID, pvc.Labels["aggr"], "the labels.aggr node must be in the same /v1/graph response")
 
 	// The QoS-less claim keeps its whole storage topology — svm included.
-	// Only its measurements are missing (design.md D3: the hops degrade
-	// independently).
+	// Only its measurements are missing (the hops degrade independently).
 	qosless, ok := byID["cluster-alpha/shop/qosless-data"]
 	s.Require().True(ok, "qos-less pvc node must be present")
 	s.Equal("pvc-noqos", qosless.Labels["volumename"])
@@ -1717,8 +1717,7 @@ func (s *GraphSuite) TestAPIKey_FileBacked_Enforced() {
 	s.Equal(http.StatusOK, live.StatusCode)
 }
 
-// TestSpanLinkRelationEdges exercises span-link relation marking
-// (add-span-link-logical-edges) end-to-end: an edge_relation="link" series
+// TestSpanLinkRelationEdges exercises span-link relation marking end-to-end: an edge_relation="link" series
 // (producer checkout/alpha-1 → consumer payments/beta-1, both UIDs resolvable)
 // yields the logical pod-calls-pod edge with labels.relation="link"; an
 // ordinary server="unknown" network series from the same producer to the

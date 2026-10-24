@@ -27,8 +27,7 @@ var NodeScopedQueries = []Query{QNodeInfo, QNodeAddresses, QNodeLabels, QNodeSta
 
 // ControllerScopedQueries are the eight kube-state-metrics owner /
 // controller-annotation families the storage build reads BY REFERENCE:
-// restricted to the controller names the loaded pods' resolved owners name
-// (scope-controller-legs-by-reference).
+// restricted to the controller names the loaded pods' resolved owners name.
 var ControllerScopedQueries = []Query{
 	QReplicaSetOwner, QReplicaSetAnnotations,
 	QJobOwner, QJobAnnotations,
@@ -51,8 +50,8 @@ const VolumeNameLabel = "volumename"
 const ClaimLabel = "persistentvolumeclaim"
 
 // ClaimScopedQueries are the five claim-keyed families a hub-mode
-// /v1/storage-graph build reads BY REFERENCE instead of in its first wave
-// (read-storage-roots-through-volume-hub): kube_persistentvolumeclaim_info
+// /v1/storage-graph build reads BY REFERENCE instead of in its first wave:
+// kube_persistentvolumeclaim_info
 // restricted on `volumename` to the PersistentVolume names the rooted Harvest
 // rows yield, and the other four restricted on `persistentvolumeclaim` to the
 // claims that read returned. Outside hub mode they stay first-wave legs, which
@@ -100,7 +99,7 @@ var scopedLabel = map[Query]string{
 //
 // The order is the query's fixed selector, then the request matchers, then the
 // scope, so the rendered string is Render's output with one matcher appended
-// (scope-controller-legs-by-reference D2: fixedSelector, defined in
+// (fixedSelector, defined in
 // queries.go, is the ONE table both Render and RenderScoped read, so a scoped
 // rendering of a family can never drop the fixed selector its unscoped
 // rendering carries — e.g. a scoped kube_job_owner query still carries
@@ -317,20 +316,5 @@ func namespaceEquality(namespace string) string {
 // side would read bindings the caller did not name. The caller MUST skip the
 // query rather than fall back to an unscoped read.
 func RenderClaimBindingsByPod(window time.Duration, keys LabelKeys, sel Selector, namespaces, pods []string) (string, bool) {
-	ns := normaliseValues(namespaces)
-	ps := normaliseValues(pods)
-	if len(ns) == 0 || len(ps) == 0 {
-		return "", false
-	}
-	var matchers []string
-	if fixed := fixedSelector[QPVCBindings]; fixed != "" {
-		matchers = append(matchers, fixed)
-	}
-	if req := sel.render(queryDims[QPVCBindings], keys); req != "" {
-		matchers = append(matchers, req)
-	}
-	matchers = appendMatcher(matchers, NamespaceLabel, ns)
-	matchers = appendMatcher(matchers, PodLabel, ps)
-	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
-		QPVCBindings, strings.Join(matchers, ","), FormatDuration(window)), true
+	return RenderNamesAcrossNamespaces(QPVCBindings, window, keys, sel, PodLabel, namespaces, pods)
 }

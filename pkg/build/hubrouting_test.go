@@ -15,8 +15,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The volume hub's routing and request matchers
-// (read-storage-roots-through-volume-hub D7 / D8), over a *promql.Router whose
+// The volume hub's routing and request matchers, over a *promql.Router whose
 // every backend is a matcher-applying promqlfake: a hub build reads exactly the
 // stores and series a non-hub build of the same request reads — the request's
 // az selects every backend, and az / env stay matchers on every Kubernetes and

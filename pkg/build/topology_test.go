@@ -187,7 +187,7 @@ func TestUnflattenLabel_HeuristicLimits(t *testing.T) {
 	}
 }
 
-// TestParseTopology_ServiceAndEndpointSliceIndexes — D29 connection-string
+// TestParseTopology_ServiceAndEndpointSliceIndexes — connection-string
 // resolution indexes: kube_service_info → ServicesByNameNS (cluster_ip retained,
 // including the headless "None" sentinel); kube_endpointslice_labels +
 // kube_endpointslice_endpoints → EndpointsByService (slice→service via
@@ -222,7 +222,7 @@ func TestParseTopology_ServiceAndEndpointSliceIndexes(t *testing.T) {
 	assert.ElementsMatch(t, []string{"c-a/p1", "c-a/p2"}, []string{eps[0].Pod.ID(), eps[1].Pod.ID()})
 }
 
-// TestParseTopology_PodOwnerAttribute — D34 controller-owner resolution with the
+// TestParseTopology_PodOwnerAttribute — controller-owner resolution with the
 // ReplicaSet skipped to its owning Deployment. Covers: RS→Deployment, bare RS,
 // a direct non-RS controller, a pod with no controller owner, and total absence
 // of the owner series.
@@ -536,7 +536,7 @@ func TestParseTopology_PodApplicationAttribute(t *testing.T) {
 
 // TestParseTopology_PodApplicationPerOwnerKind — every controller kind
 // kube-state-metrics can describe resolves through its own annotation family.
-// The Deployment case goes through the D34 ReplicaSet skip, proving the join
+// The Deployment case goes through the ReplicaSet skip, proving the join
 // keys on the ALREADY-RESOLVED owner and needs no extra hop of its own.
 func TestParseTopology_PodApplicationPerOwnerKind(t *testing.T) {
 	v := topologyVectors{
@@ -898,7 +898,7 @@ func TestPVCInheritedApps(t *testing.T) {
 
 // TestParseTopology_PVCInheritsApplicationFromMountingPod — end-to-end: an
 // app-less PVC inherits the lexically-smallest Application of the pods that
-// mount it (D13); a PVC with its own annotation keeps it (own wins); a PVC whose
+// mount it; a PVC with its own annotation keeps it (own wins); a PVC whose
 // only mounting pod has no Application stays app-less; the inherited value never
 // leaks into labels.
 func TestParseTopology_PVCInheritsApplicationFromMountingPod(t *testing.T) {
@@ -1259,7 +1259,7 @@ func TestParseTopology_NodeReadyStatusCaseInsensitive(t *testing.T) {
 
 // TestParseTopology_NodeReadyStatusOrderFree — the active-row pick and the
 // defensive multi-active tie-break are pure functions of the data, independent
-// of upstream vector order (D6).
+// of upstream vector order.
 func TestParseTopology_NodeReadyStatusOrderFree(t *testing.T) {
 	node := model.Sample{Metric: model.Metric{"cluster": "c", "node": "w0"}}
 	r := func(status string, v model.SampleValue) model.Sample {

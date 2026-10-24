@@ -272,7 +272,7 @@ func gwConfigHTTPSAndHTTP(name, ns string, selector map[string]string, hosts []s
 // :80 -> "http.80", TLS-terminated :443 -> "https.443.https.<gw>.<ns>" (same
 // clusters as :80, since VS routing is port-independent), and an unserved port
 // (:8080) or a passthrough :443 server -> an empty RC (a miss). This is the
-// design-D5 behaviour the route_engine_no_listener_on_port reason keys off.
+// mis-guessed-port behaviour the route_engine_no_listener_on_port reason keys off.
 func TestTranslatePortSelectsRouteConfig(t *testing.T) {
 	const ns = "gw-000"
 	dh := "svc-000-0-exact." + ns + ".svc.cluster.local"

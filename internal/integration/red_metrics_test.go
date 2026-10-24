@@ -230,7 +230,7 @@ traces_service_graph_request_total{client="client",server="unknown",cluster="clu
 }
 
 // TestConnStringServiceCarriesMetricsFanOutDoesNot pins the widened rule at the
-// wire: a D29 connection-string endpoint resolves to a Service, that
+// wire: a connection-string endpoint resolves to a Service, that
 // pod-calls-service edge carries data.metrics, and the service-selects-pod
 // fan-out beneath it carries none — so the caller's rate is reported exactly
 // once.

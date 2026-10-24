@@ -35,12 +35,12 @@ type podObs struct {
 	podIP   string
 }
 
-// serviceKey identifies a Service by its cluster-scoped namespace/name (D29).
+// serviceKey identifies a Service by its cluster-scoped namespace/name.
 type serviceKey struct{ cluster, namespace, service string }
 
 // podNameKey identifies a pod by its cluster-scoped namespace/name. Used
 // internally to join an endpointslice `targetref_name` to its backing pod when
-// building EndpointsByService (D29).
+// building EndpointsByService.
 type podNameKey struct{ cluster, namespace, pod string }
 
 // ServiceObs carries the kube_service_info facts needed to materialise a
@@ -120,10 +120,10 @@ type Topology struct {
 	// lexically-smaller cluster-scoped ID wins. This is a deterministic pure
 	// function of the data — NOT first-inserted — so the chosen pod (and hence
 	// every `pod-calls-pod` edge target resolved through this index) is stable
-	// across rebuilds regardless of map-iteration order (D6 determinism).
+	// across rebuilds regardless of map-iteration order (determinism).
 	PodsByUID map[string]*graph.PodNode
 
-	// D29 connection-string resolution indexes. Built only when KSM exports
+	// Connection-string resolution indexes. Built only when KSM exports
 	// services / endpointslices (and, for the slice→service join, allowlists
 	// the kubernetes.io/service-name label); empty otherwise. These are
 	// INDEXES ONLY — ServiceNodes and service-selects-pod edges are
@@ -170,7 +170,7 @@ type Topology struct {
 	// matched a FlexVol; no pod, node or controller name reached its scope).
 	// An absent key means "never read"; 0 means "read, matched nothing". This
 	// covers the twelve by-reference families under a storage build
-	// (scope-controller-legs-by-reference) exactly as it already covers the
+	// exactly as it already covers the
 	// QoS workload six: a StatefulSet-only estate, for example, carries a
 	// `kube_statefulset_annotations` entry but no key at all for
 	// `kube_job_owner`, `kube_deployment_annotations`, or any other kind no
@@ -196,9 +196,9 @@ type Topology struct {
 	clusters *clusterResolver
 
 	// ontapZones is the `az` / `env` zone set of every ONTAP cluster the
-	// Harvest read named, for the zone-agreeing alert match
-	// (read-storage-roots-through-volume-hub D11). Nil when no Harvest series
-	// carried the pair, which leaves NetApp alerts matching by label alone.
+	// Harvest read named, for the zone-agreeing alert match. Nil when no
+	// Harvest series carried the pair, which leaves NetApp alerts matching by
+	// label alone.
 	ontapZones map[string][]zone
 }
 
@@ -214,7 +214,7 @@ type topologyVectors struct {
 	Service     model.Vector
 	EpEndpoints model.Vector
 	EpLabels    model.Vector
-	// Pod controller-owner resolution (D34).
+	// Pod controller-owner resolution.
 	PodOwner        model.Vector
 	ReplicaSetOwner model.Vector
 	// Job → CronJob resolution, for pod ArgoCD Application resolution ONLY:
@@ -284,21 +284,6 @@ type topologyVectors struct {
 	// addExtraSeries under the same mutex as ScopeIssued.
 	ExtraSeriesCount map[promql.Query]int
 
-	// RootNodePods are the pods whose newest incarnation runs on a node root,
-	// claim-mounting or not. Only a Kubernetes-only build (topologyPlan.
-	// kubernetesOnly) writes it: the storage body draws a pod through the claims
-	// it mounts, so its node seed carries claimless pods no further, but a
-	// Kubernetes graph of a node draws everything that runs there. The pod wave
-	// adds these to its scope. Written by readNodeSeed before bindingsDone
-	// closes and read by readScopedPods after waiting on it, so it needs no lock.
-	RootNodePods []podSeriesKey
-	// RootNodePodInfo are the kube_pod_info rows of RootNodePods, every
-	// incarnation of each, kept from the node seed's incarnation completion. That
-	// read is the pod wave's own query over the same (namespace, pod) pairs, so
-	// the pod wave reuses these rows instead of issuing it again. Written and
-	// read under the same ordering as RootNodePods.
-	RootNodePodInfo model.Vector
-
 	// VolumeKey derives each claim's Harvest match token from its bound PV
 	// name and decides how that token is compared against the stock `volume`
 	// label. Like JobAnnotationsDegraded it is a build-scoped FACT rather than
@@ -306,13 +291,13 @@ type topologyVectors struct {
 	// Nil means the defaults (`-` → `_`, suffix match).
 	VolumeKey *VolumeKeyRewriter
 	// VolumeLabelsRestricted records that VolumeLabels was read restricted to
-	// the request's rooted components (scope-volume-labels-by-storage-root)
-	// rather than whole. Like VolumeKey and JobAnnotationsDegraded it is a
-	// build-scoped FACT the parse needs: under a restriction every claim outside
-	// the rooted components resolves no aggregate BY CONSTRUCTION, so the
-	// join-coverage signal that counts such claims no longer distinguishes a
-	// derivation that does not fit the estate's naming from a claim the request
-	// did not ask about, and is suppressed.
+	// the request's rooted components rather than whole. Like VolumeKey and
+	// JobAnnotationsDegraded it is a build-scoped FACT the parse needs: under a
+	// restriction every claim outside the rooted components resolves no
+	// aggregate BY CONSTRUCTION, so the join-coverage signal that counts such
+	// claims no longer distinguishes a derivation that does not fit the
+	// estate's naming from a claim the request did not ask about, and is
+	// suppressed.
 	VolumeLabelsRestricted bool
 	// MaterialiseUnboundClaims records that the build is claim-seeded (a pvc or
 	// pv root): every claim its claim-info read returned is a root claim, and a
@@ -322,7 +307,7 @@ type topologyVectors struct {
 	// root kind from drawing an unmounted claim. A build-scoped FACT like
 	// VolumeLabelsRestricted.
 	MaterialiseUnboundClaims bool
-	// NetApp Harvest storage series, in join order (design.md D3):
+	// NetApp Harvest storage series, in join order:
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
 	VolumeLabels     model.Vector

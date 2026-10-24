@@ -141,7 +141,7 @@ func filterNodes(g *Graph, scope Scope, excluded map[string]struct{}) map[string
 	// each is retained iff referenced by an in-scope element (or admitted
 	// unconditionally under Inventory). Wave 1: netapp-aggr iff an admitted PVC has a
 	// pvc-to-netapp-aggr edge to it. Wave 2: netapp-node iff an admitted
-	// aggregate names it in labels.node. See design.md D6.
+	// aggregate names it in labels.node.
 	var deferredK8s, deferredAggr, deferredNetAppNode []GraphNode
 	hostNodes := map[string]struct{}{}
 	for id, n := range g.NodesByID {
@@ -293,7 +293,7 @@ func nodePassesFilters(n GraphNode, scope Scope, rawName func(string) string) bo
 // namespace's storage topology.
 //
 // The cluster filter applies first and exactly as for other node types (the
-// node's own labels carry cluster). See design.md D6.
+// node's own labels carry cluster).
 func infraNodePassesFilters(n GraphNode, scope Scope, referenced map[string]struct{}, rawName func(string) string) bool {
 	labels := n.Labels()
 	if len(scope.Clusters) > 0 {

@@ -46,8 +46,8 @@ func TestIssueScoped_RequiredChunkFails(t *testing.T) {
 }
 
 // Every family fails closed, the two that degrade on /v1/graph included: a
-// by-reference wave only runs on /v1/storage-graph
-// (fail-storage-graph-on-any-leg-error). One failed chunk of three fails the
+// by-reference wave only runs on /v1/storage-graph, which fails closed on any
+// leg error. One failed chunk of three fails the
 // read, and the error names the family and nothing from the upstream text.
 func TestIssueScoped_AnyChunkFailureFailsAndNamesFamily(t *testing.T) {
 	const tracking = "annotation_argocd_argoproj_io_tracking_id"

@@ -183,7 +183,7 @@ func TestSelect_CatchAllAlwaysSelected(t *testing.T) {
 
 // Service-graph and probe accept no request dimension, so zones must be
 // ignored for them entirely: narrowing them would drop edges the loaded
-// topology still needs (design D4).
+// topology still needs.
 func TestSelect_DimensionlessFamiliesIgnoreZones(t *testing.T) {
 	tbl, err := NewTable([]Backend{
 		be("sg-a", "http://vm-a:8428", []Family{FamilyServiceGraph, FamilyProbe, FamilyKSM, FamilyKubelet, FamilyHarvest}, "zone-a"),

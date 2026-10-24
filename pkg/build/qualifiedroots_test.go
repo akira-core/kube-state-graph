@@ -14,7 +14,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// accept-multi-zone-storage-graph: `aggr=` / `svm=` accept `<ontap_cluster>/<name>`
+// Qualified roots: `aggr=` / `svm=` accept `<ontap_cluster>/<name>`
 // beside the bare form. A qualified value is read one query per ONTAP cluster
 // (cluster equality + name alternation), so an aggregate or SVM of that name on
 // another filer is never read for the root.
@@ -147,7 +147,7 @@ func TestRootedVolumeLabels_CapCountsBareAndQualifiedGroups(t *testing.T) {
 	assert.Empty(t, q.Issued())
 }
 
-// Spec (design D4): owner completion treats a qualified (oc, aggr) as read
+// Spec: owner completion treats a qualified (oc, aggr) as read
 // whole, like a bare aggregate — an SVM-group row of it needs no second read.
 func TestOwnerCompletionTargets_QualifiedAggregateIsReadWhole(t *testing.T) {
 	row := func(oc, aggr string) *model.Sample {

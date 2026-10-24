@@ -545,8 +545,7 @@ func hasPod(body cytoscape.Body, id string) bool {
 // see them, and they can see none of the suite's own.
 var hubNow = fixedNow.Add(2 * time.Hour)
 
-// TestStorageGraphHubStaysInTheRequestZone (read-storage-roots-through-volume-hub
-// task 8.5): two Kubernetes zones behind the routing table, each in its own
+// TestStorageGraphHubStaysInTheRequestZone: two Kubernetes zones behind the routing table, each in its own
 // installation, running a cluster of the SAME raw name, and one zoned Harvest
 // store per zone. A zone-a request rooted at a filer that also serves a zone-b
 // claim draws zone-a's claim only: zone-b's kube-state-metrics store is not
@@ -700,8 +699,7 @@ func (s *MultiBackendSuite) elementJSON(body cytoscape.Body) (nodes, edges map[s
 	return nodes, edges
 }
 
-// TestStorageGraphMultiZoneIsTheUnionOfItsZones (accept-multi-zone-storage-graph
-// task 7.1): against two zone-scoped installations, a request selecting both
+// TestStorageGraphMultiZoneIsTheUnionOfItsZones: against two zone-scoped installations, a request selecting both
 // zones draws both and equals — element for element, weights included — the
 // union of the two single-zone requests, although the two zones share a cluster
 // name, an aggregate name, a FlexVol name and a claim name.

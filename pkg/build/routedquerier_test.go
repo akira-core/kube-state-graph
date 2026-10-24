@@ -362,8 +362,7 @@ func TestRoutedBuild_ZoneMatcherStillRendered(t *testing.T) {
 		"selecting a backend must not replace the pushed-down matcher")
 	assert.Empty(t, fb.queryFor(promql.QPodInfo), "the other zone's store is not asked")
 
-	// The Harvest leg is zone-routed and carries no matcher
-	// (drop-harvest-zone-matchers D1).
+	// The Harvest leg is zone-routed and carries no matcher.
 	hv := fa.queryFor(promql.QVolumeLabels)
 	require.NotEmpty(t, hv, "the zone-a store must have been asked for Harvest")
 	assert.Equal(t, `last_over_time(volume_labels[1m])`, hv,
@@ -383,8 +382,7 @@ var harvestQueries = []promql.Query{
 
 // Under a zone-scoped request every Harvest leg reaches the zone's backend AND
 // any catch-all backend, and each receives the byte-identical string an
-// unfiltered build issues — the catch-all returns every zone's series
-// (drop-harvest-zone-matchers D1).
+// unfiltered build issues — the catch-all returns every zone's series.
 func TestRoutedBuild_HarvestLegsReachZoneAndCatchAllBackendsWithoutAMatcher(t *testing.T) {
 	joined := map[promql.Query]model.Vector{
 		promql.QPVCInfo: {&model.Sample{Metric: model.Metric{

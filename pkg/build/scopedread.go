@@ -21,10 +21,10 @@ import (
 //
 // There is no per-family error class. Only a by-reference plan — the
 // /v1/storage-graph and /v1/k8s-graph reads — issues these waves, and both
-// endpoints fail closed on every query error but ALERTS (fail-storage-graph-on-any-leg-error),
-// so a chunk error of ANY family here fails the build — including
-// kube_replicaset_annotations and kube_job_annotations, which /v1/graph's
-// first wave reads as degrading families.
+// endpoints fail closed on every query error but ALERTS, so a chunk error of
+// ANY family here fails the build — including kube_replicaset_annotations and
+// kube_job_annotations, which /v1/graph's first wave reads as degrading
+// families.
 //
 // render, when non-nil, replaces promql.RenderScoped for this family's
 // chunks. nil keeps today's identity-label scope. budgetOverhead is the
@@ -44,8 +44,7 @@ type scopedFamily struct {
 // issueScopedFamilies issues several families, each restricted to its OWN
 // scope, chunked and merged in chunk order, under one bounded errgroup shared
 // across every chunk of every family — the generic engine behind
-// readScopedPods, readScopedNodes and readScopedControllers' two stages
-// (scope-controller-legs-by-reference D3).
+// readScopedPods, readScopedNodes and readScopedControllers' two stages.
 //
 // A family whose scope is empty is neither launched nor tallied: its
 // topologyVectors slot is left untouched (nil, from the zero-valued

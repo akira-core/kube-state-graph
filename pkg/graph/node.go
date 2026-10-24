@@ -406,7 +406,7 @@ func (p *PVCNode) isGraphNode()              {}
 
 // ServiceNode represents a Kubernetes Service surfaced when a service-graph
 // connection string (`<service>.<namespace>.svc.<domain>`) resolves to an
-// in-cluster Service via `kube_service_info` (see design.md D29). Its backing
+// in-cluster Service via `kube_service_info`. Its backing
 // pods are wired with `service-selects-pod` edges. IPAddressValue carries the
 // service's `cluster_ip` (single-element slice) when it is not the headless
 // sentinel `"None"`; headless services carry nil.
@@ -438,7 +438,7 @@ func (s *ServiceNode) Status() string            { return "" }
 func (s *ServiceNode) isGraphNode()              {}
 
 // ExternalNode represents a non-pod endpoint surfaced by the missing-UID
-// human-label fallback (D27): the service-graph producer dropped
+// human-label fallback: the service-graph producer dropped
 // client_k8s_pod_uid or server_k8s_pod_uid, but the human-readable
 // client/server label survived.
 type ExternalNode struct {
@@ -612,6 +612,6 @@ func NetAppSVMID(ontapCluster, svm string) string {
 func ExternalID(value string) string { return "external/" + value }
 
 // Reserved: the "cluster/" ID prefix is owned by the Cytoscape presentation
-// layer (api.clusterParentID, design.md D31) for synthetic compound group
+// layer (api.clusterParentID) for synthetic compound group
 // nodes. Those are NOT GraphNodes and are never minted here — do not reuse the
 // prefix for a real node kind.

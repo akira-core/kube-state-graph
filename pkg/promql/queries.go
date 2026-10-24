@@ -25,24 +25,23 @@ const (
 	// QServiceGraphFailedTotal is the Errors counter of the service-graph RED
 	// triple. OPTIONAL — a missing metric, empty result, or query error degrades
 	// to "no error_rate on the edge" and never fails the build. Alloy/Tempo
-	// exporter family, same as QServiceGraphTotal. See design D3 / D6 of
-	// add-service-graph-red-metrics.
+	// exporter family, same as QServiceGraphTotal.
 	QServiceGraphFailedTotal Query = "traces_service_graph_request_failed_total"
 	// QServiceGraphServerSecondsBucket is the Duration classic histogram of the
 	// service-graph RED triple (server-observed). OPTIONAL — absence degrades to
 	// "no p90_server_ms". The rendered PromQL is RAW: no upstream aggregation, so
 	// each bucket series keeps the full dimension set of its request-total
 	// series plus `le` and joins by exact identity, exactly like the failure
-	// counter (design D4 / D5).
+	// counter.
 	QServiceGraphServerSecondsBucket Query = "traces_service_graph_request_server_seconds_bucket"
 	QUpProbe                         Query = "up"
 
-	// Service / endpointslice topology (D29 connection-string resolution).
+	// Service / endpointslice topology (connection-string resolution).
 	QServiceInfo            Query = "kube_service_info"
 	QEndpointSliceEndpoints Query = "kube_endpointslice_endpoints"
 	QEndpointSliceLabels    Query = "kube_endpointslice_labels"
 
-	// Pod controller-owner resolution (D34). kube_pod_owner gives a pod's
+	// Pod controller-owner resolution. kube_pod_owner gives a pod's
 	// owner refs; kube_replicaset_owner resolves a ReplicaSet owner up to
 	// its owning Deployment (the ReplicaSet is skipped). The
 	// owner_kind/owner_name/owner_is_controller labels are KSM defaults
@@ -96,7 +95,7 @@ const (
 	// `ready_status` attribute (never a label, never a new node).
 	// The condition="Ready" selector is a fixed, request-invariant metric-
 	// selection contract (same class as the QNodeAddresses type selector and the
-	// D30 sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
+	// service-graph sentinel selector), NOT a caller filter. OPTIONAL — a KSM default,
 	// absence degrades gracefully to no `ready_status`.
 	QNodeStatusCondition Query = "kube_node_status_condition"
 
@@ -132,7 +131,7 @@ const (
 	// Prometheus' reserved `job` target label. Joined on
 	// (cluster, namespace, kind, name) against the pod's already-resolved
 	// controller owner, so the Deployment case needs no extra owner hop (the
-	// D34 ReplicaSet skip has already collapsed it). ALL are OPTIONAL on the
+	// ReplicaSet skip has already collapsed it). ALL are OPTIONAL on the
 	// EMPTY-VECTOR axis — each annotation label requires the operator's
 	// --metric-annotations-allowlist=<plural-resource>=[argocd.argoproj.io/tracking-id],
 	// and because that flag is per-resource the degradation is per-family: an
@@ -159,7 +158,7 @@ const (
 	QCronJobAnnotations     Query = "kube_cronjob_annotations"
 
 	// NetApp Harvest volume label series — the SOLE source of the storage
-	// topology (hop A of design.md D3): the pvc-to-netapp-aggr edge, the
+	// topology (hop A of the storage join): the pvc-to-netapp-aggr edge, the
 	// netapp-aggr / netapp-node entities and the PVC `svm` label all derive
 	// from this one series and nothing else. It is an info series: its sample
 	// value is discarded, only its label set is consumed. The join key is the
@@ -169,7 +168,7 @@ const (
 	// vector degrades to no storage topology, never a build failure.
 	QVolumeLabels Query = "volume_labels"
 
-	// NetApp Harvest QoS workload I/O (hop B of design.md D3). Harvest has
+	// NetApp Harvest QoS workload I/O (hop B of the storage join). Harvest has
 	// already resolved ONTAP base counters — ops are per-second, latency is an
 	// average in microseconds, data is bytes per second — so these are read
 	// verbatim via last_over_time, NEVER wrapped in rate(). Read at volume
@@ -183,7 +182,7 @@ const (
 	QQoSReadData     Query = "qos_read_data"
 	QQoSWriteData    Query = "qos_write_data"
 
-	// NetApp Harvest QoS fixed-policy ceilings (hop C of design.md D3),
+	// NetApp Harvest QoS fixed-policy ceilings (hop C of the storage join),
 	// joined on the (ontap_cluster, svm, policy_group) triple: cluster and svm
 	// from hop A's matched volume_labels series, policy group from the matched
 	// QoS workload series. Rendered bare — a policy object has no LUN
@@ -529,13 +528,12 @@ func FamilyOf(q Query) (Family, bool) {
 // familyAcceptsAZ is derived from queryDims once, at package initialisation:
 // a family is zone-routable iff EVERY query in it carries dimAZ or the
 // routing-only dimAZRoute bit. Harvest carries dimAZRoute only, so it is
-// routed and not matched (drop-harvest-zone-matchers D1).
+// routed and not matched.
 //
 // Deriving it (rather than restating it) is what keeps backend selection and
 // matcher rendering reading the same table. The service-graph and probe
 // families carry neither bit, so narrowing them by zone at the routing layer
-// would drop exactly the series the matcher layer deliberately keeps — see the
-// design's D4.
+// would drop exactly the series the matcher layer deliberately keeps.
 //
 // A family whose queries disagreed would resolve to false (not zone-routable,
 // so fanned out to every backend serving it), which is the safe direction.
@@ -570,7 +568,7 @@ func (f Family) AcceptsAZ() bool { return familyAcceptsAZ[f] }
 // familyRendersAZ is derived from queryDims once, at package initialisation:
 // a family renders an `az` matcher iff EVERY query in it carries dimAZ.
 // dimAZRoute does not count, so Harvest is zone-routed (AcceptsAZ) without
-// the matcher (drop-harvest-zone-matchers D1).
+// the matcher.
 //
 // QueryLabels reads this bit for an arbitrary metric that has no queryDims
 // entry of its own: the family's queries are the only honest statement of
@@ -596,15 +594,14 @@ const HarvestVolumeLabel = "volume"
 // resolveJobCronJobOwners retains: CronJob controller owners. It is a
 // request-invariant metric-selection contract, NOT a caller filter — the
 // reader already drops every other row before it is keyed or counted, so
-// selecting them upstream is output-preserving
-// (harden-controller-annotation-legs D1).
+// selecting them upstream is output-preserving.
 const jobOwnerCronJobSelector = `owner_kind="CronJob",owner_is_controller="true"`
 
 // argoTrackingIDPresentSelector keeps each controller-annotation family at
 // series that actually carry a tracking-id. It is a request-invariant
 // metric-selection contract, NOT a caller filter — resolveApplications
 // skips an empty or absent tracking-id before keyOf, so selecting them
-// upstream is output-preserving (harden-controller-annotation-legs D1).
+// upstream is output-preserving.
 //
 // What it actually saves is the ALLOWLISTED-BUT-UNANNOTATED majority: once
 // --metric-annotations-allowlist names the resource, kube-state-metrics emits
@@ -618,22 +615,22 @@ const argoTrackingIDPresentSelector = `annotation_argocd_argoproj_io_tracking_id
 
 // alertsFiringSelector keeps the ALERTS read at alerts that are actually
 // firing. It is a request-invariant metric-selection contract of the same
-// class as the D30 sentinel and condition="Ready" — NOT a caller filter: a
+// class as the service-graph sentinel and condition="Ready" — NOT a caller filter: a
 // `pending` alert is a threshold crossed for less than its `for:` duration,
 // and surfacing it would make the graph flap on every rebuild. The value is
 // compiled in; there is no knob.
 const alertsFiringSelector = `alertstate="firing"`
 
 // serviceGraphSentinelSelector excludes the servicegraph connector's virtual
-// peers from the service-graph series at the query layer (design.md D30): an
+// peers from the service-graph series at the query layer: an
 // uninstrumented caller surfaces as client="user", an unresolved peer as
 // "unknown", neither carrying a pod UID. `!~` is a fully-anchored RE2 match, so
 // a series is dropped only when the WHOLE client/server value equals a sentinel
 // (case-sensitive) — a "http://user/..." connection string is unaffected, so
-// D29 resolution is untouched. The set is fixed, no operator knob (as with
-// D29's removal of KSG_OTHERS_NAME_PATTERN).
+// connection-string resolution is untouched. The set is fixed, no operator
+// knob (as with the removal of KSG_OTHERS_NAME_PATTERN).
 //
-// The two matchers are independent (resolve-unknown-server-peer-labels D1). The
+// The two matchers are independent. The
 // client matcher excludes both sentinels: by the connector's contract a
 // sentinel client never co-occurs with a populated pod UID, so dropping the
 // whole series upstream discards no real pod-resolved edge, and an unresolved
@@ -648,11 +645,11 @@ const alertsFiringSelector = `alertstate="firing"`
 //
 // The numeric service-graph metrics (traces_service_graph_request_failed_total,
 // traces_service_graph_request_server_seconds_bucket) reuse this fragment so the
-// three series always describe one edge population (add-service-graph-red-metrics D6).
+// three series always describe one edge population.
 const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 
 // serviceGraphLinkExclusionSelector drops span-link virtual edges from the two
-// OPTIONAL RED series (add-service-graph-red-metrics D1b / D6). The
+// OPTIONAL RED series. The
 // operator-configured `edge_relation="link"` dimension marks an edge the
 // servicegraph connector materialised from a SPAN LINK rather than from a
 // paired client/server span: the two spans belong to different trace contexts
@@ -661,7 +658,7 @@ const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 // still emitted (the request-total selector deliberately does NOT carry this
 // matcher) — only its measurement is suppressed.
 //
-// Same class as the D30 sentinel and the node condition="Ready" selector: a
+// Same class as the service-graph sentinel and the node condition="Ready" selector: a
 // fixed contract that never varies per request, NOT a caller filter, so the
 // "no filters pushed to PromQL" rule is preserved. The label name and the value
 // are compiled in — no knob.
@@ -680,8 +677,8 @@ const serviceGraphSentinelSelector = `client!~"user|unknown",server!~"user"`
 const serviceGraphLinkExclusionSelector = `edge_relation!="link"`
 
 // serviceGraphFailedSelector and serviceGraphBucketSelector are the two
-// OPTIONAL RED series' fixed selectors: the D30 sentinel composed with the
-// D1b/D6 link exclusion. Named separately from the two constants above so
+// OPTIONAL RED series' fixed selectors: the service-graph sentinel composed
+// with the span-link exclusion. Named separately from the two constants above so
 // fixedSelector (below) can hold one string per query without recomputing the
 // concatenation at every Render call.
 const (
@@ -692,8 +689,7 @@ const (
 // fixedSelector is the query's request-invariant metric-selection contract —
 // identical for every request, rendered FIRST by Render's braces helper and by
 // RenderScoped (scope.go), so a scoped rendering of a family can never drop
-// the fixed selector its unscoped rendering carries (scope-controller-legs-by-
-// reference D2). A query with no entry renders no fixed selector — the zero
+// the fixed selector its unscoped rendering carries. A query with no entry renders no fixed selector — the zero
 // value of a missing map key is "", and braces("") is exactly the pre-existing
 // behaviour. This is a single source of truth: Render's switch below reads it
 // through braces(fixedSelector[q]) instead of restating each literal, so the
@@ -810,13 +806,13 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 	case QVolumeLabels:
 		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, fx, w)
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
-		// Volume-granularity restriction (design.md D2): ONTAP collects a
+		// Volume-granularity restriction: ONTAP collects a
 		// workload per LUN as well as per volume, and a LUN workload carries
 		// the `volume` of its containing FlexVol — an unrestricted read would
 		// sum LUN traffic on top of volume traffic for the same claim. This is
 		// a fixed,
-		// request-invariant metric-selection contract (same class as the D30
-		// sentinel matcher and condition="Ready"), NOT a caller filter.
+		// request-invariant metric-selection contract (same class as the
+		// service-graph sentinel matcher and condition="Ready"), NOT a caller filter.
 		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, fx, w)
 	case QQoSPolicyFixedMaxIOPS:
 		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, fx, w)
@@ -848,19 +844,19 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// source (client-side) cluster; server-side cluster is recovered at
 		// build time via the topology pod-UID index, not via PromQL.
 		//
-		// The fixed sentinel matcher (D30) drops the connector's virtual
+		// The fixed sentinel matcher drops the connector's virtual
 		// `user` / `unknown` peers upstream. It is a metric-selection contract,
 		// identical for every request — NOT a caller-supplied filter — so it
-		// does not violate the "no filters pushed to PromQL" rule (D2 / D7).
+		// does not violate the "no filters pushed to PromQL" rule.
 		return fmt.Sprintf(`rate(traces_service_graph_request_total%s[%s])`, fx, w)
 	case QServiceGraphFailedTotal:
 		// OPTIONAL Errors counter. Raw label granularity so failures join the
-		// total series by exact identity (design D4).
+		// total series by exact identity.
 		return fmt.Sprintf(`rate(traces_service_graph_request_failed_total%s[%s])`, fx, w)
 	case QServiceGraphServerSecondsBucket:
 		// OPTIONAL Duration classic histogram.
 		//
-		// Read RAW — deliberately no upstream `sum by` (design D4). Once an
+		// Read RAW — deliberately no upstream `sum by`. Once an
 		// endpoint may be resolved from a peer address or a connection string,
 		// no low-cardinality label subset identifies an edge: grouping by the
 		// pod-pair triple merges every peer-resolved destination of one client

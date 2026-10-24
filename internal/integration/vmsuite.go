@@ -30,7 +30,7 @@ import (
 )
 
 // VMImage is the pinned VictoriaMetrics container image used across the
-// integration suite. Pinned by tag — never `:latest` — per D20.
+// integration suite. Pinned by tag — never `:latest`.
 const VMImage = "victoriametrics/victoria-metrics:v1.107.0"
 
 // VMSuite is the base suite type embedded by every integration suite that
@@ -403,7 +403,7 @@ func WithQueryLog(l *queryLog) APIOption { return func(o *apiOptions) { o.querie
 func WithClock(clk clock.Clock) APIOption { return func(o *apiOptions) { o.clk = clk } }
 
 // WithRouteResolver injects an Istio route-resolution engine into the
-// in-process server's build pipeline (translate-global-fqdn-to-k8s-service).
+// in-process server's build pipeline.
 // Mirrors how cmd/kube-state-graph wires pkg/route when --route-store-dsn is
 // set; nil (the default) keeps the feature off.
 func WithRouteResolver(rr build.RouteResolver, perCallTimeout time.Duration) APIOption {

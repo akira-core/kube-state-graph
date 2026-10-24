@@ -45,7 +45,7 @@ func TestClusterFamilyKey(t *testing.T) {
 }
 
 // TestClusterFamilyKey_OverClusterIdentities pins the family rule as it applies
-// to composed cluster identities (design D4): the unchanged digit-run rule,
+// to composed cluster identities: the unchanged digit-run rule,
 // evaluated over `<az>-<env>-<cluster>`, scopes a family to one zone AND one
 // environment.
 func TestClusterFamilyKey_OverClusterIdentities(t *testing.T) {
@@ -56,7 +56,7 @@ func TestClusterFamilyKey_OverClusterIdentities(t *testing.T) {
 	assert.False(t, same("us-dev-c1", "us-prod-c1"), "the environment alone separates families")
 	assert.False(t, same("us-dev-c1", "eu-dev-c1"), "the zone alone separates families")
 
-	// Documented caveat (design D4): the rule normalises digit runs ANYWHERE in
+	// Documented caveat: the rule normalises digit runs ANYWHERE in
 	// the string, so digits inside a zone value widen the family. Pinned so a
 	// future struct-aware key is a deliberate change to this expectation, not a
 	// silent one.

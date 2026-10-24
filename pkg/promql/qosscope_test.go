@@ -65,7 +65,7 @@ func TestRenderQoSVolumeScoped(t *testing.T) {
 			got, ok := RenderQoSVolumeScoped(q, time.Minute, LabelKeys{}, sel, []string{"v"})
 			require.True(t, ok)
 			assert.NotContains(t, got, "lun",
-				"volume granularity is the reader's rule, never a matcher (D11)")
+				"volume granularity is the reader's rule, never a matcher")
 			assert.NotContains(t, got, `az=`)
 			assert.NotContains(t, got, `env=`)
 			assert.Equal(t, `last_over_time(`+string(q)+`{volume="v"}[1m])`, got)

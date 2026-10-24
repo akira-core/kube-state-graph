@@ -140,7 +140,7 @@ func TestReadScopedQoS_RestrictedToMatchedVolumes(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Contains(t, got[0], `volume="trident_pvc_a"`)
 	assert.NotContains(t, got[0], "root_vol", "an unmatched workload is never fetched")
-	assert.NotContains(t, got[0], "lun", "volume granularity is the reader's rule, not a matcher (D11)")
+	assert.NotContains(t, got[0], "lun", "volume granularity is the reader's rule, not a matcher")
 
 	// The prerequisites were asked before the family they gate.
 	f.mu.Lock()

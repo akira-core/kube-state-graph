@@ -26,7 +26,7 @@ type Config struct {
 	APIKeysReloadInterval time.Duration
 	LogLevel              string
 	// RouteStoreDSN is the ClickHouse DSN of the versioned Istio-config store
-	// backing global-FQDN route resolution (translate-global-fqdn-to-k8s-service).
+	// backing global-FQDN route resolution.
 	// Empty (the default) disables the feature entirely: no store is dialed, no
 	// RouteResolver is constructed, and the service-graph reader behaves
 	// byte-for-byte as it did before route resolution existed.
@@ -60,8 +60,7 @@ type Config struct {
 	// KSG_PROM_PASSWORD) — deliberately NO CLI flags, since credential-carrying
 	// flags leak through process listings and container specs. Both must be set
 	// together or both left empty; Validate rejects a half-configured pair.
-	// Rotation requires a restart (no hot reload). See
-	// openspec/changes/add-prom-basic-auth/design.md D-A1/D-A2.
+	// Rotation requires a restart (no hot reload).
 	PromUsername string
 	PromPassword string
 	// AZLabel / EnvLabel name the UPSTREAM labels the `az` and `env` request
@@ -250,7 +249,7 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	}
 
 	getStr("KSG_PROM_URL", &cfg.PromURL)
-	// Env-only by design — no matching flags are registered in Parse (D-A1).
+	// Env-only by design — no matching flags are registered in Parse.
 	getStr("KSG_PROM_USERNAME", &cfg.PromUsername)
 	getStr("KSG_PROM_PASSWORD", &cfg.PromPassword)
 	getStr("KSG_LISTEN_ADDR", &cfg.ListenAddr)
@@ -324,7 +323,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("prom-url is not a valid URL: %q", c.PromURL)
 	}
 	// Upstream basic-auth credentials must be configured as a pair. The error
-	// names the env vars only — never echo the configured values (D-A2/D-A5).
+	// names the env vars only — never echo the configured values.
 	if (c.PromUsername == "") != (c.PromPassword == "") {
 		return errors.New("KSG_PROM_USERNAME and KSG_PROM_PASSWORD must be set together (or both left unset)")
 	}

@@ -144,7 +144,7 @@ func TestParseTopology_PodIPNotInheritedFromOldUID(t *testing.T) {
 
 // TestParseTopology_PVCVolumeLabelDeterministic — two binding samples for the
 // same PVC id carrying different `volume` labels must resolve to the
-// lexically-smallest volume regardless of upstream vector order (D6).
+// lexically-smallest volume regardless of upstream vector order.
 func TestParseTopology_PVCVolumeLabelDeterministic(t *testing.T) {
 	binding := func(volume string) model.Sample {
 		return model.Sample{Metric: model.Metric{
@@ -163,7 +163,7 @@ func TestParseTopology_PVCVolumeLabelDeterministic(t *testing.T) {
 
 // TestParseTopology_ExternalIPDeterministic — two ExternalIP address samples
 // for the same (cluster, node) must resolve to the lexically-smallest address
-// regardless of upstream vector order (D6).
+// regardless of upstream vector order.
 func TestParseTopology_ExternalIPDeterministic(t *testing.T) {
 	addr := func(a string) model.Sample {
 		return model.Sample{Metric: model.Metric{
@@ -184,7 +184,7 @@ func TestParseTopology_ExternalIPDeterministic(t *testing.T) {
 // TestParseTopology_InternalIPFallback — a node with only InternalIP rows
 // surfaces the InternalIP on IPAddress; ExternalIP wins whenever present,
 // regardless of upstream vector order; with neither type no IP is emitted;
-// duplicate samples within a type resolve lexically-smallest (D6).
+// duplicate samples within a type resolve lexically-smallest.
 func TestParseTopology_InternalIPFallback(t *testing.T) {
 	addr := func(typ, a string) model.Sample {
 		return model.Sample{Metric: model.Metric{
@@ -236,7 +236,7 @@ func TestParseTopology_InternalIPFallback(t *testing.T) {
 
 // TestParseTopology_NodeLabelMergeDeterministic — two kube_node_labels series
 // for the same node disagreeing on a label key must resolve to the
-// lexically-smallest value regardless of upstream vector order (D6).
+// lexically-smallest value regardless of upstream vector order.
 func TestParseTopology_NodeLabelMergeDeterministic(t *testing.T) {
 	series := func(zone string) model.Sample {
 		return model.Sample{Metric: model.Metric{

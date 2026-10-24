@@ -1,13 +1,13 @@
 // Package store is the READ-ONLY contract for the versioned Istio-config store
-// backing route resolution (the translate-global-fqdn-to-k8s-service change).
+// backing route resolution.
 // The metadata-exporter repo owns watch/ingest and the schema; kube-state-graph
 // only loads version snapshots out of it — there is deliberately no CreateSchema
-// and no inserter here (design D7). Ported from poc/route2a/internal/store with
+// and no inserter here. Ported from poc/route2a/internal/store with
 // one structural change: every row carries a `cluster` column and every
 // snapshot query is scoped by it, because kube-state-graph is multi-cluster and a
 // Gateway/VS lookup must never leak across clusters. The one deliberate
 // cross-cluster read is ClustersWithIngressIP, the ingress-cluster selection
-// probe (design D10).
+// probe.
 package store
 
 import (
@@ -242,8 +242,7 @@ type VSRow struct {
 // their bound VirtualServices, and the backend Services those VS route to. It
 // is loaded once (LoadTrafficAt), then resolved in memory
 // (pkg/route/snapshot) with no further DB round-trips. Each row's ValidTo is
-// the materialized column value, so liveness is `ValidFrom <= at < ValidTo`
-// (simplify-route-resolution-to-point-in-time D2).
+// the materialized column value, so liveness is `ValidFrom <= at < ValidTo`.
 type TrafficSnapshot struct {
 	Services []ServiceRow // ingress LB + backend destination Service versions
 	Deploys  []DeployRow
@@ -254,7 +253,7 @@ type TrafficSnapshot struct {
 // Store is the read-only snapshot loader one backend implements. The snapshot
 // load is scoped to a single cluster — route resolution must never mix one
 // cluster's Gateways with another's. The ONLY cross-cluster read is the
-// ingress-IP probe that feeds ingress-cluster selection (design D10).
+// ingress-IP probe that feeds ingress-cluster selection.
 type Store interface {
 	Close() error
 
@@ -268,7 +267,7 @@ type Store interface {
 	// ClustersWithIngressIP is the store's ONLY cross-cluster read: the
 	// distinct clusters whose ingress LB Service version carrying ip in
 	// external_ips or loadbalancer_ips was live at `at`. It feeds the
-	// ingress-cluster selection (design D10) — ClickHouse's whole job there
+	// ingress-cluster selection — ClickHouse's whole job there
 	// is answering "ip → []cluster". The same no-FINAL semantics as the
 	// snapshot load apply (valid_to never filtered in SQL except under the
 	// uniqueRows prune; client-side dedup per version slot by max

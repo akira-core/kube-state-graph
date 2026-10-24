@@ -146,7 +146,7 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// mistyped `?namespace=` would otherwise scan the whole estate to build an
 	// empty response, on every request, with no cache in front.
 	//
-	// Provably wasted, not heuristically: admission (design D6) keeps a series
+	// Provably wasted, not heuristically: filtered-build admission keeps a series
 	// only when a resolved endpoint names loaded topology — podByID, built from
 	// Pods, or an already-materialised service, which can only come from
 	// ServicesByNameNS via anchorHolds. Both empty ⇒ every series is rejected
@@ -180,8 +180,8 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// `cluster` labels, since edges only carry the trace-source cluster
 	// (Option A: the metric does not stamp server-side cluster; it is
 	// recovered via the topology pod-UID index at parse time). Any edge type
-	// counts — pod-calls-service edges may cross clusters via the D29
-	// cluster-family fan-out. One EdgeCountByType scan feeds both the log/span
+	// counts — pod-calls-service edges may cross clusters via the
+	// endpointslice → service resolution's cluster-family fan-out. One EdgeCountByType scan feeds both the log/span
 	// total (sum of the "true" buckets) and the self-metric gauges.
 	edgeCounts := g.EdgeCountByType()
 	crossCluster := 0
@@ -237,17 +237,15 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // naming a node no pod runs on) is drawable only if it is read; those can only
 // ADD a name to a scope, never narrow a read. The ontap_cluster=, aggr= and
 // svm= roots restrict the Harvest volume-label topology read to the rooted
-// components (scope-volume-labels-by-storage-root) — made output-preserving by
-// re-reading each touched aggregate whole for its owner vote and each matched
-// claim's whole candidate set in a second phase — and put the build in hub
-// mode (read-storage-roots-through-volume-hub): the claim families are read
-// FROM the rooted rows, keyed by the PersistentVolume and claim names they
-// lead to, under the same az / env matchers and the same zone routing as every
-// other storage build — a filer shared across zones is drawn with the claims
-// of the requested zone only. Either way which paths
-// are drawn stays a projection concern (graph.ProjectStorage). This
-// revises the storage-graph design's "roots never reach the build" stance
-// (harden-topology-read-cardinality D7): v1 has no result cache whose key it
+// components — made output-preserving by re-reading each touched aggregate
+// whole for its owner vote and each matched claim's whole candidate set in a
+// second phase — and put the build in hub mode: the claim families are read
+// FROM the rooted rows, keyed by the PersistentVolume and claim names they lead
+// to, under the same az / env matchers and the same zone routing as every other
+// storage build — a filer shared across zones is drawn with the claims of the
+// requested zone only. Either way which paths are drawn stays a projection
+// concern (graph.ProjectStorage). This revises the storage graph's earlier
+// "roots never reach the build" stance: v1 has no result cache whose key it
 // would widen, and the alternative was reading the whole estate.
 //
 // There is deliberately no outside-retention classification and no up{} probe.

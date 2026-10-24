@@ -4,7 +4,7 @@
 // to obtain the exact same wire shape kube-state-graph emits, with no HTTP or
 // JSON round-trip. The serialiser is presentation-only — it synthesises the
 // cluster / namespace / application / controller compound group nodes and the
-// data.parent nesting (design.md D6, which supersedes the D31 cluster>node>pod
+// data.parent nesting (which supersedes the earlier cluster>node>pod
 // grouping) without touching the core graph types. NetApp aggregates nest
 // under the real netapp-node (the first real-node compound parent); the
 // pvc→aggregate relationship is an edge, not nesting.
@@ -19,7 +19,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
-// APIVersion is the value stamped on the body's apiVersion field (design.md D14).
+// APIVersion is the value stamped on the body's apiVersion field.
 const APIVersion = "v1"
 
 // ----- Cytoscape.js shape ---------------------------------------------------
@@ -129,7 +129,7 @@ type Edge struct {
 }
 
 // EdgeMetricsDTO is the serialised form of graph.EdgeMetrics. Rounding to 6
-// significant digits is applied here and only here (design D9) so pkg/graph
+// significant digits is applied here and only here so pkg/graph
 // values stay un-rounded and the policy lives in one place.
 //
 // Absent-vs-zero: ErrorRate is omitted when the failure counter was unreadable;
@@ -169,8 +169,7 @@ type EdgeData struct {
 
 // round6 rounds v to 6 significant digits via decimal formatting.
 // Do NOT use math.Pow/math.Log10-based decimal-place rounding — it double-rounds,
-// is off-by-one at exact powers of ten, and is not bit-identical across platforms
-// (design D9 of add-service-graph-red-metrics).
+// is off-by-one at exact powers of ten, and is not bit-identical across platforms.
 func round6(v float64) float64 {
 	r, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 6, 64), 64)
 	return r
@@ -220,7 +219,7 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 		filled = true
 	}
 	// The ceilings deliberately do NOT set `filled`: the builder can only
-	// attach them alongside a measurement (design.md D3 hop C), so they can
+	// attach them alongside a measurement (hop C of the storage join), so they can
 	// never be the sole reason a metrics object exists.
 	if io.MaxIOPS != nil {
 		dto.MaxIOPS = new(round6(*io.MaxIOPS))
@@ -307,7 +306,7 @@ func usageDTO(u *graph.UsageBytes) *UsageDTO {
 
 // Synthetic compound group-node types. These exist only in the Cytoscape
 // presentation (to satisfy data.parent references); they are not
-// graph.GraphNodes. See design.md D6.
+// graph.GraphNodes.
 const (
 	nodeTypeCluster        = "cluster"
 	nodeTypeStorageCluster = "storage-cluster"
@@ -526,7 +525,7 @@ func groupNode(id, name, typ, parent string) Node {
 }
 
 // compoundParent returns the Cytoscape data.parent for a real node, per the
-// design D6 workload hierarchy:
+// workload hierarchy:
 //
 //	pod          → its controller group when it has a resolved owner,
 //	               else its application group when it has a resolved Application,

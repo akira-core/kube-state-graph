@@ -122,8 +122,8 @@ func applyAuth(chOpts *clickhouse.Options, cfg openConfig) {
 }
 
 // Open dials ClickHouse from a DSN (e.g. "clickhouse://host:9000/db"),
-// pings it, and validates the expected schema — failing fast on drift (design
-// D7) rather than silently returning empty windows. Prefer WithAuth for
+// pings it, and validates the expected schema — failing fast on drift
+// rather than silently returning empty windows. Prefer WithAuth for
 // credentials; DSN-embedded userinfo remains supported for backward compatibility.
 func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 	var cfg openConfig
@@ -217,8 +217,7 @@ func (r versionRow) slot() string {
 	return r.cluster + "\x00" + r.ns + "\x00" + r.name + "\x00" + strconv.FormatInt(r.vf.UnixMilli(), 10)
 }
 
-// liveAt reports vf <= at < vt — the as-of liveness test, checked post-dedup
-// (simplify-route-resolution-to-point-in-time D2).
+// liveAt reports vf <= at < vt — the as-of liveness test, checked post-dedup.
 func (r versionRow) liveAt(at time.Time) bool {
 	return !r.vf.After(at) && at.Before(r.vt)
 }
@@ -282,13 +281,13 @@ func closeRows(rows driver.Rows) error {
 // historical query when the known fields suffice to parse routing (istiod
 // itself parses CRs allow-unknown). The accepted trade-off — a discarded field
 // that genuinely affects routing silently diverges from what Envoy did — is
-// the design §9.4 version-coupling risk.
+// the version-coupling risk.
 var pjUnmarshal = protojson.UnmarshalOptions{DiscardUnknown: true}
 
 // expectedSchema is the fixed read contract: every column this reader selects,
 // per table. The metadata-exporter owns the DDL (types, engine, indexes);
 // kube-state-graph only asserts the columns it reads exist. Column names are a
-// case-sensitive contract (design.md D26 style).
+// case-sensitive contract.
 var expectedSchema = map[string][]string{
 	"service_versions": {"cluster", "namespace", "name", "valid_from", "valid_to", "external_ips", "loadbalancer_ips", "selector_kv", "spec_json", "ingest_seq"},
 	"deploy_versions":  {"cluster", "namespace", "name", "valid_from", "valid_to", "pod_labels_kv", "ingest_seq"},
@@ -458,8 +457,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 
 	// 3. Gateway versions whose selector ⊆ the pod-label union, scoped to the
 	// ingress namespace(s) like the deploy hop: a candidate Gateway must live
-	// in the ingress Service's own namespace
-	// (scope-gateway-candidates-to-ingress-namespace) — cross-namespace
+	// in the ingress Service's own namespace — cross-namespace
 	// selector attachment is deliberately out of scope. nsList unions all
 	// matching ingress Services' namespaces, so this is still a superset;
 	// pkg/route/snapshot re-applies the exact per-service-namespace predicate.
@@ -487,7 +485,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 	return w, nil
 }
 
-// ClustersWithIngressIP is the store's ONLY cross-cluster read (design D10):
+// ClustersWithIngressIP is the store's ONLY cross-cluster read:
 // the distinct clusters whose ingress LB Service version carrying ip was live
 // at `at`. It deliberately carries no cluster predicate — that is its whole
 // job — bounded by the small number of ingress-LB Service versions

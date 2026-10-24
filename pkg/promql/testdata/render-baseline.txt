@@ -1,4 +1,4 @@
-# promql.Render baseline, window=5m, captured before push-request-filters-upstream.
+# promql.Render baseline, window=5m, captured before request filters were pushed upstream.
 # One line per Query constant: <query-name>\t<rendered PromQL>, sorted by name.
 # A Query added after the capture is appended here at its unfiltered rendering:
 # the test compares the WHOLE queryDims map, so a new constant with no row fails.

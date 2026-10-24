@@ -120,7 +120,7 @@ jobs:
       - name: Verify docs in sync
         run: make check-docs
 
-  # Dependency containment (translate-global-fqdn-to-k8s-service D1): pkg/build
+  # Dependency containment: pkg/build
   # declares only the RouteResolver interface, pkg/route holds the engine. A
   # future pkg/build -> pkg/route import would make every embedder of the graph
   # engine inherit istio + ClickHouse + Envoy protos. The check lived only in

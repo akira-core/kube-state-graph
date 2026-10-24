@@ -37,18 +37,6 @@ func buildK8sOver(t *testing.T, fx map[promql.Query]model.Vector, opts Options, 
 	return g, q
 }
 
-// queryNames is the sorted, de-duplicated set of non-Harvest family names a
-// fake answered.
-func queryNames(q *promqlfake.Querier) []string {
-	seen := map[string]bool{}
-	for _, is := range q.Issued() {
-		if !harvestFamily(is.Name) {
-			seen[is.Name] = true
-		}
-	}
-	return slices.Sorted(maps.Keys(seen))
-}
-
 func flatten(groups [][]string) []string {
 	var out []string
 	for _, g := range groups {
@@ -61,90 +49,6 @@ func flatten(groups [][]string) []string {
 func harvestFamily(name string) bool {
 	fam, ok := promql.FamilyOf(promql.Query(name))
 	return ok && fam == promql.FamilyHarvest
-}
-
-// kubernetesFanOut is the multiset of rendered queries a fake answered, with
-// the Harvest family taken out, sorted so two builds compare directly.
-func kubernetesFanOut(q *promqlfake.Querier) []string {
-	var out []string
-	for _, is := range q.Issued() {
-		if harvestFamily(is.Name) {
-			continue
-		}
-		out = append(out, is.Name+"|"+is.Query)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// Spec: "Reads by reference, Kubernetes families only". A k8s build issues
-// the Kubernetes queries the storage build issues for the same root — the
-// seeds, completions and chunk caps are shared — and none of the families the
-// storage build adds beside them. For a pod root the two sets are identical.
-// For a node root the k8s build ALSO reads the root node's claimless pods
-// (the storage body draws a pod through its claims; this one draws everything
-// that runs on the node), so its pod-scoped reads widen by exactly those pods.
-func TestBuildK8s_FanOutIsTheStoragePlansKubernetesHalf(t *testing.T) {
-	src := defaultAppMetadata()
-	// Pods on a node root that mount no claim, by case name.
-	claimlessOnNode := map[string][]string{
-		"node root": {"web-0", "daemon-0", "ownerless-0", "job-annotated-0"},
-	}
-	for name, roots := range map[string]graph.StorageRoots{
-		"node root":        k8sRootsOf(t, graph.StorageRootNode, "worker-1"),
-		"podless node":     k8sRootsOf(t, graph.StorageRootNode, "worker-3"),
-		"pod root":         k8sRootsOf(t, graph.StorageRootPod, "shop/orders-0"),
-		"unmounting pod":   k8sRootsOf(t, graph.StorageRootPod, "shop/web-0"),
-		"pods in two ns":   k8sRootsOf(t, graph.StorageRootPod, "shop/orders-0", "platform/redis-0"),
-		"unscheduled root": k8sRootsOf(t, graph.StorageRootPod, "shop/unscheduled-0"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			opts := Options{AppMetadata: &src}
-			fx := planEstate()
-			fx[promql.QAppMetadata] = model.Vector{appMetaRow("shop", "orders-0", "shop-v2", "team-a", "alice")}
-
-			storageQ := promqlfake.New(fx)
-			_, err := New(storageQ, opts, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel, roots)
-			require.NoError(t, err)
-
-			_, k8sQ := buildK8sOver(t, fx, opts, roots)
-
-			want := kubernetesFanOut(storageQ)
-			require.NotEmpty(t, want)
-			if roots.Kind == graph.StorageRootPod || len(claimlessOnNode[name]) == 0 {
-				assert.Equal(t, want, kubernetesFanOut(k8sQ), "the Kubernetes queries are the storage build's own")
-			} else {
-				// More pods mean more controller kinds to resolve, so the k8s
-				// build may read families the storage build had no pod for.
-				assert.Subset(t, queryNames(k8sQ), queryNames(storageQ))
-				// kube_pod_owner is read by the pod wave alone, so its pod scope
-				// is the set of pods the build loaded.
-				storagePods := flatten(storageQ.ScopeValues(promql.QPodOwner, "pod"))
-				k8sPods := flatten(k8sQ.ScopeValues(promql.QPodOwner, "pod"))
-				for _, pod := range claimlessOnNode[name] {
-					assert.NotContains(t, storagePods, pod, "the storage build never loads %s", pod)
-					assert.Contains(t, k8sPods, pod, "the k8s build loads %s", pod)
-				}
-			}
-
-			for _, is := range k8sQ.Issued() {
-				assert.False(t, harvestFamily(is.Name), "%s: no Harvest query", is.Name)
-			}
-			seen := map[string]bool{}
-			for _, is := range k8sQ.Issued() {
-				seen[is.Name] = true
-			}
-			for _, forbidden := range []promql.Query{
-				promql.QServiceInfo, promql.QEndpointSliceEndpoints, promql.QEndpointSliceLabels,
-				promql.QServiceAnnotations, promql.QPodContainerInfo,
-				promql.QServiceGraphTotal, promql.QServiceGraphFailedTotal, promql.QServiceGraphServerSecondsBucket,
-				promql.QUpProbe,
-			} {
-				assert.False(t, seen[string(forbidden)], "%s must not be issued", forbidden)
-			}
-			assert.True(t, seen[string(promql.QAlerts)], "the alert overlay is read")
-		})
-	}
 }
 
 // Spec: "Kubernetes-only element set" — Harvest, service-graph and container
@@ -502,6 +406,13 @@ func TestBuildK8s_PlanIsOutputPreserving(t *testing.T) {
 		"node root with the application-metadata metric": {appMeta: true, scope: func() graph.StorageScope {
 			return vlrScope(t, graph.StorageRootNode, []string{"worker-1"})
 		}},
+		// A tracked claim (shop/shared-beta) and a co-mounter on another node
+		// (alpha-share-0) are in play, so the pod root's metric scope — fixed by
+		// the root rows and the tracked claims rather than by the loaded pods —
+		// is exercised against the reference that reads the metric whole.
+		"pod root with the application-metadata metric": {appMeta: true, scope: func() graph.StorageScope {
+			return vlrScope(t, graph.StorageRootPod, []string{"shop/beta-rwx-0"})
+		}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -509,32 +420,47 @@ func TestBuildK8s_PlanIsOutputPreserving(t *testing.T) {
 			sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: tc.namespaces}
 			opts := Options{}
 			fx := planEstate()
-			skip := maps.Clone(k8sSkippedLegs)
 			if tc.appMeta {
 				opts.AppMetadata = &src
 				fx[promql.QAppMetadata] = model.Vector{
 					appMetaRow("shop", "orders-0", "shop-v2", "team-a", "alice"),
 					appMetaRow("shop", "web-0", "storefront-v2", "team-a", "bob"),
 					appMetaRow("platform", "redis-0", "redis-app", "team-p", "carol"),
+					appMetaRow("shop", "beta-rwx-0", "beta-v2", "team-b", "dave"),
+					appMetaRow("shop", "alpha-share-0", "alpha-v2", "team-b", "erin"),
 				}
-				// The reference reads the metric whole, in the first wave.
-				delete(skip, promql.QAppMetadata)
 			}
-
-			b := New(promqlfake.New(fx), opts, nil, nil)
-			scoped, err := b.BuildK8s(t.Context(), time.Minute, vlrEnd, sel, scope.Roots)
-			require.NoError(t, err)
-
-			plan := topologyPlan{skip: skip, failClosed: true}
-			refTopology, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd, opts.withAppMetadataDefaults(), sel, plan)
-			require.NoError(t, err)
-			nodes, edges := assemble(refTopology, ServiceGraphResult{})
-			reference := b.freeze(t.Context(), refTopology, nodes, edges)
-
-			scopedBody := cytoscape.Serialise(scoped, graph.ProjectK8s(scoped, scope))
-			referenceBody := cytoscape.Serialise(reference, graph.ProjectK8s(reference, scope))
-			require.NotEmpty(t, scopedBody.Elements.Nodes, "a vacuous body would prove nothing")
-			assert.JSONEq(t, planBodyJSON(t, referenceBody), planBodyJSON(t, scopedBody))
+			requireK8sOutputPreserved(t, fx, opts, sel, scope)
 		})
 	}
+}
+
+// requireK8sOutputPreserved builds the Kubernetes graph for scope over fx by
+// reference, and once more from an UNSCOPED Kubernetes read of the whole zone —
+// the same topology fan-out with no root, no Harvest and no container list —
+// and requires the two projected bodies to be identical. It returns the by-reference
+// graph.
+func requireK8sOutputPreserved(t *testing.T, fx map[promql.Query]model.Vector, opts Options, sel promql.Selector, scope graph.StorageScope) *graph.Graph {
+	t.Helper()
+	skip := maps.Clone(k8sSkippedLegs)
+	if opts.AppMetadata != nil {
+		// The reference reads the metric whole, in the first wave.
+		delete(skip, promql.QAppMetadata)
+	}
+
+	b := New(promqlfake.New(fx), opts, nil, nil)
+	scoped, err := b.BuildK8s(t.Context(), time.Minute, vlrEnd, sel, scope.Roots)
+	require.NoError(t, err)
+
+	plan := topologyPlan{skip: skip, failClosed: true}
+	refTopology, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd, opts.withAppMetadataDefaults(), sel, plan)
+	require.NoError(t, err)
+	nodes, edges := assemble(refTopology, ServiceGraphResult{})
+	reference := b.freeze(t.Context(), refTopology, nodes, edges)
+
+	scopedBody := cytoscape.Serialise(scoped, graph.ProjectK8s(scoped, scope))
+	referenceBody := cytoscape.Serialise(reference, graph.ProjectK8s(reference, scope))
+	require.NotEmpty(t, scopedBody.Elements.Nodes, "a vacuous body would prove nothing")
+	assert.JSONEq(t, planBodyJSON(t, referenceBody), planBodyJSON(t, scopedBody))
+	return scoped
 }

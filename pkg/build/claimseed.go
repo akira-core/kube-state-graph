@@ -12,7 +12,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The claim root's seed (add-storage-graph-pv-pvc-roots).
+// The claim root's seed.
 //
 // A pvc or pv root names the claim directly, so its seed is one read of
 // kube_persistentvolumeclaim_info restricted on the roots — the same family a

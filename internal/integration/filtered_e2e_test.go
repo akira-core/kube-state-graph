@@ -279,7 +279,7 @@ func (s *FilterSuite) TestUnfilteredRequestKeepsRealCrossClusterPartner() {
 
 // A claim whose only Harvest series carries a different env still joins it:
 // Harvest queries carry no env matcher, and with no agreeing series the join
-// falls back to every match (drop-harvest-zone-matchers D2).
+// falls back to every match.
 func (s *FilterSuite) TestHarvestOfAnotherEnvJoinsByFallback() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000
@@ -318,7 +318,7 @@ volume_labels{cluster="ontap-prod",node="ontap-prod-02",aggr="aggr9",svm="svm-pr
 
 // A catch-all store holds one QoS workload twice: once with no pair and once
 // under another zone's. The edge reports it once, from the row with no pair,
-// which agrees with the claim (drop-harvest-zone-matchers D3).
+// which agrees with the claim.
 func (s *FilterSuite) TestCatchAllHarvestQoSIsCountedOnce() {
 	disc := s.T().Name()
 	t1 := fixedNow.Unix() * 1000

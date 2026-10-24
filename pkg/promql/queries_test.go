@@ -22,8 +22,8 @@ func TestRender_ServiceGraphTotal(t *testing.T) {
 	assert.NotContains(t, got, "server_cluster")
 }
 
-// TestRender_ServiceGraphExcludesSentinelPeers pins design.md D30 plus its
-// resolve-unknown-server-peer-labels D1 narrowing: the service-graph selector
+// TestRender_ServiceGraphExcludesSentinelPeers pins the sentinel matcher plus
+// its server-side narrowing: the service-graph selector
 // drops the servicegraph connector's virtual "user" peer on both sides, but
 // only drops the virtual "unknown" peer on the client side — a literal
 // server="unknown" now reaches Go so the peer-label enrichment branch can run.
@@ -38,7 +38,7 @@ func TestRender_ServiceGraphExcludesSentinelPeers(t *testing.T) {
 
 	// The Query constant itself MUST stay the bare metric name so the
 	// `query` / `query_name` self-metric + span dimensions stay stable across
-	// deployments (design.md D25 / D26); only the rendered PromQL gains the
+	// deployments; only the rendered PromQL gains the
 	// matchers.
 	assert.Equal(t, "traces_service_graph_request_total", string(QServiceGraphTotal))
 }
@@ -91,7 +91,7 @@ func TestRender_ServiceGraphFailedTotal(t *testing.T) {
 }
 
 // TestRender_ServiceGraphServerSecondsBucket pins the OPTIONAL Duration
-// histogram render: RAW rate(...) with NO upstream aggregation (design D4), so
+// histogram render: RAW rate(...) with NO upstream aggregation, so
 // each bucket series keeps its full dimension set plus `le` and joins by exact
 // identity. Sentinel + span-link selectors, bare metric name (no prefix).
 func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
@@ -104,7 +104,7 @@ func TestRender_ServiceGraphServerSecondsBucket(t *testing.T) {
 }
 
 // TestRender_ServiceGraphTotalKeepsSpanLinkSeries pins the deliberate asymmetry
-// of design D6: the span-link exclusion belongs to the two OPTIONAL RED
+// of the span-link exclusion: it exclusion belongs to the two OPTIONAL RED
 // selectors only. A link edge must still be EMITTED — it is a real dependency —
 // so filtering it out of the request-total query would delete the edge itself,
 // not just its numbers.
@@ -194,7 +194,7 @@ func TestFormatDuration(t *testing.T) {
 
 // No Harvest QoS leg carries a `lun` matcher any more: volume granularity is a
 // READER rule now (sumQoSIO skips LUN rows), because the LUN workload is the
-// only series carrying the QoS policy on a SAN backend — see design.md D11.
+// only series carrying the QoS policy on a SAN backend.
 // Pin the matcher's absence on every leg, and pin that no leg is rate()-wrapped.
 func TestRender_QoSVolumeGranularity(t *testing.T) {
 	t.Parallel()

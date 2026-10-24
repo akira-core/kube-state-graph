@@ -34,7 +34,7 @@ type Options struct {
 	// route-resolution engine for global-FQDN server="unknown" peers. Nil
 	// (the default) disables the feature. An embedder that wants it imports
 	// pkg/route itself and passes the resolver in — kubegraph deliberately
-	// does not import pkg/route (design D1 dependency containment).
+	// does not import pkg/route (dependency containment).
 	RouteResolver build.RouteResolver
 	// RouteResolveTimeout mirrors build.Options.RouteResolveTimeout.
 	RouteResolveTimeout time.Duration
@@ -120,7 +120,7 @@ func New(q promql.Querier, opts Options) *Engine {
 // router to New works identically — *promql.Router satisfies promql.Querier,
 // and the builder type-asserts the promql.QuerierSource upgrade — but that is a
 // fact an embedder would have to be told in prose; a named constructor states
-// it instead (design D1 / D14).
+// it instead.
 //
 // Build the table with promql.SingleBackendTable for a single upstream, with
 // promql.NewTable for one assembled in code, or with backendsfile.Read for the

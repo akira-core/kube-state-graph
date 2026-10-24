@@ -14,7 +14,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Span-link relation marking (add-span-link-logical-edges).
+// Span-link relation marking.
 // Fixture recap (sampleTopologyWithServices): client pod abc (cluster-alpha,
 // ns shop), backing pods pay0/pay1 (svc shop/payments), mongo0 = uid m0 (ns
 // db, svc db/mongo headless), svc db/redis with no endpoints.
@@ -62,7 +62,7 @@ func TestParseServiceGraph_LinkRelation_BothPodsResolve(t *testing.T) {
 	assert.Equal(t, "cluster-alpha/abc", e.Source)
 	assert.Equal(t, "cluster-alpha/m0", e.Target)
 	assert.Equal(t, "link", e.Labels["relation"])
-	assert.Equal(t, "cluster-alpha", e.Labels["cluster"], "ordinary D9 cluster label is unaffected")
+	assert.Equal(t, "cluster-alpha", e.Labels["cluster"], "ordinary edge-cluster label is unaffected")
 }
 
 func TestParseServiceGraph_LinkRelation_LinkWinsOverPlainSeries(t *testing.T) {
@@ -72,7 +72,7 @@ func TestParseServiceGraph_LinkRelation_LinkWinsOverPlainSeries(t *testing.T) {
 	}, Value: 7}
 	link := linkSample(nil)
 
-	// Both ingestion orders (D6): the aggregated single edge is link-marked.
+	// Both ingestion orders: the aggregated single edge is link-marked.
 	for name, vec := range map[string]model.Vector{
 		"plain_first": sampleVec(plain, link),
 		"link_first":  sampleVec(link, plain),
@@ -177,7 +177,7 @@ func TestParseServiceGraph_LinkRelation_ServerUnknown_ContributesNoMarkers(t *te
 }
 
 // Degraded server endpoints keep the logical claim: a missing-UID non-"unknown"
-// label (D27 ghost external) and an unknown-to-topology UID (synth pod) both
+// label (non-URL ghost external) and an unknown-to-topology UID (synth pod) both
 // stay link-marked.
 func TestParseServiceGraph_LinkRelation_ServerGhostExternal_KeepsLink(t *testing.T) {
 	res := parseServiceGraph(sampleVec(linkSample(model.Metric{
@@ -252,7 +252,7 @@ func TestParseServiceGraph_LinkRelation_ViaLookupNeverMaterialises(t *testing.T)
 }
 
 // A self-loop link series (same resolvable UID on both sides, no "://" label —
-// the D33 guard does not fire) emits one link-marked self-loop edge.
+// the self-loop UID guard does not fire) emits one link-marked self-loop edge.
 func TestParseServiceGraph_LinkRelation_SelfLoopLinkSeries(t *testing.T) {
 	res := parseServiceGraph(sampleVec(linkSample(model.Metric{
 		"server_k8s_pod_uid": "abc",

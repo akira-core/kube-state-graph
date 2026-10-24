@@ -47,7 +47,7 @@ func TestParseEnvoyCluster(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ResolveRoute over a mocked store: ingress-cluster selection wiring (D10).
+// ResolveRoute over a mocked store: ingress-cluster selection wiring.
 // The mock returns empty snapshots, so every case below finishes BEFORE the
 // translate/matchcheck stages — a zero matchcheck.Runner is never invoked.
 // ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ func testRequest(caller string, ips ...string) build.RouteRequest {
 }
 
 // An IP-less request is a defensive miss: RouteNoIngress without a single
-// store call (the prescan never emits one — design D6).
+// store call (the prescan never emits one).
 func TestResolveRoute_NoIPsMissesWithoutStoreCall(t *testing.T) {
 	st := storemocks.NewMockStore(t) // no expectations: any call fails the test
 	r := NewResolver(st, matchcheck.Runner{})
@@ -284,7 +284,7 @@ func TestResolveRoute_HostNotServedByAnyServerOnPort(t *testing.T) {
 	assert.Equal(t, build.RouteNoServerForHost, outcome)
 }
 
-// Hop 3 is namespace-scoped (scope-gateway-candidates-to-ingress-namespace):
+// Hop 3 is namespace-scoped:
 // the only selector-matching gateway serving the host lives OUTSIDE the ingress
 // Service's namespace, so it is not a candidate and the pipeline misses with
 // RouteNoGateway — which then feeds the ingress LB Service fallback (the
@@ -338,7 +338,7 @@ func TestResolveRoute_CrossNamespaceGatewayNotACandidate(t *testing.T) {
 	assert.Equal(t, "prod-01", dest.Cluster)
 }
 
-// The point-in-time core (simplify-route-resolution-to-point-in-time D1): with
+// The point-in-time core: with
 // two Gateway versions in the loaded rows — an older one that DID serve the
 // host and a current one that does not — resolution follows the version live at
 // req.At. Under the old range semantics the older segment would have produced a
@@ -402,7 +402,7 @@ func TestResolveRoute_UsesVersionLiveAtInstant(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Ingress LB Service fallback (ingress-lb-service-fallback change). The nginx
+// Ingress LB Service fallback. The nginx
 // snapshot shape — LB Service + Deployment, NO Gateway CR — never reaches
 // gwresolve, so the zero matchcheck.Runner tripwire applies throughout.
 // ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ func TestResolveRoute_NginxIngressFallsBackToLBService(t *testing.T) {
 	assert.Equal(t, build.RouteDestination{
 		Cluster: "prod-01", Namespace: "ingress-nginx", Service: "ingress-nginx-controller",
 		IngressNamespace: "ingress-nginx", IngressService: "ingress-nginx-controller",
-	}, dest, "dest carries the locked ingress cluster (D11), the ingress identity mirror, and no port/subset")
+	}, dest, "dest carries the locked ingress cluster, the ingress identity mirror, and no port/subset")
 }
 
 // Two differently-named LB Services carrying the same IP in the selected
@@ -478,7 +478,7 @@ func TestResolveRoute_ProbeErrorPropagates(t *testing.T) {
 	require.ErrorIs(t, err, probeErr)
 	// An infrastructure failure must not also claim a routing outcome —
 	// RouteNoGateway is the ingress-LB-fallback gate, so a store outage would
-	// read as "no Istio Gateway serves this host" (design D6).
+	// read as "no Istio Gateway serves this host".
 	assert.Empty(t, outcome)
 }
 

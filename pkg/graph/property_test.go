@@ -46,7 +46,7 @@ func genGraph(seed int64, clusters, podsPerCluster, extraEdges int) *Graph {
 		&NetAppNode{IDValue: ctrlID, NameValue: "n1", LabelsValue: map[string]string{"ontap_cluster": "ontap-prod"}},
 	)
 
-	// One Service per cluster (D29). Added before the edge loop so podsOnly()
+	// One Service per cluster. Added before the edge loop so podsOnly()
 	// still sees only pods.
 	for i := range clusters {
 		all = append(all, &ServiceNode{

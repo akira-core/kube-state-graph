@@ -29,9 +29,8 @@ func planKSM(pairs ...string) *model.Sample {
 }
 
 // planHarvest is one Harvest series: no Kubernetes cluster, stamped with the
-// fixture zone (az / env) an estate that labels Harvest gives it — read for zone
-// preference, never matched on (drop-harvest-zone-matchers D1); a pair
-// overrides it.
+// fixture zone (az / env) an estate that labels Harvest gives it — read for
+// zone preference, never matched on; a pair overrides it.
 func planHarvest(pairs ...string) *model.Sample {
 	m := model.Metric{"az": "zone-a", "env": "prod"}
 	for i := 0; i+1 < len(pairs); i += 2 {
@@ -53,13 +52,12 @@ func withValue(s *model.Sample, v float64) *model.Sample {
 // slice, and container info on every pod.
 //
 // It also carries every controller kind the by-reference controller wave must
-// resolve identically to an unrestricted read
-// (scope-controller-legs-by-reference): a DaemonSet-owned pod (shop/daemon-0),
-// a bare ReplicaSet-owned pod with NO kube_replicaset_owner row at all
-// (shop/rs-bare-0), a Job-owned pod whose Job carries its own tracking-id
-// (shop/job-annotated-0), a Job-owned pod resolved through its CronJob because
-// the Job itself carries none (shop/job-cronjob-0, via kube_job_owner to
-// CronJob "nightly"), a pod with no controller owner at all
+// resolve identically to an unrestricted read: a DaemonSet-owned pod
+// (shop/daemon-0), a bare ReplicaSet-owned pod with NO kube_replicaset_owner
+// row at all (shop/rs-bare-0), a Job-owned pod whose Job carries its own
+// tracking-id (shop/job-annotated-0), a Job-owned pod resolved through its
+// CronJob because the Job itself carries none (shop/job-cronjob-0, via
+// kube_job_owner to CronJob "nightly"), a pod with no controller owner at all
 // (shop/ownerless-0), an unscheduled pod with no `node` label
 // (shop/unscheduled-0), a third Kubernetes node no pod is scheduled on
 // (worker-3, for a `node=` root with no mounting pod), and a StatefulSet named
@@ -442,7 +440,7 @@ func TestBuildStorage_RecoveryTalliedUnderFamilyName(t *testing.T) {
 }
 
 // storageUnrestrictedLegs are the eighteen families the storage plan's first
-// wave issues under EVERY shape (design.md D6 / D8): the claim families (the
+// wave issues under EVERY shape: the claim families (the
 // scope root plus the three that co-move with it), the Harvest inventory, and
 // ALERTS. Every other first-wave family the fullPlan issues (kube_pod_info,
 // kube_pod_owner, the four kube_node_* families, the eight controller-owner /
@@ -458,12 +456,12 @@ var storageUnrestrictedLegs = []promql.Query{
 }
 
 // The storage plan's fan-out is 18 first-wave legs plus a per-build addition
-// for each by-reference family a loaded pod, node or owner actually named
-// (design.md D6). Every case pins the EXACT set of families issued, not just
+// for each by-reference family a loaded pod, node or owner actually named.
+// Every case pins the EXACT set of families issued, not just
 // a count, so a family added to the wrong wave — or omitted from one it
 // belongs in — fails here even when the total happens to match.
 func TestBuildStorage_FanOutLegCount(t *testing.T) {
-	require.Len(t, storageUnrestrictedLegs, 18, "design D6: the fixed first wave")
+	require.Len(t, storageUnrestrictedLegs, 18, "the fixed first wave")
 
 	binding := func(ns, pod string) model.Vector {
 		return sampleVec(model.Sample{Metric: model.Metric{
@@ -605,7 +603,7 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 					want[string(q)] = true
 				}
 			}
-			assert.Len(t, want, tc.want, "expected-set size must match the design D6 pin")
+			assert.Len(t, want, tc.want, "expected-set size must match the fan-out pin")
 			assert.Len(t, seen, tc.want, "distinct families issued")
 			for name := range want {
 				assert.Equal(t, 1, seen[name], "%s issued exactly once", name)
@@ -639,7 +637,7 @@ func merge2(a, b map[promql.Query]model.Vector) map[promql.Query]model.Vector {
 	return out
 }
 
-// Application rows of the fan-out pin (design D11). Rows without application=
+// Application rows of the fan-out pin. Rows without application=
 // stay in TestBuildStorage_FanOutLegCount. A recovered family is read again
 // by the forward wave, so the pin is a per-family query count.
 func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
@@ -858,9 +856,8 @@ func TestBuildStorage_FanOutLegCount_Application(t *testing.T) {
 }
 
 // hubFirstWave are the thirteen families a hub-mode storage build's first wave
-// issues (read-storage-roots-through-volume-hub D9): storageUnrestrictedLegs
-// minus the five claim-keyed families, which leave for the hub's by-reference
-// reads. volume_labels here is phase 1.
+// issues: storageUnrestrictedLegs minus the five claim-keyed families, which
+// leave for the hub's by-reference reads. volume_labels here is phase 1.
 var hubFirstWave = slices.DeleteFunc(slices.Clone(storageUnrestrictedLegs), func(q promql.Query) bool {
 	return slices.Contains(promql.ClaimScopedQueries, q)
 })
@@ -869,7 +866,7 @@ var hubFirstWave = slices.DeleteFunc(slices.Clone(storageUnrestrictedLegs), func
 // read up to three times (phase 1, owner completion, phase 2). The counts are
 // the ones docs/upstream-metrics.md documents.
 func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
-	require.Len(t, hubFirstWave, 13, "design D9: the hub's first wave")
+	require.Len(t, hubFirstWave, 13, "the hub's first wave")
 
 	vol := func(name, svm string) *model.Sample {
 		return &model.Sample{Metric: model.Metric{
@@ -911,7 +908,7 @@ func TestBuildStorage_FanOutLegCount_Hub(t *testing.T) {
 	)
 
 	// A claim root's first wave is ALERTS alone: the seed is the claim-info
-	// read, so nothing but ALERTS runs beside it (add-storage-graph-pv-pvc-roots).
+	// read, so nothing but ALERTS runs beside it.
 	claimCount := func(qs ...promql.Query) map[string]int {
 		m := map[string]int{string(promql.QAlerts): 1}
 		for _, q := range qs {

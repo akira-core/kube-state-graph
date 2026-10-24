@@ -62,8 +62,8 @@ kubegraph.AlignWindow(start, end, --end-align)  ── runBuild, AFTER validatio
    ▼
 context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; deadline exceeded → 504 timeout
    └─ Builder.Build(ctx, window, end, sel)
-         ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 D29 service/endpointslice + 2 D34 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43; a configured application-metadata metric adds one more `fetchOptional` leg, `app_metadata`, so 38 / 44)
-         ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector — D30; joined with topology)
+         ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 service/endpointslice + 2 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43; a configured application-metadata metric adds one more `fetchOptional` leg, `app_metadata`, so 38 / 44)
+         ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector; joined with topology)
          └─ assemble → attachAlerts → attachStatus → graph.NewGraph (immutable)
    (every upstream query passes its store's guard: query-result cache → miss coalescing → per-store slot, see .claude/rules/upstream-queries.md)
    ▼
@@ -84,8 +84,10 @@ HTTP /v1/k8s-graph?start=&end=&cluster=&az=&env=&<pod | node>
    ▼
 kubegraph.ParseK8sValues  ── cluster/az/env required and repeatable; exactly one of pod / node (missing_root / invalid_scope)
    ▼
-Builder.BuildK8s(…, roots) ── readTopology under k8sPlan = storagePlan with every Harvest read off (kubernetesOnly); a node root also loads its
-                              claimless pods (topologyVectors.RootNodePods); assemble (no service graph), freeze; fails closed; no up{} probe, no gauges
+Builder.BuildK8s(…, roots) ── readTopology under k8sPlan = storagePlan with every Harvest read off (kubernetesOnly): readK8sWorkload walks the root in
+                              rounds (node root 3, pod root 2, +2 with a co-mounter) — grouped (namespace, name) restrictions, a node root also loads
+                              its claimless pods, Deployment/CronJob annotations read ahead; assemble (no service graph), freeze; fails closed;
+                              no up{} probe, no gauges
    ▼
 graph.ProjectK8s → cytoscape.Serialise   ── pod / node / pvc, pod-to-node + pod-mounts-pvc only
 ```
@@ -101,10 +103,10 @@ code in it**; the one-liner is a reminder, not the rule.
 
 | Working on | Read first |
 |---|---|
-| `pkg/build/servicegraph*.go`, `redmetrics.go`, `histogram.go`; any `pod-calls-*` / `service-selects-pod` edge, `data.metrics`, `traces_service_graph_*` | `.claude/rules/service-graph-resolution.md` — endpoint resolution ladder (D27 / D29 / D30 / D33), unknown-server peer enrichment, span-link marking, RED scope, filtered-build admission |
+| `pkg/build/servicegraph*.go`, `redmetrics.go`, `histogram.go`; any `pod-calls-*` / `service-selects-pod` edge, `data.metrics`, `traces_service_graph_*` | `.claude/rules/service-graph-resolution.md` — endpoint resolution ladder (missing-UID fallback, connection-string resolution, sentinel matcher, self-loop UID guard), unknown-server peer enrichment, span-link marking, RED scope, filtered-build admission |
 | `pkg/route/**`, `pkg/build/route*.go`, `--route-store-dsn` | `.claude/rules/route-resolution.md` — Istio route engine, ingress-cluster pick, LB-Service fallback, ingress chain, containment |
 | `pkg/build/{netapp,qosscope,volumekey,volumelabelscope,claimscope,zone}.go`, `pkg/promql/{qosscope,volumelabels,harvestpair}.go`; Harvest series, `pvc-to-netapp-aggr`, `data.qos` | `.claude/rules/netapp-storage-join.md` — hops A / B / C, zone preference, rooted `volume_labels` read, scoped QoS wave, ceiling key |
-| `/v1/storage-graph` and `/v1/k8s-graph`: `pkg/build/{topologyplan,claimseed,*seed,*scope,expansion,storageflow,build_k8s}.go`, `pkg/graph/{storagescope,project_storage,project_k8s}.go`, `kubegraph.ParseStorageValues` / `ParseK8sValues` | `.claude/rules/storage-graph.md` — build lifecycle, root kinds, qualified roots, claim seed, multi-zone union |
+| `/v1/storage-graph` and `/v1/k8s-graph`: `pkg/build/{topologyplan,claimseed,*seed,*scope,expansion,storageflow,build_k8s,k8s*}.go`, `pkg/graph/{storagescope,project_storage,project_k8s}.go`, `kubegraph.ParseStorageValues` / `ParseK8sValues` | `.claude/rules/storage-graph.md` — build lifecycle, root kinds, qualified roots, claim seed, multi-zone union |
 | `pkg/promql/**`, `pkg/kubegraph/align.go`; a new `Query` constant, a selector, the cache, the routing table | `.claude/rules/upstream-queries.md` — per-store guard, end alignment, `queryDims` / `queryFamily`, selector rendering, backend routing |
 | `pkg/graph/**`, `pkg/cytoscape/**`, `pkg/build/{topology*,clusteridentity,status,alerts}.go`; a node attribute, a node / edge type, projection, goldens | `.claude/rules/graph-model.md` — connectivity prune, cluster identity, `EdgeTypes`, typed attributes, compound nodes, sealed node types |
 
@@ -112,9 +114,7 @@ The files are path-scoped rules: each one's `paths:` frontmatter loads it
 automatically when a matching file is read or edited, and is the source of truth
 for the mapping — this table is the manual route (searches, subagents, planning).
 
-The decision ids (D1–D34) refer to the archived design doc
-`openspec/changes/archive/2026-06-06-add-k8s-pod-graph-api/design.md`; the
-capability specs live under `openspec/specs/`.
+The capability specs live under `openspec/specs/`.
 
 ### Load-bearing design rules
 
@@ -137,18 +137,18 @@ capability specs live under `openspec/specs/`.
 **Request and upstream**
 
 - **`/v1/graph` takes `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`**; unknown parameters (including the withdrawn `name` / `root` / `depth` / `direction` / `edge_type`) are ignored without error. `GET /v1/clusters` is removed.
-- **`/v1/k8s-graph` takes `start`, `end`, REQUIRED repeatable `cluster` (RAW name), `az`, `env` (`missing_cluster` / `missing_az` / `missing_env`, in that order), exactly one root kind `pod` or `node` (`missing_root` / `invalid_scope`), and optional `namespace`**; `prune` and every other parameter are ignored. It reads only Kubernetes families (no Harvest, service-side, container or service-graph query), fails closed except `ALERTS`, draws only what a root reaches, and writes no last-build gauge. Reference: `.claude/rules/storage-graph.md`.
+- **`/v1/k8s-graph` takes `start`, `end`, REQUIRED repeatable `cluster` (RAW name), `az`, `env` (`missing_cluster` / `missing_az` / `missing_env`, in that order), exactly one root kind `pod` or `node` (`missing_root` / `invalid_scope`), and optional `namespace`**; `prune` and every other parameter are ignored. It reads only Kubernetes families (no Harvest, service-side, container or service-graph query), fails closed except `ALERTS`, draws only what a root reaches, and writes no last-build gauge. It shares the storage build's semantic helpers but not its orchestration (`readK8sWorkload`); drift is pinned by `TestBuildK8s_PlanIsOutputPreserving` and `TestBuildStorage_FanOutUnchanged`. Reference: `.claude/rules/storage-graph.md`.
 - **Only `end > start` is validated** — no window cap, no future-time guard. `kubegraph.AlignWindow` floors `end` to `--end-align` in exactly two places (`internal/api` `runBuild`, `Engine.BuildFromValues` / `BuildStorageFromValues` / `BuildK8sFromValues`), never inside the parsers.
 - **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries, `up`, and every NetApp Harvest query take NO request matcher. Harvest stays zone-routed: `az` selects its backends and is not rendered (`dimAZRoute`). Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
 - **A filtered build NEVER synthesises a pod**, admits a service-graph series only when a resolved endpoint names loaded topology, and returns an empty 200 (never `outside_retention`) when nothing matched.
 - **Every upstream query passes a per-store guard** — result cache → miss coalescing → concurrency slot — ON by default for server and library. Cached vectors are shared: **readers in `pkg/build` MUST NOT mutate a sample or its `Metric` map**. `pkg/build.New` stays unguarded (the test seam).
 - **Upstream is a routed table of backends** (`promql.Router`; no `--backends-file` ⇒ one implicit `default` backend). `queryFamily` is exhaustive beside `queryDims`; the cross-backend merge MUST de-duplicate by label-set fingerprint (readers sum); required legs fail closed; credentials are env-var names, never literals; file parsing lives in `pkg/promql/backendsfile`, never `pkg/promql`.
-- **No configurable metric-name prefix.** `--metric-prefix` / `KSG_METRIC_PREFIX` / `Renderer.Prefix` are removed. Every series is queried at its bare name (`promql.Render(q, window)`). A deployment whose KSM series ARE prefixed silently returns an empty graph — see `docs/BREAKING.md`. The D29 endpointslice → service join still reads `kube_endpointslice_labels{label_kubernetes_io_service_name}`, which KSM only emits when `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` is set. The metric-name suffix and the label-name set per series are a fixed contract any compatible exporter MUST honour.
+- **No configurable metric-name prefix.** `--metric-prefix` / `KSG_METRIC_PREFIX` / `Renderer.Prefix` are removed. Every series is queried at its bare name (`promql.Render(q, window)`). A deployment whose KSM series ARE prefixed silently returns an empty graph — see `docs/BREAKING.md`. The endpointslice → service join still reads `kube_endpointslice_labels{label_kubernetes_io_service_name}`, which KSM only emits when `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` is set. The metric-name suffix and the label-name set per series are a fixed contract any compatible exporter MUST honour.
 
 **Service graph**
 
 - **Per-endpoint resolution order**: (1) empty UID + `"://"` label → a single `service` node in the caller's own cluster, else `external`; (2) non-empty UID → topology pod, else synth pod; (3) empty UID + other non-empty label → `external/<label>`; (4) drop. A `"://"` endpoint is never a pod.
-- **Fixed selector contracts, no knobs**: the D30 sentinel matcher (`client!~"user|unknown",server!~"user"`), the D33 self-loop UID guard, and `edge_relation!="link"` on the two RED companion queries.
+- **Fixed selector contracts, no knobs**: the sentinel matcher (`client!~"user|unknown",server!~"user"`), the self-loop UID guard, and `edge_relation!="link"` on the two RED companion queries.
 - **`server="unknown"` produces a node only through the peer-address ladder** (real client pod required): `client_server_address` → `client_network_peer_address` → `client_net_peer_name`, classified DNS → bare name → ClusterIP (anchor cluster only) → Pod IP (family, ambiguity degrades) → route engine → `external/<raw>`.
 - **Route resolution is opt-in and can never fail a build.** I/O stays out of the parse (prescan → prefetched index). `pkg/build` declares only `RouteResolver` and MUST NOT import `pkg/route` (`make check-route-containment`).
 - **RED metrics live on the typed `Edge.Metrics`** (`data.metrics`), only on trace-derived edges whose both endpoints are pod-or-service nodes; companion-query failures degrade field by field.
@@ -173,7 +173,7 @@ capability specs live under `openspec/specs/`.
   never include the presented key value.
 - **OTLP tracing/logging is config'd by OTel env vars only** (`OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`). No bespoke `--otlp-*` flags. Telemetry defaults to no-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset (zero export overhead, no background goroutines). Tracing MUST NOT alter response bodies — resource attrs and span IDs live on spans, never in JSON. `otelgin` is mounted on `/v1/*` only; `/livez`, `/readyz`, `/metrics`, and `/docs/*` are deliberately untraced. The auth middleware MUST NEVER log or attribute the presented `X-API-Key` value via either the local handler or the OTLP slog bridge.
 
-### Reusable `pkg/` graph engine (D32)
+### Reusable `pkg/` graph engine
 
 The graph engine lives under `pkg/` so other Go modules can import it in-process
 (no HTTP, no JSON round-trip); `internal/api` is a thin HTTP / auth shell over it:
@@ -265,10 +265,8 @@ openspec archive "<name>"                           # promote to openspec/specs/
 Before archiving, check the implementation against the change with the
 `/opsx:verify` skill; the CLI has no `verify` subcommand.
 
-The v1 implementation change **`add-k8s-pod-graph-api`** is archived under
-`openspec/changes/archive/2026-06-06-add-k8s-pod-graph-api/`; its capability
-specs were promoted to `openspec/specs/`. When making non-trivial behaviour
-changes, start a new change and write its delta specs under
+The capability specs under `openspec/specs/` are the current statement of
+behaviour. When making non-trivial behaviour changes, start a new change and write its delta specs under
 `openspec/changes/<name>/specs/<capability>/spec.md` before touching code;
 `openspec archive` (or `/opsx:sync`) promotes them into
 `openspec/specs/<capability>/spec.md`.
@@ -285,22 +283,21 @@ changes, start a new change and write its delta specs under
   `CLAUDE.md` itself, and all other docs stay in English, consistent with the
   existing codebase.
 - All HTTP routes live under `/v1/`. Adding a route means committing to keeping
-  it for v1's lifetime. Schema changes that aren't additive are v2 — see D14.
+  it for v1's lifetime. Schema changes that aren't additive are v2.
 - Self-metric names are stable contracts: `kube_state_graph_*`. Adding a label
-  to an existing metric is a contract change — see design.md D26.
+  to an existing metric is a contract change.
 - Errors returned to HTTP carry a typed `build.Reason` mapped to a fixed
   status + `reason` string in `internal/api/errors.go`. Adding new failure
   modes means adding both a `Reason` constant and an entry in `mapBuildError`.
 - Don't **talk to the Kubernetes API** from the API server — no client-go
   clients, no informers, no watches, no kubeconfig, no per-cluster RBAC. All
   cluster facts come from VictoriaMetrics (topology, service graph) or the
-  versioned Istio-config store (route resolution). The rule's reasons
-  (archived design D1 / D16): informers only know the *current* state and
-  cannot answer this API's historical `?start=&end=` contract, and
-  multi-cluster would need N watch streams + per-cluster RBAC. **Linking a
-  library that transitively vendors Kubernetes types is NOT a violation;
-  constructing a Kubernetes client is** (translate-global-fqdn-to-k8s-service
-  D0) — `pkg/route` links `istio.io/istio` (→ `k8s.io/client-go` types) purely
+  versioned Istio-config store (route resolution). The rule's reasons: informers only
+  know the *current* state and cannot answer this API's historical
+  `?start=&end=` contract, and multi-cluster would need N watch streams +
+  per-cluster RBAC. **Linking a library that transitively vendors Kubernetes
+  types is NOT a violation; constructing a Kubernetes client is** —
+  `pkg/route` links `istio.io/istio` (→ `k8s.io/client-go` types) purely
   as an in-memory translation library and never dials an apiserver. Tests and
   harness tooling are exempt.
 - Don't add dependencies casually. Current direct deps: Gin, Prometheus

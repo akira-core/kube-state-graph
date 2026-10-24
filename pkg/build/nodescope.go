@@ -42,7 +42,7 @@ func nodeScope(pods model.Vector, roots []string) []string {
 
 // readScopedNodes issues the four kube_node_* families restricted to the
 // Kubernetes nodes the loaded pods are scheduled on, plus the request's
-// `node=` roots (scope-controller-legs-by-reference).
+// `node=` roots.
 //
 // It waits on the pod wave alone (podsDone): the scope is computed from the
 // MERGED v.Pod the pod wave wrote, so it must not read v.Pod before that

@@ -15,7 +15,7 @@ import (
 // indexed in PodsByUID must be a pure function of the data — the
 // lexically-smaller cluster-scoped ID — not the randomised map-iteration order
 // addPodToIndex runs in. The service-graph reader resolves pod-calls-pod edge
-// targets through this index, so an unstable winner would break the D6
+// targets through this index, so an unstable winner would break the
 // byte-identical response contract.
 func TestParseTopology_DuplicateUIDAcrossClusters_DeterministicWinner(t *testing.T) {
 	pod := func(cluster string) model.Sample {

@@ -162,7 +162,7 @@ vuln:
 	    go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...; \
 	fi
 
-## Dependency-containment check (translate-global-fqdn-to-k8s-service D1):
+## Dependency-containment check:
 ## pkg/build declares only the RouteResolver interface; the heavy engine lives
 ## in pkg/route. If pkg/kubegraph (or pkg/build) ever reaches k8s.io/client-go
 ## or pkg/route, an embedder of the graph engine would silently inherit istio +
@@ -180,7 +180,7 @@ check-route-containment:
 
 ## The routing-file parser is a pkg/promql SUBPACKAGE, never pkg/promql itself:
 ## a module that builds its table in code imports pkg/promql alone and must
-## inherit no YAML parser and no file I/O (design D3). Moving the import up into
+## inherit no YAML parser and no file I/O. Moving the import up into
 ## pkg/promql would break that quietly — nothing fails to compile.
 check-parser-containment:
 	@if go list -deps ./pkg/promql | grep -q '^sigs.k8s.io/yaml'; then \

@@ -245,7 +245,7 @@ func TestAssembleStorageFlow_FlexGroupStartsAtTheSVM(t *testing.T) {
 // The spec's "PVC aggr label" and "FlexGroup claim resolves svm but no aggr",
 // exercised through the storage-flow chain: unlike the fixtures above, this
 // Topology is built through parseTopology so the pkg/build/topology.go
-// aggr-label stamp (design.md D1) actually runs. A FlexVol claim and a
+// aggr-label stamp actually runs. A FlexVol claim and a
 // FlexGroup claim share one SVM: the FlexVol PVC names its aggregate, the
 // FlexGroup PVC carries svm and no aggr, and the FlexGroup claim draws no
 // node-aggr / aggr-svm edge of its own — those tiers are shared with (and
@@ -576,7 +576,7 @@ func TestAssembleStorageFlow_OwnerlessAggrHasNoNodeHop(t *testing.T) {
 	}
 }
 
-// --- sink claims (add-storage-graph-pv-pvc-roots) --------------------------
+// --- sink claims ------------------------------------------------------------
 
 // A claim-seeded build draws the storage-side path of a claim no pod mounts: the
 // claim is a sink, so the chain ends at it. The claim's own measurement rides

@@ -11,7 +11,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/internal/testlog"
 )
 
-// --- QAlerts rendering (design D7) ---------------------------------------
+// --- QAlerts rendering ---------------------------------------------------
 
 // The load-bearing part of the ALERTS contract is the dimension it does NOT
 // carry. An alert expression does not reliably preserve the `cluster` label —

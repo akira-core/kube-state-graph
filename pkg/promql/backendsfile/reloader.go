@@ -18,7 +18,7 @@ import (
 // Logger and Metrics are OPTIONAL: nil means silent and unrecorded, so a module
 // embedding the graph engine inherits neither kube-state-graph's log format nor
 // its kube_state_graph_* series. That mirrors the no-op-tolerant build.Metrics /
-// promql.Metrics the engine already takes (design D14).
+// promql.Metrics the engine already takes.
 type ReloaderOptions struct {
 	// Path is the routing file to re-read.
 	Path string
@@ -42,7 +42,7 @@ type ReloaderOptions struct {
 //
 // It lives here rather than in cmd/ so an embedder arms the identical behaviour
 // instead of re-deriving the digest short-circuit and the
-// keep-the-previous-table rule (design D7 / D14).
+// keep-the-previous-table rule.
 type Reloader struct {
 	router  *promql.Router
 	path    string

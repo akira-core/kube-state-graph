@@ -135,9 +135,8 @@ func TestScopedForToleratesUnknownSpecFields(t *testing.T) {
 	}
 }
 
-// TestScopedForUsesVersionLiveAtInstant is the point-in-time core
-// (simplify-route-resolution-to-point-in-time D1/D2): with two Gateway versions
-// and two VS versions in the loaded rows, ONLY the pair live at the snapshot's
+// TestScopedForUsesVersionLiveAtInstant is the point-in-time core: with two
+// Gateway versions and two VS versions in the loaded rows, ONLY the pair live at the snapshot's
 // instant reaches the translate input — the superseded ones are invisible even
 // though the store handed them over.
 func TestScopedForUsesVersionLiveAtInstant(t *testing.T) {
@@ -263,7 +262,7 @@ func TestScopedForResolvesBareShortDestinationHost(t *testing.T) {
 // A dotted relative destination.host is NOT expanded — istiod leaves it verbatim
 // and looks it up as a literal registry hostname, so a real mesh 503s on it.
 // Inferring a Service identity here would report an edge for traffic that is in
-// fact failing (design D2).
+// fact failing.
 func TestScopedForLeavesDottedRelativeDestinationHost(t *testing.T) {
 	w := testSnapshot(t)
 	w.VSes[0].SpecJSON = vsSpecJSON(t, "svc.example.com", "svc-1.ns-a")
@@ -322,7 +321,7 @@ func TestScopedForSelectsGatewayByNamespace(t *testing.T) {
 
 // Hop 1 asks "which Service owns this IP". Two live identities carrying it means
 // the question has no answer: guessing would pick a namespace that then scopes
-// hop 3 and the gateway's whole configuration (design D4).
+// hop 3 and the gateway's whole configuration.
 func TestResolveIPToGatewaysAmbiguousIngressServiceDegrades(t *testing.T) {
 	const ip = "198.51.100.7"
 	w := store.TrafficSnapshot{
@@ -445,7 +444,7 @@ func TestResolveIPToGatewaysUsesLiveVersions(t *testing.T) {
 	}
 }
 
-// Hop 3 is namespace-scoped (scope-gateway-candidates-to-ingress-namespace):
+// Hop 3 is namespace-scoped:
 // a candidate Gateway must live in the ingress Service's own namespace. A
 // same-named gateway in another namespace whose selector also matches the
 // ingress pod labels is NOT a candidate — cross-namespace attachment is

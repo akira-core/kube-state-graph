@@ -16,11 +16,11 @@ import (
 //  2. classifyK8sDNS must strip the bare ".svc" suffix before the
 //     cluster-domain ".svc." strip (which takes the LAST occurrence) so
 //     namespaces / services literally named "svc" resolve in both forms.
-//  3. pod-calls-* pair dedupe must be order-independent (D6): on a duplicate
+//  3. pod-calls-* pair dedupe must be order-independent: on a duplicate
 //     (src, tgt) pair an identified srcCluster beats "unknown", then the
 //     lexically-smaller name wins.
 
-// svcNamedTopology is a D29 topology where "svc" is used as a literal
+// svcNamedTopology is a connection-string topology where "svc" is used as a literal
 // namespace name and as a literal service name (both legal DNS-1123 labels):
 //   - service "myservice" in namespace "svc"  (ClusterIP 10.0.0.7)
 //   - headless service "svc" in namespace "myns" (ClusterIP None) → pod b0
@@ -194,7 +194,7 @@ func TestClassifyK8sDNS_SvcLiteralLabels(t *testing.T) {
 // Finding 3: two series resolving to the same (src, tgt) pair but carrying
 // different trace `cluster` labels (one missing → "unknown", the client pod
 // recovered via the cluster-agnostic UID index) must yield the same
-// labels.cluster regardless of vector arrival order (D6) — an identified
+// labels.cluster regardless of vector arrival order — an identified
 // cluster beats "unknown", then the lexically-smaller name wins.
 func TestParseServiceGraph_DupPairClusterTieBreak_OrderIndependent(t *testing.T) {
 	withCluster := model.Sample{

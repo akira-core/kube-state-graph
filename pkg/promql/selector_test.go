@@ -214,8 +214,8 @@ func TestQueryDims_UnfilteredFamilies(t *testing.T) {
 	}
 }
 
-// TestQueryDims_HarvestCarriesNoRequestMatcher pins the Harvest rule
-// (drop-harvest-zone-matchers D1): every Harvest query is zone-routed and
+// TestQueryDims_HarvestCarriesNoRequestMatcher pins the Harvest rule: every
+// Harvest query is zone-routed and
 // renders no request matcher. Its `cluster` label is the ONTAP cluster name,
 // so a Kubernetes cluster value would match nothing, and it carries no
 // namespace — those two never reach it, and neither do az or env as matchers.
@@ -237,15 +237,14 @@ func TestQueryDims_HarvestCarriesNoRequestMatcher(t *testing.T) {
 		Render(QVolumeLabels, time.Minute, LabelKeys{}, sel))
 	assert.Equal(t, `last_over_time(qos_read_ops[1m])`,
 		Render(QQoSReadOps, time.Minute, LabelKeys{}, sel),
-		"no lun matcher (D11), and no request matcher")
+		"no lun matcher, and no request matcher")
 	assert.Equal(t, `last_over_time(aggr_new_status[1m])`,
 		Render(QAggrStatus, time.Minute, LabelKeys{AZ: "zone", Env: "tier"}, sel),
 		"configured keys render nothing on a Harvest query")
 }
 
 // TestQueryDims_ControllerAnnotationFamiliesAreNamespaced pins the third
-// dimension group, the one design D5 of resolve-pod-application-from-controller
-// calls "required for correctness under a filter": a pod's controller always
+// dimension group, the one "required for correctness under a filter": a pod's controller always
 // lives in the pod's own (cluster, namespace), so the seven families that
 // resolve a pod's ArgoCD Application must be narrowed by exactly the same
 // matchers as the pods referencing them. A family narrowed differently — say

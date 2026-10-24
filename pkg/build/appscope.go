@@ -42,7 +42,7 @@ type annotationRecovery struct {
 // annotationRecoveryFamilies is stage 1. Every family fails the build on a
 // query error — the history-accumulating two included — because the
 // recovery runs only on /v1/storage-graph, which fails closed
-// (fail-storage-graph-on-any-leg-error): a lost chunk would silently drop the
+// on any leg error: a lost chunk would silently drop the
 // pods of the Applications it carried.
 func annotationRecoveryFamilies() []annotationRecovery {
 	return []annotationRecovery{
@@ -58,11 +58,11 @@ func annotationRecoveryFamilies() []annotationRecovery {
 // readScopedApplications recovers the pods owned by controllers whose
 // tracking-id names a root Application, as the (cluster, namespace, pod) their
 // kube_pod_owner rows carry, and unions the pods an application-metadata row
-// names with the same app (design D10). It returns identities only: the pods
-// are read by the existing by-reference waves, and the projection decides
-// which of them are roots. An empty root set returns nothing and issues
-// nothing. The metric seed is a candidate generator: its rows land in a local
-// vector, and the namespace read remains the source of the D6 picks.
+// names with the same app. It returns identities only: the pods are read by the
+// existing by-reference waves, and the projection decides which of them are
+// roots. An empty root set returns nothing and issues nothing. The metric seed
+// is a candidate generator: its rows land in a local vector, and the namespace
+// read remains the source of the application-metadata picks.
 func readScopedApplications(
 	ctx context.Context,
 	q promql.Querier,

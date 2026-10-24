@@ -6,7 +6,7 @@ import "testing"
 // (any all-digits line re-points the current index) cannot tell a test name from
 // a stray numeric line, so an incomplete parse must be an error rather than a
 // partially filled result set — otherwise a batch silently returns one query's
-// cluster under another query's index (design D7).
+// cluster under another query's index.
 func TestParseActuals(t *testing.T) {
 	cases := []struct {
 		name string

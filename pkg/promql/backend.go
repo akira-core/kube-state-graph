@@ -14,8 +14,8 @@ import (
 //
 // Username / Password are RESOLVED credential values, not variable names. The
 // routing file never carries a value — internal/config reads the named
-// environment variables and fills these in before constructing the Table (see
-// the design's D8). They are deliberately unexported so no formatting verb,
+// environment variables and fills these in before constructing the Table.
+// They are deliberately unexported so no formatting verb,
 // log helper, or reflective encoder can reach them.
 type Backend struct {
 	name     string
@@ -109,7 +109,7 @@ func joinFamilies(fs []Family) string {
 // router dispatches through, and it can be produced only by NewTable, so an
 // unvalidated table is unrepresentable.
 //
-// Backends are held sorted by name. That order IS the merge order (design D5):
+// Backends are held sorted by name. That order IS the merge order:
 // the fan-out concatenates each backend's result in ascending name order and
 // keeps the first copy of any duplicated series, which makes the merged result
 // a pure function of the value sets rather than of response arrival order.
@@ -247,7 +247,7 @@ func (t *Table) Len() int {
 // request whose `az` dimension carries the value set az, in ascending name
 // order.
 //
-// The rule is the design's D4:
+// The rule is:
 //
 //  1. Candidates serve the family.
 //  2. When the family accepts the `az` dimension, candidates are further
@@ -326,7 +326,7 @@ func (t *Table) Unserved() []Family {
 //
 // It lives beside the Table it constructs rather than beside the file parser
 // because it needs no parser and no file I/O — it is what an embedder with a
-// single upstream endpoint wants (design D14).
+// single upstream endpoint wants.
 func SingleBackendTable(promURL, username, password string) (*Table, error) {
 	return NewTable([]Backend{
 		NewBackend(DefaultBackendName, promURL, Families, nil, username, password),

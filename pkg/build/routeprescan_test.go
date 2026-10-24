@@ -21,8 +21,8 @@ import (
 )
 
 // testDNSAnswer is the default destination IP stamped on every
-// unknownPeerSample: destination IPs are a precondition for route resolution
-// (design D6), so a sample without one is never collected. Tests exercising
+// unknownPeerSample: destination IPs are a precondition for route resolution,
+// so a sample without one is never collected. Tests exercising
 // the no-IP path clear it via extra.
 const testDNSAnswer = "198.51.100.7"
 
@@ -204,7 +204,7 @@ func unknownPeerSample(peer string, extra model.Metric) model.Sample {
 // sampleTopologyTwoClusters extends sampleTopologyWithServices with a second
 // cluster ("cluster-beta") holding shop/payments and its own backing pods —
 // the fixture for a route-engine hit whose selected ingress cluster differs
-// from the caller's (design D11/D12). cluster-alpha and cluster-beta are
+// from the caller's. cluster-alpha and cluster-beta are
 // digit-free names, so each is its own exact-name family: the service node
 // materialises in beta and fans out over beta's endpoints only.
 func sampleTopologyTwoClusters() Topology {
@@ -225,8 +225,8 @@ func sampleTopologyTwoClusters() Topology {
 
 // A global FQDN whose route-engine answer is a hit materialises an ordinary
 // service node + pod-calls-service edge — indistinguishable from any other
-// D29-resolved service node — and no external node. The parse anchors on the
-// engine-selected dest.Cluster (here the caller's own).
+// connection-string-resolved service node — and no external node. The parse
+// anchors on the engine-selected dest.Cluster (here the caller's own).
 func TestParseServiceGraphRoutes_GlobalFQDNRouteHitResolvesService(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com", nil))
 	routes := routeIndex{
@@ -251,7 +251,7 @@ func TestParseServiceGraphRoutes_GlobalFQDNRouteHitResolvesService(t *testing.T)
 	assert.Empty(t, res.ExternalNodes, "route hit must not leave an external node behind")
 }
 
-// An ingress-lb-service-fallback resolution (the Istio pipeline missed at
+// An ingress LB-Service fallback resolution (the Istio pipeline missed at
 // gateway resolution but the destination IP uniquely mapped to an ingress LB
 // Service) rides the exact same path as a RouteHit: service node in the
 // engine-selected cluster, pod-calls-service edge, endpoint fan-out, no
@@ -283,7 +283,7 @@ func TestParseServiceGraphRoutes_IngressLBServiceFallbackResolvesService(t *test
 
 // A hit whose selected ingress cluster differs from the caller's anchors the
 // service node in THAT cluster: the pod-calls-service edge crosses clusters
-// (design D11/D12) and the service-selects-pod fan-out runs over the selected
+// and the service-selects-pod fan-out runs over the selected
 // cluster's endpoints, not the caller's.
 func TestParseServiceGraphRoutes_CrossClusterHitAnchorsOnSelectedCluster(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("cross.example.com", nil))
@@ -303,7 +303,7 @@ func TestParseServiceGraphRoutes_CrossClusterHitAnchorsOnSelectedCluster(t *test
 	require.Len(t, pcs, 1)
 	assert.Equal(t, "cluster-alpha/abc", pcs[0].Source, "caller pod stays in its own cluster")
 	assert.Equal(t, "cluster-beta/shop/payments", pcs[0].Target, "a cross-cluster pod-calls-service edge")
-	assert.Equal(t, "cluster-alpha", pcs[0].Labels["cluster"], "labels.cluster stays the client side's (D9)")
+	assert.Equal(t, "cluster-alpha", pcs[0].Labels["cluster"], "labels.cluster stays the client side's")
 
 	ssp := edgesByType(res, graph.EdgeTypeServiceSelectsPod)
 	require.Len(t, ssp, 2, "fan-out runs over the selected cluster's endpoints")
@@ -342,15 +342,15 @@ func TestParseServiceGraphRoutes_IndexMissFallsExternal(t *testing.T) {
 			outcome: RouteHit,
 		}},
 		{"ingress_lb_service_but_topology_lacks_service", routeEntry{
-			// D3: route store and VM topology disagree — the fallback hit
+			// Route store and VM topology disagree — the fallback hit
 			// degrades exactly like a RouteHit whose service is missing.
 			dest:    RouteDestination{Cluster: "cluster-alpha", Namespace: "ingress-nginx", Service: "ingress-nginx-controller"},
 			outcome: RouteIngressLBService,
 		}},
 		{"hit_with_ingress_identity_but_backend_missing", routeEntry{
-			// route-hit-ingress-chain D3: the backend resolves FIRST, so a
-			// backend topology miss stays external with the ingress never
-			// materialised — the identity must not leak an ingress node.
+			// The backend resolves FIRST, so a backend topology miss stays
+			// external with the ingress never materialised — the identity must
+			// not leak an ingress node.
 			dest: RouteDestination{
 				Cluster: "cluster-alpha", Namespace: "nowhere", Service: "ghost",
 				IngressNamespace: "istio-system", IngressService: "igw",
@@ -394,7 +394,7 @@ func TestParseServiceGraphRoutes_NilIndexIsPreChangeBehaviour(t *testing.T) {
 
 // With the engine ON (non-nil index) an endpoint carrying no destination IPs
 // still falls external — same bytes as engine-off — via the route_engine_no_ip
-// diagnostic branch (design D6): the graph output must be identical whether
+// diagnostic branch: the graph output must be identical whether
 // the index is nil or merely lacks the key.
 func TestParseServiceGraphRoutes_NoIPsFallsExternalWithEngineOn(t *testing.T) {
 	res := parseServiceGraphRoutes(
@@ -407,7 +407,7 @@ func TestParseServiceGraphRoutes_NoIPsFallsExternalWithEngineOn(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Listener-port derivation (task 7.4, design D5).
+// Listener-port derivation.
 // ---------------------------------------------------------------------------
 
 func TestPeerRouteKey_PortDerivation(t *testing.T) {
@@ -468,13 +468,13 @@ func TestParseDNSAnswers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The prescan (task 7.5, design D3 + D6).
+// The prescan.
 // ---------------------------------------------------------------------------
 
 // collectRouteQueries must collect EXACTLY the endpoints that would fall to an
 // external node — all three branches — and skip everything the in-cluster
 // ladder resolves, the trigger never fires for, or that carries no destination
-// IPs (design D6). Missing the anchor_lacks_service branch (a global FQDN
+// IPs. Missing the anchor_lacks_service branch (a global FQDN
 // classifies as service "example" in namespace "com" before failing
 // membership) would make the whole feature a silent no-op for its motivating
 // case.
@@ -497,7 +497,7 @@ func TestCollectRouteQueries_CoversAllThreeExternalBranches(t *testing.T) {
 		unknownPeerSample("", nil),
 		// NOT collected: server side resolves to a real pod.
 		unknownPeerSample("api.example.com", model.Metric{"server_k8s_pod_uid": "pay0"}),
-		// NOT collected: no destination IPs (design D6 — the engine cannot
+		// NOT collected: no destination IPs (the engine cannot
 		// select an ingress cluster without one).
 		unknownPeerSample("noip.example.com", model.Metric{"client_dns_answers": ""}),
 		// NOT collected: dns answers present but nothing parses as an IP.
@@ -510,7 +510,7 @@ func TestCollectRouteQueries_CoversAllThreeExternalBranches(t *testing.T) {
 
 	require.Len(t, keys, 3)
 	// Sorted by (callerCluster, host, port, ips) — deterministic regardless of
-	// vector arrival order (D6).
+	// vector arrival order.
 	assert.Equal(t, "203.0.113.9", keys[0].host)
 	assert.Equal(t, "a.b.c.example.com", keys[1].host)
 	assert.Equal(t, "api.example.com", keys[2].host)
@@ -521,7 +521,7 @@ func TestCollectRouteQueries_CoversAllThreeExternalBranches(t *testing.T) {
 	}
 }
 
-// resolve-unknown-server-pod-ip-peer: an IP literal the parse now resolves to a
+// Pod-IP peer: an IP literal the parse now resolves to a
 // pod never reaches routeExternal, so the prescan must not spend a store probe /
 // translation on it.
 func TestCollectRouteQueries_SkipsPodIPResolvableEndpoints(t *testing.T) {
@@ -582,7 +582,7 @@ func TestCollectRouteQueries_CarriesDNSAnswersAndPort(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ReadServiceGraph with a mocked resolver (task 7.6, design D9).
+// ReadServiceGraph with a mocked resolver.
 // ---------------------------------------------------------------------------
 
 // expectServiceGraphQueries registers Instant expectations for the three
@@ -653,7 +653,7 @@ func TestReadServiceGraph_ResolverHitProducesServiceNode(t *testing.T) {
 }
 
 // With the engine configured, an endpoint whose series carries no destination
-// IPs never reaches the resolver (design D6): no engine call, and the endpoint
+// IPs never reaches the resolver: no engine call, and the endpoint
 // stays external exactly as when the engine is off.
 func TestReadServiceGraph_NoDNSAnswersNeverConsultsResolver(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("api.example.com", model.Metric{"client_dns_answers": ""}))
@@ -691,7 +691,7 @@ func TestReadServiceGraph_NilResolverNeverPrescans(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// RouteHit ingress chain (route-hit-ingress-chain).
+// RouteHit ingress chain.
 // ---------------------------------------------------------------------------
 
 // sampleTopologyWithIngress extends sampleTopologyWithServices with the ingress
@@ -864,10 +864,10 @@ func TestParseServiceGraphRoutes_ChainDirectEdgeDedupsAgainstTracedEdge(t *testi
 	assert.Equal(t, 1, callerToPayments, "the pairs map collapses the chain's direct edge with the traced one")
 }
 
-// The ingress-lb-service-fallback destination is the LB entry point: its
+// The ingress LB-Service fallback destination is the LB entry point: its
 // service-selects-pod fan-out is LOCKED to the selected cluster's own
 // endpoints — a family sibling's same-named Service is not behind the IP
-// (route-hit-ingress-chain D2, superseding the family-wide fan-out).
+// (superseding the family-wide fan-out).
 func TestParseServiceGraphRoutes_IngressLBServiceFanOutIsLockedClusterOnly(t *testing.T) {
 	vec := sampleVec(unknownPeerSample("nats.example.com", model.Metric{"cluster": "prod-1"}))
 	routes := routeIndex{
@@ -942,7 +942,7 @@ func TestParseServiceGraphRoutes_ChainIngressLockedBackendFamilyWide(t *testing.
 }
 
 // ---------------------------------------------------------------------------
-// Ingress route-path marking (mark-ingress-route-path).
+// Ingress route-path marking.
 // ---------------------------------------------------------------------------
 
 // svcNodeByID returns the materialised service node with the given id, or nil.
@@ -955,7 +955,7 @@ func svcNodeByID(res ServiceGraphResult, id string) *graph.ServiceNode {
 	return nil
 }
 
-// assertNoRouteMarkers asserts the mark-ingress-route-path additions are
+// assertNoRouteMarkers asserts the ingress route-path markers are
 // entirely absent: no service node carries a `role` label — the invariant
 // every degrade, engine-off, and no-resolver shape must satisfy.
 func assertNoRouteMarkers(t *testing.T, res ServiceGraphResult) {
@@ -999,7 +999,7 @@ func TestParseServiceGraphRoutes_IngressLBFallbackMarksIngressLBRole(t *testing.
 	assert.Equal(t, roleIngressLB, sv.LabelsValue["role"])
 }
 
-// Determinism (design D3): when one endpoint chains through a Service as the
+// Determinism: when one endpoint chains through a Service as the
 // entry hop and another endpoint LB-falls-back to the SAME Service within one
 // build, the node is role=ingress-gateway for BOTH input orderings —
 // ingress-gateway overwrites, ingress-lb writes only into an unset value.
@@ -1028,7 +1028,7 @@ func TestParseServiceGraphRoutes_BothPathsMarkIngressGatewayEitherOrder(t *testi
 }
 
 // ---------------------------------------------------------------------------
-// Route-store cluster names under cluster identities (design D9).
+// Route-store cluster names under cluster identities.
 // ---------------------------------------------------------------------------
 
 // identityRouteTopology is sampleTopologyWithServices in composed-identity form:

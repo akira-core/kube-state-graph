@@ -13,7 +13,7 @@ import (
 )
 
 // familyTopology models the cluster-family environment for the localised
-// connection-string model (D29):
+// connection-string model:
 //   - clusters prod-1 and prod-2 (one family: "prod-0") both deploy
 //     messaging/nats and data/cache, each with one backing pod of its own;
 //   - out-of-family staging-1 ("staging-0") also deploys messaging/nats —
@@ -195,9 +195,10 @@ func TestParseServiceGraph_MissingClusterLabelRecoversAnchorFromClientPod(t *tes
 	// client UID resolves to the prod-1 pod via the global UID index — the
 	// server-side "://" anchor is recovered as prod-1, so resolution localises
 	// there and fans out across the prod-0 family. The edge's labels.cluster is
-	// the CLIENT POD's cluster identity (D9 as revised by cluster identities):
-	// the trace label alone is not an identity, and naming "unknown" here would
-	// put a cluster on the edge that appears on no node of the response.
+	// the CLIENT POD's cluster identity (the edge-cluster rule as revised by
+	// cluster identities): the trace label alone is not an identity, and naming
+	// "unknown" here would put a cluster on the edge that appears on no node of
+	// the response.
 	vec := sampleVec(famSample("checkout", "nats://nats.messaging.svc:4222", "", "abc", ""))
 	res := parseServiceGraph(vec, familyTopology())
 
@@ -367,10 +368,10 @@ func TestParseServiceGraph_SameLabelDifferentAnchorsResolveIndependently(t *test
 }
 
 func TestParseServiceGraph_SelfLoopUID_ConnStringSide_LocalNode(t *testing.T) {
-	// D33 guard: both UIDs equal and the server label is a "://" string — the
-	// server UID is cleared and that side resolves as a connection string,
-	// localised to the anchor (prod-1, the client pod). One intra-cluster
-	// pod-calls-service edge, no self-loop pod edge.
+	// Self-loop UID guard: both UIDs equal and the server label is a "://"
+	// string — the server UID is cleared and that side resolves as a connection
+	// string, localised to the anchor (prod-1, the client pod). One
+	// intra-cluster pod-calls-service edge, no self-loop pod edge.
 	vec := sampleVec(famSample("checkout", "nats://nats.messaging.svc:4222", "prod-1", "abc", "abc"))
 	res := parseServiceGraph(vec, familyTopology())
 
@@ -406,7 +407,7 @@ func TestParseServiceGraph_LocalisedResolution_Deterministic(t *testing.T) {
 	// SETS (IDs, UUIDv5 edge identities, multiplicity). Output slice order is
 	// legitimately unspecified — the serialiser's graph.SortNodes/SortEdges
 	// owns ordering — so the comparison is content-based (ElementsMatch), not
-	// positional (D6 determinism of content, not of emission order). The
+	// positional (determinism of content, not of emission order). The
 	// fixture exercises the local-node path, the cross-cluster fan-out, the
 	// both-"://" intra edge, and an unanchorable-external series.
 	mkVec := func(seed int64) model.Vector {

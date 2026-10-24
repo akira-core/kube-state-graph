@@ -14,7 +14,7 @@ import (
 // data.parent (when present) MUST reference an id also present in the same
 // response. This covers the full synthetic group tier set (cluster, namespace,
 // application, controller) across randomised multi-cluster graphs, and confirms
-// the corpus actually exercises each workload tier (design.md D6).
+// the corpus actually exercises each workload tier.
 func TestProperty_NoDanglingParent(t *testing.T) {
 	apps := []string{"", "checkout", "cart"}
 	kinds := []string{"", "Deployment", "DaemonSet"}
