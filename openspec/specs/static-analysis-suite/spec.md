@@ -1,29 +1,28 @@
 # static-analysis-suite Specification
 
 ## Purpose
-TBD - created by archiving change add-k8s-pod-graph-api. Update Purpose after archive.
+
+Keep the codebase's quality gates mechanical: a curated golangci-lint configuration with complexity caps, govulncheck, the OpenAPI drift gate, the route-engine end-to-end and dependency-containment checks, all run as parallel required CI jobs on every pull request and reproducible locally through `Makefile` targets.
+
 ## Requirements
 ### Requirement: Curated golangci-lint configuration
 
-The repository SHALL ship a `.golangci.yml` at its root enabling at minimum the following linters, grouped by intent:
-
-- **Correctness**: `errcheck`, `gosimple`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `exhaustive`.
-- **Modern Go idioms**: `copyloopvar`, `intrange`, `revive`.
-- **Error handling**: `errorlint`, `nilerr`.
-- **Security**: `gosec`.
-- **Complexity**: `gocyclo`, `gocognit`, `funlen`.
-- **Performance**: `prealloc`, `bodyclose`, `unconvert`.
-- **Style**: `misspell`, `gofmt`, `goimports`.
-- **Dead code / duplication**: `dupl`, `unparam`.
-- **Magic numbers**: `mnd`.
-- **Testify usage**: `testifylint` (with `enable-all: true`).
-
-The configuration SHALL apply to all Go source files in the repository, including `cmd/`, `internal/`, and `tests/`. Test files MAY relax `errcheck` and the strictest complexity / duplication rules.
+The repository SHALL ship a `.golangci.yml` at its root enabling at minimum the linters listed in this requirement's scenarios, applied to all Go source files in the repository, including `cmd/`, `internal/`, and `tests/`. Test files MAY relax `errcheck` and the strictest complexity / duplication rules.
 
 #### Scenario: All linters enabled
 
 - **WHEN** an operator runs `golangci-lint linters` against the repository
-- **THEN** every linter named above appears in the "Enabled" list
+- **THEN** every linter below appears in the "Enabled" list
+- **AND** correctness: `errcheck`, `gosimple`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `exhaustive`
+- **AND** modern Go idioms: `copyloopvar`, `intrange`, `revive`
+- **AND** error handling: `errorlint`, `nilerr`
+- **AND** security: `gosec`
+- **AND** complexity: `gocyclo`, `gocognit`, `funlen`
+- **AND** performance: `prealloc`, `bodyclose`, `unconvert`
+- **AND** style: `misspell`, `gofmt`, `goimports`
+- **AND** dead code / duplication: `dupl`, `unparam`
+- **AND** magic numbers: `mnd`
+- **AND** testify usage: `testifylint` (with `enable-all: true`)
 
 #### Scenario: Test files relaxed
 
@@ -32,13 +31,7 @@ The configuration SHALL apply to all Go source files in the repository, includin
 
 ### Requirement: Complexity caps
 
-The `.golangci.yml` SHALL enforce the following complexity caps:
-
-- `gocyclo`: cyclomatic complexity ≤ 15 per function.
-- `gocognit`: cognitive complexity ≤ 20 per function.
-- `funlen`: ≤ 100 lines and ≤ 50 statements per function.
-
-Functions exceeding these caps MUST be refactored or carry an explicit `//nolint:<linter>` comment with a one-line rationale.
+The `.golangci.yml` SHALL enforce per-function complexity caps: `gocyclo` cyclomatic complexity ≤ 15, `gocognit` cognitive complexity ≤ 20, and `funlen` ≤ 100 lines and ≤ 50 statements. Functions exceeding these caps MUST be refactored or carry an explicit `//nolint:<linter>` comment with a one-line rationale.
 
 #### Scenario: Function exceeds gocyclo cap
 
@@ -58,8 +51,6 @@ The repository SHALL include a CI workflow that runs `golangci-lint` on every pu
 
 The repository SHALL include a CI workflow step that runs `golang.org/x/vuln/cmd/govulncheck@latest ./...` on every pull request. Detected vulnerabilities SHALL gate merges; suppressions SHALL be made explicit via comment plus a tracking issue, never via silent ignoring.
 
-The repository SHALL NOT carry a standing suppression list. When govulncheck reports a finding, the default resolution is to **upgrade the affected module**, including when the vulnerable code path is judged unreachable from this binary — govulncheck's reachability analysis is symbol-level and cannot distinguish a linked-but-unused control-plane feature from a live one, so a module-scoped exclusion would also mask the next finding in that module, which may be reachable. Suppressing a specific finding remains permitted where an upgrade is genuinely unavailable, under the documentation rule above.
-
 #### Scenario: govulncheck flags a known CVE
 
 - **WHEN** a vulnerable transitive dependency reachable from the binary is on the dependency graph
@@ -70,11 +61,21 @@ The repository SHALL NOT carry a standing suppression list. When govulncheck rep
 - **WHEN** a contributor needs to suppress a finding (e.g., a vulnerability that does not affect the reachable code path)
 - **THEN** the suppression appears as a code comment referencing a tracked issue, not as a removal of the `vuln` job
 
+### Requirement: govulncheck findings are resolved by upgrading
+
+The repository SHALL NOT carry a standing suppression list. The default resolution of a govulncheck finding SHALL be to **upgrade the affected module**, including when the vulnerable code path is judged unreachable from this binary; suppressing a specific finding remains permitted only where an upgrade is genuinely unavailable, under the documentation rule of the govulncheck requirement.
+
 #### Scenario: An unreachable finding is still resolved by upgrading
 
 - **GIVEN** a finding whose vulnerable code path this binary never executes
 - **WHEN** a fixed version of the module is available
 - **THEN** the module is upgraded rather than excluded, so a later finding in the same module still fails the job
+- **AND** no module-scoped exclusion is added, because govulncheck's reachability analysis is symbol-level and cannot distinguish a linked-but-unused control-plane feature from a live one, so such an exclusion would also mask the next, possibly reachable, finding in that module
+
+#### Scenario: No upgrade available
+
+- **WHEN** a finding has no fixed module version
+- **THEN** that specific finding MAY be suppressed by a code comment referencing a tracked issue
 
 ### Requirement: Lint, vuln, and test jobs run in parallel
 
@@ -87,15 +88,14 @@ The CI workflow SHALL define `lint`, `vuln`, and `test` as separate jobs without
 
 ### Requirement: Local equivalents
 
-The repository's `Makefile` (or equivalent) SHALL provide developer-facing targets that run the same checks locally:
+The repository's `Makefile` (or equivalent) SHALL provide developer-facing targets that run the same checks locally — `make lint`, `make vuln`, `make test`, `make docs` and `make check-docs` — and each target SHALL exit non-zero on any failure.
 
-- `make lint` — runs `golangci-lint run`.
-- `make vuln` — runs `govulncheck ./...`.
-- `make test` — runs `go test ./...`.
-- `make docs` — runs `swag init -g cmd/kube-state-graph/main.go --output docs --parseDependency --parseInternal`.
-- `make check-docs` — runs `make docs`, then `git diff --exit-code docs/`. Fails when generated files would change.
+#### Scenario: Local targets run the CI checks
 
-Each target SHALL exit non-zero on any failure.
+- **WHEN** a developer inspects the `Makefile`
+- **THEN** `make lint` runs `golangci-lint run`, `make vuln` runs `govulncheck ./...`, and `make test` runs `go test ./...`
+- **AND** `make docs` runs `swag init -g cmd/kube-state-graph/main.go --output docs --parseDependency --parseInternal`
+- **AND** `make check-docs` runs `make docs`, then `git diff --exit-code docs/`, and fails when generated files would change
 
 #### Scenario: Local lint matches CI
 
@@ -118,14 +118,7 @@ The CI workflow SHALL include a job (or step) that runs `swag init` over the sou
 
 ### Requirement: Route-engine end-to-end coverage runs in CI
 
-The CI workflow's `test` job SHALL make the native `router_check_tool` binary available to
-the route-engine end-to-end suite and SHALL point `KSG_ROUTER_CHECK_BIN` at it. The suite
-SHALL fail the job when the binary is unavailable **in CI** — a missing tool SHALL NOT
-present as a skipped (and therefore passing) test. Outside CI the suite SHALL continue to
-skip, so a developer machine without the Linux binary is unaffected.
-
-The binary SHALL be obtained from the same pinned Envoy tools image the server image uses,
-so the matcher exercised by CI is the matcher shipped in the image.
+The CI workflow's `test` job SHALL make the native `router_check_tool` binary available to the route-engine end-to-end suite and SHALL point `KSG_ROUTER_CHECK_BIN` at it. The suite SHALL fail the job when the binary is unavailable **in CI** — a missing tool SHALL NOT present as a skipped (and therefore passing) test — and SHALL continue to skip outside CI.
 
 #### Scenario: Route e2e executes on a pull request
 
@@ -137,6 +130,16 @@ so the matcher exercised by CI is the matcher shipped in the image.
 - **GIVEN** `router_check_tool` is not available to the job
 - **WHEN** the route-engine end-to-end suite starts in CI
 - **THEN** the job fails rather than reporting the suite as passed
+
+#### Scenario: Missing matcher binary outside CI
+
+- **WHEN** the route-engine end-to-end suite runs on a developer machine without the Linux binary
+- **THEN** the suite skips, so that machine is unaffected
+
+#### Scenario: CI matcher comes from the shipped image
+
+- **WHEN** CI obtains `router_check_tool` for the suite
+- **THEN** the binary comes from the same pinned Envoy tools image the server image uses, so the matcher exercised by CI is the matcher shipped in the image
 
 ### Requirement: Dependency-containment gate runs in CI
 

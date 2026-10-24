@@ -8,9 +8,7 @@ Bounds repeated upstream load by caching successful upstream PromQL query result
 
 ### Requirement: Query-result cache key
 
-The server SHALL cache the result of a successful upstream instant query under a key composed of the backend store the query was issued to (its URL and credential identity), the exact rendered query string, and the exact evaluation instant. Two queries SHALL share an entry only when all three components are equal. The query NAME (used for self-metrics and spans) SHALL NOT be part of the key. The key SHALL never contain, and a log line or metric describing the cache SHALL never expose, a credential value.
-
-The cache SHALL sit below routing: a query fanned out to several backends is cached per backend, and the fan-out merge SHALL run over cached and fresh per-backend results identically, so the merged vector is the same whether each part came from the cache or the network.
+The server SHALL cache the result of a successful upstream instant query under a key composed of the backend store the query was issued to (its URL and credential identity), the exact rendered query string, and the exact evaluation instant. Two queries SHALL share an entry only when all three components are equal, and the query NAME SHALL NOT be part of the key.
 
 #### Scenario: Identical query at the same instant hits
 
@@ -22,14 +20,34 @@ The cache SHALL sit below routing: a query fanned out to several backends is cac
 - **WHEN** two builds issue the same rendered query to the same backend at evaluation instants one second apart
 - **THEN** each is sent upstream and cached separately
 
+#### Scenario: Query name is not part of the key
+
+- **WHEN** two queries with different query NAMES (used for self-metrics and spans) render the same query string to the same backend at the same instant
+- **THEN** they share one cache entry
+
+#### Scenario: No credential value is exposed
+
+- **WHEN** the cache key is composed for a backend that carries credentials
+- **THEN** the key carries the credential identity, never a credential value
+- **AND** no log line or metric describing the cache exposes a credential value
+
+### Requirement: The cache sits below routing
+
+A query fanned out to several backends SHALL be cached per backend, and the fan-out merge SHALL run over cached and fresh per-backend results identically.
+
 #### Scenario: Same query to two backends is cached per backend
 
 - **WHEN** a query fans out to backends `zone-a` and `zone-b`
 - **THEN** each backend's result is cached under its own key and a later identical query that routes only to `zone-a` reuses only `zone-a`'s entry
 
+#### Scenario: Merge is indifferent to where a part came from
+
+- **WHEN** a fanned-out query is answered partly from the cache and partly from the network
+- **THEN** the merged vector is the same as when every part came from the network
+
 ### Requirement: Cache bounds and eviction
 
-The cache SHALL be bounded by a total resident-series budget (`--query-cache-max-series` / `KSG_QUERY_CACHE_MAX_SERIES`, default 100000) and SHALL evict least-recently-used entries until an insertion fits. A single result larger than the whole budget SHALL NOT be cached and SHALL still be returned to its caller. Every entry SHALL expire after `--query-cache-ttl` / `KSG_QUERY_CACHE_TTL` (default 60s) from insertion; an expired entry SHALL NOT be served. A budget of `0` SHALL disable the cache entirely, restoring byte-for-byte the uncached behaviour.
+The cache SHALL be bounded by a total resident-series budget (`--query-cache-max-series` / `KSG_QUERY_CACHE_MAX_SERIES`, default 100000) and SHALL evict least-recently-used entries until an insertion fits. A single result larger than the whole budget SHALL NOT be cached and SHALL still be returned to its caller. A budget of `0` SHALL disable the cache entirely, restoring byte-for-byte the uncached behaviour.
 
 #### Scenario: LRU eviction under budget pressure
 
@@ -41,15 +59,19 @@ The cache SHALL be bounded by a total resident-series budget (`--query-cache-max
 - **WHEN** a single query returns more series than the whole budget
 - **THEN** the caller receives the full result and nothing is inserted or evicted
 
-#### Scenario: Expired entry is refetched
-
-- **WHEN** an entry is older than the TTL
-- **THEN** the next identical query is sent upstream and the fresh result replaces the entry
-
 #### Scenario: Cache disabled
 
 - **WHEN** the server starts with `--query-cache-max-series=0`
 - **THEN** every query is sent upstream and no cache metric other than the zero-valued series changes
+
+### Requirement: Cache entry expiry
+
+Every entry SHALL expire after `--query-cache-ttl` / `KSG_QUERY_CACHE_TTL` (default 60s) from insertion, and an expired entry SHALL NOT be served.
+
+#### Scenario: Expired entry is refetched
+
+- **WHEN** an entry is older than the TTL
+- **THEN** the next identical query is sent upstream and the fresh result replaces the entry
 
 ### Requirement: Only successful results are cached
 

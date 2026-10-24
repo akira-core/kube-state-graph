@@ -1,7 +1,7 @@
 # graph-api Specification
 
 ## Purpose
-TBD - created by archiving change add-k8s-pod-graph-api. Update Purpose after archive.
+Define the versioned HTTP surface of the graph API: the time-ranged `GET /v1/graph` endpoint, its filter parameters and default projection, the Cytoscape.js wire shape of every node, edge and typed attribute, and the operational endpoints (health, self-metrics, OpenAPI, docs) and cross-cutting rules (authentication, timeouts, determinism) the server applies.
 
 ## Requirements
 
@@ -45,7 +45,29 @@ The server SHALL expose `GET /v1/graph` that returns a multi-cluster pod / node 
 
 ### Requirement: Time-window passthrough
 
-The server SHALL derive the upstream evaluation window from caller-supplied `start` and `end`, after enforcing `end > start`. When the end-alignment grid (`--end-align` / `KSG_END_ALIGN`, default `30s`) is non-zero, the server SHALL floor `end` to the largest multiple of the grid (measured from the Unix epoch) that is not after it, and SHALL shift `start` earlier by the same amount, so the window length `end - start` is unchanged; upstream PromQL is then evaluated with `<window> = end - start` at the aligned `end`. When the grid is `0`, `start` and `end` SHALL be passed through verbatim. Alignment SHALL run after validation, so a request valid before alignment stays valid and every validation error is reported against the caller's own values. Alignment SHALL be a pure function of `(start, end, grid)`. There is no window cap and no future-time guard; the response body SHALL NOT echo `start`, `end`, or any derived timestamp, aligned or not. Operators relying on bounded query cost SHALL configure upstream VictoriaMetrics search limits (e.g. `-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`).
+The server SHALL derive the upstream evaluation window from the caller's `start` and `end` after enforcing `end > start`, evaluating upstream PromQL with `<window> = end - start` at the (possibly aligned) `end`. End alignment SHALL be a pure function of `(start, end, grid)` that runs after validation and preserves the window length, and the response body SHALL NOT echo `start`, `end`, or any derived timestamp, aligned or not.
+
+#### Scenario: End-alignment grid configuration
+
+- **WHEN** the end-alignment grid (`--end-align` / `KSG_END_ALIGN`, default `30s`) is non-zero
+- **THEN** the server floors `end` to the largest multiple of the grid (measured from the Unix epoch) that is not after it
+- **AND** shifts `start` earlier by the same amount, so the window length `end - start` is unchanged
+
+#### Scenario: Zero grid passes timestamps through
+
+- **WHEN** the grid is `0`
+- **THEN** `start` and `end` are passed through verbatim
+
+#### Scenario: Alignment runs after validation
+
+- **WHEN** a request is valid before alignment
+- **THEN** it stays valid after alignment, and every validation error is reported against the caller's own values
+
+#### Scenario: No window cap or future-time guard
+
+- **WHEN** a client sends an arbitrarily long window or an `end` in the future
+- **THEN** the server applies no window cap and no future-time guard
+- **AND** operators relying on bounded query cost configure upstream VictoriaMetrics search limits (e.g. `-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`)
 
 #### Scenario: Caller timestamps drive PromQL
 
@@ -69,23 +91,7 @@ The server SHALL derive the upstream evaluation window from caller-supplied `sta
 
 ### Requirement: Cytoscape.js response shape
 
-`GET /v1/graph` SHALL return a JSON document in Cytoscape.js shape: `{ apiVersion, clusters, elements: { nodes, edges } }`. The body SHALL NOT contain time-varying or echo-of-input fields, so identical inputs against the same upstream state produce byte-identical bodies. The top-level `clusters` array SHALL list **Kubernetes** cluster identities only — the `<az>-<env>-<cluster>` identity of the `cluster-topology-source` capability ("Cluster identity composed from zone and environment labels"), or the raw name for a cluster that composed none — and an ONTAP cluster name (the `ontap_cluster` label of `netapp-aggr` / `netapp-node` nodes) SHALL NEVER appear in it. An identity is NOT a valid `?cluster=` value (see "Filter parameters"); a client that wants to narrow to one listed cluster sends its three components as `az`, `env` and `cluster`.
-
-Each **node** SHALL be `{ data: { id, name, type, labels } }`:
-- `id` SHALL be a cluster-scoped composite for pods / K8s nodes / PVCs / services (pods: `<cluster>/<pod-uid>`; nodes: `<cluster>/<node-name>`; PVCs: `<cluster>/<namespace>/<claim>`; services: `<cluster>/<namespace>/<service>`), where `<cluster>` is the cluster identity. For NetApp aggregates, `id` SHALL be `netapp/<ontap-cluster>/aggr/<aggr>`; for NetApp nodes, `netapp/<ontap-cluster>/<node>` (neither carries a Kubernetes cluster prefix). For external nodes (unresolvable `"://"` connection-string endpoints or missing-UID human-label fallback), `id` SHALL be `external/<label-value>` (no cluster prefix).
-- `name` SHALL be the human-readable pod / node / PVC / service name; for NetApp aggregates, the ONTAP aggregate name; for NetApp nodes, the ONTAP controller name. For external nodes, `name` SHALL be the verbatim `client` or `server` label value from the source service-graph series.
-- `type` SHALL be one of the strings `"pod"`, `"node"`, `"pvc"`, `"service"`, `"external"`, `"netapp-aggr"`, `"netapp-node"`. The Cytoscape serialiser additionally synthesises `"cluster"`, `"storage-cluster"`, `"namespace"`, `"application"`, and `"controller"` group nodes for compound nesting (see "Cytoscape compound node grouping").
-- `data` MAY carry an optional `parent` field (`omitempty`) referencing the `id` of the node's Cytoscape compound container — see "Cytoscape compound node grouping".
-- `labels` SHALL be a JSON object whose values are strings only (`map[string]string`). For pod / K8s node / PVC / service nodes it SHALL include at minimum a `cluster` entry carrying the cluster identity — the same value as the `id` prefix; for pods, PVCs, and services it SHALL also include a `namespace` entry; for pods it SHALL include `node` (the cluster-scoped node ID, identity-prefixed), and SHALL include `pod_ip` and `host_ip` whenever the upstream `kube_pod_info` series carried them; for K8s nodes it SHALL include `external_ip` when the upstream provided one. **For NetApp aggregates**, `labels` SHALL be exactly `{ontap_cluster, node}` (the owning controller); **for NetApp nodes**, exactly `{ontap_cluster}` — deliberately no `cluster` key on either. **For external nodes**, `labels` SHALL be an empty object `{}` (no `cluster` key).
-
-Each **edge** SHALL be `{ data: { id, type, source, target, labels } }`:
-- `id` SHALL be a UUID, RFC 4122 compliant, encoded as a lowercase canonical string.
-- `type` SHALL be one of the edge types this endpoint produces — `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`, `pod-to-node`, `pvc-to-netapp-aggr` — each defined by the `pod-service-graph`, `cluster-topology-source`, and `netapp-storage-graph` capabilities. `storage-flow` is produced by `GET /v1/storage-graph` alone and SHALL NOT appear in a `/v1/graph` body. The set is a fixed contract of this specification; there is no discovery endpoint for it.
-- `source` and `target` SHALL each match the `id` of a node present in the same response's `elements.nodes`.
-- `labels` SHALL be a JSON object whose values are strings only (`map[string]string`). The exact key set per edge type is defined by the `pod-service-graph`, `cluster-topology-source`, and `netapp-storage-graph` capabilities. Wherever an edge carries a `cluster` key its value is a cluster identity, never a raw name that appears on no node of the body.
-- `data` MAY carry an optional `metrics` object (`omitempty`) holding the edge's measurements — see "Edge `metrics` attribute".
-
-Implementations SHALL NOT encode booleans or numbers as strings inside `labels`. Boolean flags remain deferred to a future typed field and are NOT part of the v1 contract. Numeric measurements are carried exclusively on the typed `data.metrics` object defined below — never inside `labels`.
+`GET /v1/graph` SHALL return a JSON document in Cytoscape.js shape: `{ apiVersion, clusters, elements: { nodes, edges } }`. The body SHALL NOT contain time-varying or echo-of-input fields, so identical inputs against the same upstream state produce byte-identical bodies.
 
 #### Scenario: Pod node payload
 
@@ -172,22 +178,130 @@ Implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
 - **WHEN** a client sends any `GET /v1/graph` request
 - **THEN** no edge in the response has `data.type` equal to `"storage-flow"`
 
+### Requirement: Top-level `clusters` array lists Kubernetes cluster identities
+
+The top-level `clusters` array SHALL list **Kubernetes** cluster identities only, and an ONTAP cluster name SHALL NEVER appear in it. An identity SHALL NOT be treated as a valid `?cluster=` value.
+
+#### Scenario: Identity or raw name per Kubernetes cluster
+
+- **WHEN** the body contains elements of a Kubernetes cluster
+- **THEN** `clusters` lists that cluster's `<az>-<env>-<cluster>` identity of the `cluster-topology-source` capability ("Cluster identity composed from zone and environment labels"), or the raw name for a cluster that composed none
+
+#### Scenario: ONTAP cluster label excluded
+
+- **WHEN** the body contains `netapp-aggr` / `netapp-node` nodes
+- **THEN** no ONTAP cluster name (the `ontap_cluster` label of those nodes) appears in `clusters`
+
+#### Scenario: Narrowing to a listed cluster
+
+- **WHEN** a client wants to narrow to one listed cluster
+- **THEN** it sends the identity's three components as `az`, `env` and `cluster`, because an identity is NOT a valid `?cluster=` value (see "Filter parameters")
+
+### Requirement: Graph node payload
+
+Each **node** SHALL be `{ data: { id, name, type, labels } }`, and its `data` MAY carry an optional `parent` field (`omitempty`) referencing the `id` of the node's Cytoscape compound container (see "Cytoscape compound node grouping").
+
+#### Scenario: Node type values
+
+- **WHEN** the response contains any node
+- **THEN** its `type` is one of the strings `"pod"`, `"node"`, `"pvc"`, `"service"`, `"external"`, `"netapp-aggr"`, `"netapp-node"`
+- **AND** the Cytoscape serialiser additionally synthesises `"cluster"`, `"storage-cluster"`, `"namespace"`, `"application"`, and `"controller"` group nodes for compound nesting (see "Cytoscape compound node grouping")
+
+#### Scenario: Cluster-scoped node ids
+
+- **WHEN** the node is a pod, K8s node, PVC or service
+- **THEN** its `id` is a cluster-scoped composite whose `<cluster>` is the cluster identity — pods: `<cluster>/<pod-uid>`; nodes: `<cluster>/<node-name>`; PVCs: `<cluster>/<namespace>/<claim>`; services: `<cluster>/<namespace>/<service>`
+
+#### Scenario: NetApp node ids carry no Kubernetes cluster prefix
+
+- **WHEN** the node is a NetApp aggregate or a NetApp node
+- **THEN** an aggregate's `id` is `netapp/<ontap-cluster>/aggr/<aggr>` and a NetApp node's `id` is `netapp/<ontap-cluster>/<node>`, neither carrying a Kubernetes cluster prefix
+
+#### Scenario: External node ids
+
+- **WHEN** the node is an external node (an unresolvable `"://"` connection-string endpoint or the missing-UID human-label fallback)
+- **THEN** its `id` is `external/<label-value>` (no cluster prefix)
+
+#### Scenario: Node names
+
+- **WHEN** the response contains any node
+- **THEN** `name` is the human-readable pod / node / PVC / service name; for NetApp aggregates, the ONTAP aggregate name; for NetApp nodes, the ONTAP controller name
+- **AND** for external nodes, `name` is the verbatim `client` or `server` label value from the source service-graph series
+
+#### Scenario: Kubernetes node labels
+
+- **WHEN** the node is a pod, K8s node, PVC or service
+- **THEN** `labels` includes at minimum a `cluster` entry carrying the cluster identity — the same value as the `id` prefix
+- **AND** pods, PVCs and services also include a `namespace` entry
+- **AND** pods include `node` (the cluster-scoped node ID, identity-prefixed), and include `pod_ip` and `host_ip` whenever the upstream `kube_pod_info` series carried them
+- **AND** K8s nodes include `external_ip` when the upstream provided one
+
+#### Scenario: NetApp and external node labels
+
+- **WHEN** the node is a NetApp aggregate, a NetApp node or an external node
+- **THEN** a NetApp aggregate's `labels` is exactly `{ontap_cluster, node}` (the owning controller) and a NetApp node's exactly `{ontap_cluster}` — deliberately no `cluster` key on either
+- **AND** an external node's `labels` is an empty object `{}` (no `cluster` key)
+
+### Requirement: Graph edge payload
+
+Each **edge** SHALL be `{ data: { id, type, source, target, labels } }`. Its `id` SHALL be an RFC 4122 compliant UUID encoded as a lowercase canonical string, and `source` and `target` SHALL each match the `id` of a node present in the same response's `elements.nodes`.
+
+#### Scenario: Edge type set is fixed
+
+- **WHEN** the response contains any edge
+- **THEN** its `type` is one of the edge types this endpoint produces — `pod-mounts-pvc`, `pod-calls-pod`, `pod-calls-service`, `service-selects-pod`, `pod-to-node`, `pvc-to-netapp-aggr` — each defined by the `pod-service-graph`, `cluster-topology-source`, and `netapp-storage-graph` capabilities
+- **AND** `storage-flow` is produced by `GET /v1/storage-graph` alone
+- **AND** the set is a fixed contract of this specification; there is no discovery endpoint for it
+
+#### Scenario: Edge label keys
+
+- **WHEN** the response contains any edge
+- **THEN** the exact `labels` key set per edge type is the one defined by the `pod-service-graph`, `cluster-topology-source`, and `netapp-storage-graph` capabilities
+- **AND** wherever an edge carries a `cluster` key its value is a cluster identity, never a raw name that appears on no node of the body
+
+#### Scenario: Optional edge metrics
+
+- **WHEN** an edge has measurements
+- **THEN** its `data` MAY carry an optional `metrics` object (`omitempty`) holding them — see "Edge `metrics` attribute"
+
+### Requirement: Labels carry strings only
+
+`labels` on every node and edge SHALL be a JSON object whose values are strings only (`map[string]string`), and implementations SHALL NOT encode booleans or numbers as strings inside `labels`.
+
+#### Scenario: Numeric measurements are typed
+
+- **WHEN** an element carries a numeric measurement
+- **THEN** it is carried exclusively on the typed `data.metrics` object — never inside `labels`
+
+#### Scenario: Boolean flags are not part of v1
+
+- **WHEN** an element would carry a boolean flag
+- **THEN** no such flag is emitted: boolean flags remain deferred to a future typed field and are NOT part of the v1 contract
+
 ### Requirement: Filter parameters
 
-`GET /v1/graph` SHALL accept the optional filter parameters `cluster`, `namespace`, `az`, `env` (each repeatable) and `prune` (single-valued, `true` | `false`, default `true`). The request surface is exactly `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`; every parameter except `start` / `end` is optional. Multiple values for the same parameter SHALL be OR-combined; different parameters SHALL be AND-combined. An unknown filter **value** (a cluster, namespace, zone, or environment with no data) SHALL NOT cause an error — it yields an empty result. An unknown filter **parameter** — including the withdrawn `name`, `root`, `depth`, `direction` and `edge_type` — SHALL be ignored without error, whatever value it carries: a withdrawn parameter never narrows the body and never rejects the request.
+`GET /v1/graph` SHALL accept exactly the parameters `start`, `end`, `cluster`, `namespace`, `az`, `env` and `prune`, where every parameter except `start` / `end` is optional, `cluster` / `namespace` / `az` / `env` are each repeatable, and `prune` is single-valued (`true` | `false`, default `true`). Neither an unknown filter value nor an unknown parameter SHALL cause an error.
 
-The `cluster` value is the **raw** Kubernetes cluster name — the value of the upstream `cluster` label — not the composed identity the response lists in `clusters[]`. A raw name selects every cluster identity whose raw component equals it, across zones and environments; the triple `az` + `env` + `cluster` pins exactly one identity, because those three request dimensions are the identity's three components.
+#### Scenario: Values combine OR within a parameter and AND across parameters
 
-Filters fall into two classes:
+- **WHEN** a request carries several values for one parameter and values for several parameters
+- **THEN** multiple values for the same parameter are OR-combined and different parameters are AND-combined
 
-- **Selector-level filters** — `cluster`, `namespace`, `az`, `env` — SHALL be rendered into the upstream PromQL queries of the build as label matchers, so the graph is narrowed by VictoriaMetrics before any sample is read. Which matcher reaches which series is the hardcoded contract of the `cluster-topology-source` capability ("Request-scoped upstream selectors"); the service-graph series are deliberately read unfiltered (`pod-service-graph`). A request with no selector-level filter SHALL issue exactly the queries it issues today and produce a byte-identical body.
-- **Projection-level filters** — `cluster` and `namespace` (applied again over the built graph as defence in depth) and `prune` — SHALL be applied at response time as a projection over the freshly built graph. The projection-level `cluster` check compares the request's raw values against the **raw-name component** of each element's cluster identity (recovered from the built graph's identity table; an identity absent from the table compares as itself), so the projection admits exactly what the upstream matcher admitted. There is no projection over edge type: every edge of the built graph whose endpoints survive node filtering is emitted, and a client wanting fewer edge types drops them by `data.type`.
+#### Scenario: Unknown filter value yields an empty result
 
-Empty filters SHALL return the **connectivity-connected subgraph** of the full multi-cluster graph for the time window (the default connectivity prune — see "Default projection prunes connectivity-disconnected workload"); it is NOT the full topology inventory. `prune=false` returns the inventory instead.
+- **WHEN** a filter **value** names a cluster, namespace, zone, or environment with no data
+- **THEN** the request does not fail; it yields an empty result
 
-Selector-level values SHALL be validated before rendering: a value longer than 253 bytes, containing a control character (including newline), or — for `prune` — not exactly `true` / `false`, SHALL be rejected with `400 Bad Request` and `reason: "invalid_scope"`. A single value SHALL render an exact matcher (`<key>="<value>"`, with `"` and `\` escaped); several values for one parameter SHALL render one fully-anchored alternation (`<key>=~"<v1>|<v2>"`) over the sorted, de-duplicated, regex-quoted values. The request value `cluster=unknown` SHALL render `cluster=~"unknown|"` so that both spellings of the bucket — a series carrying no `cluster` label and one whose label is literally `unknown` — remain addressable, matching what the projection filter accepts.
+#### Scenario: Unknown or withdrawn parameter is ignored
 
-**Edge retention rule (unified across all filters).** An edge SHALL be retained when at least one resolved endpoint is in scope after node filtering. When exactly one endpoint is in scope, the missing endpoint SHALL be re-added from the freshly built graph's node index provided it passes the non-cluster filters (namespace check; types without a namespace label — `node`, `external`, and the NetApp types `netapp-aggr` / `netapp-node` (which carry neither a namespace nor a `cluster` label) — pass through). This single rule is edge-type-agnostic and covers non-pod endpoints incident on in-scope pods — including the topology `pod-to-node` edge, the `pvc-to-netapp-aggr` edge, and the `external` partners that a filtered build produces for out-of-scope peers — and, in an **unfiltered** build, cross-cluster edges whose partner endpoint lies outside a projection-level `cluster` set.
+- **WHEN** a request carries an unknown filter **parameter** — including the withdrawn `name`, `root`, `depth`, `direction` and `edge_type` — whatever value it carries
+- **THEN** the parameter is ignored without error: a withdrawn parameter never narrows the body and never rejects the request
+
+#### Scenario: Empty filters return the connectivity-connected subgraph
+
+- **WHEN** a request carries no filter
+- **THEN** the response is the **connectivity-connected subgraph** of the full multi-cluster graph for the time window (the default connectivity prune — see "Default projection prunes connectivity-disconnected workload"), NOT the full topology inventory
+- **AND** `prune=false` returns the inventory instead
 
 #### Scenario: Cluster filter narrows result
 
@@ -299,11 +413,123 @@ Selector-level values SHALL be validated before rendering: a value longer than 2
 - **WHEN** a client sends `GET /v1/graph?start=...&end=...` with no other parameters
 - **THEN** every upstream query is byte-identical to the query issued before request-scoped selectors existed, and the response body is byte-identical to the pre-change body for the same upstream data
 
+### Requirement: Raw cluster filter value
+
+The `cluster` value SHALL be the **raw** Kubernetes cluster name — the value of the upstream `cluster` label — not the composed identity the response lists in `clusters[]`.
+
+#### Scenario: A raw name spans zones and environments
+
+- **WHEN** a request carries `cluster=<raw>`
+- **THEN** it selects every cluster identity whose raw component equals `<raw>`, across zones and environments
+
+#### Scenario: Zone, environment and cluster triple pins one identity
+
+- **WHEN** a request carries `az` + `env` + `cluster`
+- **THEN** the triple pins exactly one identity, because those three request dimensions are the identity's three components
+
+### Requirement: Selector-level filters render upstream label matchers
+
+The selector-level filters `cluster`, `namespace`, `az`, `env` SHALL be rendered into the upstream PromQL queries of the build as label matchers, so the graph is narrowed by VictoriaMetrics before any sample is read. A request with no selector-level filter SHALL issue exactly the queries it issues today and produce a byte-identical body.
+
+#### Scenario: Matcher reach is a fixed contract
+
+- **WHEN** a selector-level filter is rendered
+- **THEN** which matcher reaches which series is the hardcoded contract of the `cluster-topology-source` capability ("Request-scoped upstream selectors")
+- **AND** the service-graph series are deliberately read unfiltered (`pod-service-graph`)
+
+#### Scenario: Single value renders an exact matcher
+
+- **WHEN** a parameter carries a single value
+- **THEN** it renders an exact matcher `<key>="<value>"`, with `"` and `\` escaped
+
+#### Scenario: Several values render one anchored alternation
+
+- **WHEN** a parameter carries several values
+- **THEN** they render one fully-anchored alternation (`<key>=~"<v1>|<v2>"`) over the sorted, de-duplicated, regex-quoted values
+
+#### Scenario: cluster=unknown addresses both bucket spellings
+
+- **WHEN** a request carries `cluster=unknown`
+- **THEN** the server renders `cluster=~"unknown|"`, so both spellings of the bucket — a series carrying no `cluster` label and one whose label is literally `unknown` — remain addressable, matching what the projection filter accepts
+
+### Requirement: Selector values are validated before rendering
+
+Selector-level values and `prune` SHALL be validated before any upstream query is rendered, and an invalid value SHALL be rejected with `400 Bad Request` and `reason: "invalid_scope"`.
+
+#### Scenario: Over-long value rejected
+
+- **WHEN** a selector-level value is longer than 253 bytes
+- **THEN** the server returns `400 Bad Request` with `reason: "invalid_scope"`
+
+#### Scenario: Control character rejected
+
+- **WHEN** a selector-level value contains a control character (including newline)
+- **THEN** the server returns `400 Bad Request` with `reason: "invalid_scope"`
+
+#### Scenario: Non-boolean prune rejected
+
+- **WHEN** the `prune` value is not exactly `true` / `false`
+- **THEN** the server returns `400 Bad Request` with `reason: "invalid_scope"`
+
+### Requirement: Projection-level filters
+
+The projection-level filters — `cluster` and `namespace` (applied again over the built graph as defence in depth) and `prune` — SHALL be applied at response time as a projection over the freshly built graph, and there SHALL be no projection over edge type.
+
+#### Scenario: Projection cluster check compares the raw-name component
+
+- **WHEN** the projection-level `cluster` check runs
+- **THEN** it compares the request's raw values against the **raw-name component** of each element's cluster identity, recovered from the built graph's identity table (an identity absent from the table compares as itself)
+- **AND** the projection therefore admits exactly what the upstream matcher admitted
+
+#### Scenario: Every surviving edge is emitted regardless of type
+
+- **WHEN** node filtering completes
+- **THEN** every edge of the built graph whose endpoints survive node filtering is emitted, and a client wanting fewer edge types drops them by `data.type`
+
+### Requirement: Edge retention rule
+
+**Edge retention rule (unified across all filters).** An edge SHALL be retained when at least one resolved endpoint is in scope after node filtering. When exactly one endpoint is in scope, the missing endpoint SHALL be re-added from the freshly built graph's node index provided it passes the non-cluster filters.
+
+#### Scenario: Types without a namespace label pass the namespace check
+
+- **WHEN** the missing endpoint is re-added and it has no namespace label
+- **THEN** it passes the namespace check — `node`, `external`, and the NetApp types `netapp-aggr` / `netapp-node` (which carry neither a namespace nor a `cluster` label) pass through
+
+#### Scenario: Rule is edge-type-agnostic
+
+- **WHEN** a non-pod endpoint is incident on an in-scope pod
+- **THEN** the single rule retains it — including the topology `pod-to-node` edge, the `pvc-to-netapp-aggr` edge, and the `external` partners that a filtered build produces for out-of-scope peers
+
+#### Scenario: Unfiltered cross-cluster partner re-added
+
+- **WHEN** an **unfiltered** build holds a cross-cluster edge whose partner endpoint lies outside a projection-level `cluster` set
+- **THEN** the edge is retained and the partner re-added under the same rule
+
 ### Requirement: Default projection prunes connectivity-disconnected workload
 
-`GET /v1/graph` SHALL, on every request whose `prune` parameter is absent or `true`, return only the workload that participates in the connectivity graph. A `pod` node SHALL be retained iff it is an endpoint of at least one connectivity edge (`pod-calls-pod`, `pod-calls-service`, or `service-selects-pod`). A `pvc` node SHALL be retained iff at least one of the pods that mount it (`pod-mounts-pvc`) is itself retained by that rule; consequently a PVC with no mounting pod at all SHALL be dropped. A `node` (K8s host) and a `netapp-aggr` SHALL be retained iff referenced by a retained element (a pod scheduled on the node, a PVC joined to the aggregate via `pvc-to-netapp-aggr`), and a `netapp-node` iff referenced by a retained `netapp-aggr` (its `labels.node`) — the reference-driven infra-admission rule, operating (transitively for the NetApp chain) over the connectivity-pruned pod/PVC set. `service` and `external` nodes are connectivity-born (only ever materialised as edge endpoints) and SHALL NOT be pruned by this rule. The prune SHALL be a pure function of the built graph, applied uniformly for every selector-level filter shape, and SHALL NOT resurrect a pruned pod/PVC through the edge-retention partner re-add. Because the service-graph series are read in full, an in-scope pod whose only traffic goes to out-of-scope peers still sits on a connectivity edge (to the `external` partner a filtered build materialises for such a peer) and is therefore retained.
+`GET /v1/graph` SHALL, on every request whose `prune` parameter is absent or `true`, return only the workload that participates in the connectivity graph. The prune SHALL be a pure function of the built graph, applied uniformly for every selector-level filter shape, and SHALL NOT resurrect a pruned pod/PVC through the edge-retention partner re-add.
 
-`prune=false` SHALL turn the prune off: every loaded pod is emitted together with its `pod-to-node`, `pod-mounts-pvc`, and `pvc-to-netapp-aggr` chain regardless of traffic, and every loaded PVC is emitted whether or not it is mounted. `prune=false` is the only escape hatch; the former `name` / `root` escape hatches are withdrawn. Its effect on unreferenced infrastructure nodes is specified in "Namespace-filter retention of cluster-scoped infra nodes".
+#### Scenario: Pod retention
+
+- **WHEN** the prune runs
+- **THEN** a `pod` node is retained iff it is an endpoint of at least one connectivity edge (`pod-calls-pod`, `pod-calls-service`, or `service-selects-pod`)
+
+#### Scenario: PVC retention
+
+- **WHEN** the prune runs
+- **THEN** a `pvc` node is retained iff at least one of the pods that mount it (`pod-mounts-pvc`) is itself retained
+- **AND** a PVC with no mounting pod at all is dropped
+
+#### Scenario: Reference-driven infra admission
+
+- **WHEN** the prune runs over the connectivity-pruned pod/PVC set
+- **THEN** a `node` (K8s host) and a `netapp-aggr` are retained iff referenced by a retained element (a pod scheduled on the node, a PVC joined to the aggregate via `pvc-to-netapp-aggr`)
+- **AND** a `netapp-node` is retained iff referenced by a retained `netapp-aggr` (its `labels.node`), applying the rule transitively for the NetApp chain
+
+#### Scenario: Connectivity-born nodes are not pruned
+
+- **WHEN** the body holds `service` or `external` nodes
+- **THEN** they are not pruned by this rule, because they are connectivity-born (only ever materialised as edge endpoints)
 
 #### Scenario: Edgeless pod and its dependents are pruned from the default view
 
@@ -338,13 +564,48 @@ Selector-level values SHALL be validated before rendering: a value longer than 2
 #### Scenario: In-scope pod with only out-of-scope traffic survives the prune
 
 - **WHEN** pod `web` in namespace `shop` calls only pods in namespace `payments`, and a client sends `?namespace=shop`
-- **THEN** `web` is retained (its edge to the `external/<payments-peer-label>` partner is a connectivity edge) and the response contains `web`, that `external` node, and the edge
+- **THEN** `web` is retained (because the service-graph series are read in full, its edge to the `external/<payments-peer-label>` partner a filtered build materialises is a connectivity edge) and the response contains `web`, that `external` node, and the edge
+
+### Requirement: prune=false disables the connectivity prune
+
+`prune=false` SHALL turn the prune off: every loaded pod SHALL be emitted together with its `pod-to-node`, `pod-mounts-pvc`, and `pvc-to-netapp-aggr` chain regardless of traffic, and every loaded PVC SHALL be emitted whether or not it is mounted. `prune=false` SHALL be the only escape hatch.
+
+#### Scenario: Withdrawn escape hatches do not disable the prune
+
+- **WHEN** a request carries the former `name` / `root` escape hatches without `prune=false`
+- **THEN** the prune still applies, because those escape hatches are withdrawn
+
+#### Scenario: Unreferenced infrastructure under prune=false
+
+- **WHEN** a request carries `prune=false`
+- **THEN** its effect on unreferenced infrastructure nodes is the one specified in "Namespace-filter retention of cluster-scoped infra nodes"
 
 ### Requirement: Cross-cluster edge representation
 
-A cross-cluster edge (`pod-calls-pod`, `pod-calls-service`, or `service-selects-pod` whose source-node cluster **identity** differs from its target-node cluster identity) SHALL be emitted with **both real endpoint nodes** only when both clusters are **loaded** by the build — every build without a `cluster` filter, or a build whose `cluster` filter lists both clusters' raw names. Consumers detect cross-cluster status by comparing the `labels.cluster` of the edge's resolved source and target nodes — not from edge labels. Two clusters sharing a raw name under different zones or environments are distinct identities and an edge between them IS cross-cluster. A `pod-calls-pod` edge carries `labels.cluster` (the client pod's cluster identity, present iff the client side resolved to a pod — `pod-service-graph` "Edge cluster label"); a `service-selects-pod` edge carries no `cluster` key (its source is a service node, which is cluster-scoped via its own `labels.cluster`).
+A cross-cluster edge (`pod-calls-pod`, `pod-calls-service`, or `service-selects-pod` whose source-node cluster **identity** differs from its target-node cluster identity) SHALL be emitted with **both real endpoint nodes** only when both clusters are **loaded** by the build — every build without a `cluster` filter, or a build whose `cluster` filter lists both clusters' raw names.
 
-When a `cluster` filter excludes one side, that side's topology is not loaded; the peer then follows the `pod-service-graph` capability's filtered-build rule and is rendered as an `external/<label>` node (carrying no `cluster`), and the edge is no longer cross-cluster — it is an edge to an external. The family-wide `service-selects-pod` fan-out of a local service node reaches only backing pods in **loaded** clusters. The former rule that a `?cluster=` projection keeps the out-of-scope partner as a real pod node is withdrawn.
+#### Scenario: Consumers detect cross-cluster status from the endpoint nodes
+
+- **WHEN** a consumer needs to know whether an edge is cross-cluster
+- **THEN** it compares the `labels.cluster` of the edge's resolved source and target nodes — not edge labels
+- **AND** two clusters sharing a raw name under different zones or environments are distinct identities, so an edge between them IS cross-cluster
+
+#### Scenario: Edge cluster labels by type
+
+- **WHEN** the body carries a `pod-calls-pod` or `service-selects-pod` edge
+- **THEN** a `pod-calls-pod` edge carries `labels.cluster` (the client pod's cluster identity, present iff the client side resolved to a pod — `pod-service-graph` "Edge cluster label")
+- **AND** a `service-selects-pod` edge carries no `cluster` key (its source is a service node, which is cluster-scoped via its own `labels.cluster`)
+
+#### Scenario: Excluded side becomes an external
+
+- **WHEN** a `cluster` filter excludes one side of a call
+- **THEN** that side's topology is not loaded and the peer follows the `pod-service-graph` capability's filtered-build rule, rendered as an `external/<label>` node (carrying no `cluster`)
+- **AND** the edge is no longer cross-cluster — it is an edge to an external; the former rule that a `?cluster=` projection keeps the out-of-scope partner as a real pod node is withdrawn
+
+#### Scenario: Service fan-out reaches loaded clusters only
+
+- **WHEN** a local service node fans out `service-selects-pod` family-wide
+- **THEN** the fan-out reaches only backing pods in **loaded** clusters
 
 #### Scenario: Cross-cluster edge with both clusters in scope
 
@@ -368,11 +629,30 @@ When a `cluster` filter excludes one side, that side's topology is not loaded; t
 
 ### Requirement: Deterministic response body
 
-For identical input — same `(aligned window, filters, upstream-data)` — the server SHALL produce a byte-identical response body across rebuilds, whether each upstream result was fetched or served from the in-process query-result cache. The server SHALL NOT emit any HTTP cache validator (no `ETag`, no `Last-Modified`). The in-process cache operates on individual upstream query results (see the `upstream-query-cache` capability), never on built graphs or response bodies; within one aligned window and selector set the projection-level filters remain a pure function of the built graph.
+For identical input — same `(aligned window, filters, upstream-data)` — the server SHALL produce a byte-identical response body across rebuilds, whether each upstream result was fetched or served from the in-process query-result cache. The server SHALL NOT emit any HTTP cache validator (no `ETag`, no `Last-Modified`).
 
-The serialiser SHALL maintain determinism by sorting `view.Nodes` and `view.Edges`, sorting `Graph.ClusterNames()`, sorting `IPAddress` slices at construction, and keeping the response body shape fixed at `{apiVersion, clusters, elements}` for graph routes (no time-of-build or echo-of-input fields). Every rendered upstream selector SHALL be a pure function of the sorted, de-duplicated parameter values.
+#### Scenario: Cache scope
 
-`GET /openapi.yaml`, `GET /openapi.json`, and `GET /docs` SHALL carry an explicit `Cache-Control` header. `GET /v1/graph` SHALL NOT emit a `Cache-Control` header.
+- **WHEN** the in-process cache is consulted
+- **THEN** it operates on individual upstream query results (see the `upstream-query-cache` capability), never on built graphs or response bodies
+- **AND** within one aligned window and selector set the projection-level filters remain a pure function of the built graph
+
+#### Scenario: Serialiser sorting
+
+- **WHEN** the serialiser renders a body
+- **THEN** it sorts `view.Nodes` and `view.Edges`, sorts `Graph.ClusterNames()`, and sorts `IPAddress` slices at construction
+- **AND** keeps the response body shape fixed at `{apiVersion, clusters, elements}` for graph routes (no time-of-build or echo-of-input fields)
+
+#### Scenario: Selectors are pure functions of the parameter values
+
+- **WHEN** upstream selectors are rendered
+- **THEN** every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values
+
+#### Scenario: Cache-Control headers
+
+- **WHEN** a client sends `GET /openapi.yaml`, `GET /openapi.json`, or `GET /docs`
+- **THEN** the response carries an explicit `Cache-Control` header
+- **AND** `GET /v1/graph` does not emit a `Cache-Control` header
 
 #### Scenario: Body byte-identical across repeated requests
 
@@ -386,14 +666,29 @@ The serialiser SHALL maintain determinism by sorting `view.Nodes` and `view.Edge
 
 ### Requirement: Node `ipaddress` attribute
 
-Every `data` object for a node in the Cytoscape response SHALL expose a top-level `ipaddress` field of type `string[]` with `omitempty` semantics:
+Every `data` object for a node in the Cytoscape response SHALL expose a top-level `ipaddress` field of type `string[]` with `omitempty` semantics, sourced per node type. The legacy `labels.pod_ip`, `labels.host_ip`, `labels.external_ip` and `labels.internal_ip` keys SHALL NOT appear on any node entry.
 
-- `type="pod"` nodes SHALL carry the pod's IP from `kube_pod_info.pod_ip` (single-element slice) when the source metric surfaces it, and omit the field otherwise.
-- `type="node"` nodes SHALL carry the K8s node's `ExternalIP` from `kube_node_status_addresses` (single-element slice) when present, falling back to the node's `InternalIP` (single-element slice) when no ExternalIP row exists, and omit the field only when neither address type is present. An ExternalIP SHALL always win over an InternalIP regardless of upstream sample order.
-- `type="service"` nodes SHALL carry the service's `cluster_ip` from `kube_service_info` (single-element slice) when `cluster_ip` is not `"None"`, and omit the field for headless services (`cluster_ip="None"`) or when the metric does not surface it.
-- `type="pvc"` and `type="external"` nodes SHALL NOT emit the `ipaddress` field.
+#### Scenario: Pod source
 
-The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHALL NOT appear on any node entry — they are replaced by the typed `ipaddress` attribute and the node entry respectively. A `labels.internal_ip` key SHALL NOT appear either — the InternalIP fallback surfaces only via `ipaddress`.
+- **WHEN** a `type="pod"` node is serialised
+- **THEN** it carries the pod's IP from `kube_pod_info.pod_ip` (single-element slice) when the source metric surfaces it, and omits the field otherwise
+
+#### Scenario: K8s node source and precedence
+
+- **WHEN** a `type="node"` node is serialised
+- **THEN** it carries the K8s node's `ExternalIP` from `kube_node_status_addresses` (single-element slice) when present, falling back to the node's `InternalIP` (single-element slice) when no ExternalIP row exists, and omits the field only when neither address type is present
+- **AND** an ExternalIP always wins over an InternalIP regardless of upstream sample order
+
+#### Scenario: Service source
+
+- **WHEN** a `type="service"` node is serialised
+- **THEN** it carries the service's `cluster_ip` from `kube_service_info` (single-element slice) when `cluster_ip` is not `"None"`, and omits the field for headless services (`cluster_ip="None"`) or when the metric does not surface it
+
+#### Scenario: Legacy label keys replaced
+
+- **WHEN** any node entry is serialised
+- **THEN** `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` are absent — replaced by the typed `ipaddress` attribute and the node entry respectively
+- **AND** no `labels.internal_ip` key appears either — the InternalIP fallback surfaces only via `ipaddress`
 
 #### Scenario: Pod entry carries pod IP on ipaddress
 
@@ -437,14 +732,27 @@ The legacy `labels.pod_ip`, `labels.host_ip`, and `labels.external_ip` keys SHAL
 
 ### Requirement: Node `ready_status` attribute
 
-Every `data` object for a `type="node"` node in the Cytoscape response SHALL expose a top-level `ready_status` field of type `string` with `omitempty` semantics, carrying the node's Kubernetes Ready-condition status derived from `kube_node_status_condition{condition="Ready"}` (see cluster-topology-source Requirement: K8s node Ready-status attribute):
+Every `data` object for a `type="node"` node SHALL expose a top-level `ready_status` field of type `string` with `omitempty` semantics, carrying the node's Kubernetes Ready-condition status derived from `kube_node_status_condition{condition="Ready"}` (see cluster-topology-source Requirement: K8s node Ready-status attribute). It SHALL be a typed attribute, never inside `labels`.
 
-- The value SHALL be exactly one of `"Ready"`, `"NotReady"`, or `"Unknown"`.
-- The field SHALL be omitted entirely when the source metric is absent, when the node has no `condition="Ready"` series, or when no status row is active — a node with no Ready-condition data carries no `ready_status` key, NOT `ready_status: ""` and NOT `ready_status: "Unknown"`.
-- The literal `"Unknown"` SHALL appear only for the genuine Kubernetes state where the Ready condition's `status` label is `unknown` (kubelet not reporting); it is never a stand-in for missing data.
-- `type="pod"`, `type="service"`, `type="pvc"`, and `type="external"` nodes SHALL NOT emit the `ready_status` field.
+#### Scenario: Allowed values
 
-The Ready status SHALL NOT appear inside `labels` (which remain a strict `map[string]string` of typological metadata) — it is a typed attribute, the same precedent as `ipaddress` and `owner`.
+- **WHEN** a node carries `ready_status`
+- **THEN** the value is exactly one of `"Ready"`, `"NotReady"`, or `"Unknown"`
+
+#### Scenario: Omitted without Ready-condition data
+
+- **WHEN** the source metric is absent, the node has no `condition="Ready"` series, or no status row is active
+- **THEN** the field is omitted entirely — the node carries no `ready_status` key, NOT `ready_status: ""` and NOT `ready_status: "Unknown"`
+
+#### Scenario: Unknown only for the genuine Kubernetes state
+
+- **WHEN** the literal `"Unknown"` is emitted
+- **THEN** it is only for the genuine Kubernetes state where the Ready condition's `status` label is `unknown` (kubelet not reporting); it is never a stand-in for missing data
+
+#### Scenario: Not a label
+
+- **WHEN** a node carries a Ready status
+- **THEN** it does not appear inside `labels` (which remain a strict `map[string]string` of typological metadata) — the same precedent as `ipaddress` and `owner`
 
 #### Scenario: Ready node carries ready_status
 
@@ -468,17 +776,38 @@ The Ready status SHALL NOT appear inside `labels` (which remain a strict `map[st
 
 ### Requirement: API-key authentication on `/v1/*` and `/debug/*`
 
-When the server is started with at least one API key configured (via `--api-keys-file` or `--api-keys`), every request to `/v1/*` and `/debug/*` SHALL carry an `X-API-Key: <key>` header. Requests without the header SHALL receive `401 Unauthorized` with reason `unauthorized` and a JSON message indicating the missing header. Requests with a header value that is not present in the configured key set SHALL receive `401 Unauthorized` with reason `unauthorized`.
+When the server is started with at least one API key configured (via `--api-keys-file` or `--api-keys`), every request to `/v1/*` and `/debug/*` SHALL carry an `X-API-Key: <key>` header, and a request whose header is missing or names a key outside the configured set SHALL receive `401 Unauthorized` with reason `unauthorized`.
 
-When no keys are configured (both flags empty), the middleware SHALL be a no-op: every route SHALL behave as if auth were not configured. The server SHALL log a warning at boot identifying that auth is disabled.
+#### Scenario: Missing-header message
 
-The following routes SHALL be exempt from authentication regardless of configuration: `/livez`, `/readyz`, `/metrics`, `/openapi.yaml`, `/openapi.json`, and `/docs`.
+- **WHEN** a request to a protected route carries no `X-API-Key` header
+- **THEN** the `401` body carries a JSON message indicating the missing header
 
-Key comparison SHALL be constant-time and SHALL iterate the full configured key set on every request so neither match latency nor early exit reveals the matching position.
+#### Scenario: No keys configured disables the middleware
 
-The server SHALL increment `kube_state_graph_auth_rejected_total{reason="missing"}` on requests without the header and `kube_state_graph_auth_rejected_total{reason="invalid"}` on requests whose header value is unknown.
+- **WHEN** no keys are configured (both flags empty)
+- **THEN** the middleware is a no-op: every route behaves as if auth were not configured
+- **AND** the server logs a warning at boot identifying that auth is disabled
 
-When `--api-keys-file` is set and `--api-keys-reload-interval` is positive, the server SHALL re-read the file on the configured cadence and atomically swap the active key set. A key removed from the file SHALL be rejected on subsequent requests; a key added SHALL be accepted.
+#### Scenario: Exempt routes
+
+- **WHEN** a request targets `/livez`, `/readyz`, `/metrics`, `/openapi.yaml`, `/openapi.json`, or `/docs`
+- **THEN** it is exempt from authentication regardless of configuration
+
+#### Scenario: Constant-time full-set comparison
+
+- **WHEN** a presented key is compared
+- **THEN** the comparison is constant-time and iterates the full configured key set on every request, so neither match latency nor early exit reveals the matching position
+
+#### Scenario: Rejection counters
+
+- **WHEN** a request is rejected
+- **THEN** the server increments `kube_state_graph_auth_rejected_total{reason="missing"}` for a request without the header and `kube_state_graph_auth_rejected_total{reason="invalid"}` for one whose header value is unknown
+
+#### Scenario: Key-file reload cadence
+
+- **WHEN** `--api-keys-file` is set and `--api-keys-reload-interval` is positive
+- **THEN** the server re-reads the file on the configured cadence and atomically swaps the active key set
 
 #### Scenario: Missing header is rejected
 
@@ -512,9 +841,17 @@ When `--api-keys-file` is set and `--api-keys-reload-interval` is positive, the 
 
 ### Requirement: Health endpoints
 
-The server SHALL expose `GET /livez` that returns 200 while the process is running, and `GET /readyz` that returns 200 only when a 1-second `up{}` probe against **every** backend in the live routing table succeeds. `GET /readyz` SHALL return 503 otherwise, with a JSON body carrying a `reason` field that names the backends that did not answer. In a deployment with no routing table configured, the single implicit `default` backend is the only one probed, so the observable behaviour is unchanged.
+The server SHALL expose `GET /livez` that returns 200 while the process is running, and `GET /readyz` that returns 200 only when a 1-second `up{}` probe against **every** backend in the live routing table succeeds, and 503 otherwise with a JSON body carrying a `reason` field that names the backends that did not answer.
 
-The probes SHALL be issued concurrently and SHALL share the single 1-second budget, so readiness latency does not grow with the number of backends.
+#### Scenario: No routing table probes the implicit backend
+
+- **WHEN** a deployment has no routing table configured
+- **THEN** the single implicit `default` backend is the only one probed, so the observable behaviour is unchanged
+
+#### Scenario: Probes share one budget
+
+- **WHEN** several backends are probed
+- **THEN** the probes are issued concurrently and share the single 1-second budget, so readiness latency does not grow with the number of backends
 
 #### Scenario: livez always healthy while running
 
@@ -538,11 +875,29 @@ The probes SHALL be issued concurrently and SHALL share the single 1-second budg
 
 ### Requirement: Self-metrics endpoint
 
-The server SHALL expose `GET /metrics` in Prometheus exposition format including at least: `kube_state_graph_build_duration_seconds`, `kube_state_graph_project_duration_seconds`, `kube_state_graph_serialise_duration_seconds`, `kube_state_graph_build_rejected_total`, `kube_state_graph_graph_node_count`, `kube_state_graph_graph_edge_count`, `kube_state_graph_clusters_observed`, `kube_state_graph_upstream_query_duration_seconds`, `kube_state_graph_upstream_query_failures_total`, `kube_state_graph_http_requests_total`, `kube_state_graph_auth_rejected_total`, `kube_state_graph_upstream_backends`, `kube_state_graph_backend_config_reload_total`, `kube_state_graph_backend_query_failures_total`, and `kube_state_graph_upstream_query_result_series`.
+The server SHALL expose `GET /metrics` in Prometheus exposition format including at least the self-metrics listed in this requirement's scenarios. Adding a label to an existing self-metric is a contract change.
 
-`kube_state_graph_upstream_query_duration_seconds` and `kube_state_graph_upstream_query_failures_total` SHALL keep exactly the label sets they carried before backend routing existed: adding a label to an existing self-metric is a contract change, so per-backend detail is carried by `kube_state_graph_backend_query_failures_total` instead.
+#### Scenario: Required metric names
 
-`kube_state_graph_upstream_query_result_series` SHALL be a histogram labelled by `query` only, observing the number of series each successful upstream query returned — one observation per issued query, so a scoped read split into several chunks contributes one observation per chunk under the bare family name, and a query fanned out to several backends contributes one per backend. Its buckets SHALL be the powers of two from 1024 to 1048576, so an operator can read how close a leg sits to an upstream series limit (VictoriaMetrics' memory-derived `-search.maxUniqueTimeseries`) before that limit rejects the query. A failed query SHALL contribute no observation.
+- **WHEN** a client scrapes `GET /metrics`
+- **THEN** the exposition includes `kube_state_graph_build_duration_seconds`, `kube_state_graph_project_duration_seconds`, `kube_state_graph_serialise_duration_seconds`, `kube_state_graph_build_rejected_total`, `kube_state_graph_graph_node_count`, `kube_state_graph_graph_edge_count`, `kube_state_graph_clusters_observed`, `kube_state_graph_upstream_query_duration_seconds`, `kube_state_graph_upstream_query_failures_total`, `kube_state_graph_http_requests_total`, `kube_state_graph_auth_rejected_total`, `kube_state_graph_upstream_backends`, `kube_state_graph_backend_config_reload_total`, `kube_state_graph_backend_query_failures_total`, and `kube_state_graph_upstream_query_result_series`
+
+#### Scenario: Upstream query metrics keep their pre-routing label sets
+
+- **WHEN** backend routing is in use
+- **THEN** `kube_state_graph_upstream_query_duration_seconds` and `kube_state_graph_upstream_query_failures_total` keep exactly the label sets they carried before backend routing existed
+- **AND** per-backend detail is carried by `kube_state_graph_backend_query_failures_total` instead
+
+#### Scenario: Result-series histogram observations
+
+- **WHEN** an upstream query succeeds
+- **THEN** `kube_state_graph_upstream_query_result_series`, a histogram labelled by `query` only, observes the number of series it returned — one observation per issued query, so a scoped read split into several chunks contributes one observation per chunk under the bare family name, and a query fanned out to several backends contributes one per backend
+- **AND** a failed query contributes no observation
+
+#### Scenario: Result-series histogram buckets
+
+- **WHEN** the histogram is exposed
+- **THEN** its buckets are the powers of two from 1024 to 1048576, so an operator can read how close a leg sits to an upstream series limit (VictoriaMetrics' memory-derived `-search.maxUniqueTimeseries`) before that limit rejects the query
 
 #### Scenario: Metrics exposition
 
@@ -571,7 +926,13 @@ The server SHALL expose `GET /metrics` in Prometheus exposition format including
 
 ### Requirement: Per-build timeout (graph endpoints)
 
-For `GET /v1/graph`, the server SHALL apply a configurable per-build `context.WithTimeout` derived from `--build-timeout` (default 15 seconds). On `context.DeadlineExceeded`, the build SHALL be aborted, the `kube_state_graph_build_rejected_total{reason="timeout"}` counter SHALL be incremented, and the request SHALL receive `504 Gateway Timeout` with `reason: "timeout"` (RFC 9110 §15.6.5: gateway did not receive a timely response from an upstream server it needed to access in order to complete the request).
+For `GET /v1/graph`, the server SHALL apply a configurable per-build `context.WithTimeout` derived from `--build-timeout` (default 15 seconds), and on `context.DeadlineExceeded` SHALL abort the build and respond `504 Gateway Timeout` with `reason: "timeout"`.
+
+#### Scenario: Timeout is counted
+
+- **WHEN** a build hits `context.DeadlineExceeded`
+- **THEN** the `kube_state_graph_build_rejected_total{reason="timeout"}` counter is incremented
+- **AND** the status follows RFC 9110 §15.6.5: the gateway did not receive a timely response from an upstream server it needed to access in order to complete the request
 
 #### Scenario: Upstream stalls beyond build timeout
 
@@ -580,7 +941,17 @@ For `GET /v1/graph`, the server SHALL apply a configurable per-build `context.Wi
 
 ### Requirement: Per-request timeout (non-graph endpoints)
 
-For non-graph endpoints that perform upstream calls (`GET /readyz` `up{}` probe), the server SHALL apply a `context.WithTimeout` derived from `--api-timeout` (default 5 seconds) to the upstream call. On `context.DeadlineExceeded`, the request SHALL receive `504 Gateway Timeout` with `reason: "timeout"`. The same timeout bounds the build's `up{}` retention probe. Endpoints that do not perform upstream calls (`GET /livez`, `GET /metrics`, `GET /openapi.*`, `GET /docs*`) are not subject to this timeout.
+For non-graph endpoints that perform upstream calls (`GET /readyz` `up{}` probe), the server SHALL apply a `context.WithTimeout` derived from `--api-timeout` (default 5 seconds) to the upstream call, and on `context.DeadlineExceeded` SHALL respond `504 Gateway Timeout` with `reason: "timeout"`.
+
+#### Scenario: Same timeout bounds the retention probe
+
+- **WHEN** a build issues its `up{}` retention probe
+- **THEN** the probe is bounded by the same `--api-timeout`
+
+#### Scenario: Endpoints without upstream calls are not subject to it
+
+- **WHEN** a client sends `GET /livez`, `GET /metrics`, `GET /openapi.*`, or `GET /docs*`
+- **THEN** the request is not subject to this timeout, because those endpoints do not perform upstream calls
 
 #### Scenario: Readiness probe stalls beyond api timeout
 
@@ -599,7 +970,13 @@ For non-graph endpoints that perform upstream calls (`GET /readyz` `up{}` probe)
 
 ### Requirement: Outside-retention error
 
-When a build carrying **no selector-level filter** finds zero pods and zero nodes for the requested window but the upstream VictoriaMetrics is reachable (a parallel `up{}` probe succeeds), the server SHALL respond `400 Bad Request` with `reason: "outside_retention"`. When any selector-level filter (`cluster`, `namespace`, `az`, `env`) is active, zero rows means "nothing in scope": the classification SHALL NOT run, no `up{}` probe SHALL be issued for it, and the server SHALL respond `200` with empty `elements.nodes`, empty `elements.edges`, and an empty `clusters` list.
+When a build carrying **no selector-level filter** finds zero pods and zero nodes for the requested window but the upstream VictoriaMetrics is reachable (a parallel `up{}` probe succeeds), the server SHALL respond `400 Bad Request` with `reason: "outside_retention"`.
+
+#### Scenario: Filtered build with zero rows means nothing in scope
+
+- **WHEN** any selector-level filter (`cluster`, `namespace`, `az`, `env`) is active and the build finds zero rows
+- **THEN** the classification does not run and no `up{}` probe is issued for it
+- **AND** the server responds `200` with empty `elements.nodes`, empty `elements.edges`, and an empty `clusters` list
 
 #### Scenario: Window beyond retention
 
@@ -641,7 +1018,13 @@ Both responses SHALL carry `Cache-Control: public, max-age=3600`. The spec SHALL
 
 ### Requirement: Scalar API Reference UI served at /docs
 
-The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the same-origin OpenAPI spec from `/openapi.json` via `Scalar.createApiReference`. The Scalar standalone bundle is loaded from the jsDelivr CDN, pinned to an exact version and carrying a Subresource Integrity (`integrity=`) hash so a mutated CDN artifact cannot execute. The `/docs` response SHALL set `Content-Security-Policy`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers. There is no vendored `/docs/assets/*` route.
+The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the same-origin OpenAPI spec from `/openapi.json` via `Scalar.createApiReference`, and the `/docs` response SHALL set `Content-Security-Policy`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers.
+
+#### Scenario: Pinned, integrity-checked CDN bundle
+
+- **WHEN** the `/docs` page loads the Scalar standalone bundle
+- **THEN** it is loaded from the jsDelivr CDN, pinned to an exact version and carrying a Subresource Integrity (`integrity=`) hash, so a mutated CDN artifact cannot execute
+- **AND** there is no vendored `/docs/assets/*` route
 
 #### Scenario: /docs renders the Scalar UI from the pinned CDN bundle
 
@@ -650,7 +1033,13 @@ The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the
 
 ### Requirement: Route ↔ spec drift guard
 
-The repository SHALL guard against handler annotations drifting from the generated OpenAPI spec. The `make check-docs` CI job regenerates the swag output from source annotations and fails on any diff against the committed `docs/`, so an added, removed, or edited `@Router` / `@Summary` annotation that is not reflected in `docs/` fails CI. (A Go test that parses the embedded spec and diffs it against the live Gin route table was considered and descoped to avoid adding a `kin-openapi` dependency; `make check-docs` covers annotation↔source drift.)
+The repository SHALL guard against handler annotations drifting from the generated OpenAPI spec: the `make check-docs` CI job SHALL regenerate the swag output from source annotations and fail on any diff against the committed `docs/`.
+
+#### Scenario: Scope of the guard
+
+- **WHEN** an added, removed, or edited `@Router` / `@Summary` annotation is not reflected in `docs/`
+- **THEN** CI fails
+- **AND** no Go test diffs the embedded spec against the live Gin route table (descoped to avoid adding a `kin-openapi` dependency); `make check-docs` covers annotation↔source drift
 
 #### Scenario: Handler annotation edited without regenerating docs
 
@@ -659,35 +1048,18 @@ The repository SHALL guard against handler annotations drifting from the generat
 
 ### Requirement: Cytoscape compound node grouping
 
-`GET /v1/graph` and `GET /v1/storage-graph` SHALL express a workload compound hierarchy `cluster > namespace > application > controller > pod` (with **skip-absent-levels**), plus `cluster > namespace > { service, pvc }`, `cluster > node`, and the storage chain `storage-cluster > netapp-node > netapp-aggr` and `storage-cluster > netapp-svm`, via an optional `data.parent` field. The `cluster`, `storage-cluster`, `namespace`, `application`, and `controller` group nodes are synthesised by the Cytoscape serialiser; this is a presentation concern that SHALL NOT affect the core graph, projection, or traversal.
+`GET /v1/graph` and `GET /v1/storage-graph` SHALL express, via an optional `data.parent` field, a workload compound hierarchy `cluster > namespace > application > controller > pod` (with **skip-absent-levels**), plus `cluster > namespace > { service, pvc }`, `cluster > node`, and the storage chain `storage-cluster > netapp-node > netapp-aggr` and `storage-cluster > netapp-svm`. Grouping is a presentation concern and SHALL NOT affect the core graph, projection, or traversal.
 
-In the storage chain, the middle tier is NOT a synthesised group: the **real** `type="netapp-node"` node acts as the compound parent of its `netapp-aggr` nodes. This is a deliberate, explicitly-scoped break from the "relationships are edges, compound parents are synthesised groups" rule (the rule that removed pod-under-node nesting): it applies to the `netapp-node > netapp-aggr` tier ONLY, and no other real node type SHALL acquire compound children. An SVM spans aggregates and controllers, so `netapp-svm` nests directly under its `storage-cluster` group and is never a compound child of a controller nor a compound parent of anything.
+#### Scenario: Group nodes are synthesised by the serialiser
 
-**Cluster group node.** For each distinct `labels.cluster` value present on an emitted node, the serialiser SHALL emit one `{ data: { id: "cluster/<cluster>", name: "<cluster>", type: "cluster", labels: {} } }` with no `parent` and no `ipaddress`.
+- **WHEN** a body carries compound groups
+- **THEN** the `cluster`, `storage-cluster`, `namespace`, `application`, and `controller` group nodes are synthesised by the Cytoscape serialiser
 
-**Storage-cluster group node.** For each distinct `labels.ontap_cluster` value present on an emitted `netapp-aggr`, `netapp-node` or `netapp-svm` node, the serialiser SHALL emit one `{ data: { id: "storage-cluster/<ontap-cluster>", name: "<ontap-cluster>", type: "storage-cluster", labels: {} } }` with no `parent` and no `ipaddress`, so the NetApp node set nests under its own filer rather than floating parentless like `external` nodes. A storage-cluster group is NOT a Kubernetes cluster group; its name never appears in `clusters[]`.
+#### Scenario: Prior storageclass grouping superseded
 
-**Synthesised workload group nodes.** Derived from each emitted real node's own attributes: `namespace` and `application` groups from any `type="pod"`, `type="service"`, or `type="pvc"` node (via its `labels.namespace` and its resolved `data.application`); `controller` groups from `type="pod"` nodes only (via the pod's resolved `data.owner` `{kind, name}`). Each group node's `id` encodes its full ancestry path, so it has exactly one parent (the tree is unambiguous by construction and no `data.parent` can dangle):
-
-- **namespace** — `{ id: "<cluster>/namespace/<ns>", name: "<ns>", type: "namespace", labels: {}, parent: "cluster/<cluster>" }`
-- **application** (emitted for any pod, service, or PVC with a resolved Application) — `{ id: "<cluster>/namespace/<ns>/application/<app>", name: "<app>", type: "application", labels: {}, parent: "<cluster>/namespace/<ns>" }`
-- **controller** (emitted only for pods with a resolved owner) — `{ id: "<cluster>/namespace/<ns>/application/<app>/controller/<kind>/<name>", ... , parent: <the application group id> }` when the pod also has a resolved Application, otherwise `{ id: "<cluster>/namespace/<ns>/controller/<kind>/<name>", ... , parent: "<cluster>/namespace/<ns>" }`. `name` is `<name>`, `type` is `"controller"`, `labels` is `{}`.
-
-All synthesised group nodes carry `labels: {}` and no `ipaddress`, and SHALL be emitted in tier order (cluster, then storage-cluster, then namespace, then application, then controller), each tier ordered by `id`, before the non-group nodes, so the body stays byte-deterministic.
-
-**`data.parent` assignment** (skip-absent-levels):
-
-- `type="pod"` → its controller group id when the pod has a resolved owner; else its application group id when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>`. (Every pod with a namespace always has at least the namespace group.)
-- `type="service"`, `type="pvc"` → its application group id `<cluster>/namespace/<ns>/application/<app>` when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>` (skip-absent-levels). Services and PVCs SHALL NOT nest under a `controller` group.
-- `type="node"` → `cluster/<labels.cluster>`.
-- `type="netapp-node"` → `storage-cluster/<labels.ontap_cluster>`.
-- `type="netapp-aggr"` → the **real** NetApp node id `netapp/<labels.ontap_cluster>/<labels.node>` (the aggregate's current owner; an HA takeover moves the parent, never the aggregate's id).
-- `type="netapp-svm"` → `storage-cluster/<labels.ontap_cluster>`.
-- `type="external"` → omitted (no cluster identity).
-
-The `parent` field SHALL use `omitempty` semantics. In `GET /v1/graph` the pod→node and pvc→aggregate relationships SHALL be expressed as the edges `pod-to-node` and `pvc-to-netapp-aggr`, and in `GET /v1/storage-graph` every tier relationship as a `storage-flow` edge — **not** as compound nesting; K8s `node`, `netapp-aggr` and `netapp-svm` nodes therefore carry edges and act as infrastructure-level nodes and edge endpoints (the `netapp-node` is a compound parent and, in `/v1/graph`, the target of no edge). Services and PVCs SHALL NOT be compound parents of pods.
-
-This requirement **supersedes** the prior `storageclass` grouping and node behaviour: there is no `type="storageclass"` node (real or synthesised) and no `pvc-to-storageclass` edge in any form; the claim's StorageClass name survives only as the PVC's own `data.storageclass` attribute.
+- **WHEN** any body is serialised
+- **THEN** this requirement **supersedes** the prior `storageclass` grouping and node behaviour: there is no `type="storageclass"` node (real or synthesised) and no `pvc-to-storageclass` edge in any form
+- **AND** the claim's StorageClass name survives only as the PVC's own `data.storageclass` attribute
 
 #### Scenario: Cluster group node synthesised
 
@@ -759,46 +1131,161 @@ This requirement **supersedes** the prior `storageclass` grouping and node behav
 - **WHEN** the response contains a `type="external"` node
 - **THEN** that node's `data` has no `parent` field, and no cluster group node is synthesised for an endpoint carrying no `cluster` label
 
+### Requirement: Real NetApp node is the only real compound parent
+
+In the storage chain the middle tier SHALL NOT be a synthesised group: the **real** `type="netapp-node"` node SHALL act as the compound parent of its `netapp-aggr` nodes, and no other real node type SHALL acquire compound children.
+
+#### Scenario: Scoped break from the synthesised-parent rule
+
+- **WHEN** compound parents are assigned
+- **THEN** the real-node parenting is a deliberate, explicitly-scoped break from the "relationships are edges, compound parents are synthesised groups" rule (the rule that removed pod-under-node nesting), applying to the `netapp-node > netapp-aggr` tier ONLY
+
+#### Scenario: SVM sits beside controllers
+
+- **WHEN** a body carries a `netapp-svm`
+- **THEN** because an SVM spans aggregates and controllers, `netapp-svm` nests directly under its `storage-cluster` group and is never a compound child of a controller nor a compound parent of anything
+
+### Requirement: Cluster and storage-cluster group nodes
+
+The serialiser SHALL emit one cluster group node for each distinct `labels.cluster` value present on an emitted node, and one storage-cluster group node for each distinct `labels.ontap_cluster` value present on an emitted `netapp-aggr`, `netapp-node` or `netapp-svm` node, each with no `parent` and no `ipaddress`.
+
+#### Scenario: Cluster group shape
+
+- **WHEN** an emitted node carries `labels.cluster`
+- **THEN** the serialiser emits `{ data: { id: "cluster/<cluster>", name: "<cluster>", type: "cluster", labels: {} } }`
+
+#### Scenario: Storage-cluster group shape
+
+- **WHEN** an emitted NetApp node carries `labels.ontap_cluster`
+- **THEN** the serialiser emits `{ data: { id: "storage-cluster/<ontap-cluster>", name: "<ontap-cluster>", type: "storage-cluster", labels: {} } }`, so the NetApp node set nests under its own filer rather than floating parentless like `external` nodes
+- **AND** a storage-cluster group is NOT a Kubernetes cluster group; its name never appears in `clusters[]`
+
+### Requirement: Synthesised workload group nodes
+
+The serialiser SHALL derive `namespace`, `application` and `controller` group nodes from each emitted real node's own attributes, and each group node's `id` SHALL encode its full ancestry path, so it has exactly one parent (the tree is unambiguous by construction and no `data.parent` can dangle).
+
+#### Scenario: Group sources
+
+- **WHEN** groups are derived
+- **THEN** `namespace` and `application` groups come from any `type="pod"`, `type="service"`, or `type="pvc"` node (via its `labels.namespace` and its resolved `data.application`)
+- **AND** `controller` groups come from `type="pod"` nodes only (via the pod's resolved `data.owner` `{kind, name}`)
+
+#### Scenario: Namespace group shape
+
+- **WHEN** a namespace group is emitted
+- **THEN** it is `{ id: "<cluster>/namespace/<ns>", name: "<ns>", type: "namespace", labels: {}, parent: "cluster/<cluster>" }`
+
+#### Scenario: Application group shape
+
+- **WHEN** any pod, service, or PVC has a resolved Application
+- **THEN** an application group `{ id: "<cluster>/namespace/<ns>/application/<app>", name: "<app>", type: "application", labels: {}, parent: "<cluster>/namespace/<ns>" }` is emitted
+
+#### Scenario: Controller group shape
+
+- **WHEN** a pod has a resolved owner
+- **THEN** a controller group is emitted as `{ id: "<cluster>/namespace/<ns>/application/<app>/controller/<kind>/<name>", ... , parent: <the application group id> }` when the pod also has a resolved Application, otherwise as `{ id: "<cluster>/namespace/<ns>/controller/<kind>/<name>", ... , parent: "<cluster>/namespace/<ns>" }`
+- **AND** its `name` is `<name>`, `type` is `"controller"`, and `labels` is `{}`
+
+### Requirement: Group node emission order
+
+All synthesised group nodes SHALL carry `labels: {}` and no `ipaddress`, and SHALL be emitted in tier order (cluster, then storage-cluster, then namespace, then application, then controller), each tier ordered by `id`, before the non-group nodes, so the body stays byte-deterministic.
+
+#### Scenario: Groups precede real nodes in tier order
+
+- **WHEN** a body carries group nodes of several tiers and real nodes
+- **THEN** every cluster group precedes every storage-cluster group, which precede namespace, application and controller groups in that order, each tier sorted by `id`, and all groups precede the first non-group node
+
+### Requirement: Compound `data.parent` assignment
+
+Each real node's `data.parent` SHALL be assigned by node type with skip-absent-levels, using `omitempty` semantics.
+
+#### Scenario: Pod parent
+
+- **WHEN** a `type="pod"` node is serialised
+- **THEN** its parent is its controller group id when the pod has a resolved owner; else its application group id when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>`
+- **AND** every pod with a namespace always has at least the namespace group
+
+#### Scenario: Service and PVC parent
+
+- **WHEN** a `type="service"` or `type="pvc"` node is serialised
+- **THEN** its parent is its application group id `<cluster>/namespace/<ns>/application/<app>` when it has a resolved Application; else its namespace group id `<cluster>/namespace/<ns>` (skip-absent-levels)
+- **AND** services and PVCs never nest under a `controller` group
+
+#### Scenario: K8s node parent
+
+- **WHEN** a `type="node"` node is serialised
+- **THEN** its parent is `cluster/<labels.cluster>`
+
+#### Scenario: NetApp parents
+
+- **WHEN** a NetApp node is serialised
+- **THEN** a `type="netapp-node"` node's parent is `storage-cluster/<labels.ontap_cluster>`
+- **AND** a `type="netapp-aggr"` node's parent is the **real** NetApp node id `netapp/<labels.ontap_cluster>/<labels.node>` (the aggregate's current owner; an HA takeover moves the parent, never the aggregate's id)
+- **AND** a `type="netapp-svm"` node's parent is `storage-cluster/<labels.ontap_cluster>`
+
+#### Scenario: External node parent omitted
+
+- **WHEN** a `type="external"` node is serialised
+- **THEN** `parent` is omitted (no cluster identity)
+
+### Requirement: Infrastructure relationships are edges, not nesting
+
+In `GET /v1/graph` the pod→node and pvc→aggregate relationships SHALL be expressed as the edges `pod-to-node` and `pvc-to-netapp-aggr`, and in `GET /v1/storage-graph` every tier relationship as a `storage-flow` edge — **not** as compound nesting. Services and PVCs SHALL NOT be compound parents of pods.
+
+#### Scenario: Infrastructure nodes are edge endpoints
+
+- **WHEN** a body carries K8s `node`, `netapp-aggr` and `netapp-svm` nodes
+- **THEN** they carry edges and act as infrastructure-level nodes and edge endpoints
+- **AND** the `netapp-node` is a compound parent and, in `/v1/graph`, the target of no edge
+
 ### Requirement: Pod `application` and `containers` attributes
 
-Every `data` object for a `type="pod"`, `type="service"`, or `type="pvc"` node SHALL be able to expose an `application` attribute, and every `type="pod"` node SHALL additionally be able to expose a `containers` attribute, all with `omitempty` semantics and all **outside `labels`** (which stays a strict `map[string]string`):
+Every `data` object for a `type="pod"`, `type="service"`, or `type="pvc"` node SHALL be able to expose an `application` attribute, and every `type="pod"` node SHALL additionally be able to expose a `containers` attribute, all with `omitempty` semantics and all **outside `labels`** (which stays a strict `map[string]string`). The attributes SHALL NOT be encoded as numbers or booleans.
 
-- `application` — a `string`, the node's ArgoCD Application name as resolved by the
-  `cluster-topology-source` capability from the `annotation_argocd_argoproj_io_tracking_id`
-  label that kube-state-metrics derives from the `argocd.argoproj.io/tracking-id`
-  annotation: for `type="pod"` from the `app-metadata-source` capability's metric when
-  it names a non-empty Application for the pod (verbatim, see "Pod ArgoCD Application
-  attribute"), otherwise from the annotation series of the pod's **controller**
-  (`kube_deployment_annotations`, `kube_statefulset_annotations`,
-  `kube_daemonset_annotations`, `kube_replicaset_annotations`,
-  `kube_job_annotations`, `kube_cronjob_annotations` — see "Pod ArgoCD Application
-  attribute"), and for `type="service"` / `type="pvc"` from
-  `kube_service_annotations` / `kube_persistentvolumeclaim_annotations` (see "Service
-  and PVC ArgoCD Application resolution"). Wherever the annotation is the source, all
-  three node types derive the value from the same `<app>:<group>/<kind>:<ns>/<name>`
-  parse.
-  Emitted only when the node has a resolved Application; omitted entirely otherwise
-  (never an empty string). This attribute is **complementary** to the synthesised
-  `type="application"` group node (which is derived from this same value — see
-  "Cytoscape compound node grouping"); an existing consumer reading `data.application`
-  on a pod is unaffected in shape, though a pod whose Application previously came from
-  a non-standard pod-level `argocd_tracking_id` label now resolves it from the
-  controller instead.
-- `containers` — an array of objects `[{ name: string, image: string }]`, one per
-  container, as resolved by the `cluster-topology-source` capability and ordered
-  deterministically by `(name, image)`. Emitted only on `type="pod"` nodes and only
-  when the pod has at least one resolved container; omitted entirely otherwise (never
-  an empty array).
+#### Scenario: Application is the resolved ArgoCD Application name
 
-The `application` attribute SHALL appear only on `type="pod"`, `type="service"`, and
-`type="pvc"` nodes. The `containers` attribute SHALL appear only on `type="pod"`
-nodes. `type="node"`, `type="external"`, `type="netapp-aggr"`, `type="netapp-node"`,
-and the synthesised `type="cluster"` / `type="storage-cluster"` / `type="namespace"`
-/ `type="application"` / `type="controller"` group nodes SHALL NOT emit
-`application` or `containers`. The
-attributes SHALL NOT appear inside `labels`, and SHALL NOT be encoded as numbers or
-booleans. Because both are `omitempty`, a node with neither a resolved Application nor
-container info produces a `data` object byte-identical to the pre-change shape.
+- **WHEN** a node carries `application`
+- **THEN** it is a `string`, the node's ArgoCD Application name as resolved by the `cluster-topology-source` capability from the `annotation_argocd_argoproj_io_tracking_id` label that kube-state-metrics derives from the `argocd.argoproj.io/tracking-id` annotation
+- **AND** wherever the annotation is the source, all three node types derive the value from the same `<app>:<group>/<kind>:<ns>/<name>` parse
+
+#### Scenario: Pod application source order
+
+- **WHEN** a `type="pod"` node's Application is resolved
+- **THEN** it comes from the `app-metadata-source` capability's metric when it names a non-empty Application for the pod (verbatim, see "Pod ArgoCD Application attribute")
+- **AND** otherwise from the annotation series of the pod's **controller** (`kube_deployment_annotations`, `kube_statefulset_annotations`, `kube_daemonset_annotations`, `kube_replicaset_annotations`, `kube_job_annotations`, `kube_cronjob_annotations` — see "Pod ArgoCD Application attribute")
+
+#### Scenario: Service and PVC application source
+
+- **WHEN** a `type="service"` / `type="pvc"` node's Application is resolved
+- **THEN** it comes from `kube_service_annotations` / `kube_persistentvolumeclaim_annotations` (see "Service and PVC ArgoCD Application resolution")
+
+#### Scenario: Application emitted only when resolved
+
+- **WHEN** a node has no resolved Application
+- **THEN** `application` is omitted entirely (never an empty string)
+
+#### Scenario: Application attribute complements the group node
+
+- **WHEN** a pod carries `data.application`
+- **THEN** the attribute is **complementary** to the synthesised `type="application"` group node, which is derived from this same value (see "Cytoscape compound node grouping")
+- **AND** an existing consumer reading `data.application` on a pod is unaffected in shape, though a pod whose Application previously came from a non-standard pod-level `argocd_tracking_id` label now resolves it from the controller instead
+
+#### Scenario: Containers shape
+
+- **WHEN** a `type="pod"` node has at least one resolved container
+- **THEN** `containers` is an array of objects `[{ name: string, image: string }]`, one per container, as resolved by the `cluster-topology-source` capability and ordered deterministically by `(name, image)`
+- **AND** a pod with no resolved container omits the field entirely (never an empty array)
+
+#### Scenario: Attributes restricted to their node types
+
+- **WHEN** the body carries other node types
+- **THEN** `application` appears only on `type="pod"`, `type="service"`, and `type="pvc"` nodes, and `containers` only on `type="pod"` nodes
+- **AND** `type="node"`, `type="external"`, `type="netapp-aggr"`, `type="netapp-node"`, and the synthesised `type="cluster"` / `type="storage-cluster"` / `type="namespace"` / `type="application"` / `type="controller"` group nodes emit neither `application` nor `containers`
+
+#### Scenario: Unresolved node keeps its pre-change shape
+
+- **WHEN** a node has neither a resolved Application nor container info
+- **THEN** because both attributes are `omitempty`, its `data` object is byte-identical to the pre-change shape
 
 #### Scenario: Pod node carries application when resolved
 
@@ -857,13 +1344,48 @@ container info produces a `data` object byte-identical to the pre-change shape.
 
 ### Requirement: Namespace-filter retention of cluster-scoped infra nodes
 
-`GET /v1/graph` projection SHALL treat `type="node"`, `type="netapp-aggr"`, and `type="netapp-node"` nodes as infrastructure nodes that carry no `namespace` label, and SHALL admit such a node to a response **iff it is referenced by an in-scope element** — a `type="node"` node when some in-scope pod is scheduled on it (its `labels.node`), a `type="netapp-aggr"` node when some in-scope PVC is joined to it via a `pvc-to-netapp-aggr` edge, and a `type="netapp-node"` node when some admitted `netapp-aggr` names it as owner (its `labels.node`) — a **transitive** reference chain PVC → aggregate → controller — on every request shape. The default response therefore lists only the host nodes of pods that are in the graph, the aggregates serving in-scope PVCs, and the controllers owning those aggregates; it SHALL NOT carry an orphan K8s node that hosts no pod, an aggregate serving no in-scope PVC, or a controller owning no admitted aggregate.
+`GET /v1/graph` projection SHALL treat `type="node"`, `type="netapp-aggr"`, and `type="netapp-node"` nodes as infrastructure nodes that carry no `namespace` label, and SHALL admit such a node to a response **iff it is referenced by an in-scope element**, through a **transitive** reference chain PVC → aggregate → controller, on every request shape.
 
-The `cluster` filter applies to `type="node"` at the source (the `kube_node_*` series are cluster-filtered) and again at projection (the node's own `labels.cluster`). The NetApp types carry NO Kubernetes `cluster` label and their Harvest series receive no `cluster` or `namespace` matcher, so a `?cluster=` or `?namespace=` filter SHALL NEVER admit or exclude them directly — their admission is purely reference-driven, which means a filer shared by two Kubernetes clusters appears in a `?cluster=` view of either cluster (via that cluster's in-scope PVCs).
+#### Scenario: Reference rule per infrastructure type
 
-`prune=false` SHALL lift the reference requirement for an infrastructure node exactly when no active filter could have excluded that node by its own labels: a `type="node"` node is admitted unreferenced when no `namespace` filter is active (a `cluster` / `az` / `env` filter has already been applied to its own series); a `type="netapp-aggr"` or `type="netapp-node"` node is admitted unreferenced when neither a `cluster` nor a `namespace` filter is active (an `az` / `env` filter has already been applied to its own series). Under a `namespace` filter, `prune=false` therefore still yields only the namespace's referenced infrastructure. An unreferenced `netapp-aggr` admitted this way SHALL pull in its owning `netapp-node` (the compound parent must exist in the response). The former `?name=` exception is withdrawn with the parameter.
+- **WHEN** the projection admits infrastructure
+- **THEN** a `type="node"` node is admitted when some in-scope pod is scheduled on it (its `labels.node`), a `type="netapp-aggr"` node when some in-scope PVC is joined to it via a `pvc-to-netapp-aggr` edge, and a `type="netapp-node"` node when some admitted `netapp-aggr` names it as owner (its `labels.node`)
 
-A **consequence** of this rule is that a podless K8s node's `ready_status` / `ipaddress` is absent from the default view and is obtained with `?prune=false` (optionally combined with `cluster`, `az`, `env`); there is no exception that keeps an unhealthy (`NotReady` / `Unknown`) podless node — or a `degraded` aggregate/controller serving no in-scope PVC — in the default view.
+#### Scenario: Default response carries no orphan infrastructure
+
+- **WHEN** a client sends a default request
+- **THEN** the response lists only the host nodes of pods that are in the graph, the aggregates serving in-scope PVCs, and the controllers owning those aggregates
+- **AND** it carries no orphan K8s node that hosts no pod, no aggregate serving no in-scope PVC, and no controller owning no admitted aggregate
+
+#### Scenario: Cluster filter on K8s nodes applies twice
+
+- **WHEN** a `cluster` filter is active
+- **THEN** it applies to `type="node"` at the source (the `kube_node_*` series are cluster-filtered) and again at projection (the node's own `labels.cluster`)
+
+#### Scenario: NetApp admission is purely reference-driven
+
+- **WHEN** a `?cluster=` or `?namespace=` filter is active
+- **THEN** it never admits or excludes the NetApp types directly, because they carry NO Kubernetes `cluster` label and their Harvest series receive no `cluster` or `namespace` matcher
+- **AND** a filer shared by two Kubernetes clusters therefore appears in a `?cluster=` view of either cluster (via that cluster's in-scope PVCs)
+
+#### Scenario: prune=false lifts the reference requirement only where no filter could exclude
+
+- **WHEN** a request carries `prune=false`
+- **THEN** a `type="node"` node is admitted unreferenced when no `namespace` filter is active (a `cluster` / `az` / `env` filter has already been applied to its own series)
+- **AND** a `type="netapp-aggr"` or `type="netapp-node"` node is admitted unreferenced when neither a `cluster` nor a `namespace` filter is active (an `az` / `env` filter has already been applied to its own series)
+- **AND** under a `namespace` filter, `prune=false` therefore still yields only the namespace's referenced infrastructure
+
+#### Scenario: Unreferenced aggregate pulls in its controller
+
+- **WHEN** an unreferenced `netapp-aggr` is admitted under `prune=false`
+- **THEN** it pulls in its owning `netapp-node`, because the compound parent must exist in the response
+- **AND** the former `?name=` exception is withdrawn with the parameter
+
+#### Scenario: No health exception for podless or unreferenced infrastructure
+
+- **WHEN** a K8s node is podless, or an aggregate / controller serves no in-scope PVC
+- **THEN** as a **consequence** of this rule, the podless node's `ready_status` / `ipaddress` is absent from the default view and is obtained with `?prune=false` (optionally combined with `cluster`, `az`, `env`)
+- **AND** there is no exception that keeps an unhealthy (`NotReady` / `Unknown`) podless node — or a `degraded` aggregate/controller serving no in-scope PVC — in the default view
 
 #### Scenario: Default view drops a podless node
 
@@ -942,14 +1464,25 @@ A **consequence** of this rule is that a podless K8s node's `ready_status` / `ip
 
 ### Requirement: PVC `volumename` and `svm` labels
 
-A `type="pvc"` node's `data.labels` SHALL additively carry two further string entries whenever they resolve:
+A `type="pvc"` node's `data.labels` SHALL additively carry the plain string entries `volumename` and `svm` whenever they resolve, with NO `data.volumename` or `data.svm` typed field on the PVC node. Each key SHALL be **absent** when its value is unresolved, an empty-string value SHALL never be emitted, and `svm` SHALL never be present without `volumename`.
 
-- `volumename` — the name of the PersistentVolume bound to the claim (from the `volumename` label of `kube_persistentvolumeclaim_info`, per the `cluster-topology-source` capability).
-- `svm` — the NetApp ONTAP SVM serving the claim (from the `svm` label of the Harvest `volume_labels` series matched by the `netapp-storage-graph` capability's PV-name join — the removed Trident custom-resource chain is no longer the source, with the label's shape unchanged).
+#### Scenario: volumename source
 
-Both are plain `labels` entries (strict `map[string]string`) — there SHALL be NO `data.volumename` or `data.svm` typed field on the PVC node. Each key SHALL be **absent** when its value is unresolved; an empty-string value SHALL never be emitted. `svm` SHALL never be present without `volumename`. The `volumename` key is distinct from the existing `volume` key (the pod-spec volume name); both MAY appear on the same node.
+- **WHEN** a claim's bound PersistentVolume is known
+- **THEN** `volumename` is the name of the PersistentVolume bound to the claim (from the `volumename` label of `kube_persistentvolumeclaim_info`, per the `cluster-topology-source` capability)
+- **AND** the `volumename` key is distinct from the existing `volume` key (the pod-spec volume name); both MAY appear on the same node
 
-The additions are additive to the v1 wire contract and MUST NOT disturb the deterministic-body guarantee: for identical upstream data the label set is byte-identical across rebuilds, and responses built from upstreams without the Harvest series are unchanged except for `volumename` appearing wherever `kube_persistentvolumeclaim_info` carries it.
+#### Scenario: svm source
+
+- **WHEN** a claim's serving SVM is known
+- **THEN** `svm` is the NetApp ONTAP SVM serving the claim, from the `svm` label of the Harvest `volume_labels` series matched by the `netapp-storage-graph` capability's PV-name join
+- **AND** the removed Trident custom-resource chain is no longer the source, with the label's shape unchanged
+
+#### Scenario: Additive and deterministic
+
+- **WHEN** the same upstream data is built twice
+- **THEN** the label set is byte-identical across rebuilds, the additions being additive to the v1 wire contract
+- **AND** responses built from upstreams without the Harvest series are unchanged except for `volumename` appearing wherever `kube_persistentvolumeclaim_info` carries it
 
 #### Scenario: PVC node with a fully-resolved NetApp chain
 
@@ -968,11 +1501,34 @@ The additions are additive to the v1 wire contract and MUST NOT disturb the dete
 
 ### Requirement: PVC `aggr` label
 
-A `type="pvc"` node's `data.labels` SHALL additively carry an `aggr` entry whenever the claim's volume resolved a single containing aggregate. Its value SHALL be the **node id** of that `netapp-aggr` node (`netapp/<ontap_cluster>/aggr/<aggr>`), not the bare aggregate name: aggregate names are unique only within an ONTAP cluster, and the label must name exactly one node. It names the aggregate the claim's `pvc-to-netapp-aggr` edge is drawn to, so in `GET /v1/graph` a response carrying the label also carries that node and that edge, and the three can never disagree. `GET /v1/storage-graph`, which draws no such edge, carries the same label under the `storage-graph-api` capability.
+A `type="pvc"` node's `data.labels` SHALL additively carry an `aggr` entry whenever the claim's volume resolved a single containing aggregate, valued with the **node id** of that `netapp-aggr` node (`netapp/<ontap_cluster>/aggr/<aggr>`), not the bare aggregate name. It follows the rules of "PVC `volumename` and `svm` labels": a plain `labels` entry with no typed `data.aggr` field, **absent** when unresolved, and never an empty string.
 
-The key follows the rules of "PVC `volumename` and `svm` labels": a plain `labels` entry with no typed `data.aggr` field, **absent** when unresolved, and never an empty string. It SHALL be absent when the claim resolved no aggregate — a FlexGroup volume spanning aggregates, a claim whose volume matched no `volume_labels` series, or an upstream without the Harvest series — and `aggr` SHALL never be present without `volumename` (the join is rooted at the PV name). It is independent of `svm`: a joined series with an empty `svm` label still resolves the aggregate, and a FlexGroup series resolves `svm` with no aggregate.
+#### Scenario: Node id because aggregate names are cluster-local
 
-The addition is additive to the v1 wire contract and MUST NOT disturb the deterministic-body guarantee: for identical upstream data the label set is byte-identical across rebuilds.
+- **WHEN** the label is emitted
+- **THEN** it carries the node id because aggregate names are unique only within an ONTAP cluster, and the label must name exactly one node
+
+#### Scenario: Label, node and edge agree
+
+- **WHEN** a `GET /v1/graph` response carries the label
+- **THEN** it names the aggregate the claim's `pvc-to-netapp-aggr` edge is drawn to, so the response also carries that node and that edge, and the three can never disagree
+- **AND** `GET /v1/storage-graph`, which draws no such edge, carries the same label under the `storage-graph-api` capability
+
+#### Scenario: Absent when no aggregate resolved
+
+- **WHEN** the claim resolved no aggregate — a FlexGroup volume spanning aggregates, a claim whose volume matched no `volume_labels` series, or an upstream without the Harvest series
+- **THEN** `aggr` is absent
+- **AND** `aggr` is never present without `volumename` (the join is rooted at the PV name)
+
+#### Scenario: Independent of svm
+
+- **WHEN** a joined series carries an empty `svm` label, or a FlexGroup series resolves `svm`
+- **THEN** the empty-`svm` series still resolves the aggregate, and the FlexGroup series resolves `svm` with no aggregate
+
+#### Scenario: Additive and deterministic
+
+- **WHEN** the same upstream data is built twice
+- **THEN** the label set is byte-identical across rebuilds, the addition being additive to the v1 wire contract
 
 #### Scenario: A resolved claim names its aggregate node
 
@@ -996,21 +1552,23 @@ The addition is additive to the v1 wire contract and MUST NOT disturb the determ
 
 ### Requirement: Edge `metrics` attribute
 
-An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding the edge's measurements for the requested window. The key SHALL be **absent entirely** — never `null`, never an empty object — on every edge that has no measurements. The object is a **union of two disjoint families**, and a single edge SHALL only ever carry fields from ONE family (the family is determined by the edge's provenance, so cross-family mixing is structurally impossible):
+An edge's `data` MAY carry an optional `metrics` object (`omitempty`) holding the edge's measurements for the requested window, and the key SHALL be **absent entirely** — never `null`, never an empty object — on every edge that has no measurements. The object is a **union of two disjoint families** (RED and I/O), and a single edge SHALL only ever carry fields from ONE family.
 
-- **RED family** — on trace-derived call edges, presence rule defined by the `pod-service-graph` capability (in short: only trace-derived edges whose `source` and `target` both resolved to a pod or a service node, excluding the ingress chain's entry hop and any measurement derived from span-link series):
-  - `rate` (number, REQUIRED **within this family**, strictly greater than zero) — requests per second over the window.
-  - `error_rate` (number, OPTIONAL, absence semantics) — the failed fraction in `[0, 1]`. Absent when the upstream failure counter could not be read; `0` when it was read and reported no failures.
-  - `p90_server_ms` (number, OPTIONAL, absent when unavailable) — the 90th percentile server-observed request duration in milliseconds. The quantile and observation side match Grafana's documented service-graph queries by definition; the values are not expected to equal Grafana's numerically, because Grafana aggregates by service name while this API aggregates by pod pair.
-- **I/O family** — on `pvc-to-netapp-aggr` edges only, presence rule defined by the `netapp-storage-graph` capability (each field present iff its own Harvest family matched; the six measurements come from the Harvest QoS workload families, the two ceilings from the QoS fixed-policy families):
-  - `read_ops`, `write_ops` (numbers, OPTIONAL) — read/write requests per second, verbatim from Harvest.
-  - `read_latency_us`, `write_latency_us` (numbers, OPTIONAL) — average read/write latency in microseconds, verbatim from Harvest.
-  - `read_bytes_per_sec`, `write_bytes_per_sec` (numbers, OPTIONAL) — read/write throughput in bytes per second, verbatim from Harvest.
-  - `max_iops`, `max_bytes_per_sec` (numbers, OPTIONAL) — the volume's declared QoS throughput ceiling: `max_iops` verbatim from Harvest, `max_bytes_per_sec` converted from the policy's megabytes-per-second figure so that it carries the same unit as the measured throughput fields and the two compare directly. Absence means *no declared ceiling* — it SHALL NEVER be rendered as `0` or as an "unlimited" sentinel — and neither ceiling field can appear unless at least one measurement field does.
+#### Scenario: Family determined by provenance
 
-At the schema level every field of the union is therefore optional — a consequence the OpenAPI schema reflects by moving `rate` from required to optional. The RED invariant is preserved intact: a RED-family `metrics` object always carries a positive `rate`.
+- **WHEN** an edge carries `data.metrics`
+- **THEN** its family is determined by the edge's provenance, so cross-family mixing is structurally impossible
 
-All values SHALL be JSON numbers, never strings. Each value SHALL be rounded to a fixed number of **significant digits** — not decimal places — so that the "Deterministic response body" requirement continues to hold byte-for-byte while a non-zero value can never be rendered as `0`. Consequently a value MAY appear in JSON exponent form (for example `3.86e-7`), which is legal JSON; consumers MUST NOT assume a fixed-decimal rendering, and MUST treat `0` as semantically distinct from a very small non-zero value. The presence or absence of `metrics` SHALL NOT affect the edge's `id`, `type`, `source`, `target`, or `labels`, and SHALL NOT affect node or edge ordering.
+#### Scenario: Every union field optional at the schema level
+
+- **WHEN** the OpenAPI schema describes `metrics`
+- **THEN** every field of the union is optional — a consequence the OpenAPI schema reflects by moving `rate` from required to optional
+- **AND** the RED invariant is preserved intact: a RED-family `metrics` object always carries a positive `rate`
+
+#### Scenario: Metrics never perturb identity or ordering
+
+- **WHEN** an edge gains or loses `metrics`
+- **THEN** its `id`, `type`, `source`, `target`, and `labels` are unaffected, and node and edge ordering is unaffected
 
 #### Scenario: Pod-to-pod edge carries RED metrics
 
@@ -1052,25 +1610,91 @@ All values SHALL be JSON numbers, never strings. Each value SHALL be rounded to 
 - **WHEN** two builds run over identical upstream data
 - **THEN** both response bodies are byte-identical, including every `data.metrics` value
 
+### Requirement: RED metrics family
+
+The **RED family** SHALL appear only on trace-derived call edges, under the presence rule defined by the `pod-service-graph` capability (in short: only trace-derived edges whose `source` and `target` both resolved to a pod or a service node, excluding the ingress chain's entry hop and any measurement derived from span-link series).
+
+#### Scenario: rate
+
+- **WHEN** an edge carries a RED-family object
+- **THEN** it carries `rate` (number, REQUIRED **within this family**, strictly greater than zero) — requests per second over the window
+
+#### Scenario: error_rate
+
+- **WHEN** the RED object is rendered
+- **THEN** `error_rate` (number, OPTIONAL, absence semantics) is the failed fraction in `[0, 1]`: absent when the upstream failure counter could not be read; `0` when it was read and reported no failures
+
+#### Scenario: p90_server_ms
+
+- **WHEN** the RED object is rendered
+- **THEN** `p90_server_ms` (number, OPTIONAL, absent when unavailable) is the 90th percentile server-observed request duration in milliseconds
+- **AND** the quantile and observation side match Grafana's documented service-graph queries by definition, but the values are not expected to equal Grafana's numerically, because Grafana aggregates by service name while this API aggregates by pod pair
+
+### Requirement: I/O metrics family
+
+The **I/O family** SHALL appear on `pvc-to-netapp-aggr` edges only, under the presence rule defined by the `netapp-storage-graph` capability: each field present iff its own Harvest family matched, the six measurements coming from the Harvest QoS workload families and the two ceilings from the QoS fixed-policy families.
+
+#### Scenario: Measurement fields
+
+- **WHEN** an edge carries an I/O-family object
+- **THEN** `read_ops`, `write_ops` (numbers, OPTIONAL) are read/write requests per second, verbatim from Harvest
+- **AND** `read_latency_us`, `write_latency_us` (numbers, OPTIONAL) are average read/write latency in microseconds, verbatim from Harvest
+- **AND** `read_bytes_per_sec`, `write_bytes_per_sec` (numbers, OPTIONAL) are read/write throughput in bytes per second, verbatim from Harvest
+
+#### Scenario: Ceiling fields
+
+- **WHEN** the volume declares a QoS throughput ceiling
+- **THEN** `max_iops`, `max_bytes_per_sec` (numbers, OPTIONAL) carry it: `max_iops` verbatim from Harvest, `max_bytes_per_sec` converted from the policy's megabytes-per-second figure so that it carries the same unit as the measured throughput fields and the two compare directly
+
+#### Scenario: Absent ceiling
+
+- **WHEN** a ceiling field is absent
+- **THEN** absence means *no declared ceiling* — it is never rendered as `0` or as an "unlimited" sentinel
+- **AND** neither ceiling field can appear unless at least one measurement field does
+
+### Requirement: Metric value encoding
+
+All `metrics` values SHALL be JSON numbers, never strings, each rounded to a fixed number of **significant digits** — not decimal places — so that the "Deterministic response body" requirement continues to hold byte-for-byte while a non-zero value can never be rendered as `0`.
+
+#### Scenario: Exponent form is legal
+
+- **WHEN** a value is very small
+- **THEN** it MAY appear in JSON exponent form (for example `3.86e-7`), which is legal JSON
+- **AND** consumers MUST NOT assume a fixed-decimal rendering, and MUST treat `0` as semantically distinct from a very small non-zero value
+
 ### Requirement: NetApp aggregate and node payloads
 
-`GET /v1/graph` SHALL emit each NetApp aggregate and each NetApp node (materialised by the `netapp-storage-graph` capability) as real first-class nodes `{ data: { id, name, type, labels } }`:
+`GET /v1/graph` SHALL emit each NetApp aggregate and each NetApp node (materialised by the `netapp-storage-graph` capability) as real first-class nodes `{ data: { id, name, type, labels } }`. Neither type SHALL carry a `cluster` label, so both stay out of `clusters[]` and out of the `?cluster=` domain, and neither SHALL emit `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `provisioner`, or `parameters`.
 
-**Aggregate** (`type="netapp-aggr"`):
-- `id` SHALL be `netapp/<ontap-cluster>/aggr/<aggr>` (aggregate names are cluster-wide unique within an ONTAP cluster; the id excludes the owning node so an HA takeover never changes it).
-- `name` SHALL equal the ONTAP aggregate name (`<aggr>`).
-- `labels` SHALL be a strict `map[string]string` containing exactly `ontap_cluster` and `node` (the current owning controller, which drives `data.parent`) — deliberately no `cluster` key.
-- `data` MAY additionally carry, with `omitempty` semantics and **outside `labels`**:
-  - `health` — a `string`, exactly one of `"online"` or `"degraded"`, per the `netapp-storage-graph` capability's per-aggregate `aggr_new_status` read. Omitted entirely when the aggregate has no status data — absence of data is distinct from a reported unhealthy state and the two SHALL NOT be conflated.
-  - `usage` — an object `{used_bytes, capacity_bytes}` of JSON numbers (bytes) from `aggr_space_used` / `aggr_space_total` — the **same shape** as the PVC `usage` attribute. Present iff at least one field resolved; an unresolved field omitted; values never strings.
+#### Scenario: Aggregate identity
 
-**Controller** (`type="netapp-node"`):
-- `id` SHALL be `netapp/<ontap-cluster>/<node>` (ONTAP controller names are not globally unique across ONTAP clusters).
-- `name` SHALL equal the ONTAP controller name (`<node>`).
-- `labels` SHALL be a strict `map[string]string` containing exactly an `ontap_cluster` entry — deliberately no `cluster` key.
-- `data` MAY additionally carry `health` (`omitempty`, outside `labels`) — a `string`, exactly one of `"online"` or `"degraded"`, from `node_new_status` per the `netapp-storage-graph` capability; omitted when the controller has no status data, never a defaulted `"degraded"`.
+- **WHEN** a `type="netapp-aggr"` node is emitted
+- **THEN** its `id` is `netapp/<ontap-cluster>/aggr/<aggr>` (aggregate names are cluster-wide unique within an ONTAP cluster; the id excludes the owning node so an HA takeover never changes it) and its `name` equals the ONTAP aggregate name (`<aggr>`)
+- **AND** its `labels` is a strict `map[string]string` containing exactly `ontap_cluster` and `node` (the current owning controller, which drives `data.parent`) — deliberately no `cluster` key
 
-Because neither type carries a `cluster` label, both stay out of `clusters[]` and out of the `?cluster=` domain. Neither SHALL emit `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `provisioner`, or `parameters`.
+#### Scenario: Aggregate health
+
+- **WHEN** an aggregate is emitted
+- **THEN** its `data` MAY carry, with `omitempty` semantics and **outside `labels`**, `health` — a `string`, exactly one of `"online"` or `"degraded"`, per the `netapp-storage-graph` capability's per-aggregate `aggr_new_status` read
+- **AND** `health` is omitted entirely when the aggregate has no status data — absence of data is distinct from a reported unhealthy state and the two are never conflated
+
+#### Scenario: Aggregate usage
+
+- **WHEN** an aggregate's space series resolve
+- **THEN** its `data` MAY carry `usage` — an object `{used_bytes, capacity_bytes}` of JSON numbers (bytes) from `aggr_space_used` / `aggr_space_total`, the **same shape** as the PVC `usage` attribute
+- **AND** `usage` is present iff at least one field resolved, an unresolved field is omitted, and values are never strings
+
+#### Scenario: Controller identity
+
+- **WHEN** a `type="netapp-node"` node is emitted
+- **THEN** its `id` is `netapp/<ontap-cluster>/<node>` (ONTAP controller names are not globally unique across ONTAP clusters) and its `name` equals the ONTAP controller name (`<node>`)
+- **AND** its `labels` is a strict `map[string]string` containing exactly an `ontap_cluster` entry — deliberately no `cluster` key
+
+#### Scenario: Controller health
+
+- **WHEN** a controller is emitted
+- **THEN** its `data` MAY carry `health` (`omitempty`, outside `labels`) — a `string`, exactly one of `"online"` or `"degraded"`, from `node_new_status` per the `netapp-storage-graph` capability
+- **AND** `health` is omitted when the controller has no status data, never a defaulted `"degraded"`
 
 #### Scenario: NetApp aggregate payload
 
@@ -1089,12 +1713,29 @@ Because neither type carries a `cluster` label, both stay out of `clusters[]` an
 
 ### Requirement: PVC `storageclass` and `usage` attributes
 
-A `type="pvc"` node's `data` MAY carry two typed attributes, both with `omitempty` semantics, both **outside `labels`**, and neither encoded as a string map entry:
+A `type="pvc"` node's `data` MAY carry two typed attributes, `storageclass` and `usage`, both with `omitempty` semantics, both **outside `labels`**, and neither encoded as a string map entry. Both attributes SHALL appear only on `type="pvc"` nodes.
 
-- `storageclass` — a `string`, the claim's StorageClass name as resolved by the `cluster-topology-source` capability ("PVC StorageClass resolution"). Emitted only when the name resolved non-empty; omitted entirely otherwise (never an empty string). This **supersedes** the previous rule that no `data.storageclass` field exists — the StorageClass node that rule pointed to is removed, and the name is retained on the claim itself as the operator's discriminator for the `netapp-storage-graph` join-coverage signal.
-- `usage` — an object `{ used_bytes, capacity_bytes }` of JSON numbers (bytes), from the kubelet volume-stats series per the `cluster-topology-source` capability. The object SHALL be present iff at least one field resolved; an unresolved field SHALL be omitted from the object; values SHALL never be strings.
+#### Scenario: storageclass value
 
-Both attributes SHALL appear only on `type="pvc"` nodes. Neither SHALL appear inside `labels`. Because both are `omitempty`, a PVC with neither resolved produces a `data` object byte-identical to the pre-change shape (modulo the removed edge/node).
+- **WHEN** the claim's StorageClass name resolved non-empty, as resolved by the `cluster-topology-source` capability ("PVC StorageClass resolution")
+- **THEN** `storageclass` is that `string`; otherwise it is omitted entirely (never an empty string)
+
+#### Scenario: storageclass supersedes the former prohibition
+
+- **WHEN** a PVC carries `data.storageclass`
+- **THEN** this **supersedes** the previous rule that no `data.storageclass` field exists — the StorageClass node that rule pointed to is removed
+- **AND** the name is retained on the claim itself as the operator's discriminator for the `netapp-storage-graph` join-coverage signal
+
+#### Scenario: usage value
+
+- **WHEN** kubelet volume-stats series resolve for the claim
+- **THEN** `usage` is an object `{ used_bytes, capacity_bytes }` of JSON numbers (bytes), from the kubelet volume-stats series per the `cluster-topology-source` capability
+- **AND** the object is present iff at least one field resolved, an unresolved field is omitted from the object, and values are never strings
+
+#### Scenario: Unresolved PVC keeps its pre-change shape
+
+- **WHEN** a PVC has neither attribute resolved
+- **THEN** because both are `omitempty`, its `data` object is byte-identical to the pre-change shape (modulo the removed edge/node)
 
 #### Scenario: PVC node carries storageclass and usage
 
@@ -1118,11 +1759,37 @@ Both attributes SHALL appear only on `type="pvc"` nodes. Neither SHALL appear in
 
 ### Requirement: Availability-zone and environment selector filters
 
-`GET /v1/graph` SHALL accept the optional, repeatable parameters `az` and `env`. Each SHALL be rendered as an upstream label matcher on every kube-state-metrics and kubelet query of the build, on **no** NetApp Harvest query, and on no service-graph query; the `up{}` probe SHALL never carry them. `az` additionally selects which `harvest` backends are asked (the `upstream-backend-routing` capability's zone rule); that selection is the only effect `az` has on the Harvest legs, and `env` has none. The upstream label each parameter binds to is the operator-configured key of the `cluster-topology-source` capability ("Configurable `az` / `env` label keys"), defaulting to `az` and `env`; the request parameter names themselves are fixed.
+`GET /v1/graph` SHALL accept the optional, repeatable parameters `az` and `env`, each rendered as an upstream label matcher on every kube-state-metrics and kubelet query of the build, on **no** NetApp Harvest query, and on no service-graph query; the `up{}` probe SHALL never carry them. The two filters SHALL narrow **at the source**.
 
-The same two labels are the zone and environment components of every cluster's identity (`cluster-topology-source`, "Cluster identity composed from zone and environment labels"): a cluster whose series carry both is listed in `clusters[]` and prefixed on its ids as `<az>-<env>-<cluster>`, and the filter triple `az` + `env` + `cluster` therefore addresses exactly one listed identity.
+#### Scenario: az routes Harvest backends
 
-The two filters narrow **at the source**: a series that lacks the configured label does not match an equality matcher and is therefore absent from the build. The operator SHALL ensure every kube-state-metrics and kubelet family stamps both labels; a family that does not vanishes from every `az` / `env`-filtered request, and because the default projection keeps only connectivity-connected workload, a topology family missing the label yields an empty graph for that filter rather than a partial one — and, unfiltered, such a family resolves its cluster through the identity ladder rather than composing it. The Harvest families are exempt: they carry no matcher, so they need no label. The response `clusters` list, derived from the built graph's node `cluster` labels, SHALL therefore list only the cluster identities with data in the requested zone / environment.
+- **WHEN** a request carries `az`
+- **THEN** `az` additionally selects which `harvest` backends are asked (the `upstream-backend-routing` capability's zone rule); that selection is the only effect `az` has on the Harvest legs, and `env` has none
+
+#### Scenario: Configured label keys
+
+- **WHEN** the parameters are rendered
+- **THEN** the upstream label each parameter binds to is the operator-configured key of the `cluster-topology-source` capability ("Configurable `az` / `env` label keys"), defaulting to `az` and `env`
+- **AND** the request parameter names themselves are fixed
+
+#### Scenario: Labels are the identity components
+
+- **WHEN** a cluster's series carry both labels
+- **THEN** the same two labels are the zone and environment components of the cluster's identity (`cluster-topology-source`, "Cluster identity composed from zone and environment labels"): the cluster is listed in `clusters[]` and prefixed on its ids as `<az>-<env>-<cluster>`
+- **AND** the filter triple `az` + `env` + `cluster` therefore addresses exactly one listed identity
+
+#### Scenario: Series lacking the label is absent from the build
+
+- **WHEN** a filter is active and a series lacks the configured label
+- **THEN** the series does not match an equality matcher and is therefore absent from the build
+- **AND** the response `clusters` list, derived from the built graph's node `cluster` labels, therefore lists only the cluster identities with data in the requested zone / environment
+
+#### Scenario: Operator stamps every Kubernetes family
+
+- **WHEN** an operator deploys the server
+- **THEN** the operator SHALL ensure every kube-state-metrics and kubelet family stamps both labels
+- **AND** a family that does not vanishes from every `az` / `env`-filtered request; because the default projection keeps only connectivity-connected workload, a topology family missing the label yields an empty graph for that filter rather than a partial one — and, unfiltered, such a family resolves its cluster through the identity ladder rather than composing it
+- **AND** the Harvest families are exempt: they carry no matcher, so they need no label
 
 #### Scenario: Environment filter selects one environment's clusters
 
@@ -1156,7 +1823,22 @@ The two filters narrow **at the source**: a series that lacks the configured lab
 
 ### Requirement: Node `alerts` attribute
 
-Each `type="pod"`, `type="node"`, `type="pvc"`, `type="netapp-node"` and `type="netapp-aggr"` node MAY carry a typed `data.alerts` array of `{ name, state, severity }` objects — the active alerts the `alert-overlay` capability matched to it — serialised with `omitempty` semantics and **never inside `labels`** (the `ipaddress` / `owner` / `ready_status` precedent). `severity` is omitted from an entry when empty. The array SHALL be sorted by `name` then `severity` and de-duplicated on that pair. `service`, `external`, `netapp-svm` and every synthesised group node SHALL NOT carry `alerts`. The attribute SHALL appear on `GET /v1/graph` and `GET /v1/storage-graph` alike, since it is resolved onto the built graph.
+Each `type="pod"`, `type="node"`, `type="pvc"`, `type="netapp-node"` and `type="netapp-aggr"` node MAY carry a typed `data.alerts` array of `{ name, state, severity }` objects — the active alerts the `alert-overlay` capability matched to it — which SHALL be serialised with `omitempty` semantics and **never inside `labels`** (the `ipaddress` / `owner` / `ready_status` precedent).
+
+#### Scenario: Entry order and de-duplication
+
+- **WHEN** a node carries alerts
+- **THEN** the array is sorted by `name` then `severity` and de-duplicated on that pair, and `severity` is omitted from an entry when empty
+
+#### Scenario: Kinds that never carry alerts
+
+- **WHEN** a body contains `service`, `external`, `netapp-svm` or synthesised group nodes
+- **THEN** none of them carries `alerts`
+
+#### Scenario: Both graph endpoints
+
+- **WHEN** a node is served by `GET /v1/graph` or `GET /v1/storage-graph`
+- **THEN** the attribute appears on either alike, since it is resolved onto the built graph
 
 #### Scenario: Alerted pod serialised
 
@@ -1170,14 +1852,39 @@ Each `type="pod"`, `type="node"`, `type="pvc"`, `type="netapp-node"` and `type="
 
 ### Requirement: Node `status` attribute
 
-Each `type="pod"`, `type="node"`, `type="pvc"`, `type="netapp-node"` and `type="netapp-aggr"` node SHALL carry a typed `data.status` string — exactly one of `"normal"`, `"warning"`, `"critical"` — **always present** on those five kinds and **never inside `labels`**. `service`, `external`, `netapp-svm` and every synthesised group node SHALL NOT carry `status`, so a consumer can tell "judged, nothing wrong" (`normal`) from "this kind carries no health signal" (no key). The value SHALL be folded at build time, worst-wins, from the node's OWN attributes and nothing else:
+Each `type="pod"`, `type="node"`, `type="pvc"`, `type="netapp-node"` and `type="netapp-aggr"` node SHALL carry a typed `data.status` string — exactly one of `"normal"`, `"warning"`, `"critical"` — **always present** on those five kinds and **never inside `labels`**. The value SHALL be folded at build time, worst-wins, from the node's OWN attributes and nothing else: the highest rank reached, else `normal`.
 
-- `data.alerts`: an entry whose `severity` (compared case-insensitively) is `critical` ranks critical; `warning`, an empty or absent `severity`, or any unrecognised value ranks warning; `info` and `none` rank nothing;
-- `data.health`: `degraded` ranks critical;
-- `data.ready_status`: `NotReady` ranks critical, `Unknown` ranks warning;
-- every other value, and every absent attribute, ranks nothing.
+#### Scenario: Kinds without a health signal carry no key
 
-The result is the highest rank reached, else `normal`. `data.perf` SHALL NOT influence `status`: a threshold over a performance counter is an alert rule's job and reaches `status` through `data.alerts`. The fold is a pure function of the node's own attributes (order-free over the alert set) and SHALL never read another node, so status does not propagate along edges or compound parents. The attribute SHALL appear identically on `GET /v1/graph`, `GET /v1/storage-graph` and every in-process engine call. Roll-up onto compound groups (a collapsed namespace showing its worst pod) is NOT performed by the server.
+- **WHEN** a body carries `service`, `external`, `netapp-svm` or synthesised group nodes
+- **THEN** they carry no `status`, so a consumer can tell "judged, nothing wrong" (`normal`) from "this kind carries no health signal" (no key)
+
+#### Scenario: Alert severity ranks
+
+- **WHEN** a node carries `data.alerts`
+- **THEN** an entry whose `severity` (compared case-insensitively) is `critical` ranks critical; `warning`, an empty or absent `severity`, or any unrecognised value ranks warning; `info` and `none` rank nothing
+
+#### Scenario: Health and readiness ranks
+
+- **WHEN** a node carries `data.health` or `data.ready_status`
+- **THEN** `data.health` `degraded` ranks critical; `data.ready_status` `NotReady` ranks critical and `Unknown` ranks warning
+- **AND** every other value, and every absent attribute, ranks nothing
+
+#### Scenario: perf does not influence status
+
+- **WHEN** a node carries `data.perf`
+- **THEN** `data.perf` does not influence `status`: a threshold over a performance counter is an alert rule's job and reaches `status` through `data.alerts`
+
+#### Scenario: Fold is local and pure
+
+- **WHEN** the fold runs
+- **THEN** it is a pure function of the node's own attributes (order-free over the alert set) and never reads another node, so status does not propagate along edges or compound parents
+- **AND** roll-up onto compound groups (a collapsed namespace showing its worst pod) is NOT performed by the server
+
+#### Scenario: Identical across entry points
+
+- **WHEN** the same node is produced by `GET /v1/graph`, `GET /v1/storage-graph` or an in-process engine call
+- **THEN** the attribute appears identically on every one
 
 #### Scenario: Worst severity wins
 
@@ -1236,7 +1943,23 @@ The result is the highest rank reached, else `normal`. `data.perf` SHALL NOT inf
 
 ### Requirement: NetApp node `hardware` and `perf` attributes
 
-Each `type="netapp-node"` node MAY carry two typed, nullable objects, both `omitempty` and never inside `labels`: `data.hardware = { model, serial, version, vendor, location }` (strings, each omitted when unresolved) from the Harvest `node_labels` info series, and `data.perf = { cpu_busy_pct, total_ops, total_latency_us, total_bytes_per_sec }` (JSON numbers rounded to 6 significant digits, each omitted when unresolved) from the Harvest `system_node` counters — per the `netapp-storage-graph` "NetApp node entity and health" requirement. No other node type SHALL carry either. `data.health` on the same node SHALL remain the `node_new_status`-reported value and SHALL NOT be derived from `perf`; nor SHALL `data.status` (below) read `perf`. Both attributes SHALL appear on `GET /v1/graph` and `GET /v1/storage-graph` alike.
+Each `type="netapp-node"` node MAY carry two typed, nullable objects, `data.hardware` and `data.perf`, both `omitempty` and never inside `labels`, per the `netapp-storage-graph` "NetApp node entity and health" requirement. No other node type SHALL carry either, and both SHALL appear on `GET /v1/graph` and `GET /v1/storage-graph` alike.
+
+#### Scenario: hardware shape
+
+- **WHEN** the Harvest `node_labels` info series resolves for a controller
+- **THEN** `data.hardware = { model, serial, version, vendor, location }` (strings, each omitted when unresolved)
+
+#### Scenario: perf shape
+
+- **WHEN** the Harvest `system_node` counters resolve for a controller
+- **THEN** `data.perf = { cpu_busy_pct, total_ops, total_latency_us, total_bytes_per_sec }` (JSON numbers rounded to 6 significant digits, each omitted when unresolved)
+
+#### Scenario: perf never drives health or status
+
+- **WHEN** a controller carries `perf`
+- **THEN** `data.health` on the same node remains the `node_new_status`-reported value and is not derived from `perf`
+- **AND** `data.status` (see "Node `status` attribute") does not read `perf`
 
 #### Scenario: Hardware and perf serialised
 
@@ -1250,17 +1973,40 @@ Each `type="netapp-node"` node MAY carry two typed, nullable objects, both `omit
 
 ### Requirement: PVC `qos` attribute
 
-A `type="pvc"` node's `data` MAY carry a typed `qos` attribute — the declared QoS throughput ceiling of the policy group governing the claim's volume, as resolved by the `netapp-storage-graph` capability ("QoS fixed-policy throughput ceilings"). It is an object, serialised with `omitempty`, **outside `labels`**, and never encoded as a string map entry:
+A `type="pvc"` node's `data` MAY carry a typed `qos` object — the declared QoS throughput ceiling of the policy group governing the claim's volume, as resolved by the `netapp-storage-graph` capability ("QoS fixed-policy throughput ceilings") — serialised with `omitempty`, **outside `labels`**, and never encoded as a string map entry. The attribute SHALL appear only on `type="pvc"` nodes.
 
-- `policy_group` — a `string`, the policy group the ceiling was keyed on. Always present when the object is present, never empty.
-- `max_iops` — a JSON number, requests per second. Present iff the policy group's `qos_policy_fixed_max_throughput_iops` resolved.
-- `max_bytes_per_sec` — a JSON number, bytes per second (the policy's MB/s figure × 1048576, the unit of the edge's `read_bytes_per_sec`). Present iff the policy group's `qos_policy_fixed_max_throughput_mbps` resolved.
+#### Scenario: Object fields
 
-The object SHALL be present iff at least one of `max_iops` / `max_bytes_per_sec` resolved; a claim whose ceiling did not resolve — no `svm`, no policy group on any in-scope workload, no fixed-policy series for the triple, no Harvest series in the window — SHALL carry no `qos` key at all, never an empty object, a `0`, or an "unlimited" sentinel. Presence does NOT require an I/O measurement or a `pvc-to-netapp-aggr` edge: a FlexGroup claim (SVM resolved, no aggregate) and a claim whose edge carries no measurement still carry `qos` when the ceiling resolved.
+- **WHEN** a PVC carries `qos`
+- **THEN** `policy_group` — a `string`, the policy group the ceiling was keyed on — is always present when the object is present, never empty
+- **AND** `max_iops` — a JSON number, requests per second — is present iff the policy group's `qos_policy_fixed_max_throughput_iops` resolved
+- **AND** `max_bytes_per_sec` — a JSON number, bytes per second (the policy's MB/s figure × 1048576, the unit of the edge's `read_bytes_per_sec`) — is present iff the policy group's `qos_policy_fixed_max_throughput_mbps` resolved
 
-The attribute is a **copy**, not a replacement: the `max_iops` / `max_bytes_per_sec` fields of the claim's `pvc-to-netapp-aggr` edge `data.metrics` keep their own presence rule. Whenever both the node and the edge carry a field, the two values SHALL be equal. Both numbers SHALL be rounded to 6 significant digits at serialisation exactly as edge metrics are, and MAY appear in exponent form.
+#### Scenario: Present iff a ceiling resolved
 
-The attribute SHALL appear only on `type="pvc"` nodes. It is additive to the v1 wire contract: a PVC with no resolved ceiling produces a `data` object byte-identical to the pre-change shape, and for identical upstream data the attribute is byte-identical across rebuilds.
+- **WHEN** neither `max_iops` nor `max_bytes_per_sec` resolved — no `svm`, no policy group on any in-scope workload, no fixed-policy series for the triple, no Harvest series in the window
+- **THEN** the claim carries no `qos` key at all, never an empty object, a `0`, or an "unlimited" sentinel
+
+#### Scenario: Presence independent of measurements and edges
+
+- **WHEN** a claim's ceiling resolved but it has no I/O measurement or no `pvc-to-netapp-aggr` edge
+- **THEN** it still carries `qos` — including a FlexGroup claim (SVM resolved, no aggregate) and a claim whose edge carries no measurement
+
+#### Scenario: Copy of the edge ceiling, not a replacement
+
+- **WHEN** the claim's `pvc-to-netapp-aggr` edge carries ceiling fields in `data.metrics`
+- **THEN** the edge's `max_iops` / `max_bytes_per_sec` keep their own presence rule, and whenever both the node and the edge carry a field the two values are equal
+
+#### Scenario: Rounding
+
+- **WHEN** the attribute is serialised
+- **THEN** both numbers are rounded to 6 significant digits exactly as edge metrics are, and MAY appear in exponent form
+
+#### Scenario: Additive and deterministic
+
+- **WHEN** a PVC has no resolved ceiling, or the same upstream data is built twice
+- **THEN** the PVC's `data` object is byte-identical to the pre-change shape, the attribute being additive to the v1 wire contract
+- **AND** for identical upstream data the attribute is byte-identical across rebuilds
 
 #### Scenario: PVC node carries its ceiling
 
