@@ -3,7 +3,6 @@ package build
 import (
 	"cmp"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -91,26 +90,13 @@ func readNodeSeed(
 	}
 	lk := opts.LabelKeys.OrDefault()
 	onRoot := podsNewestOn(incarnation, plan.nodeRoots, lk)
-	var kept model.Vector
-	if plan.kubernetesOnly {
-		// The pod wave lands these rows in v.Pod, where the tally counts them, so
-		// only the rest of the read is tallied beside it.
-		kept = keepPodRows(incarnation, onRoot, lk)
-	}
-	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation)-len(kept))
+	addExtraSeries(v, scopeMu, promql.QPodInfo, len(incarnation))
 	if len(onRoot) == 0 {
 		return nil
 	}
 	rootKeys := make([]podSeriesKey, 0, len(onRoot))
 	for k := range onRoot {
 		rootKeys = append(rootKeys, k)
-	}
-	if plan.kubernetesOnly {
-		// Every pod on the root is drawn, not only those that mount a claim; the
-		// storage body keeps just the latter, and its plan never sets this.
-		slices.SortFunc(rootKeys, comparePodSeriesKeys)
-		v.RootNodePods = rootKeys
-		v.RootNodePodInfo = kept
 	}
 	byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(rootKeys))
 	if err != nil {

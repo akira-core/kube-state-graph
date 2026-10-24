@@ -361,14 +361,21 @@ func readTopology(
 	}
 	if plan.tracksByReference() && !plan.rootedClaims() && !plan.claimSeeded() {
 		finalDone := make(chan struct{})
-		g.Go(signalWhenDone(signalWhenDone(func() error {
-			return readWorkloadClaims(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, bindingsDone, appDone)
-		}, pvcInfoDone), pvcAnnotationsDone))
-		if plan.kubernetesOnly {
-			// No volume-label read follows: closing the signal up front lets the
-			// scoped QoS read compute an empty scope from the nil VolumeLabels.
+		if plan.readsK8sWorkload() {
+			// One reader walks the whole Kubernetes-only read, so it is the one
+			// closer of all three signals. No volume-label read follows: closing
+			// the final signal up front lets the scoped QoS read compute an
+			// empty scope from the nil VolumeLabels.
+			g.Go(signalWhenDone(signalWhenDone(signalWhenDone(func() error {
+				return readK8sWorkload(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
+			}, bindingsDone), pvcInfoDone), pvcAnnotationsDone))
 			close(finalDone)
 		} else {
+			// Inside this block readsK8sWorkload() is exactly kubernetesOnly, so
+			// only a storage plan reaches here.
+			g.Go(signalWhenDone(signalWhenDone(func() error {
+				return readWorkloadClaims(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, bindingsDone, appDone)
+			}, pvcInfoDone), pvcAnnotationsDone))
 			g.Go(signalWhenDone(func() error {
 				return readWorkloadVolumeLabels(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone)
 			}, finalDone))
@@ -395,13 +402,13 @@ func readTopology(
 	// copy from running; this wave does not consult that skip set.
 	switch plan.kind {
 	case graph.StorageRootNode:
-		if len(plan.nodeRoots) > 0 {
+		if len(plan.nodeRoots) > 0 && !plan.readsK8sWorkload() {
 			g.Go(signalWhenDone(func() error {
 				return readNodeSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
 			}, bindingsDone))
 		}
 	case graph.StorageRootPod:
-		if len(plan.pods) > 0 {
+		if len(plan.pods) > 0 && !plan.readsK8sWorkload() {
 			g.Go(signalWhenDone(func() error {
 				return readPodSeed(ctx, q, window, end, opts, sel, plan, &v, &scopeMu)
 			}, bindingsDone))
@@ -425,7 +432,7 @@ func readTopology(
 			return readReachedHarvest(ctx, q, window, end, opts, sel, plan, &v, &scopeMu, pvcInfoDone, volumeLabelsFinal, flowlessDone)
 		})
 	}
-	if plan.byReference {
+	if plan.byReference && !plan.readsK8sWorkload() {
 		var recovered []podSeriesKey
 		if len(plan.applicationRoots) > 0 {
 			g.Go(signalWhenDone(signalWhenDone(func() error {

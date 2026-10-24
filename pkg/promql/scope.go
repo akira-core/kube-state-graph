@@ -317,20 +317,5 @@ func namespaceEquality(namespace string) string {
 // side would read bindings the caller did not name. The caller MUST skip the
 // query rather than fall back to an unscoped read.
 func RenderClaimBindingsByPod(window time.Duration, keys LabelKeys, sel Selector, namespaces, pods []string) (string, bool) {
-	ns := normaliseValues(namespaces)
-	ps := normaliseValues(pods)
-	if len(ns) == 0 || len(ps) == 0 {
-		return "", false
-	}
-	var matchers []string
-	if fixed := fixedSelector[QPVCBindings]; fixed != "" {
-		matchers = append(matchers, fixed)
-	}
-	if req := sel.render(queryDims[QPVCBindings], keys); req != "" {
-		matchers = append(matchers, req)
-	}
-	matchers = appendMatcher(matchers, NamespaceLabel, ns)
-	matchers = appendMatcher(matchers, PodLabel, ps)
-	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
-		QPVCBindings, strings.Join(matchers, ","), FormatDuration(window)), true
+	return RenderNamesAcrossNamespaces(QPVCBindings, window, keys, sel, PodLabel, namespaces, pods)
 }

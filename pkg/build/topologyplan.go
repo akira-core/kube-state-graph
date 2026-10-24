@@ -198,11 +198,26 @@ type topologyPlan struct {
 	nodePrepared bool
 	// podSeed is the rendered bindings{namespace,pod} queries of a pod root.
 	// Empty unless preparePodSeed rendered a seed that fits the cap.
-	podSeed          []string
+	podSeed []string
+	// podSeedChunks are the restrictions podSeed was rendered from, in the same
+	// order: each chunk's pod names and the namespaces of the refs carrying
+	// them. The Kubernetes-only build reads the roots' kube_pod_info and
+	// kube_pod_owner in exactly these chunks, so the cap preparePodSeed enforced
+	// bounds every request-derived read.
+	podSeedChunks    []pairChunk
 	podPrepared      bool
 	appPrepared      bool
 	flowlessPrepared bool
 	claimPrepared    bool
+}
+
+// readsK8sWorkload reports whether readK8sWorkload runs this build's whole
+// pod, claim, node and controller read in place of the node or pod seed,
+// readWorkloadClaims and the four by-reference waves: a Kubernetes-only build
+// with a pod or node root to walk from. A kubernetesOnly plan whose seed was
+// cleared is the parity control and keeps reading the inventory.
+func (p topologyPlan) readsK8sWorkload() bool {
+	return p.kubernetesOnly && p.tracksByReference() && !p.rootedClaims() && !p.claimSeeded()
 }
 
 // failsClosed reports whether a query error of q must fail this build even
@@ -514,11 +529,13 @@ func (p topologyPlan) preparePodSeed(window time.Duration, budget int, keys prom
 		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
 	for _, chunk := range chunks {
-		rendered, ok := promql.RenderClaimBindingsByPod(window, keys, sel, namespacesForNames(p.pods, chunk), chunk)
+		namespaces := namespacesForNames(p.pods, chunk)
+		rendered, ok := promql.RenderClaimBindingsByPod(window, keys, sel, namespaces, chunk)
 		if !ok {
 			continue
 		}
 		p.podSeed = append(p.podSeed, rendered)
+		p.podSeedChunks = append(p.podSeedChunks, pairChunk{namespaces: namespaces, names: chunk})
 	}
 	return p, nil
 }

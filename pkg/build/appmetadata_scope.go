@@ -92,6 +92,11 @@ type appMetadataClusterScope struct {
 	namespaces []string
 }
 
+// clusterNamespace is one namespace of one bucketed cluster.
+type clusterNamespace struct {
+	cluster, namespace string
+}
+
 // appMetadataScopes groups the namespaces of the loaded pods and claims by
 // their bucketed cluster, sorted by cluster with each namespace list sorted
 // and de-duplicated. Both labels are kube-state-metrics' (cluster and
@@ -99,12 +104,32 @@ type appMetadataClusterScope struct {
 // only ever paired with a cluster that loaded it, so another cluster's
 // same-named namespace is not read. Samples are read only.
 func appMetadataScopes(pods, claims model.Vector) []appMetadataClusterScope {
-	byCluster := make(map[string][]string)
-	for _, vec := range []model.Vector{pods, claims} {
+	return appMetadataScopesOf(appendClusterNamespaces(nil, pods, claims))
+}
+
+// appendClusterNamespaces appends the bucketed (cluster, namespace) of every
+// row of vecs to dst. It is the one place a row's cluster is bucketed for the
+// application-metadata scope, so the storage and Kubernetes-only builds cannot
+// bucket it differently. Samples are read only.
+func appendClusterNamespaces(dst []clusterNamespace, vecs ...model.Vector) []clusterNamespace {
+	for _, vec := range vecs {
 		for _, s := range vec {
-			c := bucketCluster(string(s.Metric["cluster"]))
-			byCluster[c] = append(byCluster[c], string(s.Metric[promql.NamespaceLabel]))
+			dst = append(dst, clusterNamespace{
+				cluster:   bucketCluster(string(s.Metric["cluster"])),
+				namespace: string(s.Metric[promql.NamespaceLabel]),
+			})
 		}
+	}
+	return dst
+}
+
+// appMetadataScopesOf is appMetadataScopes over (cluster, namespace) pairs the
+// caller already holds, for a build that knows its scope before the rows are
+// loaded. The clusters must already be bucketed.
+func appMetadataScopesOf(pairs []clusterNamespace) []appMetadataClusterScope {
+	byCluster := make(map[string][]string)
+	for _, p := range pairs {
+		byCluster[p.cluster] = append(byCluster[p.cluster], p.namespace)
 	}
 	out := make([]appMetadataClusterScope, 0, len(byCluster))
 	for _, c := range slices.Sorted(maps.Keys(byCluster)) {
@@ -113,6 +138,13 @@ func appMetadataScopes(pods, claims model.Vector) []appMetadataClusterScope {
 		}
 	}
 	return out
+}
+
+// appMetadataActive reports whether a by-reference build reads the
+// namespace-restricted metric at all: the metric is configured with a
+// namespace label and the family is served.
+func appMetadataActive(src *promql.AppMetadataSource, q promql.Querier) bool {
+	return src != nil && src.Namespace != "" && appMetadataServed(q)
 }
 
 // readScopedAppMetadata issues the application-metadata metric restricted to
@@ -138,8 +170,7 @@ func readScopedAppMetadata(
 	scopeMu *sync.Mutex,
 	podsDone, pvcInfoDone <-chan struct{},
 ) error {
-	src := opts.AppMetadata
-	if src == nil || src.Namespace == "" || !appMetadataServed(q) {
+	if !appMetadataActive(opts.AppMetadata, q) {
 		return nil
 	}
 	if !waitSignal(ctx, podsDone) || !waitSignal(ctx, pvcInfoDone) {
@@ -149,6 +180,30 @@ func readScopedAppMetadata(
 	if len(scopes) == 0 {
 		return nil
 	}
+	rows, err := issueAppMetadata(ctx, q, window, end, opts, sel, v, scopeMu, scopes)
+	if err != nil {
+		return err
+	}
+	v.AppMetadata = rows
+	return nil
+}
+
+// issueAppMetadata reads the metric once per cluster scope, each restriction
+// carrying that cluster's matcher and only its namespaces, chunked under the
+// shared byte budget, and returns the per-cluster vectors concatenated in
+// cluster order. It marks the family issued when a chunk reached the upstream.
+func issueAppMetadata(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	scopeMu *sync.Mutex,
+	scopes []appMetadataClusterScope,
+) (model.Vector, error) {
+	src := opts.AppMetadata
 	parts := make([]model.Vector, len(scopes))
 	families := make([]scopedFamily, len(scopes))
 	for i, sc := range scopes {
@@ -164,10 +219,9 @@ func readScopedAppMetadata(
 		}
 	}
 	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, families); err != nil {
-		return err
+		return nil, err
 	}
-	v.AppMetadata = slices.Concat(parts...)
-	return nil
+	return slices.Concat(parts...), nil
 }
 
 // appMetadataPodKeys reads the (az, env, cluster, namespace, pod) of every

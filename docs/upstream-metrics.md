@@ -347,30 +347,111 @@ storage root — see [netapp-harvest-preconditions.md](netapp-harvest-preconditi
 
 ## Fan-out per `/v1/k8s-graph` request
 
-The Kubernetes graph is the storage build with Harvest switched off: the same
-seeds, claim expansion, completions, chunk caps, routing and fail-closed rule
-for a `pod` or `node` root, and none of the NetApp reads. A pod root seeds from
-the claim bindings of its `(namespace, pod)` pairs; a node root seeds from
-`kube_pod_info{node}` plus incarnation completion, and — unlike the storage
-build, which follows only the pods that mount a claim — also loads every other
-pod whose newest incarnation runs on a root node, since the body draws them.
+The Kubernetes graph is the Kubernetes half of the storage build for a `pod` or
+`node` root, with Harvest switched off: the same seeds' first reads, root-set
+chunk caps, routing and fail-closed rule, and none of the NetApp reads. What a
+pod, a claim, a controller or a node *is* comes from the same helpers the storage
+build uses; the **order and grouping** of the reads is its own, because the body
+is different. A node root loads every pod whose newest incarnation runs on a
+root node — the storage build follows only the ones that mount a claim — so its
+owner, controller and application-metadata reads span every namespace those
+pods live in. Read one namespace at a time, along the storage build's chain of
+waits, that costs seven sequential upstream rounds; the Kubernetes build reads
+each family as soon as the reads its restriction depends on have returned.
+
+**Grouped restriction.** A read of known pods or claims is one query per chunk,
+restricted on a namespace alternation and a name alternation together, instead
+of one query per namespace:
+
+```
+kube_pod_info{az="a",env="p",namespace=~"platform|shop",pod=~"orders-0|redis-0|web-0"}
+```
+
+The two alternations are independent, so a chunk can also match a cross pair —
+`platform/web-0` above, a pod of that name in a namespace the request did not
+name it in. Every such row is discarded in the reader before any later read's
+restriction is computed from it, and still counts in the family's series tally.
+Pairs are sorted by `(namespace, name)` and packed greedily under
+`--netapp-qos-scope-batch-bytes`, each chunk charged for the request matchers it
+repeats and for its own two alternations, so a chunk holds a run of neighbouring
+namespaces; a single pair larger than the budget is still issued. Node and
+controller families are read by name alone, as before.
+
+**Rounds.** Every read of a round is issued together; a round starts when the
+reads its restriction depends on have returned. Mounter completion adds no claim
+and a mounter shares its claim's namespace, so only the co-mounters' own reads
+wait for it.
+
+```
+node root
+  r1  kube_pod_info{node}                                         [+ ALERTS]
+  r2  incarnation completion || claim bindings || kube_pod_owner  — each on the seed's pairs
+  r3  mounter completion (bindings by claim)
+      || kube_persistentvolumeclaim_info, kube_persistentvolumeclaim_annotations,
+         kubelet_volume_stats_{used,capacity}_bytes               — by (namespace, claim)
+      || app_metadata                    — the root pods' and tracked claims' namespaces
+      || kube_node_*                     — the root pods' nodes and the node roots
+      || controllers, first stage        — the root pods' owners, with the second stage read ahead
+  r4  only for mounters no read loaded:
+         their kube_pod_info || kube_pod_owner
+         || the second controller stage of the roots' owners, if the early read missed
+  r5  only for those mounters:
+         their controllers, first stage + early second stage || kube_node_* for nodes not yet read
+  r6  only if their early read missed: the second controller stage
+
+pod root
+  r1  claim bindings || kube_pod_info || kube_pod_owner of the roots   [+ ALERTS]
+        the three in the seed's own chunk split
+  r2  as node root r3
+  r3+ as node root r4..r6
+```
+
+| Root | Sequential rounds | When the early controller read misses |
+|---|---|---|
+| `node`, every tracked claim mounted only by root-node pods | 3 | 4 |
+| `node`, a tracked claim with a co-mounter elsewhere | 5 | 5 for the root pods' owners (the read rides r4); 6 for the co-mounter's |
+| `pod` mounting claims with no co-mounter, or mounting nothing | 2 | 3 |
+
+The pod root's r1 reads use the chunks `preparePodSeed` capped, so a root set
+the cap accepts is never rejected after a query was issued. A co-mounter is read
+only if no earlier read loaded it; the node and controller families only for
+names no earlier read of the same family covered, so a StatefulSet owning a
+root-node pod and a co-mounter is read once. A root node pod is identified by its
+full `(zone, environment, cluster, namespace, pod)`; a pod root names its pod in
+every selected cluster, so it is identified by `(namespace, pod)` alone.
+
+**The second controller stage is read ahead.** `kube_deployment_annotations` and
+`kube_cronjob_annotations` are issued with the first stage, on the direct
+Deployment / CronJob owner names plus each ReplicaSet / Job name with its final
+`-` segment removed (the Deployment controller names a ReplicaSet
+`<deployment>-<pod-template-hash>`, the CronJob controller a Job
+`<cronjob>-<scheduled-time>`). When the first stage returns, every name it
+resolves that the guess did not cover is read in the round after. A wrong guess
+costs a query and, at worst, a row no loaded pod's owner chain consults; the
+annotation indexes are read only through that chain, so the body is unchanged.
+Only a hand-made object misses, for example
+`kubectl create job --from=cronjob/x`.
+
+No query joins two families (`and on(…)`). Every query keeps its selector-only
+shape, so the endpoint reads the same on any Prometheus-compatible store:
+VictoriaMetrics pushes a join's right-hand labels down into the left read only up
+to 100 values per label, and Prometheus does not push down at all.
 
 ```
 GET /v1/k8s-graph?start=&end=&cluster=&az=&env=&(pod|node)=&…
         │
-        └─ ReadTopology (k8s plan) — ALERTS in the first wave, then the seed
-           and the storage expansion's Kubernetes half
-              issued, by reference as for /v1/storage-graph: ALERTS; the seed
-                (kube_pod_info{node} + incarnation completion, or the bindings
-                of the root pods); claim bindings by claim (mounter
+        └─ ReadTopology (k8s plan) — ALERTS in the first wave, then readK8sWorkload
+              issued: the seed (kube_pod_info{node} for a node root; the bindings
+                of the root pods for a pod root); kube_pod_info and kube_pod_owner
+                of the root pods; claim bindings by pod and by claim (mounter
                 completion); kube_persistentvolumeclaim_info,
                 kube_persistentvolumeclaim_annotations and the two kubelet
-                families per namespace on (namespace, persistentvolumeclaim);
-                kube_pod_info / kube_pod_owner for the loaded pods; the four
-                kube_node_* families for their nodes; the controller-owner and
-                controller-annotation families for their owners; and, when the
+                families on (namespace, persistentvolumeclaim); the four
+                kube_node_* families; the controller-owner and
+                controller-annotation families; and, when the
                 application-metadata metric is configured and served,
-                app_metadata restricted to the loaded namespaces
+                app_metadata restricted to the namespaces of the root pods
+                and the tracked claims
               never issued: every NetApp Harvest family (volume_labels, the
                 aggr_* / node_* / qos_* legs and the six QoS workload legs),
                 kube_pod_container_info, kube_service_info,
@@ -383,9 +464,11 @@ is `400 invalid_scope` before any query. **The build fails closed**: a query
 error of any family but `ALERTS` fails the request with HTTP 502
 `upstream query failed: <family>`; an `ALERTS` error yields an alert-less body;
 an empty vector is never a failure. There is no `outside_retention`
-classification, no `up{}` probe, and no last-build gauge is written. The
-per-family counts of the storage build above apply to the Kubernetes families
-of a `pod` or `node` root, minus the pod-wave widening of a node root.
+classification, no `up{}` probe, and no last-build gauge is written. A family's
+series tally counts every series a restriction matched — the cross pairs a
+grouped restriction matched included — whether or not it landed in the body.
+`/v1/storage-graph` is unchanged: it keeps its per-namespace reads, their order
+and its bodies (`TestBuildStorage_FanOutUnchanged`).
 
 ## Query error vs empty vector
 
