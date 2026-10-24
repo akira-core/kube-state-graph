@@ -118,7 +118,7 @@ func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEn
 //
 // The loop itself lives in pkg/promql/backendsfile, so an embedding module arms
 // the identical behaviour instead of re-deriving the digest short-circuit and
-// the keep-the-previous-table rule (design D14).
+// the keep-the-previous-table rule.
 func startBackendReload(ctx context.Context, r *promql.Router, cfg config.Config, logger *slog.Logger, m promql.RouterMetrics, lookup config.LookupEnvFunc) {
 	backendsfile.Start(ctx, r, backendsfile.ReloaderOptions{
 		Path:    cfg.BackendsFile,

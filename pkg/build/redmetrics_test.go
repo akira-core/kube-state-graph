@@ -59,8 +59,8 @@ func failSample(clientUID, serverUID string, rate float64, extra ...model.Metric
 	return s
 }
 
-// bucketSample is one duration-histogram bucket. The histogram is read RAW
-// (design D4), so a bucket series carries its request-total series' full
+// bucketSample is one duration-histogram bucket. The histogram is read RAW,
+// so a bucket series carries its request-total series' full
 // dimension set PLUS `le`, and joins by that identity minus `le`. The fixture
 // mirrors that shape — a bucket built from a narrower label set would join
 // nothing, exactly as it would in production.
@@ -108,7 +108,7 @@ func TestRED_BothUIDResolvedRealPods(t *testing.T) {
 }
 
 func TestRED_SynthPodTargetStillGetsMetrics(t *testing.T) {
-	// server UID unknown to topology → synth pod; still UID-resolved (D1).
+	// server UID unknown to topology → synth pod; still UID-resolved, so in scope.
 	vec := sampleVec(uidPodSample("abc", "unknown-uid", 3))
 	res := parseServiceGraphRED(vec, nil, nil, sampleTopology())
 	require.Len(t, res.SynthPods, 1)
@@ -156,7 +156,7 @@ func TestRED_ExternalEndpoint_NoMetrics(t *testing.T) {
 			"server":             "payments.example.com",
 			"cluster":            "cluster-alpha",
 			"client_k8s_pod_uid": "abc",
-			// empty server UID, non-:// label → D27 external
+			// empty server UID, non-:// label → external
 		},
 		Value: 2,
 	})
@@ -167,7 +167,7 @@ func TestRED_ExternalEndpoint_NoMetrics(t *testing.T) {
 	}
 }
 
-// TestRED_PodCallsService_GetsMetrics: a D29 connection string names the
+// TestRED_PodCallsService_GetsMetrics: a connection string names the
 // Service the caller actually dialled, so that is where the caller's rate
 // belongs. Nothing is double-counted — the fan-out below it carries none.
 func TestRED_PodCallsService_GetsMetrics(t *testing.T) {
@@ -231,7 +231,7 @@ func TestRED_TwoSeriesCollapseSumRates(t *testing.T) {
 
 // TestRED_UIDAndPeerResolvedSeriesSumRates: a UID-resolved series and a
 // peer-resolved series landing on the SAME pair are both in scope, so their
-// rates sum. (Under the first draft of D1 this pair carried no metrics at all.)
+// rates sum.
 func TestRED_UIDAndPeerResolvedSeriesSumRates(t *testing.T) {
 	topo := sampleTopologyPodIP()
 	// Register the peer pod under UID "def" so a UID-resolved series hits the
@@ -322,7 +322,7 @@ func TestRED_LinkSeriesNotJoined(t *testing.T) {
 	assert.InDelta(t, 0.0, *m.ErrorRate, 1e-12, "a link failure series must join nothing")
 }
 
-// --- D1: the ingress chain's entry hop is not measured ---
+// --- RED attachment: the ingress chain's entry hop is not measured ---
 
 // TestRED_RouteChainEntryHopUnmeasured: one series produces caller→ingress AND
 // caller→backend. They are two projections of the SAME call, so measuring both
@@ -612,14 +612,15 @@ func TestRED_P90InfClamp(t *testing.T) {
 }
 
 // TestRED_D33ClearedUIDDoesNotAttachToExternal guards the interaction between
-// the D33 self-loop UID normalisation and the RED attachment rule (design D1).
+// the self-loop UID normalisation and the RED attachment rule.
 //
-// D33 clears the "://" side's UID when both UIDs are non-empty and equal, so
-// that side falls through to connection-string resolution. The raw-UID in-scope
-// test runs BEFORE that normalisation, and an unresolvable "://" target
-// materialises an `external` node WITHOUT downgrading the edge type (only a
-// service target does that). So neither the raw UIDs nor the edge type can
-// catch this pair on its own — the resolved endpoint types must be checked.
+// The self-loop guard clears the "://" side's UID when both UIDs are non-empty
+// and equal, so that side falls through to connection-string resolution. The
+// raw-UID in-scope test runs BEFORE that normalisation, and an unresolvable
+// "://" target materialises an `external` node WITHOUT downgrading the edge
+// type (only a service target does that). So neither the raw UIDs nor the edge
+// type can catch this pair on its own — the resolved endpoint types must be
+// checked.
 func TestRED_D33ClearedUIDDoesNotAttachToExternal(t *testing.T) {
 	// client and server UID are identical and non-empty; the server label is an
 	// unresolvable connection string, so the server side becomes external/…

@@ -7,8 +7,8 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/route/store"
 )
 
-// TestResolveIPToIngressServices covers the Hop-1 accessor of the
-// ingress-lb-service-fallback change: every row LIVE AT the snapshot's instant
+// TestResolveIPToIngressServices covers the Hop-1 accessor of the ingress LB
+// Service fallback: every row LIVE AT the snapshot's instant
 // carrying the IP is returned (no first-match short-circuit), rows not live at
 // that instant or without the IP are not.
 func TestResolveIPToIngressServices(t *testing.T) {
@@ -58,7 +58,7 @@ func TestResolveIPToIngressServices(t *testing.T) {
 }
 
 // A superseded ingress identity is invisible at the instant — the point of the
-// as-of evaluation (simplify-route-resolution-to-point-in-time D5): what used
+// as-of evaluation: what used
 // to read as an ambiguous identity change is now a clean single owner.
 func TestResolveIPToIngressServicesSupersededIdentity(t *testing.T) {
 	const ip = "198.51.100.7"

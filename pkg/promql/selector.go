@@ -116,7 +116,7 @@ const (
 	// matcher. render and Reaches ignore it; familyAcceptsAZ is the only
 	// reader. Harvest is the only user: the store a request's `az` selects is
 	// the zone boundary, and a Harvest series is not required to carry the
-	// label (drop-harvest-zone-matchers D1).
+	// label.
 	dimAZRoute
 )
 

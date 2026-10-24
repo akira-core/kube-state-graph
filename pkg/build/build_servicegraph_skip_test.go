@@ -63,7 +63,7 @@ func hasServiceGraphLeg(names []string) bool {
 
 // TestBuild_FilteredEmptyTopology_SkipsServiceGraphRead: when a selector
 // narrowed the topology to nothing, no service-graph series can survive
-// admission (design D6 needs one resolved endpoint in loaded topology, and a
+// filtered-build admission (it needs one resolved endpoint in loaded topology, and a
 // service node can only come from ServicesByNameNS). The three
 // traces_service_graph_* queries are the one leg no selector narrows, so
 // issuing them would scan the whole estate to produce an empty response on

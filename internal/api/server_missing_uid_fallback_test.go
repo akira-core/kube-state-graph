@@ -14,7 +14,7 @@ import (
 )
 
 // TestGraphEndpoint_MissingClientUID_PromotesToExternal exercises the
-// Section 31 / D27 fallback at the HTTP boundary: a service-graph series
+// missing-UID fallback at the HTTP boundary: a service-graph series
 // with empty client_k8s_pod_uid + non-empty client label produces an
 // `external` node carrying the human label as `name`, and the resulting
 // edge omits `labels.cluster` (the client side is external).
@@ -83,7 +83,7 @@ func TestGraphEndpoint_MissingClientUID_PromotesToExternal(t *testing.T) {
 			sawEdge = true
 			assert.Equal(t, "pod-calls-pod", e.Data.Type)
 			assert.NotContains(t, e.Data.Labels, "cluster",
-				"edge cluster label MUST be omitted when client side is external (D27)")
+				"edge cluster label MUST be omitted when client side is external (missing-UID fallback)")
 		}
 	}
 	assert.True(t, sawEdge, "expected pod-calls-pod edge from external/admin to cluster-alpha/uid-checkout")

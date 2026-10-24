@@ -70,7 +70,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		}
 	}
 
-	// Pod controller-owner resolution (D34), with the ReplicaSet skipped to its
+	// Pod controller-owner resolution, with the ReplicaSet skipped to its
 	// owning Deployment. Built up-front so the per-pod assembly below can set
 	// each pod's typed Owner attribute (never a label).
 	podOwners := resolvePodOwners(v.PodOwner, v.ReplicaSetOwner, mc)
@@ -147,7 +147,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			// Deterministic pick: lexically-smallest address wins on duplicate
 			// (cluster, node) samples WITHIN each address type, so the emitted
 			// IP is a pure function of the data, not upstream vector order
-			// (D6 determinism). The external-over-internal preference is
+			// (determinism). The external-over-internal preference is
 			// applied at node assembly.
 			switch typ {
 			case "ExternalIP":
@@ -181,7 +181,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			lk, val := unflattenLabel(name), string(lv)
 			// Deterministic merge: when two series disagree on a key, the
 			// lexically-smaller value wins so the emitted label set is a pure
-			// function of the data, not upstream vector order (D6 determinism).
+			// function of the data, not upstream vector order (determinism).
 			if cur, ok := nodeLabels[key][lk]; !ok || val < cur {
 				nodeLabels[key][lk] = val
 			}
@@ -197,7 +197,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	// (nodeLabels / nodeIPs / nodeReady), so duplicate series describe the
 	// identical node; collapsing them here (first occurrence wins — the node is a
 	// pure function of the order-free join maps, so the winner is deterministic
-	// regardless of vector order, D6) keeps same-ID K8sNodes from flooding
+	// regardless of vector order) keeps same-ID K8sNodes from flooding
 	// NewGraph with "duplicate node ID" warnings.
 	nodes := make([]*graph.K8sNode, 0, len(v.Node))
 	seenNodes := make(map[[2]string]struct{}, len(v.Node))
@@ -282,7 +282,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 			)
 			// Deterministic dedupe: the lexically-smaller cluster-scoped ID
 			// wins so the winner is a pure function of the data, independent of
-			// the randomised map-iteration order this runs in (D6 determinism).
+			// the randomised map-iteration order this runs in (determinism).
 			if existing.ID() <= pod.ID() {
 				return
 			}
@@ -295,7 +295,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		// identity link (deleted pods do not back-fill metrics). On equal
 		// timestamps (two distinct UIDs scraped at the same step) the
 		// lexically-larger UID is the deterministic tie-break, so the canonical
-		// pick is a pure function of the data, not vector arrival order (D6).
+		// pick is a pure function of the data, not vector arrival order.
 		slices.SortStableFunc(group, func(a, b podObs) int {
 			return cmp.Or(cmp.Compare(b.ts, a.ts), cmp.Compare(b.uid, a.uid))
 		})
@@ -404,7 +404,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		}
 		// Deterministic pick: the lexically-smallest non-empty volume wins
 		// across all samples for this PVC, so the emitted label is a pure
-		// function of the data, not upstream vector order (D6 determinism).
+		// function of the data, not upstream vector order (determinism).
 		if vol := string(s.Metric["volume"]); vol != "" {
 			if cur, ok := node.LabelsValue["volume"]; !ok || vol < cur {
 				node.LabelsValue["volume"] = vol
@@ -440,20 +440,20 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		}
 	}
 
-	// PVC ArgoCD Application inheritance (D13): a PVC with no Application of its
+	// PVC ArgoCD Application inheritance: a PVC with no Application of its
 	// own inherits the lexically-smallest Application among the pods that mount
 	// it, so an unannotated PVC still nests under its workload's application
 	// group. The PVC's own annotation (set above from pvcApplications) ALWAYS
 	// wins — this pass only fills app-less PVCs — and runs before graph.NewGraph
 	// freezes the nodes. Pure function of the (binding set, pod Applications), so
-	// order-independent and byte-stable (D6).
+	// order-independent and byte-stable.
 	podAppByID := make(map[string]string, len(pods))
 	for _, p := range pods {
 		if p.ApplicationValue == "" {
 			continue
 		}
 		// Lexically-smallest wins on the (improbable) same-ID pod collision —
-		// the same tie-break as addPodToIndex, so the join key is order-free (D6).
+		// the same tie-break as addPodToIndex, so the join key is order-free.
 		if cur, ok := podAppByID[p.IDValue]; !ok || p.ApplicationValue < cur {
 			podAppByID[p.IDValue] = p.ApplicationValue
 		}
@@ -498,7 +498,8 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		}
 	}
 
-	// Services (D29). kube_service_info carries cluster_ip; "None" means headless.
+	// Services (endpointslice → service resolution). kube_service_info carries
+	// cluster_ip; "None" means headless.
 	servicesByNameNS := map[serviceKey]ServiceObs{}
 	for _, s := range v.Service {
 		cluster := mc.bucket(promql.QServiceInfo, s.Metric)

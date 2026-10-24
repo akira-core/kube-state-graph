@@ -8,7 +8,7 @@ import (
 // The routing file's schema, parse, and credential resolution live in
 // pkg/promql/backendsfile so an external module embedding the graph engine
 // configures routing with the same code this binary runs — internal/* is
-// unreachable from outside the module (design D3 / D14). The functions here
+// unreachable from outside the module. The functions here
 // are delegations kept so the binary's call sites and their tests are
 // unchanged.
 

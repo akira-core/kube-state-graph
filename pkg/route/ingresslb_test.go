@@ -55,7 +55,7 @@ func TestIngressServiceIdentity(t *testing.T) {
 	sameIdentityV2.ValidFrom = lbAt.Add(-time.Minute)
 
 	// A rename that completed BEFORE the instant: the old identity is dead, so
-	// as-of evaluation sees exactly one owner (D5 — no longer ambiguous).
+	// as-of evaluation sees exactly one owner (no longer ambiguous).
 	renamedOld := lbRow("ingress-nginx", "lb-old", "198.51.100.7")
 	renamedOld.ValidTo = lbAt.Add(-time.Minute)
 	renamedNew := lbRow("ingress-nginx", "lb-new", "198.51.100.7")
@@ -270,8 +270,7 @@ func TestResolveIngressLBService_SameIdentityMultiVersionHit(t *testing.T) {
 
 // An identity change that COMPLETED before the resolution instant (lb-old
 // deleted, lb-new created on the same IP) is not ambiguous under as-of
-// evaluation: only the owner live at the instant counts
-// (simplify-route-resolution-to-point-in-time D5).
+// evaluation: only the owner live at the instant counts.
 func TestResolveIngressLBService_SupersededIdentityResolvesToLiveOwner(t *testing.T) {
 	old := lbRow("ingress-nginx", "lb-old", "198.51.100.7")
 	old.ValidTo = lbAt.Add(-time.Minute)

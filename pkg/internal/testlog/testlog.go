@@ -1,6 +1,7 @@
 // Package testlog provides the shared slog-capture helper for pkg/ unit
 // tests that assert on global-logger output (the engine's warn paths log via
-// the process-wide slog default; see the D32 note in CLAUDE.md). Living under
+// the process-wide slog default; see the reusable pkg/ graph engine note in
+// CLAUDE.md). Living under
 // pkg/internal it is importable by every pkg/... test file while remaining
 // invisible to external embedders.
 package testlog

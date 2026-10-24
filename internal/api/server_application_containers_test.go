@@ -30,7 +30,7 @@ func TestGraphEndpoint_PodApplicationAndContainers(t *testing.T) {
 		"owner_name":          "web-7f9c",
 		"owner_is_controller": "true",
 	})
-	// The D34 ReplicaSet skip resolves the owner to the Deployment, which is the
+	// The ReplicaSet skip resolves the owner to the Deployment, which is the
 	// object ArgoCD actually annotates — no extra owner hop is needed.
 	fixtures["last_over_time(kube_replicaset_owner"] = vec(map[string]string{
 		"cluster":    "test",

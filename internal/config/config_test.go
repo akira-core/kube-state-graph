@@ -86,9 +86,8 @@ func TestSplitAndTrim(t *testing.T) {
 	assert.Equal(t, []string{"a", "b", "c"}, splitAndTrim(" a, b ,, c "))
 }
 
-// Upstream basic-auth credentials are env-only (D-A1) and must be configured
-// as a pair (D-A2); validation errors must never echo the configured values
-// (D-A5).
+// Upstream basic-auth credentials are env-only and must be configured as a
+// pair; validation errors must never echo the configured values.
 func TestParse_PromBasicAuth_EnvPair(t *testing.T) {
 	env := map[string]string{
 		"KSG_PROM_USERNAME": "ksg",
@@ -140,7 +139,7 @@ func TestValidate_PromBasicAuth_ColonInUsernameRejected(t *testing.T) {
 }
 
 // Credentials are deliberately env-only: no --prom-username / --prom-password
-// flags exist, so flag parsing must reject them as unknown (D-A1).
+// flags exist, so flag parsing must reject them as unknown.
 func TestParse_PromBasicAuth_NoFlagsRegistered(t *testing.T) {
 	for _, arg := range []string{"--prom-username=x", "--prom-password=x"} {
 		t.Run(arg, func(t *testing.T) {

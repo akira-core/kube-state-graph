@@ -39,8 +39,8 @@ func allFanOut(q *promqlfake.Querier) []string {
 // string included, Harvest and the application-metadata read among them. The
 // Kubernetes-only read plan is allowed to group, reorder and read ahead;
 // the storage plan is not, so any edit that moves one of these lines is an
-// edit to /v1/storage-graph and has to be a deliberate one (design D1 of
-// shorten-by-reference-read-path). The flag is not the repo's routine `-update`,
+// edit to /v1/storage-graph and has to be a deliberate one. The flag is not
+// the repo's routine `-update`,
 // so a golden refresh elsewhere cannot rewrite this guard; refresh with
 // `go test ./pkg/build -run TestBuildStorage_FanOutUnchanged -update-storage-fanout`
 // only for an INTENDED storage change.

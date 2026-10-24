@@ -21,7 +21,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   Attachment rule (hardcoded): a **trace-derived** edge whose **both resolved
   endpoints** name a `type="pod"` node (real or synth) or a `type="service"`
   node — enforced by `sgResolver.isPodOrServiceID`, NOT by the raw UID labels
-  and NOT by the edge type (D33 clears a `"://"` side's UID after the labels are
+  and NOT by the edge type (the self-loop UID guard clears a `"://"` side's UID after the labels are
   read, and an `external` target leaves the type at `pod-calls-pod`). **How** an
   endpoint was identified is irrelevant: pod UID, `"://"` connection string,
   `server="unknown"` peer address → ClusterIP or Pod IP, and route-engine
@@ -42,7 +42,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `..._server_seconds_bucket` — both read at the total counter's **raw** label
   granularity (the histogram has NO upstream `sum by`) and joined by exact
   series identity (the histogram minus `le`) through one `seriesKey → pairKey`
-  map, both carrying D30's sentinel plus `serviceGraphLinkExclusionSelector`
+  map, both carrying the sentinel matcher plus `serviceGraphLinkExclusionSelector`
   (`edge_relation!="link"`). The queried population is a **superset** of the
   attached one (endpoint node type has no label-level form); what holds is the
   one-way property — every query-layer filter is mirrored in Go, so no eligible
@@ -59,7 +59,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   side is non-pod. (Not the raw trace label: that label is not an identity and
   could name a cluster present on no node of the response.) Cross-cluster
   status is derived by comparing the resolved source-node and target-node
-  `labels.cluster` — D9.
+  `labels.cluster`.
 
 ## Resolution rules
 
@@ -90,7 +90,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   endpoints pod-or-service, not the chain entry hop, at least one in-scope
   contributing series.
 
-- **Connection-string resolution rule** (D29, hardcoded — no knob): for any
+- **Connection-string resolution rule** (hardcoded — no knob): for any
   service-graph endpoint whose pod UID is empty, the verbatim `client`/`server`
   label is checked for a `"://"` connection string. Detection is hardcoded —
   there is no operator-tunable substring and no config knob. Per-endpoint
@@ -107,7 +107,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     is the **UID-recovered client-pod cluster** when the client side resolved to
     a topology pod (the trace `cluster` label is frequently missing or wrong),
     falling back to the raw trace label otherwise; edge `labels.cluster` always
-    stays the raw trace label (D9). The endpoint resolves **iff the anchor
+    stays the raw trace label. The endpoint resolves **iff the anchor
     cluster itself holds the `(namespace, service)`** in `ServicesByNameNS` — a
     same-named local Service is a service-mesh precondition (Istio multi-primary
     / Cilium Cluster Mesh keep the Service in *every* cluster; cross-cluster is
@@ -121,7 +121,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     (`id="<anchor>/<namespace>/<service>"`, `labels={cluster,namespace}`,
     `ipaddress=[cluster_ip]` from the anchor's own `kube_service_info` unless
     headless `cluster_ip="None"`) and yields **one** `pod-calls-service` edge
-    (this D29 path is always intra-cluster by construction; the TYPE is
+    (this connection-string path is always intra-cluster by construction; the TYPE is
     registered `may_cross_cluster: true` only because the route-engine path
     (`route-resolution.md`) can anchor on a sibling cluster). **Cross-cluster
     `service-selects-pod` fan-out**: from that single node, one edge is emitted
@@ -145,7 +145,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     ingress-cluster pick shares it) and the membership/union logic
     are hardcoded pure functions — no knob, no PromQL change (filtering is
     in-memory at resolution — it adds no PromQL matcher of its own; the
-    request-scoped selectors of push-request-filters-upstream are a separate,
+    request-scoped selectors are a separate,
     hardcoded per-series contract). The
     3-label form drops the leading pod-hostname and resolves as its parent
     service. When BOTH sides of a series are `"://"` labels, each resolves to a
@@ -159,7 +159,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     external nodes or fan-out edges as an orphan subgraph.
   A client-side `"://"` label resolves to `service` or `external` (never a pod),
   so the edge `labels.cluster` is always omitted for it.
-- **Missing pod-UID human-label fallback** (D27, always on): when
+- **Missing pod-UID human-label fallback** (always on): when
   `client_k8s_pod_uid` or `server_k8s_pod_uid` is empty AND the corresponding
   `client`/`server` label is non-empty AND the label does NOT contain `"://"`,
   that endpoint is promoted to `external/<label>` (no cluster prefix; `labels={}`)
@@ -168,7 +168,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   a single `service` node in the caller's own (anchor) cluster (iff that
   cluster holds the service), with a cross-cluster `service-selects-pod`
   endpoint union over the same-family clusters holding it, or `external` when
-  the anchor cluster lacks the service, per the D29 same-cluster rule above
+  the anchor cluster lacks the service, per the connection-string same-cluster rule above
   (never a pod; no unknown-family fallback, no endpoint-backed pruning);
   (2) UID-based pod resolution / synth-pod fallback (only when UID is non-empty);
   (3) missing-UID human-label fallback (this rule) → external with `labels={}`
@@ -178,7 +178,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `labels.cluster` is omitted whenever the client side resolves to a non-pod node,
   whether via the connection-string rule (`service` / `external`) or this fallback
   (`external`).
-- **Self-loop UID guard** (D33, always on, no knob): a pre-resolution
+- **Self-loop UID guard** (always on, no knob): a pre-resolution
   normalisation in `parseServiceGraph`, applied **before** the resolution order
   above. Some `servicegraph` exporters stamp the **caller's own** pod UID onto
   **both** sides for a peer they could only identify as a `"://"` connection
@@ -199,7 +199,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   string labels); no new node/edge type. Tests:
   `pkg/build/servicegraph_test.go` (`TestParseServiceGraph_SelfLoopUID_*`) and
   `internal/integration` (`TestConnStringSelfLoopUIDResolvesToServiceNode`).
-- **Sentinel-endpoint exclusion at the query layer** (D30, hardcoded — no knob):
+- **Sentinel-endpoint exclusion at the query layer** (hardcoded — no knob):
   the `servicegraph` connector emits virtual peers for endpoints it cannot pair
   to an instrumented span — an uninstrumented caller as `client="user"`, an
   unresolved peer as `"unknown"`. The service-graph selector drops these
@@ -207,8 +207,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[w])`
   — so a `client="user"`/`"unknown"` series never reaches the resolver: no node
   (`pod` / synth / `service` / `external`) and no edge is produced for it. The
-  **server-side matcher is narrower** (`server!~"user"` only —
-  resolve-unknown-server-peer-labels D1): a `server="unknown"` series
+  **server-side matcher is narrower** (`server!~"user"` only): a `server="unknown"` series
   reaches Go, but the reader drops it (no node, no edge) **UNLESS** the
   "Unknown-server peer-label enrichment" rule below applies — every
   `server="unknown"` case outside that rule's narrow trigger (client
@@ -222,16 +221,13 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   constant stays the bare metric name so `query_name` self-metric / span
   dimensions are unchanged. Deferred numeric service-graph metrics MUST reuse
   the same fragment when added.
-- **Unknown-server peer-label enrichment** (resolve-unknown-server-peer-labels
-  D1–D3, extended by resolve-unknown-server-ip-peer,
-  resolve-unknown-server-network-peer-address, and
-  resolve-unknown-server-pod-ip-peer, hardcoded — no knob): the one
-  carve-out from the D30 outcome above. When `client_k8s_pod_uid` resolves to
+- **Unknown-server peer-label enrichment** (hardcoded — no knob): the one
+  carve-out from the sentinel-exclusion outcome above. When `client_k8s_pod_uid` resolves to
   a **real topology pod** (never a synthesised one) AND the server side has no
   resolvable pod (UID empty, or present but absent from `Topology.PodsByUID`)
   AND the raw `server` label is exactly `"unknown"`, `resolveServer` dispatches
   to the new `resolveUnknownServerPeer` instead of the generic empty-UID
-  (`resolveEmptyUID`, which owns the D27 fallback) or synth-pod path — never
+  (`resolveEmptyUID`, which owns the missing-UID fallback) or synth-pod path — never
   both, for this literal value. It reads **three** client-recorded peer-address
   labels, checked in this precedence order — `client_server_address` (checked
   first), then `client_network_peer_address` (checked second), then
@@ -263,7 +259,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   (2) an optional trailing `:<port>` is then best-effort stripped via
   `net.SplitHostPort`. Both steps apply uniformly regardless of which label
   supplied the value — the resolver stays provenance-free. The result is
-  classified via the same `classifyK8sDNS` grammar D29 connection-string
+  classified via the same `classifyK8sDNS` grammar connection-string
   resolution uses (2-label `<service>.<namespace>`, 3-label headless
   `<pod>.<service>.<namespace>`, `.svc[.<domain>]` suffix stripped), **plus
   three grammar extensions scoped to this rule only**: (1) a single dot-free,
@@ -271,14 +267,14 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   **client pod's own namespace** — note this means bracket truncation can
   promote a value like `mongo:27017[-181]` into the bare short name `mongo`,
   resolved in the client's own namespace, exactly as the un-bracketed
-  `mongo:27017` already does; (2) (resolve-unknown-server-ip-peer) when
+  `mongo:27017` already does; (2) when
   neither the DNS grammar nor the bare-short-name form matches AND the host is
   a valid IP literal (`net.ParseIP`), it is looked up as a Service `ClusterIP`
   **within the already-resolved client pod's own (anchor) cluster only** —
   never a family sibling, since a `ClusterIP` is a per-cluster address that
   can legitimately collide across unrelated clusters' Service CIDRs (unlike a
   Service DNS name, which is a mesh-wide convention the family union already
-  handles); (3) (resolve-unknown-server-pod-ip-peer) when the IP literal
+  handles); (3) when the IP literal
   matches **no** Service `ClusterIP`, it is looked up as a **Pod IP** against
   a second index (`famIPKey{family, pod_ip} → []podIPCandidate{cluster, pod}`,
   built once per parse from `topology.Pods` in **two stages**: stage 1 reduces
@@ -313,7 +309,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   **same-cluster** duplicate `pod_ip` — the normal case for `hostNetwork`
   pods, which all report their node's address, and transient on address reuse
   within the window — stage 1 keeps the **lexically-smallest pod ID**
-  (order-free, D6), so an intra-cluster duplicate never makes the family look
+  (order-free), so an intra-cluster duplicate never makes the family look
   ambiguous. `lookupPeerPodIP` is pure and shared with the
   `collectRouteQueries` prescan, which skips resolvable endpoints so the route
   engine is never asked about traffic the in-cluster ladder resolves —
@@ -332,7 +328,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   identification lookup itself is anchor-scoped. A successful classification
   resolves via the existing `resolveServiceLevel(anchorCluster, ns, svc)` —
   anchor = the already-resolved client pod's own cluster (no anchor-recovery
-  fallback chain needed here, unlike D29) — with the same anchor-membership
+  fallback chain needed here, unlike connection-string resolution) — with the same anchor-membership
   test and cross-cluster `service-selects-pod` fan-out. An unresolvable
   classification, or a `resolveServiceLevel` miss, falls back to
   `external/<raw_peer_address>` — the RAW, wholly unnormalised label value
@@ -342,10 +338,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   empty/absent, or the client did not resolve to a real pod, drops the
   endpoint (no node, no edge). This is the invariant the narrower
   server-side selector must never violate: it must never leak a
-  `external/unknown` node via the generic D27 path for a case outside this
+  `external/unknown` node via the generic missing-UID fallback path for a case outside this
   rule's trigger.
-- **Span-link logical edge relation marking** (add-span-link-logical-edges,
-  hardcoded — no knob): a series whose `edge_relation` label is exactly
+- **Span-link logical edge relation marking** (hardcoded — no knob): a series whose `edge_relation` label is exactly
   `"link"` (span-link-derived: client = producer pod, server = consumer pod,
   joined across trace IDs through a broker) resolves through the ordinary
   ladder unchanged and its emitted edge carries `labels.relation="link"`;
@@ -366,7 +361,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   Marking is set-membership at edge-build time over two
   **`parseWithResolver`-local** sets (`linkPairs`/`transportPairs` — no
   resolver field, no cross-build state); insert-only accumulation makes it
-  order-free (D6), `link` wins over `transport` and over plain series for the
+  order-free, `link` wins over `transport` and over plain series for the
   same pair, `service-selects-pod` fan-out and synthesized route-chain edges
   are NEVER marked, and a transport pair with no matching edge is a pure
   marker (aggregated Debug, never synthesised — via lookup materialises
@@ -378,7 +373,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   "transport = the network hop backing a rendered logical edge", so a
   `transport` edge always coexists with a `link` edge from the same series
   set in the built graph — do NOT re-add a demote-to-transport rule (other
-  degrades — synth pod, D27 ghost external — keep `link`). Any other
+  degrades — synth pod, missing-UID ghost external — keep `link`). Any other
   `edge_relation` value is ignored (exact match). Prescan: link series emit
   ≤2 via keys (per resolved side, anchor = that side's own pod cluster)
   through `viaRouteKey` — the extracted skip chain the unknown-server branch
@@ -386,7 +381,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   keys (same `peerRouteKey` derivation ⇒ one store read per broker FQDN per
   anchor cluster; the in-memory chain stays un-memoised per the
   `resolveConnString` precedent). Edge IDs (UUIDv5 over `type|source|target`)
-  and the D30 selector are untouched; `relation` is registered on the
+  and the sentinel selector are untouched; `relation` is registered on the
   `pod-calls-pod`/`pod-calls-service` `graph.EdgeTypes` entries only. Tests:
   `pkg/build/servicegraph_link_test.go`, golden
   `link-relation-cytoscape.json`, `internal/integration`
@@ -405,4 +400,4 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
 
 ## Filtered builds
 
-- **Filtered-build rules for the service graph** (design D5 / D6 of push-request-filters-upstream). Because the topology is narrowed while the service-graph series are read in full, a build with any selector-level dimension active applies two rules that are **inert when unfiltered** (`sgResolver.filtered`): (1) an endpoint whose non-empty pod UID names a pod the request did NOT load resolves exactly as if the UID were empty — the `"://"` ladder can still reach a LOADED Service, `server="unknown"` still goes through the peer ladder (which needs a real client pod, so an out-of-scope caller is dropped), any other non-empty label becomes `external/<label>` via the D27 fallback, and an empty label drops the side; **a filtered build NEVER synthesises a pod**; (2) a series is ADMITTED only when both sides resolved AND at least one resolved id names loaded topology (`podByID` or an already-materialised `services` entry) — otherwise a per-series **journal** rolls back every side effect (external / service / `service-selects-pod` / route-chain / ingress `role` / `extReasons`) and the series contributes nothing to `pairs`, the RED join or the link markers. This is what keeps the out-of-scope estate from rendering as an external-to-external web, and what makes an out-of-scope peer render as `external/<label>` instead of a ghost pod. **Consequence:** under `?cluster=` the cross-cluster partner is an `external` node, not a real pod — "Cross-cluster edge representation" requires BOTH clusters loaded.
+- **Filtered-build rules for the service graph**. Because the topology is narrowed while the service-graph series are read in full, a build with any selector-level dimension active applies two rules that are **inert when unfiltered** (`sgResolver.filtered`): (1) an endpoint whose non-empty pod UID names a pod the request did NOT load resolves exactly as if the UID were empty — the `"://"` ladder can still reach a LOADED Service, `server="unknown"` still goes through the peer ladder (which needs a real client pod, so an out-of-scope caller is dropped), any other non-empty label becomes `external/<label>` via the missing-UID fallback, and an empty label drops the side; **a filtered build NEVER synthesises a pod**; (2) a series is ADMITTED only when both sides resolved AND at least one resolved id names loaded topology (`podByID` or an already-materialised `services` entry) — otherwise a per-series **journal** rolls back every side effect (external / service / `service-selects-pod` / route-chain / ingress `role` / `extReasons`) and the series contributes nothing to `pairs`, the RED join or the link markers. This is what keeps the out-of-scope estate from rendering as an external-to-external web, and what makes an out-of-scope peer render as `external/<label>` instead of a ghost pod. **Consequence:** under `?cluster=` the cross-cluster partner is an `external` node, not a real pod — "Cross-cluster edge representation" requires BOTH clusters loaded.

@@ -2,7 +2,7 @@
 // Envoy process) over istiod-translated RouteConfigurations to resolve each
 // host+path to its destination cluster. It is the sole route-matching engine:
 // reimplementing Envoy's RDS semantics in Go was rejected because the whole
-// correctness argument rests on the matcher being Envoy's own (design D8).
+// correctness argument rests on the matcher being Envoy's own.
 //
 // Ported from poc/route2a/internal/matchcheck with the docker fallback DROPPED:
 // the tool runs as a native binary only, its path injected from configuration
@@ -146,10 +146,10 @@ var actualMarker = []byte("actual: [")
 // It errors unless EVERY query was recovered. The marker rule — any all-digits
 // line re-points the current index — cannot distinguish a test name from a stray
 // numeric line the tool prints for its own reasons, and the scraped text format
-// is not a stable contract (design D8 rests on the MATCHER being Envoy's, not on
+// is not a stable contract (correctness rests on the MATCHER being Envoy's, not on
 // its output format). Today only a single query is ever posed, so a stray line
 // already fails closed; requiring a full result set makes that hold for any
-// batch size instead of by accident (design D7).
+// batch size instead of by accident.
 func parseActuals(out []byte, n int) ([]string, error) {
 	res := make([]string, n)
 	filled := make([]bool, n)

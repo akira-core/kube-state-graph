@@ -171,7 +171,7 @@ func TestStorageRootKinds_Order(t *testing.T) {
 	}, StorageRootKinds)
 }
 
-// accept-multi-zone-storage-graph: `aggr=` and `svm=` also accept
+// `aggr=` and `svm=` also accept
 // `<ontap_cluster>/<name>`, naming exactly one component. Bare values keep their
 // meaning (that name on every filer) and the two forms may be mixed.
 func TestNewStorageScope_QualifiedAggrAndSVM(t *testing.T) {

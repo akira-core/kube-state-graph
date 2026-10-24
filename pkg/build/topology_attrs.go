@@ -41,7 +41,7 @@ type pvcInfoAttrs struct {
 // degradation). The returned map is a deterministic function of the input
 // vector — on a duplicate (cluster, namespace, claim) the lexically-smallest
 // non-empty value wins PER FIELD, so the emitted grouping and labels are
-// stable across rebuilds (D6 determinism). The only side effect is tallying
+// stable across rebuilds (determinism). The only side effect is tallying
 // missing-cluster samples into the caller's mc accumulator.
 func resolvePVCInfo(vec model.Vector, mc *clusterResolver) map[pvcKey]pvcInfoAttrs {
 	pick := func(cur *string, val string) {
@@ -101,7 +101,7 @@ func readyStatusFromLabel(status string) string {
 // AND a recognised status are considered, so a 0-valued (inactive) row, or a
 // malformed status, never wins. On the defensive case where more than one row
 // is active for the same (cluster, node) — which correct KSM never emits — the
-// lexically-smallest `status` label wins, so the result is order-free (D6).
+// lexically-smallest `status` label wins, so the result is order-free.
 //
 // OPTIONAL: an absent or empty vector yields an empty map and nodes carry no
 // ready_status (graceful degradation). "" (absent) is intentionally distinct

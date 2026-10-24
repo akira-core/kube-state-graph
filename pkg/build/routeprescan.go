@@ -18,7 +18,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
-// defaultListenerPort is the design-D5 fallback when neither the peer-address
+// defaultListenerPort is the listener-port fallback when neither the peer-address
 // value nor the optional port dimensions carry a listener port. 443 rather
 // than 80: a Gateway declaring only :443 (or an httpsRedirect :80 stub) is the
 // common global-FQDN ingress shape, and a wrong guess fails as "no listener"
@@ -26,13 +26,13 @@ import (
 const defaultListenerPort = 443
 
 // peerLabels bundles the client-recorded peer dimensions of one service-graph
-// sample that feed the unknown-server enrichment: the three peer-address
-// labels the D1 precedence reads (resolve-unknown-server-network-peer-address),
-// plus the two OPTIONAL dimensions added by translate-global-fqdn-to-k8s-service
-// (destination IPs and listener port). client_network_peer_port is deliberately
-// NOT read — a port participates in neither peer identification nor node naming
-// (design.md Non-Goals); the listener-port dimensions below are the older
-// client_server_port / client_net_peer_port pair used only by route resolution.
+// sample that feed the unknown-server enrichment: the three peer-address labels
+// the peer-address precedence reads, plus the two OPTIONAL dimensions route
+// resolution reads (destination IPs and listener port).
+// client_network_peer_port is deliberately NOT read — a port participates in
+// neither peer identification nor node naming; the listener-port dimensions
+// below are the older client_server_port / client_net_peer_port pair used only
+// by route resolution.
 type peerLabels struct {
 	serverAddress      string // client_server_address (checked first)
 	networkPeerAddress string // client_network_peer_address (checked second)
@@ -55,13 +55,12 @@ func peerLabelsOf(m model.Metric) peerLabels {
 }
 
 // serverPeerLabelsOf extracts the SERVER-side mirror bundle of one span-link
-// sample's metric (add-span-link-logical-edges): the exporter records the
-// consumer side's own broker peer address under server_-prefixed mirrors of
-// the client labels. v1 emits no server_network_peer_address and no
-// server_net_peer_port, so those fields stay empty — peerLabels.value() and
-// derivePort skip empty fields, which keeps the D1 precedence and the D5
-// port ladder applicable unchanged (one struct, two constructors, zero
-// forked logic).
+// sample's metric: the exporter records the consumer side's own broker peer
+// address under server_-prefixed mirrors of the client labels. v1 emits no
+// server_network_peer_address and no server_net_peer_port, so those fields stay
+// empty — peerLabels.value() and derivePort skip empty fields, which keeps the
+// peer-address precedence and the listener-port ladder applicable unchanged
+// (one struct, two constructors, zero forked logic).
 func serverPeerLabelsOf(m model.Metric) peerLabels {
 	return peerLabels{
 		serverAddress: string(m["server_server_address"]),
@@ -71,12 +70,11 @@ func serverPeerLabelsOf(m model.Metric) peerLabels {
 	}
 }
 
-// value returns the peer-address value under the D1 precedence
-// (resolve-unknown-server-network-peer-address): client_server_address first,
-// client_network_peer_address second, client_net_peer_name third. The first
-// non-empty wins outright — a non-empty higher-precedence label that fails to
-// classify does NOT fall through to a lower-precedence one. "" when all three
-// are absent.
+// value returns the peer-address value under the peer-address precedence:
+// client_server_address first, client_network_peer_address second,
+// client_net_peer_name third. The first non-empty wins outright — a non-empty
+// higher-precedence label that fails to classify does NOT fall through to a
+// lower-precedence one. "" when all three are absent.
 func (p peerLabels) value() string {
 	if p.serverAddress != "" {
 		return p.serverAddress
@@ -87,8 +85,8 @@ func (p peerLabels) value() string {
 	return p.netPeerName
 }
 
-// truncateBracketSuffix implements resolve-unknown-server-network-peer-address
-// D2: cut a peer-address value at the first '[' whose index is > 0, discarding
+// truncateBracketSuffix implements the bracket-suffix rule: cut a peer-address
+// value at the first '[' whose index is > 0, discarding
 // that byte and everything after it. Runs BEFORE splitPeerAddressPort so
 // net.SplitHostPort sees a well-formed authority.
 //
@@ -106,8 +104,7 @@ func (p peerLabels) value() string {
 // first-'[' cut would truncate that value to the empty string and regress a
 // peer that currently resolves. The guard is a property of the value's
 // shape, not of which label supplied it — this function is called uniformly
-// on all three peer-address labels, keeping the resolver provenance-free
-// (resolve-unknown-server-ip-peer D4).
+// on all three peer-address labels, keeping the resolver provenance-free.
 func truncateBracketSuffix(value string) string {
 	if i := strings.IndexByte(value, '['); i > 0 {
 		return value[:i]
@@ -124,9 +121,9 @@ func truncateBracketSuffix(value string) string {
 // bracketed shape this function handles correctly on its own — it strips the
 // brackets and the port together — which is why truncateBracketSuffix guards
 // index 0 rather than cutting unconditionally. This is the pre-change
-// stripPeerAddressPort with the port RETURNED instead of discarded (design D5
-// step 1); every classification caller keeps using the host alone, so their
-// behaviour is unchanged.
+// stripPeerAddressPort with the port RETURNED instead of discarded (step 1 of
+// the listener-port precedence); every classification caller keeps using the
+// host alone, so their behaviour is unchanged.
 func splitPeerAddressPort(value string) (host, port string) {
 	h, p, err := net.SplitHostPort(value)
 	if err != nil {
@@ -135,7 +132,7 @@ func splitPeerAddressPort(value string) (host, port string) {
 	return h, p
 }
 
-// derivePort implements the design-D5 listener-port precedence: (1) the
+// derivePort implements the listener-port precedence: (1) the
 // ":<port>" split off the peer-address value, (2) the optional
 // client_server_port then client_net_peer_port dimension, (3) 443. A value
 // that does not parse as a port number falls through to the next step.
@@ -157,8 +154,8 @@ func derivePort(hostPort string, p peerLabels) int {
 // the parse is permissive: brackets stripped, split on commas/semicolons/
 // whitespace, non-IP tokens dropped, order preserved, duplicates removed.
 // Order matters only for determinism of the joined key — the resolver selects
-// one ingress cluster per IP and requires the selections to agree (design
-// D10), which is order-free.
+// one ingress cluster per IP and requires the selections to agree, which is
+// order-free.
 func parseDNSAnswers(raw string) []string {
 	raw = strings.Trim(raw, "[]")
 	if raw == "" {
@@ -184,7 +181,7 @@ func parseDNSAnswers(raw string) []string {
 // The resolution instant is deliberately absent — it is constant per build — so
 // multiple samples naming the same (caller cluster, host, port, IPs) share
 // one engine invocation. The caller cluster stays a key dimension even though
-// it no longer scopes the store (design D11): two callers in different
+// it no longer scopes the store: two callers in different
 // clusters may legitimately resolve the same host to different ingress
 // clusters via the family-first selection. ips is the parsed answer list
 // joined by "," (order preserved from the label, so the key is a pure
@@ -216,7 +213,7 @@ type routeIndex map[routeKey]routeEntry
 // sample carries no peer-address value (nothing to resolve — the endpoint
 // drops exactly as before). Shared by the collectRouteQueries prescan and by
 // resolveUnknownServerPeer so the two can never derive different keys for the
-// same sample (design D2's anti-drift requirement).
+// same sample (the anti-drift requirement).
 func peerRouteKey(anchorCluster string, peer peerLabels) (routeKey, bool) {
 	value := peer.value()
 	if value == "" {
@@ -235,8 +232,7 @@ func peerRouteKey(anchorCluster string, peer peerLabels) (routeKey, bool) {
 }
 
 // request expands a routeKey back into the RouteRequest posed to the engine.
-// at is the build window's end — the single instant the engine evaluates at
-// (simplify-route-resolution-to-point-in-time D1).
+// at is the build window's end — the single instant the engine evaluates at.
 func (k routeKey) request(at time.Time) RouteRequest {
 	var ips []string
 	if k.ips != "" {
@@ -262,11 +258,11 @@ func (k routeKey) request(at time.Time) RouteRequest {
 // anchorHolds), so the two cannot drift. It materialises nothing: only the
 // resolver's immutable topology indexes are consulted.
 //
-// Collection deliberately covers ALL THREE external branches (design D3): a
+// Collection deliberately covers ALL THREE external branches: a
 // host no grammar matches, an IP literal with no ClusterIP hit, AND a
 // classified (namespace, service) the anchor cluster does not hold — the
 // branch a global FQDN like api.example.com actually takes. An endpoint with
-// no parseable client_dns_answers IP is NOT collected (design D6): the IPs
+// no parseable client_dns_answers IP is NOT collected: the IPs
 // select the ingress cluster, so without them the engine has nothing to
 // select with — the parse records route_engine_no_ip and falls external.
 func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
@@ -283,8 +279,8 @@ func collectRouteQueries(vec model.Vector, topology Topology) []routeKey {
 // peer value, an in-cluster classification the anchor holds, a Pod-IP-
 // resolvable host (an AMBIGUOUS family deliberately does not skip — the
 // parse falls external there, so the engine should get its chance), or no
-// destination IPs (design D6: the ingress cluster cannot be selected without
-// one) all yield ok=false — the parse never consults the route index for such
+// destination IPs (the ingress cluster cannot be selected without one) all
+// yield ok=false — the parse never consults the route index for such
 // an endpoint, so the engine must not be asked about it either. Shared by the
 // unknown-server collection branch and the span-link via-key branch so the
 // two cannot drift, and mirrored lookup-only by viaNodeID in the parse.
@@ -299,7 +295,7 @@ func (r *sgResolver) viaRouteKey(ownPod *graph.PodNode, peer peerLabels) (routeK
 	if ns, svc, classified := r.classifyPeerHost(key.host, ownPod.Labels()["namespace"], anchorCluster); classified && r.anchorHolds(anchorCluster, ns, svc) {
 		return routeKey{}, false
 	}
-	// Same reason, for the resolve-unknown-server-pod-ip-peer step: an IP
+	// Same reason, for the pod-IP peer step: an IP
 	// literal that resolves to a pod in the anchor cluster's family never
 	// reaches the parse's external fallback.
 	if pod, _ := r.lookupPeerPodIP(anchorCluster, key.host); pod != nil {
@@ -346,12 +342,12 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 			continue // wholly-empty side: the parse drops the series pre-resolution
 		}
 
-		// Span-link series (add-span-link-logical-edges): each side whose own
+		// Span-link series: each side whose own
 		// pod resolves may consult the route index for its broker peer address
 		// (viaNodeID in the parse), so its key must be collected — anchored on
 		// that side's own pod cluster. Mirrors the parse's no-consumer guard: a
 		// link series whose server side is the "unknown" sentinel with no
-		// resolvable pod contributes no via markers in the parse (design D6),
+		// resolvable pod contributes no via markers in the parse,
 		// so the link branch skips it here too — the unknown-server branch
 		// below still derives the identical key for the enrichment path, so
 		// the collected set is unchanged either way (`seen` would unify them).
@@ -390,7 +386,7 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 			add(key)
 		}
 	}
-	// Deterministic resolution order (D6): sorted, not vector-arrival order.
+	// Deterministic resolution order: sorted, not vector-arrival order.
 	slices.SortFunc(keys, func(a, b routeKey) int {
 		return cmp.Or(
 			cmp.Compare(a.callerCluster, b.callerCluster),
@@ -414,7 +410,7 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 // maxRouteKeys is a backstop against a build whose service graph carries an
 // unbounded number of distinct external FQDNs. Keys are resolved in the
 // prescan's deterministic sorted order, so the truncation point is a function of
-// the data rather than of scheduling — and it is always logged (design D5).
+// the data rather than of scheduling — and it is always logged.
 const (
 	routeResolveConcurrency = 4
 	maxRouteKeys            = 512
@@ -428,14 +424,14 @@ var errRouteCallTimeout = errors.New("route resolution exceeded its per-call tim
 // resolveRouteQueries answers the prescan's keys against the injected
 // RouteResolver with bounded concurrency, each call bounded by perCallTimeout
 // (zero = inherit ctx only). Errors and misses are recorded in the index —
-// never returned — so route resolution can never fail a build (design D9); the
+// never returned — so route resolution can never fail a build; the
 // parse logs the per-endpoint reason off the recorded entry.
 //
 // Concurrency cannot change the index's CONTENTS: entries are keyed by routeKey
 // and each key's answer is independent of every other key's. What it changes is
 // which keys are answered when the build deadline fires first — already
 // wall-clock dependent in the serial version, and a successful build answers
-// every key either way (design D5).
+// every key either way.
 //
 // With a resolver configured the returned index is ALWAYS non-nil (possibly
 // empty): nil means "engine off", non-nil-empty means "engine on, nothing
@@ -496,7 +492,7 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 				mu.Unlock()
 			}
 			// The error is deliberately swallowed: route resolution can never
-			// fail a build (design D9); it is recorded per key instead.
+			// fail a build; it is recorded per key instead.
 			return nil
 		})
 	}
@@ -517,7 +513,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		return nil, false // engine off: pre-change behaviour
 	}
 	if key.ips == "" {
-		// Design D6: no destination IPs ⇒ the prescan never asked the engine.
+		// No destination IPs ⇒ the prescan never asked the engine.
 		// Same outward result as engine-off (external), but with a distinct
 		// reason so the missing client_dns_answers dimension is visible.
 		r.noteExternal("route_engine_no_ip", t, "host", key.host, "port", key.port,
@@ -534,7 +530,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 	// through, a raw name is adopted while unambiguous, and anything else
 	// stands verbatim and simply misses the topology lookups below — degrading
 	// through the existing route_engine_dest_cluster_lacks_service path rather
-	// than a new outcome (design D9).
+	// than a new outcome.
 	dest := entry.dest
 	dest.Cluster = r.clusters.resolveForeign(dest.Cluster)
 
@@ -543,22 +539,20 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		r.noteExternal("route_engine_error", t, "host", key.host, "port", key.port,
 			"peer_address", value, "caller_cluster", key.callerCluster, "classify_reason", origReason)
 	case entry.outcome == RouteHit:
-		// Anchor on the engine-selected ingress cluster (design D11), which
-		// may differ from the caller's — the resulting pod-calls-service edge
-		// may cross clusters (design D12). The backend resolves FIRST
-		// (family-wide, unchanged): a backend topology miss keeps the
-		// existing external path with the ingress never materialised
-		// (route-hit-ingress-chain D3).
+		// Anchor on the engine-selected ingress cluster, which may differ
+		// from the caller's — the resulting pod-calls-service edge may cross
+		// clusters. The backend resolves FIRST (family-wide, unchanged): a
+		// backend topology miss keeps the existing external path with the
+		// ingress never materialised.
 		if ids := r.resolveServiceLevel(dest.Cluster, dest.Namespace, dest.Service); len(ids) > 0 {
 			chain := false
-			// When the destination carries the ingress LB Service identity
-			// and every chain precondition holds, the endpoint resolves to
-			// BOTH the ingress service and the backend: the caller's edges
-			// target the entry point AND the routed backend directly (so the
+			// When the destination carries the ingress LB Service identity and
+			// every chain precondition holds, the endpoint resolves to BOTH the
+			// ingress service and the backend: the caller's edges target the
+			// entry point AND the routed backend directly (so the
 			// caller→backend dependency survives the ingress hop), while the
-			// locked-cluster ingress pods fan in between
-			// (route-hit-ingress-chain D5). Any precondition failure keeps
-			// ids = the backend alone — today's direct shape.
+			// locked-cluster ingress pods fan in between. Any precondition
+			// failure keeps ids = the backend alone — today's direct shape.
 			if chainIDs, ok := r.resolveRouteChain(dest, ids[0], t); ok {
 				chainIDs = append(chainIDs, ids[0]) // [ingress, backend]
 				ids, chain = chainIDs, true
@@ -580,14 +574,13 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 			"host", key.host, "port", key.port, "ingress_cluster", dest.Cluster,
 			"caller_cluster", key.callerCluster)
 	case entry.outcome == RouteIngressLBService:
-		// The ingress-lb-service-fallback destination is the LB entry point
+		// The ingress LB-Service fallback destination is the LB entry point
 		// itself — "which ingress LB Service owns this IP" — so its
 		// service-selects-pod fan-out is LOCKED to the selected cluster's own
 		// endpoints (the pods actually behind the IP; a family sibling's
-		// same-named Service is not — route-hit-ingress-chain D2). No
-		// synthesized edges: there is no routed backend behind the entry
-		// point. The outcome dimension in the log keeps the coarser
-		// semantics distinguishable from a routed hit.
+		// same-named Service is not). No synthesized edges: there is no routed
+		// backend behind the entry point. The outcome dimension in the log
+		// keeps the coarser semantics distinguishable from a routed hit.
 		if ids := r.resolveServiceLevelInCluster(dest.Cluster, dest.Namespace, dest.Service); len(ids) > 0 {
 			r.markIngressService(ids[0], roleIngressLB)
 			slog.Debug("service-graph unknown-server peer resolved via route engine",
@@ -603,7 +596,7 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 			"host", key.host, "port", key.port, "ingress_cluster", dest.Cluster,
 			"caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoListenerOnPort:
-		// The design-D5 mis-derived-port signature, kept distinct from an
+		// The mis-derived-listener-port signature, kept distinct from an
 		// ordinary route miss so operators can spot a bad port guess.
 		r.noteExternal("route_engine_no_listener_on_port", t, "host", key.host,
 			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
@@ -613,19 +606,19 @@ func (r *sgResolver) routeIndexResolve(key routeKey, value, origReason string, t
 		r.noteExternal("route_engine_no_server_for_host", t, "host", key.host,
 			"port", key.port, "peer_address", value, "caller_cluster", key.callerCluster)
 	case entry.outcome == RouteNoIngress:
-		// Design D10: no cluster had an ingress Service carrying any of the
+		// No cluster had an ingress Service carrying any of the
 		// destination IPs at the resolution instant.
 		r.noteExternal("route_engine_no_ingress", t, "host", key.host, "port", key.port,
 			"ips", key.ips, "peer_address", value, "caller_cluster", key.callerCluster,
 			"classify_reason", origReason)
 	case entry.outcome == RouteAmbiguousIngress:
-		// Design D10: candidates could not be reduced to one cluster
+		// Ingress-cluster selection: candidates could not be reduced to one cluster
 		// (unresolvable tie or disagreeing multi-IP selections).
 		r.noteExternal("route_engine_ambiguous_ingress_cluster", t, "host", key.host,
 			"port", key.port, "ips", key.ips, "peer_address", value,
 			"caller_cluster", key.callerCluster, "classify_reason", origReason)
 	case entry.outcome == RouteAmbiguousIngressService:
-		// ingress-lb-service-fallback: the Istio pipeline missed at gateway
+		// Ingress LB-Service fallback: the Istio pipeline missed at gateway
 		// resolution and the destination IPs matched MORE than one ingress LB
 		// Service identity in the selected cluster at the instant — degrade rather
 		// than guess, mirroring the ambiguous-ingress-cluster spirit.

@@ -26,12 +26,12 @@ const (
 // bytesPerMB scales a QoS fixed policy's megabytes-per-second ceiling to bytes
 // per second, so max_bytes_per_sec carries the unit of the measured
 // read_bytes_per_sec / write_bytes_per_sec and the two compare directly
-// (design.md D2 — the ONE value in this resolver not read verbatim).
+// (the ONE value in this resolver not read verbatim).
 // Basis: ONTAP expresses QoS throughput limits in binary megabytes.
 const bytesPerMB = 1048576
 
 // volumeLabelCandidate is one Harvest volume_labels sample — hop A of the
-// storage join (design.md D3). This series is the SOLE source of the storage
+// storage join. This series is the SOLE source of the storage
 // topology; its sample value is discarded and only its labels are consumed.
 type volumeLabelCandidate struct {
 	ontapCluster string
@@ -47,7 +47,7 @@ type volumeLabelCandidate struct {
 // aggr/node dimension, which is exactly why hop A exists. It DOES carry the
 // policy group: `volume_labels` states no policy identity, so this is the only
 // upstream statement of which QoS policy governs this FlexVol, and hop C's key
-// takes that one component from here (design.md D9).
+// takes that one component from here.
 type qosCandidate struct {
 	ontapCluster string
 	svm          string
@@ -58,7 +58,7 @@ type qosCandidate struct {
 	// SAN backend the QoS policy is attached to the LUN, and the FlexVol's own
 	// workload falls into ONTAP's built-in `User-Best_effort` class, which
 	// declares no ceiling. Measurement therefore reads volume-level candidates
-	// only while the policy pick reads every one (design.md D11).
+	// only while the policy pick reads every one.
 	lun string
 	// volume is the FlexVol name the row was indexed under; with the fields
 	// above and the family it names one workload apart from its zone.
@@ -67,7 +67,7 @@ type qosCandidate struct {
 	value  float64
 	// zone is the (az, env) pair the series carries. The zero zone is unknown.
 	// Hop B keeps one zone per workload so a workload labelled under several
-	// pairs is counted once (drop-harvest-zone-matchers D3).
+	// pairs is counted once.
 	zone zone
 }
 
@@ -85,8 +85,7 @@ func (c qosCandidate) workload() qosWorkload {
 // pvcVolume is a PVC that carries a non-empty volumename (the join key). Its
 // zone is the (az, env) pair its kube_persistentvolumeclaim_info series carries
 // (the zero zone when either label is absent). A claim prefers FlexVols of its
-// own zone and falls back to every matched series when none agree
-// (drop-harvest-zone-matchers D2).
+// own zone and falls back to every matched series when none agree.
 type pvcVolume struct {
 	id, volumeName string
 	zone           zone
@@ -124,7 +123,7 @@ type netappResult struct {
 // and `data.perf` are resolved exactly once, in one place.
 //
 // Each slice is sorted by node id and de-duplicated, so the inventory is a pure
-// function of the vectors rather than of their order (D6).
+// function of the vectors rather than of their order (deterministic body).
 //
 // Sources, deliberately different per entity kind:
 //   - Nodes — volume_labels' `node`, plus node_new_status, node_labels and the
@@ -134,7 +133,7 @@ type netappResult struct {
 //     aggregate serving no claim is exactly the flowless-root case.
 //   - SVMs — volume_labels ONLY. No other Harvest leg this build reads names an
 //     SVM, and the QoS workload families' `svm` is a scope test rather than an
-//     identity statement (design.md D9 re-keyed the ceiling's svm onto hop A).
+//     identity statement (the ceiling's svm is keyed from hop A).
 type NetAppInventory struct {
 	Nodes []*graph.NetAppNode
 	Aggrs []*graph.NetAppAggrNode
@@ -183,7 +182,7 @@ func aggrKeyOf(m model.Metric) (aggrKey, bool) {
 	return aggrKey{oc, aggr}, true
 }
 
-// resolveNetAppStorage runs the three-hop storage join of design.md D3:
+// resolveNetAppStorage runs the three-hop storage join:
 //
 //	hop A  volume_labels             → edge + aggregate + controller + PVC svm
 //	hop B  qos_* workload families   → the six measured I/O figures
@@ -191,7 +190,7 @@ func aggrKeyOf(m model.Metric) (aggrKey, bool) {
 //
 // The hops degrade independently: a hop-B miss leaves a valid measurement-less
 // edge rather than erasing the claim's storage topology. Pure except for the
-// two aggregated coverage warnings (D8).
+// two aggregated coverage warnings.
 //
 // A claim's candidate set — the matched series every pick runs over — is its
 // agreeing matches when it has any, and every match otherwise (zonesAgree: an
@@ -224,7 +223,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	volIndex := map[string][]volumeLabelCandidate{}
 	// Each match keeps its agreement bit. After the pass a claim keeps the
 	// agreeing matches when it has any, and every match otherwise — a filer
-	// labelled with another pair still joins (drop-harvest-zone-matchers D2).
+	// labelled with another pair still joins.
 	type claimMatch struct {
 		cand   volumeLabelCandidate
 		vol    string
@@ -278,7 +277,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	// A claim matching several FlexVol names gathers its QoS candidates in
 	// sorted name order, so the float summation order — and therefore the last
 	// bits of every I/O figure — is a pure function of the matched set rather
-	// than of upstream vector order (D6).
+	// than of upstream vector order (deterministic body).
 	for i := range volsByClaim {
 		slices.Sort(volsByClaim[i])
 	}
@@ -303,7 +302,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	// FlexVol naming is exactly the coverage failure these signals exist to
 	// surface.
 	topoPresent := len(volumeLabels) > 0
-	// Under a RESTRICTED read (scope-volume-labels-by-storage-root) the count
+	// Under a RESTRICTED (storage-root-scoped) read the count
 	// is taken over the claims that MATCHED something, not over every loaded
 	// claim: a claim with no candidate at all is off the rooted components —
 	// the request did not ask about it — and counting it would fire the signal
@@ -356,7 +355,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 		}
 		// The in-scope rows, one zone per workload, supply both the ceiling and
 		// the I/O sums. A new slice: the index is shared across claims and must
-		// not be mutated (drop-harvest-zone-matchers D3).
+		// not be mutated.
 		qcands := preferQoSZone(qosCandidatesFor(volsByClaim[i], qosIndex), c.zone, keyOC, svm)
 		ceiling := resolveCeiling(qcands, policyIndex, keyOC, svm)
 		if ceiling != nil {
@@ -415,7 +414,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 	// The join-only half: the aggregates claims actually landed on, and the
 	// controllers those aggregates name as their owner. `hits` iterates in map
 	// order, so nothing here may depend on which claim is seen first — every
-	// value comes from the order-free index (D6).
+	// value comes from the order-free index (deterministic body).
 	aggrSeen := map[aggrKey]*graph.NetAppAggrNode{}
 	for _, hit := range hits {
 		if a, ok := idx.aggrByKey[aggrKey{hit.oc, hit.aggr}]; ok {
@@ -469,7 +468,7 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 }
 
 // buildNetAppIndexes materialises every NetApp entity the Harvest read named,
-// join-independent (design.md D2), and returns them both as sorted slices and
+// join-independent, and returns them both as sorted slices and
 // keyed for lookup. It is a pure function of the vectors: each set is
 // accumulated insert-only and then sorted, so upstream order cannot reach the
 // output.
@@ -751,10 +750,10 @@ func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOM
 // nothing — absence means "no declared ceiling" and is never rendered as a
 // number. The key is IGNORED when incomplete, never widened: borrowing another
 // policy group's figure from the same SVM would name a limit this volume does
-// not have (design.md D9).
+// not have.
 //
 // The floats are copied, not aliased: one index entry serves EVERY claim in the
-// SVM (D9 widened the key from a policy group to the pair), so handing out the
+// SVM (the key is per SVM and policy group, not per claim), so handing out the
 // index's own pointers would make all of them one shared mutable cell.
 func resolveCeiling(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, svm string) *graph.QoSCeiling {
 	if oc == "" || svm == "" {
@@ -867,25 +866,25 @@ func pickSVM(cands []volumeLabelCandidate, oc string) (string, string) {
 // svm, the policy group exists ONLY on these series — volume_labels carries no
 // policy identity.
 //
-// Candidates are read at BOTH granularities, LUN rows included (design.md
-// D11). On a SAN backend the QoS policy is attached to the LUN while the
-// FlexVol's own workload falls into ONTAP's built-in `User-Best_effort` class,
-// which by definition declares no ceiling and therefore has no fixed-policy
-// series. Restricting the pick to volume-level rows would resolve that
-// built-in class and stop there. sumQoSIO still sums volume-level rows only,
-// so admitting LUN rows here cannot affect a measurement.
+// Candidates are read at BOTH granularities, LUN rows included. On a SAN
+// backend the QoS policy is attached to the LUN while the FlexVol's own
+// workload falls into ONTAP's built-in `User-Best_effort` class, which by
+// definition declares no ceiling and therefore has no fixed-policy series.
+// Restricting the pick to volume-level rows would resolve that built-in class
+// and stop there. sumQoSIO still sums volume-level rows only, so admitting LUN
+// rows here cannot affect a measurement.
 //
 // The pick therefore PREFERS a policy the fixed-policy index actually holds,
 // falling back to the lexically-smallest non-empty value when none resolves —
 // which is the honest answer (the volume really is in that class) and leaves
 // resolveCeiling resolving nothing, exactly as before. Both passes take the
-// lexically-smallest candidate, so the result is order-free (D6). The rule is
+// lexically-smallest candidate, so the result is order-free. The rule is
 // data-driven rather than a hardcoded list of ONTAP's built-in class names,
 // which vary by release.
 //
 // A candidate with no `svm` label of its own still contributes: the key's svm
 // comes from hop A, so such a series measures the edge AND reaches hop C
-// (design.md D9). cands are preferQoSZone's output, so every one is in scope.
+// as well. cands are preferQoSZone's output, so every one is in scope.
 func pickPolicy(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, svm string) string {
 	var resolving, any string
 	for _, c := range cands {
@@ -913,7 +912,7 @@ func pickPolicy(cands []qosCandidate, index map[policyKey]*graph.IOMetrics, oc, 
 // colliding across two filers sharing one VictoriaMetrics would otherwise be
 // double-counted onto this edge. The svm must match too when BOTH sides
 // resolved one; a candidate with no svm label still measures the volume and is
-// kept — and, since D9 takes the ceiling key's svm from hop A, such a candidate
+// kept — and, since the ceiling key's svm comes from hop A, such a candidate
 // can still contribute its policy group.
 func qosInScope(c qosCandidate, oc, svm string) bool {
 	if c.ontapCluster != oc {
@@ -1025,7 +1024,7 @@ func healthByAggr(vec model.Vector) map[aggrKey]string {
 //
 // Each field resolves independently to the lexically-smallest NON-EMPTY value
 // seen for that key, so a duplicate series (a poller restart inside the
-// window, two Harvest instances scraping one filer) is order-free (D6) and a
+// window, two Harvest instances scraping one filer) is order-free and a
 // series that carries only some of the fields cannot blank out a sibling that
 // carried the rest. A key whose every field stayed empty yields no entry at
 // all, so the attribute is omitted rather than serialised as an object of

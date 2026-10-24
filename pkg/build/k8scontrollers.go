@@ -19,7 +19,7 @@ import (
 // second reads the Deployments and CronJobs only the first stage's
 // ReplicaSet-owner and Job-owner rows reveal.
 //
-// The second stage is read AHEAD of the first (design D6). The Deployment and
+// The second stage is read AHEAD of the first. The Deployment and
 // CronJob controllers name what they create after themselves — a ReplicaSet
 // `<deployment>-<pod-template-hash>`, a Job `<cronjob>-<scheduled-time>` — so
 // the names the first stage is about to resolve can be guessed from the pods'

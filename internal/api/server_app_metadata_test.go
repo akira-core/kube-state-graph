@@ -28,7 +28,7 @@ import (
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
-// appMetadataSource is the D1 default binding the component tests configure.
+// appMetadataSource is the default binding the component tests configure.
 func appMetadataSource() *promql.AppMetadataSource {
 	return &promql.AppMetadataSource{
 		Metric:    "argocd_app_pod_info",

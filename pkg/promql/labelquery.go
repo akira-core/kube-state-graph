@@ -101,7 +101,7 @@ func (r *Router) QueryLabels(ctx context.Context, req LabelQuery) ([]map[string]
 
 	// De-duplication happens here rather than in the vector merge: that merge
 	// keys on the full label set INCLUDING __name__, and whether an upstream
-	// preserves __name__ through a rolling function varies by engine (D7). Two
+	// preserves __name__ through a rolling function varies by engine. Two
 	// backends of different engines holding one series would otherwise survive
 	// the merge as two fingerprints and land in the result twice.
 	entries := labelSetsOf(vec)

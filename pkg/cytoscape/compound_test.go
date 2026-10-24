@@ -40,7 +40,7 @@ func assertNoClusterGroup(t *testing.T, nodes map[string]NodeData) {
 
 // Full workload hierarchy: cluster > namespace > application > controller > pod.
 // The pod→node relationship is an edge now (the node parents to the cluster, not
-// the pod to the node). Supersedes the D31 cluster > node > pod nesting.
+// the pod to the node). Supersedes the earlier cluster > node > pod nesting.
 func TestSerialiseCytoscape_WorkloadHierarchy(t *testing.T) {
 	pod := &graph.PodNode{
 		IDValue:          "c1/p1",
@@ -207,7 +207,7 @@ func TestSerialiseCytoscape_ServiceApplicationWithoutNamespaceFallsBack(t *testi
 }
 
 // End-to-end (project → serialise): under a namespace filter the host K8s node
-// is retained because it hosts an in-scope pod (D6), and the pod nests under its
+// is retained because it hosts an in-scope pod, and the pod nests under its
 // namespace group while the node parents to the cluster group.
 func TestSerialiseCytoscape_NamespaceFilterKeepsHostNode(t *testing.T) {
 	pod := &graph.PodNode{IDValue: "c1/p1", NameValue: "checkout", LabelsValue: map[string]string{"cluster": "c1", "namespace": "shop", "node": "c1/worker-0"}}
@@ -227,7 +227,7 @@ func TestSerialiseCytoscape_NamespaceFilterKeepsHostNode(t *testing.T) {
 }
 
 // Cluster group nodes are emitted first, sorted by cluster name, so the body
-// stays byte-deterministic (D6).
+// stays byte-deterministic.
 func TestSerialiseCytoscape_ClusterNodesSortedFirst(t *testing.T) {
 	a := &graph.PodNode{IDValue: "c-beta/p1", NameValue: "p", LabelsValue: map[string]string{"cluster": "c-beta"}}
 	b := &graph.PodNode{IDValue: "c-alpha/p2", NameValue: "p", LabelsValue: map[string]string{"cluster": "c-alpha"}}

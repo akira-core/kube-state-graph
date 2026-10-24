@@ -17,12 +17,12 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// Spec: "A multi-zone body is the union of its zones" (accept-multi-zone-storage-graph
-// D5). One mocked estate holds two zones that both run a cluster named c1, both
-// serve an aggregate `aggr1` and a FlexVol `trident_pvc_orders`, and zone-b
-// recreated its `shop/db-0` on another node. The same request is built for
-// zone-a, for zone-b and for both, and the third body must be the union of the
-// first two — every element, edge weights included.
+// Spec: "A multi-zone body is the union of its zones". One mocked estate holds
+// two zones that both run a cluster named c1, both serve an aggregate `aggr1`
+// and a FlexVol `trident_pvc_orders`, and zone-b recreated its `shop/db-0` on
+// another node. The same request is built for zone-a, for zone-b and for both,
+// and the third body must be the union of the first two — every element, edge
+// weights included.
 
 var harvestFamilies = []promql.Query{
 	promql.QVolumeLabels, promql.QQoSReadOps, promql.QQoSWriteOps, promql.QQoSReadLatency,

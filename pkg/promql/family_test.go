@@ -110,8 +110,7 @@ func TestParseFamily(t *testing.T) {
 
 // TestFamilyAcceptsAZ pins the zone-routable set. The service-graph and probe
 // families accept no request dimension, so backend selection must never narrow
-// them by zone — narrowing them would drop edges the loaded topology needs
-// (design D4).
+// them by zone — narrowing them would drop edges the loaded topology needs.
 func TestFamilyAcceptsAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.AcceptsAZ())
 	assert.True(t, FamilyKubelet.AcceptsAZ())
@@ -124,8 +123,8 @@ func TestFamilyAcceptsAZ(t *testing.T) {
 }
 
 // TestFamilyRendersAZ pins the matcher bit. ksm, kubelet and alerts render
-// the az matcher; harvest is zone-routed without it (drop-harvest-zone-matchers
-// D1); servicegraph / probe do neither.
+// the az matcher; harvest is zone-routed without it; servicegraph / probe do
+// neither.
 func TestFamilyRendersAZ(t *testing.T) {
 	assert.True(t, FamilyKSM.RendersAZ())
 	assert.True(t, FamilyKubelet.RendersAZ())

@@ -4,7 +4,7 @@
 // would — but against the already-loaded rows, with no further DB round-trips.
 //
 // Route resolution evaluates the ingress configuration at ONE instant — the
-// build window's end (simplify-route-resolution-to-point-in-time D1) — so this
+// build window's end — so this
 // package has no notion of segments, version boundaries, or config-signature
 // dedup: every accessor answers as of the snapshot's own `at`.
 //
@@ -49,8 +49,7 @@ func New(w store.TrafficSnapshot, at time.Time) *Snapshot {
 // ResolveIPToGateways runs the 3-hop selector join for a destination IP as of
 // the snapshot's instant: IP -> ingress Service (selector) -> ingress Deployment
 // pod labels L -> gateways whose selector ⊆ L AND whose namespace is the
-// ingress Service's own. Hop 3 is namespace-scoped
-// (scope-gateway-candidates-to-ingress-namespace): Istio's cross-namespace
+// ingress Service's own. Hop 3 is namespace-scoped: Istio's cross-namespace
 // gateway attachment is deliberately out of scope, so within a resolution the
 // candidate set can never hold two same-named Gateways (K8s per-namespace name
 // uniqueness) and the bare-name identity downstream is unambiguous. Empty
@@ -60,7 +59,7 @@ func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
 	// live identity carrying the IP means the question "which Service owns this
 	// address" has no answer, so the hop degrades rather than taking whichever
 	// row the store returned first — the same rule the ingress LB Service
-	// identity dedup already applies to this exact situation (design D4). A
+	// identity dedup already applies to this exact situation. A
 	// single identity with several rows is only a defensive case (liveness is
 	// exclusive per version slot); the lexically-smallest selector wins, per the
 	// repo-wide determinism convention.
@@ -74,7 +73,7 @@ func (s *Snapshot) ResolveIPToGateways(ip string) []store.GatewayCand {
 	// gateway upgrade runs two whose pods both satisfy the Service selector — so
 	// the hop takes the UNION of their labels rather than one Deployment's set.
 	// That is also what the store query itself computes (labelUnion), and hop 3
-	// is a subset test over the result (design D4).
+	// is a subset test over the result.
 	var podLabels []string
 	found = false
 	seen := map[string]bool{}
@@ -174,7 +173,7 @@ func (s *Snapshot) ResolveIPToIngressServices(ip string) []store.ServiceRow {
 // candidates across IPs). Matching by name alone could select a same-named
 // Gateway from another namespace — and since the selected row's namespace also
 // decides which VirtualServices bind to it, that yielded a WRONG destination
-// rather than a miss (design D3).
+// rather than a miss.
 func (s *Snapshot) ScopedFor(gwNS, gwName string) (translate.ScopedInput, bool, error) {
 	var gw *store.GatewayRow
 	for i := range s.w.Gateways {
@@ -194,7 +193,7 @@ func (s *Snapshot) ScopedFor(gwNS, gwName string) (translate.ScopedInput, bool, 
 	// Domain is what production's config store stamps on every config it serves,
 	// and istiod needs it to finish resolving a short destination.host: without
 	// it ResolveShortnameToFQDN appends only the namespace, yielding `<svc>.<ns>`
-	// — neither a short name nor an FQDN, and unparseable downstream (design D2).
+	// — neither a short name nor an FQDN, and unparseable downstream.
 	cfgs := []config.Config{{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.Gateway,
@@ -210,7 +209,7 @@ func (s *Snapshot) ScopedFor(gwNS, gwName string) (translate.ScopedInput, bool, 
 	// translation. Resolver.loadSnapshot already dedups its multi-IP union, but
 	// store.Store is an interface and this package's contract is to answer
 	// exactly what a point-in-time query would — so the invariant is enforced
-	// here too (design D1).
+	// here too.
 	seen := map[string]bool{gvk.Gateway.String() + "|" + gw.Namespace + "|" + gwName: true}
 
 	var destHosts []string

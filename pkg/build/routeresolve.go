@@ -8,16 +8,16 @@ import (
 // RouteRequest is one route-resolution question posed to a RouteResolver: which
 // Kubernetes Service did the Istio ingress config route (Host, Path, Port) to
 // AT the instant At? The ingress cluster is not an input — the resolver
-// selects it from the destination IPs (design D10), with CallerCluster feeding
+// selects it from the destination IPs, with CallerCluster feeding
 // only the family key and the collision tie-break.
 //
 // It is assembled by the collectRouteQueries prescan in ReadServiceGraph for
 // every server="unknown" endpoint that would otherwise fall back to an
-// external node (the translate-global-fqdn-to-k8s-service change, design D2/D3).
+// external node.
 type RouteRequest struct {
 	// CallerCluster is the already-resolved client pod's own cluster. It is
 	// used ONLY to derive the cluster-family key and to break candidate ties
-	// during ingress-cluster selection (design D10/D11) — it never scopes a
+	// during ingress-cluster selection — it never scopes a
 	// route-store snapshot load by itself.
 	CallerCluster string
 	// Host is the peer FQDN with any trailing ":<port>" already split off.
@@ -27,20 +27,20 @@ type RouteRequest struct {
 	Path string
 	// Port is the ingress listener port; it selects WHICH RouteConfiguration
 	// (http.<port> / https.<port>...) the gateway config is translated to.
-	// Derived per design D5: peer-address ":<port>" → optional
+	// Derived by the listener-port precedence: peer-address ":<port>" → optional
 	// client_server_port / client_net_peer_port label → default 443.
 	Port int
 	// IPs are the destination IPs from the client_dns_answers dimension.
-	// They are REQUIRED (design D6): they select the ingress cluster before
+	// They are REQUIRED: they select the ingress cluster before
 	// any snapshot is loaded, and the prescan never emits an IP-less request —
 	// an endpoint with no parseable IP falls external without consulting the
 	// engine at all.
 	IPs []string
 	// At is the instant the config is evaluated at: the END of the build's own
-	// time window (simplify-route-resolution-to-point-in-time D1), the same
-	// instant the service-graph samples are evaluated at. The resolver consults
-	// exactly the resource versions live at At — it never resolves per-version
-	// across the window, so exactly one outcome is produced.
+	// time window, the same instant the service-graph samples are evaluated at.
+	// The resolver consults exactly the resource versions live at At — it never
+	// resolves per-version across the window, so exactly one outcome is
+	// produced.
 	At time.Time
 }
 
@@ -49,7 +49,7 @@ type RouteRequest struct {
 // names, in the engine-selected ingress cluster. Cluster, Namespace and
 // Service feed the graph — the triple is handed to resolveServiceLevel, the
 // same family-wide resolution every other service path uses, anchored on
-// Cluster (design D11). The ingress ENTRY POINT (the chain's first hop, and the
+// Cluster. The ingress ENTRY POINT (the chain's first hop, and the
 // LB fallback's destination) instead goes through the locked-cluster variant:
 // an ingress address is per-cluster, so a family sibling's same-named Service
 // is not behind it. Port and Subset are parsed but unused in v1 (labels
@@ -57,7 +57,7 @@ type RouteRequest struct {
 // change).
 type RouteDestination struct {
 	// Cluster is the ingress cluster the engine selected from the destination
-	// IPs (design D10) — the cluster whose Gateway + VirtualService config
+	// IPs — the cluster whose Gateway + VirtualService config
 	// produced this destination, and the cluster the parse anchors on. It may
 	// differ from the caller's cluster.
 	Cluster   string
@@ -68,13 +68,12 @@ type RouteDestination struct {
 
 	// IngressNamespace / IngressService identify the ingress LB Service the
 	// destination IPs uniquely mapped to in the selected cluster's snapshot —
-	// the entry-point hop in front of the routed backend
-	// (route-hit-ingress-chain D1). Populated on RouteHit when the snapshot
-	// pins exactly one identity (same as-of dedup as the LB fallback)
-	// and, for uniformity, on RouteIngressLBService (where they equal
-	// Namespace/Service). Empty when no unique identity exists — the parse
-	// then degrades to the direct caller→backend shape; an ambiguous or
-	// absent identity NEVER demotes a hit.
+	// the entry-point hop in front of the routed backend. Populated on RouteHit
+	// when the snapshot pins exactly one identity (same as-of dedup as the LB
+	// fallback) and, for uniformity, on RouteIngressLBService (where they equal
+	// Namespace/Service). Empty when no unique identity exists — the parse then
+	// degrades to the direct caller→backend shape; an ambiguous or absent
+	// identity NEVER demotes a hit.
 	IngressNamespace string
 	IngressService   string
 }
@@ -82,9 +81,9 @@ type RouteDestination struct {
 // RouteOutcome classifies one ResolveRoute answer. Every non-hit degrades to
 // the caller's existing external-node fallback; the outcome only picks WHICH
 // diagnostic reason is recorded, so a mis-derived listener port
-// (RouteNoListenerOnPort, design D5) is distinguishable in the logs from a
+// (RouteNoListenerOnPort) is distinguishable in the logs from a
 // host no gateway serves, a path no route matches, or an ingress-cluster
-// selection that found nothing / could not converge (design D10).
+// selection that found nothing / could not converge.
 type RouteOutcome string
 
 const (
@@ -96,7 +95,7 @@ const (
 	RouteNoGateway RouteOutcome = "no_gateway"
 	// RouteNoListenerOnPort — a gateway serves the host, but NO server
 	// listens on the derived port at all (or the server winning the host
-	// there has no HTTP RDS route: TLS passthrough, TCP). The design-D5
+	// there has no HTTP RDS route: TLS passthrough, TCP). The listener-port
 	// signature of a mis-guessed port. Mutually exclusive with
 	// RouteNoServerForHost, which fires only when servers DO listen on the
 	// port.
@@ -113,18 +112,18 @@ const (
 	// the matched cluster string was not a parseable in-cluster Service).
 	RouteNoRoute RouteOutcome = "no_route"
 	// RouteNoIngress — no cluster had an ingress Service carrying any of the
-	// destination IPs live at the request instant (design D10). Occurs before
+	// destination IPs live at the request instant. Occurs before
 	// any snapshot is loaded.
 	RouteNoIngress RouteOutcome = "no_ingress"
 	// RouteAmbiguousIngress — the ingress-cluster candidates could not be
 	// reduced to one cluster by the family-first selection (an unresolvable
-	// tie, or multi-IP selections that disagree — design D10). Occurs before
+	// tie, or multi-IP selections that disagree). Occurs before
 	// any snapshot is loaded. Deliberately degrades rather than guessing:
 	// never a wrong cluster.
 	RouteAmbiguousIngress RouteOutcome = "ambiguous_ingress_cluster"
 	// RouteIngressLBService — the Istio pipeline missed, but the destination
 	// IPs map to exactly ONE ingress LB Service inside the selected ingress
-	// cluster's snapshot (the ingress-lb-service-fallback change). The
+	// cluster's snapshot (the ingress LB-Service fallback). The
 	// destination is that Service — the LB *entry point* (e.g. an nginx ingress
 	// controller's Service), NOT a routed backend: host, path, and port play no
 	// part. Resolved by the parse exactly like RouteHit.
@@ -143,7 +142,7 @@ const (
 // resolution existed. This is the default and the regression safety net.
 //
 // The concrete implementation lives in pkg/route, which pkg/build MUST NOT
-// import (design D1 — dependency hygiene: pkg/route links istio.io/istio,
+// import (dependency hygiene: pkg/route links istio.io/istio,
 // clickhouse-go, and envoy protos, and an embedder of pkg/kubegraph must not
 // inherit them). Only cmd/kube-state-graph (or an embedder that opts in)
 // constructs one and injects it via Options.RouteResolver.

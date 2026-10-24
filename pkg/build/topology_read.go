@@ -57,7 +57,7 @@ func renderTopologyQuery(name promql.Query, src *promql.AppMetadataSource, windo
 // ReadTopology runs the topology queries in parallel and assembles the
 // result.
 //
-// The service / endpointslice queries (D29) are best-effort: an upstream that
+// The service / endpointslice queries are best-effort: an upstream that
 // does not export them (older KSM, or KSM started without
 // --resources=services,endpointslices) yields empty indexes, and "://"
 // connection-string endpoints simply fall back to `external/<label>`.
@@ -65,9 +65,9 @@ func renderTopologyQuery(name promql.Query, src *promql.AppMetadataSource, windo
 // semantics (a non-NetApp deployment must build cleanly). Existing KSM
 // legs keep abort-on-error semantics, except kube_replicaset_annotations
 // and kube_job_annotations whose cardinality accumulates with history
-// (harden-controller-annotation-legs D3) and kube_pod_container_info whose
-// cardinality multiplies with containers, image variants and pod churn
-// (harden-topology-read-cardinality D1); all three degrade like Harvest.
+// and kube_pod_container_info whose
+// cardinality multiplies with containers, image variants and pod churn;
+// all three degrade like Harvest.
 //
 // ReadTopology is the /v1/graph read: every leg, every pod (fullPlan). The
 // storage build reads through the same fan-out under storagePlan.
@@ -210,7 +210,7 @@ func readTopology(
 	// Second-wave prerequisites. Each is closed when its leg returns, whatever it
 	// returns (signalWhenDone), so a scoped wave starts as soon as the families
 	// its scope is computed from land instead of behind the slowest
-	// kube-state-metrics leg (design D5 of the scoped QoS read).
+	// kube-state-metrics leg.
 	pvcInfoDone, volumeLabelsDone, bindingsDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	pvcAnnotationsDone := make(chan struct{})
 	signals := map[promql.Query]chan struct{}{
@@ -388,18 +388,18 @@ func readTopology(
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
 	// kube_node_* families and the eight controller-owner /
-	// controller-annotation families are three more second waves
-	// (scope-controller-legs-by-reference): pods restricted to the pods a
-	// claim-binding series names plus the request's pod roots, issued once
-	// the binding family has landed; nodes and controllers each restricted to
-	// what the LOADED pods name, issued once the pod wave has landed (podsDone
-	// closes on every return path of readScopedPods, success or failure, so
-	// the two later waves compute an empty scope and issue nothing rather
-	// than block forever when the pod wave fails). The application-metadata
-	// read is one more wave beside the controllers: it waits on that same pod
-	// wave and on the claim-info read, then restricts the metric to the union
-	// of their namespaces. storageSkippedLegs keeps the unscoped first-wave
-	// copy from running; this wave does not consult that skip set.
+	// controller-annotation families are three more second waves: pods
+	// restricted to the pods a claim-binding series names plus the request's
+	// pod roots, issued once the binding family has landed; nodes and
+	// controllers each restricted to what the LOADED pods name, issued once the
+	// pod wave has landed (podsDone closes on every return path of
+	// readScopedPods, success or failure, so the two later waves compute an
+	// empty scope and issue nothing rather than block forever when the pod wave
+	// fails). The application-metadata read is one more wave beside the
+	// controllers: it waits on that same pod wave and on the claim-info read,
+	// then restricts the metric to the union of their namespaces.
+	// storageSkippedLegs keeps the unscoped first-wave copy from running; this
+	// wave does not consult that skip set.
 	switch plan.kind {
 	case graph.StorageRootNode:
 		if len(plan.nodeRoots) > 0 && !plan.readsK8sWorkload() {
@@ -476,12 +476,11 @@ func readTopology(
 // selector demonstrably matches the deployment's labelling, yet a kubelet
 // family came back empty. A family is reported ONLY when a dimension the
 // request actually carries reaches it (promql.Selector.Reaches). In practice
-// that is the kubelet pair alone. The Harvest families carry no request
-// matcher — az only routes them (drop-harvest-zone-matchers D1) — so Reaches
-// is false for them and an empty volume_labels, which is also the ordinary
-// state of a deployment with no NetApp storage, is never named. QVolumeLabels
-// stays in the list so that exclusion is pinned through Reaches rather than
-// through an omission.
+// that is the kubelet pair alone. The Harvest families carry no request matcher
+// — az only routes them — so Reaches is false for them and an empty
+// volume_labels, which is also the ordinary state of a deployment with no
+// NetApp storage, is never named. QVolumeLabels stays in the list so that
+// exclusion is pinned through Reaches rather than through an omission.
 //
 // An OPTIONAL family (Family.Optional — FamilyAlerts and FamilyAppMeta) is excluded
 // on a DIFFERENT axis, and it needs its own rule because Reaches cannot

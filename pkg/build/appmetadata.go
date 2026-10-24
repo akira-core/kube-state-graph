@@ -14,7 +14,7 @@ type appNamespaceKey struct{ cluster, namespace string }
 // the row's own app label, not the pod's resolved Application.
 type appDeployerKey struct{ cluster, namespace, app string }
 
-// appMetadataIndex is the three picks design D6 builds from one
+// appMetadataIndex is the three application-metadata picks built from one
 // tlast_over_time vector. Empty maps (never nil) mean the vector contributed
 // nothing. Callers that did not read the metric leave the graph maps nil
 // instead of storing this value.

@@ -13,7 +13,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// accept-multi-zone-storage-graph: a /v1/storage-graph request may select
+// Multi-zone storage graph: a /v1/storage-graph request may select
 // several zones and environments. The selector reaches upstream exactly as it
 // does on /v1/graph — one anchored alternation on every family that carries the
 // dimension, and every zone-routed family dispatched to the backends serving

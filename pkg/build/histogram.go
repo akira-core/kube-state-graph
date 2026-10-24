@@ -16,7 +16,7 @@ type bucket struct {
 }
 
 // classicQuantile implements the classic cumulative-le histogram quantile
-// with in-bucket linear interpolation (design D5), matching the semantics of
+// with in-bucket linear interpolation, matching the semantics of
 // PromQL histogram_quantile(q, ...).
 //
 // Contract (ok=false when any of these fail):
@@ -32,7 +32,8 @@ func classicQuantile(q float64, buckets []bucket) (float64, bool) {
 	if len(buckets) < 2 {
 		return 0, false
 	}
-	// Work on a sorted copy so input order cannot affect the result (D6).
+	// Work on a sorted copy so input order cannot affect the result
+	// (deterministic response body).
 	bs := slices.Clone(buckets)
 	slices.SortStableFunc(bs, func(a, b bucket) int { return cmp.Compare(a.le, b.le) })
 

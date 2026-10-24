@@ -270,8 +270,7 @@ func TestChunkScopeWithOverhead(t *testing.T) {
 // root-derived restriction a different mechanism from a selector-level
 // dimension: Harvest is zone-routed and no request dimension reaches the
 // family. Every restricted Harvest renderer emits its own restriction and
-// never az, env, a Kubernetes cluster or a namespace
-// (drop-harvest-zone-matchers D1).
+// never az, env, a Kubernetes cluster or a namespace.
 func TestHarvestRenderers_CarryNoRequestMatcher(t *testing.T) {
 	t.Parallel()
 

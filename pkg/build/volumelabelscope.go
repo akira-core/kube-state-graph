@@ -15,8 +15,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The rooted Harvest volume-label read (scope-volume-labels-by-storage-root,
-// read-storage-roots-through-volume-hub).
+// The rooted Harvest volume-label read.
 //
 // A /v1/storage-graph request rooted at an ONTAP cluster, an aggregate or an SVM
 // reads the volume-label family from that root, in phases:
@@ -309,7 +308,7 @@ func issueVolumeLabelsQueries(
 // and returns one result per query, in query order.
 //
 // A failed query fails the build, named with its family. This read runs only
-// on /v1/storage-graph, which fails closed (fail-storage-graph-on-any-leg-error):
+// on /v1/storage-graph, which fails closed on any leg error:
 // a lost chunk would draw the rooted components with no path through the
 // claims it carried, indistinguishable from a filer that serves nothing.
 func issueVolumeLabelsParts(
@@ -597,7 +596,7 @@ func readOwnerCompletion(
 // still drawn from the aggregate, controller and policy families, which are
 // unrestricted.
 //
-// A failed chunk fails the build (fail-storage-graph-on-any-leg-error).
+// A failed chunk fails the build (/v1/storage-graph fails closed).
 func readTokenScopedVolumeLabels(
 	ctx context.Context,
 	q promql.Querier,

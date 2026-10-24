@@ -15,7 +15,7 @@ import (
 )
 
 // The storage plan fails closed on every first-wave leg but ALERTS; the full
-// plan keeps each family's own class (fail-storage-graph-on-any-leg-error).
+// plan keeps each family's own class.
 func TestTopologyPlan_FailsClosed(t *testing.T) {
 	storage := storagePlan(graph.StorageRoots{})
 	src := defaultAppMetadata()

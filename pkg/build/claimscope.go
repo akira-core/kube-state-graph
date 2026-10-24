@@ -16,7 +16,7 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The volume hub's claim-keyed reads (read-storage-roots-through-volume-hub).
+// The volume hub's claim-keyed reads.
 //
 // A hub-mode /v1/storage-graph build reads the claim side of the chain FROM
 // the rooted Harvest rows instead of scanning the zone:

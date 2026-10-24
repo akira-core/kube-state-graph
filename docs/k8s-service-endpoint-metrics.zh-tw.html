@@ -146,7 +146,7 @@
     <h1>Kubernetes Service / Endpoint 指標與圖譜建構</h1>
     <p>
       說明 <code>kube-state-graph</code> 為建構服務拓撲圖所需的三個 kube-state-metrics（KSM）系列、
-      各系列使用的 label、以及這些資料在圖譜中的用途。內容依據設計文件 D29 與原始碼實作整理。
+      各系列使用的 label、以及這些資料在圖譜中的用途。內容依據原始碼實作整理。
     </p>
   </header>
 
@@ -176,7 +176,7 @@
           <code>mongodb://payments-svc.shop.svc.cluster.local:27017</code>）時，
           API 必須把 DNS host 解析成叢集內的 Kubernetes 資源，而不是一律當成外部節點。
         </p>
-        <p>這就是設計決策 <strong>D29（connection-string resolution）</strong> 要解決的問題：</p>
+        <p>這就是<strong>連線字串解析（connection-string resolution）</strong>要解決的問題：</p>
         <ul>
           <li><strong>兩段式 DNS</strong>（<code>&lt;service&gt;.&lt;namespace&gt;</code>）→ 解析為 <code>type="service"</code> 節點</li>
           <li><strong>三段式 DNS</strong>（<code>&lt;pod&gt;.&lt;service&gt;.&lt;namespace&gt;</code>，Headless Service）→ 解析為<strong>真實後端 Pod</strong></li>
@@ -369,7 +369,7 @@ kube_pod_info（既有）
       </section>
 
       <section id="resolution">
-        <h2>連線字串解析（D29）如何使用這些索引</h2>
+        <h2>連線字串解析如何使用這些索引</h2>
         <p>
           觸發條件：<code>traces_service_graph_request_total</code> 某側的
           <code>client_k8s_pod_uid</code> 或 <code>server_k8s_pod_uid</code> 為空，
@@ -490,9 +490,9 @@ last_over_time(kube_endpointslice_labels[&lt;window&gt;])</pre>
           <li>上游未匯出這三個系列 → 索引為空，<strong>不會</strong>讓整次 graph build 失敗</li>
           <li>缺少 <code>label_kubernetes_io_service_name</code> → slice 無法 join Service，該 Service 的 endpoint 被略過</li>
           <li>endpoint 的 Pod 不在 <code>kube_pod_info</code> → 該 endpoint 被略過</li>
-          <li>連線字串無法解析 → <code>others/&lt;label&gt;</code> 節點（與 D29 之前行為相容的可見性）</li>
+          <li>連線字串無法解析 → <code>others/&lt;label&gt;</code> 節點（與先前行為相容的可見性）</li>
         </ul>
-        <p>因此 D29 功能對 topology 表面是<strong>加法</strong>：有指標就解析 Service，沒有就退回 others。</p>
+        <p>因此連線字串解析對 topology 表面是<strong>加法</strong>：有指標就解析 Service，沒有就退回 others。</p>
       </section>
 
       <section id="related">
@@ -514,7 +514,7 @@ last_over_time(kube_endpointslice_labels[&lt;window&gt;])</pre>
               </td>
               <td>
                 產生 <code>pod-calls-pod</code> 邊；當 UID 為空且 label 含 <code>://</code> 時
-                觸發 D29，才會用到 Service/Endpoint 索引
+                觸發連線字串解析，才會用到 Service/Endpoint 索引
               </td>
             </tr>
             <tr>
@@ -529,7 +529,7 @@ last_over_time(kube_endpointslice_labels[&lt;window&gt;])</pre>
           </tbody>
         </table>
 
-        <h3>Service-graph 查詢層過濾（D30）</h3>
+        <h3>Service-graph 查詢層過濾（sentinel matcher）</h3>
         <p>
           <code>client!~"user|unknown",server!~"user|unknown"</code> 會在 PromQL 層排除
           servicegraph 的虛擬 peer。這與 Service/Endpoint 指標無關，但影響哪些邊會進入解析管線。
@@ -543,7 +543,6 @@ last_over_time(kube_endpointslice_labels[&lt;window&gt;])</pre>
           <li>PromQL：<code>internal/promql/queries.go</code></li>
           <li>營運文件：<code>docs/operations.md</code>（Exporter compatibility contract）</li>
           <li>連線字串語法：<code>docs/others-substitution.md</code></li>
-          <li>設計：<code>openspec/changes/add-k8s-pod-graph-api/design.md</code> D29</li>
         </ul>
       </section>
     </main>

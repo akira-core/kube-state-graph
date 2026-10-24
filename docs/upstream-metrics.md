@@ -207,7 +207,7 @@ unique per namespace (or per cluster, for nodes) only, so a by-reference scope
 may admit a same-named object from another namespace or cluster; it is
 consulted by no loaded pod and the body is unchanged.
 
-**Fan-out per build** (design.md D6 / D11). A storage request's first wave is `ALERTS` alone; everything else is the seed and the expansion. The historical unscoped inventory — 18 legs, plus 2 when the
+**Fan-out per build**. A storage request's first wave is `ALERTS` alone; everything else is the seed and the expansion. The historical unscoped inventory — 18 legs, plus 2 when the
 pod scope is non-empty, plus 4 when any loaded pod is scheduled or a `node=`
 root exists, plus 2 (owner + annotations) for each of ReplicaSet / Job that
 owns a loaded pod, plus 1 each for StatefulSet / DaemonSet that owns one, plus
@@ -564,8 +564,7 @@ They are **not** caller filters and are always rendered **before** any
 ## kube-state-metrics (22)
 
 20 abort-on-error; `kube_replicaset_annotations` and `kube_job_annotations`
-log-and-continue (accumulating cardinality —
-harden-controller-annotation-legs D3). Empty vectors
+log-and-continue (accumulating cardinality). Empty vectors
 degrade as in the last column.
 
 | Metric | Graph role | Labels read | Empty vector |
@@ -577,7 +576,7 @@ degrade as in the last column.
 | `kube_node_status_condition{condition="Ready"}` | Node `data.ready_status` ∈ {`Ready`, `NotReady`, `Unknown`} from the **active** (`value=1`) Ready row; `status` matched case-insensitively (`true`/`True`). Omitted when no Ready data — **not** the same as `"Unknown"` (kubelet lost contact) | `cluster`, `node`, `condition`, `status` | Attribute omitted |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | PVC nodes + `pod-mounts-pvc` | `cluster`, `namespace`, `pod`, `persistentvolumeclaim`, `volume` | No PVCs / mount edges |
 | `kube_persistentvolumeclaim_info` | PVC `data.storageclass` (policy name, never a node) + `labels.volumename` (bound PV name; Harvest join key) | `cluster`, `namespace`, `persistentvolumeclaim`, `storageclass`, `volumename` | No StorageClass / no Harvest join |
-| `kube_service_info` | Service **index** for `://` resolution (D29). A `type="service"` node is materialised only when a connection-string / route-engine / peer-address path needs it — this series is not emitted as nodes on its own. `cluster_ip` → `data.ipaddress`; headless `"None"` omits it | `cluster`, `namespace`, `service`, `cluster_ip` | `://` endpoints fall back to `external` |
+| `kube_service_info` | Service **index** for `://` resolution. A `type="service"` node is materialised only when a connection-string / route-engine / peer-address path needs it — this series is not emitted as nodes on its own. `cluster_ip` → `data.ipaddress`; headless `"None"` omits it | `cluster`, `namespace`, `service`, `cluster_ip` | `://` endpoints fall back to `external` |
 | `kube_endpointslice_endpoints` | `service-selects-pod` fan-out | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | No backing-pod edges |
 | `kube_endpointslice_labels` | EndpointSlice → Service name. **Requires** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]` (not a KSM default) | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | Same as above |
 | `kube_pod_owner` | Pod `data.owner` = `{kind, name}` (ReplicaSet skipped to its Deployment). The resolved owner is also the **join key** for the pod's `data.application` — the tracking-id lives on the controller, never on the pod | `cluster`, `namespace`, `pod`, `owner_kind`, `owner_name`, `owner_is_controller` | No `owner`, and no pod Application (it is keyed on the controller) |
@@ -868,7 +867,7 @@ fails if topology issues anything other than 37 queries when no claim matches a
 Harvest volume, or 43 when one does. `TestBuildStorage_FanOutLegCount` pins the
 storage plan's by-reference fan-out the same way: 18 legs when nothing is
 named, growing by exactly what the loaded pods, nodes and resolved owners name
-(design.md D6) — 22 with a `node=` root alone, 25 / 27 / 27 with one
+— 22 with a `node=` root alone, 25 / 27 / 27 with one
 StatefulSet-, Deployment- or CronJob-owned pod, and 32 with every controller
 kind present, 38 with one matched FlexVol added.
 `TestBuildStorage_FanOutLegCount_Hub` pins a storage seed: families with no

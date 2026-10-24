@@ -4,8 +4,7 @@
 > `build.ResolvePodApplication`。本文件只涵蓋「給定一個 pod，查它屬於哪個
 > ArgoCD Application」這個 Go API，不涵蓋 `/v1/graph` 的批次解析。
 >
-> 規格來源：`openspec/specs/pod-application-lookup/spec.md`；設計決策：
-> `openspec/changes/archive/2026-09-16-add-pod-application-lookup/design.md`；
+> 規格來源：`openspec/specs/pod-application-lookup/spec.md`；
 > 實作：`pkg/build/podapplication.go`。
 
 ---
@@ -22,7 +21,7 @@ family query（依 owner 種類而定）。請求若帶了 application-metadata 
 - Controller chain 與 graph build 為 `PodNode.Application()` 套用的規則相同
   （兩條路徑共用 `resolveOwnerApplication`、`ownerLess`、`betterTrackingID`、
   `controllerAnnotationFamilies`）。Metric 步驟另取該 pod 列上字典序最小的
-  非空 `app`，原值使用、不切 `:`，與 build 的 D6 挑選相同；有值就勝出，
+  非空 `app`，原值使用、不切 `:`，與 build 的挑選規則相同；有值就勝出，
   沒有才走 chain。
 - 與 build 不同：**任何一條上游 query 失敗，整個查詢就失敗**，不會降級成空值。
   沒有 `FamilyServer`、或 `appmeta` 沒有 backend 時，lookup **略過** metric

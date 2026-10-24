@@ -98,11 +98,10 @@ func shuffleAcrossKeys(rows model.Vector, key func(model.Metric) string, rng *ra
 	return out
 }
 
-// Design D5 of shorten-by-reference-read-path: a Kubernetes-only build appends
-// rows to a slot in round order, so the parse must not depend on the order of
-// rows of DIFFERENT keys. Shuffling every such slot across its keys, with each
-// key's own rows kept in order (they come from one query), must not move a byte
-// of the body.
+// A Kubernetes-only build appends rows to a slot in round order, so the parse
+// must not depend on the order of rows of DIFFERENT keys. Shuffling every such
+// slot across its keys, with each key's own rows kept in order (they come from
+// one query), must not move a byte of the body.
 func TestParseTopology_IsOrderInsensitiveAcrossKeys(t *testing.T) {
 	src := defaultAppMetadata()
 	opts := Options{AppMetadata: &src}

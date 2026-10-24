@@ -3,9 +3,9 @@
 // (host, path, port) to at instant `at`?" against a versioned config store
 // written by the metadata-exporter.
 //
-// Pipeline (ported from poc/route2a/internal/rangequery, extended by design
-// D10 and simplified to a single instant by
-// simplify-route-resolution-to-point-in-time D1): probe the store per
+// Pipeline (ported from poc/route2a/internal/rangequery, extended with
+// ingress-cluster selection and simplified to a single instant): probe the
+// store per
 // destination IP for the clusters serving it (store.ClustersWithIngressIP —
 // the one cross-cluster read) → select the ingress cluster C
 // (pickIngressCluster: family-first, caller tie-break; any unresolvable case
@@ -15,13 +15,13 @@
 // RouteConfiguration (in-process istiod, translate) and match with Envoy's
 // router_check_tool (matchcheck). Exactly one configuration is evaluated, so
 // exactly one outcome is produced — there is no segment loop and no
-// config-signature dedup. Destination IPs are REQUIRED (design D6): an IP-less
+// config-signature dedup. Destination IPs are REQUIRED: an IP-less
 // request misses with RouteNoIngress before touching the store.
 //
-// pkg/build MUST NOT import this package (design D1); only cmd/kube-state-graph
+// pkg/build MUST NOT import this package; only cmd/kube-state-graph
 // or an opting-in embedder constructs a Resolver and injects it via
 // build.Options.RouteResolver. Nothing here constructs a Kubernetes client,
-// informer, watch, or kubeconfig (design D0) — istio is a pure library.
+// informer, watch, or kubeconfig — istio is a pure library.
 package route
 
 import (
@@ -76,15 +76,15 @@ type ingressIPProbe func(ctx context.Context, ip string, at time.Time) ([]string
 // When the returned error is non-nil the outcome is meaningless and MUST be the
 // empty value: RouteNoGateway is the ingress-LB-fallback gate below, so
 // returning it alongside an infrastructure failure would let a store outage read
-// as "no Istio Gateway serves this host" (design D6).
+// as "no Istio Gateway serves this host".
 func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe ingressIPProbe) (build.RouteDestination, build.RouteOutcome, error) {
 	if len(req.IPs) == 0 {
-		// Defensive: the prescan never emits an IP-less request (design D6) —
+		// Defensive: the prescan never emits an IP-less request —
 		// without a destination IP no ingress cluster can be selected.
 		return build.RouteDestination{}, build.RouteNoIngress, nil
 	}
 
-	// Design D10: select the ingress cluster from the destination IPs before
+	// Select the ingress cluster from the destination IPs before
 	// touching any snapshot. One probe per IP; the candidate sets stay separate
 	// so multi-IP answers must agree — never unioned across clusters.
 	perIP := make([][]string, len(req.IPs))
@@ -112,11 +112,11 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 	}
 
 	if outcome == build.RouteHit {
-		// The destination lives in the selected ingress cluster (design D11):
+		// The destination lives in the selected ingress cluster:
 		// ParseEnvoyCluster cannot know it — the Envoy cluster string carries
 		// only (port, subset, service, namespace) — so it is stamped here.
 		dest.Cluster = cluster
-		// route-hit-ingress-chain D1: recover the ingress LB Service the
+		// Ingress chain: recover the ingress LB Service the
 		// destination IPs uniquely map to in the already-loaded snapshot (same
 		// identity dedup as the LB fallback, zero new store reads) so the parse
 		// can emit the full caller → ingress → backend chain. Ambiguous or
@@ -128,7 +128,7 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 		return dest, build.RouteHit, nil
 	}
 
-	// Ingress LB Service fallback (ingress-lb-service-fallback change), gated
+	// Ingress LB Service fallback, gated
 	// on the miss being RouteNoGateway: the nginx-ingress signature is Hop 3
 	// finding no Istio Gateway CR, so resolution never got past gateway
 	// selection — yet the loaded snapshot may still map the destination IPs to
@@ -140,7 +140,7 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 	if outcome == build.RouteNoGateway {
 		if lbDest, out, ok := resolveIngressLBService(snap, req.IPs); ok {
 			if out == build.RouteIngressLBService {
-				lbDest.Cluster = cluster // same D11 stamp as a RouteHit
+				lbDest.Cluster = cluster // same ingress-cluster stamp as a RouteHit
 				return lbDest, out, nil
 			}
 			return build.RouteDestination{}, out, nil // ambiguous_ingress_service
@@ -152,7 +152,7 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 // loadSnapshot loads the selected ingress cluster's configuration state at
 // req.At: one store.LoadTrafficAt per destination IP, rows unioned —
 // multi-A-record DNS answers are a union of candidates WITHIN the one selected
-// cluster (design §9.2 / D10; cross-cluster unions are forbidden).
+// cluster (cross-cluster unions are forbidden).
 //
 // The union is deduplicated by resource-version identity. Two destination IPs
 // published by the SAME ingress Service (a dual-stack Service carrying an A and
@@ -160,7 +160,7 @@ func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe in
 // load return the same gateway/VS rows, and the store's own dedup only spans a
 // single call. Without this, ScopedFor would hand istiod the same
 // VirtualService twice and its config store would reject it ("item already
-// exists"), failing the whole resolution — see design D1.
+// exists"), failing the whole resolution.
 func (r *Resolver) loadSnapshot(ctx context.Context, cluster string, req build.RouteRequest) (store.TrafficSnapshot, error) {
 	var out store.TrafficSnapshot
 	svcSeen, depSeen := map[versionKey]bool{}, map[versionKey]bool{}
@@ -240,8 +240,8 @@ func (r *Resolver) resolveConfig(ctx context.Context, snap *snapshot.Snapshot, r
 	if !ok {
 		// Two candidates share a bare name across namespaces — only reachable
 		// when a multi-IP request's per-IP hop 1 landed in different namespaces.
-		// Neither is more correct than the other, so degrade instead of guessing
-		// (design D3); the caller's LB fallback still applies.
+		// Neither is more correct than the other, so degrade instead of
+		// guessing; the caller's LB fallback still applies.
 		return build.RouteDestination{}, build.RouteNoGateway, nil
 	}
 
@@ -260,7 +260,7 @@ func (r *Resolver) resolveConfig(ctx context.Context, snap *snapshot.Snapshot, r
 
 	// Listener gate: both misses are decided from config alone — no translate
 	// round-trip, no router_check_tool exec. A port with no routable HTTP
-	// listener is the D5 mis-guessed-port signature; a port whose servers all
+	// listener is the mis-guessed-port signature; a port whose servers all
 	// serve OTHER hosts is the distinct no-server-for-host miss (translating
 	// anyway could only reach RouteNoRoute — istiod builds vhosts from the
 	// server-hosts ∩ VS-hosts intersection).

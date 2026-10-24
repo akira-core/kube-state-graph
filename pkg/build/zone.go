@@ -25,10 +25,9 @@ func zoneOf(m model.Metric, keys promql.LabelKeys) (zone, bool) {
 	return zone{az: az, env: env}, true
 }
 
-// zoneAdmits is the zone-agreement rule (read-storage-roots-through-volume-hub
-// D11): a candidate is excluded only when BOTH sides know their zone and they
-// disagree. An alert with no pair, or a candidate whose zone is unknown,
-// falls back to the label comparison alone.
+// zoneAdmits is the zone-agreement rule: a candidate is excluded only when BOTH
+// sides know their zone and they disagree. An alert with no pair, or a
+// candidate whose zone is unknown, falls back to the label comparison alone.
 func zoneAdmits(candidate []zone, z zone, zoned bool) bool {
 	return !zoned || len(candidate) == 0 || slices.Contains(candidate, z)
 }
@@ -37,10 +36,9 @@ func zoneAdmits(candidate []zone, z zone, zoned bool) bool {
 // pair, so the zero zone is exactly "unknown".
 func (z zone) known() bool { return z != zone{} }
 
-// zonesAgree is the same rule for two single-zone sides: they disagree only when
-// BOTH carry a complete pair and the pairs differ. The claim → FlexVol join
-// (accept-multi-zone-storage-graph) applies it to a claim's own zone and each
-// matched volume_labels series'.
+// zonesAgree is the same rule for two single-zone sides: they disagree only
+// when BOTH carry a complete pair and the pairs differ. The claim → FlexVol
+// join applies it to a claim's own zone and each matched volume_labels series'.
 func zonesAgree(a, b zone) bool {
 	return !a.known() || !b.known() || a == b
 }
@@ -55,7 +53,7 @@ func (z zone) compare(o zone) int {
 // a claim in zone claim: the claim's own zone first, then no zone (which agrees
 // with every claim, the zonesAgree rule hop A prefers by), then any other
 // complete pair in compare order. It is a strict order, so a choice among
-// several is order-free (drop-harvest-zone-matchers D3).
+// several is order-free.
 func (claim zone) prefers(a, b zone) bool {
 	if ra, rb := claim.rank(a), claim.rank(b); ra != rb {
 		return ra < rb

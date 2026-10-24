@@ -55,7 +55,7 @@ func bindingPodRefs(bindings model.Vector) []graph.PodRef {
 //
 // Unlike a /v1/graph QoS chunk, a pod chunk FAILS CLOSED. A pod is
 // topology, not a measurement: a missing chunk would be a smaller, plausible,
-// wrong body with no signal — the partial fan-out that backend routing D6
+// wrong body with no signal — the partial fan-out that backend routing
 // forbids — so the first chunk error fails the build exactly as an unscoped
 // kube_pod_info error does. Results merge in CHUNK ORDER (issueScopedFamilies),
 // so the vectors and everything parsed from them are a pure function of the

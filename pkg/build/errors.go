@@ -30,10 +30,10 @@ const RootScopeCapMessage = "root scope exceeds the query cap"
 
 // Error wraps an underlying cause with a typed Reason for HTTP mapping.
 //
-// Query names the upstream query family whose error failed the build, when
-// one did (fail-storage-graph-on-any-leg-error D2). It is always a bare
-// promql.Query constant — never text taken from the upstream error, which can
-// embed an internal URL — so the API layer may put it in a response body.
+// Query names the upstream query family whose error failed the build, when one
+// did. It is always a bare promql.Query constant — never text taken from the
+// upstream error, which can embed an internal URL — so the API layer may put it
+// in a response body.
 type Error struct {
 	Reason  Reason
 	Message string

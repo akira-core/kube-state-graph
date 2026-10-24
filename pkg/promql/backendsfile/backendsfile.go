@@ -9,7 +9,7 @@
 // importable library — an external module cannot import internal/*, and a
 // parser there would force every embedder to hand-roll the same schema, the
 // same validation and the same credential rules, three copies of a contract
-// whose failure mode is a silently mis-routed family (design D3 / D14).
+// whose failure mode is a silently mis-routed family.
 package backendsfile
 
 import (

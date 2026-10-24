@@ -16,7 +16,7 @@ import (
 type ownerRef struct{ kind, name string }
 
 // resolvePodOwners builds the (cluster, namespace, pod) → controller-owner index
-// from kube_pod_owner, skipping the intermediate ReplicaSet (D34): when a pod's
+// from kube_pod_owner, skipping the intermediate ReplicaSet: when a pod's
 // controller owner is a ReplicaSet, it is resolved one level up via
 // kube_replicaset_owner to the owning Deployment. A bare ReplicaSet with no
 // Deployment owner keeps the ReplicaSet as the owner; any other owner kind is
@@ -26,7 +26,7 @@ type ownerRef struct{ kind, name string }
 // The returned map is a deterministic function of the two input vectors — no
 // ordering dependence: when a pod reports multiple controller owners, the
 // lexically-smallest (kind, name) wins so the emitted entity is stable across
-// rebuilds (D6 determinism). The only side effect is tallying missing-cluster
+// rebuilds (determinism). The only side effect is tallying missing-cluster
 // samples into the caller's mc accumulator.
 func resolvePodOwners(ownerVec, rsOwnerVec model.Vector, mc *clusterResolver) map[podNameKey]ownerRef {
 	// ReplicaSet → owning Deployment, keyed by (cluster, namespace, replicaset).
@@ -91,11 +91,11 @@ func ownerLess(kind, name, curKind, curName string) bool {
 // changed image in the window — each image being a DISTINCT series (image is a
 // label) — the image SEEN LATEST wins (the current one). Exact-timestamp ties
 // (co-scraped images) break by lexically-smallest image so the body stays
-// byte-identical across rebuilds (D6). Empty images are skipped so a transient
+// byte-identical across rebuilds. Empty images are skipped so a transient
 // image-less series never masks (or, by a later timestamp, beats) a populated
 // sibling. The per-pod list is sorted by (name, image).
 //
-// CAVEAT (documented in design.md D-A4): for query windows far from the real wall
+// CAVEAT: for query windows far from the real wall
 // clock, VictoriaMetrics returns only ONE image-variant series per container
 // (dropping the rest) — true for last_over_time, tlast_over_time, AND
 // query_range alike. So "latest" is only meaningful for near-now windows (the
@@ -191,7 +191,7 @@ var controllerAnnotationFamilies = []controllerAnnotationFamily{
 //
 // The six results are merged into one map. Their key spaces are disjoint by
 // construction (the kind component differs), so the merge needs no cross-family
-// tie-break and is independent of iteration order (D6 determinism).
+// tie-break and is independent of iteration order (determinism).
 //
 // OPTIONAL: every family is empty unless the operator allowlisted the
 // annotation, which is the stock kube-state-metrics state. An empty input
@@ -235,7 +235,7 @@ type jobKey struct{ cluster, namespace, job string }
 // rsToDeployment pass in resolvePodOwners, this one DOES filter
 // owner_is_controller: new code honours the authoritative label, while
 // tightening rsToDeployment would move the pod `owner` attribute and is out of
-// scope. On a defensive collision the lexically-smallest CronJob name wins (D6).
+// scope. On a defensive collision the lexically-smallest CronJob name wins.
 //
 // This index is NEVER read by resolvePodOwners, which is what makes "the hop
 // cannot change data.owner" a structural property rather than a convention.
@@ -267,12 +267,13 @@ func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]s
 // applies, never on the pods a controller spawns, so the controller is the
 // only annotation source — no pod-level label is read.
 //
-// Because the D34 ReplicaSet skip has already collapsed a ReplicaSet owner to
-// its Deployment, the Deployment case needs no extra hop. The ONE fallback is
-// Job → CronJob: when the owner is a Job that carries no annotation of its own,
-// the owning CronJob is consulted. The Job's own annotation is tried FIRST, so
-// a Job that ArgoCD manages directly keeps its own Application — the same
-// "nearest managed ancestor wins" rule the ReplicaSet collapse implies.
+// Because the controller-owner ReplicaSet skip has already collapsed a
+// ReplicaSet owner to its Deployment, the Deployment case needs no extra hop.
+// The ONE fallback is Job → CronJob: when the owner is a Job that carries no
+// annotation of its own, the owning CronJob is consulted. The Job's own
+// annotation is tried FIRST, so a Job that ArgoCD manages directly keeps its
+// own Application — the same "nearest managed ancestor wins" rule the
+// ReplicaSet collapse implies.
 //
 // A pod with no controller owner, or an owner of a kind outside
 // controllerAnnotationFamilies, is absent from the returned map so the caller
@@ -287,7 +288,7 @@ func resolveJobCronJobOwners(vec model.Vector, mc *clusterResolver) map[jobKey]s
 // cost of suppressing is that a genuinely annotation-less Job under an
 // annotated CronJob also loses its Application for that build; losing a string
 // is strictly better than reporting the wrong one, and it keeps every degrade
-// in this package subtractive (harden-controller-annotation-legs D3).
+// in this package subtractive.
 func resolvePodApplications(
 	metricApps map[podNameKey]string,
 	owners map[podNameKey]ownerRef,
@@ -403,12 +404,12 @@ func resolvePVCApplications(vec model.Vector, mc *clusterResolver) map[pvcKey]st
 }
 
 // pvcInheritedApps computes, per PVC ID, the ArgoCD Application a PVC may
-// inherit from the pods that mount it (D13): the lexically-smallest non-empty
+// inherit from the pods that mount it: the lexically-smallest non-empty
 // Application across all its mounting pods (from the pod-PVC bindings, joined to
 // each pod's already-resolved Application via podApp keyed by pod ID). A PVC
 // whose mounting pods all carry no Application is absent from the result. The
 // accumulation is a pure min over the binding set, so it is independent of
-// binding order (D6 determinism). The caller applies this only to PVCs that have
+// binding order (determinism). The caller applies this only to PVCs that have
 // no Application of their own, so an own annotation always wins.
 func pvcInheritedApps(bindings []PodPVCBinding, podApp map[string]string) map[string]string {
 	out := make(map[string]string)

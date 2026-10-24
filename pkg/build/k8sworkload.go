@@ -311,7 +311,7 @@ func (r *k8sRead) fanOut(tracked map[claimKey]struct{}, rootInfo, rootOwner mode
 }
 
 // appMetadataScopes is the namespace restriction of the application-metadata
-// read, fixed by the root pods and the tracked claims (design D4): a mounter
+// read, fixed by the root pods and the tracked claims: a mounter
 // shares its claim's cluster and namespace, so no later round can add one.
 func (r *k8sRead) appMetadataScopes(rootInfo model.Vector, tracked map[claimKey]struct{}) []appMetadataClusterScope {
 	if !appMetadataActive(r.opts.AppMetadata, r.q) {

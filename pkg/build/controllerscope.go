@@ -39,8 +39,7 @@ func sortedNames(names []string) []string {
 // controllerScope groups the loaded pods' resolved CONTROLLER owner names by
 // kind — exactly the rows resolvePodOwners itself consults (owner_is_controller
 // == "true", non-empty owner_kind/owner_name) — mirroring the reader's own
-// discard so a name enters the scope iff it could resolve an owner
-// (scope-controller-legs-by-reference).
+// discard so a name enters the scope iff it could resolve an owner.
 //
 // This is the DIRECT owner kind kube_pod_owner names — "ReplicaSet" for a
 // pod owned by a ReplicaSet regardless of whether that ReplicaSet itself
@@ -107,8 +106,7 @@ func cronJobScope(direct []string, jobOwner model.Vector) []string {
 
 // readScopedControllers issues the eight controller-owner /
 // controller-annotation families restricted to the controller names the
-// loaded pods' resolved owners name, in two stages
-// (scope-controller-legs-by-reference).
+// loaded pods' resolved owners name, in two stages.
 //
 // Stage A scopes six families directly off the loaded pods' owner refs
 // (controllerScope): kube_replicaset_owner / kube_replicaset_annotations on

@@ -105,7 +105,7 @@ func volLabelSample(pvName, oc, node, aggr, svm string) model.Sample {
 
 // qosSample is a hop-B QoS workload series at VOLUME granularity (no `lun`
 // label). It carries no aggr/node dimension — that is exactly why hop A exists.
-// LUN-level workloads DO reach the resolver since D11 (see lunQosSample); it is
+// LUN-level workloads DO reach the resolver (see lunQosSample); it is
 // sumQoSIO that discards them, so their policy group stays readable.
 func qosSample(pvName, oc, svm, policy string, val float64) model.Sample {
 	return model.Sample{
@@ -313,7 +313,7 @@ func TestResolveNetAppStorage_PerFamilyPresenceAbsence(t *testing.T) {
 
 // A hop-B miss must cost measurements ONLY. The claim keeps its edge, its
 // aggregate, its controller and its svm — the property the whole hop split
-// exists for (design.md D3).
+// exists for.
 func TestResolveNetAppStorage_TopologyWithoutQoS(t *testing.T) {
 	recs := captureDebugRecords(t, func() {
 		res := netappFixture{
@@ -770,7 +770,7 @@ func pvcBindingVectors(cluster, ns, pod, claim, volumeName string) topologyVecto
 }
 
 // TestParseTopology_PVCAggrLabel pins "PVC aggr label from the Harvest join"
-// and "PVC aggr label" (design.md D1-D2): the stamp in parseTopology, not just
+// and "PVC aggr label": the stamp in parseTopology, not just
 // the edge resolveNetAppStorage draws.
 func TestParseTopology_PVCAggrLabel(t *testing.T) {
 	t.Run("equals edge target", func(t *testing.T) {

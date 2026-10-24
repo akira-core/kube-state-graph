@@ -107,8 +107,7 @@ func TestRenderScoped(t *testing.T) {
 // with and without a request-scoped selector, that the scoped string is
 // exactly Render's output with one `<label>=~"…"` (or `<label>="…"`) matcher
 // appended as the last element inside the braces — so a family's fixed
-// selector can never drift between its unscoped and scoped renderings
-// (scope-controller-legs-by-reference D2).
+// selector can never drift between its unscoped and scoped renderings.
 func TestRenderScoped_IsRenderPlusOneMatcher(t *testing.T) {
 	t.Parallel()
 	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}

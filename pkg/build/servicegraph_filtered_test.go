@@ -11,15 +11,15 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
-// Filtered-build rules (push-request-filters-upstream design D5 / D6).
+// Filtered-build rules.
 //
 // A filtered build narrows the TOPOLOGY at the source while the three
 // traces_service_graph_* series are still read in full. Two rules keep the
 // result self-consistent:
 //
-//	D5 — an endpoint whose pod UID names a pod the request did not load
-//	     resolves exactly as if the UID were empty (never a synthesised pod).
-//	D6 — a series is kept only if at least one endpoint reached LOADED
+//	Resolution — an endpoint whose pod UID names a pod the request did not
+//	     load resolves exactly as if the UID were empty (never a synthesised pod).
+//	Admission — a series is kept only if at least one endpoint reached LOADED
 //	     topology; a rejected series rolls back every side effect.
 //
 // Both are inert when the build is unfiltered, which the paired
@@ -47,7 +47,7 @@ func sgSample(m model.Metric, v float64) model.Sample {
 	return model.Sample{Metric: m, Value: model.SampleValue(v)}
 }
 
-// D5: an unloaded server UID falls to the human label as external/<label>,
+// Resolution: an unloaded server UID falls to the human label as external/<label>,
 // with no synthesised pod anywhere in the result.
 func TestFiltered_UnloadedServerUIDBecomesExternal(t *testing.T) {
 	vec := sampleVec(sgSample(model.Metric{
@@ -65,7 +65,7 @@ func TestFiltered_UnloadedServerUIDBecomesExternal(t *testing.T) {
 	assert.Equal(t, graph.EdgeTypePodCallsPod, e.Type)
 	assert.Equal(t, "cluster-alpha/abc", e.Source)
 	assert.Equal(t, graph.ExternalID("cart"), e.Target)
-	assert.Equal(t, "cluster-alpha", e.Labels["cluster"], "the client side is a loaded pod, so D9 still applies")
+	assert.Equal(t, "cluster-alpha", e.Labels["cluster"], "the client side is a loaded pod, so the edge-cluster rule still applies")
 	assert.Nil(t, e.Metrics, "an external endpoint is never measured")
 
 	require.Len(t, res.ExternalNodes, 1)
@@ -74,7 +74,7 @@ func TestFiltered_UnloadedServerUIDBecomesExternal(t *testing.T) {
 	assert.Empty(t, res.SynthPods, "a filtered build never synthesises a pod")
 }
 
-// D5 counterpart: the SAME series in an unfiltered build still synthesises,
+// Resolution counterpart: the SAME series in an unfiltered build still synthesises,
 // so the change cannot regress the pre-existing behaviour.
 func TestUnfiltered_UnloadedServerUIDStillSynthesises(t *testing.T) {
 	vec := sampleVec(sgSample(model.Metric{
@@ -92,7 +92,7 @@ func TestUnfiltered_UnloadedServerUIDStillSynthesises(t *testing.T) {
 	assert.Empty(t, res.ExternalNodes)
 }
 
-// D5: an unloaded CLIENT UID externalises too — an out-of-scope caller of an
+// Resolution: an unloaded CLIENT UID externalises too — an out-of-scope caller of an
 // in-scope pod is an inbound dependency, and the edge then carries no
 // labels.cluster (the client side is not a pod).
 func TestFiltered_UnloadedClientUIDBecomesInboundExternal(t *testing.T) {
@@ -114,10 +114,10 @@ func TestFiltered_UnloadedClientUIDBecomesInboundExternal(t *testing.T) {
 	assert.Empty(t, res.SynthPods)
 }
 
-// D5: a "://" label on an unloaded-UID side still reaches the connection-string
-// ladder, so an in-scope Service is resolved rather than externalised — the
-// reason the rule routes through resolveEmptyUID instead of emitting an
-// external directly.
+// Resolution: a "://" label on an unloaded-UID side still reaches the
+// connection-string ladder, so an in-scope Service is resolved rather than
+// externalised — the reason the rule routes through resolveEmptyUID instead of
+// emitting an external directly.
 func TestFiltered_UnloadedUIDWithConnStringResolvesLoadedService(t *testing.T) {
 	vec := sampleVec(sgSample(model.Metric{
 		"client":             "frontend",
@@ -140,7 +140,7 @@ func TestFiltered_UnloadedUIDWithConnStringResolvesLoadedService(t *testing.T) {
 	assert.Len(t, edgesByType(res, graph.EdgeTypeServiceSelectsPod), 1, "the loaded fan-out is emitted")
 }
 
-// D6 (a): a series touching NO loaded topology is dropped and leaves the
+// Admission: a series touching NO loaded topology is dropped and leaves the
 // resolver byte-identical — no external node, no service node, no fan-out
 // edge, no evidence counter.
 func TestFiltered_UnanchoredSeriesDroppedWithoutResidue(t *testing.T) {
@@ -197,7 +197,7 @@ func snapshotResolver(r *sgResolver) resolverSnapshot {
 	return out
 }
 
-// D6 (a) at the resolver level: a rejected series must leave the resolver's
+// Admission at the resolver level: a rejected series must leave the resolver's
 // state byte-identical, so nothing it touched can be found by a later series.
 func TestFiltered_RollbackLeavesResolverStateUnchanged(t *testing.T) {
 	res := newSGResolver(filteredScopeTopology(), true)
@@ -230,7 +230,7 @@ func TestFiltered_RollbackLeavesResolverStateUnchanged(t *testing.T) {
 	assert.Empty(t, res.journal, "the journal is drained after every series")
 }
 
-// D6 (d): the emitted set is a pure function of the series SET — swapping the
+// Admission: the emitted set is a pure function of the series SET — swapping the
 // vector order must not change the outcome.
 func TestFiltered_OutcomeIsOrderFree(t *testing.T) {
 	anchored := sgSample(model.Metric{
@@ -265,7 +265,7 @@ func TestFiltered_OutcomeIsOrderFree(t *testing.T) {
 	assert.Len(t, a, 2, "one edge to external/cart plus the external node itself")
 }
 
-// D6 (e): a rejected series contributes nothing to the RED join, so its
+// Admission: a rejected series contributes nothing to the RED join, so its
 // companion samples cannot leak onto an admitted edge.
 func TestFiltered_RejectedSeriesContributesNoRED(t *testing.T) {
 	m := model.Metric{

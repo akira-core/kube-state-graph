@@ -31,12 +31,12 @@ import (
 )
 
 // CHImage is the pinned ClickHouse image for the route-store container (same
-// pin the POC benchmarked against). Never `:latest`, per D20.
+// pin the POC benchmarked against). Never `:latest`.
 const CHImage = "clickhouse/clickhouse-server:25.5"
 
 // routeChDDL is the TEST-SIDE seed of the route-store schema. In production
 // the metadata-exporter owns this DDL; kube-state-graph only validates and
-// reads it (design D7). Columns must stay a superset of
+// reads it. Columns must stay a superset of
 // pkg/route/store.expectedSchema.
 var routeChDDL = []string{
 	`CREATE TABLE service_versions (
@@ -84,7 +84,7 @@ var routeChDDL = []string{
 }
 
 // Route-store fixture constants. Validity spans a wide fixed interval around
-// fixedNow so the 5m request window always overlaps (D20: no time.Now()).
+// fixedNow so the 5m request window always overlaps (no time.Now()).
 var (
 	routeValidFrom = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	routeValidTo   = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -105,7 +105,7 @@ const (
 	ingressExtIP = "203.0.113.80"
 	// ingressLBIPNginx fronts cluster-alpha's nginx ingress controller: an LB
 	// Service + Deployment whose selector chain reaches NO Istio Gateway CR —
-	// the ingress-lb-service-fallback fixture (Hop 3 empty, pipeline misses at
+	// the LB-Service fallback fixture (Hop 3 empty, pipeline misses at
 	// gateway resolution, the unique LB Service resolves).
 	ingressLBIPNginx = "203.0.113.90"
 	// ingressLBIPNginxDup is carried by TWO differently-named LB Services in
@@ -132,7 +132,7 @@ const (
 // dt64Lit avoids on the query side.
 func dt64s(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000") }
 
-// RouteSuite exercises translate-global-fqdn-to-k8s-service end to end: a
+// RouteSuite exercises global-FQDN route resolution end to end: a
 // real VictoriaMetrics container carries the topology + service-graph
 // fixtures, a real ClickHouse container carries the versioned Istio config,
 // and the REAL router_check_tool binary performs the route match.
@@ -274,7 +274,7 @@ func (s *RouteSuite) mustSpec(m proto.Message) string {
 //     (same-namespace shorthand) — the boundTo production case.
 //   - cluster-beta corpus: a second, family-foreign cluster whose ingress LB
 //     carries ingressLBIP2 and whose public-gw serves cross.example.com :443 →
-//     payments.shop:8080 — the cross-cluster ingress-selection fixture (D10).
+//     payments.shop:8080 — the cross-cluster ingress-selection fixture.
 //   - cluster-gone: an ingress Service version carrying ingressLBIPGone whose
 //     open row was CLOSED by a rewrite well before the query window — the
 //     probe's no-FINAL dedup fixture.
@@ -299,7 +299,7 @@ func (s *RouteSuite) seedRouteStore() {
 			// noip.example.com is served and routable (→ reviews.shop) but only
 			// ever queried WITHOUT client_dns_answers: if the engine were
 			// consulted for an IP-less endpoint, reviews would materialise —
-			// the sharp negative probe for design D6.
+			// the sharp negative probe for the no-DNS-answers rule.
 			// short.example.com routes to a BARE short destination.host, the
 			// most common way an operator writes a VirtualService destination.
 			Hosts: []string{"api.example.com", "noip.example.com", "short.example.com"},
@@ -424,7 +424,7 @@ func (s *RouteSuite) seedRouteStore() {
 
 	// cluster-beta: a family-foreign cluster fronted by ingressLBIP2 whose
 	// gateway serves cross.example.com. A caller in cluster-alpha reaches it
-	// via the |F|==0, |G|==1 selection rule (design D10).
+	// via the |F|==0, |G|==1 ingress-cluster selection rule.
 	const beta = "cluster-beta"
 	gwBeta := s.mustSpec(&networking.Gateway{
 		Selector: map[string]string{"istio": "ingressgateway"},
@@ -460,7 +460,7 @@ func (s *RouteSuite) seedRouteStore() {
 		beta, "shop", "payments", dt64s(routeValidFrom), dt64s(routeValidTo),
 		[]string{}, []string{}, []string{}, backendSpec, uint64(14))
 
-	// nginx ingress (ingress-lb-service-fallback): an LB Service + Deployment
+	// nginx ingress (LB-Service fallback): an LB Service + Deployment
 	// in cluster-alpha whose selector chain (app=ingress-nginx) matches no
 	// seeded Istio Gateway CR — Hop 3 is empty, the pipeline misses with
 	// no_gateway, and the fallback resolves the unique LB Service. A second
@@ -491,7 +491,7 @@ func (s *RouteSuite) seedRouteStore() {
 		"cluster-gone", "istio-system", "igw", dt64s(routeValidFrom), dt64s(fixedNow.Add(-2*time.Hour)),
 		[]string{}, []string{ingressLBIPGone}, []string{"istio=ingressgateway"}, "", uint64(21))
 
-	// Cross-namespace gateway (scope-gateway-candidates-to-ingress-namespace):
+	// Cross-namespace gateway:
 	// its selector matches cluster-alpha's istio-system ingress deploy labels,
 	// but it lives in team-b — the namespace-scoped Hop 3 SQL must exclude it,
 	// which TestTrafficSnapshotNoFinalDedupAndBareRef's gateway count proves.
@@ -531,8 +531,7 @@ func (s *RouteSuite) seedRouteStore() {
 // payments Service + backing pod in cluster-alpha (so the route-engine
 // destination resolves in topology and fans out), alpha's istio-system/igw
 // ingress LB Service + gateway pod (matching the ClickHouse ingress seed, so
-// a RouteHit's ingress chain has its middle hop in topology —
-// route-hit-ingress-chain), plus cluster-beta's own payments Service +
+// a RouteHit's ingress chain has its middle hop in topology), plus cluster-beta's own payments Service +
 // backing pod (the cross-cluster ingress fixture — a route hit anchored on
 // beta must resolve against beta's topology; beta's igw is deliberately
 // ABSENT from VM topology, so the beta hit doubles as the e2e
@@ -604,7 +603,7 @@ func (s *RouteSuite) startRouteAPIServer() string {
 // the ingress LB IP via the ClickHouse 3-hop. The destination IP uniquely
 // maps to istio-system/igw, which the VM topology holds with a backing
 // gateway pod — so the graph carries the FULL ingress chain
-// (route-hit-ingress-chain): caller → igw service → igw pod → payments →
+// caller → igw service → igw pod → payments →
 // backing pod, PLUS the direct caller→payments edge (the caller's dependency
 // on the backend survives the ingress funnel), and no external node.
 func (s *RouteSuite) TestGlobalFQDNRoutesToService() {
@@ -686,8 +685,8 @@ func (s *RouteSuite) TestBareShortDestinationHostResolves() {
 }
 
 // TestExplicitPortRoutesViaHTTPListener covers the explicit-port path: the
-// peer value carries ":8080" (design D5 step 1), the destination IP selects
-// the caller's own cluster, and the HTTP :8080 listener's RouteConfiguration
+// peer value carries ":8080", the destination IP selects the caller's own
+// cluster, and the HTTP :8080 listener's RouteConfiguration
 // ("http.8080") routes to payments.
 func (s *RouteSuite) TestExplicitPortRoutesViaHTTPListener() {
 	s.ingestUnknownServerSeries(
@@ -710,9 +709,9 @@ func (s *RouteSuite) TestExplicitPortRoutesViaHTTPListener() {
 		"the raw peer value must not leak as an external node")
 }
 
-// TestNoDNSAnswersStaysExternal proves design D6 end to end: with the engine
-// ON, a series carrying no client_dns_answers never consults the route store —
-// the endpoint stays the pre-change external node. The probe host
+// TestNoDNSAnswersStaysExternal proves the no-DNS-answers rule end to end:
+// with the engine ON, a series carrying no client_dns_answers never consults
+// the route store — the endpoint stays the pre-change external node. The probe host
 // noip.example.com is served by the alpha gateway and routed to reviews.shop
 // (present in topology), and NO other test resolves reviews — so if an
 // IP-less endpoint ever consulted the engine again, the reviews service node
@@ -734,15 +733,14 @@ func (s *RouteSuite) TestNoDNSAnswersStaysExternal() {
 		"the routed Service must NOT materialise without a destination IP")
 }
 
-// TestCrossClusterIngressResolves is the design-D10/D11/D12 case end to end:
+// TestCrossClusterIngressResolves is the cross-cluster ingress case end to end:
 // the caller pod lives in cluster-alpha, but the destination IP belongs to
 // cluster-beta's ingress (|F|==0, |G|==1 → C=beta). The route engine reads
 // BETA's Gateway + VirtualService config, the service node materialises in
 // beta, the pod-calls-service edge crosses clusters, and the fan-out runs
 // over beta's endpoints. Beta's istio-system/igw is deliberately ABSENT from
-// the VM topology, so this doubles as the e2e chain-degrade proof
-// (route-hit-ingress-chain D3): the hit keeps today's direct-edge shape and
-// no ingress node materialises.
+// the VM topology, so this doubles as the e2e chain-degrade proof: the hit
+// keeps today's direct-edge shape and no ingress node materialises.
 func (s *RouteSuite) TestCrossClusterIngressResolves() {
 	s.ingestUnknownServerSeries(
 		`client_net_peer_name="cross.example.com",client_dns_answers="` + ingressLBIP2 + `"`)
@@ -775,13 +773,13 @@ func (s *RouteSuite) TestCrossClusterIngressResolves() {
 		"a cross-cluster route hit must not leave an external node behind")
 }
 
-// TestNginxIngressFallsBackToLBService is the ingress-lb-service-fallback
+// TestNginxIngressFallsBackToLBService is the LB-Service fallback's
 // motivating case end to end: the destination IP selects cluster-alpha, whose
 // window holds the nginx LB Service + Deployment but NO Istio Gateway CR
 // reachable from the IP (Hop 3 empty → every segment misses at gateway
 // resolution). The fallback resolves the unique LB Service; the graph carries
 // a pod-calls-service edge to it and the locked-cluster fan-out
-// (route-hit-ingress-chain D2 — the selected cluster's own endpoints, though
+// (the selected cluster's own endpoints, though
 // with one cluster the set is indistinguishable from the old family union)
 // reaches the nginx controller pod — and no external node.
 func (s *RouteSuite) TestNginxIngressFallsBackToLBService() {
@@ -918,7 +916,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotThreeHopAndTranslate() {
 }
 
 // TestClustersWithIngressIPProbe covers the ingress-cluster selection probe —
-// the store's ONLY cross-cluster read (design D10): each seeded LB IP names
+// the store's ONLY cross-cluster read: each seeded LB IP names
 // exactly its own cluster, an external_ips-only IP also matches, an unknown
 // IP names none, and a version pair whose open row was closed by a rewrite
 // BEFORE the resolution instant collapses under the probe's no-FINAL dedup
@@ -978,8 +976,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	// ONE version per gateway, not every version of the window. The seeded
 	// team-b/public-gw (selector-matching but cross-namespace) is absent too:
 	// Hop 3 is scoped to the ingress namespace, so a gateway outside the
-	// ingress Service's namespace is never loaded
-	// (scope-gateway-candidates-to-ingress-namespace).
+	// ingress Service's namespace is never loaded.
 	s.Len(w.Gateways, 2,
 		"the stale open row must be dedup-collapsed away and the cross-namespace gateway excluded")
 	for _, gw := range w.Gateways {
@@ -1116,7 +1113,7 @@ func (s *RouteStoreSuite) TestOpenWithAuthUsesEnvStyleCredentials() {
 	defer func() { _ = st.Close() }()
 }
 
-// TestNginxFallbackResolvesViaRealStore drives the ingress-lb-service-fallback
+// TestNginxFallbackResolvesViaRealStore drives the LB-Service fallback
 // through the real ClickHouse rows WITHOUT router_check_tool: the nginx
 // snapshot shape never reaches gwresolve, so a zero matchcheck.Runner is a tripwire
 // (any invocation would fail). Unique IP → RouteIngressLBService anchored on

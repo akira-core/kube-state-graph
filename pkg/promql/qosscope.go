@@ -26,7 +26,7 @@ func isQoSWorkloadQuery(q Query) bool {
 // query — az routes the family and is not a matcher — so the volume scope is
 // the query's ONLY matcher. Volume granularity is enforced by the reader, not
 // here, because the LUN rows a `lun=""` matcher would drop are the only ones
-// naming the QoS policy on a SAN backend (design.md D11):
+// naming the QoS policy on a SAN backend:
 //
 //	last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //

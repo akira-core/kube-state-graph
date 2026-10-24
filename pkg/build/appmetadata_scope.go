@@ -79,7 +79,7 @@ func rejectWideAppMetadataSeed(plan topologyPlan, opts Options, sel promql.Selec
 // /v1/graph leg is added, since neither has a routing table to consult. An
 // explicit Serves(FamilyAppMeta) == false is the unserved table: both builds
 // skip the metric.
-// The on-demand lookup uses the opposite default (design D11) and must not
+// The on-demand lookup uses the opposite default and must not
 // share this helper.
 func appMetadataServed(q promql.Querier) bool {
 	fs, ok := q.(promql.FamilyServer)
@@ -148,7 +148,7 @@ func appMetadataActive(src *promql.AppMetadataSource, q promql.Querier) bool {
 }
 
 // readScopedAppMetadata issues the application-metadata metric restricted to
-// the (cluster, namespace) pairs of the loaded pods and claims (design D9):
+// the (cluster, namespace) pairs of the loaded pods and claims:
 // one restriction per cluster, each carrying only that cluster's namespaces.
 //
 // It waits on both waves so the two vectors are complete, then runs beside

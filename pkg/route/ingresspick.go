@@ -5,7 +5,7 @@ import (
 )
 
 // pickIngressCluster implements the IP + family-first ingress-cluster
-// selection (design D10). caller is the client pod's own cluster — it feeds
+// selection. caller is the client pod's own cluster — it feeds
 // ONLY the family key and the collision tie-break, never a default answer.
 // perIP holds, per destination IP, the candidate clusters that had an ingress
 // Service carrying that IP live at the resolution instant (the store probe's output;
@@ -33,7 +33,7 @@ import (
 // report (RouteNoIngress or RouteAmbiguousIngress).
 func pickIngressCluster(caller string, perIP [][]string) (cluster string, miss build.RouteOutcome, ok bool) {
 	if len(perIP) == 0 {
-		// Defensive: the prescan never emits an IP-less request (design D6).
+		// Defensive: the prescan never emits an IP-less request.
 		return "", build.RouteNoIngress, false
 	}
 
@@ -68,7 +68,7 @@ func pickIngressCluster(caller string, perIP [][]string) (cluster string, miss b
 	}
 }
 
-// pickOneIP applies the D10 selection table to one IP's candidate set.
+// pickOneIP applies the ingress-cluster selection table to one IP's candidate set.
 func pickOneIP(caller, callerFamily string, cands []string) (string, build.RouteOutcome, bool) {
 	seen := map[string]bool{}
 	var family []string // F: same-family candidates
@@ -108,7 +108,7 @@ func pickOneIP(caller, callerFamily string, cands []string) (string, build.Route
 	case total == 1:
 		return only, "", true
 	case callerInG:
-		// Defensive mirror of the D10 table's rule 4 tie-break. Unreachable
+		// Defensive mirror of the selection table's rule 4 tie-break. Unreachable
 		// in practice: caller ∈ G implies caller ∈ F (a cluster is always in
 		// its own family), which the |F| >= 1 cases above already consumed.
 		return caller, "", true

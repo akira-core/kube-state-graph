@@ -24,7 +24,7 @@ import (
 // pods that sit on a connectivity edge, so without that edge web-1 (and its host
 // node) would be pruned and the serialiser would see an empty graph; the
 // pod-calls-pod → external edge keeps the pod connected. The service-graph
-// metric is never metric-prefixed (different exporter family — D26).
+// metric is never metric-prefixed (different exporter family).
 func happyFixtures() fixtureSet {
 	return fixtureSet{
 		"last_over_time(kube_pod_info": vec(map[string]string{
@@ -50,7 +50,7 @@ func happyFixtures() fixtureSet {
 
 // serviceGraphConnectsWeb1 is a single service-graph series whose client is the
 // happy-fixture pod (uid-web-1) and whose server is an external label with no
-// UID — resolving (missing-UID fallback, D27) to an external node and a
+// UID — resolving (missing-UID fallback) to an external node and a
 // pod-calls-pod edge that makes web-1 connectivity-connected.
 func serviceGraphConnectsWeb1() model.Vector {
 	return vec(map[string]string{

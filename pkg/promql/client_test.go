@@ -36,7 +36,7 @@ func roundTrip(t *testing.T, rt http.RoundTripper, inner *fakeRoundTripper, rawU
 	defer resp.Body.Close()
 	require.NotNil(t, inner.got, "inner transport not invoked")
 
-	// RoundTrippers must not mutate the caller's request (D-A4).
+	// RoundTrippers must not mutate the caller's request.
 	assert.Empty(t, req.Header.Get("Authorization"), "original request mutated")
 	return inner.got
 }

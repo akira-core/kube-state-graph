@@ -12,7 +12,7 @@ import (
 
 // redInputs carries the two OPTIONAL RED query results into the parse.
 // A non-nil *Err means that query failed and the corresponding field must be
-// omitted (not zeroed) on every edge — design D3 / graceful degradation.
+// omitted (not zeroed) on every edge — graceful degradation.
 //
 // A nil Err with an EMPTY vector means the metric does not exist upstream. The
 // spec puts that on the same footing as a query error: `error_rate` is OMITTED
@@ -36,7 +36,7 @@ type pairKey struct{ src, tgt string }
 
 // redPairAcc accumulates in-scope RED contributions for one pairKey.
 // Contributions are stored as slices and summed in ascending order at attach
-// time so the result is a pure function of the multiset (design D9) — that
+// time so the result is a pure function of the multiset — that
 // holds for the histogram buckets too, since float addition is not
 // associative and several contributing series may feed one le boundary.
 type redPairAcc struct {
@@ -45,9 +45,9 @@ type redPairAcc struct {
 	buckets map[float64][]float64 // le → cumulative-count contributions
 	// ineligible is sticky: set when the pair failed a structural condition
 	// of the attachment rule (an endpoint that is neither a pod nor a
-	// service node, or the RouteHit chain's caller→ingress entry hop —
-	// design D1). Sticky rather than per-series so the outcome is a pure
-	// function of the data, independent of vector arrival order (D6).
+	// service node, or the RouteHit chain's caller→ingress entry hop).
+	// Sticky rather than per-series so the outcome is a pure function of
+	// the data, independent of vector arrival order.
 	ineligible bool
 	// noUsableLe is set when duration series matched this pair but none
 	// carried a parseable classic "le" label (native-histogram / vmrange).
@@ -62,7 +62,7 @@ type redPairAcc struct {
 // deployment that exposes neither metric — the join map is never allocated and
 // its key is never computed, so the parse pays nothing for an absent metric.
 // Both vectors join through the SAME map: the failure counter by full series
-// identity, the histogram by that identity minus `le` (design D4).
+// identity, the histogram by that identity minus `le`.
 type redJoin struct {
 	joinFailures bool
 	joinDuration bool
@@ -103,7 +103,7 @@ func (j *redJoin) pairAcc(k pairKey) *redPairAcc {
 // recordSeries is called once per upstream total series for each (src,tgt)
 // pair it produced.
 //
-// eligible carries the pair's STRUCTURAL verdict (design D1 conditions 2–3:
+// eligible carries the pair's STRUCTURAL verdict (the RED attachment rule:
 // both endpoints resolved to a pod or a service node, and this is not the
 // ingress chain's entry hop); a false value rejects the pair permanently.
 // inScope carries the SERIES verdict (design D1b: not a span-link series); a
@@ -170,7 +170,7 @@ func (j *redJoin) accumulateFailures(failed model.Vector) (matched, unmatched in
 
 // accumulateDuration walks the RAW duration vector and sums bucket counts per
 // le boundary onto each mapped pair. Several contributing series mapping to one
-// pair sum together, per le (design D4/D5).
+// pair sum together, per le.
 //
 // The join mirrors accumulateFailures exactly, minus the `le` label: a bucket
 // series carries the same dimension set as its request-total series plus `le`,
@@ -264,7 +264,7 @@ func (a *redPairAcc) attachMetrics(failedOK, durationOK bool) (graph.EdgeMetrics
 }
 
 // sumAscending returns the sum of xs after sorting ascending, so the result is
-// independent of contribution arrival order (design D9).
+// independent of contribution arrival order.
 func sumAscending(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
@@ -279,14 +279,14 @@ func sumAscending(xs []float64) float64 {
 }
 
 // seriesKeyOf builds a deterministic identity for a sample's full label set
-// minus __name__, used to join the failure counter to the total series (D4).
+// minus __name__, used to join the failure counter to the total series.
 func seriesKeyOf(m model.Metric) string {
 	return seriesKeyExcluding(m, "")
 }
 
 // bucketSeriesKeyOf is seriesKeyOf minus the `le` label: a duration-histogram
 // series carries its request-total series' dimension set plus the bucket
-// boundary, so dropping `le` yields that series' identity (D4).
+// boundary, so dropping `le` yields that series' identity.
 func bucketSeriesKeyOf(m model.Metric) string {
 	return seriesKeyExcluding(m, model.BucketLabel)
 }
@@ -320,8 +320,8 @@ const (
 	// labelEdgeRelation is the operator-configured servicegraph dimension that
 	// marks how the connector derived an edge, and edgeRelationLink is the
 	// value it carries for an edge materialised from a SPAN LINK. A fixed,
-	// case-sensitive contract with no knob — same class as the D30 sentinel
-	// values (design D1b).
+	// case-sensitive contract with no knob — same class as the sentinel
+	// values (`client!~"user|unknown",server!~"user"`).
 	labelEdgeRelation = "edge_relation"
 	edgeRelationLink  = "link"
 )

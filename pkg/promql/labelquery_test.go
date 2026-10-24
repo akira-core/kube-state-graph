@@ -247,7 +247,7 @@ func TestQueryLabels_AZRejectedOnUnroutedFamilies(t *testing.T) {
 	}
 }
 
-// Harvest routes by az and renders no az matcher (drop-harvest-zone-matchers D1).
+// Harvest routes by az and renders no az matcher.
 func TestQueryLabels_HarvestAZRoutesWithoutAMatcher(t *testing.T) {
 	tbl := ksmTable(t)
 	fakes := fakesFor(tbl)

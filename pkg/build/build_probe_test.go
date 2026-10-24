@@ -96,11 +96,12 @@ func TestBuild_UpProbeHealthy_OutsideRetentionUnchanged(t *testing.T) {
 	assert.Equal(t, ReasonOutsideRetention, AsReason(err))
 }
 
-// TestBuild_FilteredEmptyResultSkipsRetentionClassification pins design D7:
-// with any selector-level dimension active, "zero pods and zero nodes" means
-// "nothing in scope", not a retention miss. The build returns an empty graph,
-// and the up{} probe is never issued — asserted structurally, by registering
-// NO up-probe expectation on the mock (an unexpected call fails the test).
+// TestBuild_FilteredEmptyResultSkipsRetentionClassification pins the
+// filtered-empty rule: with any selector-level dimension active, "zero pods and
+// zero nodes" means "nothing in scope", not a retention miss. The build returns
+// an empty graph, and the up{} probe is never issued — asserted structurally,
+// by registering NO up-probe expectation on the mock (an unexpected call fails
+// the test).
 func TestBuild_FilteredEmptyResultSkipsRetentionClassification(t *testing.T) {
 	q := promqlmocks.NewMockQuerier(t)
 	q.EXPECT().

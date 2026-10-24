@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// accept-multi-zone-storage-graph: a qualified `aggr=` / `svm=` value
+// A qualified `aggr=` / `svm=` value
 // (`<ontap_cluster>/<name>`) roots exactly one filer's component; the bare form
 // still roots that name on every filer.
 

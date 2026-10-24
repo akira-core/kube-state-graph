@@ -20,7 +20,7 @@
 // its stop channel to t.Cleanup and builds a fake Kubernetes client for the
 // ServiceEntry registry. Translator assembles the minimal config-generator world
 // by hand and tears it down when the call returns, so nothing outlives a
-// translation. This is also the design-D0 discipline: no Kubernetes client,
+// translation. This is also the no-Kubernetes-client discipline: no Kubernetes client,
 // informer, watch, or kubeconfig is ever constructed here.
 //
 // The world is no longer entirely static. istio moved VirtualService merging
@@ -156,7 +156,7 @@ const (
 	ListenerFound ListenerStatus = iota
 	// ListenerNoneOnPort — no server listens on the port, or the server that
 	// wins the host on it has no HTTP RDS route (TLS passthrough, TCP). The
-	// design-D5 mis-guessed-port signature.
+	// mis-guessed-port signature.
 	ListenerNoneOnPort
 	// ListenerNoServerForHost — servers listen on the port, but none of their
 	// hosts match the request host. Distinct from ListenerNoneOnPort so a
@@ -278,7 +278,7 @@ func routeConfigNameFor(gwCfg config.Config, port int, reqHost string) (string, 
 // ServiceEntry: ScopedInput.Configs carries Gateway + VirtualService only, and
 // every backend Service arrives through in.Services. Constructing one now
 // requires a *multicluster.Controller, which would mean building Kubernetes
-// clients — forbidden here (design D0) — so the registry that was never
+// clients — forbidden here — so the registry that was never
 // consulted is gone rather than faked.
 func buildScopedEnv(in ScopedInput) (*model.Environment, func(), error) {
 	// NewController, not the removed NewSyncController: the memory store is
