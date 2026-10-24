@@ -11,37 +11,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRenderNamePairs(t *testing.T) {
+func TestRenderNamesAcrossNamespaces(t *testing.T) {
 	t.Parallel()
+	render := func(q Query, sel Selector, label string, namespaces, names []string) (string, bool) {
+		return RenderNamesAcrossNamespaces(q, time.Minute, LabelKeys{}, sel, label, namespaces, names)
+	}
 
-	t.Run("one pair renders two equalities", func(t *testing.T) {
-		got, ok := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel,
-			[]NamePair{{"shop", "orders-0"}})
+	t.Run("one namespace and one name render two equalities", func(t *testing.T) {
+		got, ok := render(QPodInfo, Selector{}, PodLabel, []string{"shop"}, []string{"orders-0"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(kube_pod_info{namespace="shop",pod="orders-0"}[1m])`, got)
 	})
 
-	t.Run("several pairs render the union of their namespaces and of their names", func(t *testing.T) {
-		got, ok := RenderNamePairs(QPodOwner, time.Minute, LabelKeys{}, Selector{}, PodLabel,
-			[]NamePair{{"shop", "orders-0"}, {"platform", "redis-0"}, {"shop", "web-0"}, {"shop", "orders-0"}})
+	t.Run("several values render sorted, de-duplicated alternations", func(t *testing.T) {
+		got, ok := render(QPodOwner, Selector{}, PodLabel,
+			[]string{"shop", "platform", "shop"}, []string{"web-0", "orders-0", "redis-0", "orders-0"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(kube_pod_owner{namespace=~"platform|shop",pod=~"orders-0|redis-0|web-0"}[1m])`, got,
-			"sorted and de-duplicated: a pure function of the pair set")
-	})
-
-	t.Run("the order of the pairs does not change the query", func(t *testing.T) {
-		a := []NamePair{{"b", "y"}, {"a", "x"}, {"a", "z"}}
-		b := []NamePair{{"a", "z"}, {"b", "y"}, {"a", "x"}}
-		qa, _ := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel, a)
-		qb, _ := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel, b)
-		assert.Equal(t, qa, qb)
+			"a pure function of the two value sets")
 	})
 
 	t.Run("fixed selector, then request matchers, then namespaces, then names", func(t *testing.T) {
 		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
-		got, ok := RenderNamePairs(QPVCBindings, time.Minute, LabelKeys{}, sel, PodLabel,
-			[]NamePair{{"platform", "redis-0"}, {"shop", "orders-0"}})
+		got, ok := render(QPVCBindings, sel, PodLabel, []string{"platform", "shop"}, []string{"redis-0", "orders-0"})
 		require.True(t, ok)
 		assert.Equal(t,
 			`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",cluster="c1",namespace="shop",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1m])`,
@@ -54,8 +47,7 @@ func TestRenderNamePairs(t *testing.T) {
 			if !slices.Contains(PodNamespaceScopedQueries, q) {
 				label = ClaimLabel
 			}
-			got, ok := RenderNamePairs(q, time.Minute, LabelKeys{}, Selector{AZ: []string{"zone-a"}}, label,
-				[]NamePair{{"shop", "a"}})
+			got, ok := render(q, Selector{AZ: []string{"zone-a"}}, label, []string{"shop"}, []string{"a"})
 			require.True(t, ok, q)
 			if fixed := fixedSelector[q]; fixed != "" {
 				assert.Contains(t, got, `{`+fixed+`,az="zone-a",`, "%s: fixed selector, then request matchers", q)
@@ -66,57 +58,57 @@ func TestRenderNamePairs(t *testing.T) {
 	})
 
 	t.Run("regex metacharacters and quotes are escaped", func(t *testing.T) {
-		got, ok := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel,
-			[]NamePair{{"shop.a", `web"0`}, {"b", "z"}})
+		got, ok := render(QPodInfo, Selector{}, PodLabel, []string{"shop.a", "b"}, []string{`web"0`, "z"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(kube_pod_info{namespace=~"b|shop\\.a",pod=~"web\"0|z"}[1m])`, got)
-		one, ok := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel,
-			[]NamePair{{"shop.a", `web"0`}})
+		one, ok := render(QPodInfo, Selector{}, PodLabel, []string{"shop.a"}, []string{`web"0`})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(kube_pod_info{namespace="shop.a",pod="web\"0"}[1m])`, one,
 			"a single value is an equality, so only string escapes apply")
 	})
 
 	t.Run("the unknown cluster renders both alternatives", func(t *testing.T) {
-		got, ok := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{Cluster: []string{ClusterUnknownValue}}, PodLabel,
-			[]NamePair{{"shop", "orders-0"}})
+		got, ok := render(QPodInfo, Selector{Cluster: []string{ClusterUnknownValue}}, PodLabel,
+			[]string{"shop"}, []string{"orders-0"})
 		require.True(t, ok)
 		assert.Equal(t, `last_over_time(kube_pod_info{cluster=~"unknown|",namespace="shop",pod="orders-0"}[1m])`, got)
 	})
 
 	t.Run("every pod-keyed and claim-keyed family is accepted on its own label", func(t *testing.T) {
+		ns, names := []string{"shop"}, []string{"a"}
 		for _, q := range PodNamespaceScopedQueries {
-			_, ok := RenderNamePairs(q, time.Minute, LabelKeys{}, Selector{}, PodLabel, []NamePair{{"shop", "a"}})
+			_, ok := render(q, Selector{}, PodLabel, ns, names)
 			assert.True(t, ok, "%s on pod", q)
-			_, ok = RenderNamePairs(q, time.Minute, LabelKeys{}, Selector{}, ClaimLabel, []NamePair{{"shop", "a"}})
+			_, ok = render(q, Selector{}, ClaimLabel, ns, names)
 			// The binding family is keyed both ways: by pod for a pod seed, by
 			// claim for mounter completion.
 			assert.Equal(t, q == QPVCBindings, ok, "%s on claim", q)
 		}
 		for _, q := range ClaimNamespaceScopedQueries {
-			_, ok := RenderNamePairs(q, time.Minute, LabelKeys{}, Selector{}, ClaimLabel, []NamePair{{"shop", "a"}})
+			_, ok := render(q, Selector{}, ClaimLabel, ns, names)
 			assert.True(t, ok, "%s on claim", q)
 		}
-		_, ok := RenderNamePairs(QNodeInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel, []NamePair{{"shop", "a"}})
+		_, ok := render(QNodeInfo, Selector{}, PodLabel, ns, names)
 		assert.False(t, ok, "a node family is not namespaced")
 	})
 
-	t.Run("nothing to restrict renders nothing", func(t *testing.T) {
-		for name, pairs := range map[string][]NamePair{
-			"no pairs":     nil,
-			"empty halves": {{"", "a"}, {"shop", ""}},
+	t.Run("restricting only one side renders nothing", func(t *testing.T) {
+		for name, tc := range map[string]struct{ namespaces, names []string }{
+			"no namespace":     {nil, []string{"a"}},
+			"no name":          {[]string{"shop"}, nil},
+			"empty namespaces": {[]string{""}, []string{"a"}},
+			"empty names":      {[]string{"shop"}, []string{""}},
 		} {
-			_, ok := RenderNamePairs(QPodInfo, time.Minute, LabelKeys{}, Selector{}, PodLabel, pairs)
+			_, ok := render(QPodInfo, Selector{}, PodLabel, tc.namespaces, tc.names)
 			assert.False(t, ok, name)
 		}
 	})
 
 	t.Run("it is the claim-binding renderer generalised", func(t *testing.T) {
-		pairs := []NamePair{{"platform", "redis-0"}, {"shop", "orders-0"}}
-		got, ok := RenderNamePairs(QPVCBindings, time.Minute, LabelKeys{}, Selector{}, PodLabel, pairs)
+		ns, pods := []string{"platform", "shop"}, []string{"redis-0", "orders-0"}
+		got, ok := render(QPVCBindings, Selector{}, PodLabel, ns, pods)
 		require.True(t, ok)
-		want, ok := RenderClaimBindingsByPod(time.Minute, LabelKeys{}, Selector{},
-			[]string{"platform", "shop"}, []string{"redis-0", "orders-0"})
+		want, ok := RenderClaimBindingsByPod(time.Minute, LabelKeys{}, Selector{}, ns, pods)
 		require.True(t, ok)
 		assert.Equal(t, want, got)
 	})

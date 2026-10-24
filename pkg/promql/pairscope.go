@@ -58,24 +58,6 @@ func RenderNamesAcrossNamespaces(q Query, window time.Duration, keys LabelKeys, 
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
-// RenderNamePairs is RenderNamesAcrossNamespaces for a set of pairs: the
-// namespace alternation is the pairs' distinct namespaces and the name
-// alternation their distinct names. The renderer is a pure function of the pair
-// set — its order and duplicates do not matter.
-func RenderNamePairs(q Query, window time.Duration, keys LabelKeys, sel Selector, label string, pairs []NamePair) (string, bool) {
-	// An unusable pair contributes nothing: letting its one non-empty half
-	// through would restrict the query on a namespace or a name the caller never
-	// paired with the other.
-	pairs = SortedNamePairs(pairs)
-	namespaces := make([]string, 0, len(pairs))
-	names := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		namespaces = append(namespaces, p.Namespace)
-		names = append(names, p.Name)
-	}
-	return RenderNamesAcrossNamespaces(q, window, keys, sel, label, namespaces, names)
-}
-
 // SortedNamePairs is the canonical form of a pair set: the usable pairs — both
 // halves non-empty — sorted by (namespace, name) and de-duplicated. A caller that
 // compares or chunks pair sets goes through it so the result is a pure function
