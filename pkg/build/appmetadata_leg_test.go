@@ -58,7 +58,7 @@ func TestReadTopology_ConfiguredAppMetadataIssuesOneLogicalQuery(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, inner.QueriesFor(promql.QAppMetadata))
 		assert.NotContains(t, tp.RawSeriesCount, string(promql.QAppMetadata))
-		assert.Nil(t, tp.NamespaceOwners)
+		assert.Nil(t, tp.NamespaceMetadata)
 	})
 
 	t.Run("empty labels read their defaults", func(t *testing.T) {
@@ -70,7 +70,9 @@ func TestReadTopology_ConfiguredAppMetadataIssuesOneLogicalQuery(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, f.QueriesFor(promql.QAppMetadata), 1)
 		assert.Equal(t, 1, tp.RawSeriesCount[string(promql.QAppMetadata)])
-		assert.Equal(t, map[graph.NamespaceRef]string{{Cluster: "c", Namespace: "shop"}: "team"}, tp.NamespaceOwners)
+		assert.Equal(t, map[graph.NamespaceRef]graph.NamespaceMeta{
+			{Cluster: "c", Namespace: "shop"}: {Owner: "team"},
+		}, tp.NamespaceMetadata)
 		assert.Empty(t, partial.App, "the caller's source is not mutated")
 	})
 
@@ -100,8 +102,8 @@ func TestBuild_AppMetadataGroupIndexes(t *testing.T) {
 	t.Run("unset leaves both maps nil", func(t *testing.T) {
 		g, err := New(promqlfake.New(nil), Options{}, nil, nil).Build(t.Context(), window, end, sel)
 		require.NoError(t, err)
-		assert.Nil(t, g.NamespaceOwners)
-		assert.Nil(t, g.ApplicationDeployers)
+		assert.Nil(t, g.NamespaceMetadata)
+		assert.Nil(t, g.ApplicationMetadata)
 	})
 
 	t.Run("a read row is keyed by cluster identity", func(t *testing.T) {
@@ -110,26 +112,31 @@ func TestBuild_AppMetadataGroupIndexes(t *testing.T) {
 		})
 		g, err := New(f, Options{AppMetadata: &src}, nil, nil).Build(t.Context(), window, end, sel)
 		require.NoError(t, err)
-		assert.Equal(t, map[graph.NamespaceRef]string{
-			{Cluster: "us-dev-c1", Namespace: "shop"}: "team-a",
-		}, g.NamespaceOwners)
-		assert.Equal(t, map[graph.ApplicationRef]string{
-			{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: "alice",
-		}, g.ApplicationDeployers)
+		assert.Equal(t, map[graph.NamespaceRef]graph.NamespaceMeta{
+			{Cluster: "us-dev-c1", Namespace: "shop"}: {Owner: "team-a"},
+		}, g.NamespaceMetadata)
+		assert.Equal(t, map[graph.ApplicationRef]graph.ApplicationMeta{
+			{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {DeployedBy: "alice"},
+		}, g.ApplicationMetadata)
 	})
 
 	t.Run("an empty read is an empty map", func(t *testing.T) {
 		g, err := New(promqlfake.New(nil), Options{AppMetadata: &src}, nil, nil).Build(t.Context(), window, end, sel)
 		require.NoError(t, err)
-		assert.NotNil(t, g.NamespaceOwners)
-		assert.Empty(t, g.NamespaceOwners)
-		assert.NotNil(t, g.ApplicationDeployers)
-		assert.Empty(t, g.ApplicationDeployers)
+		assert.NotNil(t, g.NamespaceMetadata)
+		assert.Empty(t, g.NamespaceMetadata)
+		assert.NotNil(t, g.ApplicationMetadata)
+		assert.Empty(t, g.ApplicationMetadata)
 	})
 
 	t.Run("a query error leaves both maps nil", func(t *testing.T) {
+		labels := appMetaBase("web-1", "checkout", "team-a", "alice")
+		labels["deploy_time"] = "2025/10/08 13:14:15"
+		labels["namespace_group"] = "commerce"
+		labels["namespace_group_owner"] = "bob"
+		labels["namespace_alias"] = "Shop"
 		f := promqlfake.New(map[promql.Query]model.Vector{
-			promql.QAppMetadata: {sample},
+			promql.QAppMetadata: {appMetaSample(labels, 1)},
 		})
 		f.Fail = func(name, _ string) error {
 			if name == string(promql.QAppMetadata) {
@@ -143,8 +150,8 @@ func TestBuild_AppMetadataGroupIndexes(t *testing.T) {
 			g, err = New(f, Options{AppMetadata: &src}, nil, nil).Build(t.Context(), window, end, sel)
 			require.NoError(t, err)
 		})
-		assert.Nil(t, g.NamespaceOwners)
-		assert.Nil(t, g.ApplicationDeployers)
+		assert.Nil(t, g.NamespaceMetadata)
+		assert.Nil(t, g.ApplicationMetadata)
 		logged := false
 		for _, r := range recs {
 			if r["msg"] == "optional topology query failed; continuing with empty vector" && r["query"] == string(promql.QAppMetadata) {
@@ -204,6 +211,6 @@ func TestBuildStorage_ConfiguredAppMetadataSkipsUnscopedLeg(t *testing.T) {
 		t.Context(), time.Minute, time.Unix(1, 0).UTC(), storageSel, graph.StorageRoots{})
 	require.NoError(t, err)
 	assert.Empty(t, f.QueriesFor(promql.QAppMetadata))
-	assert.Nil(t, g.NamespaceOwners, "the unscoped leg is not the storage read")
-	assert.Nil(t, g.ApplicationDeployers)
+	assert.Nil(t, g.NamespaceMetadata, "the unscoped leg is not the storage read")
+	assert.Nil(t, g.ApplicationMetadata)
 }

@@ -111,9 +111,14 @@ func buildK8sGraphEstate() *graph.Graph {
 		a: {AZ: "zone-a", Env: "prod", Name: "c1"},
 		b: {AZ: "zone-b", Env: "prod", Name: "c1"},
 	}
-	g.NamespaceOwners = map[graph.NamespaceRef]string{{Cluster: a, Namespace: "shop"}: "team-shop"}
-	g.ApplicationDeployers = map[graph.ApplicationRef]string{
-		{Cluster: a, Namespace: "shop", Application: "checkout"}: "alice",
+	g.NamespaceMetadata = map[graph.NamespaceRef]graph.NamespaceMeta{
+		{Cluster: a, Namespace: "shop"}: {Owner: "team-shop", Group: "commerce", GroupOwner: "bob", Alias: "Shop"},
+	}
+	g.ApplicationMetadata = map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: a, Namespace: "shop", Application: "checkout"}: {
+			DeployedBy: "alice",
+			DeployedAt: time.Date(2025, 10, 8, 13, 14, 15, 0, time.UTC),
+		},
 	}
 	return g
 }

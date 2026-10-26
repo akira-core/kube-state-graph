@@ -78,9 +78,9 @@ func TestBuildStorage_AppMetadataReadsPodAndClaimNamespaces(t *testing.T) {
 	require.NotNil(t, pod.Owner())
 	assert.Equal(t, graph.Owner{Kind: "StatefulSet", Name: "orders"}, *pod.Owner())
 
-	assert.Equal(t, "team-a", g.NamespaceOwners[graph.NamespaceRef{Cluster: cluster, Namespace: "shop"}])
-	assert.Equal(t, "alice", g.ApplicationDeployers[graph.ApplicationRef{Cluster: cluster, Namespace: "shop", Application: "shop-v2"}])
-	assert.Equal(t, "ghost-user", g.ApplicationDeployers[graph.ApplicationRef{Cluster: cluster, Namespace: "shop", Application: "ghost-app"}])
+	assert.Equal(t, "team-a", g.NamespaceMetadata[graph.NamespaceRef{Cluster: cluster, Namespace: "shop"}].Owner)
+	assert.Equal(t, "alice", g.ApplicationMetadata[graph.ApplicationRef{Cluster: cluster, Namespace: "shop", Application: "shop-v2"}].DeployedBy)
+	assert.Equal(t, "ghost-user", g.ApplicationMetadata[graph.ApplicationRef{Cluster: cluster, Namespace: "shop", Application: "ghost-app"}].DeployedBy)
 	for _, n := range g.NodesByID {
 		assert.NotEqual(t, "ghost-app", n.Application())
 	}
@@ -122,8 +122,8 @@ func TestBuildStorage_UnsetAppMetadataIssuesNoRead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, q.QueriesFor(promql.QAppMetadata))
 	assert.Equal(t, "shop-orders", g.NodesByID["zone-a-prod-c1/uid-o0"].Application())
-	assert.Nil(t, g.NamespaceOwners)
-	assert.Nil(t, g.ApplicationDeployers)
+	assert.Nil(t, g.NamespaceMetadata)
+	assert.Nil(t, g.ApplicationMetadata)
 }
 
 func TestBuildStorage_UnservedAppMetadataIssuesNoRead(t *testing.T) {
@@ -134,8 +134,8 @@ func TestBuildStorage_UnservedAppMetadataIssuesNoRead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, inner.QueriesFor(promql.QAppMetadata))
 	assert.Equal(t, "shop-orders", g.NodesByID["zone-a-prod-c1/uid-o0"].Application())
-	assert.Nil(t, g.NamespaceOwners)
-	assert.Nil(t, g.ApplicationDeployers)
+	assert.Nil(t, g.NamespaceMetadata)
+	assert.Nil(t, g.ApplicationMetadata)
 }
 
 func TestBuildStorage_AppMetadataChunkErrorFailsClosed(t *testing.T) {

@@ -29,6 +29,9 @@
           "type": "namespace",
           "parent": "cluster/zone-a-prod-c1",
           "namespace_owner": "team-shop",
+          "namespace_group": "commerce",
+          "namespace_group_owner": "bob",
+          "namespace_alias": "Shop",
           "labels": {}
         }
       },
@@ -48,6 +51,7 @@
           "type": "application",
           "parent": "zone-a-prod-c1/namespace/shop",
           "deployed_by": "alice",
+          "deployed_at": "2025-10-08T13:14:15Z",
           "labels": {}
         }
       },

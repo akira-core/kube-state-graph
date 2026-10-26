@@ -121,7 +121,7 @@ The capability specs live under `openspec/specs/`.
 **Wire contract**
 
 - **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`, and every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values (so `?az=b&az=a` and `?az=a&az=b` issue identical queries): node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Every golden carrying a pod / K8s node / PVC / NetApp controller / aggregate intentionally carries an explicit `data.status`; hand-built golden fixtures must stamp the same `FoldStatus` result the builder bakes before `graph.NewGraph`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
-- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, `namespace_owner`, `deployed_by`, and edge `metrics`. `namespace_owner` and `deployed_by` appear only on synthesised `namespace` and `application` groups.
+- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by`, `deployed_at`, and edge `metrics`. `namespace_owner`, `namespace_group`, `namespace_group_owner` and `namespace_alias` appear only on synthesised `namespace` groups; `deployed_by` and `deployed_at` only on synthesised `application` groups.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
   and the canonical input `<type>|<source>|<target>`. Stable across rebuilds —
   required for golden tests. Bumping the namespace UUID is a v2 break.
@@ -131,7 +131,7 @@ The capability specs live under `openspec/specs/`.
 - **`<cluster>` is the composed identity `<az>-<env>-<cluster>`**, composed at the ONE point a series' `cluster` label is read (`build.clusterResolver`, `bucket(query, metric)`); nothing downstream knows about zones. **`?cluster=` is the RAW name at both layers; `clusters[]` is the identity** — a `clusters[]` value sent back as `?cluster=` is an empty 200, deliberately.
 - **Default projection is the connectivity-connected subgraph**: a pod is kept iff it is an endpoint of a connectivity edge, and infra hangs off kept pods. `?prune=false` is the only escape hatch; `cluster` / `namespace` / `az` / `env` never disable the prune. The prune is a projection concern and a pure function of the built graph.
 - **`graph.EdgeTypes` is the single edge-type registry**: adding an edge type means updating the builder AND the registry in the same change. `GraphNode` is sealed; serialisation goes through its methods, never a type switch.
-- **Compound nodes (`cluster` / `namespace` / `application` / `controller` / `storage-cluster`) are presentation-only**, synthesised in `pkg/cytoscape`. A `namespace` group may carry omitempty `data.namespace_owner` and an `application` group omitempty `data.deployed_by`, looked up from `Graph.NamespaceOwners` / `Graph.ApplicationDeployers` at serialise time and never placed inside `labels` (which stay `{}`); both are omitted when the optional application-metadata metric is unset or did not resolve a value. NetApp nodes belong to no Kubernetes cluster and stay out of `clusters[]`.
+- **Compound nodes (`cluster` / `namespace` / `application` / `controller` / `storage-cluster`) are presentation-only**, synthesised in `pkg/cytoscape`. A `namespace` group may carry omitempty `data.namespace_owner`, `data.namespace_group`, `data.namespace_group_owner` and `data.namespace_alias`, and an `application` group omitempty `data.deployed_by` and `data.deployed_at`, looked up from `Graph.NamespaceMetadata` / `Graph.ApplicationMetadata` at serialise time and never placed inside `labels` (which stay `{}`); each is omitted when the optional application-metadata metric is unset or did not resolve that value. NetApp nodes belong to no Kubernetes cluster and stay out of `clusters[]`.
 - **`data.status` is always present** on pods, K8s nodes, PVCs, NetApp controllers and aggregates (`graph.FoldStatus`, baked before `graph.NewGraph`); hand-built golden fixtures must stamp it too. `"normal"` means no negative signal, not full coverage.
 
 **Request and upstream**
@@ -216,10 +216,10 @@ types: `PodNode`, `K8sNode`, `PVCNode`, `ServiceNode`, `ExternalNode`,
 `NetAppAggrNode`, `NetAppNode`, `NetAppSVMNode`. Every attribute is a method on
 the interface returning its zero value for the kinds it does not apply to;
 serialisation goes through these methods — never through type switches in the
-serialiser. `namespace_owner` and `deployed_by` are not `GraphNode` methods.
+serialiser. `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` are not `GraphNode` methods.
 They live only on synthesised Cytoscape `namespace` and `application` groups,
-filled by `cytoscape.Serialise` from `Graph.NamespaceOwners` (`NamespaceRef`)
-and `Graph.ApplicationDeployers` (`ApplicationRef`). Per-method semantics:
+filled by `cytoscape.Serialise` from `Graph.NamespaceMetadata` (`NamespaceRef`)
+and `Graph.ApplicationMetadata` (`ApplicationRef`). Per-method semantics:
 `.claude/rules/graph-model.md`.
 
 ### Test stack layers

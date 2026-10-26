@@ -182,12 +182,13 @@ type Topology struct {
 	// identity's RAW component. Nil for an estate that stamps no az/env pair.
 	ClusterIdentities map[string]graph.ClusterIdentity
 
-	// NamespaceOwners and ApplicationDeployers are the group-metadata indexes
+	// NamespaceMetadata and ApplicationMetadata are the group-metadata indexes
 	// of one application-metadata read, keyed the way the built graph stores
 	// them. Nil when the metric was unset or its vector was not read; an
-	// empty map means the read contributed nothing.
-	NamespaceOwners      map[graph.NamespaceRef]string
-	ApplicationDeployers map[graph.ApplicationRef]string
+	// empty map means the read contributed nothing. An entry exists only when
+	// at least one of its fields resolved.
+	NamespaceMetadata   map[graph.NamespaceRef]graph.NamespaceMeta
+	ApplicationMetadata map[graph.ApplicationRef]graph.ApplicationMeta
 
 	// clusters is the resolver that composed those identities. Carried so the
 	// service-graph reader resolves the trace `cluster` label and the route

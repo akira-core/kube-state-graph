@@ -1,3 +1,26 @@
+# BREAKING — application-metadata group maps are structs
+
+**What changed.** The HTTP body is unchanged. In-process embedders that read the group-metadata maps now read struct values.
+
+| | before | after |
+|---|---|---|
+| `graph.Graph` | `NamespaceOwners map[NamespaceRef]string` | `NamespaceMetadata map[NamespaceRef]NamespaceMeta` |
+| `graph.Graph` | `ApplicationDeployers map[ApplicationRef]string` | `ApplicationMetadata map[ApplicationRef]ApplicationMeta` |
+| `build.Topology` | `NamespaceOwners map[graph.NamespaceRef]string` | `NamespaceMetadata map[graph.NamespaceRef]graph.NamespaceMeta` |
+| `build.Topology` | `ApplicationDeployers map[graph.ApplicationRef]string` | `ApplicationMetadata map[graph.ApplicationRef]graph.ApplicationMeta` |
+
+`NamespaceMeta` is `{Owner, Group, GroupOwner, Alias string}`. `ApplicationMeta` is `{DeployedBy string, DeployedAt time.Time}`. `Owner` and `DeployedBy` carry the values the previous string maps held. A zero `DeployedAt` means the deploy time did not resolve. Nil still means the metric was unset or its vector was not read. An entry exists only when at least one field resolved.
+
+**Operators.** An `--app-metadata-labels` / `KSG_APP_METADATA_LABELS` override that binds an existing field to one of the new default labels (`deploy_time`, `namespace_group`, `namespace_group_owner`, `namespace_alias`) fails startup. `user=namespace_alias` is rejected because that label is the default of `ns_alias`. Rebind the new field in the same list: `user=namespace_alias,ns_alias=ns_display`.
+
+**In-process embedders.** A directly built `promql.AppMetadataSource` that binds an existing field to a new default label now fails `Validate`, including the source passed to `build.ResolvePodApplication`. Leave the new fields empty so they take their defaults, or rebind the new field the same way an operator does.
+
+**Who is affected.** Embedders that read the previous string maps, and any deployment or embedder whose label binding collides with a new default. A metric that does not carry the new labels keeps the previous response body.
+
+**Migration.** Read `Owner` and `DeployedBy` off the struct maps. No flag was renamed. Rollback is a revert.
+
+---
+
 # BREAKING — NetApp Harvest queries carry no `az` / `env` matcher
 
 *Supersedes "NetApp Harvest queries carry the request's `az` / `env`" below.*

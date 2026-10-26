@@ -14,12 +14,16 @@ import (
 
 func defaultAppMetadata() promql.AppMetadataSource {
 	return promql.AppMetadataSource{
-		Metric:    "argocd_app_pod_info",
-		App:       "argocd_app",
-		User:      "user",
-		NSOwner:   "owner",
-		Namespace: "namespace",
-		Pod:       "pod",
+		Metric:       "argocd_app_pod_info",
+		App:          "argocd_app",
+		User:         "user",
+		NSOwner:      "owner",
+		Namespace:    "namespace",
+		Pod:          "pod",
+		DeployTime:   promql.DefaultAppMetadataDeployTimeLabel,
+		NSGroup:      promql.DefaultAppMetadataNSGroupLabel,
+		NSGroupOwner: promql.DefaultAppMetadataNSGroupOwnerLabel,
+		NSAlias:      promql.DefaultAppMetadataNSAliasLabel,
 	}
 }
 

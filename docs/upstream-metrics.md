@@ -73,9 +73,7 @@ GET /v1/graph?start=&end=&…
 
 When `--app-metadata-metric` is set, `ReadTopology` adds one optional
 `app_metadata` query (log-and-continue). Unset, that query is not issued and
-the counts above are unchanged. A query error falls back to the
-controller-annotation Application and emits no `namespace_owner` or
-`deployed_by`. See [Application metadata](#application-metadata).
+the counts above are unchanged. A query error falls back to the controller-annotation Application and emits no `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` or `deployed_at`. See [Application metadata](#application-metadata).
 
 v1 has no result cache: this fan-out runs on every request.
 
@@ -511,6 +509,8 @@ one bucket below the cap is the next rejection:
 histogram_quantile(0.99, sum by (query, le) (rate(kube_state_graph_upstream_query_result_series_bucket[1h])))
 ```
 
+A `deploy_time` label creates a new series on every deploy, including a redeploy by the same user. The series count of `app_metadata` is therefore bounded by deploy frequency times the window, not by pod count alone. Keep that churn inside `-search.maxUniqueTimeseries`.
+
 ## Which request filter reaches which series
 
 Selector-level parameters (`cluster`, `namespace`, `az`, `env`) are rendered
@@ -803,13 +803,21 @@ metric's Application on one request and the controller chain's on another.
 | `user` | `user` | Latest-seen non-empty value per `(cluster, namespace, the row's own app)`; lexical tie-break as above. An empty `app` or an empty `user` does not contribute. Surfaces as `deployed_by` on the synthesised application group, keyed by that group's Application whatever resolved it. |
 | `namespace` | `namespace` | The pod's namespace. `?namespace=` is rendered on this label. |
 | `pod` | `pod` | The pod's name. |
+| `deploy_time` | `deploy_time` | Paired with the `user` pick on `(cluster, namespace, app)`. The stored instant comes only from rows that share the winning last-seen timestamp and the winning `user`. Surfaces as `deployed_at` on the synthesised application group. |
+| `ns_group` | `namespace_group` | Paired with `ns_group_owner` per `(cluster, namespace)`. An empty group contributes to neither field. Surfaces as `namespace_group` on the synthesised namespace group. |
+| `ns_group_owner` | `namespace_group_owner` | The owner carried by the row that won the `ns_group` pick. Never borrowed from another row. Surfaces as `namespace_group_owner`. |
+| `ns_alias` | `namespace_alias` | Latest-seen non-empty value per `(cluster, namespace)`, independent of the group row; the lexically-smallest value breaks an exact timestamp tie. A row with an empty `pod` still contributes. Surfaces as `namespace_alias`. |
+
+An existing override that binds a field to one of the new default labels collides at startup. `user=namespace_alias` is rejected (`label "namespace_alias" is used by both "user" and "ns_alias"`). Rebind the new field in the same list: `user=namespace_alias,ns_alias=ns_display`.
+
+`deploy_time` is accepted only as `YYYY/MM/DD hh:mm:ss`, every component zero-padded, or as RFC 3339 with its own offset. A value with no zone is UTC. The wire value is RFC 3339 in UTC, whole seconds, with a `Z` suffix, and a fractional second is truncated. `2025/10/08 13:14:15` becomes `2025-10-08T13:14:15Z`. `2025-10-08T13:14:15.987+08:00` becomes `2025-10-08T05:14:15Z`. `2025/10/08 9:14:15`, `2025/10/08 13:14:15.5`, ` 2025/10/08 13:14:15`, `1759929255` and `2025/02/30 00:00:00` leave `deployed_at` unset and do not fail the build.
+
+The deployer and the deploy time are one pick, and the time is never borrowed from another row. A row last seen at t1 with `user="alice"` and `deploy_time="2025/10/01 08:00:00"`, beside a row last seen at t2 with `user="bob"` and `deploy_time="2025/10/08 13:14:15"`, resolves deployer `bob` and deploy time `2025-10-08T13:14:15Z`. A later `user="bob"` row with no `deploy_time` resolves deployer `bob` and no deploy time. An empty `user` contributes no time. Two `bob` rows at the same instant pick the later parsed instant, so `2025/10/08 13:14:15` wins over `2025/10/01 08:00:00`. A tied `yesterday` beside `2025/10/08 13:14:15` still resolves `2025-10-08T13:14:15Z`.
+
+The namespace group and its owner are one pick. `ns_group="retail"` with `ns_group_owner="alice"` at t1, and `ns_group="commerce"` with `ns_group_owner="bob"` at t2, resolve group `commerce` and owner `bob`. A later `commerce` row with no owner does not borrow `alice`. An owner on a row with an empty group is ignored. Three tied `commerce` rows whose owners are `""`, `carol` and `bob` resolve owner `bob`. `ns_alias` is independent of that row: `ns_alias="Shop (old)"` at t1 and `ns_alias="Shop"` at t2 resolve alias `Shop`, including when the latest row carries a group and no alias. A row with an empty `pod` still contributes to the group, the owner and the alias.
 
 The sample value is the last-seen timestamp (`tlast_over_time`) and is read
-only for the latest-seen picks. On `/v1/graph` a query error is log-and-continue:
-Applications fall back to the controller chain and no group carries
-`namespace_owner` or `deployed_by`. On `/v1/storage-graph` the same query is
-fail-closed and is restricted, per cluster, to the namespaces the loaded pods and
-claims carry in that cluster.
+only for the latest-seen picks. On `/v1/graph` a query error is log-and-continue: Applications fall back to the controller chain and no group carries `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` or `deployed_at`. On `/v1/storage-graph` the same query is fail-closed and is restricted, per cluster, to the namespaces the loaded pods and claims carry in that cluster.
 An `application=` root also seeds pods from rows whose `app` label names a
 requested Application.
 

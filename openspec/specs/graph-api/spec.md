@@ -2040,7 +2040,7 @@ A `type="pvc"` node's `data` MAY carry a typed `qos` object — the declared QoS
 
 ### Requirement: Namespace and application group metadata
 
-When the `app-metadata-source` capability resolves a namespace owner for a `namespace` group's `(cluster, namespace)`, that group SHALL carry `data.namespace_owner`; when it resolves a deployer for an `application` group's `(cluster, namespace, application)`, that group SHALL carry `data.deployed_by`. Both are `omitempty` strings outside `labels`, which stay `{}`; no other node type carries either.
+For each value the `app-metadata-source` capability resolves, a `namespace` group SHALL carry `data.namespace_owner`, `data.namespace_group`, `data.namespace_group_owner` and `data.namespace_alias` for its `(cluster, namespace)`, and an `application` group `data.deployed_by` and `data.deployed_at` for its `(cluster, namespace, application)`. All are `omitempty` strings outside `labels`, which stay `{}`; no other node type carries any.
 
 #### Scenario: Namespace group carries its owner
 
@@ -2059,8 +2059,8 @@ When the `app-metadata-source` capability resolves a namespace owner for a `name
 
 #### Scenario: Unresolved values are omitted
 
-- **WHEN** a namespace group or application group has no resolved owner or deployer, or the metric is unset
-- **THEN** its `data` object carries no `namespace_owner` or `deployed_by` key, and the body is byte-identical to the pre-change shape
+- **WHEN** a namespace group or application group has no resolved value for one of its fields, or the metric is unset
+- **THEN** its `data` object carries no key for that field, and with the metric unset the body is byte-identical to the pre-change shape
 
 #### Scenario: Application group from the controller chain still gets its deployer
 
@@ -2070,4 +2070,19 @@ When the `app-metadata-source` capability resolves a namespace owner for a `name
 #### Scenario: Real nodes never carry the group fields
 
 - **WHEN** the response contains pod, service, PVC, K8s node, external or NetApp nodes
-- **THEN** none of their `data` objects carries `namespace_owner` or `deployed_by`
+- **THEN** none of their `data` objects carries `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` or `deployed_at`
+
+#### Scenario: Namespace group carries its group, group owner and alias
+
+- **WHEN** the metric resolves group `commerce` with group owner `bob` and alias `Shop` for namespace `shop` in cluster `us-dev-c1`
+- **THEN** the node `us-dev-c1/namespace/shop` carries `data.namespace_group: "commerce"`, `data.namespace_group_owner: "bob"` and `data.namespace_alias: "Shop"`, and `data.labels` is `{}`
+
+#### Scenario: Application group carries its deploy time
+
+- **WHEN** the metric resolves deployer `alice` and deploy time `2025-10-08T13:14:15Z` for Application `checkout` in namespace `shop` of cluster `us-dev-c1`
+- **THEN** the node `us-dev-c1/namespace/shop/application/checkout` carries `data.deployed_by: "alice"` and `data.deployed_at: "2025-10-08T13:14:15Z"`
+
+#### Scenario: A metric without the new labels keeps the previous body
+
+- **WHEN** the metric is configured and none of its rows carries a `deploy_time`, `namespace_group`, `namespace_group_owner` or `namespace_alias` label
+- **THEN** no group carries `namespace_group`, `namespace_group_owner`, `namespace_alias` or `deployed_at`, and the body equals that of the same build before this change

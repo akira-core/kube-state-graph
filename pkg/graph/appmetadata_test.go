@@ -9,6 +9,6 @@ import (
 
 func TestNewGraph_AppMetadataMapsStayNil(t *testing.T) {
 	g := NewGraph(nil, nil, time.Unix(1, 0).UTC())
-	assert.Nil(t, g.NamespaceOwners)
-	assert.Nil(t, g.ApplicationDeployers)
+	assert.Nil(t, g.NamespaceMetadata)
+	assert.Nil(t, g.ApplicationMetadata)
 }

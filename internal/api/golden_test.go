@@ -54,11 +54,11 @@ func TestGolden_GraphResponses(t *testing.T) {
 		t.Run(name+"-cytoscape", func(t *testing.T) {
 			stampFixtureStatuses(view.Nodes)
 			g := &graph.Graph{
-				BuiltAt:              time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
-				NodesByID:            map[string]graph.GraphNode{},
-				ClusterIdentities:    identities[name],
-				NamespaceOwners:      appMetadataOwners[name],
-				ApplicationDeployers: appMetadataDeployers[name],
+				BuiltAt:             time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC),
+				NodesByID:           map[string]graph.GraphNode{},
+				ClusterIdentities:   identities[name],
+				NamespaceMetadata:   appMetadataOwners[name],
+				ApplicationMetadata: appMetadataDeployers[name],
 			}
 			for _, n := range view.Nodes {
 				g.NodesByID[n.ID()] = n
@@ -180,15 +180,20 @@ func compareGolden(t *testing.T, file string, body any) {
 // appMetadataOwners / appMetadataDeployers are the group-metadata tables of
 // the one scenario that models a configured application-metadata metric.
 // Every other scenario leaves them nil, which is the metric-unset body.
-var appMetadataOwners = map[string]map[graph.NamespaceRef]string{
+var appMetadataOwners = map[string]map[graph.NamespaceRef]graph.NamespaceMeta{
 	"with-app-metadata": {
-		{Cluster: "us-dev-c1", Namespace: "shop"}: "team-a",
+		{Cluster: "us-dev-c1", Namespace: "shop"}: {
+			Owner: "team-a", Group: "commerce", GroupOwner: "bob", Alias: "Shop",
+		},
 	},
 }
 
-var appMetadataDeployers = map[string]map[graph.ApplicationRef]string{
+var appMetadataDeployers = map[string]map[graph.ApplicationRef]graph.ApplicationMeta{
 	"with-app-metadata": {
-		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: "alice",
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {
+			DeployedBy: "alice",
+			DeployedAt: time.Date(2025, 10, 8, 13, 14, 15, 0, time.UTC),
+		},
 	},
 }
 

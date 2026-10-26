@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strings"
 	"testing"
@@ -167,8 +169,18 @@ func TestGraphEndpoint_AppMetadataLeg(t *testing.T) {
 	assert.Equal(t, "shop-v2", cfgPod.Application, "the metric wins over the controller annotation")
 	require.NotNil(t, cfgPod.Owner)
 	assert.Equal(t, graph.Owner{Kind: "Deployment", Name: "web"}, *cfgPod.Owner)
+	for _, key := range []string{"namespace_group", "namespace_alias", "deployed_at"} {
+		assert.NotContains(t, string(cfgRaw), key, "a metric without the new labels keeps those keys off the body")
+	}
 
-	errQ := newAppMetadataErrQuerier(t, fixtures)
+	errFixtures := controllerChainFixtures()
+	errFixtures["tlast_over_time(argocd_app_pod_info"] = vec(map[string]string{
+		"cluster": "test", "namespace": "default", "pod": "web-1",
+		"argocd_app": "shop-v2", "owner": "payments", "user": "alice",
+		"deploy_time": "2025/10/08 13:14:15", "namespace_group": "commerce",
+		"namespace_group_owner": "bob", "namespace_alias": "Shop",
+	})
+	errQ := newAppMetadataErrQuerier(t, errFixtures)
 	errSrv := httptest.NewServer(newServerWithAppMetadata(t, errQ, appMetadataSource()).Handler())
 	t.Cleanup(errSrv.Close)
 	errStatus, errRaw := graphBody(t, errSrv)
@@ -177,10 +189,99 @@ func TestGraphEndpoint_AppMetadataLeg(t *testing.T) {
 	assert.Equal(t, "storefront", errPod.Application, "a query error falls back to the controller chain")
 	require.NotNil(t, errPod.Owner)
 	assert.Equal(t, graph.Owner{Kind: "Deployment", Name: "web"}, *errPod.Owner)
-	assert.NotContains(t, string(errRaw), "namespace_owner")
-	assert.NotContains(t, string(errRaw), "deployed_by")
+	for _, key := range []string{
+		"namespace_owner", "namespace_group", "namespace_group_owner",
+		"namespace_alias", "deployed_by", "deployed_at",
+	} {
+		assert.NotContains(t, string(errRaw), key)
+	}
 	assert.Equal(t, string(unsetRaw), string(errRaw), "a degraded build equals the metric-unset body")
 	assert.Equal(t, 1, countNamed(recordedInstants(errQ), string(promql.QAppMetadata)))
+}
+
+// appMetadataRows is one metric row for the happy pod. extra labels are the
+// four new fields; leaving them unset is the "metric without the new labels" body.
+func appMetadataRows(extra map[string]string) model.Vector {
+	labels := map[string]string{
+		"cluster": "test", "namespace": "default", "pod": "web-1",
+		"argocd_app": "shop-v2", "owner": "payments", "user": "alice",
+	}
+	maps.Copy(labels, extra)
+	return vec(labels)
+}
+
+func bodyNode(t *testing.T, raw []byte, id string) cytoscape.NodeData {
+	t.Helper()
+	var body cytoscape.Body
+	require.NoError(t, json.Unmarshal(raw, &body))
+	for _, n := range body.Elements.Nodes {
+		if n.Data.ID == id {
+			return n.Data
+		}
+	}
+	t.Fatalf("missing node %s", id)
+	return cytoscape.NodeData{}
+}
+
+func TestGraphEndpoint_AppMetadataGroupFields(t *testing.T) {
+	start := time.Unix(1746442800, 0).UTC()
+	end := time.Unix(1746446400, 0).UTC()
+
+	plain := controllerChainFixtures()
+	plain["tlast_over_time(argocd_app_pod_info"] = appMetadataRows(nil)
+	plainSrv := httptest.NewServer(newServerWithAppMetadata(t, newMockQuerier(t, plain), appMetadataSource()).Handler())
+	t.Cleanup(plainSrv.Close)
+	plainResp, err := http.Get(graphURL(plainSrv.URL+"/v1/graph", start, end))
+	require.NoError(t, err)
+	defer plainResp.Body.Close()
+	plainRaw, err := io.ReadAll(plainResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, plainResp.StatusCode, string(plainRaw))
+	for _, key := range []string{"namespace_group", "namespace_alias", "deployed_at"} {
+		assert.NotContains(t, string(plainRaw), key)
+	}
+
+	full := controllerChainFixtures()
+	full["tlast_over_time(argocd_app_pod_info"] = appMetadataRows(map[string]string{
+		"deploy_time":           "2025/10/08 13:14:15",
+		"namespace_group":       "commerce",
+		"namespace_group_owner": "bob",
+		"namespace_alias":       "Shop",
+	})
+	graphSrv := httptest.NewServer(newServerWithAppMetadata(t, newMockQuerier(t, full), appMetadataSource()).Handler())
+	t.Cleanup(graphSrv.Close)
+	graphResp, err := http.Get(graphURL(graphSrv.URL+"/v1/graph", start, end))
+	require.NoError(t, err)
+	defer graphResp.Body.Close()
+	graphRaw, err := io.ReadAll(graphResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, graphResp.StatusCode, string(graphRaw))
+
+	storageSrv := httptest.NewServer(newServerWithAppMetadata(t, newMockQuerier(t, full), appMetadataSource()).Handler())
+	t.Cleanup(storageSrv.Close)
+	storageResp, err := http.Get(storageGraphURL(storageSrv.URL, url.Values{"pod": {"default/web-1"}}))
+	require.NoError(t, err)
+	defer storageResp.Body.Close()
+	storageRaw, err := io.ReadAll(storageResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, storageResp.StatusCode, string(storageRaw))
+
+	for _, raw := range [][]byte{graphRaw, storageRaw} {
+		ns := bodyNode(t, raw, "test/namespace/default")
+		assert.Equal(t, "payments", ns.NamespaceOwner)
+		assert.Equal(t, "commerce", ns.NamespaceGroup)
+		assert.Equal(t, "bob", ns.NamespaceGroupOwner)
+		assert.Equal(t, "Shop", ns.NamespaceAlias)
+		assert.Empty(t, ns.Labels)
+		app := bodyNode(t, raw, "test/namespace/default/application/shop-v2")
+		assert.Equal(t, "alice", app.DeployedBy)
+		assert.Equal(t, "2025-10-08T13:14:15Z", app.DeployedAt)
+		assert.Empty(t, app.Labels)
+		pod := bodyNode(t, raw, "test/uid-web-1")
+		assert.Empty(t, pod.NamespaceGroup)
+		assert.Empty(t, pod.NamespaceAlias)
+		assert.Empty(t, pod.DeployedAt)
+	}
 }
 
 // newAppMetadataErrQuerier is newMockQuerier, except the logical app_metadata

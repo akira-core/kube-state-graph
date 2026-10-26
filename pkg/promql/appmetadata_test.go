@@ -153,12 +153,16 @@ func TestAppMetadataSource_OrDefault(t *testing.T) {
 	t.Parallel()
 	got := AppMetadataSource{Metric: "m", User: "deployer"}.OrDefault()
 	assert.Equal(t, AppMetadataSource{
-		Metric:    "m",
-		App:       DefaultAppMetadataAppLabel,
-		User:      "deployer",
-		NSOwner:   DefaultAppMetadataNSOwnerLabel,
-		Namespace: DefaultAppMetadataNamespaceLabel,
-		Pod:       DefaultAppMetadataPodLabel,
+		Metric:       "m",
+		App:          DefaultAppMetadataAppLabel,
+		User:         "deployer",
+		NSOwner:      DefaultAppMetadataNSOwnerLabel,
+		Namespace:    DefaultAppMetadataNamespaceLabel,
+		Pod:          DefaultAppMetadataPodLabel,
+		DeployTime:   DefaultAppMetadataDeployTimeLabel,
+		NSGroup:      DefaultAppMetadataNSGroupLabel,
+		NSGroupOwner: DefaultAppMetadataNSGroupOwnerLabel,
+		NSAlias:      DefaultAppMetadataNSAliasLabel,
 	}, got)
 	assert.Empty(t, AppMetadataSource{}.OrDefault().Metric, "the metric name is never defaulted")
 }
@@ -182,6 +186,11 @@ func TestAppMetadataSource_Validate(t *testing.T) {
 		"configured az key": {AppMetadataSource{Metric: "m", NSOwner: "zone"}, LabelKeys{AZ: "zone"}, []string{`"ns_owner"`, `"zone"`}},
 		"duplicate labels":  {AppMetadataSource{Metric: "m", App: "x", User: "x"}, LabelKeys{}, []string{`"x"`, `"app"`, `"user"`}},
 		"default collision": {AppMetadataSource{Metric: "m", App: "pod"}, LabelKeys{}, []string{`"pod"`, `"app"`}},
+		"new default collision": {
+			AppMetadataSource{Metric: "m", User: "namespace_alias"},
+			LabelKeys{},
+			[]string{`"namespace_alias"`, `"user"`, `"ns_alias"`},
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
