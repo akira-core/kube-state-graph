@@ -7,18 +7,22 @@ import (
 	"time"
 )
 
-// Default label names of the five application-metadata fields. A field left
+// Default label names of the nine application-metadata fields. A field left
 // empty on AppMetadataSource reads its default (OrDefault).
 const (
-	DefaultAppMetadataAppLabel       = "argocd_app"
-	DefaultAppMetadataUserLabel      = "user"
-	DefaultAppMetadataNSOwnerLabel   = "owner"
-	DefaultAppMetadataNamespaceLabel = "namespace"
-	DefaultAppMetadataPodLabel       = "pod"
+	DefaultAppMetadataAppLabel          = "argocd_app"
+	DefaultAppMetadataUserLabel         = "user"
+	DefaultAppMetadataNSOwnerLabel      = "owner"
+	DefaultAppMetadataNamespaceLabel    = "namespace"
+	DefaultAppMetadataPodLabel          = "pod"
+	DefaultAppMetadataDeployTimeLabel   = "deploy_time"
+	DefaultAppMetadataNSGroupLabel      = "namespace_group"
+	DefaultAppMetadataNSGroupOwnerLabel = "namespace_group_owner"
+	DefaultAppMetadataNSAliasLabel      = "namespace_alias"
 )
 
 // AppMetadataSource is the operator's application-metadata metric: the series
-// name plus the five label names its rows are read through. A nil pointer at
+// name plus the nine label names its rows are read through. A nil pointer at
 // the build options is the off switch; this value is only constructed once a
 // metric name is configured. An empty label field means its default; the
 // build and the lookup apply OrDefault before reading the value.
@@ -31,12 +35,16 @@ const (
 // Validate at startup; an embedder constructing the value directly is trusted
 // code, as with LabelKeys, and should call Validate itself.
 type AppMetadataSource struct {
-	Metric    string
-	App       string
-	User      string
-	NSOwner   string
-	Namespace string
-	Pod       string
+	Metric       string
+	App          string
+	User         string
+	NSOwner      string
+	Namespace    string
+	Pod          string
+	DeployTime   string
+	NSGroup      string
+	NSGroupOwner string
+	NSAlias      string
 }
 
 // OrDefault returns a copy with every empty label field set to its default.
@@ -47,23 +55,32 @@ func (s AppMetadataSource) OrDefault() AppMetadataSource {
 	s.NSOwner = cmp.Or(s.NSOwner, DefaultAppMetadataNSOwnerLabel)
 	s.Namespace = cmp.Or(s.Namespace, DefaultAppMetadataNamespaceLabel)
 	s.Pod = cmp.Or(s.Pod, DefaultAppMetadataPodLabel)
+	s.DeployTime = cmp.Or(s.DeployTime, DefaultAppMetadataDeployTimeLabel)
+	s.NSGroup = cmp.Or(s.NSGroup, DefaultAppMetadataNSGroupLabel)
+	s.NSGroupOwner = cmp.Or(s.NSGroupOwner, DefaultAppMetadataNSGroupOwnerLabel)
+	s.NSAlias = cmp.Or(s.NSAlias, DefaultAppMetadataNSAliasLabel)
 	return s
 }
 
 // Validate checks the value after OrDefault: Metric is a legal metric name,
 // every label a legal label name, no two fields share a label, and no field
 // uses "cluster" or the az / env key of keys. Each error names the field by
-// its configuration name (app, user, ns_owner, namespace, pod).
+// its configuration name (app, user, ns_owner, namespace, pod,
+// deploy_time, ns_group, ns_group_owner, ns_alias). The four added fields
+// are checked after the original five, so a collision names the earlier field
+// first.
 func (s AppMetadataSource) Validate(keys LabelKeys) error {
 	if !metricNameRe.MatchString(s.Metric) {
 		return fmt.Errorf("metric %q is not a valid Prometheus metric name", s.Metric)
 	}
 	keys = keys.OrDefault()
 	s = s.OrDefault()
-	used := make(map[string]string, 5)
+	used := make(map[string]string, 9)
 	for _, f := range []struct{ field, label string }{
 		{"app", s.App}, {"user", s.User}, {"ns_owner", s.NSOwner},
 		{"namespace", s.Namespace}, {"pod", s.Pod},
+		{"deploy_time", s.DeployTime}, {"ns_group", s.NSGroup},
+		{"ns_group_owner", s.NSGroupOwner}, {"ns_alias", s.NSAlias},
 	} {
 		if !labelNameRe.MatchString(f.label) {
 			return fmt.Errorf("label for field %q is not a valid PromQL label name: %q", f.field, f.label)

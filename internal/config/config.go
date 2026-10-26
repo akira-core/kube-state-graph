@@ -77,7 +77,7 @@ type Config struct {
 	// feature: no query is issued.
 	AppMetadataMetric string
 	// AppMetadataLabels is a comma-separated field=label list overriding any
-	// subset of the five default bindings (--app-metadata-labels /
+	// subset of the nine default bindings (--app-metadata-labels /
 	// KSG_APP_METADATA_LABELS). Empty keeps every default. It is an error
 	// without AppMetadataMetric.
 	AppMetadataLabels string
@@ -195,7 +195,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.AZLabel, "az-label", cfg.AZLabel, "Upstream label the ?az= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.EnvLabel, "env-label", cfg.EnvLabel, "Upstream label the ?env= request parameter is matched against on every topology query.")
 	fs.StringVar(&cfg.AppMetadataMetric, "app-metadata-metric", cfg.AppMetadataMetric, "Per-pod application-metadata metric. Empty disables the feature.")
-	fs.StringVar(&cfg.AppMetadataLabels, "app-metadata-labels", cfg.AppMetadataLabels, "Comma-separated field=label overrides for the application-metadata metric. Fields: app, user, ns_owner, namespace, pod. Omitted fields keep their defaults.")
+	fs.StringVar(&cfg.AppMetadataLabels, "app-metadata-labels", cfg.AppMetadataLabels, "Comma-separated field=label overrides for the application-metadata metric. Fields: app, user, ns_owner, namespace, pod, deploy_time, ns_group, ns_group_owner, ns_alias. Omitted fields keep their defaults.")
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
@@ -413,14 +413,19 @@ func (c Config) Validate() error {
 // labelNameRE is the PromQL label-name grammar.
 var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-// appMetadataDefaults are the five field=label bindings an operator keeps
-// by omitting them from --app-metadata-labels.
+// appMetadataDefaults are the nine field=label bindings an operator keeps
+// by omitting them from --app-metadata-labels. The four added fields follow
+// the original five so a label collision names the earlier field first.
 var appMetadataDefaults = []struct{ field, label string }{
 	{"app", promql.DefaultAppMetadataAppLabel},
 	{"user", promql.DefaultAppMetadataUserLabel},
 	{"ns_owner", promql.DefaultAppMetadataNSOwnerLabel},
 	{"namespace", promql.DefaultAppMetadataNamespaceLabel},
 	{"pod", promql.DefaultAppMetadataPodLabel},
+	{"deploy_time", promql.DefaultAppMetadataDeployTimeLabel},
+	{"ns_group", promql.DefaultAppMetadataNSGroupLabel},
+	{"ns_group_owner", promql.DefaultAppMetadataNSGroupOwnerLabel},
+	{"ns_alias", promql.DefaultAppMetadataNSAliasLabel},
 }
 
 // AppMetadata resolves the application-metadata source. A nil source with a
@@ -466,12 +471,16 @@ func (c Config) AppMetadata() (*promql.AppMetadataSource, error) {
 		}
 	}
 	src := &promql.AppMetadataSource{
-		Metric:    c.AppMetadataMetric,
-		App:       labels["app"],
-		User:      labels["user"],
-		NSOwner:   labels["ns_owner"],
-		Namespace: labels["namespace"],
-		Pod:       labels["pod"],
+		Metric:       c.AppMetadataMetric,
+		App:          labels["app"],
+		User:         labels["user"],
+		NSOwner:      labels["ns_owner"],
+		Namespace:    labels["namespace"],
+		Pod:          labels["pod"],
+		DeployTime:   labels["deploy_time"],
+		NSGroup:      labels["ns_group"],
+		NSGroupOwner: labels["ns_group_owner"],
+		NSAlias:      labels["ns_alias"],
 	}
 	if err := src.Validate(promql.LabelKeys{AZ: c.AZLabel, Env: c.EnvLabel}); err != nil {
 		return nil, fmt.Errorf("app-metadata (KSG_APP_METADATA_METRIC / KSG_APP_METADATA_LABELS): %w", err)

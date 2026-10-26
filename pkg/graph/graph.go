@@ -29,25 +29,43 @@ type Graph struct {
 	// compares raw labels exactly as it did before.
 	ClusterIdentities map[string]ClusterIdentity
 
-	// NamespaceOwners maps a namespace, inside a cluster identity, to the
-	// owner the application-metadata metric resolved. ApplicationDeployers
-	// maps an Application in that namespace to the deployer the same metric
-	// resolved, keyed by the row's own app label. Both are set by the builder
-	// after NewGraph. Nil — a hand-built graph, or a build whose metric was
-	// unset or not read — emits neither group field.
-	NamespaceOwners      map[NamespaceRef]string
-	ApplicationDeployers map[ApplicationRef]string
+	// NamespaceMetadata maps a namespace, inside a cluster identity, to the
+	// fields the application-metadata metric resolved for it.
+	// ApplicationMetadata maps an Application in that namespace to the fields
+	// the same metric resolved, keyed by the row's own app label. Both are
+	// set by the builder after NewGraph. Nil — a hand-built graph, or a build
+	// whose metric was unset or not read — emits no group field. An entry
+	// exists only when at least one of its fields resolved.
+	NamespaceMetadata   map[NamespaceRef]NamespaceMeta
+	ApplicationMetadata map[ApplicationRef]ApplicationMeta
+}
+
+// NamespaceMeta is the application-metadata record of one namespace. An empty
+// string means that pick did not resolve.
+type NamespaceMeta struct {
+	Owner      string
+	Group      string
+	GroupOwner string
+	Alias      string
+}
+
+// ApplicationMeta is the application-metadata record of one Application.
+// DeployedAt is the zero time when the deploy time did not resolve. A
+// non-zero value is UTC, truncated to the whole second.
+type ApplicationMeta struct {
+	DeployedBy string
+	DeployedAt time.Time
 }
 
 // NamespaceRef names one namespace inside a cluster identity. It is the key
-// of Graph.NamespaceOwners, matched against a synthesised namespace group.
+// of Graph.NamespaceMetadata, matched against a synthesised namespace group.
 type NamespaceRef struct {
 	Cluster   string
 	Namespace string
 }
 
 // ApplicationRef names one Application inside a namespace. It is the key of
-// Graph.ApplicationDeployers, matched against a synthesised application group.
+// Graph.ApplicationMetadata, matched against a synthesised application group.
 // Application is the metric's app value verbatim, not a tracking-id parse.
 type ApplicationRef struct {
 	Cluster     string

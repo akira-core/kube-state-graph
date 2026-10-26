@@ -120,8 +120,8 @@ func TestBuildK8s_Attributes(t *testing.T) {
 		}
 	})
 	t.Run("group metadata", func(t *testing.T) {
-		assert.Equal(t, "team-a", g.NamespaceOwners[graph.NamespaceRef{Cluster: k8sCluster, Namespace: "shop"}])
-		assert.Equal(t, "alice", g.ApplicationDeployers[graph.ApplicationRef{Cluster: k8sCluster, Namespace: "shop", Application: "shop-v2"}])
+		assert.Equal(t, "team-a", g.NamespaceMetadata[graph.NamespaceRef{Cluster: k8sCluster, Namespace: "shop"}].Owner)
+		assert.Equal(t, "alice", g.ApplicationMetadata[graph.ApplicationRef{Cluster: k8sCluster, Namespace: "shop", Application: "shop-v2"}].DeployedBy)
 	})
 }
 

@@ -3,6 +3,7 @@ package cytoscape
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -10,16 +11,16 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
 
-func cyMeta(t *testing.T, nodes []graph.GraphNode, owners map[graph.NamespaceRef]string, deployers map[graph.ApplicationRef]string) Body {
+func cyMeta(t *testing.T, nodes []graph.GraphNode, namespaces map[graph.NamespaceRef]graph.NamespaceMeta, applications map[graph.ApplicationRef]graph.ApplicationMeta) Body {
 	t.Helper()
 	byID := make(map[string]graph.GraphNode, len(nodes))
 	for _, n := range nodes {
 		byID[n.ID()] = n
 	}
 	return Serialise(&graph.Graph{
-		NodesByID:            byID,
-		NamespaceOwners:      owners,
-		ApplicationDeployers: deployers,
+		NodesByID:           byID,
+		NamespaceMetadata:   namespaces,
+		ApplicationMetadata: applications,
 	}, graph.View{Nodes: nodes})
 }
 
@@ -27,8 +28,12 @@ func assertOmitsGroupFields(t *testing.T, data NodeData) {
 	t.Helper()
 	raw, err := json.Marshal(data)
 	require.NoError(t, err)
-	assert.NotContains(t, string(raw), "namespace_owner")
-	assert.NotContains(t, string(raw), "deployed_by")
+	for _, key := range []string{
+		"namespace_owner", "namespace_group", "namespace_group_owner",
+		"namespace_alias", "deployed_by", "deployed_at",
+	} {
+		assert.NotContains(t, string(raw), key)
+	}
 }
 
 func TestSerialise_NamespaceGroupCarriesOwner(t *testing.T) {
@@ -37,9 +42,9 @@ func TestSerialise_NamespaceGroupCarriesOwner(t *testing.T) {
 		NameValue:   "web",
 		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"},
 	}
-	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, map[graph.NamespaceRef]string{
-		{Cluster: "us-dev-c1", Namespace: "shop"}: "team-a",
-		{Cluster: "us-dev-c1", Namespace: "idle"}: "team-z",
+	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, map[graph.NamespaceRef]graph.NamespaceMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop"}: {Owner: "team-a"},
+		{Cluster: "us-dev-c1", Namespace: "idle"}: {Owner: "team-z"},
 	}, nil))
 
 	ns := nodes[namespaceParentID("us-dev-c1", "shop")]
@@ -59,8 +64,8 @@ func TestSerialise_ApplicationGroupCarriesDeployer(t *testing.T) {
 		ApplicationValue: "checkout",
 		OwnerValue:       &graph.Owner{Kind: "Deployment", Name: "web"},
 	}
-	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, nil, map[graph.ApplicationRef]string{
-		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: "alice",
+	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, nil, map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {DeployedBy: "alice"},
 	}))
 
 	app := nodes[applicationParentID("us-dev-c1", "shop", "checkout")]
@@ -85,10 +90,10 @@ func TestSerialise_UnresolvedGroupMetadataOmitted(t *testing.T) {
 
 	// A populated table that simply does not name this namespace or Application
 	// omits the fields the same way a nil table does.
-	nodes = cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, map[graph.NamespaceRef]string{
-		{Cluster: "us-dev-c1", Namespace: "other"}: "team-b",
-	}, map[graph.ApplicationRef]string{
-		{Cluster: "us-dev-c1", Namespace: "shop", Application: "other"}: "bob",
+	nodes = cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, map[graph.NamespaceRef]graph.NamespaceMeta{
+		{Cluster: "us-dev-c1", Namespace: "other"}: {Owner: "team-b"},
+	}, map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "other"}: {DeployedBy: "bob"},
 	}))
 	assertOmitsGroupFields(t, nodes[namespaceParentID("us-dev-c1", "shop")])
 	assertOmitsGroupFields(t, nodes[applicationParentID("us-dev-c1", "shop", "checkout")])
@@ -105,10 +110,10 @@ func TestSerialise_RealNodesNeverCarryGroupFields(t *testing.T) {
 		&graph.NetAppAggrNode{IDValue: "netapp/oc/aggr/a1", NameValue: "a1", LabelsValue: map[string]string{"ontap_cluster": "oc", "node": "n"}},
 		&graph.NetAppNode{IDValue: "netapp/oc/n", NameValue: "n", LabelsValue: map[string]string{"ontap_cluster": "oc"}},
 	}
-	body := cyMeta(t, nodes, map[graph.NamespaceRef]string{
-		{Cluster: "us-dev-c1", Namespace: "shop"}: "team-a",
-	}, map[graph.ApplicationRef]string{
-		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: "alice",
+	body := cyMeta(t, nodes, map[graph.NamespaceRef]graph.NamespaceMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop"}: {Owner: "team-a"},
+	}, map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {DeployedBy: "alice"},
 	})
 	byID := cyNodesByID(body)
 	for _, n := range nodes {
@@ -117,4 +122,44 @@ func TestSerialise_RealNodesNeverCarryGroupFields(t *testing.T) {
 	assert.Equal(t, "team-a", byID[namespaceParentID("us-dev-c1", "shop")].NamespaceOwner)
 	assert.Equal(t, "alice", byID[applicationParentID("us-dev-c1", "shop", "checkout")].DeployedBy)
 	assertOmitsGroupFields(t, byID["cluster/us-dev-c1"])
+}
+
+func TestSerialise_NamespaceGroupCarriesGroupFields(t *testing.T) {
+	pod := &graph.PodNode{
+		IDValue:     "us-dev-c1/p1",
+		NameValue:   "web",
+		LabelsValue: map[string]string{"cluster": "us-dev-c1", "namespace": "shop"},
+	}
+	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, map[graph.NamespaceRef]graph.NamespaceMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop"}: {Group: "commerce", GroupOwner: "bob", Alias: "Shop"},
+	}, nil))
+	ns := nodes[namespaceParentID("us-dev-c1", "shop")]
+	assert.Equal(t, "commerce", ns.NamespaceGroup)
+	assert.Equal(t, "bob", ns.NamespaceGroupOwner)
+	assert.Equal(t, "Shop", ns.NamespaceAlias)
+	assert.Equal(t, map[string]string{}, ns.Labels)
+	assert.Empty(t, ns.NamespaceOwner)
+	assertOmitsGroupFields(t, nodes[pod.ID()])
+}
+
+func TestSerialise_ApplicationGroupCarriesDeployTime(t *testing.T) {
+	pod := &graph.PodNode{
+		IDValue:          "us-dev-c1/p1",
+		NameValue:        "web",
+		LabelsValue:      map[string]string{"cluster": "us-dev-c1", "namespace": "shop"},
+		ApplicationValue: "checkout",
+	}
+	when := time.Date(2025, 10, 8, 13, 14, 15, 0, time.UTC)
+	nodes := cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, nil, map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {DeployedBy: "alice", DeployedAt: when},
+	}))
+	app := nodes[applicationParentID("us-dev-c1", "shop", "checkout")]
+	assert.Equal(t, "alice", app.DeployedBy)
+	assert.Equal(t, "2025-10-08T13:14:15Z", app.DeployedAt)
+	assertOmitsGroupFields(t, nodes[pod.ID()])
+
+	nodes = cyNodesByID(cyMeta(t, []graph.GraphNode{pod}, nil, map[graph.ApplicationRef]graph.ApplicationMeta{
+		{Cluster: "us-dev-c1", Namespace: "shop", Application: "checkout"}: {DeployedBy: "alice"},
+	}))
+	assert.Empty(t, nodes[applicationParentID("us-dev-c1", "shop", "checkout")].DeployedAt)
 }

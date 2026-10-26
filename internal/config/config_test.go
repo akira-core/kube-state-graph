@@ -258,12 +258,16 @@ func TestParse_AppMetadataPartialOverrideKeepsDefaults(t *testing.T) {
 	src, err := cfg.AppMetadata()
 	require.NoError(t, err)
 	assert.Equal(t, &promql.AppMetadataSource{
-		Metric:    "argocd_app_pod_info",
-		App:       "application",
-		User:      "deployer",
-		NSOwner:   "owner",
-		Namespace: "namespace",
-		Pod:       "pod",
+		Metric:       "argocd_app_pod_info",
+		App:          "application",
+		User:         "deployer",
+		NSOwner:      "owner",
+		Namespace:    "namespace",
+		Pod:          "pod",
+		DeployTime:   promql.DefaultAppMetadataDeployTimeLabel,
+		NSGroup:      promql.DefaultAppMetadataNSGroupLabel,
+		NSGroupOwner: promql.DefaultAppMetadataNSGroupOwnerLabel,
+		NSAlias:      promql.DefaultAppMetadataNSAliasLabel,
 	}, src)
 }
 
@@ -284,12 +288,16 @@ func TestParse_AppMetadataFromEnvOnly(t *testing.T) {
 	src, err := cfg.AppMetadata()
 	require.NoError(t, err)
 	assert.Equal(t, &promql.AppMetadataSource{
-		Metric:    "argocd_app_pod_info",
-		App:       promql.DefaultAppMetadataAppLabel,
-		User:      promql.DefaultAppMetadataUserLabel,
-		NSOwner:   "team",
-		Namespace: promql.DefaultAppMetadataNamespaceLabel,
-		Pod:       promql.DefaultAppMetadataPodLabel,
+		Metric:       "argocd_app_pod_info",
+		App:          promql.DefaultAppMetadataAppLabel,
+		User:         promql.DefaultAppMetadataUserLabel,
+		NSOwner:      "team",
+		Namespace:    promql.DefaultAppMetadataNamespaceLabel,
+		Pod:          promql.DefaultAppMetadataPodLabel,
+		DeployTime:   promql.DefaultAppMetadataDeployTimeLabel,
+		NSGroup:      promql.DefaultAppMetadataNSGroupLabel,
+		NSGroupOwner: promql.DefaultAppMetadataNSGroupOwnerLabel,
+		NSAlias:      promql.DefaultAppMetadataNSAliasLabel,
 	}, src)
 }
 
@@ -314,6 +322,36 @@ func TestParse_AppMetadataFlagOverridesEnv(t *testing.T) {
 	assert.Equal(t, "from_flag", src.Metric)
 	assert.Equal(t, "workload", src.Pod)
 	assert.Equal(t, "argocd_app", src.App)
+}
+
+func TestParse_AppMetadataLabelOverrides(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+
+	t.Run("two fields only", func(t *testing.T) {
+		cfg, err := Parse([]string{
+			"--app-metadata-metric=argocd_app_pod_info",
+			"--app-metadata-labels=deploy_time=last_deployed,ns_alias=ns_display",
+		}, noEnv)
+		require.NoError(t, err)
+		src, err := cfg.AppMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, "last_deployed", src.DeployTime)
+		assert.Equal(t, "ns_display", src.NSAlias)
+		assert.Equal(t, promql.DefaultAppMetadataUserLabel, src.User)
+		assert.Equal(t, promql.DefaultAppMetadataNSGroupLabel, src.NSGroup)
+	})
+
+	t.Run("rebind the colliding default", func(t *testing.T) {
+		cfg, err := Parse([]string{
+			"--app-metadata-metric=argocd_app_pod_info",
+			"--app-metadata-labels=user=namespace_alias,ns_alias=ns_display",
+		}, noEnv)
+		require.NoError(t, err)
+		src, err := cfg.AppMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, "namespace_alias", src.User)
+		assert.Equal(t, "ns_display", src.NSAlias)
+	})
 }
 
 func TestParse_AppMetadataRejected(t *testing.T) {
@@ -372,6 +410,11 @@ func TestParse_AppMetadataRejected(t *testing.T) {
 			name: "labels without a metric",
 			args: []string{"--app-metadata-labels=app=application"},
 			want: []string{"KSG_APP_METADATA_LABELS", "KSG_APP_METADATA_METRIC"},
+		},
+		{
+			name: "user collides with the namespace-alias default",
+			args: []string{"--app-metadata-metric=argocd_app_pod_info", "--app-metadata-labels=user=namespace_alias"},
+			want: []string{"namespace_alias", "user", "ns_alias"},
 		},
 	}
 	for _, tc := range cases {

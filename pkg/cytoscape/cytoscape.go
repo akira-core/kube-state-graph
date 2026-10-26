@@ -15,6 +15,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 )
@@ -63,14 +64,19 @@ type NodeData struct {
 	Perf         *PerfDTO          `json:"perf,omitempty"`
 	Alerts       []AlertDTO        `json:"alerts,omitempty"`
 	Status       string            `json:"status,omitempty"`
-	// NamespaceOwner is set only on a synthesised namespace group, from the
-	// application-metadata metric. Omitted on every other node and when the
-	// metric did not resolve an owner.
-	NamespaceOwner string `json:"namespace_owner,omitempty"`
-	// DeployedBy is set only on a synthesised application group, from the
-	// application-metadata metric. Omitted on every other node and when the
-	// metric did not resolve a deployer.
+	// NamespaceOwner, NamespaceGroup, NamespaceGroupOwner and NamespaceAlias
+	// are set only on a synthesised namespace group, from the
+	// application-metadata metric. Each is omitted when that pick did not
+	// resolve, and none is set on any other node.
+	NamespaceOwner      string `json:"namespace_owner,omitempty"`
+	NamespaceGroup      string `json:"namespace_group,omitempty"`
+	NamespaceGroupOwner string `json:"namespace_group_owner,omitempty"`
+	NamespaceAlias      string `json:"namespace_alias,omitempty"`
+	// DeployedBy and DeployedAt are set only on a synthesised application
+	// group. DeployedAt is RFC 3339 UTC with whole seconds, omitted when the
+	// deploy time did not resolve.
 	DeployedBy string            `json:"deployed_by,omitempty"`
+	DeployedAt string            `json:"deployed_at,omitempty"`
 	Labels     map[string]string `json:"labels"`
 }
 
@@ -428,7 +434,11 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	})
 	for _, k := range nsKeys {
 		n := groupNode(namespaceParentID(k.cluster, k.ns), k.ns, nodeTypeNamespace, clusterParentID(k.cluster))
-		n.Data.NamespaceOwner = namespaceOwner(g, k.cluster, k.ns)
+		meta := namespaceMeta(g, k.cluster, k.ns)
+		n.Data.NamespaceOwner = meta.Owner
+		n.Data.NamespaceGroup = meta.Group
+		n.Data.NamespaceGroupOwner = meta.GroupOwner
+		n.Data.NamespaceAlias = meta.Alias
 		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
 	appKeys := slices.SortedFunc(maps.Keys(appSeen), func(a, b appKey) int {
@@ -436,7 +446,11 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	})
 	for _, k := range appKeys {
 		n := groupNode(applicationParentID(k.cluster, k.ns, k.app), k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns))
-		n.Data.DeployedBy = applicationDeployer(g, k.cluster, k.ns, k.app)
+		appMeta := applicationMeta(g, k.cluster, k.ns, k.app)
+		n.Data.DeployedBy = appMeta.DeployedBy
+		if !appMeta.DeployedAt.IsZero() {
+			n.Data.DeployedAt = appMeta.DeployedAt.UTC().Format(time.RFC3339)
+		}
 		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
 	ctrlKeys := slices.SortedFunc(maps.Keys(ctrlSeen), func(a, b ctrlKey) int {
@@ -494,23 +508,22 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 	return body
 }
 
-// namespaceOwner is the metric-resolved owner of one namespace group, or ""
-// when the graph has no table or no entry (a nil map reads as ""). "" is what
-// omitempty drops.
-func namespaceOwner(g *graph.Graph, cluster, ns string) string {
+// namespaceMeta is the metric record of one namespace group. A nil graph or a
+// missing entry is the zero record, and omitempty drops each empty field.
+func namespaceMeta(g *graph.Graph, cluster, ns string) graph.NamespaceMeta {
 	if g == nil {
-		return ""
+		return graph.NamespaceMeta{}
 	}
-	return g.NamespaceOwners[graph.NamespaceRef{Cluster: cluster, Namespace: ns}]
+	return g.NamespaceMetadata[graph.NamespaceRef{Cluster: cluster, Namespace: ns}]
 }
 
-// applicationDeployer is the metric-resolved deployer of one application
-// group, or "" when the graph has no table or no entry.
-func applicationDeployer(g *graph.Graph, cluster, ns, app string) string {
+// applicationMeta is the metric record of one application group. A nil graph
+// or a missing entry is the zero record.
+func applicationMeta(g *graph.Graph, cluster, ns, app string) graph.ApplicationMeta {
 	if g == nil {
-		return ""
+		return graph.ApplicationMeta{}
 	}
-	return g.ApplicationDeployers[graph.ApplicationRef{Cluster: cluster, Namespace: ns, Application: app}]
+	return g.ApplicationMetadata[graph.ApplicationRef{Cluster: cluster, Namespace: ns, Application: app}]
 }
 
 // groupNode builds a synthetic compound group node DTO (labels {}, no ipaddress).

@@ -100,14 +100,17 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	// vector — the leg was not issued, or the optional graph leg degraded —
 	// leaves the graph maps nil, which is the metric-unset shape.
 	var metricApps map[podNameKey]string
-	var namespaceOwners map[graph.NamespaceRef]string
-	var applicationDeployers map[graph.ApplicationRef]string
+	var namespaceMetadata map[graph.NamespaceRef]graph.NamespaceMeta
+	var applicationMetadata map[graph.ApplicationRef]graph.ApplicationMeta
 	if v.AppMetadataSource != nil {
 		idx := resolveAppMetadata(v.AppMetadata, *v.AppMetadataSource, mc)
 		metricApps = idx.podApps
 		if v.AppMetadata != nil {
-			namespaceOwners = namespaceOwnersOf(idx)
-			applicationDeployers = applicationDeployersOf(idx)
+			namespaceMetadata = namespaceMetadataOf(idx)
+			applicationMetadata = applicationMetadataOf(idx)
+			if idx.unparsedDeployTimes > 0 {
+				slog.Debug("app_metadata_deploy_time_unparsed", "count", idx.unparsedDeployTimes)
+			}
 		}
 	}
 	podApplications := resolvePodApplications(
@@ -574,27 +577,27 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	mc.warn()
 
 	return Topology{
-		Pods:                 pods,
-		Nodes:                nodes,
-		PVCs:                 pvcs,
-		NetAppAggrs:          netapp.aggrs,
-		NetAppNodes:          netapp.nodes,
-		StorageEdges:         netapp.edges,
-		NetAppInventory:      netapp.inventory,
-		SVMByPVC:             netapp.svmByPVC,
-		Alerts:               v.Alerts,
-		PodPVCs:              bindings,
-		ClaimSeeded:          v.MaterialiseUnboundClaims,
-		PodsByUID:            podsByUID,
-		ServicesByNameNS:     servicesByNameNS,
-		EndpointsByService:   endpointsByService,
-		ServiceApplications:  serviceApplications,
-		ClustersObserved:     clusterList,
-		ClusterIdentities:    mc.snapshot(),
-		NamespaceOwners:      namespaceOwners,
-		ApplicationDeployers: applicationDeployers,
-		clusters:             mc,
-		ontapZones:           ontapZonesOf(v, mc.keys),
+		Pods:                pods,
+		Nodes:               nodes,
+		PVCs:                pvcs,
+		NetAppAggrs:         netapp.aggrs,
+		NetAppNodes:         netapp.nodes,
+		StorageEdges:        netapp.edges,
+		NetAppInventory:     netapp.inventory,
+		SVMByPVC:            netapp.svmByPVC,
+		Alerts:              v.Alerts,
+		PodPVCs:             bindings,
+		ClaimSeeded:         v.MaterialiseUnboundClaims,
+		PodsByUID:           podsByUID,
+		ServicesByNameNS:    servicesByNameNS,
+		EndpointsByService:  endpointsByService,
+		ServiceApplications: serviceApplications,
+		ClustersObserved:    clusterList,
+		ClusterIdentities:   mc.snapshot(),
+		NamespaceMetadata:   namespaceMetadata,
+		ApplicationMetadata: applicationMetadata,
+		clusters:            mc,
+		ontapZones:          ontapZonesOf(v, mc.keys),
 	}
 }
 

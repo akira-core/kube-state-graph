@@ -380,8 +380,8 @@ func (b *Builder) freeze(ctx context.Context, topology Topology, nodes []graph.G
 	attachStatus(nodes)
 	g := graph.NewGraph(nodes, edges, b.clk.Now().UTC())
 	g.ClusterIdentities = topology.ClusterIdentities
-	g.NamespaceOwners = topology.NamespaceOwners
-	g.ApplicationDeployers = topology.ApplicationDeployers
+	g.NamespaceMetadata = topology.NamespaceMetadata
+	g.ApplicationMetadata = topology.ApplicationMetadata
 	return g
 }
 
