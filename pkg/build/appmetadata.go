@@ -77,56 +77,78 @@ type deployerCandidate struct {
 // the namespace picks. Cluster keys go through clusterResolver.bucket. The
 // sample and its Metric map are read only.
 func resolveAppMetadata(vec model.Vector, src promql.AppMetadataSource, mc *clusterResolver) appMetadataIndex {
-	podSeen := make(map[podNameKey]string, len(vec))
-	ownerSeen := make(map[appNamespaceKey]appMetadataSeen, len(vec))
-	aliasSeen := make(map[appNamespaceKey]appMetadataSeen, len(vec))
-	groupSeen := make(map[appNamespaceKey]groupCandidate, len(vec))
-	deployerSeen := make(map[appDeployerKey]deployerCandidate, len(vec))
+	picks := newAppMetadataPicks(len(vec))
 	for _, s := range vec {
-		cluster := mc.bucket(promql.QAppMetadata, s.Metric)
-		ns := metricLabel(s.Metric, src.Namespace)
-		pod := metricLabel(s.Metric, src.Pod)
-		app := metricLabel(s.Metric, src.App)
-		nsKey := appNamespaceKey{cluster, ns}
-		if pod != "" && app != "" {
-			key := podNameKey{cluster, ns, pod}
-			if cur, ok := podSeen[key]; !ok || app < cur {
-				podSeen[key] = app
-			}
-		}
-		if owner := metricLabel(s.Metric, src.NSOwner); owner != "" {
-			keepLatest(ownerSeen, nsKey, owner, s.Value)
-		}
-		if group := metricLabel(s.Metric, src.NSGroup); group != "" {
-			keepGroup(groupSeen, nsKey, group, metricLabel(s.Metric, src.NSGroupOwner), s.Value)
-		}
-		if alias := metricLabel(s.Metric, src.NSAlias); alias != "" {
-			keepLatest(aliasSeen, nsKey, alias, s.Value)
-		}
-		if app != "" {
-			if user := metricLabel(s.Metric, src.User); user != "" {
-				keepDeployer(deployerSeen, appDeployerKey{cluster, ns, app}, user, metricLabel(s.Metric, src.DeployTime), s.Value)
-			}
+		picks.add(s, src, mc.bucket(promql.QAppMetadata, s.Metric))
+	}
+	return picks.index()
+}
+
+// appMetadataPicks accumulates the in-progress picks of one vector.
+type appMetadataPicks struct {
+	pods      map[podNameKey]string
+	owners    map[appNamespaceKey]appMetadataSeen
+	aliases   map[appNamespaceKey]appMetadataSeen
+	groups    map[appNamespaceKey]groupCandidate
+	deployers map[appDeployerKey]deployerCandidate
+}
+
+func newAppMetadataPicks(n int) *appMetadataPicks {
+	return &appMetadataPicks{
+		pods:      make(map[podNameKey]string, n),
+		owners:    make(map[appNamespaceKey]appMetadataSeen, n),
+		aliases:   make(map[appNamespaceKey]appMetadataSeen, n),
+		groups:    make(map[appNamespaceKey]groupCandidate, n),
+		deployers: make(map[appDeployerKey]deployerCandidate, n),
+	}
+}
+
+// add feeds one row, already bucketed to cluster, into every pick it can
+// contribute to.
+func (p *appMetadataPicks) add(s *model.Sample, src promql.AppMetadataSource, cluster string) {
+	ns := metricLabel(s.Metric, src.Namespace)
+	app := metricLabel(s.Metric, src.App)
+	nsKey := appNamespaceKey{cluster, ns}
+	if pod := metricLabel(s.Metric, src.Pod); pod != "" && app != "" {
+		key := podNameKey{cluster, ns, pod}
+		if cur, ok := p.pods[key]; !ok || app < cur {
+			p.pods[key] = app
 		}
 	}
+	if owner := metricLabel(s.Metric, src.NSOwner); owner != "" {
+		keepLatest(p.owners, nsKey, owner, s.Value)
+	}
+	if group := metricLabel(s.Metric, src.NSGroup); group != "" {
+		keepGroup(p.groups, nsKey, group, metricLabel(s.Metric, src.NSGroupOwner), s.Value)
+	}
+	if alias := metricLabel(s.Metric, src.NSAlias); alias != "" {
+		keepLatest(p.aliases, nsKey, alias, s.Value)
+	}
+	if user := metricLabel(s.Metric, src.User); app != "" && user != "" {
+		keepDeployer(p.deployers, appDeployerKey{cluster, ns, app}, user, metricLabel(s.Metric, src.DeployTime), s.Value)
+	}
+}
+
+// index freezes the picks into the index the callers read.
+func (p *appMetadataPicks) index() appMetadataIndex {
 	out := appMetadataIndex{
-		podApps:     podSeen,
-		nsOwners:    make(map[appNamespaceKey]string, len(ownerSeen)),
-		nsGroups:    make(map[appNamespaceKey]nsGroupPick, len(groupSeen)),
-		nsAliases:   make(map[appNamespaceKey]string, len(aliasSeen)),
-		deployers:   make(map[appDeployerKey]string, len(deployerSeen)),
+		podApps:     p.pods,
+		nsOwners:    make(map[appNamespaceKey]string, len(p.owners)),
+		nsGroups:    make(map[appNamespaceKey]nsGroupPick, len(p.groups)),
+		nsAliases:   make(map[appNamespaceKey]string, len(p.aliases)),
+		deployers:   make(map[appDeployerKey]string, len(p.deployers)),
 		deployTimes: make(map[appDeployerKey]time.Time),
 	}
-	for key, seen := range ownerSeen {
+	for key, seen := range p.owners {
 		out.nsOwners[key] = seen.value
 	}
-	for key, seen := range groupSeen {
+	for key, seen := range p.groups {
 		out.nsGroups[key] = nsGroupPick{name: seen.name, owner: seen.owner}
 	}
-	for key, seen := range aliasSeen {
+	for key, seen := range p.aliases {
 		out.nsAliases[key] = seen.value
 	}
-	for key, seen := range deployerSeen {
+	for key, seen := range p.deployers {
 		out.deployers[key] = seen.user
 		if seen.ok {
 			out.deployTimes[key] = seen.when

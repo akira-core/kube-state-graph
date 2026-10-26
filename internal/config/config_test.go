@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -424,6 +425,58 @@ func TestParse_AppMetadataRejected(t *testing.T) {
 			for _, want := range tc.want {
 				assert.Contains(t, err.Error(), want)
 			}
+		})
+	}
+}
+
+// The field names are listed in five places: appMetadataDefaults, the
+// literal in Config.AppMetadata, and promql's struct, OrDefault and Validate.
+// Each subtest fails when one of them misses a field the others carry.
+func TestAppMetadataFieldListsAgree(t *testing.T) {
+	const metric = "argocd_app_pod_info"
+	noEnv := func(string) (string, bool) { return "", false }
+
+	t.Run("every struct label field is defaulted and configurable", func(t *testing.T) {
+		src := reflect.ValueOf(promql.AppMetadataSource{Metric: metric}.OrDefault())
+		labelFields := 0
+		for i := range src.NumField() {
+			name := src.Type().Field(i).Name
+			if name == "Metric" {
+				continue
+			}
+			labelFields++
+			assert.NotEmpty(t, src.Field(i).String(), "OrDefault leaves %s empty", name)
+		}
+		assert.Len(t, appMetadataDefaults, labelFields)
+	})
+
+	t.Run("defaults agree with OrDefault", func(t *testing.T) {
+		cfg, err := Parse([]string{"--app-metadata-metric=" + metric}, noEnv)
+		require.NoError(t, err)
+		src, err := cfg.AppMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, promql.AppMetadataSource{Metric: metric}.OrDefault(), *src)
+	})
+
+	for _, d := range appMetadataDefaults {
+		t.Run(d.field, func(t *testing.T) {
+			override := "override_" + d.field
+			cfg, err := Parse([]string{"--app-metadata-metric=" + metric, "--app-metadata-labels=" + d.field + "=" + override}, noEnv)
+			require.NoError(t, err)
+			src, err := cfg.AppMetadata()
+			require.NoError(t, err)
+			v := reflect.ValueOf(*src)
+			hits := 0
+			for i := range v.NumField() {
+				if v.Field(i).String() == override {
+					hits++
+				}
+			}
+			assert.Equal(t, 1, hits, "override of %s reaches exactly one struct field", d.field)
+
+			_, err = Parse([]string{"--app-metadata-metric=" + metric, "--app-metadata-labels=" + d.field + "=cluster"}, noEnv)
+			require.Error(t, err, "Validate does not check %s", d.field)
+			assert.Contains(t, err.Error(), d.field)
 		})
 	}
 }
