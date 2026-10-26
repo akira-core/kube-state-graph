@@ -33,7 +33,7 @@
 ## 5. Integration checks
 
 - [x] 5.1 Confirm no rendered query moved: `go test ./pkg/promql/ -run TestRender_EmptySelectorMatchesBaseline` and `go test ./pkg/build/ -run TestBuildStorage_FanOutUnchanged`, both without update flags, then `git diff --exit-code pkg/promql/testdata pkg/build/testdata`.
-- [ ] 5.2 Run `make ci` and verify it is green (lint, vuln, test, check-docs, verify-mocks, containment checks).
+- [x] 5.2 Run `make ci` and verify it is green (lint, vuln, test, check-docs, verify-mocks, containment checks).
 - [x] 5.3 Run `openspec validate extend-app-metadata-fields --strict` and verify it reports the change valid.
 
 ## Workflow follow-up
