@@ -1283,7 +1283,7 @@ The body SHALL retain a node iff it lies on a **complete** storage-flow path tha
 
 ### Requirement: Attributes and compound groups carry over
 
-Every retained real node SHALL carry the same `data` attributes it carries in `/v1/graph`, except `data.containers`, and the body SHALL include the same synthesised compound groups with the same `data.parent` rules and the same `namespace_owner` / `deployed_by` values (graph-api "Namespace and application group metadata"). Namespace and ArgoCD Application SHALL NOT be tiers of the flow.
+Every retained real node SHALL carry the same `data` attributes it carries in `/v1/graph`, except `data.containers`, and the body SHALL include the same synthesised compound groups with the same `data.parent` rules and the same group metadata values — `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` (graph-api "Namespace and application group metadata"). Namespace and ArgoCD Application SHALL NOT be tiers of the flow.
 
 #### Scenario: Pod keeps its attributes and groups
 
@@ -1313,7 +1313,7 @@ Every retained real node SHALL carry the same `data` attributes it carries in `/
 #### Scenario: Group metadata matches the graph endpoint
 
 - **WHEN** `/v1/graph` and `/v1/storage-graph` for the same window and zone both render namespace group `us-dev-c1/namespace/shop` and application group `us-dev-c1/namespace/shop/application/checkout`
-- **THEN** both bodies carry the same `data.namespace_owner` on the namespace group and the same `data.deployed_by` on the application group
+- **THEN** both bodies carry the same `data.namespace_owner`, `data.namespace_group`, `data.namespace_group_owner` and `data.namespace_alias` on the namespace group and the same `data.deployed_by` and `data.deployed_at` on the application group
 
 #### Scenario: The carried attributes and groups
 
