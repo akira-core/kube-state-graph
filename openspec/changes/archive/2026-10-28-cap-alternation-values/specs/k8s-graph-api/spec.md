@@ -16,7 +16,7 @@ When a root kind's first read would take more queries than the `/v1/storage-grap
 
 ### Requirement: Known pods and claims are read across namespaces in one restriction
 
-A read of known pods or claims SHALL be issued one query per chunk, carrying the chunk's namespaces as one alternation and its pod or claim names as another, chunked under the shared byte budget and so that neither alternation holds more than 100 values (a `pod` root's first read follows the seed's split instead: its name alternation is bounded, and its namespace alternation is taken from the request's roots and is not), instead of one query per namespace. A row whose `(namespace, name)` pair the read did not request SHALL be discarded before any later read's restriction is computed from it.
+A read of known pods or claims SHALL be issued one query per chunk, carrying the chunk's namespaces as one alternation and its pod or claim names as another, chunked under the shared byte budget and so that neither alternation holds more than 100 values, instead of one query per namespace. A row whose `(namespace, name)` pair the read did not request SHALL be discarded before any later read's restriction is computed from it.
 
 #### Scenario: Several namespaces in one query
 
@@ -48,4 +48,9 @@ A read of known pods or claims SHALL be issued one query per chunk, carrying the
 
 - **WHEN** the pairs a later read requests — pods a seed or a mounter read returned, or tracked claims — hold 100 or fewer distinct names but more than 100 distinct namespaces
 - **THEN** the pairs are still split so that no query's namespace alternation holds more than 100 values
+
+#### Scenario: A pod root's first read follows the seed's split
+
+- **WHEN** a client roots at `pod=` values
+- **THEN** the roots' own reads follow the seed's split: no chunk's pod-name alternation holds more than 100 values, and each chunk's namespace alternation is the namespaces of its roots, taken from the request like a repeated `namespace` parameter and not bounded
 

@@ -534,9 +534,9 @@ The storage build SHALL reach the claims a request can retain by walking from it
 
 #### Scenario: Root sets are bounded before any query
 
-- **WHEN** a root kind's first read would take more than a fixed maximum number of queries under the shared byte budget
+- **WHEN** a root kind's first read would take more than a fixed maximum number of queries under the shared chunk bounds — the byte budget and the alternation value bound, so the cap is reached by many short values as well as by few long ones
 - **THEN** the request is rejected 400 with `reason: "invalid_scope"` before any upstream query is issued — root parameters are repeatable and the parser bounds each value's length, never their count, so a root set is a scope a client can inflate
-- **AND** the decision needs no upstream data, since the first read's shape is a pure function of the root values and the byte budget
+- **AND** the decision needs no upstream data, since the first read's shape is a pure function of the root values and the two chunk bounds
 - **AND** the build never falls back to reading the family across the zone
 
 #### Scenario: Claims without a candidate are reached only from other roots
@@ -776,6 +776,18 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 - **WHEN** a restriction is rendered
 - **THEN** it is chunked deterministically under one byte budget shared by every data-derived alternation, one query per chunk per family, results merged in chunk order, each chunk issued under the bare family name for self-metrics and span dimensions
 - **AND** a single value is always issued, even when it alone exceeds the budget
+
+#### Scenario: A literal alternation holds at most 100 values
+
+- **WHEN** a restriction renders its values as a literal alternation — every by-reference read, the per-namespace pod and claim reads, the pair-keyed Harvest reads and the root-derived reads on their identity label
+- **THEN** no chunk carries more than 100 values in that alternation, whatever the byte budget admits, so the upstream resolves it by exact value lookup rather than by evaluating a regex against every value of the label
+- **AND** the bound holds when the byte budget is unset or non-positive, and the split stays a pure function of the value set, so the body is byte-identical to the one an unbounded split produces
+- **AND** the namespace alternation of a `pod` root's seed is taken from the request's roots, like a repeated `namespace` parameter, and is not bounded
+
+#### Scenario: A suffix-token alternation is chunked by bytes alone
+
+- **WHEN** the restricted `volume_labels` read renders FlexVol tokens as suffix branches (`.*<token>`)
+- **THEN** it is chunked under the byte budget alone and is NOT split by value count, because the upstream resolves a `.*`-prefixed alternation by regex at any count and a further split would only multiply that evaluation
 
 #### Scenario: An empty scope is neither issued nor tallied
 
