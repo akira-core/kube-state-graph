@@ -43,7 +43,7 @@
 
 ## 5. Full verification
 
-- [ ] 5.1 Run `make ci` (lint, vuln, test, check-docs, verify-mocks, containment checks). It must be green.
+- [x] 5.1 Run `make ci` (lint, vuln, test, check-docs, verify-mocks, containment checks). It must be green.
 - [x] 5.2 Optional manual check against a real VictoriaMetrics, such as the integration container or a staging store. Issue one captured k8s-graph query with 100 and with 101 pod names and record both latencies in the PR description, as evidence for the threshold. If no store is reachable, mark this as skipped.
 
 ## Workflow follow-up
