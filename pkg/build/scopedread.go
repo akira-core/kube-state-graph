@@ -29,7 +29,10 @@ import (
 // render, when non-nil, replaces promql.RenderScoped for this family's
 // chunks. nil keeps today's identity-label scope. budgetOverhead is the
 // per-value argument of promql.ChunkScopeWithOverhead (zero for an
-// identity-label scope). budgetReserve is subtracted once from the byte
+// identity-label scope); every chunk also holds at most
+// promql.MaxAlternationValues values, so a scope rendered as `.*`-prefixed
+// suffix branches does not belong here — it is chunked by
+// promql.ChunkSuffixTokenScope. budgetReserve is subtracted once from the byte
 // budget before chunking — the tracking-id wrapper, which a chunk pays once
 // rather than once per value.
 type scopedFamily struct {

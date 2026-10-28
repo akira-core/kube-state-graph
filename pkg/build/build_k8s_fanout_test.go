@@ -312,3 +312,75 @@ func TestBuildK8s_APodRootSetAtTheCapIsNeverRejectedLater(t *testing.T) {
 	require.Equal(t, ReasonInvalidScope, AsReason(err))
 	assert.Empty(t, over.Issued(), "rejected before any query")
 }
+
+// Spec: "A node with more than 100 pods keeps every alternation at 100 values or
+// fewer". The seed returns 150 pods whose names fit the default byte budget in one
+// query; the value bound splits every read of them in two, in the same round, and
+// the body is the one an unrestricted read projects.
+func TestBuildK8s_ANodeWithMoreThan100PodsKeepsEveryAlternationBounded(t *testing.T) {
+	pods := make([]miniPod, 0, 150)
+	for _, ns := range []string{"alpha", "bravo", "charlie"} {
+		for i := range 50 {
+			name := ns + "-pod-" + itoa(i)
+			pods = append(pods, miniPod{ns: ns, name: name, node: "worker-1", owner: name + "-set", claim: "data-" + name})
+		}
+	}
+	fx := miniEstate(pods...)
+	scope := vlrScope(t, graph.StorageRootNode, []string{"worker-1"})
+
+	requireK8sOutputPreserved(t, fx, Options{}, vlrSel, scope)
+	_, q := buildK8sOver(t, fx, Options{}, scope.Roots)
+
+	for _, read := range []struct {
+		fam   promql.Query
+		label string
+	}{
+		{promql.QPodInfo, "pod"},                                  // incarnation completion
+		{promql.QPVCBindings, "pod"},                              // the claim-binding read
+		{promql.QPodOwner, "pod"},                                 // kube_pod_owner
+		{promql.QPVCBindings, "persistentvolumeclaim"},            // mounter completion
+		{promql.QPVCInfo, "persistentvolumeclaim"},                // claim families
+		{promql.QKubeletVolumeUsedBytes, "persistentvolumeclaim"}, // kubelet
+	} {
+		chunks := q.ScopeValues(read.fam, read.label)
+		require.Len(t, chunks, 2, "%s on %s: 150 values fit one byte chunk but not one value chunk", read.fam, read.label)
+		var covered int
+		for i, values := range chunks {
+			assert.LessOrEqual(t, len(values), promql.MaxAlternationValues, "%s chunk %d", read.fam, i)
+			covered += len(values)
+		}
+		assert.Equal(t, 150, covered, "%s on %s: every value is read, in exactly one chunk", read.fam, read.label)
+	}
+	for _, ns := range q.ScopeValues(promql.QPodInfo, "namespace") {
+		assert.LessOrEqual(t, len(ns), promql.MaxAlternationValues)
+	}
+
+	b := runLockstep(t, fx, Options{}, scope.Roots)
+	assert.Len(t, b.Rounds, 3, "more chunks, not more rounds: %v", b.Rounds)
+}
+
+// Spec: "Many short roots reach the cap by count". Each root is a few bytes, so
+// the byte budget alone would admit the whole set; the value bound puts at most
+// promql.MaxAlternationValues roots in a chunk, and one root past the cap's chunk
+// count times that bound is rejected before any query.
+func TestBuildK8s_ManyShortNodeRootsReachTheCapByCount(t *testing.T) {
+	rootsOf := func(n int) graph.StorageRoots {
+		nodes := make([]string, n)
+		for i := range nodes {
+			nodes[i] = "n" + itoa(i)
+		}
+		return k8sRootsOf(t, graph.StorageRootNode, nodes...)
+	}
+	// The spec's number, not the constant's: a bound moved above 100 must fail here.
+	atCap := maxRootedVolumeLabelChunks * 100
+
+	q := promqlfake.New(planEstate())
+	_, err := New(q, Options{}, nil, nil).BuildK8s(t.Context(), time.Minute, vlrEnd, vlrSel, rootsOf(atCap))
+	require.NoError(t, err, "a set the cap admits is built")
+	assert.Len(t, q.ScopeValues(promql.QPodInfo, "node"), maxRootedVolumeLabelChunks, "the seed is read in the cap's chunk count")
+
+	q = promqlfake.New(planEstate())
+	_, err = New(q, Options{}, nil, nil).BuildK8s(t.Context(), time.Minute, vlrEnd, vlrSel, rootsOf(atCap+1))
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, q.Issued(), "rejected before any query")
+}

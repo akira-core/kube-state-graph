@@ -233,12 +233,16 @@ func TestRootedVolumeLabelsChunks(t *testing.T) {
 		assert.False(t, ok, "a budget collapsed to the floor")
 
 		// What a real request looks like is nowhere near it: a filer has tens
-		// of aggregates, and even 5000 ordinary names fit in six chunks.
+		// of aggregates. Every chunk holds at most 100 values, so short names reach the cap by count: the cap admits exactly
+		// that many chunks of them, and one value more is refused.
 		_, ok = rootedVolumeLabelsChunks([]string{"ontap-prod"}, []string{"aggr1", "aggr2", "aggr3"}, nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.True(t, ok)
-		got, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(5000, 0), nil, nil, nil, DefaultQoSScopeBatchBytes)
+		atCap := maxRootedVolumeLabelChunks * 100 // the spec's bound, not the constant's
+		got, ok := rootedVolumeLabelsChunks(nil, manyAggrRoots(atCap, 0), nil, nil, nil, DefaultQoSScopeBatchBytes)
 		assert.True(t, ok)
-		assert.LessOrEqual(t, len(got), maxRootedVolumeLabelChunks)
+		assert.Len(t, got, maxRootedVolumeLabelChunks)
+		_, ok = rootedVolumeLabelsChunks(nil, manyAggrRoots(atCap+1, 0), nil, nil, nil, DefaultQoSScopeBatchBytes)
+		assert.False(t, ok, "%d short values exceed the cap by count, not by bytes", atCap+1)
 	})
 }
 

@@ -77,7 +77,10 @@ func SortedNamePairs(pairs []NamePair) []NamePair {
 
 // ChunkNamePairs splits a pair set into chunks whose two rendered alternations —
 // namespaces and names, the matcher wrappers and the comma joining them
-// included — each fit the byte budget. A caller that also renders request
+// included — each fit the byte budget, and neither of which holds more than
+// MaxAlternationValues values. The value bound counts DISTINCT namespaces and
+// DISTINCT names separately, because the upstream judges each label filter on
+// its own; it never counts pairs. A caller that also renders request
 // matchers takes RequestMatcherCost off the budget first, as it does for every
 // other restriction.
 //
@@ -85,7 +88,8 @@ func SortedNamePairs(pairs []NamePair) []NamePair {
 // run of neighbouring namespaces and its namespace alternation stays small,
 // which also keeps the cross pairs its independent alternations can match few.
 // Each chunk is charged for ITS OWN namespaces and names, not the whole set's.
-// The split is a pure function of the set and the budget.
+// The split is a pure function of the set and the budget. A non-positive
+// budget imposes no byte bound, but the value bound still holds.
 //
 // The cost is measured on the regex form, which is one byte longer than the
 // single-value equality, so a one-pair chunk never reads as smaller than it
@@ -97,9 +101,6 @@ func ChunkNamePairs(pairs []NamePair, label string, budget int) [][]NamePair {
 	sorted := SortedNamePairs(pairs)
 	if len(sorted) == 0 {
 		return nil
-	}
-	if budget <= 0 {
-		return [][]NamePair{sorted}
 	}
 	// The wrappers and the comma are paid once per chunk: `namespace=~"…",label=~"…"`.
 	wrapper := len(NamespaceLabel) + len(`=~""`) + 1 + len(label) + len(`=~""`)
@@ -133,7 +134,11 @@ func ChunkNamePairs(pairs []NamePair, label string, budget int) [][]NamePair {
 		if _, ok := names[p.Name]; !ok {
 			add += valueCost(p.Name, len(names))
 		}
-		if len(cur) > 0 && used+add > budget {
+		_, knownNS := namespaces[p.Namespace]
+		_, knownName := names[p.Name]
+		overCount := (!knownNS && len(namespaces) >= MaxAlternationValues) ||
+			(!knownName && len(names) >= MaxAlternationValues)
+		if len(cur) > 0 && ((budget > 0 && used+add > budget) || overCount) {
 			out = append(out, cur)
 			reset()
 			add = valueCost(p.Namespace, 0) + valueCost(p.Name, 0)

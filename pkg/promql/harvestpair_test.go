@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -212,4 +213,21 @@ func TestChunkHarvestPairs(t *testing.T) {
 		assert.Nil(t, ChunkHarvestPairs(QVolumeLabels, LabelKeys{}, Selector{}, map[string][]string{"oc": {"a"}}, 100))
 		assert.Nil(t, ChunkHarvestPairs(QQoSReadOps, LabelKeys{}, Selector{}, map[string][]string{"oc": {"a"}}, 100))
 	})
+}
+
+func TestChunkHarvestPairs_BoundsTheValueCountPerCluster(t *testing.T) {
+	t.Parallel()
+	byCluster := map[string][]string{
+		"oc1": numberedValues("a", 150),
+		"oc2": numberedValues("b", 40),
+	}
+	for _, budget := range []int{0, 1 << 20} {
+		got := ChunkHarvestPairs(QAggrStatus, LabelKeys{}, Selector{}, byCluster, budget)
+		sizes := make([]string, len(got))
+		for i, c := range got {
+			sizes[i] = fmt.Sprintf("%s:%d", c.Cluster, len(c.Names))
+			assert.LessOrEqual(t, len(c.Names), MaxAlternationValues)
+		}
+		assert.Equal(t, []string{"oc1:100", "oc1:50", "oc2:40"}, sizes, "budget=%d", budget)
+	}
 }

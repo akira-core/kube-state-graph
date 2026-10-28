@@ -226,3 +226,62 @@ func TestKeepNamePairs(t *testing.T) {
 
 	assert.Empty(t, KeepNamePairs(rows, PodLabel, nil))
 }
+
+// The upstream judges each label filter on its own, so a chunk closes when
+// either alternation — distinct namespaces or distinct names — would pass
+// MaxAlternationValues, never on the pair count.
+func TestChunkNamePairs_BoundsEachAlternation(t *testing.T) {
+	t.Parallel()
+
+	sides := func(chunks [][]NamePair) []string {
+		out := make([]string, len(chunks))
+		for i, c := range chunks {
+			ns, names := map[string]struct{}{}, map[string]struct{}{}
+			for _, p := range c {
+				ns[p.Namespace] = struct{}{}
+				names[p.Name] = struct{}{}
+			}
+			out[i] = fmt.Sprintf("ns=%d names=%d", len(ns), len(names))
+		}
+		return out
+	}
+
+	for _, budget := range []int{0, 1 << 20} {
+		t.Run(fmt.Sprintf("150 pods in one namespace, budget %d", budget), func(t *testing.T) {
+			pairs := make([]NamePair, 0, 150)
+			for _, n := range numberedValues("pod-", 150) {
+				pairs = append(pairs, NamePair{"shop", n})
+			}
+			got := ChunkNamePairs(pairs, PodLabel, budget)
+			assert.Equal(t, []string{"ns=1 names=100", "ns=1 names=50"}, sides(got))
+		})
+
+		t.Run(fmt.Sprintf("120 namespaces sharing one pod name, budget %d", budget), func(t *testing.T) {
+			pairs := make([]NamePair, 0, 120)
+			for _, ns := range numberedValues("ns-", 120) {
+				pairs = append(pairs, NamePair{ns, "web-0"})
+			}
+			got := ChunkNamePairs(pairs, PodLabel, budget)
+			assert.Equal(t, []string{"ns=100 names=1", "ns=20 names=1"}, sides(got))
+		})
+
+		t.Run(fmt.Sprintf("more pairs than the bound but each side within it, budget %d", budget), func(t *testing.T) {
+			pairs := make([]NamePair, 0, 225)
+			for _, ns := range []string{"a", "b", "c"} {
+				for _, n := range numberedValues("pod-", 75) {
+					pairs = append(pairs, NamePair{ns, n})
+				}
+			}
+			got := ChunkNamePairs(pairs, PodLabel, budget)
+			assert.Equal(t, []string{"ns=3 names=75"}, sides(got), "225 pairs, but 3 namespaces and 75 names")
+		})
+	}
+
+	t.Run("exactly 100 names in 3 namespaces stay one chunk", func(t *testing.T) {
+		pairs := make([]NamePair, 0, 100)
+		for i, n := range numberedValues("pod-", 100) {
+			pairs = append(pairs, NamePair{[]string{"a", "b", "c"}[i%3], n})
+		}
+		assert.Len(t, ChunkNamePairs(pairs, PodLabel, 1<<20), 1)
+	})
+}

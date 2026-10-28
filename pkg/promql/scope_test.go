@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -421,4 +422,96 @@ func TestHarvestQueries_EmitNoRequestMatcher(t *testing.T) {
 		assert.NotContains(t, Render(q, time.Minute, keys, sel), "zone=", "%s", q)
 		assert.NotContains(t, Render(q, time.Minute, keys, sel), "tier=", "%s", q)
 	}
+}
+
+// numberedValues is n distinct, sorted, short values — few enough bytes that
+// any test budget admits them all in one chunk, so only the value bound can
+// split them.
+func numberedValues(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range n {
+		out[i] = fmt.Sprintf("%s%04d", prefix, i)
+	}
+	return out
+}
+
+// The upstream resolves an anchored literal alternation by exact value lookup
+// only while it holds at most MaxAlternationValues values; past that it
+// evaluates the regex against every value of the label. Every literal chunker
+// therefore closes a chunk at the bound, whatever the byte budget admits.
+func TestChunkScope_BoundsTheValueCount(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		n    int
+		want []int
+	}{
+		{n: 100, want: []int{100}},
+		{n: 101, want: []int{100, 1}},
+		{n: 250, want: []int{100, 100, 50}},
+		{n: 1000, want: []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100}},
+	} {
+		in := numberedValues("v", tc.n)
+		for _, budget := range []int{0, -1, 1 << 20} {
+			for name, chunk := range map[string]func([]string, int) [][]string{
+				"ChunkScope":             ChunkScope,
+				"ChunkScopeWithOverhead": func(v []string, b int) [][]string { return ChunkScopeWithOverhead(v, b, 3) },
+				"ChunkQoSVolumeScope":    ChunkQoSVolumeScope,
+			} {
+				got := chunk(in, budget)
+				sizes := make([]int, len(got))
+				var flat []string
+				for i, c := range got {
+					sizes[i] = len(c)
+					flat = append(flat, c...)
+				}
+				assert.Equal(t, tc.want, sizes, "%s n=%d budget=%d", name, tc.n, budget)
+				assert.Equal(t, in, flat, "%s n=%d budget=%d: input order, nothing dropped", name, tc.n, budget)
+				assert.Equal(t, got, chunk(in, budget), "%s: a pure function of the input", name)
+			}
+		}
+	}
+}
+
+// The bound composes with the byte budget: whichever closes a chunk first wins.
+func TestChunkScope_ByteBudgetStillBindsFirst(t *testing.T) {
+	t.Parallel()
+	in := numberedValues("v", 150) // 5 bytes each, 6 with the separator
+	got := ChunkScope(in, 60)      // 10 values per chunk by bytes
+	require.Len(t, got, 15)
+	for _, c := range got {
+		assert.Len(t, c, 10)
+	}
+}
+
+// MaxAlternationValues mirrors VictoriaMetrics' maxOrValues. Moving it is a
+// deliberate edit: above 100 a chunk silently falls back to a label-wide regex
+// scan, the regression the bound exists to prevent.
+func TestMaxAlternationValues_IsTheUpstreamLookupLimit(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, 100, MaxAlternationValues)
+}
+
+// A `.*`-prefixed branch never takes the upstream's exact-lookup path, so the
+// suffix-token chunker splits on bytes alone and charges the `.*` per token.
+func TestChunkSuffixTokenScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no value bound", func(t *testing.T) {
+		in := numberedValues("t", 250)
+		got := ChunkSuffixTokenScope(in, 1<<20)
+		assert.Equal(t, [][]string{in}, got, "a further split would only multiply the regex evaluation")
+	})
+
+	t.Run("charges the branch overhead", func(t *testing.T) {
+		// 4 bytes + 2 for `.*` = 6, +1 separator once the chunk is non-empty:
+		// two tokens are 13 bytes, a third does not fit.
+		in := []string{"aaaa", "bbbb", "cccc"}
+		assert.Equal(t, [][]string{{"aaaa", "bbbb"}, {"cccc"}}, ChunkSuffixTokenScope(in, 13))
+		assert.Equal(t, [][]string{{"aaaa"}, {"bbbb"}, {"cccc"}}, ChunkSuffixTokenScope(in, 12))
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		assert.Nil(t, ChunkSuffixTokenScope(nil, 100))
+	})
 }

@@ -25,7 +25,7 @@ type pairChunk struct {
 }
 
 // chunksOfPairs splits pairs into the restrictions ChunkNamePairs packs them
-// under the byte budget.
+// under the byte budget and promql.MaxAlternationValues per alternation.
 func chunksOfPairs(pairs []promql.NamePair, label string, budget int) []pairChunk {
 	chunked := promql.ChunkNamePairs(pairs, label, budget)
 	out := make([]pairChunk, 0, len(chunked))

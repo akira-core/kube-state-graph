@@ -1,3 +1,17 @@
+# BREAKING — root sets are capped by value count as well as bytes
+
+*Change: `cap-alternation-values`.*
+
+**What changed.** Every literal alternation the builder renders from data or from request roots now holds at most 100 values (`promql.MaxAlternationValues`), in addition to the `--netapp-qos-scope-batch-bytes` byte budget. VictoriaMetrics resolves such an alternation by exact value lookup only up to 100 values; past that it evaluates the regex against every value of the label, which made a `/v1/k8s-graph` node root with 100+ pods slow. Response bodies are unchanged; only the number of upstream queries grows for large scopes.
+
+The request-derived root caps count these chunks (16 per root kind's first read). A root set therefore admits at most about 1600 values of one kind — fewer when the byte budget binds first.
+
+**Who is affected.** A `/v1/storage-graph` or `/v1/k8s-graph` request carrying more than about 1600 short values of one root kind (`node=`, `pod=`, `aggr=`, `svm=`, `ontap_cluster=`, `ontap_node=`, `pvc=`, `pv=`, `application=`). It was a 200 when the values fit 16 byte-chunks; it is now 400 `invalid_scope`, still before any upstream query. In-process embedders calling `promql.ChunkScope`, `ChunkScopeWithOverhead`, `ChunkQoSVolumeScope`, `ChunkHarvestPairs` or `ChunkNamePairs` directly receive more, smaller chunks for sets above 100 values, including when the budget is non-positive (previously one chunk holding everything).
+
+**Migration.** Split such a request into several requests of at most about 1600 roots each. Embedders that need a byte-only split of `.*`-prefixed suffix tokens use the new `promql.ChunkSuffixTokenScope`. Rollback is a revert.
+
+---
+
 # BREAKING — application-metadata group maps are structs
 
 **What changed.** The HTTP body is unchanged. In-process embedders that read the group-metadata maps now read struct values.
