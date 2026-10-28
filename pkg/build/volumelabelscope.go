@@ -117,7 +117,8 @@ func (r rootedVolumeLabelsQuery) render(window time.Duration, keys promql.LabelK
 }
 
 // rootedNodeLabelChunks splits an ontap_node seed across as many node-scoped
-// volume_labels queries as the byte budget requires. ok is false past the cap.
+// volume_labels queries as the byte budget and promql.MaxAlternationValues
+// require. ok is false past the cap.
 func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuery, bool) {
 	chunks := promql.ChunkScope(nodes, max(budget, 1))
 	out := make([]rootedVolumeLabelsQuery, 0, len(chunks))
@@ -141,11 +142,14 @@ func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuer
 // length, never the count). Without a ceiling, one request naming thousands of
 // aggregates would turn a single `last_over_time(volume_labels[w])` into
 // thousands of queries. The value matches scopeConcurrency, so a restricted
-// read never spans more than one concurrency wave.
+// read never spans more than one concurrency wave. Each chunk holds at most
+// promql.MaxAlternationValues values, so short values reach the cap by count:
+// a root kind admits at most maxRootedVolumeLabelChunks × 100 of them.
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
 // rootedVolumeLabelsChunks splits the phase-1 restriction across as many
-// queries as the byte budget requires, in (group, chunk) order: the bare
+// queries as the byte budget and promql.MaxAlternationValues require, in
+// (group, chunk) order: the bare
 // aggregate group's chunks first, then the bare SVM group's, then one group per
 // ONTAP cluster of the qualified aggregates and of the qualified SVMs, each in
 // sorted cluster order. ok is false when that would take more than
@@ -668,8 +672,7 @@ func issueTokenVolumeLabels(
 	if len(tokens) == 0 {
 		return nil, nil
 	}
-	overhead := promql.VolumeTokenBranchOverhead
-	chunks := promql.ChunkScopeWithOverhead(tokens, opts.qosScopeBatchBytes(), overhead)
+	chunks := promql.ChunkSuffixTokenScope(tokens, opts.qosScopeBatchBytes())
 	rendered := make([]string, 0, len(chunks))
 	for _, chunk := range chunks {
 		query, ok := promql.RenderVolumeLabelsTokenScoped(window, opts.LabelKeys, sel, chunk, true, excludeClusters)

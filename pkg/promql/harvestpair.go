@@ -121,14 +121,15 @@ type HarvestNameChunk struct {
 }
 
 // ChunkHarvestPairs groups names by ONTAP cluster and splits each cluster so
-// the rendered query fits budget, after the repeated request matchers and the
+// the rendered query fits budget and no chunk holds more than
+// MaxAlternationValues names, after the repeated request matchers and the
 // repeated cluster equality are charged at their rendered length (the
 // owner-completion precedent). Clusters are visited in sorted order. Names are
 // de-duplicated and sorted before the split, so the chunks are a pure function
 // of the name set.
 //
-// Every chunk names exactly one cluster. budget <= 0 yields one chunk per
-// cluster holding all of its names. A positive budget that the repeated
+// Every chunk names exactly one cluster. budget <= 0 imposes no byte bound, so
+// each cluster is split by the value bound alone. A positive budget that the repeated
 // matchers already exhaust still issues each name (the remainder passed to
 // ChunkScope is at least 1), and a single name longer than that remainder is
 // issued alone, never dropped. A cluster whose names normalise to nothing is

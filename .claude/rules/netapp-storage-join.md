@@ -163,7 +163,8 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     barrier behind the whole first wave. An **empty scope issues no QoS query at
     all** (hop A drew no edge for hop B to measure), mirroring the
     service-graph short-circuit. A scope exceeding
-    `--netapp-qos-scope-batch-bytes` (default 8192) is chunked deterministically
+    `--netapp-qos-scope-batch-bytes` (default 8192), or holding more than
+    `promql.MaxAlternationValues` (100) names, is chunked deterministically
     (`promql.ChunkQoSVolumeScope`); a single over-budget name still gets its own
     query rather than being dropped. Chunks are issued concurrently under
     `scopeConcurrency` and merged **in chunk-index order, never completion

@@ -304,6 +304,12 @@ The builder SHALL **chunk deterministically** the QoS scope and issue one query 
 - **WHEN** the alternation grows with the number of matched volumes past what upstream installations accept as query length
 - **THEN** the scope is split into chunks and one query is issued per chunk per family
 
+#### Scenario: Chunking bounds the alternation's value count
+
+- **WHEN** the matched scope holds more than 100 FlexVol names, even when they all fit the byte budget
+- **THEN** it is split so that no chunk's `volume` alternation holds more than 100 values, so the upstream resolves each chunk by exact value lookup rather than by evaluating a regex against every `volume` value it indexes
+- **AND** the merged result is identical to the one a byte-only split produces, and which claims a failed chunk costs on `/v1/graph` remains a pure function of the scope
+
 #### Scenario: An oversized volume name is still issued
 
 - **WHEN** a single volume name alone exceeds the chunk budget

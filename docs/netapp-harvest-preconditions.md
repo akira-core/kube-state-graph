@@ -46,7 +46,7 @@ name extends past the token (`trident_pvc_x_clone`) does not.
 | Setting | Default | Meaning |
 |---|---|---|
 | `--netapp-volume-key-rewrite` / `KSG_NETAPP_VOLUME_KEY_REWRITE` | `-=_` | Ordered `<regex>=<replacement>` rules producing the match token from the PV name. Repeat the flag for several rules; the env form is semicolon-separated. Each entry splits on its FIRST `=`; a pattern needing a literal `=` writes `\x3d`. The first flag occurrence REPLACES the default list rather than appending to it |
-| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, a `/v1/storage-graph` pod read's `pod`, or a storage-rooted `volume_labels` read's `aggr` / `cluster` / token set. A larger matched set is split across several queries |
+| `--netapp-qos-scope-batch-bytes` / `KSG_NETAPP_QOS_SCOPE_BATCH_BYTES` | `8192` | Byte budget for one data-derived alternation — a scoped QoS query's `volume`, a `/v1/storage-graph` pod read's `pod`, or a storage-rooted `volume_labels` read's `aggr` / `cluster` / token set. A larger matched set is split across several queries. Independently of the budget, a literal alternation never carries more than 100 values (see `promql.MaxAlternationValues`); the suffix-mode token set is split by bytes alone |
 
 An uncompilable pattern is a **startup failure**, never a silent fallback to
 the defaults: a typo would otherwise resolve a different estate than the
@@ -319,7 +319,10 @@ Consequences worth knowing:
   wave, so it is not delayed by the slowest kube-state-metrics leg.
 - A scope larger than `--netapp-qos-scope-batch-bytes` is split across several
   queries per family, since upstream installations cap query length
-  (`-search.maxQueryLen`). On `/v1/graph` each chunk degrades on its own: a
+  (`-search.maxQueryLen`). A scope of more than 100 FlexVol names is split as
+  well, whatever its length: VictoriaMetrics resolves an alternation by exact
+  value lookup only up to 100 values and by a regex over every indexed
+  `volume` value past that. On `/v1/graph` each chunk degrades on its own: a
   failed chunk costs I/O measurements only for the claims whose volumes it
   carried, and never an edge, aggregate, controller or `svm`. On
   `/v1/storage-graph` a failed chunk fails the request.

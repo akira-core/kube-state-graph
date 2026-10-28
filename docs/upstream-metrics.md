@@ -372,7 +372,10 @@ restriction is computed from it, and still counts in the family's series tally.
 Pairs are sorted by `(namespace, name)` and packed greedily under
 `--netapp-qos-scope-batch-bytes`, each chunk charged for the request matchers it
 repeats and for its own two alternations, so a chunk holds a run of neighbouring
-namespaces; a single pair larger than the budget is still issued. Node and
+namespaces; a single pair larger than the budget is still issued. A chunk also
+closes before either alternation passes 100 distinct values (namespaces and
+names counted separately), so a node running 150 pods reads them in two queries
+of the same round. Node and
 controller families are read by name alone, as before.
 
 **Rounds.** Every read of a round is issued together; a round starts when the

@@ -97,7 +97,8 @@ type Config struct {
 	// Deployment / StatefulSet / DaemonSet / CronJob) scopes
 	// (--netapp-qos-scope-batch-bytes / KSG_NETAPP_QOS_SCOPE_BATCH_BYTES) — so
 	// a large estate is split across several queries instead of exceeding the
-	// upstream's query-length limit.
+	// upstream's query-length limit. Independently of it, a literal alternation
+	// never carries more than promql.MaxAlternationValues values.
 	NetAppQoSScopeBatchBytes int
 	// BackendsFile is the path to the mounted routing table declaring the
 	// upstream backends queries are dispatched across (--backends-file /
@@ -197,7 +198,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.StringVar(&cfg.AppMetadataMetric, "app-metadata-metric", cfg.AppMetadataMetric, "Per-pod application-metadata metric. Empty disables the feature.")
 	fs.StringVar(&cfg.AppMetadataLabels, "app-metadata-labels", cfg.AppMetadataLabels, "Comma-separated field=label overrides for the application-metadata metric. Fields: app, user, ns_owner, namespace, pod, deploy_time, ns_group, ns_group_owner, ns_alias. Omitted fields keep their defaults.")
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
-	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries.")
+	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries; a literal alternation is also split at 100 values, independently of this budget.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
 	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
 	fs.DurationVar(&cfg.QueryCacheTTL, "query-cache-ttl", cfg.QueryCacheTTL, "How long a cached upstream query result may be served.")

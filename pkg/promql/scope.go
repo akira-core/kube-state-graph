@@ -149,10 +149,25 @@ func RenderOnLabel(q Query, window time.Duration, keys LabelKeys, sel Selector, 
 		q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
+// MaxAlternationValues is the most values one rendered literal alternation
+// carries. VictoriaMetrics resolves an anchored alternation of literals by
+// exact value lookup only while it has at most this many alternatives: past it,
+// `getOrValues` in lib/regexutil/regexutil.go (`maxOrValues = 100`, checked as
+// `len(a) > maxOrValues` at both master and v1.107.0) gives up and
+// lib/storage/tag_filters.go evaluates the regex against EVERY value of the
+// label in the queried range — a cost that grows with the whole estate's churn,
+// not with the scope. Exactly this many values still take the lookup path.
+//
+// Every literal chunker closes a chunk at this bound as well as at its byte
+// budget. Suffix-mode token alternations (`.*<token>`) never take the lookup
+// path at any count and are chunked by ChunkSuffixTokenScope instead.
+const MaxAlternationValues = 100
+
 // ChunkScope splits a sorted, de-duplicated scope into chunks whose rendered
-// alternation fits the byte budget, so a large scope is read through several
-// narrow queries instead of one query the upstream would reject for length
-// (`-search.maxQueryLen`).
+// alternation fits the byte budget and holds at most MaxAlternationValues
+// values, so a large scope is read through several narrow queries instead of
+// one query the upstream would reject for length (`-search.maxQueryLen`) or
+// resolve by a label-wide regex scan.
 //
 // The split is a pure function of the input slice and the budget, so which
 // values share a chunk is deterministic across rebuilds.
@@ -165,19 +180,34 @@ func ChunkScope(values []string, budget int) [][]string {
 }
 
 // ChunkScopeWithOverhead is ChunkScope for an alternation whose every branch
-// carries a fixed extra cost beyond the escaped value — the two bytes of the
-// `.*` prefix a suffix-mode token branch renders with. Ignoring it would let a
-// chunk overrun the budget by that much per value, which at the default budget
-// and a typical token length is a few percent of the headroom the budget leaves
-// under `-search.maxQueryLen`; accounting for it keeps the budget a real bound.
+// carries a fixed extra cost beyond the escaped value. Ignoring it would let a
+// chunk overrun the budget by that much per value; accounting for it keeps the
+// budget a real bound.
 //
 // overhead is per value and never negative; a negative value is treated as zero.
+// A non-positive budget imposes no byte bound, but the value bound still holds.
 func ChunkScopeWithOverhead(values []string, budget, overhead int) [][]string {
+	return chunkScope(values, budget, overhead, MaxAlternationValues)
+}
+
+// ChunkSuffixTokenScope splits a sorted, de-duplicated set of FlexVol tokens
+// rendered as suffix-mode branches (`.*<token>`, RenderVolumeLabelsTokenScoped)
+// under the byte budget ALONE, charging VolumeTokenBranchOverhead per token.
+//
+// It deliberately applies no MaxAlternationValues bound: VictoriaMetrics
+// extracts no or-values from a `.*`-prefixed branch at any count, so such an
+// alternation is always resolved by regex, and splitting it further would only
+// multiply that evaluation.
+func ChunkSuffixTokenScope(tokens []string, budget int) [][]string {
+	return chunkScope(tokens, budget, VolumeTokenBranchOverhead, 0)
+}
+
+// chunkScope is the one split every scope chunker shares. A chunk closes when
+// the next value would push its rendered alternation past budget (when budget is
+// positive) or its value count past maxValues (when maxValues is positive).
+func chunkScope(values []string, budget, overhead, maxValues int) [][]string {
 	if len(values) == 0 {
 		return nil
-	}
-	if budget <= 0 {
-		return [][]string{values}
 	}
 	overhead = max(overhead, 0)
 	var (
@@ -194,7 +224,9 @@ func ChunkScopeWithOverhead(values []string, budget, overhead int) [][]string {
 		if len(cur) > 0 {
 			cost++
 		}
-		if len(cur) > 0 && used+cost > budget {
+		overBytes := budget > 0 && used+cost > budget
+		overCount := maxValues > 0 && len(cur) >= maxValues
+		if len(cur) > 0 && (overBytes || overCount) {
 			out = append(out, cur)
 			cur, used = nil, 0
 			cost = base

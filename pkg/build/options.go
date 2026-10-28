@@ -51,7 +51,8 @@ type Options struct {
 	// volume-label read's `aggr` / `cluster` / claim-token sets — so a large
 	// estate is split across several queries rather than exceeding the
 	// upstream's query-length limit. Zero (the default) means
-	// DefaultQoSScopeBatchBytes.
+	// DefaultQoSScopeBatchBytes. Independently of it, a literal alternation
+	// never carries more than promql.MaxAlternationValues values.
 	QoSScopeBatchBytes int
 }
 

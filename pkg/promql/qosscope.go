@@ -60,7 +60,8 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, keys LabelKeys, sel Se
 }
 
 // ChunkQoSVolumeScope splits a sorted, de-duplicated FlexVol scope into
-// chunks whose rendered alternation fits the byte budget. It is ChunkScope
+// chunks whose rendered alternation fits the byte budget and holds at most
+// MaxAlternationValues names. It is ChunkScope
 // under the name the QoS workload read was introduced with.
 func ChunkQoSVolumeScope(volumes []string, budget int) [][]string {
 	return ChunkScope(volumes, budget)
