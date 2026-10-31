@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // NodeType is the canonical type field on every graph node.
@@ -210,15 +211,20 @@ func (p NodePerf) Empty() bool {
 // Alert is one active alert the ALERTS overlay matched to a node. Name is the
 // `alertname` label, State the `alertstate` label (always "firing" — pending
 // alerts are excluded at the query layer), Severity the `severity` label,
-// omitted when empty.
+// omitted when empty. Time is the last firing sample of the alert inside the
+// request window ("last seen firing", not the activation time); the zero value
+// means it did not resolve. The wire form (epoch seconds) is produced in
+// pkg/cytoscape, so no JSON tag exposes a second representation here.
 //
 // The set on a node is sorted by (Name, Severity) and de-duplicated on that
 // pair, so two ALERTS series differing only in a label the matcher does not
-// read collapse to one entry and the wire form is order-independent.
+// read collapse to one entry — keeping the greatest Time — and the wire form
+// is order-independent. Time never feeds FoldStatus.
 type Alert struct {
-	Name     string `json:"name"`
-	State    string `json:"state"`
-	Severity string `json:"severity,omitempty"`
+	Name     string    `json:"name"`
+	State    string    `json:"state"`
+	Severity string    `json:"severity,omitempty"`
+	Time     time.Time `json:"-"`
 }
 
 // AlertStateFiring is the only `alertstate` value that reaches the graph. A
@@ -262,7 +268,10 @@ func FoldStatus(alerts []Alert, health, readyStatus string) string {
 // SortAlerts orders alerts by (Name, Severity) and removes duplicates on that
 // pair, in place semantics aside — it returns the normalised slice. Callers
 // attach the RESULT; the ordering is what makes the serialised attribute a
-// pure function of the matched set rather than of series arrival order.
+// pure function of the matched set rather than of series arrival order. A
+// duplicate group keeps the greatest Time (a zero Time loses to any resolved
+// one); Name, State and Severity are equal within a group by construction, so
+// only the time needs merging, and the maximum does not depend on input order.
 func SortAlerts(alerts []Alert) []Alert {
 	if len(alerts) == 0 {
 		return nil
@@ -271,14 +280,13 @@ func SortAlerts(alerts []Alert) []Alert {
 		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Severity, b.Severity))
 	})
 	out := alerts[:0]
-	type key struct{ name, severity string }
-	seen := make(map[key]struct{}, len(alerts))
 	for _, a := range alerts {
-		k := key{a.Name, a.Severity}
-		if _, dup := seen[k]; dup {
+		if n := len(out); n > 0 && out[n-1].Name == a.Name && out[n-1].Severity == a.Severity {
+			if a.Time.After(out[n-1].Time) {
+				out[n-1].Time = a.Time
+			}
 			continue
 		}
-		seen[k] = struct{}{}
 		out = append(out, a)
 	}
 	return out

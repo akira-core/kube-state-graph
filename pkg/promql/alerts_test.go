@@ -1,9 +1,15 @@
 package promql
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
+
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,7 +42,7 @@ func TestRender_AlertsCarriesEveryDimensionButCluster(t *testing.T) {
 	got := Render(QAlerts, time.Minute, LabelKeys{}, sel)
 
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1m])`,
+		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1m])`,
 		got)
 	assert.NotContains(t, got, "cluster",
 		"a ?cluster= value must never narrow the alert read")
@@ -45,7 +51,7 @@ func TestRender_AlertsCarriesEveryDimensionButCluster(t *testing.T) {
 // Several namespaces still render ONE anchored alternation with the empty
 // alternative last, so the query stays a pure function of the value set.
 func TestRender_AlertsNamespaceOrAbsentIsOrderFree(t *testing.T) {
-	want := `last_over_time(ALERTS{alertstate="firing",namespace=~"platform|shop|"}[1m])`
+	want := `tlast_over_time(ALERTS{alertstate="firing",namespace=~"platform|shop|"}[1m])`
 	assert.Equal(t, want, Render(QAlerts, time.Minute, LabelKeys{},
 		Selector{Namespace: []string{"shop", "platform"}}))
 	assert.Equal(t, want, Render(QAlerts, time.Minute, LabelKeys{},
@@ -56,14 +62,14 @@ func TestRender_AlertsHonoursConfiguredLabelKeys(t *testing.T) {
 	sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
 	got := Render(QAlerts, time.Minute, LabelKeys{AZ: "zone", Env: "stage"}, sel)
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",zone="zone-a",stage="prod"}[1m])`,
+		`tlast_over_time(ALERTS{alertstate="firing",zone="zone-a",stage="prod"}[1m])`,
 		got)
 }
 
 // An unfiltered build reads every alert in the estate.
 func TestRender_AlertsUnfiltered(t *testing.T) {
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing"}[5m])`,
+		`tlast_over_time(ALERTS{alertstate="firing"}[5m])`,
 		Render(QAlerts, 5*time.Minute, LabelKeys{}, Selector{}))
 }
 
@@ -199,4 +205,46 @@ func TestFanout_AlertsReachesOnlyItsOwnBackend(t *testing.T) {
 	_, ksmQueries := k8s.seen()
 	assert.Equal(t, []string{"alerts-q"}, alertQueries)
 	assert.Equal(t, []string{"ksm-q"}, ksmQueries)
+}
+
+// --- portable fallback ---------------------------------------------------
+
+// The fallback is the previous portable read over the SAME selector, so a
+// store without tlast_over_time still returns the same series selection.
+func TestRenderAlertsPortable_SameSelectorAsQAlerts(t *testing.T) {
+	for name, sel := range map[string]Selector{
+		"unfiltered": {},
+		"filtered": {
+			AZ: []string{"zone-a"}, Env: []string{"prod"},
+			Cluster: []string{"c1"}, Namespace: []string{"shop"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tl := Render(QAlerts, time.Hour, LabelKeys{}, sel)
+			got := RenderAlertsPortable(time.Hour, LabelKeys{}, sel)
+			assert.Equal(t, "t"+got, tl, "only the function name differs")
+			assert.True(t, strings.HasPrefix(got, "last_over_time(ALERTS{"), got)
+		})
+	}
+	assert.Equal(t,
+		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
+		RenderAlertsPortable(time.Hour, LabelKeys{}, Selector{
+			AZ: []string{"zone-a"}, Env: []string{"prod"}, Namespace: []string{"shop"},
+		}))
+}
+
+// IsBadQuery recognises the store rejecting the query itself (a bad_data API
+// error — what Prometheus answers for an unknown function) through every wrap
+// the guard, the fan-out and the build add, and nothing else: a dial error, a
+// server error or a context error must not trigger a retry.
+func TestIsBadQuery(t *testing.T) {
+	bad := &v1.Error{Type: v1.ErrBadData, Msg: `unknown function with name "tlast_over_time"`}
+	assert.True(t, IsBadQuery(bad))
+	assert.True(t, IsBadQuery(fmt.Errorf("backend %q: %w", "alerts", fmt.Errorf("prom query ALERTS: %w", bad))))
+
+	assert.False(t, IsBadQuery(nil))
+	assert.False(t, IsBadQuery(errors.New("dial tcp 10.0.0.1:8428: connect: connection refused")))
+	assert.False(t, IsBadQuery(&v1.Error{Type: v1.ErrServer, Msg: "boom"}))
+	assert.False(t, IsBadQuery(&v1.Error{Type: v1.ErrTimeout, Msg: "slow"}))
+	assert.False(t, IsBadQuery(fmt.Errorf("prom query ALERTS: %w", context.DeadlineExceeded)))
 }

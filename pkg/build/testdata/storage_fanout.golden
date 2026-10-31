@@ -1,5 +1,5 @@
 ## node root, claimful and claimless pods
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
@@ -49,7 +49,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr1|agg
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_betadb|.*pvc_foreign|.*pvc_inheritbeta|.*pvc_orders|.*pvc_redis|.*pvc_sharedbeta"}[1m])
 
 ## node root, second node
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
@@ -96,7 +96,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr1|agg
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_cache|.*pvc_inheritbeta|.*pvc_orders|.*pvc_sharedbeta"}[1m])
 
 ## two node roots
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
@@ -146,7 +146,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr1|agg
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_betadb|.*pvc_cache|.*pvc_foreign|.*pvc_inheritbeta|.*pvc_orders|.*pvc_redis|.*pvc_sharedbeta"}[1m])
 
 ## podless node root
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 kube_node_info|last_over_time(kube_node_info{az="zone-a",env="prod",node="worker-3"}[1m])
 kube_node_labels|last_over_time(kube_node_labels{az="zone-a",env="prod",node="worker-3"}[1m])
 kube_node_status_addresses|last_over_time(kube_node_status_addresses{type=~"ExternalIP|InternalIP",az="zone-a",env="prod",node="worker-3"}[1m])
@@ -154,7 +154,7 @@ kube_node_status_condition|last_over_time(kube_node_status_condition{condition="
 kube_pod_info|last_over_time(kube_pod_info{az="zone-a",env="prod",node="worker-3"}[1m])
 
 ## mounting pod root
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr="aggr1"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr="aggr1"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr="aggr1"}[1m])
@@ -190,7 +190,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr1"}[1m
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_orders"}[1m])
 
 ## claimless pod root
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 app_metadata|tlast_over_time(argocd_app_pod_info{az="zone-a",env="prod",cluster="c1",namespace="shop"}[1m])
 kube_deployment_annotations|last_over_time(kube_deployment_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",env="prod",deployment="web"}[1m])
 kube_node_info|last_over_time(kube_node_info{az="zone-a",env="prod",node="worker-1"}[1m])
@@ -204,7 +204,7 @@ kube_replicaset_annotations|last_over_time(kube_replicaset_annotations{annotatio
 kube_replicaset_owner|last_over_time(kube_replicaset_owner{az="zone-a",env="prod",replicaset="web-7d9"}[1m])
 
 ## pod roots in two namespaces
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr=~"aggr1|aggr2"}[1m])
@@ -247,7 +247,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr=~"aggr1|agg
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_orders|.*pvc_redis"}[1m])
 
 ## shared claim with an undrawn mounter
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 aggr_new_status|last_over_time(aggr_new_status{cluster="ontap-prod",aggr="aggr1"}[1m])
 aggr_space_total|last_over_time(aggr_space_total{cluster="ontap-prod",aggr="aggr1"}[1m])
 aggr_space_used|last_over_time(aggr_space_used{cluster="ontap-prod",aggr="aggr1"}[1m])
@@ -283,7 +283,7 @@ volume_labels|last_over_time(volume_labels{cluster="ontap-prod",aggr="aggr1"}[1m
 volume_labels|last_over_time(volume_labels{volume=~".*pvc_sharedbeta"}[1m])
 
 ## job resolved through its cronjob
-ALERTS|last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
+ALERTS|tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1m])
 app_metadata|tlast_over_time(argocd_app_pod_info{az="zone-a",env="prod",cluster="c1",namespace="shop"}[1m])
 kube_cronjob_annotations|last_over_time(kube_cronjob_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",env="prod",cronjob="nightly"}[1m])
 kube_job_annotations|last_over_time(kube_job_annotations{annotation_argocd_argoproj_io_tracking_id!="",az="zone-a",env="prod",job_name="nightly-28901"}[1m])

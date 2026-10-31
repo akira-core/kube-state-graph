@@ -154,7 +154,11 @@ visibly — so a series held by two backends would multiply an edge's `rate` and
 alongside a per-zone one makes that overlap ordinary.
 
 A duplicate carrying a *different* value is logged at `DEBUG` and counted; the
-first contributor still wins, so the response stays deterministic.
+first contributor still wins, so the response stays deterministic. The one
+exception is the `alerts` family: its `ALERTS` value is the series' last-sample
+timestamp, so the copy with the GREATER value wins instead (HA vmalert writing
+to two stores must report the later sample, not the first store's). The
+maximum is just as order-free.
 
 ## Failure handling
 

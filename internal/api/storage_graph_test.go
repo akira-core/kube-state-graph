@@ -123,7 +123,7 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 	assert.NotContains(t, seen, "volume_labels",
 		"a Kubernetes node with no pod tracks no claim, so volume_labels is not read")
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
+		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
 		seen["ALERTS"], "ALERTS takes az/env and namespace-or-absent, never cluster")
 	assert.NotContains(t, seen, "traces_service_graph_request_total",
 		"storage-graph never reads the service graph")
@@ -158,7 +158,7 @@ func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="orders-0"}[1h])`,
 	}, seen["kube_pod_info"], "each namespace's pods are read by their own query")
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
+		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
 		seen["ALERTS"])
 	assert.NotContains(t, seen, "volume_labels",
 		"the pod mounts no claim in this fixture, so candidate completion is not issued")

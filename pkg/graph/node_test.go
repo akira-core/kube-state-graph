@@ -2,6 +2,7 @@ package graph
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -356,6 +357,25 @@ func TestSortAlerts_SortsAndDeduplicates(t *testing.T) {
 	}), 2)
 
 	assert.Nil(t, SortAlerts(nil))
+}
+
+// Collapsing duplicates keeps the GREATEST last-seen time, not the first
+// entry's: taking the maximum is independent of arrival order, so the wire form
+// stays a pure function of the matched set. A zero (unresolved) time loses to
+// any resolved one.
+func TestSortAlerts_KeepsLatestTimeWhateverTheOrder(t *testing.T) {
+	early := time.Unix(1761897600, 0)
+	late := time.Unix(1761897720, 0)
+	mk := func(ts time.Time) Alert {
+		return Alert{Name: "KubePodCrashLooping", State: AlertStateFiring, Severity: "warning", Time: ts}
+	}
+	want := []Alert{mk(late)}
+
+	assert.Equal(t, want, SortAlerts([]Alert{mk(early), mk(late)}))
+	assert.Equal(t, want, SortAlerts([]Alert{mk(late), mk(early)}))
+	assert.Equal(t, want, SortAlerts([]Alert{mk(time.Time{}), mk(late), mk(early)}))
+	assert.Equal(t, []Alert{mk(early)}, SortAlerts([]Alert{mk(time.Time{}), mk(early)}))
+	assert.Equal(t, []Alert{mk(time.Time{})}, SortAlerts([]Alert{mk(time.Time{}), mk(time.Time{})}))
 }
 
 // TestQoS_OnlyPVCsCarryIt — QoS() returns the resolved ceiling for a PVC and

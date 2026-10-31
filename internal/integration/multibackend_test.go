@@ -494,9 +494,50 @@ ALERTS{alertname="KubePodCrashLooping",alertstate="firing",severity="warning",cl
 		if n.Data.ID == "mb-alpha/mb-uid-1" && len(n.Data.Alerts) > 0 {
 			alerted = true
 			s.Equal("KubePodCrashLooping", n.Data.Alerts[0].Name)
+			s.Equal(fixedNow.Unix(), n.Data.Alerts[0].Time,
+				"tlast_over_time through the routed alerts store returns the sample's own timestamp")
 		}
 	}
 	s.True(alerted, "the alert ingested only in the alerts store must attach")
+}
+
+// Two backends serving the alerts family hold the SAME series (HA vmalert
+// writing to both), and the one that sorts first stopped receiving samples a
+// minute ago. The merge keeps the later timestamp for this family, so the
+// alert reads as last seen now — first-backend-wins would report it a minute
+// stale.
+func (s *MultiBackendSuite) TestAlertsDuplicatedAcrossBackendsKeepsLatestTime() {
+	const series = `ALERTS{alertname="MbDupAcrossStores",alertstate="firing",severity="warning",cluster="mb-alpha",namespace="db",pod="mongo-0",az="zone-a"}`
+	stale, fresh := fixedNow.Add(-time.Minute), fixedNow
+	s.ingestInto(s.VMURL(), fmt.Sprintf("%s 1 %d\n", series, stale.Unix()*1000))
+	s.ingestInto(s.secondURL, fmt.Sprintf("%s 1 %d\n", series, fresh.Unix()*1000))
+	s.Require().True(s.waitForSeriesAt(s.VMURL(), `ALERTS{alertname="MbDupAcrossStores"}`, fixedNow, 30*time.Second),
+		"container A did not observe the ALERTS fixture")
+	s.Require().True(s.waitForSeriesAt(s.secondURL, `ALERTS{alertname="MbDupAcrossStores"}`, fixedNow, 30*time.Second),
+		"container B did not observe the ALERTS fixture")
+
+	srv := s.startRoutedAPI(append(s.familySplitBackends(),
+		promql.NewBackend("alerts-a", s.VMURL(), []promql.Family{promql.FamilyAlerts}, nil, "", ""),
+		promql.NewBackend("alerts-b", s.secondURL, []promql.Family{promql.FamilyAlerts}, nil, "", ""),
+	))
+	body := s.fetchGraph(srv, func(q url.Values) {
+		inventory(q)
+		q.Set("az", "zone-a")
+	})
+
+	var found bool
+	for _, n := range body.Elements.Nodes {
+		if n.Data.ID != "mb-alpha/mb-uid-1" {
+			continue
+		}
+		for _, a := range n.Data.Alerts {
+			if a.Name == "MbDupAcrossStores" {
+				found = true
+				s.Equal(fresh.Unix(), a.Time, "the later of the two stores' timestamps wins")
+			}
+		}
+	}
+	s.True(found, "the duplicated alert attaches once")
 }
 
 type recQuerier struct {
