@@ -162,16 +162,17 @@ func readTopology(
 			return wrapQueryError(name, err)
 		}
 	}
-	// fetchOptionalTracking is the OPTIONAL-leg twin of fetch: a query error logs
-	// and yields an empty vector instead of failing the build. Caller
-	// cancellation still fails the group. Used for Harvest, kubelet, and
-	// the two accumulating-cardinality annotation families.
+	// fetchOptionalVia is the OPTIONAL-leg twin of fetch, over an arbitrary
+	// issue func: a query error logs and yields an empty vector instead of
+	// failing the build. Caller cancellation still fails the group.
 	//
 	// A non-nil degraded is set when — and only when — an error was swallowed,
 	// so a reader that infers something from the family's ABSENCE can tell
 	// "read, matched nothing" from "never read". Only kube_job_annotations
-	// needs that today; every other optional leg passes nil via fetchOptional.
-	fetchOptionalTracking := func(name promql.Query, dst *model.Vector, degraded *bool) func() error {
+	// needs that today; every other optional leg passes nil.
+	fetchOptionalVia := func(name promql.Query, dst *model.Vector, degraded *bool,
+		issue func() (model.Vector, error),
+	) func() error {
 		return func() (err error) {
 			defer func() {
 				if rec := recover(); rec != nil {
@@ -183,7 +184,7 @@ func readTopology(
 					err = fmt.Errorf("panic in %s query: %v", name, rec)
 				}
 			}()
-			out, qerr := q.Instant(ctx, string(name), renderTopologyQuery(name, opts.AppMetadata, window, keys, sel), end)
+			out, qerr := issue()
 			if qerr != nil {
 				if cerr := optionalQueryFatal(callerCtx, qerr); cerr != nil {
 					return cerr
@@ -201,10 +202,41 @@ func readTopology(
 			return nil
 		}
 	}
+	// fetchOptionalTracking issues the leg's own rendered query. Used for
+	// Harvest, kubelet, and the two accumulating-cardinality annotation
+	// families.
+	fetchOptionalTracking := func(name promql.Query, dst *model.Vector, degraded *bool) func() error {
+		return fetchOptionalVia(name, dst, degraded, func() (model.Vector, error) {
+			return q.Instant(ctx, string(name), renderTopologyQuery(name, opts.AppMetadata, window, keys, sel), end)
+		})
+	}
 	// fetchOptional is fetchOptionalTracking for the legs whose degrade needs no
 	// downstream signal.
 	fetchOptional := func(name promql.Query, dst *model.Vector) func() error {
 		return fetchOptionalTracking(name, dst, nil)
+	}
+
+	// fetchAlerts is fetchOptional for the ALERTS leg, plus one portable retry.
+	// The leg is rendered with the MetricsQL tlast_over_time; a store that
+	// rejects it as an invalid query (promql.IsBadQuery — a plain Prometheus)
+	// is asked once more with promql.RenderAlertsPortable under the same query
+	// name, so every alert still attaches and still feeds the status fold,
+	// only without a last-seen time. Any other error degrades exactly as
+	// fetchOptional does — a store that is down must not pay two timeouts per
+	// build — and the caller's own cancellation still fails the build before a
+	// retry is considered.
+	fetchAlerts := func(dst *model.Vector) func() error {
+		name := promql.QAlerts
+		return fetchOptionalVia(name, dst, nil, func() (model.Vector, error) {
+			out, qerr := q.Instant(ctx, string(name), promql.Render(name, window, keys, sel), end)
+			if qerr == nil || !promql.IsBadQuery(qerr) || optionalQueryFatal(callerCtx, qerr) != nil {
+				return out, qerr
+			}
+			slog.WarnContext(ctx, "alerts store rejected tlast_over_time; retrying with the portable read, alerts carry no time",
+				"query", string(name),
+				"error", qerr)
+			return q.Instant(ctx, string(name), promql.RenderAlertsPortable(window, keys, sel), end)
+		})
 	}
 
 	// Second-wave prerequisites. Each is closed when its leg returns, whatever it
@@ -264,6 +296,8 @@ func readTopology(
 			run = readRootedVolumeLabels(ctx, q, end, plan.phaseOne, l.dst, &svmRows)
 		case !l.optional || plan.failsClosed(l.query):
 			run = fetch(l.query, l.dst)
+		case l.query == promql.QAlerts:
+			run = fetchAlerts(l.dst)
 		case l.degraded != nil:
 			run = fetchOptionalTracking(l.query, l.dst, l.degraded)
 		default:
@@ -461,6 +495,7 @@ func readTopology(
 	}
 
 	t := parseTopology(v, keys)
+	t.alertWindow = alertWindow{start: end.Add(-window), end: end}
 	t.RawSeriesCount = tallySeries(legs, plan, &v)
 	warnSelectorFamilyEmpty(ctx, sel, keys, t.RawSeriesCount)
 	return t, nil

@@ -201,6 +201,10 @@ type Topology struct {
 	// Harvest series carried the pair, which leaves NetApp alerts matching by
 	// label alone.
 	ontapZones map[string][]zone
+
+	// alertWindow is the build window, against which each ALERTS last-sample
+	// time is bounded. Zero for a hand-built Topology, which skips the bound.
+	alertWindow alertWindow
 }
 
 // topologyVectors groups the raw result vectors of the topology fan-out. It

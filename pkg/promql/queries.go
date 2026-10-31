@@ -1,9 +1,12 @@
 package promql
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"time"
+
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 )
 
 // Query identifies one of the PromQL templates the build pipeline issues.
@@ -241,6 +244,11 @@ const (
 	// OPTIONAL in every direction: an unserved family, a query error, or an
 	// empty vector each leave every node without `data.alerts` and never fail
 	// the build.
+	//
+	// The leg is rendered with the MetricsQL tlast_over_time, so each sample's
+	// value is the series' last-sample Unix timestamp in seconds. A store that
+	// rejects it as an invalid query (a plain Prometheus) is asked once more
+	// with RenderAlertsPortable: alerts still attach, without a time.
 	QAlerts Query = "ALERTS"
 
 	// QAppMetadata is the LOGICAL name of the operator-configured per-pod
@@ -613,6 +621,47 @@ const jobOwnerCronJobSelector = `owner_kind="CronJob",owner_is_controller="true"
 // nothing there to drop.
 const argoTrackingIDPresentSelector = `annotation_argocd_argoproj_io_tracking_id!=""`
 
+// selectorBraces joins a query's fixed selector with the request matchers its
+// queryDims entry admits, omitting the braces entirely when neither is present.
+func selectorBraces(q Query, keys LabelKeys, sel Selector) string {
+	fixed := fixedSelector[q]
+	req := sel.render(queryDims[q], keys)
+	switch {
+	case fixed == "" && req == "":
+		return ""
+	case req == "":
+		return "{" + fixed + "}"
+	case fixed == "":
+		return "{" + req + "}"
+	default:
+		return "{" + fixed + "," + req + "}"
+	}
+}
+
+// RenderAlertsPortable is the QAlerts read in its portable PromQL form,
+// `last_over_time(ALERTS{…}[w])`, over exactly the selector Render(QAlerts)
+// composes. The build issues it once, under the same query name, when the
+// alerts store rejects the MetricsQL tlast_over_time read as an invalid query
+// (IsBadQuery) — a plain Prometheus. It returns the same series selection; its
+// values are the constant 1 rather than a timestamp, so every alert still
+// attaches and only its last-seen time is absent.
+//
+// It is a separate render rather than a Query constant on purpose: the leg,
+// its family, its dimensions and its self-metric name are QAlerts'.
+func RenderAlertsPortable(window time.Duration, keys LabelKeys, sel Selector) string {
+	return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, selectorBraces(QAlerts, keys, sel), FormatDuration(window))
+}
+
+// IsBadQuery reports whether err is the store rejecting the query itself — a
+// Prometheus HTTP API `bad_data` error, which is what Prometheus answers for a
+// function it does not know — through any number of %w wraps. Transport,
+// timeout, server and context errors are not: retrying those with another
+// query would only double the cost of a store that is down.
+func IsBadQuery(err error) bool {
+	var apiErr *v1.Error
+	return errors.As(err, &apiErr) && apiErr.Type == v1.ErrBadData
+}
+
 // alertsFiringSelector keeps the ALERTS read at alerts that are actually
 // firing. It is a request-invariant metric-selection contract of the same
 // class as the service-graph sentinel and condition="Ready" — NOT a caller filter: a
@@ -730,24 +779,7 @@ var fixedSelector = map[Query]string{
 // TestRender_EmptySelectorMatchesBaseline).
 func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string {
 	w := FormatDuration(window)
-	req := sel.render(queryDims[q], keys)
-
-	// braces joins a query's fixed selector with the request matchers, omitting
-	// the braces entirely when neither is present.
-	braces := func(fixed string) string {
-		switch {
-		case fixed == "" && req == "":
-			return ""
-		case req == "":
-			return "{" + fixed + "}"
-		case fixed == "":
-			return "{" + req + "}"
-		default:
-			return "{" + fixed + "," + req + "}"
-		}
-	}
-
-	fx := braces(fixedSelector[q])
+	fx := selectorBraces(q, keys, sel)
 
 	switch q {
 	case QPodInfo:
@@ -872,7 +904,14 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// and resolved inside the window is part of the answer. The fixed
 		// alertstate="firing" selector is rendered first, so a request matcher
 		// composes with it rather than replacing it.
-		return fmt.Sprintf(`last_over_time(ALERTS%s[%s])`, fx, w)
+		//
+		// tlast_over_time (MetricsQL, the QPodContainerInfo precedent) returns
+		// the same series selection as last_over_time (its label sets may lack
+		// __name__, which no reader keys on), but its VALUE is each
+		// series' last-sample Unix timestamp in seconds rather than the
+		// constant 1 — the alert's "last seen firing" time. Matching is
+		// unaffected. RenderAlertsPortable is the fallback form.
+		return fmt.Sprintf(`tlast_over_time(ALERTS%s[%s])`, fx, w)
 	case QAppMetadata:
 		// Logical name only: the issued query names the configured metric
 		// and goes through RenderAppMetadata, never through Render.

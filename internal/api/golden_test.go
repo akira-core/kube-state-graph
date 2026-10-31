@@ -20,6 +20,11 @@ import (
 
 var update = flag.Bool("update", false, "update golden files")
 
+// goldenAlertSeen is the last-seen-firing time every golden alert fixture
+// carries (Unix 1761897720), so the goldens show a realistic in-window epoch
+// instead of the 1970 a zero value would imply.
+var goldenAlertSeen = time.Unix(1761897720, 0).UTC()
+
 // TestGolden_GraphResponses snapshots the Cytoscape responses for several
 // canned scenarios so contract drift is caught on PR.
 func TestGolden_GraphResponses(t *testing.T) {
@@ -306,12 +311,12 @@ func buildWithNetAppStorage() graph.View {
 	pod := &graph.PodNode{
 		IDValue: "cluster-alpha/p1", NameValue: "mongo-0",
 		LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"},
-		AlertsValue: []graph.Alert{{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"}},
+		AlertsValue: []graph.Alert{{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning", Time: goldenAlertSeen}},
 	}
 	k8sNode := &graph.K8sNode{
 		IDValue: "cluster-alpha/worker-0", NameValue: "worker-0",
 		LabelsValue: map[string]string{"cluster": "cluster-alpha"},
-		AlertsValue: []graph.Alert{{Name: "KubeNodeNotReady", State: graph.AlertStateFiring, Severity: "critical"}},
+		AlertsValue: []graph.Alert{{Name: "KubeNodeNotReady", State: graph.AlertStateFiring, Severity: "critical", Time: goldenAlertSeen}},
 	}
 	used, cap := 700000000000.0, 1000000000000.0
 	readOps, writeOps, readLat, writeLat, readBps, writeBps := 150.0, 40.0, 830.0, 1200.0, 5242880.0, 1000000.0
@@ -328,7 +333,7 @@ func buildWithNetAppStorage() graph.View {
 		StorageClassValue: "netapp-nas",
 		// The same ceiling the edge below carries: one resolution feeds both.
 		QoSValue:    &graph.QoSCeiling{PolicyGroup: "gold-tier", MaxIOPS: &maxIOPS, MaxBytesPerSec: &maxBps},
-		AlertsValue: []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning"}},
+		AlertsValue: []graph.Alert{{Name: "PVCAlmostFull", State: graph.AlertStateFiring, Severity: "warning", Time: goldenAlertSeen}},
 	}
 	pvcPlain := &graph.PVCNode{IDValue: "cluster-alpha/db/scratch", NameValue: "scratch", LabelsValue: map[string]string{"cluster": "cluster-alpha", "namespace": "db"}}
 	aggr := &graph.NetAppAggrNode{
@@ -337,7 +342,7 @@ func buildWithNetAppStorage() graph.View {
 		LabelsValue: map[string]string{"ontap_cluster": "ontap-prod", "node": "ontap-prod-01"},
 		HealthValue: graph.HealthOnline,
 		UsageValue:  &graph.UsageBytes{UsedBytes: &used, CapacityBytes: &cap},
-		AlertsValue: []graph.Alert{{Name: "AggrSpaceLow", State: graph.AlertStateFiring, Severity: "warning"}},
+		AlertsValue: []graph.Alert{{Name: "AggrSpaceLow", State: graph.AlertStateFiring, Severity: "warning", Time: goldenAlertSeen}},
 	}
 	ctrl := &graph.NetAppNode{
 		IDValue:     graph.NetAppNodeID("ontap-prod", "ontap-prod-01"),
@@ -348,7 +353,7 @@ func buildWithNetAppStorage() graph.View {
 			Model: "AFF-A400", Serial: "721234000123", Version: "9.14.1", Vendor: "NetApp",
 		},
 		PerfValue:   &graph.NodePerf{CPUBusyPct: &cpu, TotalOps: &ops, TotalLatencyUs: &lat, TotalBytesPerSec: &data},
-		AlertsValue: []graph.Alert{{Name: "NodeCPUBusy", State: graph.AlertStateFiring, Severity: "critical"}},
+		AlertsValue: []graph.Alert{{Name: "NodeCPUBusy", State: graph.AlertStateFiring, Severity: "critical", Time: goldenAlertSeen}},
 	}
 	ioEdge := graph.NewEdge(graph.EdgeTypePVCToNetAppAggr, pvc.IDValue, aggr.IDValue, nil).WithIO(graph.IOMetrics{
 		ReadOps: &readOps, WriteOps: &writeOps, ReadLatencyUs: &readLat, WriteLatencyUs: &writeLat,

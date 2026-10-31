@@ -11,6 +11,9 @@
                     },
                     "state": {
                         "type": "string"
+                    },
+                    "time": {
+                        "type": "integer"
                     }
                 },
                 "type": "object"

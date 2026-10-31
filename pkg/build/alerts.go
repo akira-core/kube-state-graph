@@ -3,7 +3,9 @@ package build
 import (
 	"context"
 	"log/slog"
+	"math"
 	"slices"
+	"time"
 
 	"github.com/prometheus/common/model"
 
@@ -263,7 +265,7 @@ type alertMatch struct {
 // The alert sets come back sorted by (name, severity) and de-duplicated on that
 // pair, so two ALERTS series differing only in a label the matcher never reads
 // collapse to one entry whatever order the vector held them in.
-func resolveAlerts(vec model.Vector, idx alertIndex, clusters *clusterResolver) (
+func resolveAlerts(vec model.Vector, idx alertIndex, clusters *clusterResolver, win alertWindow) (
 	byNode map[string][]graph.Alert, unmatched, ambiguous int,
 ) {
 	if len(vec) == 0 {
@@ -295,6 +297,7 @@ func resolveAlerts(vec model.Vector, idx alertIndex, clusters *clusterResolver) 
 				Name:     string(s.Metric[alertNameLabel]),
 				State:    string(s.Metric[alertStateLabel]),
 				Severity: string(s.Metric[alertSeverityLabel]),
+				Time:     alertSeenTime(s.Value, win),
 			})
 		}
 	}
@@ -306,6 +309,34 @@ func resolveAlerts(vec model.Vector, idx alertIndex, clusters *clusterResolver) 
 		byNode[id] = graph.SortAlerts(alerts)
 	}
 	return byNode, unmatched, ambiguous
+}
+
+// alertWindow is the build window an ALERTS last-sample time must fall in.
+// The zero value is "unknown" (a hand-built Topology, an embedder) and skips
+// the bound.
+type alertWindow struct{ start, end time.Time }
+
+// alertSeenTime converts an ALERTS sample value into the alert's last-seen
+// time. The QAlerts leg is rendered with tlast_over_time, so the value is the
+// series' last-sample Unix timestamp in seconds; it is truncated toward zero so
+// the time never claims a moment later than the sample.
+//
+// A value that is not a usable timestamp resolves to the zero time: NaN, ±Inf,
+// below one second, or — when the window is known — a whole second outside
+// [start, end], both ends inclusive. A last sample inside the window cannot lie
+// outside it, so this is what turns the portable fallback's constant 1 (and an
+// embedder's vector still carrying it) into "unresolved" rather than 1970. The
+// alert is attached either way: a missing timestamp is no reason to drop it.
+func alertSeenTime(v model.SampleValue, win alertWindow) time.Time {
+	f := float64(v)
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 1 || f >= math.MaxInt64 {
+		return time.Time{}
+	}
+	sec := int64(f)
+	if !win.end.IsZero() && (sec < win.start.Unix() || sec > win.end.Unix()) {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
 }
 
 // resolveOneAlert applies the kind precedence: the target kind is chosen by the
@@ -433,7 +464,8 @@ func attachAlerts(ctx context.Context, nodes []graph.GraphNode, topology Topolog
 		return
 	}
 	byNode, unmatched, ambiguous := resolveAlerts(
-		topology.Alerts, newAlertIndex(nodes, topology.clusters, topology.ontapZones), topology.clusters)
+		topology.Alerts, newAlertIndex(nodes, topology.clusters, topology.ontapZones), topology.clusters,
+		topology.alertWindow)
 
 	for _, n := range nodes {
 		alerts := byNode[n.ID()]

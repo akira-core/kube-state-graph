@@ -82,10 +82,25 @@ func siblingCancelled(ctx, gctx context.Context, err error) bool {
 // rate and error_rate by the number of backends holding it. A catch-all backend
 // sitting alongside a per-zone one makes that overlap ordinary.
 //
+// With keepMax a duplicate carrying a GREATER value replaces the kept copy at
+// the first copy's position. It is set for the alerts family only: the ALERTS
+// value is the series' last-sample timestamp (tlast_over_time), so two stores
+// holding one alert (HA vmalert writing to both) must yield the later one, or
+// a stalled remote write into the first store would show a still-firing alert
+// as last seen long ago — and the reader could not fix it, because the second
+// copy never reaches it. The maximum is order-free, so the result stays
+// deterministic. The kept sample is swapped, never written to: a cached
+// vector's samples are shared.
+//
+// The rule follows the FAMILY, so a caller-declared label query
+// (Router.QueryLabels) naming the alerts family gets it too. That is harmless:
+// a label-values lookup reads the label set, which two duplicates share by
+// definition, and never the value.
+//
 // The result is a pure function of the value SETS returned, never of response
 // arrival order, which is what keeps the serialised response body
 // byte-deterministic.
-func mergeVectors(parts []model.Vector) (model.Vector, int) {
+func mergeVectors(parts []model.Vector, keepMax bool) (model.Vector, int) {
 	total := 0
 	for _, p := range parts {
 		total += len(p)
@@ -95,7 +110,7 @@ func mergeVectors(parts []model.Vector) (model.Vector, int) {
 	}
 
 	out := make(model.Vector, 0, total)
-	seen := make(map[model.Fingerprint]*model.Sample, total)
+	seen := make(map[model.Fingerprint]int, total) // fingerprint → index in out
 	conflicts := 0
 	for _, part := range parts {
 		for _, s := range part {
@@ -103,18 +118,21 @@ func mergeVectors(parts []model.Vector) (model.Vector, int) {
 				continue
 			}
 			fp := s.Metric.Fingerprint()
-			if kept, dup := seen[fp]; dup {
+			if i, dup := seen[fp]; dup {
 				// A duplicate carrying a DIFFERENT value is a genuine data
 				// ambiguity — two stores disagreeing about one series. Keeping
 				// the first (lexically-smallest backend) is deterministic;
 				// counting it makes the disagreement visible without turning a
 				// benign scrape overlap into an outage.
-				if kept.Value != s.Value {
+				if out[i].Value != s.Value {
 					conflicts++
+					if keepMax && s.Value > out[i].Value {
+						out[i] = s
+					}
 				}
 				continue
 			}
-			seen[fp] = s
+			seen[fp] = len(out)
 			out = append(out, s)
 		}
 	}
@@ -233,7 +251,7 @@ func (f *fanoutQuerier) issue(ctx context.Context, fam Family, name, query strin
 		return nil, err
 	}
 
-	merged, conflicts := mergeVectors(parts)
+	merged, conflicts := mergeVectors(parts, fam == FamilyAlerts)
 	if conflicts > 0 {
 		slog.DebugContext(ctx, "upstream backends disagreed about a series value",
 			"query_name", name,

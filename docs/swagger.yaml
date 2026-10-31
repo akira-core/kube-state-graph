@@ -8,6 +8,8 @@ components:
           type: string
         state:
           type: string
+        time:
+          type: integer
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.Body:
       properties:

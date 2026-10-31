@@ -79,7 +79,7 @@ func buildK8sGraphEstate() *graph.Graph {
 	orders0.OwnerValue = &graph.Owner{Kind: "Deployment", Name: "orders"}
 	orders0.ApplicationValue = "checkout"
 	orders0.IPAddressValue = []string{"10.244.0.10"}
-	orders0.AlertsValue = []graph.Alert{{Name: "PodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"}}
+	orders0.AlertsValue = []graph.Alert{{Name: "PodCrashLooping", State: graph.AlertStateFiring, Severity: "warning", Time: goldenAlertSeen}}
 	orders1 := pod(a, "shop", "orders-1", "uid-a-orders-1", "worker-2")
 	orders1.OwnerValue = &graph.Owner{Kind: "Deployment", Name: "orders"}
 	orders1.ApplicationValue = "checkout"
