@@ -3,6 +3,7 @@ package cytoscape
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,21 +158,38 @@ func TestSerialise_AlertsAttributeShape(t *testing.T) {
 		NameValue:   "orders-0",
 		LabelsValue: map[string]string{"cluster": "c1", "namespace": "shop"},
 		AlertsValue: []graph.Alert{
-			{Name: "HighMemory", State: graph.AlertStateFiring, Severity: "critical"},
-			{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"},
+			{Name: "HighMemory", State: graph.AlertStateFiring, Severity: "critical", Time: time.Unix(1761897600, 0)},
+			{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning", Time: time.Unix(1761897720, 0)},
 		},
 	}
 	body := cy(t, []graph.GraphNode{pod}, nil)
 	nodes := cyNodesByID(body)
 	require.Equal(t, []AlertDTO{
-		{Name: "HighMemory", State: "firing", Severity: "critical"},
-		{Name: "KubePodCrashLooping", State: "firing", Severity: "warning"},
+		{Name: "HighMemory", State: "firing", Severity: "critical", Time: 1761897600},
+		{Name: "KubePodCrashLooping", State: "firing", Severity: "warning", Time: 1761897720},
 	}, nodes[pod.ID()].Alerts)
 	assert.NotContains(t, nodes[pod.ID()].Labels, "alertname")
 
 	raw, err := json.Marshal(nodes[pod.ID()].Alerts)
 	require.NoError(t, err)
-	assert.JSONEq(t, `[{"name":"HighMemory","state":"firing","severity":"critical"},{"name":"KubePodCrashLooping","state":"firing","severity":"warning"}]`, string(raw))
+	assert.JSONEq(t, `[{"name":"HighMemory","state":"firing","severity":"critical","time":1761897600},{"name":"KubePodCrashLooping","state":"firing","severity":"warning","time":1761897720}]`, string(raw))
+}
+
+// A time that did not resolve (the zero value) is omitted, not serialised as a
+// negative or 1970 epoch; the entry itself is still emitted.
+func TestSerialise_AlertTimeOmittedWhenUnresolved(t *testing.T) {
+	pod := &graph.PodNode{
+		IDValue:     "c1/uid-1",
+		NameValue:   "orders-0",
+		LabelsValue: map[string]string{"cluster": "c1", "namespace": "shop"},
+		AlertsValue: []graph.Alert{{Name: "HighMemory", State: graph.AlertStateFiring, Severity: "critical"}},
+	}
+	nodes := cyNodesByID(cy(t, []graph.GraphNode{pod}, nil))
+
+	raw, err := json.Marshal(nodes[pod.ID()].Alerts)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"name":"HighMemory","state":"firing","severity":"critical"}]`, string(raw))
+	assert.NotContains(t, string(raw), `"time"`)
 }
 
 func TestSerialise_SVMNestsUnderStorageCluster(t *testing.T) {

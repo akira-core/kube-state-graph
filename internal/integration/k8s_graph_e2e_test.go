@@ -110,6 +110,9 @@ ALERTS{alertname="KgPodWarning",alertstate="firing",severity="warning",cluster="
 	pod := byID[ident+"/uid-kg-orders-0"]
 	s.Require().NotEmpty(pod.Alerts)
 	s.Equal("KgPodWarning", pod.Alerts[0].Name)
+	// tlast_over_time returns the fixture sample's own timestamp (whole seconds)
+	// as the series value, so the entry's time is when it was last seen firing.
+	s.Equal(fixedNow.Unix(), pod.Alerts[0].Time, "alert time = the firing sample's timestamp")
 	s.Equal("warning", pod.Status)
 
 	// A pod root: the pod, its node and its claim.

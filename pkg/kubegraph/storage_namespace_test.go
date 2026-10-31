@@ -101,6 +101,6 @@ func TestParseStorageValues_PodRootDoesNotDeriveNamespace(t *testing.T) {
 		`last_over_time(kube_persistentvolumeclaim_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1h])`,
 	}, q.QueriesFor(promql.QPVCInfo), "claim info is read by the tracked (namespace, claim) pairs")
 	assert.Equal(t, []string{
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
+		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
 	}, q.QueriesFor(promql.QAlerts))
 }

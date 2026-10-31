@@ -726,6 +726,10 @@ The series takes `az`, `env` and `namespace` matchers but **never** `cluster`;
 `namespace` renders in its or-absent form (`namespace=~"shop|"`) so the
 namespace-less node / controller / aggregate alerts are not excluded upstream.
 
+The leg is read with the MetricsQL `tlast_over_time(ALERTS{…}[w])`, so each series' sample value is its last-sample Unix timestamp. It has the same series selection as `last_over_time`; only the value differs. That value becomes the entry's `time` when its whole second lies inside `[start, end]`, and is omitted otherwise. Series that collapse into one `(name, severity)` entry keep the greatest timestamp, and when two backends serving `alerts` hold the same series, the cross-backend merge keeps the copy with the greater value rather than the first backend's.
+
+**Portable fallback.** A store that rejects the read as an invalid query (`bad_data` — a plain Prometheus, which has no `tlast_over_time`) is asked once more, under the same query name, with `last_over_time(ALERTS{…}[w])`. Every alert still attaches and still feeds `data.status`; its value is the constant `1`, outside any real window, so no entry carries `time`. A dial, timeout or server error does not retry. Two costs on such a store: every build first issues the rejected query (errors are never cached), so `kube_state_graph_upstream_query_failures_total{query="ALERTS"}` and `kube_state_graph_upstream_backend_query_failures_total{backend}` each grow by one per build, and the client logs one ERROR (`promql query failed`) plus the build one Warn (the retry); and the fallback is per leg, so a mixed fleet — one Prometheus and one VictoriaMetrics `alerts` backend — fails the `tlast` fan-out as a whole and loses `time` on every alert.
+
 Matching is label-set, most-specific kind first: `{namespace, pod}` → pod;
 else `{namespace, persistentvolumeclaim}` → PVC; else `{aggr}` → aggregate
 (it outranks `node` because the stock Harvest `aggr_*` series carry the
@@ -757,7 +761,7 @@ empty alert vector is the healthy estate.
 
 | Metric | Graph role | Empty / error |
 |---|---|---|
-| `ALERTS` | `data.alerts` `[{name, state, severity}]` on pod / K8s node / PVC / netapp-node / netapp-aggr. Sorted by `(name, severity)`, omitted when empty | Attribute omitted; build succeeds |
+| `ALERTS` | `data.alerts` `[{name, state, severity, time}]` on pod / K8s node / PVC / netapp-node / netapp-aggr. Sorted by `(name, severity)`, omitted when empty. `time` is the last firing sample inside the window, in Unix epoch seconds ("last seen firing", not the activation time); it is omitted when it did not resolve | Attribute omitted; build succeeds |
 
 `severity` is compared case-insensitively when the builder folds
 `data.status`: `critical` → `critical`; `warning`, an empty value, or any

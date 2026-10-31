@@ -262,7 +262,7 @@ func TestK8sGraph_QuerySet(t *testing.T) {
 		`last_over_time(kube_pod_info{az="zone-a",env="prod",cluster="c1",namespace="shop",node="worker-1"}[1h])`,
 		seen["kube_pod_info"])
 	assert.Equal(t,
-		`last_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
+		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod",namespace=~"shop|"}[1h])`,
 		seen["ALERTS"], "ALERTS takes az/env and namespace-or-absent, never cluster")
 	for _, forbidden := range []string{
 		"volume_labels", "aggr_space_used", "kube_pod_container_info", "kube_service_info",

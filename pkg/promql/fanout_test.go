@@ -75,7 +75,7 @@ func TestMergeVectors_DisjointConcatenatesInOrder(t *testing.T) {
 	b := model.Vector{
 		sample("kube_pod_info", map[string]string{"pod": "b1"}, 1),
 	}
-	got, conflicts := mergeVectors([]model.Vector{a, b})
+	got, conflicts := mergeVectors([]model.Vector{a, b}, false)
 	require.Len(t, got, 3)
 	assert.Zero(t, conflicts)
 	assert.Equal(t, model.LabelValue("a1"), got[0].Metric["pod"])
@@ -87,7 +87,7 @@ func TestMergeVectors_ExactDuplicateCollapses(t *testing.T) {
 	got, conflicts := mergeVectors([]model.Vector{
 		{sample("kube_pod_info", dup, 1)},
 		{sample("kube_pod_info", dup, 1)},
-	})
+	}, false)
 	assert.Len(t, got, 1)
 	assert.Zero(t, conflicts, "identical values are not a disagreement")
 }
@@ -100,10 +100,69 @@ func TestMergeVectors_DifferingDuplicateKeepsFirstAndCounts(t *testing.T) {
 	got, conflicts := mergeVectors([]model.Vector{
 		{sample("kube_pod_info", dup, 7)},
 		{sample("kube_pod_info", dup, 9)},
-	})
+	}, false)
 	require.Len(t, got, 1)
 	assert.InDelta(t, 7.0, float64(got[0].Value), 0)
 	assert.Equal(t, 1, conflicts)
+}
+
+// With keepMax (the alerts family, whose value is a last-sample timestamp) a
+// differing duplicate keeps the GREATER value whichever part holds it, at the
+// first copy's position, and is still counted. Neither input sample is written
+// to: cached samples are shared across builds.
+func TestMergeVectors_KeepMaxTakesGreaterValueWithoutMutating(t *testing.T) {
+	dup := map[string]string{"alertname": "A", "pod": "shared"}
+	for name, parts := range map[string]func() []model.Vector{
+		"greater second": func() []model.Vector {
+			return []model.Vector{
+				{sample("ALERTS", map[string]string{"alertname": "B"}, 5), sample("ALERTS", dup, 1761897600)},
+				{sample("ALERTS", dup, 1761897720)},
+			}
+		},
+		"greater first": func() []model.Vector {
+			return []model.Vector{
+				{sample("ALERTS", map[string]string{"alertname": "B"}, 5), sample("ALERTS", dup, 1761897720)},
+				{sample("ALERTS", dup, 1761897600)},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := parts()
+			want := []float64{float64(in[0][1].Value), float64(in[1][0].Value)}
+
+			got, conflicts := mergeVectors(in, true)
+
+			require.Len(t, got, 2)
+			assert.Equal(t, model.LabelValue("B"), got[0].Metric["alertname"], "position follows first appearance")
+			assert.InDelta(t, 1761897720.0, float64(got[1].Value), 0)
+			assert.Equal(t, 1, conflicts, "the disagreement is still counted")
+			after := []float64{float64(in[0][1].Value), float64(in[1][0].Value)}
+			assert.Equal(t, want, after, "no sample mutated")
+		})
+	}
+}
+
+// Through the real fan-out: the ALERTS query keeps the later timestamp,
+// whichever backend sorts first; every other family keeps first-backend-wins.
+func TestFanout_AlertsDuplicateKeepsLatestTimestamp(t *testing.T) {
+	dup := map[string]string{"alertname": "A", "pod": "shared"}
+	run := func(name Query, va, vb float64) model.Vector {
+		fa := &fakeBackend{vec: model.Vector{sample("ALERTS", dup, va)}}
+		fb := &fakeBackend{vec: model.Vector{sample("ALERTS", dup, vb)}}
+		r := routerWithFakes(t, twoZoneTable(t), map[string]*fakeBackend{"zone-a": fa, "zone-b": fb}, nil)
+		got, err := r.QuerierFor(Selector{}).Instant(t.Context(), string(name), "q", time.Unix(0, 0))
+		require.NoError(t, err)
+		return got
+	}
+
+	for _, vals := range [][2]float64{{1761897600, 1761897720}, {1761897720, 1761897600}} {
+		got := run(QAlerts, vals[0], vals[1])
+		require.Len(t, got, 1)
+		assert.InDelta(t, 1761897720.0, float64(got[0].Value), 0, "alerts: the later timestamp wins (%v)", vals)
+	}
+	got := run(QPodInfo, 7, 9)
+	require.Len(t, got, 1)
+	assert.InDelta(t, 7.0, float64(got[0].Value), 0, "other families: the first backend still wins")
 }
 
 // The merged result must be a pure function of the value sets, never of which
@@ -160,11 +219,11 @@ func TestFanout_DuplicateWinnerIndependentOfArrivalOrder(t *testing.T) {
 }
 
 func TestMergeVectors_EmptyInputs(t *testing.T) {
-	got, conflicts := mergeVectors(nil)
+	got, conflicts := mergeVectors(nil, false)
 	assert.Empty(t, got)
 	assert.Zero(t, conflicts)
 
-	got, _ = mergeVectors([]model.Vector{{}, nil, {}})
+	got, _ = mergeVectors([]model.Vector{{}, nil, {}}, false)
 	assert.Empty(t, got)
 	assert.NotNil(t, got, "an empty merge is an empty vector, never nil")
 }

@@ -138,14 +138,18 @@ func TestBuildStorage_HubMatchesThePreChangeReadAcrossZones(t *testing.T) {
 		cytoscape.Serialise(gHub, graph.ProjectStorage(gHub, scope)))
 }
 
+// hubAlertSeen is the last-sample Unix timestamp the hub ALERTS fixtures carry:
+// the build's own end, so it lies inside the window and resolves.
+var hubAlertSeen = vlrEnd.Unix()
+
 // ALERTS follows the same rule: zone-b's alert store is never asked, and a
 // zone-b alert that sits in zone-a's store is excluded by the az matcher, so
 // the rooted aggregate's status folds from the zone-a alert alone.
 func TestBuildStorage_HubAlertsStayInTheRequestZone(t *testing.T) {
 	k8sA, k8sB, netappA, netappB := hubZonesStores()
 	alert := func(name, severity, az string) *model.Sample {
-		return planHarvest("alertname", name, "alertstate", graph.AlertStateFiring, "severity", severity,
-			"az", az, "env", "prod", "cluster", "ontap-prod", "aggr", "aggr1")
+		return withValue(planHarvest("alertname", name, "alertstate", graph.AlertStateFiring, "severity", severity,
+			"az", az, "env", "prod", "cluster", "ontap-prod", "aggr", "aggr1"), float64(hubAlertSeen))
 	}
 	k8sA[promql.QAlerts] = model.Vector{alert("AggrFillingA", "warning", "zone-a"), alert("Misfiled", "critical", "zone-b")}
 	k8sB[promql.QAlerts] = model.Vector{alert("AggrFillingB", "critical", "zone-b")}
@@ -159,7 +163,7 @@ func TestBuildStorage_HubAlertsStayInTheRequestZone(t *testing.T) {
 	aggr, ok := g.NodesByID[graph.NetAppAggrID("ontap-prod", "aggr1")]
 	require.True(t, ok)
 	assert.Equal(t,
-		[]graph.Alert{{Name: "AggrFillingA", State: graph.AlertStateFiring, Severity: "warning"}},
+		[]graph.Alert{{Name: "AggrFillingA", State: graph.AlertStateFiring, Severity: "warning", Time: time.Unix(hubAlertSeen, 0).UTC()}},
 		aggr.Alerts())
 	assert.Equal(t, graph.StatusWarning, aggr.Status())
 }

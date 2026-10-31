@@ -3,6 +3,7 @@ package graph
 import (
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -54,6 +55,19 @@ func TestFoldStatus_AlertOrderDoesNotMatter(t *testing.T) {
 		})
 		assert.Equal(t, want, FoldStatus(shuffled, "", ""))
 	}
+}
+
+// An alert's last-seen time is not a status input: severity alone folds. A
+// critical alert last seen long before the window's end, and one whose time did
+// not resolve, both still fold to critical.
+func TestFoldStatus_IgnoresAlertTime(t *testing.T) {
+	old := Alert{Name: "A", State: AlertStateFiring, Severity: "critical", Time: time.Unix(1, 0)}
+	unresolved := Alert{Name: "A", State: AlertStateFiring, Severity: "critical"}
+	assert.Equal(t, StatusCritical, FoldStatus([]Alert{old}, "", ""))
+	assert.Equal(t, StatusCritical, FoldStatus([]Alert{unresolved}, "", ""))
+	assert.Equal(t,
+		FoldStatus([]Alert{{Severity: "warning", Time: time.Unix(1761897720, 0)}}, "", ""),
+		FoldStatus([]Alert{{Severity: "warning"}}, "", ""))
 }
 
 func TestGraphNodeStatusAccessors(t *testing.T) {

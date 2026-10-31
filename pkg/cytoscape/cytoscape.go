@@ -100,10 +100,14 @@ type PerfDTO struct {
 }
 
 // AlertDTO is the wire form of graph.Alert. Severity is omitted when empty.
+// Time is the Unix epoch second of the alert's last firing sample inside the
+// request window (not its activation time), an integer, omitted when it did
+// not resolve.
 type AlertDTO struct {
 	Name     string `json:"name"`
 	State    string `json:"state"`
 	Severity string `json:"severity,omitempty"`
+	Time     int64  `json:"time,omitempty"`
 }
 
 // UsageDTO is the wire form of graph.UsageBytes. Either field may be omitted.
@@ -295,7 +299,11 @@ func alertsDTO(alerts []graph.Alert) []AlertDTO {
 	}
 	out := make([]AlertDTO, len(alerts))
 	for i, a := range alerts {
-		out[i] = AlertDTO{Name: a.Name, State: a.State, Severity: a.Severity}
+		dto := AlertDTO{Name: a.Name, State: a.State, Severity: a.Severity}
+		if !a.Time.IsZero() {
+			dto.Time = a.Time.Unix()
+		}
+		out[i] = dto
 	}
 	return out
 }

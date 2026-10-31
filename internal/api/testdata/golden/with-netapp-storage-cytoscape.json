@@ -40,7 +40,8 @@
             {
               "name": "KubePodCrashLooping",
               "state": "firing",
-              "severity": "warning"
+              "severity": "warning",
+              "time": 1761897720
             }
           ],
           "status": "warning",
@@ -60,7 +61,8 @@
             {
               "name": "KubeNodeNotReady",
               "state": "firing",
-              "severity": "critical"
+              "severity": "critical",
+              "time": 1761897720
             }
           ],
           "status": "critical",
@@ -85,7 +87,8 @@
             {
               "name": "PVCAlmostFull",
               "state": "firing",
-              "severity": "warning"
+              "severity": "warning",
+              "time": 1761897720
             }
           ],
           "status": "warning",
@@ -127,7 +130,8 @@
             {
               "name": "AggrSpaceLow",
               "state": "firing",
-              "severity": "warning"
+              "severity": "warning",
+              "time": 1761897720
             }
           ],
           "status": "warning",
@@ -160,7 +164,8 @@
             {
               "name": "NodeCPUBusy",
               "state": "firing",
-              "severity": "critical"
+              "severity": "critical",
+              "time": 1761897720
             }
           ],
           "status": "critical",

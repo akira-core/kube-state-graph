@@ -1,22 +1,39 @@
 package build
 
 import (
+	"context"
 	"errors"
+	"math"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/promql"
+	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
 // alertSample builds one ALERTS series. Every case here carries
 // alertstate="firing": the query's fixed selector means a `pending` series
 // never reaches the reader, so a fixture producing one would be testing a
 // state the resolver cannot observe.
+//
+// Its value is 0, which the reader resolves to "no last-seen time", so the
+// matching cases compare entries without a time. alertSampleAt carries one.
 func alertSample(name, severity string, labels map[string]string) model.Sample {
+	return alertSampleAt(name, severity, labels, 0)
+}
+
+// alertSampleAt is alertSample with an explicit value — the series' last-sample
+// Unix timestamp, as tlast_over_time returns it.
+func alertSampleAt(name, severity string, labels map[string]string, value float64) model.Sample {
 	m := model.Metric{
 		"alertname":  model.LabelValue(name),
 		"alertstate": model.LabelValue(graph.AlertStateFiring),
@@ -27,7 +44,7 @@ func alertSample(name, severity string, labels map[string]string) model.Sample {
 	for k, v := range labels {
 		m[model.LabelName(k)] = model.LabelValue(v)
 	}
-	return model.Sample{Metric: m, Value: 1}
+	return model.Sample{Metric: m, Value: model.SampleValue(value)}
 }
 
 // alertEstate is the node set every matching case resolves against: one pod,
@@ -88,7 +105,7 @@ func resolveOver(t *testing.T, nodes []graph.GraphNode, samples ...model.Sample)
 func resolveZoned(nodes []graph.GraphNode, r *clusterResolver, ontapZones map[string][]zone,
 	samples ...model.Sample,
 ) (map[string][]graph.Alert, int, int) {
-	return resolveAlerts(sampleVec(samples...), newAlertIndex(nodes, r, ontapZones), r)
+	return resolveAlerts(sampleVec(samples...), newAlertIndex(nodes, r, ontapZones), r, alertWindow{})
 }
 
 // --- kind 1: pods ---------------------------------------------------------
@@ -106,6 +123,97 @@ func TestResolveAlerts_PodAttached(t *testing.T) {
 			{Name: "KubePodCrashLooping", State: graph.AlertStateFiring, Severity: "warning"},
 		},
 	}, byNode, "the alert attaches to the pod and to no other node")
+}
+
+// The series value is the last-sample Unix timestamp; the entry carries it
+// truncated to a whole second. A value that is not a usable timestamp (zero,
+// negative, NaN, infinite) leaves the time unresolved but never drops the alert.
+func TestResolveAlerts_TimeFromSeriesValue(t *testing.T) {
+	labels := map[string]string{"cluster": "c1", "namespace": "shop", "pod": "orders-0"}
+	podID := graph.PodID("zone-a-prod-c1", "uid-1")
+
+	tests := []struct {
+		name  string
+		value float64
+		want  time.Time
+	}{
+		{"whole second", 1761897720, time.Unix(1761897720, 0)},
+		{"fraction is truncated", 1761897720.9, time.Unix(1761897720, 0)},
+		{"zero", 0, time.Time{}},
+		{"negative", -5, time.Time{}},
+		{"NaN", math.NaN(), time.Time{}},
+		{"+Inf", math.Inf(1), time.Time{}},
+		{"-Inf", math.Inf(-1), time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			byNode, unmatched, ambiguous := resolveOver(t, alertEstate(),
+				alertSampleAt("KubePodCrashLooping", "warning", labels, tt.value))
+
+			assert.Zero(t, unmatched)
+			assert.Zero(t, ambiguous)
+			require.Len(t, byNode[podID], 1, "the alert is attached whether or not its time resolved")
+			assert.True(t, tt.want.Equal(byNode[podID][0].Time), "time = %v, want %v", byNode[podID][0].Time, tt.want)
+		})
+	}
+}
+
+// Two series differing only in a label the matcher never reads collapse to one
+// entry carrying the LARGER time, whichever arrived first.
+func TestResolveAlerts_CollapsedSeriesKeepLatestTime(t *testing.T) {
+	podID := graph.PodID("zone-a-prod-c1", "uid-1")
+	mk := func(instance string, value float64) model.Sample {
+		return alertSampleAt("KubePodCrashLooping", "warning", map[string]string{
+			"cluster": "c1", "namespace": "shop", "pod": "orders-0", "instance": instance,
+		}, value)
+	}
+	want := time.Unix(1761897720, 0)
+
+	for name, samples := range map[string][]model.Sample{
+		"later last":  {mk("a", 1761897600), mk("b", 1761897720)},
+		"later first": {mk("b", 1761897720), mk("a", 1761897600)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			byNode, _, _ := resolveOver(t, alertEstate(), samples...)
+			require.Len(t, byNode[podID], 1)
+			assert.True(t, want.Equal(byNode[podID][0].Time))
+		})
+	}
+}
+
+// With the build window known, a value whose whole second lies outside
+// [start, end] is no last-sample time of THIS window — the portable fallback's
+// constant 1 is the case that matters — so it resolves to no time. Both ends
+// are inclusive. The alert itself is attached either way.
+func TestResolveAlerts_TimeOutsideWindowIsUnresolved(t *testing.T) {
+	labels := map[string]string{"cluster": "c1", "namespace": "shop", "pod": "orders-0"}
+	podID := graph.PodID("zone-a-prod-c1", "uid-1")
+	end := time.Unix(1761897720, 0).UTC()
+	win := alertWindow{start: end.Add(-time.Hour), end: end}
+
+	tests := []struct {
+		name  string
+		value float64
+		want  time.Time
+	}{
+		{"inside", 1761897600, time.Unix(1761897600, 0)},
+		{"at end", 1761897720, end},
+		{"at start", float64(end.Add(-time.Hour).Unix()), end.Add(-time.Hour)},
+		{"fraction past end truncates into it", 1761897720.5, end},
+		{"before start", float64(end.Add(-time.Hour).Unix() - 1), time.Time{}},
+		{"after end", 1761897721, time.Time{}},
+		{"portable constant 1", 1, time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := identityResolver(t)
+			byNode, _, _ := resolveAlerts(
+				sampleVec(alertSampleAt("KubePodCrashLooping", "warning", labels, tt.value)),
+				newAlertIndex(alertEstate(), r, nil), r, win)
+			require.Len(t, byNode[podID], 1, "the alert is attached whether or not its time resolved")
+			assert.True(t, tt.want.Equal(byNode[podID][0].Time), "time = %v, want %v", byNode[podID][0].Time, tt.want)
+		})
+	}
 }
 
 // The kind precedence: an alert naming BOTH a pod and the node it runs on is
@@ -214,7 +322,7 @@ func TestResolveAlerts_NodeShapedAmbiguousAcrossKinds(t *testing.T) {
 	// Kubernetes side and equals the ONTAP cluster name on the other.
 	byNode, unmatched, ambiguous := resolveAlerts(
 		sampleVec(alertSample("Something", "warning", map[string]string{"cluster": "x", "node": "n1"})),
-		newAlertIndex(nodes, nil, nil), newClusterResolver(promql.LabelKeys{}))
+		newAlertIndex(nodes, nil, nil), newClusterResolver(promql.LabelKeys{}), alertWindow{})
 
 	assert.Empty(t, byNode, "attached to neither kind")
 	assert.Zero(t, unmatched, "an ambiguous alert is counted ambiguous, not unmatched")
@@ -424,7 +532,7 @@ func TestResolveAlerts_SynthPodContributesNothing(t *testing.T) {
 }
 
 func TestResolveAlerts_EmptyVector(t *testing.T) {
-	byNode, unmatched, ambiguous := resolveAlerts(nil, newAlertIndex(alertEstate(), nil, nil), nil)
+	byNode, unmatched, ambiguous := resolveAlerts(nil, newAlertIndex(alertEstate(), nil, nil), nil, alertWindow{})
 	assert.Nil(t, byNode)
 	assert.Zero(t, unmatched)
 	assert.Zero(t, ambiguous)
@@ -748,4 +856,100 @@ func TestReadTopology_AlertsVectorCarriedRaw(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, vec, tp.Alerts)
 	assert.Equal(t, 1, tp.RawSeriesCount[string(promql.QAlerts)])
+}
+
+// --- portable fallback ----------------------------------------------------
+
+// fallbackEnd is a realistic build instant: the portable read's constant 1 lies
+// far outside any window ending here, which is what leaves its alerts untimed.
+var fallbackEnd = time.Unix(1761897720, 0).UTC()
+
+// alertsLegQuerier answers the ALERTS leg with tlastErr for the tlast_over_time
+// read and with one firing pod alert (value 1, as last_over_time returns) for
+// the portable read, recording every ALERTS query string it was asked. Every
+// other leg returns one pod for the alert to attach to, or nothing.
+func alertsLegQuerier(t *testing.T, tlastErr error) (*promqlmocks.MockQuerier, func() []string) {
+	t.Helper()
+	var (
+		mu     sync.Mutex
+		issued []string
+	)
+	pod := sampleVec(model.Sample{Metric: model.Metric{
+		"cluster": "c", "namespace": "shop", "pod": "orders-0", "uid": "u1", "node": "w0",
+	}, Value: 1})
+	portable := sampleVec(alertSampleAt("PodWarning", "warning", map[string]string{
+		"cluster": "c", "namespace": "shop", "pod": "orders-0",
+	}, 1))
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, name, query string, _ time.Time) (model.Vector, error) {
+			switch name {
+			case string(promql.QAlerts):
+				mu.Lock()
+				issued = append(issued, query)
+				mu.Unlock()
+				if strings.HasPrefix(query, "tlast_over_time(") {
+					return nil, tlastErr
+				}
+				return portable, nil
+			case string(promql.QPodInfo):
+				return pod, nil
+			}
+			return model.Vector{}, nil
+		}).Maybe()
+	return q, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), issued...)
+	}
+}
+
+// A store that rejects tlast_over_time as an invalid query (a plain Prometheus)
+// is asked once more with the portable read: the alert attaches and still
+// colours the node, and only its time is absent.
+func TestBuild_AlertsFallBackToPortableReadOnBadQuery(t *testing.T) {
+	bad := &v1.Error{Type: v1.ErrBadData, Msg: `unknown function with name "tlast_over_time"`}
+	q, issued := alertsLegQuerier(t, bad)
+
+	g, err := New(q, Options{}, nil, nil).Build(t.Context(), time.Minute, fallbackEnd, promql.Selector{})
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		`tlast_over_time(ALERTS{alertstate="firing"}[1m])`,
+		`last_over_time(ALERTS{alertstate="firing"}[1m])`,
+	}, issued(), "one rejected read, then exactly one portable read under the same name")
+
+	pod := g.NodesByID[graph.PodID("c", "u1")]
+	require.NotNil(t, pod)
+	require.Len(t, pod.Alerts(), 1)
+	assert.Equal(t, "PodWarning", pod.Alerts()[0].Name)
+	assert.True(t, pod.Alerts()[0].Time.IsZero(), "the portable value 1 is outside the window: no time")
+	assert.Equal(t, graph.StatusWarning, pod.Status(), "the alert still feeds the status fold")
+}
+
+// Any other error is not a reason to ask again: a store that is down would
+// otherwise cost two timeouts per build. The leg degrades as before.
+func TestBuild_AlertsNoFallbackOnTransportError(t *testing.T) {
+	q, issued := alertsLegQuerier(t, errors.New("dial tcp 10.0.0.1:8428: connect: connection refused"))
+
+	g, err := New(q, Options{}, nil, nil).Build(t.Context(), time.Minute, fallbackEnd, promql.Selector{})
+	require.NoError(t, err)
+
+	assert.Len(t, issued(), 1, "no portable retry")
+	pod := g.NodesByID[graph.PodID("c", "u1")]
+	require.NotNil(t, pod)
+	assert.Nil(t, pod.Alerts())
+}
+
+// The caller going away still fails the build, before any retry is considered.
+func TestReadTopology_AlertsFallbackNeverMasksCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	q, issued := alertsLegQuerier(t, context.Canceled)
+
+	_, err := ReadTopology(ctx, q, time.Minute, fallbackEnd, Options{}, promql.Selector{})
+	require.ErrorIs(t, err, context.Canceled)
+	for _, s := range issued() {
+		assert.False(t, strings.HasPrefix(s, "last_over_time("), "no portable retry after cancellation: %s", s)
+	}
 }
