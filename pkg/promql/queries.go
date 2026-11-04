@@ -173,11 +173,14 @@ const (
 
 	// NetApp Harvest QoS workload I/O (hop B of the storage join). Harvest has
 	// already resolved ONTAP base counters — ops are per-second, latency is an
-	// average in microseconds, data is bytes per second — so these are read
-	// verbatim via last_over_time, NEVER wrapped in rate(). Read at volume
-	// granularity only (see qosVolumeGranularitySelector). OPTIONAL and
-	// independent of the topology source: a miss leaves the claim's edge in
-	// place carrying no metrics at all.
+	// average in microseconds, data is bytes per second — so a rollup reduces
+	// those resolved values and the query is NEVER wrapped in rate(). The
+	// build renders each series through RenderQoSVolumeScopedRollup, per
+	// series, as last_over_time, max_over_time or avg_over_time. /v1/graph
+	// always selects last. The unscoped Render arm below stays last_over_time
+	// and is not the build path. Volume granularity is the reader's rule, not
+	// a matcher. OPTIONAL and independent of the topology source: a miss
+	// leaves the claim's edge in place carrying no metrics at all.
 	QQoSReadOps      Query = "qos_read_ops"
 	QQoSWriteOps     Query = "qos_write_ops"
 	QQoSReadLatency  Query = "qos_read_latency"
@@ -194,8 +197,9 @@ const (
 	QQoSPolicyFixedMaxIOPS Query = "qos_policy_fixed_max_throughput_iops"
 	QQoSPolicyFixedMaxMBps Query = "qos_policy_fixed_max_throughput_mbps"
 
-	// NetApp Harvest aggregate + controller gauges. Same last_over_time
-	// verbatim read; OPTIONAL; log-and-continue on query error.
+	// NetApp Harvest aggregate + controller gauges. Read verbatim via
+	// last_over_time on every build (never the QoS rollup); OPTIONAL;
+	// log-and-continue on query error.
 	QAggrStatus       Query = "aggr_new_status"
 	QAggrSpaceUsed    Query = "aggr_space_used"
 	QAggrSpaceTotal   Query = "aggr_space_total"
@@ -216,8 +220,9 @@ const (
 	// `total_data`). Harvest has already resolved the ONTAP base counters —
 	// cpu_busy is a percent, total_ops per-second, total_latency an average in
 	// microseconds, total_data bytes per second — so these are read VERBATIM
-	// via last_over_time, NEVER wrapped in rate(), exactly like the QoS
-	// workload families. They feed the netapp-node `data.perf` attribute and
+	// via last_over_time, NEVER wrapped in rate(). They stay on last_over_time
+	// on every build; only the six QoS workload queries take the rollup. These
+	// counters feed the netapp-node `data.perf` attribute and
 	// are NEVER turned into a health verdict: thresholds are model- and
 	// estate-specific and belong in the operator's alert rules, whose verdicts
 	// reach the node through the alert overlay (QAlerts). Each leg is
@@ -838,13 +843,12 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 	case QVolumeLabels:
 		return fmt.Sprintf(`last_over_time(volume_labels%s[%s])`, fx, w)
 	case QQoSReadOps, QQoSWriteOps, QQoSReadLatency, QQoSWriteLatency, QQoSReadData, QQoSWriteData:
-		// Volume-granularity restriction: ONTAP collects a
-		// workload per LUN as well as per volume, and a LUN workload carries
-		// the `volume` of its containing FlexVol — an unrestricted read would
-		// sum LUN traffic on top of volume traffic for the same claim. This is
-		// a fixed,
-		// request-invariant metric-selection contract (same class as the
-		// service-graph sentinel matcher and condition="Ready"), NOT a caller filter.
+		// Unscoped Render only, so this arm stays last_over_time and
+		// render-baseline.txt does not move. The build path is
+		// RenderQoSVolumeScopedRollup, which selects last_over_time,
+		// max_over_time or avg_over_time per series. Volume granularity is
+		// the reader's rule: a LUN workload carries its FlexVol's `volume`,
+		// and no matcher here drops it.
 		return fmt.Sprintf(`last_over_time(%s%s[%s])`, q, fx, w)
 	case QQoSPolicyFixedMaxIOPS:
 		return fmt.Sprintf(`last_over_time(qos_policy_fixed_max_throughput_iops%s[%s])`, fx, w)

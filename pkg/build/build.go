@@ -261,7 +261,32 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 // replace them with storage-flow until the next /v1/graph request, making the
 // gauges a function of request mix rather than of the estate.
 func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots) (*graph.Graph, error) {
-	return b.buildStorage(ctx, window, end, sel, storagePlan(roots))
+	return b.BuildStorageWith(ctx, window, end, sel, roots, StorageOptions{})
+}
+
+// StorageOptions carries the choices a storage build takes beyond the
+// request's roots and selector. The zero value is the build BuildStorage
+// runs: each QoS series reduced with last_over_time.
+type StorageOptions struct {
+	// IORollup reduces each of the six QoS workload series over the window
+	// before the reader sums. The zero value and RollupLast are last_over_time.
+	// RollupMax is that series' own peak. RollupAvg is the unweighted mean of
+	// the samples the series has. Ceilings and every other family stay
+	// last_over_time. An invalid value is ReasonInvalidScope and issues no query.
+	IORollup promql.Rollup
+}
+
+// BuildStorageWith is BuildStorage with an explicit rollup. It rejects a
+// rollup Valid does not accept before the plan is prepared and before a
+// querier is bound, and it does not coerce that value to last.
+func (b *Builder) BuildStorageWith(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots, opts StorageOptions) (*graph.Graph, error) {
+	if !opts.IORollup.Valid() {
+		return nil, NewError(ReasonInvalidScope,
+			promql.InvalidRollupMessage("io_rollup", string(opts.IORollup)), nil)
+	}
+	plan := storagePlan(roots)
+	plan.ioRollup = opts.IORollup
+	return b.buildStorage(ctx, window, end, sel, plan)
 }
 
 // buildStorage is BuildStorage under an explicit read plan.

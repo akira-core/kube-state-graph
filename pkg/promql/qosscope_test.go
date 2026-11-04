@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +113,96 @@ func TestChunkQoSVolumeScope(t *testing.T) {
 	t.Run("a non-positive budget is one chunk, never zero chunks", func(t *testing.T) {
 		assert.Equal(t, [][]string{{"a", "b"}}, ChunkQoSVolumeScope([]string{"a", "b"}, 0))
 	})
+}
+
+func TestRenderQoSVolumeScopedRollup(t *testing.T) {
+	t.Parallel()
+
+	const matcher = `{volume=~"v_a|v_b"}[5m]`
+	volumes := []string{"v_b", "v_a"}
+	window := 5 * time.Minute
+
+	t.Run("each rollup changes only the function name", func(t *testing.T) {
+		t.Parallel()
+		last, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, window, LabelKeys{}, Selector{}, volumes, RollupLast)
+		require.True(t, ok)
+		maxR, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, window, LabelKeys{}, Selector{}, volumes, RollupMax)
+		require.True(t, ok)
+		avg, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, window, LabelKeys{}, Selector{}, volumes, RollupAvg)
+		require.True(t, ok)
+		zero, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, window, LabelKeys{}, Selector{}, volumes, "")
+		require.True(t, ok)
+
+		assert.Equal(t, `last_over_time(qos_read_ops`+matcher+`)`, last)
+		assert.Equal(t, `max_over_time(qos_read_ops`+matcher+`)`, maxR)
+		assert.Equal(t, `avg_over_time(qos_read_ops`+matcher+`)`, avg)
+		assert.Equal(t, last, zero, "the zero rollup renders last")
+		assert.Equal(t, trimRollupFunc(last), trimRollupFunc(maxR))
+		assert.Equal(t, trimRollupFunc(last), trimRollupFunc(avg))
+	})
+
+	t.Run("every workload family keeps the same matcher and window", func(t *testing.T) {
+		t.Parallel()
+		for _, q := range QoSWorkloadQueries {
+			for _, roll := range []Rollup{"", RollupLast, RollupMax, RollupAvg} {
+				got, ok := RenderQoSVolumeScopedRollup(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"}, roll)
+				require.True(t, ok, "%s %q", q, roll)
+				assert.Equal(t, roll.rangeFunc()+`(`+string(q)+`{volume="v"}[1m])`, got)
+			}
+		}
+	})
+
+	t.Run("a non-QoS query renders nothing", func(t *testing.T) {
+		t.Parallel()
+		for _, q := range []Query{QVolumeLabels, QQoSPolicyFixedMaxIOPS, QAggrStatus, QPodInfo} {
+			for _, roll := range []Rollup{"", RollupLast, RollupMax, RollupAvg} {
+				got, ok := RenderQoSVolumeScopedRollup(q, time.Minute, LabelKeys{}, Selector{}, []string{"v"}, roll)
+				assert.False(t, ok, string(q))
+				assert.Empty(t, got)
+			}
+		}
+	})
+
+	t.Run("an empty scope renders nothing", func(t *testing.T) {
+		t.Parallel()
+		for _, roll := range []Rollup{"", RollupMax, RollupAvg} {
+			got, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, nil, roll)
+			assert.False(t, ok)
+			assert.Empty(t, got)
+			got, ok = RenderQoSVolumeScopedRollup(QQoSReadOps, time.Minute, LabelKeys{}, Selector{}, []string{"", ""}, roll)
+			assert.False(t, ok)
+			assert.Empty(t, got)
+		}
+	})
+
+	t.Run("RenderQoSVolumeScoped matches the last rollup byte for byte", func(t *testing.T) {
+		t.Parallel()
+		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
+		keys := LabelKeys{AZ: "zone", Env: "stage"}
+		sets := [][]string{
+			{"trident_pvc_b", "trident_pvc_a"},
+			{"v_a", "", "v_a"},
+			nil,
+			{"", ""},
+		}
+		for _, q := range append(append([]Query{}, QoSWorkloadQueries...), QVolumeLabels, QPodInfo) {
+			for _, vols := range sets {
+				want, wantOK := RenderQoSVolumeScoped(q, window, keys, sel, vols)
+				for _, roll := range []Rollup{"", RollupLast} {
+					got, ok := RenderQoSVolumeScopedRollup(q, window, keys, sel, vols, roll)
+					assert.Equal(t, wantOK, ok, "%s %q", q, roll)
+					assert.Equal(t, want, got, "%s %q", q, roll)
+				}
+			}
+		}
+	})
+}
+
+// trimRollupFunc drops the range-function name so two renders can be compared
+// on matcher and window alone.
+func trimRollupFunc(q string) string {
+	_, rest, _ := strings.Cut(q, "(")
+	return rest
 }
 
 // The scoped renderer is an ADDITIONAL entry point: Render's own output for the

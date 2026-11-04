@@ -1,6 +1,7 @@
 package kubegraph_test
 
 import (
+	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/akira-core/kube-state-graph/pkg/graph"
 	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
 func storageBase() url.Values {
@@ -297,4 +299,86 @@ func TestParseStorageValues_SlashIsNotQualifyingOtherKinds(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a/b"}, req.Scope.Roots.Names)
 	assert.Empty(t, req.Scope.Roots.Qualified)
+}
+
+func TestParseStorageValues_IORollup(t *testing.T) {
+	withRollup := func(values ...string) url.Values {
+		v := storageBase()
+		v.Set("aggr", "aggr1")
+		v["io_rollup"] = values
+		return v
+	}
+
+	t.Run("absent is last", func(t *testing.T) {
+		v := storageBase()
+		v.Set("aggr", "aggr1")
+		req, err := kubegraph.ParseStorageValues(v)
+		require.NoError(t, err)
+		assert.Equal(t, promql.RollupLast, req.IORollup)
+	})
+
+	t.Run("empty is last", func(t *testing.T) {
+		req, err := kubegraph.ParseStorageValues(withRollup(""))
+		require.NoError(t, err)
+		assert.Equal(t, promql.RollupLast, req.IORollup)
+	})
+
+	for _, raw := range []promql.Rollup{promql.RollupLast, promql.RollupMax, promql.RollupAvg} {
+		t.Run(string(raw), func(t *testing.T) {
+			req, err := kubegraph.ParseStorageValues(withRollup(string(raw)))
+			require.NoError(t, err)
+			assert.Equal(t, raw, req.IORollup)
+		})
+	}
+
+	t.Run("repeated max dedupes", func(t *testing.T) {
+		req, err := kubegraph.ParseStorageValues(withRollup("max", "max"))
+		require.NoError(t, err)
+		assert.Equal(t, promql.RollupMax, req.IORollup)
+	})
+
+	t.Run("empty then max is max", func(t *testing.T) {
+		req, err := kubegraph.ParseStorageValues(withRollup("", "max"))
+		require.NoError(t, err)
+		assert.Equal(t, promql.RollupMax, req.IORollup)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+	}{
+		{"two distinct values", []string{"max", "avg"}},
+		{"p99", []string{"p99"}},
+		{"MAX", []string{"MAX"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := kubegraph.ParseStorageValues(withRollup(tc.values...))
+			pe, ok := errors.AsType[*kubegraph.ParseError](err)
+			require.True(t, ok)
+			assert.Equal(t, "invalid_scope", pe.Reason)
+			assert.Contains(t, pe.Message, "io_rollup")
+			assert.Contains(t, pe.Message, "last, max, avg")
+		})
+	}
+
+	t.Run("a hostile value is rejected without being echoed", func(t *testing.T) {
+		long := strings.Repeat("x", 1<<16)
+		for _, raw := range []string{long, "max\n", "\xffmax"} {
+			_, err := kubegraph.ParseStorageValues(withRollup(raw))
+			pe, ok := errors.AsType[*kubegraph.ParseError](err)
+			require.True(t, ok, "value %q", raw)
+			assert.Equal(t, "invalid_scope", pe.Reason)
+			assert.Contains(t, pe.Message, "io_rollup")
+			assert.NotContains(t, pe.Message, raw)
+		}
+	})
+
+	t.Run("no root beats an invalid rollup", func(t *testing.T) {
+		v := storageBase()
+		v.Set("io_rollup", "p99")
+		_, err := kubegraph.ParseStorageValues(v)
+		pe, ok := errors.AsType[*kubegraph.ParseError](err)
+		require.True(t, ok)
+		assert.Equal(t, "missing_root", pe.Reason)
+	})
 }

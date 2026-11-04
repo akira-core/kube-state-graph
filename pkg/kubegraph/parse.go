@@ -95,13 +95,17 @@ func ParseValues(v url.Values) (Request, error) {
 }
 
 // StorageRequest is the parsed /v1/storage-graph request: a build window, the
-// upstream selector (az and env required, each one or more values), and the
-// storage projection scope.
+// upstream selector (az and env required, each one or more values), the
+// storage projection scope, and the QoS rollup.
 type StorageRequest struct {
 	Start    time.Time
 	End      time.Time
 	Scope    graph.StorageScope
 	Selector promql.Selector
+	// IORollup reduces each of the six QoS workload series over the window.
+	// Absent and empty values are RollupLast. The field is never the zero
+	// Rollup: ParseStorageValues always sets one of the three constants.
+	IORollup promql.Rollup
 }
 
 // ParseStorageValues parses the /v1/storage-graph query parameters. It shares
@@ -109,6 +113,8 @@ type StorageRequest struct {
 // endpoints cannot drift on those contracts. az and env are required and
 // repeatable — the selected zones are their Cartesian product; `prune` and
 // every unknown parameter — including the withdrawn `edge_type` — are ignored.
+// `io_rollup` is read after the root, so a missing root wins over an invalid
+// rollup. An absent or empty value is last.
 func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	var req StorageRequest
 
@@ -145,6 +151,11 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, &ParseError{"invalid_scope", serr.Error()}
 	}
 	req.Scope = scope
+	ioRollup, err := parseIORollup(v["io_rollup"])
+	if err != nil {
+		return req, err
+	}
+	req.IORollup = ioRollup
 	req.Selector = promql.Selector{
 		AZ:        az,
 		Env:       env,
@@ -152,6 +163,35 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		Namespace: v["namespace"],
 	}
 	return req, nil
+}
+
+// parseIORollup reads the optional io_rollup parameter. Empty values are
+// dropped and the rest are sorted and de-duplicated, so the order a client
+// repeats them in never changes the result. No remaining value is last. One
+// value must be last, max or avg. Two distinct values, or a value ParseRollup
+// rejects, is invalid_scope and names the accepted values. Each value is
+// bounded by validateSelectorValues first, so the rejection never echoes an
+// arbitrarily long or control-character-laden value back to the client.
+func parseIORollup(values []string) (promql.Rollup, error) {
+	if err := validateSelectorValues("io_rollup", values); err != nil {
+		return "", err
+	}
+	got := nonEmptySorted(values)
+	invalid := func(raw string) error {
+		return &ParseError{"invalid_scope", promql.InvalidRollupMessage("io_rollup", raw)}
+	}
+	switch len(got) {
+	case 0:
+		return promql.RollupLast, nil
+	case 1:
+		roll, err := promql.ParseRollup(got[0])
+		if err != nil {
+			return "", invalid(got[0])
+		}
+		return roll, nil
+	default:
+		return "", invalid(strings.Join(got, ","))
+	}
 }
 
 // K8sRequest is the parsed /v1/k8s-graph request: a build window, the upstream
@@ -293,17 +333,24 @@ func parseWindow(v url.Values) (start, end time.Time, err error) {
 // missing_<param> (the message names the parameter so a client can tell az from
 // env).
 func atLeastOne(param string, values []string) ([]string, error) {
+	got := nonEmptySorted(values)
+	if len(got) == 0 {
+		return nil, &ParseError{"missing_" + param, param + " query parameter is required"}
+	}
+	return got, nil
+}
+
+// nonEmptySorted returns the non-empty values, sorted and de-duplicated, in a
+// new slice (the caller's url.Values is never reordered).
+func nonEmptySorted(values []string) []string {
 	got := make([]string, 0, len(values))
 	for _, v := range values {
 		if v != "" {
 			got = append(got, v)
 		}
 	}
-	if len(got) == 0 {
-		return nil, &ParseError{"missing_" + param, param + " query parameter is required"}
-	}
 	slices.Sort(got)
-	return slices.Compact(got), nil
+	return slices.Compact(got)
 }
 
 // parsePrune reads the single-valued `prune` parameter. Absent ⇒ true (the

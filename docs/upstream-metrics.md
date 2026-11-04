@@ -81,7 +81,8 @@ v1 has no result cache: this fan-out runs on every request.
 
 | Family | PromQL wrapper |
 |---|---|
-| kube-state-metrics, Harvest, kubelet | `last_over_time(<metric>[<window>])` evaluated at `end` |
+| kube-state-metrics, Harvest other than the six QoS workload families below, kubelet | `last_over_time(<metric>[<window>])` evaluated at `end` |
+| six `qos_{read,write}_{ops,latency,data}` | `<rollup>_over_time(<metric>{volume=~"…"}[<window>])` on `/v1/storage-graph` (`last_over_time`, `max_over_time` or `avg_over_time`). `/v1/graph` always renders `last_over_time`. See [io_rollup](#io_rollup) |
 | `kube_pod_container_info` only | `tlast_over_time(...)` so each per-image series carries its last-sample timestamp |
 | application metadata (`app_metadata`) | `tlast_over_time(<configured metric>{…}[<window>])`. The logical query name stays `app_metadata`; the configured metric name is never a self-metric label |
 | `traces_service_graph_*` | `rate(<metric>[<window>])` evaluated at `end` |
@@ -167,8 +168,9 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                  therefore unreachable on this endpoint
               ── wave 4 (QoS), gated on kube_persistentvolumeclaim_info
                  and volume_labels ────────────────────────────────────────
-               6 Harvest QoS workload legs, scoped exactly as for /v1/graph;
-                 a chunk error FAILS the build
+               6 Harvest QoS workload legs, volume scope exactly as for
+                 /v1/graph, range function from io_rollup (/v1/graph is
+                 always last_over_time); a chunk error FAILS the build
 ```
 
 Every storage build is a seed plus an expansion. The claim families are read
@@ -631,12 +633,12 @@ names hop A matched. See
 | Metric | Hop | Graph role | Empty / miss |
 |---|---|---|---|
 | `volume_labels` | A — topology | Sole source of the storage *shape*: `pvc-to-netapp-aggr`, `netapp-aggr` / `netapp-node`, PVC `labels.svm`. Info series: sample **value discarded**, labels only (`cluster`, `node`, `aggr`, `svm`, `volume`). Read UNFILTERED — the interesting FlexVol names are not known until it has been read — except by a `/v1/storage-graph` request rooted at `ontap_cluster=` / `aggr=`, which reads it restricted to those components and then re-reads it for the matched claims' tokens | No NetApp nodes, edges, or `svm`, and no QoS query is issued at all |
-| `qos_read_ops` | B — I/O | `data.metrics.read_ops` (ops/s, verbatim — never `rate()`) | Edge kept, no I/O fields |
-| `qos_write_ops` | B | `write_ops` | same |
-| `qos_read_latency` | B | `read_latency_us` (average µs, verbatim) | same |
-| `qos_write_latency` | B | `write_latency_us` | same |
-| `qos_read_data` | B | `read_bytes_per_sec` (bytes/s, verbatim) | same |
-| `qos_write_data` | B | `write_bytes_per_sec` | same |
+| `qos_read_ops` | B — I/O | `<rollup>_over_time` per series, then the per-claim sum. `data.metrics.read_ops` (ops/s, verbatim — never `rate()`) | Edge kept, no I/O fields |
+| `qos_write_ops` | B | `<rollup>_over_time` per series, then the per-claim sum. `write_ops` | same |
+| `qos_read_latency` | B | `<rollup>_over_time` per series, then the per-claim sum. `read_latency_us` (average µs, verbatim) | same |
+| `qos_write_latency` | B | `<rollup>_over_time` per series, then the per-claim sum. `write_latency_us` | same |
+| `qos_read_data` | B | `<rollup>_over_time` per series, then the per-claim sum. `read_bytes_per_sec` (bytes/s, verbatim) | same |
+| `qos_write_data` | B | `<rollup>_over_time` per series, then the per-claim sum. `write_bytes_per_sec` | same |
 | `qos_policy_fixed_max_throughput_iops` | C — ceiling | `max_iops` on the edge and `data.qos.max_iops` on the PVC node, joined on the `(ontap_cluster, svm, policy_group)` triple — cluster and svm from hop A, policy group from hop B. Policy identity read as `name` with a `policy_group` fallback; smallest value on a duplicate triple | No ceiling (never `0`). An edge carries a ceiling only alongside a measurement; the PVC node's `data.qos` needs only a resolved policy group. A volume in no policy group gets none — another group's figure is never borrowed |
 | `qos_policy_fixed_max_throughput_mbps` | C | `max_bytes_per_sec` (edge) and `data.qos.max_bytes_per_sec` (PVC node) = mbps × 1048576 (the one converted value, so it shares the unit of `read_bytes_per_sec`) | same |
 | `aggr_new_status` | — | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | Attribute omitted |
@@ -655,6 +657,29 @@ request it counts only claims that matched at least one series, so a FlexGroup
 still reports while a claim off the rooted components — which the request never
 asked about — does not), `netapp_qos_join_miss` (edge drawn, no QoS match). No
 warning for a missing ceiling — a volume in no policy group is normal.
+
+### io_rollup
+
+`GET /v1/storage-graph` takes an optional `io_rollup` of `last` (the default), `max` or `avg`. It selects the range function of the six hop-B queries and of nothing else. Absent and empty values are `last`. An unrecognised value, or two different values, is 400 `invalid_scope`, validated after the root. `GET /v1/graph` ignores the parameter and always renders `last_over_time` for these six. `GET /v1/k8s-graph` reads no Harvest.
+
+Each series is reduced over the whole window first. The reader then discards non-empty `lun` rows, keeps one zone per workload and sums the reduced values per claim, the same steps it runs under `last`. A tier total is that sum. Under `max` the tier is the sum of the per-claim peaks, which can exceed the peak the tier itself carried at one instant. Latency under `avg` is the unweighted mean of the series, not a mean weighted by ops. A series present for only part of the window is averaged over the samples it has; the rest of the window is not counted as zero.
+
+Ceilings (`qos_policy_fixed_max_throughput_iops`, `qos_policy_fixed_max_throughput_mbps`), aggregate and controller gauges, controller performance counters and kubelet usage stay `last_over_time`.
+
+The scoped query for FlexVols `v_b` and `v_a` over a 5-minute window is what `RenderQoSVolumeScopedRollup` emits. Volumes are sorted, so the matcher is `v_a|v_b`. The other five families keep that matcher and window and substitute the metric name. `<rollup>` is `last`, `max` or `avg`:
+
+```promql
+<rollup>_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
+<rollup>_over_time(qos_write_ops{volume=~"v_a|v_b"}[5m])
+<rollup>_over_time(qos_read_latency{volume=~"v_a|v_b"}[5m])
+<rollup>_over_time(qos_write_latency{volume=~"v_a|v_b"}[5m])
+<rollup>_over_time(qos_read_data{volume=~"v_a|v_b"}[5m])
+<rollup>_over_time(qos_write_data{volume=~"v_a|v_b"}[5m])
+
+last_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
+max_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
+avg_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
+```
 
 ## kubelet (2)
 
