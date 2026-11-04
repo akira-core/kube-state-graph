@@ -71,11 +71,13 @@ graph.Project(g, scope)            ── projection-level filters (cluster/name
    ▼
 serialiseCytoscape
 
-HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>
+HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>&io_rollup=
    ▼
-kubegraph.ParseStorageValues  ── az/env required and repeatable; one root kind (missing_root / invalid_scope)
+kubegraph.ParseStorageValues  ── az/env required and repeatable; one root kind (missing_root / invalid_scope);
+                                  optional io_rollup (last / max / avg, default last) validated after the root (invalid_scope)
    ▼
-Builder.BuildStorage(…, roots) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
+Builder.BuildStorageWith(…, roots, StorageOptions{IORollup}) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
+                                  the six QoS legs use that rollup (BuildStorage means last);
                                   no ReadServiceGraph, no up{} probe; fails closed; Kubernetes queries never leave the request's zones; Harvest is routed by az
    ▼
 graph.ProjectStorage → cytoscape.Serialise
@@ -138,6 +140,7 @@ The capability specs live under `openspec/specs/`.
 
 - **`/v1/graph` takes `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`**; unknown parameters (including the withdrawn `name` / `root` / `depth` / `direction` / `edge_type`) are ignored without error. `GET /v1/clusters` is removed.
 - **`/v1/k8s-graph` takes `start`, `end`, REQUIRED repeatable `cluster` (RAW name), `az`, `env` (`missing_cluster` / `missing_az` / `missing_env`, in that order), exactly one root kind `pod` or `node` (`missing_root` / `invalid_scope`), and optional `namespace`**; `prune` and every other parameter are ignored. It reads only Kubernetes families (no Harvest, service-side, container or service-graph query), fails closed except `ALERTS`, draws only what a root reaches, and writes no last-build gauge. It shares the storage build's semantic helpers but not its orchestration (`readK8sWorkload`); drift is pinned by `TestBuildK8s_PlanIsOutputPreserving` and `TestBuildStorage_FanOutUnchanged`. Reference: `.claude/rules/storage-graph.md`.
+- **`/v1/storage-graph` takes `start`, `end`, REQUIRED repeatable `az` and `env`, exactly one root kind, and optional `io_rollup` (`last` / `max` / `avg`, default `last`)**; `io_rollup` is validated after the root, and an unrecognised value or two different values is 400 `invalid_scope` before any query. The body does not echo `io_rollup`. `/v1/graph` ignores the parameter and always renders `last_over_time` for the six QoS families; `/v1/k8s-graph` ignores it and issues no Harvest. Reference: `.claude/rules/storage-graph.md`.
 - **Only `end > start` is validated** — no window cap, no future-time guard. `kubegraph.AlignWindow` floors `end` to `--end-align` in exactly two places (`internal/api` `runBuild`, `Engine.BuildFromValues` / `BuildStorageFromValues` / `BuildK8sFromValues`), never inside the parsers.
 - **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries, `up`, and every NetApp Harvest query take NO request matcher. Harvest stays zone-routed: `az` selects its backends and is not rendered (`dimAZRoute`). Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
 - **A filtered build NEVER synthesises a pod**, admits a service-graph series only when a resolved endpoint names loaded topology, and returns an empty 200 (never `outside_retention`) when nothing matched.
@@ -183,7 +186,7 @@ The graph engine lives under `pkg/` so other Go modules can import it in-process
   `Graph` carries **no adjacency index** — the `Forward` / `Reverse` maps existed
   only for the withdrawn `?root=&depth=` traversal, and every surviving consumer
   (projection, the connectivity prune, serialisation) scans `Edges` once.
-- `pkg/build` — `Builder` + `Build` / `BuildStorage` / `BuildK8s`; topology / service-graph / NetApp readers. Takes a
+- `pkg/build` — `Builder` + `Build` / `BuildStorage` / `BuildStorageWith` / `BuildK8s`; topology / service-graph / NetApp readers. `BuildStorage` means `last`; `BuildStorageWith` takes `StorageOptions{IORollup}`. Takes a
   `build.Options{APITimeout, LabelKeys}` and a no-op-tolerant `build.Metrics`
   interface — **not** `internal/config` / `internal/observability`, whose
   couplings were broken so the package is externally importable.
@@ -195,8 +198,9 @@ The graph engine lives under `pkg/` so other Go modules can import it in-process
   into one call. `kubegraph.ParseValues` / `ParseStorageValues` / `ParseK8sValues` are the
   **single** request parsers, shared by the HTTP handlers and the facade, so
   the `/v1/graph`, `/v1/storage-graph` and `/v1/k8s-graph` contracts cannot drift.
-  `Engine.BuildStorageFromValues` and `Engine.BuildK8sFromValues` are the
-  storage-graph and k8s-graph counterparts.
+  `Engine.BuildStorageFromValues` passes `io_rollup` through `Engine.BuildStorageWith`
+  (`build.StorageOptions{IORollup}`); `Engine.BuildStorage` stays `last`.
+  `Engine.BuildK8sFromValues` is the k8s-graph counterpart.
 
 `pkg/` packages MUST NOT import `internal/*` — Go's internal rule would block any
 external module from importing the engine. Metrics and OTLP tracing are injected

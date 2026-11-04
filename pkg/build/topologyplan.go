@@ -181,6 +181,11 @@ type topologyPlan struct {
 	// wave, and closes the signal the scoped QoS read waits on up front, so that
 	// read computes an empty scope and issues nothing. Only k8sPlan sets it.
 	kubernetesOnly bool
+	// ioRollup is the range function of the six QoS workload queries. Only the
+	// storage path sets it (BuildStorageWith). fullPlan and k8sPlan leave the
+	// zero value, which renders last_over_time, so /v1/graph cannot select
+	// another rollup. Ceilings and every other family stay last_over_time.
+	ioRollup promql.Rollup
 
 	// phaseOne is the Harvest seed's phase-1 read, rendered, in (group, chunk)
 	// order. Non-empty means this build reads volume_labels from the root and

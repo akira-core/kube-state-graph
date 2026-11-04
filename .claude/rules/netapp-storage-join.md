@@ -138,7 +138,14 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     the only route to a SAN ceiling; it was also never airtight, since an
     empty-string matcher admits rows carrying no `lun` label at all. Cardinality
     stays bounded because the six legs are issued ONLY through
-    `RenderQoSVolumeScoped`. Candidates are further scoped in
+    `RenderQoSVolumeScopedRollup` (`RenderQoSVolumeScoped` delegates to it
+    with the zero rollup). The range function is chosen at render time, per
+    series, before the LUN discard, the one-zone-per-workload choice and the
+    sum: `last_over_time`, `max_over_time` or `avg_over_time`. `/v1/graph`
+    leaves the rollup at its zero value, so those six queries render
+    `last_over_time` there. A `/v1/storage-graph` build uses the request's
+    `io_rollup`. Ceilings, gauges and perf counters are never rolled up.
+    Candidates are further scoped in
     Go to the picked aggregate's ONTAP cluster (and its `svm` when both sides
     resolve one) so a colliding FlexVol name across two filers cannot merge.
     **One zone per workload**: the queries
@@ -157,8 +164,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     **These six legs are read in a SECOND WAVE** (`pkg/build/qosscope.go`
     `readScopedQoS`), issued only after hop A and restricted to exactly the
     FlexVol names the loaded claims matched
-    (`promql.RenderQoSVolumeScoped` renders an anchored `volume=~"…"` as the
-    query's ONLY matcher). The launcher waits on `kube_persistentvolumeclaim_info`
+    (`promql.RenderQoSVolumeScopedRollup` renders an anchored `volume=~"…"` as
+    the query's ONLY matcher; the rollup changes the function name and nothing
+    else). The launcher waits on `kube_persistentvolumeclaim_info`
     and `volume_labels` ALONE — a dependency edge inside the one errgroup, not a
     barrier behind the whole first wave. An **empty scope issues no QoS query at
     all** (hop A drew no edge for hop B to measure), mirroring the

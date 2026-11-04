@@ -30,6 +30,9 @@ func isQoSWorkloadQuery(q Query) bool {
 //
 //	last_over_time(qos_read_ops{volume=~"trident_pvc_a|trident_pvc_b"}[5m])
 //
+// This function always renders last_over_time. RenderQoSVolumeScopedRollup
+// takes the rollup explicitly; this one delegates to it with the zero value.
+//
 // The values are FlexVol names the volume-object family already returned, so
 // the restriction is EXACT: pkg/build's derive-then-suffix runs once, in Go,
 // during scope computation, and the comparison never reaches the query layer.
@@ -47,6 +50,18 @@ func isQoSWorkloadQuery(q Query) bool {
 // empty scope means no claim matched anything, so the unrestricted read could
 // only fetch series the reader would discard.
 func RenderQoSVolumeScoped(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string) (string, bool) {
+	return RenderQoSVolumeScopedRollup(q, window, keys, sel, volumes, "")
+}
+
+// RenderQoSVolumeScopedRollup is RenderQoSVolumeScoped with the range
+// function chosen by rollup. The matcher set and the window are identical
+// for every rollup; only the function name changes. rollup's zero value and
+// RollupLast both render last_over_time. Each series is reduced by that
+// function over the whole window before any per-claim sum.
+//
+// ok is false on the same inputs as RenderQoSVolumeScoped: q is not a QoS
+// workload family, or volumes normalises to nothing.
+func RenderQoSVolumeScopedRollup(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string, rollup Rollup) (string, bool) {
 	if !isQoSWorkloadQuery(q) {
 		return "", false
 	}
@@ -55,8 +70,8 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, keys LabelKeys, sel Se
 		return "", false
 	}
 	matchers := appendMatcher(requestMatchers(q, keys, sel), HarvestVolumeLabel, vals)
-	return fmt.Sprintf(`last_over_time(%s{%s}[%s])`,
-		q, strings.Join(matchers, ","), FormatDuration(window)), true
+	return fmt.Sprintf(`%s(%s{%s}[%s])`,
+		rollup.rangeFunc(), q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
 // ChunkQoSVolumeScope splits a sorted, de-duplicated FlexVol scope into

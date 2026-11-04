@@ -14,9 +14,12 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/cytoscape"
 	"github.com/akira-core/kube-state-graph/pkg/graph"
+	"github.com/akira-core/kube-state-graph/pkg/internal/promqlfake"
 	"github.com/akira-core/kube-state-graph/pkg/kubegraph"
+	"github.com/akira-core/kube-state-graph/pkg/promql"
 	promqlmocks "github.com/akira-core/kube-state-graph/pkg/promql/mocks"
 )
 
@@ -140,6 +143,69 @@ func TestBuildStorageFromValues_AgreesWithComposedPipeline(t *testing.T) {
 	require.NoError(t, err)
 	composed := cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope))
 	assert.Equal(t, composed, facade)
+}
+
+func TestBuildStorageFromValues_IORollupMatchesBuildStorageWith(t *testing.T) {
+	vals := url.Values{
+		"start":     {"1700000000"},
+		"end":       {"1700003600"},
+		"az":        {"zone-a"},
+		"env":       {"prod"},
+		"aggr":      {"aggr1"},
+		"io_rollup": {"avg"},
+	}
+	fromValues := promqlfake.New(namespaceEstate())
+	typed := promqlfake.New(namespaceEstate())
+	body, err := kubegraph.New(fromValues, kubegraph.Options{}).BuildStorageFromValues(t.Context(), vals)
+	require.NoError(t, err)
+
+	req, err := kubegraph.ParseStorageValues(vals)
+	require.NoError(t, err)
+	start, end := kubegraph.AlignWindow(req.Start, req.End, kubegraph.DefaultEndAlign)
+	g, err := kubegraph.New(typed, kubegraph.Options{}).BuildStorageWith(t.Context(),
+		end.Sub(start), end, req.Selector, req.Scope.Roots,
+		build.StorageOptions{IORollup: promql.RollupAvg})
+	require.NoError(t, err)
+	assert.Equal(t, cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope)), body)
+
+	for _, q := range []*promqlfake.Querier{fromValues, typed} {
+		issued := q.QueriesFor(promql.QQoSReadOps)
+		require.NotEmpty(t, issued)
+		for _, query := range issued {
+			assert.True(t, strings.HasPrefix(query, "avg_over_time("), query)
+		}
+	}
+}
+
+func TestBuildStorageFromValues_InvalidIORollup(t *testing.T) {
+	q := promqlfake.New(namespaceEstate())
+	_, err := kubegraph.New(q, kubegraph.Options{}).BuildStorageFromValues(t.Context(), url.Values{
+		"start":     {"1700000000"},
+		"end":       {"1700003600"},
+		"az":        {"zone-a"},
+		"env":       {"prod"},
+		"aggr":      {"aggr1"},
+		"io_rollup": {"p99"},
+	})
+	pe, ok := errors.AsType[*kubegraph.ParseError](err)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_scope", pe.Reason)
+	assert.Empty(t, q.Issued())
+}
+
+func TestEngineBuildStorage_QoSStaysLast(t *testing.T) {
+	q := promqlfake.New(namespaceEstate())
+	end := time.Unix(1700003600, 0).UTC()
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
+	require.NoError(t, err)
+	_, err = kubegraph.New(q, kubegraph.Options{}).BuildStorage(t.Context(),
+		time.Hour, end, promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, scope.Roots)
+	require.NoError(t, err)
+	issued := q.QueriesFor(promql.QQoSReadOps)
+	require.NotEmpty(t, issued)
+	for _, query := range issued {
+		assert.True(t, strings.HasPrefix(query, "last_over_time("), query)
+	}
 }
 
 func TestEngine_Probe(t *testing.T) {

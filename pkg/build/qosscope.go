@@ -83,6 +83,7 @@ func readScopedQoS(
 	v *topologyVectors,
 	scopeMu *sync.Mutex,
 	failClosed bool,
+	rollup promql.Rollup,
 	prerequisites ...<-chan struct{},
 ) error {
 	for _, done := range prerequisites {
@@ -115,7 +116,7 @@ func readScopedQoS(
 	for ti, t := range targets {
 		for ci, chunk := range chunks {
 			wave.Go(func() error {
-				out, err := instantQoSChunk(ctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed)
+				out, err := instantQoSChunk(ctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed, rollup)
 				if err != nil {
 					return err
 				}
@@ -156,6 +157,7 @@ func instantQoSChunk(
 	sel promql.Selector,
 	volumes []string,
 	failClosed bool,
+	rollup promql.Rollup,
 ) (out model.Vector, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -168,7 +170,7 @@ func instantQoSChunk(
 		}
 	}()
 
-	rendered, ok := promql.RenderQoSVolumeScoped(name, window, keys, sel, volumes)
+	rendered, ok := promql.RenderQoSVolumeScopedRollup(name, window, keys, sel, volumes, rollup)
 	if !ok {
 		// Unreachable for a non-empty chunk; never fall back to an unscoped
 		// read, which would fetch the whole filer's workloads.

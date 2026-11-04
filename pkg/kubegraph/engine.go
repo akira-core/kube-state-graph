@@ -170,21 +170,31 @@ func (e *Engine) BuildFromValues(ctx context.Context, v url.Values) (cytoscape.B
 // for a request with no roots — and pass the SAME roots to
 // graph.ProjectStorage, or a claimless pod root cannot be drawn.
 func (e *Engine) BuildStorage(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots) (*graph.Graph, error) {
-	return e.builder.BuildStorage(ctx, window, end, sel, roots)
+	return e.BuildStorageWith(ctx, window, end, sel, roots, build.StorageOptions{})
+}
+
+// BuildStorageWith is BuildStorage with an explicit QoS rollup. The zero
+// StorageOptions selects last_over_time for the six QoS workload queries,
+// which is what BuildStorage does. An invalid IORollup is
+// build.ReasonInvalidScope and issues no query.
+func (e *Engine) BuildStorageWith(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots, opts build.StorageOptions) (*graph.Graph, error) {
+	return e.builder.BuildStorageWith(ctx, window, end, sel, roots, opts)
 }
 
 // BuildStorageFromValues parses the /v1/storage-graph query parameters, builds
 // the storage-flow graph, applies the storage projection, and serialises to
 // the Cytoscape body. Parsing failures are *ParseError; build failures
-// propagate the build layer's typed errors. The HTTP handler uses the same
-// parser, so the request contract cannot drift.
+// propagate the build layer's typed errors. The parsed io_rollup is forwarded
+// to BuildStorageWith; an invalid value is a *ParseError invalid_scope before
+// any query. The HTTP handler uses the same parser, so the request contract
+// cannot drift.
 func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
 	req, err := ParseStorageValues(v)
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
 	start, end := AlignWindow(req.Start, req.End, e.endAlign)
-	g, err := e.builder.BuildStorage(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots)
+	g, err := e.BuildStorageWith(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots, build.StorageOptions{IORollup: req.IORollup})
 	if err != nil {
 		return cytoscape.Body{}, err
 	}
