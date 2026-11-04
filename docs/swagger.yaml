@@ -655,7 +655,7 @@ paths:
 
         **Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).
 
-        `cluster` / `namespace` remain optional narrowing filters. `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
+        `cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `/v1/graph` ignores `io_rollup`. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
       parameters:
       - description: Window start. RFC 3339 or Unix seconds.
         example: "2026-05-01T12:00:00Z"
@@ -806,6 +806,21 @@ paths:
             type: string
           type: array
         style: form
+      - description: Per-series rollup of each of the six QoS workload measurements
+          over the window, applied before claims are summed. `last` (the default)
+          is the sample at the window end. `max` is that series' own peak, so a tier
+          total is the sum of per-claim peaks and not the tier's own peak. `avg` is
+          the unweighted mean of the samples the series has. Ceilings and gauges stay
+          at the window end. `/v1/graph` ignores this parameter.
+        in: query
+        name: io_rollup
+        schema:
+          default: last
+          enum:
+          - last
+          - max
+          - avg
+          type: string
       - description: API key. Required when the server is started with API keys configured.
         in: header
         name: X-API-Key
