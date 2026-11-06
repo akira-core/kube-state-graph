@@ -51,3 +51,44 @@ func TestGuard_RollupsOfOneWindowAreCachedApart(t *testing.T) {
 	}
 	assert.EqualValues(t, 2, calls.Load(), "one upstream call per rollup; each repeat is a cache hit")
 }
+
+// A delta query and the last measurement query of the same scope and instant
+// render two different strings, so they are two cache entries; each repeat is
+// a hit.
+func TestGuard_DeltaAndMeasurementAreCachedApart(t *testing.T) {
+	t.Parallel()
+
+	volumes := []string{"v_a"}
+	last, ok := RenderQoSVolumeScopedRollup(QQoSReadOps, 5*time.Minute, LabelKeys{}, Selector{}, volumes, RollupLast)
+	require.True(t, ok)
+	delta, ok := RenderQoSVolumeScopedDelta(QQoSReadOps, 5*time.Minute, LabelKeys{}, Selector{}, volumes)
+	require.True(t, ok)
+	require.NotEqual(t, last, delta)
+
+	var calls atomic.Int64
+	backend := querierFunc(func(_ context.Context, _, query string, _ time.Time) (model.Vector, error) {
+		calls.Add(1)
+		v := model.SampleValue(100) // the sample at the window end
+		if strings.Contains(query, " offset ") {
+			v = 50 // end minus start
+		}
+		return model.Vector{&model.Sample{Metric: model.Metric{"volume": "v_a"}, Value: v}}, nil
+	})
+	q := Guard(backend)
+
+	for range 2 {
+		for _, tc := range []struct {
+			query string
+			want  float64
+		}{
+			{query: delta, want: 50},
+			{query: last, want: 100},
+		} {
+			got, err := q.Instant(t.Context(), string(QQoSReadOps), tc.query, ts0)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+			assert.InDelta(t, tc.want, float64(got[0].Value), 1e-9, "query %q", tc.query)
+		}
+	}
+	assert.EqualValues(t, 2, calls.Load(), "one upstream call per query shape; each repeat is a cache hit")
+}

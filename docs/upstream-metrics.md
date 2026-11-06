@@ -82,7 +82,7 @@ v1 has no result cache: this fan-out runs on every request.
 | Family | PromQL wrapper |
 |---|---|
 | kube-state-metrics, Harvest other than the six QoS workload families below, kubelet | `last_over_time(<metric>[<window>])` evaluated at `end` |
-| six `qos_{read,write}_{ops,latency,data}` | `<rollup>_over_time(<metric>{volume=~"…"}[<window>])` on `/v1/storage-graph` (`last_over_time`, `max_over_time` or `avg_over_time`). `/v1/graph` always renders `last_over_time`. See [io_rollup](#io_rollup) |
+| six `qos_{read,write}_{ops,latency,data}` | `<rollup>_over_time(<metric>{volume=~"…"}[<window>])` on `/v1/storage-graph` (`last_over_time`, `max_over_time` or `avg_over_time`). `/v1/graph` always renders `last_over_time`. See [io_rollup](#io_rollup). With `io_delta=true` each family also gets the end-minus-start form, see [io_delta](#io_delta) |
 | `kube_pod_container_info` only | `tlast_over_time(...)` so each per-image series carries its last-sample timestamp |
 | application metadata (`app_metadata`) | `tlast_over_time(<configured metric>{…}[<window>])`. The logical query name stays `app_metadata`; the configured metric name is never a self-metric label |
 | `traces_service_graph_*` | `rate(<metric>[<window>])` evaluated at `end` |
@@ -171,6 +171,9 @@ GET /v1/storage-graph?start=&end=&az=&env=&…
                6 Harvest QoS workload legs, volume scope exactly as for
                  /v1/graph, range function from io_rollup (/v1/graph is
                  always last_over_time); a chunk error FAILS the build
+               io_delta=true: + 6 delta queries per delta chunk (one per QoS
+                 family; half-budget chunks), same wave, same scope, same
+                 fail-closed rule — see [io_delta](#io_delta)
 ```
 
 Every storage build is a seed plus an expansion. The claim families are read
@@ -681,6 +684,26 @@ max_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
 avg_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m])
 ```
 
+### io_delta
+
+`GET /v1/storage-graph` takes an optional `io_delta` of `true` or `false` (default `false`; absent and empty values are `false`; a repeated identical value is one value). Any other value, or two different values, is 400 `invalid_scope`, validated after `io_rollup`. `GET /v1/graph` and `GET /v1/k8s-graph` ignore it. Without it (or with `false`) every query and body is byte-identical to before.
+
+With `io_delta=true` the six hop-B families are read a second time as the **end-minus-start** change of each series. For FlexVols `v_b` and `v_a` over a 5-minute window, `RenderQoSVolumeScopedDelta` emits:
+
+```promql
+last_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m]) - last_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m] offset 5m)
+```
+
+and the same for `qos_write_ops`, `qos_read_latency`, `qos_write_latency`, `qos_read_data` and `qos_write_data`. The left operand is each series' last sample in the window; the right is its last sample in the equally long span ending at `start`, which is what `io_rollup=last` reads for the window ending at `start`. The two operands share every label but `__name__`, which arithmetic matching ignores, so the subtraction is one-to-one. It is standard PromQL (`last_over_time`, `offset`, `-`), so any Prometheus-compatible Harvest store serves it, and it is two rollups of one selector, not a join of two families. It is deliberately not `delta()`, which extrapolates in Prometheus and reads the sample before the window only within the staleness interval in VictoriaMetrics.
+
+The delta is independent of `io_rollup`: it is always the last value at `end` minus the last value at `start`, so under `io_rollup=max` an edge carries the peak beside the end-to-start change. The query form never changes with the rollup.
+
+**Where the change appears.** The reader first keeps a workload's delta rows only when the delta read returned exactly the series the measurement read returned for that workload (its ONTAP cluster, `volume`, `lun` and family, across every `svm` and every zone; label sets compared without `__name__`), and drops the workload's delta otherwise — see **Absence**. It then runs its normal steps over the kept rows: non-empty `lun` rows are discarded, one zone is kept per workload, only rows on the claim's own filer count, and values are summed per claim. The result rides on the claim's measurement as `read_ops_delta`, `write_ops_delta`, `read_bytes_per_sec_delta`, `write_bytes_per_sec_delta` on every `storage-flow` tier (summed and split exactly like the flow weights) and `read_latency_us_delta`, `write_latency_us_delta` on the claim-level `svm-pvc` edge only. Each is signed, in the unit of its base field; `0` means unchanged.
+
+**Absence.** A series with no sample in the span before `start` (created inside the window, a gap, or `start - window` older than retention) has no delta; its field is omitted, never `0`. A series whose labels changed between `start` and `end` (a policy group moved, an `svm` label added or renamed, a poller relabelled or re-zoned) is not dropped by the query: the OLD series has samples on both sides of `start`, so the upstream returns its stale change, while the new series has no start sample. The reader discards it: when any series of a workload appeared inside the window without a start value, the whole workload contributes no delta. That includes a second poller, of any zone, that started scraping the workload mid-window, even when the claim's own zone has a valid change, and a Harvest exporter restart that changes its scrape labels (`instance`, `pod`), which removes the delta of every workload on that poller for any window spanning the restart; the start value of the whole workload is then unknown. The check cannot see every stale change: a FlexVol renamed to another name the claim still matches, an ONTAP cluster or `lun` rename, a label that moved away before `start` and back inside the window, or a measurement served from the 60-second result cache before a relabel landing just before `end` still pass the old series' change. The workload's measurement is still read, and the check is per workload and family, so the claim's other workloads and families keep their deltas. A claim sums only the workloads that have a delta, so a claim with two workloads, one new, carries a partial change. A tier change sums only the claims that carry one, so it is not the tier's end weight minus its start weight when a claim appeared inside the window. A delta never creates a measurement, and the policy pick, the ceiling and the `netapp_*_join_miss` signals read the measurement rows only.
+
+**Cost.** Each delta query scans twice the window (`2w`), and the retention of the Harvest store must cover `start - w`. A delta query renders the `volume` alternation twice, so the delta read chunks the same scope with **half** the byte budget (`--netapp-qos-scope-batch-bytes`), at most 100 values per alternation as always. A scope that fits one measurement chunk can therefore split into two delta chunks. The extra queries are issued in the same wave under the same concurrency limit, merged in chunk order, and fail the build on error like every storage-build query: `+6` queries per delta chunk, none when no FlexVol matched. They reuse the family name, so self-metrics and the `upstream query failed: <family>` message carry the family only; the full text is on the query span and in the `promql query failed` log line. They are not counted in the per-family series tally (`RawSeriesCount` / `largest_leg`), which keeps describing the measurement read.
+
 ## kubelet (2)
 
 OPTIONAL (log-and-continue). Namespaced — `?cluster=` / `?namespace=` /
@@ -909,6 +932,9 @@ storage plan's by-reference fan-out the same way: 18 legs when nothing is
 named, growing by exactly what the loaded pods, nodes and resolved owners name
 — 22 with a `node=` root alone, 25 / 27 / 27 with one
 StatefulSet-, Deployment- or CronJob-owned pod, and 32 with every controller
-kind present, 38 with one matched FlexVol added.
+kind present, 38 with one matched FlexVol added. With `io_delta=true` the same
+rows issue 6 more queries for a one-chunk scope and none when no FlexVol
+matched; the delta queries reuse the family names, so the distinct-family
+counts above do not move.
 `TestBuildStorage_FanOutLegCount_Hub` pins a storage seed: families with no
 candidate, 14 with a candidate naming no claim, 31 for one claim's full path.

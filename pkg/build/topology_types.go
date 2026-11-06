@@ -315,19 +315,32 @@ type topologyVectors struct {
 	// NetApp Harvest storage series, in join order:
 	// hop A the volume label series (topology), hop B the QoS workload
 	// families (I/O), hop C the QoS fixed-policy ceilings.
-	VolumeLabels     model.Vector
-	QoSReadOps       model.Vector
-	QoSWriteOps      model.Vector
-	QoSReadLatency   model.Vector
-	QoSWriteLatency  model.Vector
-	QoSReadData      model.Vector
-	QoSWriteData     model.Vector
-	QoSPolicyMaxIOPS model.Vector
-	QoSPolicyMaxMBps model.Vector
-	AggrStatus       model.Vector
-	AggrSpaceUsed    model.Vector
-	AggrSpaceTotal   model.Vector
-	NetAppNodeStatus model.Vector
+	VolumeLabels    model.Vector
+	QoSReadOps      model.Vector
+	QoSWriteOps     model.Vector
+	QoSReadLatency  model.Vector
+	QoSWriteLatency model.Vector
+	QoSReadData     model.Vector
+	QoSWriteData    model.Vector
+	// The end-minus-start change of each QoS workload family, read only by a
+	// /v1/storage-graph build with io_delta=true (see readScopedQoS). Each row
+	// is one workload series' last sample in the window minus its last sample
+	// in the equally long span ending at start, so a series with no start
+	// sample has no row. The reader runs the measurement's rules over them and
+	// never reads them for the policy pick, the ceiling or the coverage
+	// signal. Empty on every other build.
+	QoSReadOpsDelta      model.Vector
+	QoSWriteOpsDelta     model.Vector
+	QoSReadLatencyDelta  model.Vector
+	QoSWriteLatencyDelta model.Vector
+	QoSReadDataDelta     model.Vector
+	QoSWriteDataDelta    model.Vector
+	QoSPolicyMaxIOPS     model.Vector
+	QoSPolicyMaxMBps     model.Vector
+	AggrStatus           model.Vector
+	AggrSpaceUsed        model.Vector
+	AggrSpaceTotal       model.Vector
+	NetAppNodeStatus     model.Vector
 	// Controller hardware identity (an info series — labels only) and the four
 	// system_node performance counters, all matched on (ontap cluster, node)
 	// and all read VERBATIM. They resolve the netapp-node data.hardware and

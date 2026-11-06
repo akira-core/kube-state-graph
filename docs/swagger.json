@@ -71,7 +71,7 @@
                 "type": "object"
             },
             "github_com_akira-core_kube-state-graph_pkg_cytoscape.EdgeMetricsDTO": {
-                "description": "Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, \u003e 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume's own QoS policy group's declared ceiling, max_iops and max_bytes_per_sec (absent means no declared ceiling, never 0; neither appears without at least one measurement). A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).",
+                "description": "Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, \u003e 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume's own QoS policy group's declared ceiling, max_iops and max_bytes_per_sec (absent means no declared ceiling, never 0; neither appears without at least one measurement). On a GET /v1/storage-graph body requested with io_delta=true, a storage-flow edge also carries signed change fields beside the measurements that have a start value: read_ops_delta, write_ops_delta, read_bytes_per_sec_delta, write_bytes_per_sec_delta on every tier, and read_latency_us_delta, write_latency_us_delta on the claim-level svm-pvc edge only. Each is the value at the window end minus the value at its start, in the unit of its base field (positive up, negative down, 0 unchanged), and is absent when the start value is unknown, never 0. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).",
                 "properties": {
                     "error_rate": {
                         "description": "ErrorRate is the failed fraction in [0,1]. Omitted when the failure counter was unreadable; 0 means read successfully with no failures.",
@@ -99,19 +99,43 @@
                     "read_bytes_per_sec": {
                         "type": "number"
                     },
+                    "read_bytes_per_sec_delta": {
+                        "description": "ReadBytesPerSecDelta is read_bytes_per_sec at the window end minus its start value, in bytes per second. Same rules as read_ops_delta.",
+                        "type": "number"
+                    },
                     "read_latency_us": {
+                        "type": "number"
+                    },
+                    "read_latency_us_delta": {
+                        "description": "ReadLatencyUsDelta is read_latency_us at the window end minus its start value, in microseconds per operation. Carried by the claim-level (svm-pvc) edge only, beside read_latency_us.",
                         "type": "number"
                     },
                     "read_ops": {
                         "type": "number"
                     },
+                    "read_ops_delta": {
+                        "description": "ReadOpsDelta is read_ops at the window end minus read_ops at its start, in requests per second. Signed: positive is up, negative down, 0 unchanged. Present only on a GET /v1/storage-graph body requested with io_delta=true, only beside read_ops, and absent when no start value exists (never 0).",
+                        "type": "number"
+                    },
                     "write_bytes_per_sec": {
+                        "type": "number"
+                    },
+                    "write_bytes_per_sec_delta": {
+                        "description": "WriteBytesPerSecDelta is write_bytes_per_sec at the window end minus its start value, in bytes per second. Same rules as read_ops_delta.",
                         "type": "number"
                     },
                     "write_latency_us": {
                         "type": "number"
                     },
+                    "write_latency_us_delta": {
+                        "description": "WriteLatencyUsDelta is write_latency_us at the window end minus its start value, in microseconds per operation. Carried by the claim-level (svm-pvc) edge only, beside write_latency_us.",
+                        "type": "number"
+                    },
                     "write_ops": {
+                        "type": "number"
+                    },
+                    "write_ops_delta": {
+                        "description": "WriteOpsDelta is write_ops at the window end minus write_ops at its start, in requests per second. Same rules as read_ops_delta.",
                         "type": "number"
                     }
                 },
@@ -822,7 +846,7 @@
         },
         "/v1/storage-graph": {
             "get": {
-                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus `az` and `env`, each at least once and repeatable (400 `missing_az` / `missing_env` when absent), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. The selected zones are the Cartesian product of the two value sets: every Kubernetes and `ALERTS` query is narrowed to them. Harvest is routed by `az` and carries no request matcher; every query is still sent only to the backends serving the selected `az` values. The body is the union of the single-zone bodies: no node merges across zones, and a claim prefers FlexVols of its own zone, falling back to every matched series when none agree.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (the bare form roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's component; the two forms may be mixed, and `ontap_cluster=` does not qualify them — it is a separate root kind), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `pvc=\u003cnamespace\u003e/\u003cclaim-name\u003e` (a PersistentVolumeClaim, in every cluster of the estate), `pv` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included), `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own. A `pvc` / `pv` root claim that no pod mounts keeps its storage-side path (controller → aggregate → SVM → claim) and its whole measurement rides that path with no `pvc-pod` edge; an unmounted claim that is not a root stays dropped under every root kind.\n\n**Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).\n\n`cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `/v1/graph` ignores `io_rollup`. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
+                "description": "Returns a storage-rooted flow graph — NetApp controller → aggregate → SVM → PVC → pod → Kubernetes node — for the supplied `[start, end]` window, in the same `{apiVersion, clusters, elements}` Cytoscape.js shape as `/v1/graph`.\n\n**Required**: `start`, `end` (same validation as `/v1/graph`), plus `az` and `env`, each at least once and repeatable (400 `missing_az` / `missing_env` when absent), plus exactly one root kind (400 `missing_root` when none; 400 `invalid_scope` naming the parameters when two or more). `az` and `env` are checked before the root. The selected zones are the Cartesian product of the two value sets: every Kubernetes and `ALERTS` query is narrowed to them. Harvest is routed by `az` and carries no request matcher; every query is still sent only to the backends serving the selected `az` values. The body is the union of the single-zone bodies: no node merges across zones, and a claim prefers FlexVols of its own zone, falling back to every matched series when none agree.\n\n**Roots** (exactly one kind, repeatable values OR-combined): `ontap_cluster` (every controller, aggregate and SVM of a filer), `ontap_node` (an ONTAP controller; the claims on the aggregates it owns), `aggr` and `svm` (the bare form roots that name on every filer of the selected zones; `\u003contap_cluster\u003e/\u003cname\u003e` roots exactly one filer's component; the two forms may be mixed, and `ontap_cluster=` does not qualify them — it is a separate root kind), `node` (a Kubernetes node only; an ONTAP controller name sent here is an empty 200), `pod=\u003cnamespace\u003e/\u003cname\u003e`, `pvc=\u003cnamespace\u003e/\u003cclaim-name\u003e` (a PersistentVolumeClaim, in every cluster of the estate), `pv` (a PersistentVolume by its bare name, matched on the `volumename` of the claim bound to it — a statically provisioned volume included), `application` (ArgoCD Application name, as `data.application` carries it). A root the upstream names is always drawn, even with no flow; a root no series names is simply absent. An `application` root keeps a path whose pod or claim carries it, and every pod that resolves it is drawn even when it mounts nothing. A claim hit is not materialised on its own. A `pvc` / `pv` root claim that no pod mounts keeps its storage-side path (controller → aggregate → SVM → claim) and its whole measurement rides that path with no `pvc-pod` edge; an unmounted claim that is not a root stays dropped under every root kind.\n\n**Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).\n\n`cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `io_delta` (`true` or `false`; default `false`) adds, beside the measurements, the signed change of each figure from the window start to its end (`read_ops_delta` …), is validated after `io_rollup` (400 `invalid_scope` for an unrecognised value or two different values), and costs six more QoS queries per delta chunk. `/v1/graph` and `/v1/k8s-graph` ignore both. Auth, timeout (504) and upstream error mapping match `/v1/graph`.",
                 "parameters": [
                     {
                         "description": "Window start. RFC 3339 or Unix seconds.",
@@ -1020,6 +1044,19 @@
                                 "last",
                                 "max",
                                 "avg"
+                            ],
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "description": "When `true`, every storage-flow edge that carries a measurement also carries its signed change over the window in `data.metrics`: `read_ops_delta`, `write_ops_delta`, `read_bytes_per_sec_delta`, `write_bytes_per_sec_delta` on every tier (summed and split like the flow weights) and `read_latency_us_delta`, `write_latency_us_delta` on the claim-level svm-pvc edge only. Each is the value at the window end minus the value at its start, in the unit of its base field (positive up, negative down, 0 unchanged). Independent of `io_rollup`: it is always the last value at the end minus the last value at the start. A field is absent, never 0, when the start value is unknown (no sample in the window-length span before `start`, a series created inside the window, labels that changed, or a poller that started scraping the workload inside the window). A tier change sums only the claims that carry one. Reads each series over twice the window; retention must cover `start` minus the window length. `/v1/graph` and `/v1/k8s-graph` ignore this parameter.",
+                        "in": "query",
+                        "name": "io_delta",
+                        "schema": {
+                            "default": "false",
+                            "enum": [
+                                "true",
+                                "false"
                             ],
                             "type": "string"
                         }

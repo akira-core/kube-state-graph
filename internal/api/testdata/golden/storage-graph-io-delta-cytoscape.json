@@ -1,0 +1,551 @@
+{
+  "apiVersion": "v1",
+  "clusters": [
+    "cluster-alpha"
+  ],
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "cluster/cluster-alpha",
+          "name": "cluster-alpha",
+          "type": "cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "storage-cluster/ontap-prod",
+          "name": "ontap-prod",
+          "type": "storage-cluster",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/namespace/shop",
+          "name": "shop",
+          "type": "namespace",
+          "parent": "cluster/cluster-alpha",
+          "labels": {}
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/cart-data",
+          "name": "cart-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/catalog-data",
+          "name": "catalog-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/orders-data",
+          "name": "orders-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/shop/shared-data",
+          "name": "shared-data",
+          "type": "pvc",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "aggr": "netapp/ontap-prod/aggr/aggr1",
+            "cluster": "cluster-alpha",
+            "namespace": "shop"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-cart-0",
+          "name": "cart-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-catalog-0",
+          "name": "catalog-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-orders-0",
+          "name": "orders-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-shared-0",
+          "name": "shared-0",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/uid-shared-1",
+          "name": "shared-1",
+          "type": "pod",
+          "parent": "cluster-alpha/namespace/shop",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha",
+            "namespace": "shop",
+            "node": "cluster-alpha/worker-1"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "cluster-alpha/worker-1",
+          "name": "worker-1",
+          "type": "node",
+          "parent": "cluster/cluster-alpha",
+          "status": "normal",
+          "labels": {
+            "cluster": "cluster-alpha"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/aggr/aggr1",
+          "name": "aggr1",
+          "type": "netapp-aggr",
+          "parent": "netapp/ontap-prod/ontap-prod-01",
+          "status": "normal",
+          "labels": {
+            "node": "ontap-prod-01",
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/ontap-prod-01",
+          "name": "ontap-prod-01",
+          "type": "netapp-node",
+          "parent": "storage-cluster/ontap-prod",
+          "status": "normal",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "netapp/ontap-prod/svm/svm_shop",
+          "name": "svm_shop",
+          "type": "netapp-svm",
+          "parent": "storage-cluster/ontap-prod",
+          "labels": {
+            "ontap_cluster": "ontap-prod"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "0268d788-9f5a-576d-9f84-974b66457da6",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/ontap-prod-01",
+          "target": "netapp/ontap-prod/aggr/aggr1",
+          "labels": {
+            "tier": "node-aggr"
+          },
+          "metrics": {
+            "read_ops": 750,
+            "write_ops": 210,
+            "read_bytes_per_sec": 19000000,
+            "write_bytes_per_sec": 6500000,
+            "read_ops_delta": 0,
+            "write_ops_delta": -20,
+            "read_bytes_per_sec_delta": -800000,
+            "write_bytes_per_sec_delta": -800000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "1c9ae693-f6f5-545e-be46-f0e267bb49d6",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/svm/svm_shop",
+          "target": "cluster-alpha/shop/catalog-data",
+          "labels": {
+            "tier": "svm-pvc"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 20,
+            "read_latency_us": 200,
+            "write_latency_us": 150,
+            "read_bytes_per_sec": 1000000,
+            "write_bytes_per_sec": 500000,
+            "read_ops_delta": -80,
+            "write_ops_delta": -30,
+            "read_latency_us_delta": -50,
+            "write_latency_us_delta": -25,
+            "read_bytes_per_sec_delta": -3000000,
+            "write_bytes_per_sec_delta": -1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "20ef9c05-d085-54cb-9fd2-06e06cfed918",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-shared-1",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 45,
+            "read_bytes_per_sec": 4500000,
+            "write_bytes_per_sec": 1500000,
+            "read_ops_delta": 15,
+            "write_ops_delta": 0,
+            "read_bytes_per_sec_delta": 600000,
+            "write_bytes_per_sec_delta": -150000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "443f8246-30dc-504b-bf0b-26004610c227",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/aggr/aggr1",
+          "target": "netapp/ontap-prod/svm/svm_shop",
+          "labels": {
+            "tier": "aggr-svm"
+          },
+          "metrics": {
+            "read_ops": 750,
+            "write_ops": 210,
+            "read_bytes_per_sec": 19000000,
+            "write_bytes_per_sec": 6500000,
+            "read_ops_delta": 0,
+            "write_ops_delta": -20,
+            "read_bytes_per_sec_delta": -800000,
+            "write_bytes_per_sec_delta": -800000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "4a39304a-f553-547c-8046-27a0fc1ca30a",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/catalog-data",
+          "target": "cluster-alpha/uid-catalog-0",
+          "labels": {
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 20,
+            "read_bytes_per_sec": 1000000,
+            "write_bytes_per_sec": 500000,
+            "read_ops_delta": -80,
+            "write_ops_delta": -30,
+            "read_bytes_per_sec_delta": -3000000,
+            "write_bytes_per_sec_delta": -1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "56c1200e-d6cf-5f43-bce9-679f278c62a8",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/shared-data",
+          "target": "cluster-alpha/uid-shared-0",
+          "labels": {
+            "attribution": "split",
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 45,
+            "read_bytes_per_sec": 4500000,
+            "write_bytes_per_sec": 1500000,
+            "read_ops_delta": 15,
+            "write_ops_delta": 0,
+            "read_bytes_per_sec_delta": 600000,
+            "write_bytes_per_sec_delta": -150000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "5b11e8c5-7167-53f5-9807-f19ed0d6bf2f",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/cart-data",
+          "target": "cluster-alpha/uid-cart-0",
+          "labels": {
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 200,
+            "write_ops": 60,
+            "read_bytes_per_sec": 3000000,
+            "write_bytes_per_sec": 1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "6fb2cdfa-b56f-588c-8cfd-77401fb4c057",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-orders-0",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 40,
+            "read_bytes_per_sec": 6000000,
+            "write_bytes_per_sec": 2000000,
+            "read_ops_delta": 50,
+            "write_ops_delta": 10,
+            "read_bytes_per_sec_delta": 1000000,
+            "write_bytes_per_sec_delta": 500000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "71333d91-d641-5c69-8b34-590e6bba336f",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/orders-data",
+          "target": "cluster-alpha/uid-orders-0",
+          "labels": {
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 40,
+            "read_bytes_per_sec": 6000000,
+            "write_bytes_per_sec": 2000000,
+            "read_ops_delta": 50,
+            "write_ops_delta": 10,
+            "read_bytes_per_sec_delta": 1000000,
+            "write_bytes_per_sec_delta": 500000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "7db93fb7-177b-5482-a1c1-b39bca114913",
+          "type": "storage-flow",
+          "source": "cluster-alpha/shop/shared-data",
+          "target": "cluster-alpha/uid-shared-1",
+          "labels": {
+            "attribution": "split",
+            "tier": "pvc-pod"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 45,
+            "read_bytes_per_sec": 4500000,
+            "write_bytes_per_sec": 1500000,
+            "read_ops_delta": 15,
+            "write_ops_delta": 0,
+            "read_bytes_per_sec_delta": 600000,
+            "write_bytes_per_sec_delta": -150000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "8e95943e-1b17-520f-8e52-99e417f2e89d",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-catalog-0",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 100,
+            "write_ops": 20,
+            "read_bytes_per_sec": 1000000,
+            "write_bytes_per_sec": 500000,
+            "read_ops_delta": -80,
+            "write_ops_delta": -30,
+            "read_bytes_per_sec_delta": -3000000,
+            "write_bytes_per_sec_delta": -1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "9941e4bb-2c0a-523a-bf9f-24060f1229bc",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-cart-0",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 200,
+            "write_ops": 60,
+            "read_bytes_per_sec": 3000000,
+            "write_bytes_per_sec": 1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "aa08a041-b172-5773-bd2d-767f78434948",
+          "type": "storage-flow",
+          "source": "cluster-alpha/uid-shared-0",
+          "target": "cluster-alpha/worker-1",
+          "labels": {
+            "tier": "pod-node"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 45,
+            "read_bytes_per_sec": 4500000,
+            "write_bytes_per_sec": 1500000,
+            "read_ops_delta": 15,
+            "write_ops_delta": 0,
+            "read_bytes_per_sec_delta": 600000,
+            "write_bytes_per_sec_delta": -150000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "d06814ba-5e16-557f-b3cd-bb067ee82c00",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/svm/svm_shop",
+          "target": "cluster-alpha/shop/orders-data",
+          "labels": {
+            "tier": "svm-pvc"
+          },
+          "metrics": {
+            "read_ops": 150,
+            "write_ops": 40,
+            "read_latency_us": 650,
+            "write_latency_us": 300,
+            "read_bytes_per_sec": 6000000,
+            "write_bytes_per_sec": 2000000,
+            "read_ops_delta": 50,
+            "write_ops_delta": 10,
+            "read_latency_us_delta": 250,
+            "write_latency_us_delta": 100,
+            "read_bytes_per_sec_delta": 1000000,
+            "write_bytes_per_sec_delta": 500000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "e3708ca0-f569-5f52-8d8e-6401b2675ff4",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/svm/svm_shop",
+          "target": "cluster-alpha/shop/cart-data",
+          "labels": {
+            "tier": "svm-pvc"
+          },
+          "metrics": {
+            "read_ops": 200,
+            "write_ops": 60,
+            "read_latency_us": 400,
+            "write_latency_us": 300,
+            "read_bytes_per_sec": 3000000,
+            "write_bytes_per_sec": 1000000
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "fb7e9c12-d9df-516a-813c-cda9356620c9",
+          "type": "storage-flow",
+          "source": "netapp/ontap-prod/svm/svm_shop",
+          "target": "cluster-alpha/shop/shared-data",
+          "labels": {
+            "tier": "svm-pvc"
+          },
+          "metrics": {
+            "read_ops": 300,
+            "write_ops": 90,
+            "read_latency_us": 500,
+            "write_latency_us": 250,
+            "read_bytes_per_sec": 9000000,
+            "write_bytes_per_sec": 3000000,
+            "read_ops_delta": 30,
+            "write_ops_delta": 0,
+            "read_latency_us_delta": 10,
+            "write_latency_us_delta": -4,
+            "read_bytes_per_sec_delta": 1200000,
+            "write_bytes_per_sec_delta": -300000
+          }
+        }
+      }
+    ]
+  }
+}

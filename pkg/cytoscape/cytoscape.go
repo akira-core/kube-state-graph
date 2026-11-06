@@ -147,7 +147,7 @@ type Edge struct {
 // when no usable classic histogram was available. All three values are JSON
 // numbers (never strings) and MAY appear in exponent form for small values.
 //
-//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume's own QoS policy group's declared ceiling, max_iops and max_bytes_per_sec (absent means no declared ceiling, never 0; neither appears without at least one measurement). A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
+//	@Description	Union of two disjoint measurement families. RED family (trace-derived call edges): rate (required within the family, > 0), error_rate, p90_server_ms. I/O family (pvc-to-netapp-aggr edges): read_ops, write_ops, read_latency_us, write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume's own QoS policy group's declared ceiling, max_iops and max_bytes_per_sec (absent means no declared ceiling, never 0; neither appears without at least one measurement). On a GET /v1/storage-graph body requested with io_delta=true, a storage-flow edge also carries signed change fields beside the measurements that have a start value: read_ops_delta, write_ops_delta, read_bytes_per_sec_delta, write_bytes_per_sec_delta on every tier, and read_latency_us_delta, write_latency_us_delta on the claim-level svm-pvc edge only. Each is the value at the window end minus the value at its start, in the unit of its base field (positive up, negative down, 0 unchanged), and is absent when the start value is unknown, never 0. A single edge carries fields from exactly one family. All values are JSON numbers rounded to 6 significant digits and may appear in exponent form (e.g. 3.86e-7).
 type EdgeMetricsDTO struct {
 	// Rate is requests per second over the window (always > 0 when the RED family is present). Schema-optional because the object is a union.
 	Rate *float64 `json:"rate,omitempty" example:"5"`
@@ -165,6 +165,18 @@ type EdgeMetricsDTO struct {
 	MaxIOPS *float64 `json:"max_iops,omitempty"`
 	// MaxBytesPerSec is the declared throughput ceiling of the volume's own QoS policy group, converted from the policy's MB/s figure so it shares the unit of read_bytes_per_sec / write_bytes_per_sec.
 	MaxBytesPerSec *float64 `json:"max_bytes_per_sec,omitempty"`
+	// ReadOpsDelta is read_ops at the window end minus read_ops at its start, in requests per second. Signed: positive is up, negative down, 0 unchanged. Present only on a GET /v1/storage-graph body requested with io_delta=true, only beside read_ops, and absent when no start value exists (never 0).
+	ReadOpsDelta *float64 `json:"read_ops_delta,omitempty"`
+	// WriteOpsDelta is write_ops at the window end minus write_ops at its start, in requests per second. Same rules as read_ops_delta.
+	WriteOpsDelta *float64 `json:"write_ops_delta,omitempty"`
+	// ReadLatencyUsDelta is read_latency_us at the window end minus its start value, in microseconds per operation. Carried by the claim-level (svm-pvc) edge only, beside read_latency_us.
+	ReadLatencyUsDelta *float64 `json:"read_latency_us_delta,omitempty"`
+	// WriteLatencyUsDelta is write_latency_us at the window end minus its start value, in microseconds per operation. Carried by the claim-level (svm-pvc) edge only, beside write_latency_us.
+	WriteLatencyUsDelta *float64 `json:"write_latency_us_delta,omitempty"`
+	// ReadBytesPerSecDelta is read_bytes_per_sec at the window end minus its start value, in bytes per second. Same rules as read_ops_delta.
+	ReadBytesPerSecDelta *float64 `json:"read_bytes_per_sec_delta,omitempty"`
+	// WriteBytesPerSecDelta is write_bytes_per_sec at the window end minus its start value, in bytes per second. Same rules as read_ops_delta.
+	WriteBytesPerSecDelta *float64 `json:"write_bytes_per_sec_delta,omitempty"`
 }
 
 // EdgeData is the serialised form of a graph edge.
@@ -228,6 +240,15 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 		dto.WriteBytesPerSec = new(round6(*io.WriteBytesPerSec))
 		filled = true
 	}
+	// A change field is serialised only beside its base field, and like the
+	// ceilings never sets `filled`: the object exists because a measurement
+	// does. round6 keeps the sign, and a zero change is a present 0.
+	dto.ReadOpsDelta = roundedBeside(io.ReadOps, io.ReadOpsDelta)
+	dto.WriteOpsDelta = roundedBeside(io.WriteOps, io.WriteOpsDelta)
+	dto.ReadLatencyUsDelta = roundedBeside(io.ReadLatencyUs, io.ReadLatencyUsDelta)
+	dto.WriteLatencyUsDelta = roundedBeside(io.WriteLatencyUs, io.WriteLatencyUsDelta)
+	dto.ReadBytesPerSecDelta = roundedBeside(io.ReadBytesPerSec, io.ReadBytesPerSecDelta)
+	dto.WriteBytesPerSecDelta = roundedBeside(io.WriteBytesPerSec, io.WriteBytesPerSecDelta)
 	// The ceilings deliberately do NOT set `filled`: the builder can only
 	// attach them alongside a measurement (hop C of the storage join), so they can
 	// never be the sole reason a metrics object exists.
@@ -241,6 +262,15 @@ func metricsDTO(m *graph.EdgeMetrics, io *graph.IOMetrics) *EdgeMetricsDTO {
 		return nil
 	}
 	return dto
+}
+
+// roundedBeside is round6(delta), or nil when delta is nil or its base figure
+// is absent.
+func roundedBeside(base, delta *float64) *float64 {
+	if base == nil || delta == nil {
+		return nil
+	}
+	return new(round6(*delta))
 }
 
 // qosDTO maps a resolved ceiling to its wire form, or nil when there is none —

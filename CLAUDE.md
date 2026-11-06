@@ -71,13 +71,14 @@ graph.Project(g, scope)            ── projection-level filters (cluster/name
    ▼
 serialiseCytoscape
 
-HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>&io_rollup=
+HTTP /v1/storage-graph?start=&end=&az=&env=&<exactly one root kind>&io_rollup=&io_delta=
    ▼
 kubegraph.ParseStorageValues  ── az/env required and repeatable; one root kind (missing_root / invalid_scope);
-                                  optional io_rollup (last / max / avg, default last) validated after the root (invalid_scope)
+                                  optional io_rollup (last / max / avg, default last) validated after the root (invalid_scope),
+                                  then optional io_delta (true / false, default false; invalid_scope)
    ▼
-Builder.BuildStorageWith(…, roots, StorageOptions{IORollup}) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
-                                  the six QoS legs use that rollup (BuildStorage means last);
+Builder.BuildStorageWith(…, roots, StorageOptions{IORollup, IODelta}) ── readTopology under storagePlan: per-kind seed → claims → one expansion;
+                                  the six QoS legs use that rollup (BuildStorage means last); io_delta adds six end-minus-start reads per delta chunk to the same wave;
                                   no ReadServiceGraph, no up{} probe; fails closed; Kubernetes queries never leave the request's zones; Harvest is routed by az
    ▼
 graph.ProjectStorage → cytoscape.Serialise
@@ -123,7 +124,7 @@ The capability specs live under `openspec/specs/`.
 **Wire contract**
 
 - **Deterministic response body.** The serialiser produces byte-identical output for the same `(window, filters, upstream-data)`, and every rendered upstream selector is a pure function of the sorted, de-duplicated parameter values (so `?az=b&az=a` and `?az=a&az=b` issue identical queries): node/edge slices MUST go through `graph.SortNodes`/`SortEdges`, `Graph.ClusterNames()` MUST sort, and the response body MUST NOT carry time-of-build or echo-of-input fields. Body shape is fixed at `{apiVersion, clusters, elements}`. Optional edge `data.metrics` (when present) is part of that contract — contributions are summed in ascending order and rounded to 6 significant digits so the wire form is order-independent. Every golden carrying a pod / K8s node / PVC / NetApp controller / aggregate intentionally carries an explicit `data.status`; hand-built golden fixtures must stamp the same `FoldStatus` result the builder bakes before `graph.NewGraph`. Don't add timestamps, random IDs, or unsorted map iteration to the response — golden tests will break.
-- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by`, `deployed_at`, and edge `metrics`. `namespace_owner`, `namespace_group`, `namespace_group_owner` and `namespace_alias` appear only on synthesised `namespace` groups; `deployed_by` and `deployed_at` only on synthesised `application` groups.
+- **`labels` is strict `map[string]string`** on nodes and edges — no bools, no numbers, no string-encoded numbers. Everything else is a typed, `omitempty` attribute and never appears inside `labels`: `ipaddress`, `owner`, `application`, `containers`, `ready_status`, `status`, `health`, `usage`, `storageclass`, `qos`, `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by`, `deployed_at`, and edge `metrics` (including the `io_delta=true` change fields `read_ops_delta` … `write_bytes_per_sec_delta`). `namespace_owner`, `namespace_group`, `namespace_group_owner` and `namespace_alias` appear only on synthesised `namespace` groups; `deployed_by` and `deployed_at` only on synthesised `application` groups.
 - **Edge IDs are UUIDv5** with a fixed compiled-in namespace (`graph.edgeNamespace`)
   and the canonical input `<type>|<source>|<target>`. Stable across rebuilds —
   required for golden tests. Bumping the namespace UUID is a v2 break.
@@ -140,7 +141,7 @@ The capability specs live under `openspec/specs/`.
 
 - **`/v1/graph` takes `start`, `end`, `cluster`, `namespace`, `az`, `env`, `prune`**; unknown parameters (including the withdrawn `name` / `root` / `depth` / `direction` / `edge_type`) are ignored without error. `GET /v1/clusters` is removed.
 - **`/v1/k8s-graph` takes `start`, `end`, REQUIRED repeatable `cluster` (RAW name), `az`, `env` (`missing_cluster` / `missing_az` / `missing_env`, in that order), exactly one root kind `pod` or `node` (`missing_root` / `invalid_scope`), and optional `namespace`**; `prune` and every other parameter are ignored. It reads only Kubernetes families (no Harvest, service-side, container or service-graph query), fails closed except `ALERTS`, draws only what a root reaches, and writes no last-build gauge. It shares the storage build's semantic helpers but not its orchestration (`readK8sWorkload`); drift is pinned by `TestBuildK8s_PlanIsOutputPreserving` and `TestBuildStorage_FanOutUnchanged`. Reference: `.claude/rules/storage-graph.md`.
-- **`/v1/storage-graph` takes `start`, `end`, REQUIRED repeatable `az` and `env`, exactly one root kind, and optional `io_rollup` (`last` / `max` / `avg`, default `last`)**; `io_rollup` is validated after the root, and an unrecognised value or two different values is 400 `invalid_scope` before any query. The body does not echo `io_rollup`. `/v1/graph` ignores the parameter and always renders `last_over_time` for the six QoS families; `/v1/k8s-graph` ignores it and issues no Harvest. Reference: `.claude/rules/storage-graph.md`.
+- **`/v1/storage-graph` takes `start`, `end`, REQUIRED repeatable `az` and `env`, exactly one root kind, and optional `io_rollup` (`last` / `max` / `avg`, default `last`) and `io_delta` (`true` / `false`, default `false`)**; `io_rollup` is validated after the root and `io_delta` after `io_rollup`, and an unrecognised value or two different values of either is 400 `invalid_scope` before any query. The body does not echo either. `io_delta=true` adds signed `<field>_delta` figures (end minus start, beside the measurement; latency on `svm-pvc` only) to `storage-flow` `data.metrics`, independent of `io_rollup`. `/v1/graph` ignores both parameters and always renders `last_over_time` for the six QoS families; `/v1/k8s-graph` ignores both and issues no Harvest. Reference: `.claude/rules/storage-graph.md`.
 - **Only `end > start` is validated** — no window cap, no future-time guard. `kubegraph.AlignWindow` floors `end` to `--end-align` in exactly two places (`internal/api` `runBuild`, `Engine.BuildFromValues` / `BuildStorageFromValues` / `BuildK8sFromValues`), never inside the parsers.
 - **Two filter classes.** Selector-level (`cluster`, `namespace`, `az`, `env`) render as upstream label matchers per the hardcoded `promql.queryDims` table; projection-level (`prune`, plus `cluster` / `namespace` again) run over the built graph. The three `traces_service_graph_*` queries, `up`, and every NetApp Harvest query take NO request matcher. Harvest stays zone-routed: `az` selects its backends and is not rendered (`dimAZRoute`). Each query's fixed selector must mirror a discard its Go reader already performs — never stricter.
 - **A filtered build NEVER synthesises a pod**, admits a service-graph series only when a resolved endpoint names loaded topology, and returns an empty 200 (never `outside_retention`) when nothing matched.
@@ -186,7 +187,7 @@ The graph engine lives under `pkg/` so other Go modules can import it in-process
   `Graph` carries **no adjacency index** — the `Forward` / `Reverse` maps existed
   only for the withdrawn `?root=&depth=` traversal, and every surviving consumer
   (projection, the connectivity prune, serialisation) scans `Edges` once.
-- `pkg/build` — `Builder` + `Build` / `BuildStorage` / `BuildStorageWith` / `BuildK8s`; topology / service-graph / NetApp readers. `BuildStorage` means `last`; `BuildStorageWith` takes `StorageOptions{IORollup}`. Takes a
+- `pkg/build` — `Builder` + `Build` / `BuildStorage` / `BuildStorageWith` / `BuildK8s`; topology / service-graph / NetApp readers. `BuildStorage` means `last` with no delta; `BuildStorageWith` takes `StorageOptions{IORollup, IODelta}`. Takes a
   `build.Options{APITimeout, LabelKeys}` and a no-op-tolerant `build.Metrics`
   interface — **not** `internal/config` / `internal/observability`, whose
   couplings were broken so the package is externally importable.
@@ -198,8 +199,8 @@ The graph engine lives under `pkg/` so other Go modules can import it in-process
   into one call. `kubegraph.ParseValues` / `ParseStorageValues` / `ParseK8sValues` are the
   **single** request parsers, shared by the HTTP handlers and the facade, so
   the `/v1/graph`, `/v1/storage-graph` and `/v1/k8s-graph` contracts cannot drift.
-  `Engine.BuildStorageFromValues` passes `io_rollup` through `Engine.BuildStorageWith`
-  (`build.StorageOptions{IORollup}`); `Engine.BuildStorage` stays `last`.
+  `Engine.BuildStorageFromValues` passes `io_rollup` and `io_delta` through `Engine.BuildStorageWith`
+  (`build.StorageOptions{IORollup, IODelta}`); `Engine.BuildStorage` stays `last` with no delta.
   `Engine.BuildK8sFromValues` is the k8s-graph counterpart.
 
 `pkg/` packages MUST NOT import `internal/*` — Go's internal rule would block any

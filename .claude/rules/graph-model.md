@@ -83,7 +83,7 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `write_latency_us`, `read_bytes_per_sec`, `write_bytes_per_sec`, plus the
   declared ceiling `max_iops`, `max_bytes_per_sec` — which the claim's PVC node
   also carries as `data.qos`), and
-  `storage-flow` (the Sankey hop of `GET /v1/storage-graph`; `may_cross_cluster: false`; labels `tier` and `attribution`; `/v1/graph` never emits it).
+  `storage-flow` (the Sankey hop of `GET /v1/storage-graph`; `may_cross_cluster: false`; labels `tier` and `attribution`; `/v1/graph` never emits it; under `io_delta=true` its `data.metrics` also carry `read_ops_delta`, `write_ops_delta`, `read_bytes_per_sec_delta`, `write_bytes_per_sec_delta` and, on `svm-pvc` only, `read_latency_us_delta`, `write_latency_us_delta` — signed end-minus-start figures, `graph.IOMetrics.*Delta`, present only beside their base field and never setting the serialiser's `filled`).
 
   **Which endpoint emits which types.** `/v1/graph` emits every node and edge type its reads can build. `/v1/storage-graph` emits `storage-flow` edges over the NetApp, SVM, claim, pod and Kubernetes-node types. `/v1/k8s-graph` emits only the `pod`, `node` and `pvc` node types and the `pod-to-node` and `pod-mounts-pvc` edge types (plus the `cluster` / `namespace` / `application` / `controller` groups): it reads no Harvest, service or service-graph series, so a NetApp type, a `service` / `external` node, a `storage-cluster` group, `data.containers`, `data.qos` and the PVC `labels.aggr` / `labels.svm` never appear on it. The attributes it does carry are resolved by the same code as on the other two endpoints.
 

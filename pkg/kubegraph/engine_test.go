@@ -2,6 +2,7 @@ package kubegraph_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"strings"
@@ -344,4 +345,84 @@ func TestParseValues_EmptyFilterValueIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, req.Selector.Active())
 	assert.Empty(t, req.Scope.Namespaces)
+}
+
+func TestBuildStorageFromValues_IODeltaMatchesBuildStorageWith(t *testing.T) {
+	vals := url.Values{
+		"start":    {"1700000000"},
+		"end":      {"1700003600"},
+		"az":       {"zone-a"},
+		"env":      {"prod"},
+		"aggr":     {"aggr1"},
+		"io_delta": {"true"},
+	}
+	// Both fakes answer the delta query, so the equality below compares two
+	// bodies that carry changes rather than two that carry none.
+	fromValues := promqlfake.New(ioDeltaEstate())
+	fromValues.Delta = readOpsDelta()
+	typed := promqlfake.New(ioDeltaEstate())
+	typed.Delta = readOpsDelta()
+	body, err := kubegraph.New(fromValues, kubegraph.Options{}).BuildStorageFromValues(t.Context(), vals)
+	require.NoError(t, err)
+	assert.Equal(t, wantAggr1ReadOps, bodyReadOps(body.Elements.Edges),
+		"data.metrics carries read_ops_delta on every tier")
+	for _, e := range body.Elements.Edges {
+		if e.Data.Labels["tier"] == graph.StorageTierNodeAggr {
+			wire, err := json.Marshal(e.Data.Metrics)
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"read_ops":200,"read_ops_delta":-27.5}`, string(wire))
+		}
+	}
+
+	req, err := kubegraph.ParseStorageValues(vals)
+	require.NoError(t, err)
+	start, end := kubegraph.AlignWindow(req.Start, req.End, kubegraph.DefaultEndAlign)
+	g, err := kubegraph.New(typed, kubegraph.Options{}).BuildStorageWith(t.Context(),
+		end.Sub(start), end, req.Selector, req.Scope.Roots,
+		build.StorageOptions{IODelta: true})
+	require.NoError(t, err)
+	orders := claimIO(t, g, ordersClaimID)
+	assert.Equal(t, "read_ops=100 read_ops_delta=12.5", fmtReadOps(orders.ReadOps, orders.ReadOpsDelta))
+	assert.Equal(t, cytoscape.Serialise(g, graph.ProjectStorage(g, req.Scope)), body)
+
+	for _, q := range []*promqlfake.Querier{fromValues, typed} {
+		var deltas int
+		for _, family := range promql.QoSWorkloadQueries {
+			for _, query := range q.QueriesFor(family) {
+				if strings.Contains(query, "] offset ") {
+					deltas++
+				}
+			}
+		}
+		assert.Equal(t, len(promql.QoSWorkloadQueries), deltas, "one delta query per QoS family")
+	}
+}
+
+func TestBuildStorageFromValues_InvalidIODelta(t *testing.T) {
+	q := promqlfake.New(namespaceEstate())
+	_, err := kubegraph.New(q, kubegraph.Options{}).BuildStorageFromValues(t.Context(), url.Values{
+		"start":    {"1700000000"},
+		"end":      {"1700003600"},
+		"az":       {"zone-a"},
+		"env":      {"prod"},
+		"aggr":     {"aggr1"},
+		"io_delta": {"yes"},
+	})
+	pe, ok := errors.AsType[*kubegraph.ParseError](err)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_scope", pe.Reason)
+	assert.Empty(t, q.Issued())
+}
+
+func TestEngineBuildStorage_IssuesNoDeltaQuery(t *testing.T) {
+	q := promqlfake.New(namespaceEstate())
+	end := time.Unix(1700003600, 0).UTC()
+	scope, err := graph.NewStorageScope(nil, nil, graph.StorageRootAggr, []string{"aggr1"})
+	require.NoError(t, err)
+	_, err = kubegraph.New(q, kubegraph.Options{}).BuildStorage(t.Context(),
+		time.Hour, end, promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}, scope.Roots)
+	require.NoError(t, err)
+	for _, issued := range q.Issued() {
+		assert.NotContains(t, issued.Query, "] offset ", issued.Query)
+	}
 }

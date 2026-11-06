@@ -186,6 +186,11 @@ type topologyPlan struct {
 	// zero value, which renders last_over_time, so /v1/graph cannot select
 	// another rollup. Ceilings and every other family stay last_over_time.
 	ioRollup promql.Rollup
+	// ioDelta adds the six QoS workload delta reads (end minus start per
+	// series) to the scoped QoS wave. Only BuildStorageWith sets it; fullPlan
+	// and k8sPlan leave it false, so /v1/graph and /v1/k8s-graph cannot issue a
+	// delta query.
+	ioDelta bool
 
 	// phaseOne is the Harvest seed's phase-1 read, rendered, in (group, chunk)
 	// order. Non-empty means this build reads volume_labels from the root and

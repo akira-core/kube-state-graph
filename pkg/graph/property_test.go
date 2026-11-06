@@ -280,6 +280,22 @@ func genStorageEstate(r *rand.Rand) *Graph {
 				ReadOps: &ops, WriteOps: ptrFloat(ops / 2),
 				ReadLatencyUs: ptrFloat(100), MaxIOPS: ptrFloat(1000),
 			}
+			// Some claims carry change fields (signed, possibly zero), some
+			// carry only a few, some none: a tier change sums only the claims
+			// that have one, and must still conserve tier to tier.
+			if r.Intn(3) > 0 {
+				io.ReadOpsDelta = ptrFloat(float64(r.Intn(201) - 100))
+				io.ReadLatencyUsDelta = ptrFloat(float64(r.Intn(21) - 10))
+			}
+			if r.Intn(3) > 0 {
+				io.WriteOpsDelta = ptrFloat(float64(r.Intn(41) - 20))
+				// A change rides only beside its base figure, so the read-bytes
+				// change needs its base for conservation to exercise it.
+				io.ReadBytesPerSec = ptrFloat(ops * 4)
+				io.ReadBytesPerSecDelta = ptrFloat(float64(r.Intn(2001) - 1000))
+				io.WriteBytesPerSec = ptrFloat(ops * 3)
+				io.WriteBytesPerSecDelta = ptrFloat(float64(r.Intn(2001) - 1000))
+			}
 		}
 		svmID := NetAppSVMID(oc, svms[r.Intn(len(svms))])
 		var aggrID, ctrlID string
@@ -468,7 +484,7 @@ func assertStorageRetainedSubset(t *testing.T, seed int64, g *Graph, v View) {
 func assertStorageConservation(t *testing.T, seed int64, v View) {
 	t.Helper()
 	type bucket struct {
-		in, out       [4]float64
+		in, out       [8]float64
 		hasIn, hasOut bool
 	}
 	by := map[string]*bucket{}
@@ -480,7 +496,7 @@ func assertStorageConservation(t *testing.T, seed int64, v View) {
 		}
 		return b
 	}
-	add := func(dst *[4]float64, io *IOMetrics) {
+	add := func(dst *[8]float64, io *IOMetrics) {
 		if io == nil {
 			return
 		}
@@ -495,6 +511,18 @@ func assertStorageConservation(t *testing.T, seed int64, v View) {
 		}
 		if io.WriteBytesPerSec != nil {
 			dst[3] += *io.WriteBytesPerSec
+		}
+		if io.ReadOpsDelta != nil {
+			dst[4] += *io.ReadOpsDelta
+		}
+		if io.WriteOpsDelta != nil {
+			dst[5] += *io.WriteOpsDelta
+		}
+		if io.ReadBytesPerSecDelta != nil {
+			dst[6] += *io.ReadBytesPerSecDelta
+		}
+		if io.WriteBytesPerSecDelta != nil {
+			dst[7] += *io.WriteBytesPerSecDelta
 		}
 	}
 	for _, e := range v.Edges {
@@ -522,7 +550,8 @@ func assertStorageConservation(t *testing.T, seed int64, v View) {
 		default:
 			continue
 		}
-		for i, name := range []string{"read_ops", "write_ops", "read_bytes", "write_bytes"} {
+		for i, name := range []string{"read_ops", "write_ops", "read_bytes", "write_bytes",
+			"read_ops_delta", "write_ops_delta", "read_bytes_delta", "write_bytes_delta"} {
 			require.InDeltaf(t, round6prop(b.in[i]), round6prop(b.out[i]), 1e-9,
 				"seed=%d node=%s type=%s %s in=%g out=%g", seed, id, n.Type(), name, b.in[i], b.out[i])
 		}

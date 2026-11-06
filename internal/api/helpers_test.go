@@ -24,7 +24,35 @@ import (
 // the upstream Querier is asked a query containing that substring. Mirrors
 // the substring-match semantics of the previous httptest-based promMock but
 // without spinning a TCP listener.
+//
+// A needle built with deltaNeedle matches ONLY end-minus-start (delta) queries,
+// and an unmarked needle matches only non-delta ones. Every substring of a
+// `last` measurement query is also a substring of its delta query, so without
+// the split a measurement needle and a delta needle for the same family would
+// both match the delta query and fail as ambiguous. The ambiguity rule applies
+// within each class.
 type fixtureSet map[string]model.Vector
+
+// deltaMark prefixes a fixtureSet needle that targets delta queries only. It
+// is not a valid query byte, so it never collides with a real substring.
+const deltaMark = "\x00delta\x00"
+
+// deltaNeedle marks needle as matching only delta-shaped queries.
+func deltaNeedle(needle string) string { return deltaMark + needle }
+
+// isDeltaQuery reports whether query is the end-minus-start form
+// promql.RenderQoSVolumeScopedDelta renders.
+func isDeltaQuery(query string) bool { return strings.Contains(query, "] offset ") }
+
+// fixtureNeedleMatches reports whether a fixtureSet needle applies to query,
+// honouring the delta mark.
+func fixtureNeedleMatches(needle, query string) bool {
+	body, wantDelta := strings.CutPrefix(needle, deltaMark)
+	if wantDelta != isDeltaQuery(query) {
+		return false
+	}
+	return strings.Contains(query, body)
+}
 
 // newMockQuerier returns a Querier mock that responds to Instant by matching
 // the query string against fixtures. No match → empty Vector. Any number of
@@ -43,7 +71,7 @@ func newMockQuerier(t *testing.T, fixtures fixtureSet) *promqlmocks.MockQuerier 
 			var hits []string
 			var match model.Vector
 			for needle, vec := range fixtures {
-				if strings.Contains(query, needle) {
+				if fixtureNeedleMatches(needle, query) {
 					hits = append(hits, needle)
 					match = vec
 				}

@@ -98,7 +98,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Description
 //	@Description	**Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).
 //	@Description
-//	@Description	`cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `/v1/graph` ignores `io_rollup`. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
+//	@Description	`cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `io_delta` (`true` or `false`; default `false`) adds, beside the measurements, the signed change of each figure from the window start to its end (`read_ops_delta` …), is validated after `io_rollup` (400 `invalid_scope` for an unrecognised value or two different values), and costs six more QoS queries per delta chunk. `/v1/graph` and `/v1/k8s-graph` ignore both. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
 //	@Tags			graph
 //	@Produce		json
 //	@Param			start			query		string		true	"Window start. RFC 3339 or Unix seconds."	example(2026-05-01T12:00:00Z)
@@ -117,6 +117,7 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Param			pv				query		[]string	false	"Root kind: PersistentVolume name (cluster-scoped, bare), matched on the `volumename` of the claim bound to it; roots that claim. A volume bound to no claim roots nothing."	collectionFormat(multi)	example(pvc-ab12-cd34)
 //	@Param			application		query		[]string	false	"Root kind: ArgoCD Application name, as `data.application` carries it (the application-metadata metric's verbatim value when configured, else the tracking-id segment before the first `:`); matches a path whose pod or claim carries it; every pod resolving it is drawn even with no claim"	collectionFormat(multi)	example(checkout)
 //	@Param			io_rollup		query		string		false	"Per-series rollup of each of the six QoS workload measurements over the window, applied before claims are summed. `last` (the default) is the sample at the window end. `max` is that series' own peak, so a tier total is the sum of per-claim peaks and not the tier's own peak. `avg` is the unweighted mean of the samples the series has. Ceilings and gauges stay at the window end. `/v1/graph` ignores this parameter."	Enums(last,max,avg)	default(last)
+//	@Param			io_delta		query		string		false	"When `true`, every storage-flow edge that carries a measurement also carries its signed change over the window in `data.metrics`: `read_ops_delta`, `write_ops_delta`, `read_bytes_per_sec_delta`, `write_bytes_per_sec_delta` on every tier (summed and split like the flow weights) and `read_latency_us_delta`, `write_latency_us_delta` on the claim-level svm-pvc edge only. Each is the value at the window end minus the value at its start, in the unit of its base field (positive up, negative down, 0 unchanged). Independent of `io_rollup`: it is always the last value at the end minus the last value at the start. A field is absent, never 0, when the start value is unknown (no sample in the window-length span before `start`, a series created inside the window, labels that changed, or a poller that started scraping the workload inside the window). A tier change sums only the claims that carry one. Reads each series over twice the window; retention must cover `start` minus the window length. `/v1/graph` and `/v1/k8s-graph` ignore this parameter."	Enums(true,false)	default(false)
 //	@Param			X-API-Key		header		string		false	"API key. Required when the server is started with API keys configured."
 //	@Success		200				{object}	cytoscape.Body
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
@@ -133,8 +134,9 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 	s.serveGraph(c, req.Start, req.End, req.Selector,
 		func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error) {
 			// The roots reach the build: a pod root's name joins the pod scope.
-			// io_rollup changes only the six QoS workload range functions.
-			return s.builder.BuildStorageWith(ctx, window, end, sel, req.Scope.Roots, build.StorageOptions{IORollup: req.IORollup})
+			// io_rollup changes only the six QoS workload range functions; io_delta
+			// adds the six end-minus-start reads to the same wave.
+			return s.builder.BuildStorageWith(ctx, window, end, sel, req.Scope.Roots, build.StorageOptions{IORollup: req.IORollup, IODelta: req.IODelta})
 		},
 		"kube-state-graph.project_storage",
 		func(g *graph.Graph) graph.View { return graph.ProjectStorage(g, req.Scope) })
