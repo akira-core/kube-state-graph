@@ -793,7 +793,7 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 
 - **WHEN** a by-reference family's scope is empty
 - **THEN** it is not issued and is absent from the build's per-family series tally
-- **AND** an issued family's tally entry is the total count of series its restrictions matched across every read of the build
+- **AND** an issued family's tally entry is the total count of series its restrictions matched across every read of the build, except the end-minus-start reads of an `io_delta=true` build ("QoS workload delta" of the `netapp-storage-graph` capability), which are never tallied: a QoS workload family's entry counts its measurement read alone and does not move with `io_delta`
 
 #### Scenario: Chunk errors and cancellation
 

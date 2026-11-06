@@ -24,7 +24,7 @@ _None._
 
 ### Modified Capabilities
 
-- `storage-graph-api`: new `io_delta` request parameter (values, default, validation order, ignored on the other endpoints, not echoed), the delta fields on `storage-flow` edges and how they sum tier to tier, the determinism tuple gains `io_delta`, and the in-process engine surface exposes the switch without breaking existing callers.
+- `storage-graph-api`: new `io_delta` request parameter (values, default, validation order, ignored on the other endpoints, not echoed), the delta fields on `storage-flow` edges and how they sum tier to tier, the determinism tuple gains `io_delta`, the by-reference read's per-family series tally excludes the delta reads, and the in-process engine surface exposes the switch without breaking existing callers.
 - `netapp-storage-graph`: a `/v1/storage-graph` build with `io_delta` reads each QoS workload family's end-minus-start change per series over the same volume scope, chunked so the twice-rendered alternation still fits the byte budget, and the reader turns it into per-claim deltas with the same rules as the measurements, after a gate that drops the delta of a workload whose series set changed inside the window.
 
 ## Impact
