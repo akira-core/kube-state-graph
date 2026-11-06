@@ -573,58 +573,89 @@ func TestBuildStorage_FanOutLegCount(t *testing.T) {
 		promql.QPVCInfo: claimInfo, promql.QVolumeLabels: volume,
 	})
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := promqlfake.New(tc.fixtures)
-			tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
-				Options{}, promql.Selector{}, storagePlan(tc.roots))
-			require.NoError(t, err)
-
-			seen := map[string]int{}
-			for _, is := range f.Issued() {
-				seen[is.Name]++
+	// Every row also runs with io_delta on. The delta reads reuse the family
+	// names, so the distinct-family pin is unchanged; what moves is the QUERY
+	// count: +6 for a scope that fits one delta chunk (one per QoS family), and
+	// +0 when no volume matched (an empty scope issues no QoS query at all).
+	for _, delta := range []bool{false, true} {
+		for _, tc := range cases {
+			name := tc.name
+			if delta {
+				name += " (io_delta)"
 			}
-			want := make(map[string]bool, tc.want)
-			base := storageUnrestrictedLegs
-			if tc.tracked {
-				base = []promql.Query{promql.QAlerts}
-			}
-			for _, q := range base {
-				if slices.Contains(tc.skip, q) {
-					continue
-				}
-				want[string(q)] = true
-			}
-			for _, q := range tc.byReference {
-				want[string(q)] = true
-			}
-			if tc.matchVolume {
-				for _, q := range promql.QoSWorkloadQueries {
-					want[string(q)] = true
-				}
-			}
-			assert.Len(t, want, tc.want, "expected-set size must match the fan-out pin")
-			assert.Len(t, seen, tc.want, "distinct families issued")
-			for name := range want {
-				assert.Equal(t, 1, seen[name], "%s issued exactly once", name)
-				assert.Contains(t, tp.RawSeriesCount, name, "%s tallied", name)
-			}
-			for name := range seen {
-				assert.True(t, want[name], "unexpected family issued: %s", name)
-			}
-
-			for q := range storageSkippedLegs {
-				assert.Zero(t, seen[string(q)], "%s is never read by the storage build", q)
-				assert.NotContains(t, tp.RawSeriesCount, string(q), "a skipped family is absent, never 0")
-			}
-			for _, q := range promql.ReferenceScopedQueries {
-				if want[string(q)] {
-					continue
-				}
-				assert.NotContains(t, tp.RawSeriesCount, string(q), "%s: a family this case did not name is absent, never 0", q)
-			}
-		})
+			t.Run(name, func(t *testing.T) {
+				fanOutLegCount(t, tc.fixtures, tc.roots, tc.byReference, tc.skip, tc.matchVolume, tc.want, tc.tracked, delta)
+			})
+		}
 	}
+}
+
+// fanOutLegCount runs one TestBuildStorage_FanOutLegCount row, with the scoped
+// QoS delta read on or off.
+func fanOutLegCount(t *testing.T, fixtures map[promql.Query]model.Vector, roots graph.StorageRoots,
+	byReference, skip []promql.Query, matchVolume bool, wantFamilies int, tracked, delta bool) {
+	t.Helper()
+	f := promqlfake.New(fixtures)
+	plan := storagePlan(roots)
+	plan.ioDelta = delta
+	tp, err := readTopology(t.Context(), f, time.Minute, time.Unix(1, 0).UTC(),
+		Options{}, promql.Selector{}, plan)
+	require.NoError(t, err)
+
+	seen := map[string]int{}
+	deltaQueries := 0
+	for _, is := range f.Issued() {
+		if strings.Contains(is.Query, "] offset ") {
+			deltaQueries++
+			continue
+		}
+		seen[is.Name]++
+	}
+	if delta && matchVolume {
+		assert.Equal(t, len(promql.QoSWorkloadQueries), deltaQueries, "+6: one delta query per QoS family for a one-chunk scope")
+	} else {
+		assert.Zero(t, deltaQueries, "no delta query without io_delta, or with an empty scope")
+	}
+	want := make(map[string]bool, wantFamilies)
+	base := storageUnrestrictedLegs
+	if tracked {
+		base = []promql.Query{promql.QAlerts}
+	}
+	for _, q := range base {
+		if slices.Contains(skip, q) {
+			continue
+		}
+		want[string(q)] = true
+	}
+	for _, q := range byReference {
+		want[string(q)] = true
+	}
+	if matchVolume {
+		for _, q := range promql.QoSWorkloadQueries {
+			want[string(q)] = true
+		}
+	}
+	assert.Len(t, want, wantFamilies, "expected-set size must match the fan-out pin")
+	assert.Len(t, seen, wantFamilies, "distinct families issued")
+	for name := range want {
+		assert.Equal(t, 1, seen[name], "%s issued exactly once", name)
+		assert.Contains(t, tp.RawSeriesCount, name, "%s tallied", name)
+	}
+	for name := range seen {
+		assert.True(t, want[name], "unexpected family issued: %s", name)
+	}
+
+	for q := range storageSkippedLegs {
+		assert.Zero(t, seen[string(q)], "%s is never read by the storage build", q)
+		assert.NotContains(t, tp.RawSeriesCount, string(q), "a skipped family is absent, never 0")
+	}
+	for _, q := range promql.ReferenceScopedQueries {
+		if want[string(q)] {
+			continue
+		}
+		assert.NotContains(t, tp.RawSeriesCount, string(q), "%s: a family this case did not name is absent, never 0", q)
+	}
+
 }
 
 // merge2 returns a new map combining a and b, with b's entries winning on a

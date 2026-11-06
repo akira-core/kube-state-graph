@@ -3,6 +3,7 @@ package build
 import (
 	"cmp"
 	"log/slog"
+	"maps"
 	"slices"
 
 	"github.com/prometheus/common/model"
@@ -69,6 +70,12 @@ type qosCandidate struct {
 	// Hop B keeps one zone per workload so a workload labelled under several
 	// pairs is counted once.
 	zone zone
+	// series identifies the upstream series the row came from: the
+	// fingerprint of its whole label set minus the metric name, which range
+	// functions and arithmetic drop differently per store. Only the delta
+	// gate (keepUnchangedDeltaRows) reads it, and it is the zero value in a
+	// build that read no delta row (indexQoSFamily's withSeries).
+	series model.Fingerprint
 }
 
 // qosWorkload is a QoS row's identity minus its zone: two rows with the same
@@ -284,13 +291,34 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 
 	// Keyed by the same stock `volume` label the topology family carries, so a
 	// claim looks its QoS candidates up through the FlexVol names it matched.
+	//
+	// The series identity the delta gate compares is computed only when the
+	// build read at least one delta row; without one the gate has nothing to
+	// judge.
+	deltaRead := len(v.QoSReadOpsDelta)+len(v.QoSWriteOpsDelta)+len(v.QoSReadLatencyDelta)+
+		len(v.QoSWriteLatencyDelta)+len(v.QoSReadDataDelta)+len(v.QoSWriteDataDelta) > 0
 	qosIndex := map[string][]qosCandidate{}
-	indexQoSFamily(qosIndex, readOps, ioReadOps, keys)
-	indexQoSFamily(qosIndex, writeOps, ioWriteOps, keys)
-	indexQoSFamily(qosIndex, readLat, ioReadLat, keys)
-	indexQoSFamily(qosIndex, writeLat, ioWriteLat, keys)
-	indexQoSFamily(qosIndex, readData, ioReadData, keys)
-	indexQoSFamily(qosIndex, writeData, ioWriteData, keys)
+	indexQoSFamily(qosIndex, readOps, ioReadOps, keys, deltaRead)
+	indexQoSFamily(qosIndex, writeOps, ioWriteOps, keys, deltaRead)
+	indexQoSFamily(qosIndex, readLat, ioReadLat, keys, deltaRead)
+	indexQoSFamily(qosIndex, writeLat, ioWriteLat, keys, deltaRead)
+	indexQoSFamily(qosIndex, readData, ioReadData, keys, deltaRead)
+	indexQoSFamily(qosIndex, writeData, ioWriteData, keys, deltaRead)
+
+	// The end-minus-start rows of the same six families, indexed the same way
+	// into a SECOND index so the measurement's picks, ceiling and coverage
+	// signal never see them. Empty (and unread) without io_delta.
+	deltaIndex := map[string][]qosCandidate{}
+	indexQoSFamily(deltaIndex, v.QoSReadOpsDelta, ioReadOps, keys, true)
+	indexQoSFamily(deltaIndex, v.QoSWriteOpsDelta, ioWriteOps, keys, true)
+	indexQoSFamily(deltaIndex, v.QoSReadLatencyDelta, ioReadLat, keys, true)
+	indexQoSFamily(deltaIndex, v.QoSWriteLatencyDelta, ioWriteLat, keys, true)
+	indexQoSFamily(deltaIndex, v.QoSReadDataDelta, ioReadData, keys, true)
+	indexQoSFamily(deltaIndex, v.QoSWriteDataDelta, ioWriteData, keys, true)
+	// A workload whose labels changed inside the window still returns its
+	// OLD series' stale change from the upstream; drop it here, before any
+	// claim reads the index.
+	keepUnchangedDeltaRows(deltaIndex, qosIndex)
 
 	policyIndex := indexPolicyCeilings(policyMaxIOPS, policyMaxMBps)
 
@@ -376,6 +404,12 @@ func resolveNetAppStorage(claims []pvcVolume, v topologyVectors, keys promql.Lab
 			// The edge keeps its own rule: a ceiling rides only on an edge that
 			// carries a measurement, copied from the value the node carries.
 			applyCeiling(io, ceiling)
+			if len(deltaIndex) > 0 {
+				// The zone choice runs on the delta rows independently: two
+				// rows of one workload under different zones are copies scraped
+				// by two pollers, so either copy measures the same workload.
+				applyDelta(io, sumQoSIO(preferQoSZone(qosCandidatesFor(volsByClaim[i], deltaIndex), c.zone, keyOC, svm)))
+			}
 		}
 		hits[c.id] = joinHit{oc: oc, aggr: aggr, io: io}
 	}
@@ -634,7 +668,12 @@ func qosCandidatesFor(volumes []string, index map[string][]qosCandidate) []qosCa
 	return out
 }
 
-func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily, keys promql.LabelKeys) {
+// indexQoSFamily appends vec's rows to dst under their FlexVol name. series
+// is filled only when withSeries is set: the fingerprint is a real share of a
+// large build's reader time and only the delta gate reads it, so a build that
+// read no delta row (every /v1/graph build, every storage build without
+// io_delta) never computes one.
+func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamily, keys promql.LabelKeys, withSeries bool) {
 	for _, s := range vec {
 		vol := string(s.Metric[promql.HarvestVolumeLabel])
 		oc := string(s.Metric["cluster"])
@@ -642,7 +681,7 @@ func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamil
 			continue
 		}
 		z, _ := zoneOf(s.Metric, keys)
-		dst[vol] = append(dst[vol], qosCandidate{
+		c := qosCandidate{
 			ontapCluster: oc,
 			svm:          string(s.Metric["svm"]),
 			policyGroup:  string(s.Metric["policy_group"]),
@@ -651,8 +690,103 @@ func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamil
 			family:       fam,
 			value:        float64(s.Value),
 			zone:         z,
-		})
+		}
+		if withSeries {
+			c.series = seriesFingerprint(s.Metric)
+		}
+		dst[vol] = append(dst[vol], c)
 	}
+}
+
+// seriesFingerprint is m's fingerprint without __name__. A range function or
+// an arithmetic result may or may not keep the metric name depending on the
+// store, so the name never takes part in a series identity. m belongs to a
+// cached vector shared across builds, so it is never mutated: a set carrying
+// the name is cloned first.
+func seriesFingerprint(m model.Metric) model.Fingerprint {
+	if _, ok := m[model.MetricNameLabel]; !ok {
+		return m.Fingerprint()
+	}
+	c := m.Clone()
+	delete(c, model.MetricNameLabel)
+	return c.Fingerprint()
+}
+
+// deltaGateKey groups QoS rows for the delta gate: a workload's identity
+// WITHOUT the svm and the zone. qosWorkload keeps the svm because the zone
+// choice and the scope test need it; the gate drops it so a series whose svm
+// label appears, disappears or is renamed inside the window lands in the SAME
+// group as its predecessor instead of starting a group of its own that the
+// gate would never compare. The ONTAP cluster stays so two filers never mix,
+// and the lun stays so a LUN workload's churn never touches its volume's
+// delta.
+type deltaGateKey struct {
+	ontapCluster, volume, lun string
+	family                    ioFamily
+}
+
+func (c qosCandidate) deltaGate() deltaGateKey {
+	return deltaGateKey{ontapCluster: c.ontapCluster, volume: c.volume, lun: c.lun, family: c.family}
+}
+
+// keepUnchangedDeltaRows discards, in place, every delta row whose group
+// (deltaGateKey: ONTAP cluster, volume, lun and family, across every svm and
+// zone) has a set of delta series different from its set of measured series.
+//
+// The delta query subtracts the last sample before start from the last sample
+// in the window, matching the two operands by label set. A series whose labels
+// change inside the window (a policy group moved, an svm label added, a poller
+// relabelled or re-zoned) ends as one series and continues as another: the
+// OLD series has samples on both sides of start, so the upstream returns its
+// stale change, while the new one has no start sample and drops out. The
+// measurement read sees both series in the window, so the two sets differ and
+// the whole group contributes no delta. A second poller that starts scraping
+// the workload inside the window looks the same and drops the delta too:
+// absent is the honest answer when part of the workload has no start value.
+// A delta series the measurement lacks (two reads of a moving upstream) fails
+// the comparison as well.
+//
+// Equal sets do not prove the change is fresh. Undetected: a rename of a
+// label the group is keyed on (a FlexVol renamed to another name the claim
+// still matches, an ONTAP cluster or a lun renamed), which starts a group of
+// its own; a series that moved away before start and back inside the window,
+// whose two series both have samples on both sides of start; and a
+// measurement served from the result cache, read before a relabel the fresh
+// delta read cannot see either.
+//
+// The comparison is per group, never per claim, so a claim's other FlexVols,
+// LUN workloads and families keep their deltas. delta is the build's own
+// index, built from scratch; measured is only read, and both were indexed
+// with their series filled.
+func keepUnchangedDeltaRows(delta, measured map[string][]qosCandidate) {
+	for vol, rows := range delta {
+		want := seriesByGate(measured[vol])
+		got := seriesByGate(rows)
+		kept := make([]qosCandidate, 0, len(rows))
+		for _, c := range rows {
+			if k := c.deltaGate(); maps.Equal(want[k], got[k]) {
+				kept = append(kept, c)
+			}
+		}
+		if len(kept) == 0 {
+			delete(delta, vol)
+			continue
+		}
+		delta[vol] = kept
+	}
+}
+
+// seriesByGate collects the distinct series of each gate group among rows.
+func seriesByGate(rows []qosCandidate) map[deltaGateKey]map[model.Fingerprint]struct{} {
+	out := map[deltaGateKey]map[model.Fingerprint]struct{}{}
+	for _, c := range rows {
+		k := c.deltaGate()
+		if out[k] == nil {
+			out[k] = map[model.Fingerprint]struct{}{}
+		}
+		out[k][c.series] = struct{}{}
+	}
+	return out
 }
 
 // preferQoSZone returns a new slice of the candidates that pass qosInScope,
@@ -975,6 +1109,34 @@ func sumQoSIO(cands []qosCandidate) *graph.IOMetrics {
 		io.WriteBytesPerSec = &v
 	}
 	return io
+}
+
+// applyDelta copies the six figures sumQoSIO produced from a claim's delta
+// rows onto its measurement as the *Delta fields. delta is nil when the claim
+// has no delta row at all. A delta is attached only beside a measurement, so
+// the caller passes the claim's existing, non-nil IOMetrics.
+func applyDelta(io, delta *graph.IOMetrics) {
+	if delta == nil {
+		return
+	}
+	if io.ReadOps != nil {
+		io.ReadOpsDelta = delta.ReadOps
+	}
+	if io.WriteOps != nil {
+		io.WriteOpsDelta = delta.WriteOps
+	}
+	if io.ReadLatencyUs != nil {
+		io.ReadLatencyUsDelta = delta.ReadLatencyUs
+	}
+	if io.WriteLatencyUs != nil {
+		io.WriteLatencyUsDelta = delta.WriteLatencyUs
+	}
+	if io.ReadBytesPerSec != nil {
+		io.ReadBytesPerSecDelta = delta.ReadBytesPerSec
+	}
+	if io.WriteBytesPerSec != nil {
+		io.WriteBytesPerSecDelta = delta.WriteBytesPerSec
+	}
 }
 
 func sumIOFamily(vals []float64) (float64, bool) {

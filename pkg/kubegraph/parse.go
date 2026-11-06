@@ -106,6 +106,10 @@ type StorageRequest struct {
 	// Absent and empty values are RollupLast. The field is never the zero
 	// Rollup: ParseStorageValues always sets one of the three constants.
 	IORollup promql.Rollup
+	// IODelta asks for the end-minus-start change of every QoS figure beside
+	// the figure itself (build.StorageOptions.IODelta). Absent and empty values
+	// are false. ParseStorageValues is the only place that fills it.
+	IODelta bool
 }
 
 // ParseStorageValues parses the /v1/storage-graph query parameters. It shares
@@ -114,7 +118,8 @@ type StorageRequest struct {
 // repeatable — the selected zones are their Cartesian product; `prune` and
 // every unknown parameter — including the withdrawn `edge_type` — are ignored.
 // `io_rollup` is read after the root, so a missing root wins over an invalid
-// rollup. An absent or empty value is last.
+// rollup. An absent or empty value is last. `io_delta` is read after
+// `io_rollup`; an absent or empty value is false.
 func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	var req StorageRequest
 
@@ -156,6 +161,11 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		return req, err
 	}
 	req.IORollup = ioRollup
+	ioDelta, err := parseIODelta(v["io_delta"])
+	if err != nil {
+		return req, err
+	}
+	req.IODelta = ioDelta
 	req.Selector = promql.Selector{
 		AZ:        az,
 		Env:       env,
@@ -163,6 +173,31 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 		Namespace: v["namespace"],
 	}
 	return req, nil
+}
+
+// parseIODelta reads the optional io_delta parameter with the same repeated-
+// value rule as io_rollup: empty values are dropped, the rest are sorted and
+// de-duplicated, so a repeated identical value is one value and two different
+// values are a conflict. No remaining value is false; the only accepted
+// literals are true and false (no case folding, no 1/0, no yes/no). The raw
+// value is validated before it is ever quoted into a message.
+func parseIODelta(values []string) (bool, error) {
+	if err := validateSelectorValues("io_delta", values); err != nil {
+		return false, err
+	}
+	got := nonEmptySorted(values)
+	switch len(got) {
+	case 0:
+		return false, nil
+	case 1:
+		switch got[0] {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
+	}
+	return false, &ParseError{"invalid_scope", fmt.Sprintf("io_delta must be true or false, got %q", strings.Join(got, ","))}
 }
 
 // parseIORollup reads the optional io_rollup parameter. Empty values are

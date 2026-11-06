@@ -215,3 +215,69 @@ func TestRenderQoSVolumeScoped_DoesNotDisturbRender(t *testing.T) {
 			Render(q, time.Minute, LabelKeys{}, Selector{}))
 	}
 }
+
+func TestRenderQoSVolumeScopedDelta(t *testing.T) {
+	t.Parallel()
+
+	const matcher = `{volume=~"v_a|v_b"}[5m]`
+	volumes := []string{"v_b", "v_a"}
+	window := 5 * time.Minute
+
+	t.Run("end minus start per series, one selector twice", func(t *testing.T) {
+		t.Parallel()
+		for _, q := range QoSWorkloadQueries {
+			got, ok := RenderQoSVolumeScopedDelta(q, window, LabelKeys{}, Selector{}, volumes)
+			require.True(t, ok, string(q))
+			assert.Equal(t,
+				`last_over_time(`+string(q)+matcher+`) - last_over_time(`+string(q)+matcher+` offset 5m)`, got)
+		}
+	})
+
+	t.Run("window and offset both go through FormatDuration", func(t *testing.T) {
+		t.Parallel()
+		got, ok := RenderQoSVolumeScopedDelta(QQoSReadOps, 90*time.Second, LabelKeys{}, Selector{}, []string{"v"})
+		require.True(t, ok)
+		assert.Equal(t,
+			`last_over_time(qos_read_ops{volume="v"}[90s]) - last_over_time(qos_read_ops{volume="v"}[90s] offset 90s)`, got)
+	})
+
+	t.Run("both operands carry the rollup render's matcher set", func(t *testing.T) {
+		t.Parallel()
+		sel := Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}, Cluster: []string{"c1"}, Namespace: []string{"shop"}}
+		keys := LabelKeys{AZ: "zone", Env: "stage"}
+		for _, q := range QoSWorkloadQueries {
+			last, ok := RenderQoSVolumeScopedRollup(q, window, keys, sel, volumes, RollupLast)
+			require.True(t, ok)
+			got, ok := RenderQoSVolumeScopedDelta(q, window, keys, sel, volumes)
+			require.True(t, ok)
+			assert.Equal(t, last+` - `+strings.TrimSuffix(last, `)`)+` offset 5m)`, got)
+			assert.NotContains(t, got, "lun", "volume granularity is the reader's rule, never a matcher")
+			// Harvest is routed, not matched: neither the configured zone keys
+			// nor the cluster / namespace values reach either operand.
+			assert.NotContains(t, got, `zone=`)
+			assert.NotContains(t, got, `stage=`)
+			assert.NotContains(t, got, `cluster=`)
+			assert.NotContains(t, got, `namespace=`)
+			assert.NotContains(t, got, "delta(")
+			assert.NotContains(t, got, "rate(")
+		}
+	})
+
+	t.Run("a non-QoS query renders nothing", func(t *testing.T) {
+		t.Parallel()
+		for _, q := range []Query{QVolumeLabels, QQoSPolicyFixedMaxIOPS, QAggrStatus, QPodInfo} {
+			got, ok := RenderQoSVolumeScopedDelta(q, window, LabelKeys{}, Selector{}, volumes)
+			assert.False(t, ok, string(q))
+			assert.Empty(t, got)
+		}
+	})
+
+	t.Run("an empty scope renders nothing", func(t *testing.T) {
+		t.Parallel()
+		for _, vols := range [][]string{nil, {"", ""}} {
+			got, ok := RenderQoSVolumeScopedDelta(QQoSReadOps, window, LabelKeys{}, Selector{}, vols)
+			assert.False(t, ok)
+			assert.Empty(t, got)
+		}
+	})
+}

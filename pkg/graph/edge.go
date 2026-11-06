@@ -131,6 +131,20 @@ type IOMetrics struct {
 	WriteBytesPerSec *float64
 	MaxIOPS          *float64
 	MaxBytesPerSec   *float64
+
+	// The six *Delta fields are the end-minus-start change of the base field
+	// beside them, signed and in the base field's unit (positive = up, zero =
+	// unchanged). They are set only by a /v1/storage-graph build with
+	// io_delta=true, only beside a non-nil base field, and nil means the start
+	// value is unknown — never 0. They never count as a measurement: an
+	// IOMetrics holding only deltas serialises no metrics, and a ceiling never
+	// rides on one.
+	ReadOpsDelta          *float64
+	WriteOpsDelta         *float64
+	ReadLatencyUsDelta    *float64
+	WriteLatencyUsDelta   *float64
+	ReadBytesPerSecDelta  *float64
+	WriteBytesPerSecDelta *float64
 }
 
 // NewEdge constructs an Edge with a deterministic UUIDv5 id derived from

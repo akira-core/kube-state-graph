@@ -62,6 +62,45 @@ func RenderQoSVolumeScoped(q Query, window time.Duration, keys LabelKeys, sel Se
 // ok is false on the same inputs as RenderQoSVolumeScoped: q is not a QoS
 // workload family, or volumes normalises to nothing.
 func RenderQoSVolumeScopedRollup(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string, rollup Rollup) (string, bool) {
+	selector, ok := qosVolumeSelector(q, window, keys, sel, volumes)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf(`%s(%s)`, rollup.rangeFunc(), selector), true
+}
+
+// RenderQoSVolumeScopedDelta renders the end-minus-start change of one QoS
+// workload query over the same FlexVol scope and matcher set as the rollup
+// render:
+//
+//	last_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m]) - last_over_time(qos_read_ops{volume=~"v_a|v_b"}[5m] offset 5m)
+//
+// The left operand is each series' last sample in (end-w, end]; the right is
+// its last sample in (start-w, start], the value a plain last-rollup request
+// for the window ending at start would read. The two operands carry identical
+// label sets apart from __name__, which arithmetic matching ignores, so the
+// subtraction is one-to-one and a series with no start sample drops out: its
+// delta is absent, never zero. It is deliberately not PromQL delta(), which
+// extrapolates in Prometheus and reads the sample before the window only
+// within the staleness interval in VictoriaMetrics, and not rate-of-a-rate.
+// It stays standard PromQL — two rollups of ONE selector, never a join of two
+// families — so any Prometheus-compatible store serves it. The window is
+// rendered twice, so the result scans twice the window.
+//
+// ok is false on the same inputs as RenderQoSVolumeScopedRollup.
+func RenderQoSVolumeScopedDelta(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string) (string, bool) {
+	selector, ok := qosVolumeSelector(q, window, keys, sel, volumes)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf(`last_over_time(%s) - last_over_time(%s offset %s)`,
+		selector, selector, FormatDuration(window)), true
+}
+
+// qosVolumeSelector renders `<family>{<matchers>}[<window>]`, the one body both
+// the rollup and the delta render share. ok is false when q is not a QoS
+// workload family or volumes normalises to nothing.
+func qosVolumeSelector(q Query, window time.Duration, keys LabelKeys, sel Selector, volumes []string) (string, bool) {
 	if !isQoSWorkloadQuery(q) {
 		return "", false
 	}
@@ -70,8 +109,7 @@ func RenderQoSVolumeScopedRollup(q Query, window time.Duration, keys LabelKeys, 
 		return "", false
 	}
 	matchers := appendMatcher(requestMatchers(q, keys, sel), HarvestVolumeLabel, vals)
-	return fmt.Sprintf(`%s(%s{%s}[%s])`,
-		rollup.rangeFunc(), q, strings.Join(matchers, ","), FormatDuration(window)), true
+	return fmt.Sprintf(`%s{%s}[%s]`, q, strings.Join(matchers, ","), FormatDuration(window)), true
 }
 
 // ChunkQoSVolumeScope splits a sorted, de-duplicated FlexVol scope into

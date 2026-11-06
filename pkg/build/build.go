@@ -266,7 +266,7 @@ func (b *Builder) BuildStorage(ctx context.Context, window time.Duration, end ti
 
 // StorageOptions carries the choices a storage build takes beyond the
 // request's roots and selector. The zero value is the build BuildStorage
-// runs: each QoS series reduced with last_over_time.
+// runs: each QoS series reduced with last_over_time, and no delta read.
 type StorageOptions struct {
 	// IORollup reduces each of the six QoS workload series over the window
 	// before the reader sums. The zero value and RollupLast are last_over_time.
@@ -274,11 +274,23 @@ type StorageOptions struct {
 	// the samples the series has. Ceilings and every other family stay
 	// last_over_time. An invalid value is ReasonInvalidScope and issues no query.
 	IORollup promql.Rollup
+	// IODelta adds, per QoS workload family, the end-minus-start change of
+	// every series (last value in the window minus last value in the equally
+	// long span ending at start) to the scoped QoS wave, and the claim's
+	// IOMetrics gain the *Delta fields beside the figures that have a start
+	// value. A workload one of whose series appeared inside the window without
+	// a start value (a relabel such as a moved policy group, a re-zoned or new
+	// poller) carries no delta: the upstream still returns the old series'
+	// stale change, and the reader drops it. It is independent of IORollup.
+	// The delta reads fail the build on error like every other storage-build
+	// query. The zero value issues nothing extra.
+	IODelta bool
 }
 
-// BuildStorageWith is BuildStorage with an explicit rollup. It rejects a
-// rollup Valid does not accept before the plan is prepared and before a
-// querier is bound, and it does not coerce that value to last.
+// BuildStorageWith is BuildStorage with explicit StorageOptions: the QoS
+// rollup and the io_delta switch. It rejects a rollup Valid does not accept
+// before the plan is prepared and before a querier is bound, and it does not
+// coerce that value to last.
 func (b *Builder) BuildStorageWith(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots, opts StorageOptions) (*graph.Graph, error) {
 	if !opts.IORollup.Valid() {
 		return nil, NewError(ReasonInvalidScope,
@@ -286,6 +298,7 @@ func (b *Builder) BuildStorageWith(ctx context.Context, window time.Duration, en
 	}
 	plan := storagePlan(roots)
 	plan.ioRollup = opts.IORollup
+	plan.ioDelta = opts.IODelta
 	return b.buildStorage(ctx, window, end, sel, plan)
 }
 

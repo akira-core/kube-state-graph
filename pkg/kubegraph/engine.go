@@ -173,8 +173,9 @@ func (e *Engine) BuildStorage(ctx context.Context, window time.Duration, end tim
 	return e.BuildStorageWith(ctx, window, end, sel, roots, build.StorageOptions{})
 }
 
-// BuildStorageWith is BuildStorage with an explicit QoS rollup. The zero
-// StorageOptions selects last_over_time for the six QoS workload queries,
+// BuildStorageWith is BuildStorage with explicit storage options: the QoS
+// rollup and the io_delta switch. The zero StorageOptions selects
+// last_over_time for the six QoS workload queries and issues no delta read,
 // which is what BuildStorage does. An invalid IORollup is
 // build.ReasonInvalidScope and issues no query.
 func (e *Engine) BuildStorageWith(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector, roots graph.StorageRoots, opts build.StorageOptions) (*graph.Graph, error) {
@@ -184,9 +185,9 @@ func (e *Engine) BuildStorageWith(ctx context.Context, window time.Duration, end
 // BuildStorageFromValues parses the /v1/storage-graph query parameters, builds
 // the storage-flow graph, applies the storage projection, and serialises to
 // the Cytoscape body. Parsing failures are *ParseError; build failures
-// propagate the build layer's typed errors. The parsed io_rollup is forwarded
-// to BuildStorageWith; an invalid value is a *ParseError invalid_scope before
-// any query. The HTTP handler uses the same parser, so the request contract
+// propagate the build layer's typed errors. The parsed io_rollup and io_delta
+// are forwarded to BuildStorageWith; an invalid value of either is a
+// *ParseError invalid_scope before any query. The HTTP handler uses the same parser, so the request contract
 // cannot drift.
 func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cytoscape.Body, error) {
 	req, err := ParseStorageValues(v)
@@ -194,7 +195,7 @@ func (e *Engine) BuildStorageFromValues(ctx context.Context, v url.Values) (cyto
 		return cytoscape.Body{}, err
 	}
 	start, end := AlignWindow(req.Start, req.End, e.endAlign)
-	g, err := e.BuildStorageWith(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots, build.StorageOptions{IORollup: req.IORollup})
+	g, err := e.BuildStorageWith(ctx, end.Sub(start), end, req.Selector, req.Scope.Roots, build.StorageOptions{IORollup: req.IORollup, IODelta: req.IODelta})
 	if err != nil {
 		return cytoscape.Body{}, err
 	}

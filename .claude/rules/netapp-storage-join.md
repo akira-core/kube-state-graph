@@ -139,8 +139,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     empty-string matcher admits rows carrying no `lun` label at all. Cardinality
     stays bounded because the six legs are issued ONLY through
     `RenderQoSVolumeScopedRollup` (`RenderQoSVolumeScoped` delegates to it
-    with the zero rollup). The range function is chosen at render time, per
-    series, before the LUN discard, the one-zone-per-workload choice and the
+    with the zero rollup) and, under `io_delta=true`,
+    `RenderQoSVolumeScopedDelta` — both over the same `volume` scope. The
+    range function is chosen at render time, per series, before the LUN discard, the one-zone-per-workload choice and the
     sum: `last_over_time`, `max_over_time` or `avg_over_time`. `/v1/graph`
     leaves the rollup at its zero value, so those six queries render
     `last_over_time` there. A `/v1/storage-graph` build uses the request's
@@ -186,6 +187,76 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     Harvest family still renders no `az` / `env` / `cluster` / `namespace`
     matcher — but the claims that produced it were loaded under the request's
     selectors, which is "narrowed by reference" reaching the query layer.
+    **Change over the window (`io_delta=true`, `/v1/storage-graph` only).** The
+    same wave also issues, per family and per chunk, the end-minus-start change
+    of every series over the SAME `volume` scope, rendered by
+    `promql.RenderQoSVolumeScopedDelta`:
+    `last_over_time(f{volume=~"…"}[w]) - last_over_time(f{volume=~"…"}[w] offset w)`.
+    The right operand is the last sample in the `w` before `start`, so a series
+    with no start sample has no match and drops out: its delta is absent, never
+    `0`. A series whose labels changed inside the window is NOT dropped by the
+    query: the OLD series has samples on both sides of `start` and returns its
+    stale change, while the new one has no start sample; the reader's gate
+    below discards it. It is two rollups of ONE selector, not a join of two
+    families, and not PromQL `delta()` (extrapolated in Prometheus,
+    staleness-dependent in VictoriaMetrics). The window is rendered twice, so a
+    delta chunk uses HALF the byte budget (`deltaBudget`); it is independent of
+    `io_rollup`. Queries keep the bare family name (no new `Query` constant), land
+    in six `QoS*Delta` vectors in chunk order, and are read by the SAME reader:
+    `resolveNetAppStorage` indexes them into a second `qosIndex`, gates it
+    with `keepUnchangedDeltaRows(deltaIndex, qosIndex)`, then runs
+    `preferQoSZone` + `sumQoSIO` over it per claim (LUN discard, one zone per
+    workload, scope test, sorted sum) and copies the result onto the claim's
+    existing `IOMetrics` as the `*Delta` fields — only when that `IOMetrics` is
+    non-nil, so a delta never creates a measurement. **The gate** keeps a
+    group's delta rows only when, for that `deltaGateKey` (ONTAP cluster,
+    `volume`, `lun`, family — `qosWorkload` WITHOUT the `svm`) taken ACROSS
+    EVERY `svm` AND ZONE, the set of distinct series in the delta index EQUALS
+    the set in the measurement index; else the whole group contributes no
+    delta. A series is `qosCandidate.series` (`seriesFingerprint`: the label
+    set minus `__name__`, which stores keep or drop differently through range
+    functions and arithmetic — VictoriaMetrics keeps it on `last_over_time`
+    and drops it on `-`; the cached `Metric` is cloned, never mutated),
+    computed only when the build read at least one delta row, so `/v1/graph`
+    and a storage build without `io_delta` never pay for it. The delta's left
+    operand reads the same window and selector as the measurement, so its
+    series are a subset of the measured ones, and the sets differ when a
+    series of the group appeared inside the window without a start value: a
+    relabel (policy group moved, `svm` added or renamed), a re-zoned poller, or
+    a new poller of ANY zone starting mid-window — the last drops the group's
+    delta even when another zone's copy had a valid one (accepted). A delta
+    series the measurement lacks fails too. Per group, never per claim: a
+    claim's other FlexVols, LUN workloads and families keep theirs. Do NOT
+    narrow it to per (workload, zone) — a relabel of `az` / `env` itself would
+    then pass its stale change — nor put the `svm` back in the key — an `svm`
+    label appearing or renamed would. Keep the ONTAP cluster (filers never mix)
+    and the `lun` (LUN churn never touches the volume's delta). Equal sets do
+    NOT prove freshness; undetected: a rename of a key label (a FlexVol renamed
+    to another name the claim still matches, an ONTAP cluster, a `lun`), a
+    series that moved away before `start` and back inside the window, and a
+    cached measurement read before a relabel within ingestion lag of `end`.
+    `resolveCeiling`, the policy pick and the `netapp_*_join_miss` signals read
+    the measurement rows only, so the gate never changes them.
+    Storage-only: `topologyPlan.ioDelta` is set by `BuildStorageWith` alone, so
+    `/v1/graph` and `/v1/k8s-graph` never issue a delta query. Delta chunks
+    fail closed like every storage-build query and are NOT written to
+    `ScopeIssued` / `ExtraSeriesCount`, so the per-family series tally keeps
+    describing the measurement read. Tests: `pkg/promql/qosscope_test.go`,
+    `pkg/build/iodelta_reader_test.go` (the gate:
+    `TestIODelta_ALabelChangeInsideTheWindowLeavesNoDelta`,
+    `TestIODelta_TheLabelChangeGateIsPerWorkload`,
+    `TestIODelta_AnUnchangedSeriesSetKeepsItsDelta`,
+    `TestIODelta_ASeriesNewInsideTheWindowLeavesNoDelta`,
+    `TestIODelta_ADeltaSeriesTheMeasurementLacksLeavesNoDelta`,
+    `TestIODelta_TheGateIgnoresTheMetricName`,
+    `TestIODelta_ANewLUNWorkloadLeavesTheVolumeDelta`,
+    `TestIODelta_AnSVMRelabelInsideTheWindowLeavesNoDelta`,
+    `TestIODelta_OneFlexVolNameInTwoSVMsKeepsItsDelta`), `pkg/build/iodelta_test.go`,
+    `pkg/kubegraph/storage_iodelta_test.go` (the embedder reads the change by
+    value, gate included), `internal/integration` `TestIODelta`
+    (`TestRelabelInsideTheWindowLeavesNoDelta`: VictoriaMetrics returns the old
+    series' stale change, the body carries none),
+    `TestBuildStorage_FanOutLegCount` (`+6` queries for a one-chunk scope).
   - **hop C `qos_policy_fixed_max_throughput_{iops,mbps}`** — the declared
     ceiling, joined on the `(ontap_cluster, svm, policy_group)` triple assembled
     from BOTH topology hops: **hop A** owns the ONTAP cluster of the picked

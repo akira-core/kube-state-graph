@@ -418,7 +418,7 @@ func readTopology(
 	}
 	g.Go(func() error {
 		return readScopedQoS(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, plan.failClosed,
-			plan.ioRollup, pvcInfoDone, volumeLabelsFinal)
+			plan.ioRollup, plan.ioDelta, pvcInfoDone, volumeLabelsFinal)
 	})
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
 	// kube_node_* families and the eight controller-owner /

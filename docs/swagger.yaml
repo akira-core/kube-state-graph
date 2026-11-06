@@ -52,9 +52,15 @@ components:
         write_latency_us, read_bytes_per_sec, write_bytes_per_sec, plus the volume''s
         own QoS policy group''s declared ceiling, max_iops and max_bytes_per_sec (absent
         means no declared ceiling, never 0; neither appears without at least one measurement).
-        A single edge carries fields from exactly one family. All values are JSON
-        numbers rounded to 6 significant digits and may appear in exponent form (e.g.
-        3.86e-7).'
+        On a GET /v1/storage-graph body requested with io_delta=true, a storage-flow
+        edge also carries signed change fields beside the measurements that have a
+        start value: read_ops_delta, write_ops_delta, read_bytes_per_sec_delta, write_bytes_per_sec_delta
+        on every tier, and read_latency_us_delta, write_latency_us_delta on the claim-level
+        svm-pvc edge only. Each is the value at the window end minus the value at
+        its start, in the unit of its base field (positive up, negative down, 0 unchanged),
+        and is absent when the start value is unknown, never 0. A single edge carries
+        fields from exactly one family. All values are JSON numbers rounded to 6 significant
+        digits and may appear in exponent form (e.g. 3.86e-7).'
       properties:
         error_rate:
           description: ErrorRate is the failed fraction in [0,1]. Omitted when the
@@ -83,15 +89,44 @@ components:
           type: number
         read_bytes_per_sec:
           type: number
+        read_bytes_per_sec_delta:
+          description: ReadBytesPerSecDelta is read_bytes_per_sec at the window end
+            minus its start value, in bytes per second. Same rules as read_ops_delta.
+          type: number
         read_latency_us:
+          type: number
+        read_latency_us_delta:
+          description: ReadLatencyUsDelta is read_latency_us at the window end minus
+            its start value, in microseconds per operation. Carried by the claim-level
+            (svm-pvc) edge only, beside read_latency_us.
           type: number
         read_ops:
           type: number
+        read_ops_delta:
+          description: 'ReadOpsDelta is read_ops at the window end minus read_ops
+            at its start, in requests per second. Signed: positive is up, negative
+            down, 0 unchanged. Present only on a GET /v1/storage-graph body requested
+            with io_delta=true, only beside read_ops, and absent when no start value
+            exists (never 0).'
+          type: number
         write_bytes_per_sec:
+          type: number
+        write_bytes_per_sec_delta:
+          description: WriteBytesPerSecDelta is write_bytes_per_sec at the window
+            end minus its start value, in bytes per second. Same rules as read_ops_delta.
           type: number
         write_latency_us:
           type: number
+        write_latency_us_delta:
+          description: WriteLatencyUsDelta is write_latency_us at the window end minus
+            its start value, in microseconds per operation. Carried by the claim-level
+            (svm-pvc) edge only, beside write_latency_us.
+          type: number
         write_ops:
+          type: number
+        write_ops_delta:
+          description: WriteOpsDelta is write_ops at the window end minus write_ops
+            at its start, in requests per second. Same rules as read_ops_delta.
           type: number
       type: object
     github_com_akira-core_kube-state-graph_pkg_cytoscape.Elements:
@@ -655,7 +690,7 @@ paths:
 
         **Group metadata**: when the optional application-metadata metric is configured, `namespace` and `application` groups carry `namespace_owner`, `namespace_group`, `namespace_group_owner`, `namespace_alias`, `deployed_by` and `deployed_at` exactly as on `/v1/graph` (omitempty, never inside `labels`). The metric is read per loaded cluster, restricted to the namespaces of the loaded pods and claims; a failure of that read fails the request (502 `upstream query failed: app_metadata`).
 
-        `cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `/v1/graph` ignores `io_rollup`. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
+        `cluster` / `namespace` remain optional narrowing filters. `io_rollup` (`last`, `max` or `avg`; default `last`) reduces each of the six QoS workload series over the window before claims are summed, and is validated after the root (400 `invalid_scope` for an unrecognised value or two different values). `prune` and every unknown parameter — including the withdrawn `edge_type` — are ignored. `io_delta` (`true` or `false`; default `false`) adds, beside the measurements, the signed change of each figure from the window start to its end (`read_ops_delta` …), is validated after `io_rollup` (400 `invalid_scope` for an unrecognised value or two different values), and costs six more QoS queries per delta chunk. `/v1/graph` and `/v1/k8s-graph` ignore both. Auth, timeout (504) and upstream error mapping match `/v1/graph`.
       parameters:
       - description: Window start. RFC 3339 or Unix seconds.
         example: "2026-05-01T12:00:00Z"
@@ -820,6 +855,28 @@ paths:
           - last
           - max
           - avg
+          type: string
+      - description: 'When `true`, every storage-flow edge that carries a measurement
+          also carries its signed change over the window in `data.metrics`: `read_ops_delta`,
+          `write_ops_delta`, `read_bytes_per_sec_delta`, `write_bytes_per_sec_delta`
+          on every tier (summed and split like the flow weights) and `read_latency_us_delta`,
+          `write_latency_us_delta` on the claim-level svm-pvc edge only. Each is the
+          value at the window end minus the value at its start, in the unit of its
+          base field (positive up, negative down, 0 unchanged). Independent of `io_rollup`:
+          it is always the last value at the end minus the last value at the start.
+          A field is absent, never 0, when the start value is unknown (no sample in
+          the window-length span before `start`, a series created inside the window,
+          labels that changed, or a poller that started scraping the workload inside
+          the window). A tier change sums only the claims that carry one. Reads each
+          series over twice the window; retention must cover `start` minus the window
+          length. `/v1/graph` and `/v1/k8s-graph` ignore this parameter.'
+        in: query
+        name: io_delta
+        schema:
+          default: "false"
+          enum:
+          - "true"
+          - "false"
           type: string
       - description: API key. Required when the server is started with API keys configured.
         in: header

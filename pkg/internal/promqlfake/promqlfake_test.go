@@ -108,3 +108,39 @@ func TestQuerier_SuffixTokenAlternation(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1, "both matchers must hold: an AND, not a union")
 }
+
+// A delta query (` offset ` operand) is answered from Delta, a measurement
+// query only from the by-name fixtures, so one family name can carry both
+// answers without the shape of the query being ignored.
+func TestQuerier_DeltaShapeAnswersFromDeltaFixtures(t *testing.T) {
+	sample := func(volume string, v float64) *model.Sample {
+		return &model.Sample{Metric: model.Metric{"volume": model.LabelValue(volume)}, Value: model.SampleValue(v)}
+	}
+	f := New(map[promql.Query]model.Vector{
+		promql.QQoSReadOps: {sample("v_a", 100), sample("v_b", 200)},
+	})
+	f.Delta = map[promql.Query]model.Vector{
+		promql.QQoSReadOps: {sample("v_a", 50), sample("v_b", -10)},
+	}
+	volumes := []string{"v_a"}
+	last, ok := promql.RenderQoSVolumeScopedRollup(promql.QQoSReadOps, time.Minute, promql.LabelKeys{}, promql.Selector{}, volumes, promql.RollupLast)
+	require.True(t, ok)
+	delta, ok := promql.RenderQoSVolumeScopedDelta(promql.QQoSReadOps, time.Minute, promql.LabelKeys{}, promql.Selector{}, volumes)
+	require.True(t, ok)
+
+	got, err := f.Instant(t.Context(), string(promql.QQoSReadOps), last, time.Unix(1, 0))
+	require.NoError(t, err)
+	require.Len(t, got, 1, "the measurement query keeps its by-name fixture, volume-filtered")
+	assert.InDelta(t, 100, float64(got[0].Value), 1e-9)
+
+	got, err = f.Instant(t.Context(), string(promql.QQoSReadOps), delta, time.Unix(1, 0))
+	require.NoError(t, err)
+	require.Len(t, got, 1, "the delta query is answered from Delta, volume-filtered")
+	assert.InDelta(t, 50, float64(got[0].Value), 1e-9)
+
+	// No delta fixture for a family: an empty vector, never the measurement.
+	f.Delta = nil
+	got, err = f.Instant(t.Context(), string(promql.QQoSReadOps), delta, time.Unix(1, 0))
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}

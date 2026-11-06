@@ -31,7 +31,7 @@ func readQoSRollup(t *testing.T, fx map[promql.Query]model.Vector, roll promql.R
 	close(done)
 	var mu sync.Mutex
 	require.NoError(t, readScopedQoS(ctx, ctx, q, time.Minute, time.Unix(1, 0).UTC(),
-		Options{}, promql.Selector{}, &v, &mu, false, roll, done, done))
+		Options{}, promql.Selector{}, &v, &mu, false, roll, false, done, done))
 	return q, v
 }
 

@@ -382,3 +382,105 @@ func TestParseStorageValues_IORollup(t *testing.T) {
 		assert.Equal(t, "missing_root", pe.Reason)
 	})
 }
+
+func TestParseStorageValues_IODelta(t *testing.T) {
+	withDelta := func(values ...string) url.Values {
+		v := storageBase()
+		v.Set("aggr", "aggr1")
+		v["io_delta"] = values
+		return v
+	}
+
+	t.Run("absent is false", func(t *testing.T) {
+		v := storageBase()
+		v.Set("aggr", "aggr1")
+		req, err := kubegraph.ParseStorageValues(v)
+		require.NoError(t, err)
+		assert.False(t, req.IODelta)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{"empty is false", []string{""}, false},
+		{"false", []string{"false"}, false},
+		{"true", []string{"true"}, true},
+		{"repeated true is one value", []string{"true", "true"}, true},
+		{"empty then true is true", []string{"", "true"}, true},
+		{"repeated false is one value", []string{"false", "false"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := kubegraph.ParseStorageValues(withDelta(tc.values...))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, req.IODelta)
+		})
+	}
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+		got    string
+	}{
+		{"true and false", []string{"true", "false"}, "false,true"},
+		{"1", []string{"1"}, "1"},
+		{"TRUE", []string{"TRUE"}, "TRUE"},
+		{"yes", []string{"yes"}, "yes"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			_, err := kubegraph.ParseStorageValues(withDelta(tc.values...))
+			pe, ok := errors.AsType[*kubegraph.ParseError](err)
+			require.True(t, ok)
+			assert.Equal(t, "invalid_scope", pe.Reason)
+			assert.Equal(t, `io_delta must be true or false, got "`+tc.got+`"`, pe.Message)
+		})
+	}
+
+	t.Run("a hostile value is rejected without being echoed", func(t *testing.T) {
+		long := strings.Repeat("x", 1<<16)
+		for _, raw := range []string{long, "true\n", "\xfftrue"} {
+			_, err := kubegraph.ParseStorageValues(withDelta(raw))
+			pe, ok := errors.AsType[*kubegraph.ParseError](err)
+			require.True(t, ok, "value %q", raw)
+			assert.Equal(t, "invalid_scope", pe.Reason)
+			assert.Contains(t, pe.Message, "io_delta")
+			assert.NotContains(t, pe.Message, raw)
+		}
+	})
+
+	t.Run("no root beats an invalid io_delta", func(t *testing.T) {
+		v := storageBase()
+		v.Set("io_delta", "yes")
+		_, err := kubegraph.ParseStorageValues(v)
+		pe, ok := errors.AsType[*kubegraph.ParseError](err)
+		require.True(t, ok)
+		assert.Equal(t, "missing_root", pe.Reason)
+	})
+
+	t.Run("io_rollup is checked before io_delta", func(t *testing.T) {
+		v := withDelta("yes")
+		v.Set("io_rollup", "p99")
+		_, err := kubegraph.ParseStorageValues(v)
+		pe, ok := errors.AsType[*kubegraph.ParseError](err)
+		require.True(t, ok)
+		assert.Equal(t, "invalid_scope", pe.Reason)
+		assert.Contains(t, pe.Message, "io_rollup")
+		assert.NotContains(t, pe.Message, "io_delta")
+	})
+
+	t.Run("io_delta composes with every rollup", func(t *testing.T) {
+		v := withDelta("true")
+		v.Set("io_rollup", "max")
+		req, err := kubegraph.ParseStorageValues(v)
+		require.NoError(t, err)
+		assert.True(t, req.IODelta)
+		assert.Equal(t, promql.RollupMax, req.IORollup)
+	})
+
+	t.Run("the other parsers ignore it", func(t *testing.T) {
+		v := url.Values{"start": {"1700000000"}, "end": {"1700000300"}, "io_delta": {"yes"}}
+		_, err := kubegraph.ParseValues(v)
+		require.NoError(t, err)
+	})
+}

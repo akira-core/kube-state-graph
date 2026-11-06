@@ -35,6 +35,13 @@ type Querier struct {
 	// returned as the query's error.
 	Fail func(name, query string) error
 
+	// Delta holds the answers to delta-shaped queries (an end-minus-start
+	// query carries an ` offset ` operand), keyed by family name and filtered
+	// through the same matchers as Fixtures. A delta query is answered ONLY
+	// from here and a measurement query ONLY from the by-name fixtures, so one
+	// family can serve both. Set it before the first query.
+	Delta map[promql.Query]model.Vector
+
 	fixtures map[promql.Query]model.Vector
 
 	mu     sync.Mutex
@@ -61,13 +68,24 @@ func (f *Querier) Instant(_ context.Context, name, query string, _ time.Time) (m
 	if err != nil {
 		return nil, fmt.Errorf("promqlfake: %s: %w", name, err)
 	}
+	source := f.fixtures
+	if isDeltaShape(query) {
+		source = f.Delta
+	}
 	out := model.Vector{}
-	for _, s := range f.fixtures[promql.Query(name)] {
+	for _, s := range source[promql.Query(name)] {
 		if matchesAll(s.Metric, matchers) {
 			out = append(out, &model.Sample{Metric: s.Metric.Clone(), Value: s.Value, Timestamp: s.Timestamp})
 		}
 	}
 	return out, nil
+}
+
+// isDeltaShape reports whether query is the end-minus-start form
+// promql.RenderQoSVolumeScopedDelta renders: its second operand is the same
+// selector shifted by ` offset <window>`.
+func isDeltaShape(query string) bool {
+	return strings.Contains(query, "] offset ")
 }
 
 // Issued returns every query answered so far, in arrival order.

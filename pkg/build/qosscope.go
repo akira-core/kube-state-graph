@@ -68,6 +68,17 @@ func signalWhenDone(fn func() error, done chan<- struct{}) func() error {
 // the rule that a selector loading no pods or services issues no
 // traces_service_graph_* queries.
 //
+// With delta (a /v1/storage-graph build with io_delta=true) the same wave also
+// issues, per family, the end-minus-start change of every series over the same
+// scope (promql.RenderQoSVolumeScopedDelta). A delta query renders the volume
+// alternation twice, so the delta read chunks the scope with half the byte
+// budget and the two alternations of one query together stay within the budget
+// the operator set for one. Delta chunks are issued under the same concurrency
+// limit, merge in chunk order into the family's delta vector, fail closed like
+// every storage-build query, and are deliberately NOT written to ScopeIssued
+// or ExtraSeriesCount: the per-family series tally keeps describing the
+// measurement read. Delta is only ever set for a fail-closed storage plan.
+//
 // Each chunk degrades on its own (log-and-continue, like every Harvest leg), so
 // one failed chunk costs I/O measurements for the claims whose volumes it
 // carried and nothing else. Chunk results are merged in CHUNK ORDER, never
@@ -84,6 +95,7 @@ func readScopedQoS(
 	scopeMu *sync.Mutex,
 	failClosed bool,
 	rollup promql.Rollup,
+	delta bool,
 	prerequisites ...<-chan struct{},
 ) error {
 	for _, done := range prerequisites {
@@ -111,8 +123,32 @@ func readScopedQoS(
 		parts[i] = make([]model.Vector, len(chunks))
 	}
 
+	var deltaChunks [][]string
+	var deltaTargets []scopedTarget
+	var deltaParts [][]model.Vector
+	if delta {
+		deltaTargets = qosDeltaTargets(v)
+		deltaChunks = promql.ChunkQoSVolumeScope(scope, deltaBudget(opts.qosScopeBatchBytes()))
+		deltaParts = make([][]model.Vector, len(deltaTargets))
+		for i := range deltaParts {
+			deltaParts[i] = make([]model.Vector, len(deltaChunks))
+		}
+	}
+
 	var wave errgroup.Group
 	wave.SetLimit(scopeConcurrency)
+	for ti, t := range deltaTargets {
+		for ci, chunk := range deltaChunks {
+			wave.Go(func() error {
+				out, err := instantQoSDeltaChunk(ctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed)
+				if err != nil {
+					return err
+				}
+				deltaParts[ti][ci] = out
+				return nil
+			})
+		}
+	}
 	for ti, t := range targets {
 		for ci, chunk := range chunks {
 			wave.Go(func() error {
@@ -137,7 +173,38 @@ func readScopedQoS(
 		*t.dst = merged
 		markScopeIssued(v, scopeMu, t.query)
 	}
+	for ti, t := range deltaTargets {
+		var merged model.Vector
+		for _, part := range deltaParts[ti] {
+			merged = append(merged, part...)
+		}
+		*t.dst = merged
+	}
 	return nil
+}
+
+// qosDeltaTargets are the six slots the delta read lands in, in the same
+// family order as qosTargets.
+func qosDeltaTargets(v *topologyVectors) []scopedTarget {
+	return []scopedTarget{
+		{promql.QQoSReadOps, &v.QoSReadOpsDelta},
+		{promql.QQoSWriteOps, &v.QoSWriteOpsDelta},
+		{promql.QQoSReadLatency, &v.QoSReadLatencyDelta},
+		{promql.QQoSWriteLatency, &v.QoSWriteLatencyDelta},
+		{promql.QQoSReadData, &v.QoSReadDataDelta},
+		{promql.QQoSWriteData, &v.QoSWriteDataDelta},
+	}
+}
+
+// deltaBudget halves the scoped-read byte budget for a delta query, which
+// renders the volume alternation twice. A non-positive budget stays as it is:
+// ChunkScope reads it as "no byte limit", leaving only the per-alternation
+// value cap.
+func deltaBudget(budget int) int {
+	if budget <= 0 {
+		return budget
+	}
+	return max(budget/2, 1)
 }
 
 // instantQoSChunk issues one family's query for one chunk of the scope. It
@@ -158,6 +225,42 @@ func instantQoSChunk(
 	volumes []string,
 	failClosed bool,
 	rollup promql.Rollup,
+) (model.Vector, error) {
+	return runQoSChunk(ctx, callerCtx, q, name, func() (string, bool) {
+		return promql.RenderQoSVolumeScopedRollup(name, window, keys, sel, volumes, rollup)
+	}, end, len(volumes), failClosed)
+}
+
+// instantQoSDeltaChunk is instantQoSChunk for the end-minus-start form: the
+// same query NAME (the bare family, so self-metrics and the fail-closed error
+// keep one label value per family), the same recover / fail-closed contract.
+func instantQoSDeltaChunk(
+	ctx, callerCtx context.Context,
+	q promql.Querier,
+	name promql.Query,
+	window time.Duration,
+	end time.Time,
+	keys promql.LabelKeys,
+	sel promql.Selector,
+	volumes []string,
+	failClosed bool,
+) (model.Vector, error) {
+	return runQoSChunk(ctx, callerCtx, q, name, func() (string, bool) {
+		return promql.RenderQoSVolumeScopedDelta(name, window, keys, sel, volumes)
+	}, end, len(volumes), failClosed)
+}
+
+// runQoSChunk renders and issues one scoped QoS query. render runs AFTER the
+// recover is armed, so a panic while rendering becomes this chunk's error like
+// a panic in the query itself, never an escaped goroutine panic.
+func runQoSChunk(
+	ctx, callerCtx context.Context,
+	q promql.Querier,
+	name promql.Query,
+	render func() (string, bool),
+	end time.Time,
+	volumes int,
+	failClosed bool,
 ) (out model.Vector, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -170,7 +273,7 @@ func instantQoSChunk(
 		}
 	}()
 
-	rendered, ok := promql.RenderQoSVolumeScopedRollup(name, window, keys, sel, volumes, rollup)
+	rendered, ok := render()
 	if !ok {
 		// Unreachable for a non-empty chunk; never fall back to an unscoped
 		// read, which would fetch the whole filer's workloads.
@@ -186,7 +289,7 @@ func instantQoSChunk(
 		}
 		slog.WarnContext(ctx, "optional scoped QoS query failed; continuing with empty vector",
 			"query", string(name),
-			"volumes", len(volumes),
+			"volumes", volumes,
 			"error", qerr)
 		return nil, nil
 	}

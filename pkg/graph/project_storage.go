@@ -521,6 +521,12 @@ func sumUnitShares(edge *Edge, units []flowUnit) *IOMetrics {
 		acc.WriteOps = addPtr(acc.WriteOps, share.WriteOps)
 		acc.ReadBytesPerSec = addPtr(acc.ReadBytesPerSec, share.ReadBytesPerSec)
 		acc.WriteBytesPerSec = addPtr(acc.WriteBytesPerSec, share.WriteBytesPerSec)
+		// A unit with a base figure but no change adds nothing here, so a tier
+		// change covers only the claims that carry one.
+		acc.ReadOpsDelta = addPtr(acc.ReadOpsDelta, share.ReadOpsDelta)
+		acc.WriteOpsDelta = addPtr(acc.WriteOpsDelta, share.WriteOpsDelta)
+		acc.ReadBytesPerSecDelta = addPtr(acc.ReadBytesPerSecDelta, share.ReadBytesPerSecDelta)
+		acc.WriteBytesPerSecDelta = addPtr(acc.WriteBytesPerSecDelta, share.WriteBytesPerSecDelta)
 		filled = true
 		if claimIO == nil {
 			claimIO = u.io
@@ -532,6 +538,13 @@ func sumUnitShares(edge *Edge, units []flowUnit) *IOMetrics {
 	if claimTier && claimIO != nil {
 		acc.ReadLatencyUs = claimIO.ReadLatencyUs
 		acc.WriteLatencyUs = claimIO.WriteLatencyUs
+		// A latency change rides beside its latency, on the claim-level edge only.
+		if claimIO.ReadLatencyUs != nil {
+			acc.ReadLatencyUsDelta = claimIO.ReadLatencyUsDelta
+		}
+		if claimIO.WriteLatencyUs != nil {
+			acc.WriteLatencyUsDelta = claimIO.WriteLatencyUsDelta
+		}
 		acc.MaxIOPS = claimIO.MaxIOPS
 		acc.MaxBytesPerSec = claimIO.MaxBytesPerSec
 	}
@@ -549,23 +562,37 @@ func scaleFlow(io *IOMetrics, n int) (IOMetrics, bool) {
 	}
 	f := float64(n)
 	ok := false
+	// Each change field is split exactly like its base figure and only beside
+	// it: a change without its base figure is never carried.
 	if io.ReadOps != nil {
 		out.ReadOps = new(*io.ReadOps / f)
+		out.ReadOpsDelta = divPtr(io.ReadOpsDelta, f)
 		ok = true
 	}
 	if io.WriteOps != nil {
 		out.WriteOps = new(*io.WriteOps / f)
+		out.WriteOpsDelta = divPtr(io.WriteOpsDelta, f)
 		ok = true
 	}
 	if io.ReadBytesPerSec != nil {
 		out.ReadBytesPerSec = new(*io.ReadBytesPerSec / f)
+		out.ReadBytesPerSecDelta = divPtr(io.ReadBytesPerSecDelta, f)
 		ok = true
 	}
 	if io.WriteBytesPerSec != nil {
 		out.WriteBytesPerSec = new(*io.WriteBytesPerSec / f)
+		out.WriteBytesPerSecDelta = divPtr(io.WriteBytesPerSecDelta, f)
 		ok = true
 	}
 	return out, ok
+}
+
+// divPtr is p / by, nil for a nil p.
+func divPtr(p *float64, by float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	return new(*p / by)
 }
 
 func addPtr(dst, src *float64) *float64 {
