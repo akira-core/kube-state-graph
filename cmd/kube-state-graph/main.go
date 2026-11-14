@@ -203,32 +203,12 @@ func run() error {
 		return err
 	}
 
-	// The drain window must cover the slowest legitimate in-flight request, so
-	// derive it from the server's own WriteTimeout (with a 10s floor for very
-	// short build timeouts) instead of re-deriving the formula.
-	shutdownTimeout := max(httpSrv.WriteTimeout, 10*time.Second)
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-
-	// Telemetry shutdown MUST run even when the HTTP drain fails — otherwise
-	// buffered OTLP spans/logs are dropped. Collect both errors.
-	var errs []error
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http server shutdown failed", "err", err)
-		errs = append(errs, fmt.Errorf("shutdown: %w", err))
-	}
-	// The telemetry flush gets its OWN budget: a timed-out drain has exhausted
-	// shutdownCtx, and the OTel SDK Shutdowns bail immediately on an expired
-	// context — exporting nothing in exactly the abnormal-shutdown case whose
-	// spans/logs matter most (including the drain-failure record just emitted).
-	telCtx, telCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer telCancel()
-	if err := telemetryProviders.Shutdown(telCtx); err != nil {
-		// Bypass the slog OTLP bridge — providers are tearing down.
-		fmt.Fprintf(os.Stderr, "otlp shutdown timed out: %v\n", err)
-		errs = append(errs, fmt.Errorf("otlp shutdown: %w", err))
-	}
-	return errors.Join(errs...)
+	// One grace deadline covers the HTTP drain AND the telemetry flush, so the
+	// exporter never extends the grace period; the drain stops a flush reserve
+	// early so a timed-out drain still leaves the flush time. See shutdown.
+	grace, reserve := shutdownBudget(httpSrv.WriteTimeout)
+	return shutdown(context.Background(), grace, reserve,
+		httpSrv.Shutdown, telemetryProviders.Shutdown, logger, os.Stderr)
 }
 
 // loadAPIKeys returns a populated KeySet (file or CSV) or an empty one when
