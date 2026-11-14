@@ -180,20 +180,18 @@ func TestVolumeHub_SameNamedClaimInAnotherNamespaceIsFiltered(t *testing.T) {
 	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QKubeletVolumeUsedBytes)])
 }
 
-// Each claim family is read once per namespace the claim-info read returned,
-// in namespace order — never by claim name across the estate.
-func TestVolumeHub_ClaimFamiliesAreReadPerNamespace(t *testing.T) {
+// Each claim family is read in ONE query grouping the namespaces the
+// claim-info read returned — never by claim name across the estate.
+func TestVolumeHub_ClaimFamiliesAreGroupedAcrossNamespaces(t *testing.T) {
 	vols, claims := hubBase()
 	scope := vlrScope(t, graph.StorageRootAggr, []string{"aggr1", "aggr2"})
 	g, q, err := hubBuild(t, hubEstate(vols, claims), scope, Options{})
 	require.NoError(t, err)
 
 	for _, fam := range promql.ClaimScopedQueries[1:] {
-		// The namespaces are issued concurrently, so only the set is pinned.
-		got := strings.Join(q.QueriesFor(fam), "\n")
-		require.Len(t, q.QueriesFor(fam), 2, "%s: one query per namespace", fam)
-		assert.Contains(t, got, `namespace="platform",persistentvolumeclaim="redis-data"`, fam)
-		assert.Contains(t, got, `namespace="shop",persistentvolumeclaim="orders-data"`, fam)
+		got := q.QueriesFor(fam)
+		require.Len(t, got, 1, "%s: one grouped query", fam)
+		assert.Contains(t, got[0], `namespace=~"platform|shop",persistentvolumeclaim=~"orders-data|redis-data"`, fam)
 	}
 	ids := vlrIDs(vlrBody(t, g, scope))
 	assert.True(t, ids["zone-a-prod-c1/shop/orders-data"])

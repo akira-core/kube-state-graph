@@ -15,8 +15,8 @@ import (
 // readWorkloadClaims is the claim side of a workload root (node, pod,
 // application). The seed already named the claims, so every claim family but
 // the bindings — those the seed re-read by claim, which is the mounter
-// completion — is read per namespace on (namespace, persistentvolumeclaim)
-// and kept only when the row's (az, env, cluster, namespace, claim) is
+// completion — is read on the tracked (namespace, persistentvolumeclaim)
+// pairs, grouped across namespaces, and kept only when the row's (az, env, cluster, namespace, claim) is
 // tracked. An empty set issues nothing.
 func readWorkloadClaims(
 	ctx context.Context,
@@ -50,7 +50,7 @@ func readWorkloadClaims(
 	if n := len(v.PVCAnnotations); n > 0 {
 		addExtraSeries(v, scopeMu, promql.QPVCAnnotations, n)
 	}
-	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{
+	return issueClaimFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{
 		{promql.QPVCInfo, &v.PVCInfo},
 		{promql.QPVCAnnotations, &v.PVCAnnotations},
 		{promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed},

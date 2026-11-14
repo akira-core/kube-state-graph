@@ -99,9 +99,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     PV name (a generator, never a judge; static PVs and custom volume-name
     prefixes are NOT reached from a storage root), `kube_persistentvolumeclaim_info`
     is scoped on `volumename`, and the expansion reads the other claim families
-    one query per namespace on `(namespace, persistentvolumeclaim)`
-    (`issueClaimFamiliesByNamespace`, shared by every seed kind's claim side and
-    mounter completion — a claim name alone would be read across the estate),
+    on the tracked `(namespace, persistentvolumeclaim)` pairs, grouped across
+    namespaces (`issueClaimFamiliesByPair`, shared by every seed kind's claim side
+    and mounter completion — a claim name alone would be read across the estate),
     filtered to the loaded `(az, env, cluster, namespace, claim)` keys. A data-derived scope is chunked however large it is and never replaced
     by a read across the zone. `storage_root_claim_miss` (`no_pv_candidate` /
     `no_claim`) reports a seed that found nothing (`no_claim` drops to Debug under

@@ -36,7 +36,7 @@ func TestPodSeed_ReadsBindingsByReference(t *testing.T) {
 		},
 	}
 	q := promqlfake.New(fx)
-	_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+	g, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
 		vlrScope(t, graph.StorageRootPod, []string{"shop/orders-0", "platform/redis-0"}).Roots)
 	require.NoError(t, err)
 
@@ -54,26 +54,30 @@ func TestPodSeed_ReadsBindingsByReference(t *testing.T) {
 	}
 
 	// Mounter completion and the claim families read the tracked claims by
-	// (namespace, claim), one query per namespace, so a same-named claim in
-	// another namespace is never read.
+	// (namespace, claim), grouped across namespaces: the cross pairs the two
+	// alternations admit (shop/redis-data, platform/orders-data) name no
+	// binding here, and a row that did would be dropped by the claim key.
 	assert.Contains(t, bindings,
-		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="shop",persistentvolumeclaim="orders-data"}[1m])`)
-	assert.Contains(t, bindings,
-		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace="platform",persistentvolumeclaim="redis-data"}[1m])`)
+		`last_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{az="zone-a",env="prod",namespace=~"platform|shop",persistentvolumeclaim=~"orders-data|redis-data"}[1m])`)
 	for _, fam := range promql.ClaimScopedQueries {
 		for _, query := range q.QueriesFor(fam) {
 			if strings.Contains(query, `persistentvolumeclaim=`) {
-				assert.Contains(t, query, `,namespace="`, "%s is read per namespace: %s", fam, query)
+				assert.Contains(t, query, `,namespace=`, "%s is read by (namespace, claim): %s", fam, query)
 			}
 		}
 	}
 
-	// The pod wave reads the roots by (namespace, pod), one query per namespace,
-	// so neither cross pair (shop/redis-0, platform/orders-0) is fetched.
-	assert.ElementsMatch(t, []string{
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="platform",pod="redis-0"}[1m])`,
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="orders-0"}[1m])`,
+	// The pod wave reads the roots by (namespace, pod), grouped: one query
+	// whose alternations admit the cross pairs shop/redis-0 and
+	// platform/orders-0, which the read drops before the node and controller
+	// waves are scoped from it.
+	assert.Equal(t, []string{
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1m])`,
 	}, q.QueriesFor(promql.QPodInfo))
+	assert.NotContains(t, g.NodesByID, "zone-a-prod-c1/uid-sr", "the cross pair shop/redis-0 is dropped")
+	assert.NotContains(t, g.NodesByID, "zone-a-prod-c1/uid-po", "the cross pair platform/orders-0 is dropped")
+	assert.Contains(t, g.NodesByID, "zone-a-prod-c1/uid-o")
+	assert.Contains(t, g.NodesByID, "zone-a-prod-c1/uid-r")
 }
 
 // Spec: "Claimless pod root is still drawn", kept identical to an unrestricted

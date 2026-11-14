@@ -85,24 +85,25 @@ func TestBindingPodRefs(t *testing.T) {
 	assert.Empty(t, bindingPodRefs(nil))
 }
 
-// Refs group by namespace, sorted and de-duplicated, independent of input
-// order; a nameless ref is dropped.
-func TestGroupPodRefs(t *testing.T) {
+// Refs become (namespace, pod) pairs, sorted and de-duplicated, independent of
+// input order; a ref missing either half names no pod and is dropped.
+func TestPodNamePairs(t *testing.T) {
 	in := []graph.PodRef{
 		{Namespace: "shop", Name: "web-0"},
 		{Namespace: "platform", Name: "orders-0"},
 		{Namespace: "shop", Name: "orders-0"},
 		{Namespace: "shop", Name: "web-0"},
 		{Namespace: "shop", Name: ""},
+		{Namespace: "", Name: "orphan-0"},
 	}
 	snapshot := slices.Clone(in)
-	namespaces, byNS := groupPodRefs(in)
-	assert.Equal(t, []string{"platform", "shop"}, namespaces)
-	assert.Equal(t, map[string][]string{"platform": {"orders-0"}, "shop": {"orders-0", "web-0"}}, byNS)
+	assert.Equal(t, []promql.NamePair{
+		{Namespace: "platform", Name: "orders-0"},
+		{Namespace: "shop", Name: "orders-0"},
+		{Namespace: "shop", Name: "web-0"},
+	}, podNamePairs(in))
 	assert.Equal(t, snapshot, in, "the input is not mutated")
-
-	empty, _ := groupPodRefs([]graph.PodRef{{Namespace: "shop"}})
-	assert.Empty(t, empty)
+	assert.Empty(t, podNamePairs([]graph.PodRef{{Namespace: "shop"}}))
 }
 
 // A pod root's pod read is the root plus the other mounters of its claims.
