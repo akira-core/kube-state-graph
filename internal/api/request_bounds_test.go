@@ -103,18 +103,7 @@ func largestLegalStorageRequest(t *testing.T) url.Values {
 // is refused before parsing". Driven through the production http.Server over a
 // real listener: a ResponseRecorder never applies MaxHeaderBytes.
 func TestMaxHeaderBytes_AdmitsTheLargestLegalRequest(t *testing.T) {
-	cfg := config.Defaults()
-	cfg.PromURL = "http://unused"
-	s := newServerWithMocks(t, newMockQuerier(t, nil), nil)
-	httpSrv := NewHTTPServer(cfg, s.Handler())
-	require.Equal(t, MaxHeaderBytes, httpSrv.MaxHeaderBytes)
-	require.Equal(t, 256<<10, httpSrv.MaxHeaderBytes)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	go func() { _ = httpSrv.Serve(ln) }()
-	t.Cleanup(func() { _ = httpSrv.Close() })
-	base := "http://" + ln.Addr().String()
+	base := startProductionServer(t)
 
 	params := largestLegalStorageRequest(t)
 	target := base + "/v1/storage-graph?" + params.Encode()
@@ -138,6 +127,78 @@ func TestMaxHeaderBytes_AdmitsTheLargestLegalRequest(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusRequestHeaderFieldsTooLarge, resp.StatusCode)
+}
+
+// startProductionServer serves a mock-backed handler through NewHTTPServer on a
+// real listener and returns its base URL.
+func startProductionServer(t *testing.T) string {
+	t.Helper()
+	cfg := config.Defaults()
+	cfg.PromURL = "http://unused"
+	s := newServerWithMocks(t, newMockQuerier(t, nil), nil)
+	httpSrv := NewHTTPServer(cfg, s.Handler())
+	require.Equal(t, MaxHeaderBytes, httpSrv.MaxHeaderBytes)
+	require.Equal(t, 256<<10, httpSrv.MaxHeaderBytes)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = httpSrv.Serve(ln) }()
+	t.Cleanup(func() { _ = httpSrv.Close() })
+	return "http://" + ln.Addr().String()
+}
+
+// podRootRequest is a /v1/storage-graph request rooted at n pods of one
+// namespace ns, each name nameLen bytes long.
+func podRootRequest(ns string, n, nameLen int) url.Values {
+	params := url.Values{"start": {"1746442800"}, "end": {"1746446400"}, "az": {"zone-a"}, "env": {"prod"}}
+	for _, name := range longValues("p", n, nameLen) {
+		params.Add("pod", ns+"/"+name)
+	}
+	return params
+}
+
+// A prefixed root (`pod=<ns>/<name>`, qualified `aggr=<oc>/<name>`) repeats its
+// prefix in every URL value while the chunk budget charges it once per chunk,
+// so its request line is the one that can outgrow the bound. With a
+// Kubernetes-legal namespace (a DNS label, at most 63 bytes) the largest pod
+// root set the caps admit still fits; a parser-legal 170-byte prefix does not
+// and is refused with 431 — the documented limit of design D2.
+func TestMaxHeaderBytes_PrefixedRoots(t *testing.T) {
+	base := startProductionServer(t)
+	budget := config.Defaults().NetAppQoSScopeBatchBytes
+	sel := promql.Selector{AZ: []string{"zone-a"}, Env: []string{"prod"}}
+	ns := "ns-" + strings.Repeat("n", 60) // 63 bytes, the longest namespace
+
+	// The largest Kubernetes-legal pod root set: for every name length, the
+	// most pods preparePodSeed's name split admits in the cap's 16 chunks.
+	nameBudget := budget - promql.RequestMatcherCost(promql.QPVCBindings, promql.LabelKeys{AZ: "az", Env: "env"}, sel) -
+		promql.MatcherCost(promql.NamespaceLabel, []string{ns}) - 1
+	var worst url.Values
+	worstLen := 0
+	for nameLen := 12; nameLen <= 253; nameLen++ {
+		// ChunkScope packs greedily, so the first 16 chunks of a set larger
+		// than any cap-admitted one hold exactly the most it admits.
+		n := 0
+		for _, chunk := range promql.ChunkScope(longValues("p", 16*promql.MaxAlternationValues+1, nameLen), nameBudget)[:16] {
+			n += len(chunk)
+		}
+		if req := podRootRequest(ns, n, nameLen); len(req.Encode()) > worstLen {
+			worst, worstLen = req, len(req.Encode())
+		}
+	}
+	target := base + "/v1/storage-graph?" + worst.Encode()
+	t.Logf("largest Kubernetes-legal pod root request line: %d bytes, %d pods", len(target), len(worst["pod"]))
+	resp, err := http.Get(target)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "admitted by the bound and by both pod caps")
+
+	corner := podRootRequest("ns-"+strings.Repeat("n", 167), 1600, 70)
+	resp, err = http.Get(base + "/v1/storage-graph?" + corner.Encode())
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusRequestHeaderFieldsTooLarge, resp.StatusCode,
+		"a parser-legal 170-byte namespace prefix repeated 1600 times exceeds the bound")
 }
 
 // Spec: "Many cluster values are truncated in the log".

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -69,18 +70,36 @@ func (g *gatedQuerier) sawSubstring(s string) bool {
 // metric, e.g. "kube_state_graph_inflight_builds 2".
 func metricValue(t *testing.T, base, name string) string {
 	t.Helper()
-	resp, err := http.Get(base + "/metrics")
+	line, err := scrapeLine(base, name)
 	require.NoError(t, err)
+	return line
+}
+
+// metricIs is metricValue as a require.Eventually condition: it never calls
+// into the testing.T, because the condition runs on testify's own goroutine.
+func metricIs(base, name, want string) func() bool {
+	return func() bool {
+		line, err := scrapeLine(base, name)
+		return err == nil && line == want
+	}
+}
+
+func scrapeLine(base, name string) (string, error) {
+	resp, err := http.Get(base + "/metrics")
+	if err != nil {
+		return "", err
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
+	if err != nil {
+		return "", err
+	}
 	for line := range strings.SplitSeq(string(body), "\n") {
 		if strings.HasPrefix(line, name+" ") {
-			return line
+			return line, nil
 		}
 	}
-	t.Fatalf("metric %s not exposed", name)
-	return ""
+	return "", fmt.Errorf("metric %s not exposed", name)
 }
 
 // getGraphNS issues /v1/graph narrowed to namespace ns, so its queries are
@@ -113,9 +132,8 @@ func TestAdmission_ShedsPastTheBoundAndNeverLimitsOperationalRoutes(t *testing.T
 			statuses <- resp.StatusCode
 		}()
 	}
-	require.Eventually(t, func() bool {
-		return metricValue(t, srv.URL, "kube_state_graph_inflight_builds") == "kube_state_graph_inflight_builds 2"
-	}, 5*time.Second, 5*time.Millisecond, "both requests are admitted and held")
+	require.Eventually(t, metricIs(srv.URL, "kube_state_graph_inflight_builds", "kube_state_graph_inflight_builds 2"),
+		5*time.Second, 5*time.Millisecond, "both requests are admitted and held")
 
 	resp := getGraphNS(t, srv.URL, "third", nil)
 	defer resp.Body.Close()
@@ -162,9 +180,8 @@ func TestAdmission_AuthenticationRunsFirst(t *testing.T) {
 		resp := getGraphNS(t, srv.URL, "held", http.Header{"X-Api-Key": {"k1"}})
 		resp.Body.Close()
 	}()
-	require.Eventually(t, func() bool {
-		return metricValue(t, srv.URL, "kube_state_graph_inflight_builds") == "kube_state_graph_inflight_builds 1"
-	}, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, metricIs(srv.URL, "kube_state_graph_inflight_builds", "kube_state_graph_inflight_builds 1"),
+		5*time.Second, 5*time.Millisecond)
 
 	resp := getGraphNS(t, srv.URL, "anon", nil)
 	resp.Body.Close()

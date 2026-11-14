@@ -4,7 +4,17 @@
 
 ### Requirement: Bounded request line
 
-The server SHALL set `http.Server.MaxHeaderBytes` explicitly to 256 KiB, so the request line and headers of one request are bounded independently of the Go default. The bound SHALL admit the largest request every graph endpoint's parser and root caps accept at the default byte budget.
+The server SHALL set `http.Server.MaxHeaderBytes` explicitly to 256 KiB. At the default byte budget it SHALL admit the largest request the parsers and root caps accept with bare roots or with `pod=` roots in a Kubernetes-legal (≤63-byte) namespace. A root set with a far longer repeated prefix MAY receive 431.
+
+#### Scenario: The largest Kubernetes-legal pod root set is admitted
+
+- **WHEN** a client sends `/v1/storage-graph` with the largest `pod=` root set the caps admit, every root in one 63-byte namespace
+- **THEN** the server reads the request and answers it with a status other than 431
+
+#### Scenario: A long repeated prefix can exceed the bound
+
+- **WHEN** a client sends 1600 `pod=` roots sharing one 170-byte namespace
+- **THEN** the server answers `431 Request Header Fields Too Large`, because the namespace repeats in every value while the chunk budget charges it once per chunk
 
 #### Scenario: The largest legal request is admitted
 
@@ -227,3 +237,24 @@ Every served HTTP request SHALL emit exactly one structured log line via `log/sl
 
 - **WHEN** a request carries 50 `cluster` values, one of them 200 bytes long
 - **THEN** the log line's `clusters` holds the first 10 values, none longer than 64 bytes, and `clusters_truncated` is `true`
+
+### Requirement: Scalar API Reference UI served at /docs
+
+The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the same-origin OpenAPI spec from `/openapi.json` via `Scalar.createApiReference`, and the `/docs` response SHALL set `Content-Security-Policy`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers. The policy's `script-src` SHALL allow the page's one inline script by its `sha256` hash and SHALL NOT carry `'unsafe-inline'`.
+
+#### Scenario: Pinned, integrity-checked CDN bundle
+
+- **WHEN** the `/docs` page loads the Scalar standalone bundle
+- **THEN** it is loaded from the jsDelivr CDN, pinned to an exact version and carrying a Subresource Integrity (`integrity=`) hash, so a mutated CDN artifact cannot execute
+- **AND** there is no vendored `/docs/assets/*` route
+
+#### Scenario: /docs renders the Scalar UI from the pinned CDN bundle
+
+- **WHEN** a client sends `GET /docs`
+- **THEN** the response is 200, `Content-Type: text/html`, and the page loads the version-pinned `@scalar/api-reference` standalone bundle from `cdn.jsdelivr.net` with an `integrity` hash, then calls `Scalar.createApiReference` against the same-origin `/openapi.json`, and the response carries `Content-Security-Policy`, `X-Frame-Options`, and `X-Content-Type-Options` headers
+
+#### Scenario: The inline script is allowed by hash only
+
+- **WHEN** a client sends `GET /docs`
+- **THEN** the `Content-Security-Policy` `script-src` directive carries `'sha256-<base64>'` equal to the SHA-256 of the page's one inline `<script>` body, plus `'self'` and `https://cdn.jsdelivr.net`, and does not carry `'unsafe-inline'`
+- **AND** `style-src` keeps `'unsafe-inline'`, because Scalar injects its styles at runtime

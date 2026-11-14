@@ -12,9 +12,11 @@ import (
 // every graph parser and root cap admits at the default byte budget is 236779
 // bytes (~231 KiB) of request line (100 × 253-byte values for each of the four
 // selector parameters plus 512 253-byte `aggr` roots filling the chunk cap,
-// measured by TestMaxHeaderBytes_AdmitsTheLargestLegalRequest), so 256 KiB
-// admits it with room for headers while refusing anything larger with 431
-// before a handler runs.
+// measured by TestMaxHeaderBytes_AdmitsTheLargestLegalRequest), and the
+// largest pod root set in a Kubernetes-legal (≤63-byte) namespace is 240090
+// bytes, so 256 KiB admits both with room for headers while refusing anything
+// larger with 431 before a handler runs. A prefixed root set whose prefix is
+// far longer than any real name can exceed it (TestMaxHeaderBytes_PrefixedRoots).
 const MaxHeaderBytes = 256 << 10
 
 // NewHTTPServer returns the http.Server the binary runs: the handler, the

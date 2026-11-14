@@ -20,7 +20,8 @@ Every graph endpoint accepts work whose cost is set by the client and bounded by
 - **Stage deadlines.** The `--build-timeout` deadline now bounds the whole graph request — build, projection, serialisation and encoding — and the server checks the request context between those stages, answering `504 timeout` or `499 canceled` instead of finishing work nobody will read.
 - **Non-finite upstream values are dropped.** The Harvest and kubelet readers skip a NaN or ±Inf sample, exactly as the RED and alert readers already do, so a non-finite value can no longer make `json.Marshal` fail with a 500.
 - **Bounded echoes.** An inbound `X-Request-ID` is kept only when it is 1–128 bytes of `[A-Za-z0-9._:=+/@-]`, else replaced by a generated id; the access log's `clusters` field carries at most the first 10 values, each cut to 64 bytes, with `clusters_truncated: true` when anything was cut; the `invalid_start` / `invalid_end` / `prune` 400 messages echo the raw value only when it passes the selector-value checks (≤253 bytes, valid UTF-8, no control character), as the `io_rollup` / `io_delta` messages already do.
-- **Documentation only.** The embedder facade (`kubegraph.Engine`) has no default build deadline — documented, behaviour unchanged. Response compression stays the ingress's job. The `/docs` CSP keeps `script-src 'unsafe-inline'` (see design D9).
+- **`/docs` CSP by hash.** The `/docs` page's `script-src` allows its one inline `Scalar.createApiReference` call by `sha256` hash instead of `'unsafe-inline'` (see design D9 for the browser proof).
+- **Documentation only.** The embedder facade (`kubegraph.Engine`) has no default build deadline — documented, behaviour unchanged. Response compression stays the ingress's job (design D10).
 
 ## Capabilities
 
@@ -30,7 +31,7 @@ _None._
 
 ### Modified Capabilities
 
-- `graph-api`: selector value count cap; request-line bound; build admission control (503 `overloaded`, `Retry-After`, flag, exempt routes, self-metrics); optional window cap replacing "no window cap"; the build deadline bounds every stage; non-finite upstream values dropped; bounded `X-Request-ID`, access-log `clusters` and 400 echoes.
+- `graph-api`: selector value count cap; request-line bound; build admission control (503 `overloaded`, `Retry-After`, flag, exempt routes, self-metrics); optional window cap replacing "no window cap"; the build deadline bounds every stage; non-finite upstream values dropped; bounded `X-Request-ID`, access-log `clusters` and 400 echoes; `/docs` `script-src` by hash.
 - `storage-graph-api`: the `pod` root's namespace side is bounded by the root cap; the selector value cap, admission control and window cap apply.
 - `k8s-graph-api`: the same `pod` root bound on its first read.
 
