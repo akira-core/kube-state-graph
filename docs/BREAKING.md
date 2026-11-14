@@ -1,3 +1,15 @@
+# BREAKING — `translate.Translator.Translate` takes a context
+
+*Change: `route-engine-memo-and-cache`.*
+
+**What changed.** `pkg/route/translate`'s `(*Translator).Translate(in ScopedInput)` is now `Translate(ctx context.Context, in ScopedInput)`. An ended context returns its cause before any istiod world is built, and ends the wait for the world's config controllers to synchronise, which now backs off from 100 µs to 2 ms instead of polling every 100 µs. The returned RouteConfiguration is unchanged. The HTTP API, flags and response bodies are unchanged.
+
+**Who is affected.** Only in-process embedders that call the istiod translation stage directly. `pkg/route` is linked only by `cmd/kube-state-graph` and by embedders that opt into route resolution; a plain `pkg/kubegraph` embedder never sees the package.
+
+**Migration.** Pass the caller's context: `tr.Translate(ctx, in)`. Rollback is a revert.
+
+---
+
 # BREAKING — root sets are capped by value count as well as bytes
 
 *Change: `cap-alternation-values`.*

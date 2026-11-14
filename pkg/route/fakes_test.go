@@ -83,9 +83,11 @@ type fakeTranslator struct {
 	hook    func(in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
 }
 
-func (f *fakeTranslator) Translate(in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
+func (f *fakeTranslator) Translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
 	f.calls.Add(1)
-	time.Sleep(f.latency)
+	if err := sleepCtx(ctx, f.latency); err != nil {
+		return nil, err
+	}
 	if f.hook != nil {
 		return f.hook(in)
 	}

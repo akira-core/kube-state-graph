@@ -901,7 +901,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotThreeHopAndTranslate() {
 	s.Require().True(found)
 	scoped.Port = 443
 
-	rc, err := translate.NewTranslator().Translate(scoped)
+	rc, err := translate.NewTranslator().Translate(ctx, scoped)
 	s.Require().NoError(err)
 	s.Equal("https.443.https.public-gw.istio-system", rc.GetName(),
 		"default-443 must select the TLS-terminated listener's RouteConfiguration")

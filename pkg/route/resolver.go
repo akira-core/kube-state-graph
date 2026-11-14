@@ -58,7 +58,7 @@ var _ build.RouteResolver = (*Resolver)(nil)
 // (memoisation, batching, the engine limit) can be exercised without building
 // an istiod world per call.
 type translator interface {
-	Translate(in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
+	Translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
 }
 
 // matcher is the router_check_tool stage: one RouteConfiguration plus a batch
@@ -296,7 +296,7 @@ func (r *Resolver) resolveConfig(ctx context.Context, snap *snapshot.Snapshot, r
 		// fall through to the translate + router_check_tool stages
 	}
 
-	rc, err := r.tr.Translate(scoped)
+	rc, err := r.tr.Translate(ctx, scoped)
 	if err != nil {
 		return build.RouteDestination{}, "", err
 	}
