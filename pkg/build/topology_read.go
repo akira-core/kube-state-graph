@@ -43,6 +43,20 @@ func addExtraSeries(v *topologyVectors, mu *sync.Mutex, q promql.Query, n int) {
 	v.ExtraSeriesCount[q] += n
 }
 
+// recovering wraps a second-wave goroutine so a panic raised while it
+// computes its scope — outside every per-query recover — fails the build
+// instead of the process. errgroup does not propagate a goroutine panic to
+// Wait, and a recover only catches a panic raised on its own goroutine, so the
+// wrapper sits at the launch site: every reader it wraps is covered, including
+// one added later without a defer of its own. name is the family the error
+// and the log line are named with.
+func recovering(ctx context.Context, name promql.Query, run func() error) func() error {
+	return func() (err error) {
+		defer recoverScopedPanic(ctx, name, &err)
+		return run()
+	}
+}
+
 // renderTopologyQuery is promql.Render for every leg except the
 // application-metadata one. That leg's PromQL names the configured metric;
 // the Instant query name stays the logical app_metadata, which is what
@@ -416,10 +430,10 @@ func readTopology(
 		}
 		volumeLabelsFinal = finalDone
 	}
-	g.Go(func() error {
+	g.Go(recovering(ctx, promql.QQoSReadOps, func() error {
 		return readScopedQoS(ctx, callerCtx, q, window, end, opts, sel, &v, &scopeMu, plan.failClosed,
 			plan.ioRollup, plan.ioDelta, pvcInfoDone, volumeLabelsFinal)
-	})
+	}))
 	// Under a by-reference plan, kube_pod_info / kube_pod_owner, the four
 	// kube_node_* families and the eight controller-owner /
 	// controller-annotation families are three more second waves: pods
@@ -469,26 +483,26 @@ func readTopology(
 	if plan.byReference && !plan.readsK8sWorkload() {
 		var recovered []podSeriesKey
 		if len(plan.applicationRoots) > 0 {
-			g.Go(signalWhenDone(signalWhenDone(func() error {
+			g.Go(recovering(ctx, promql.QPodOwner, signalWhenDone(signalWhenDone(func() error {
 				names, err := readScopedApplications(ctx, q, window, end, opts, sel, plan.applicationRoots, &v, &scopeMu)
 				recovered = names
 				return err
-			}, bindingsDone), appDone))
+			}, bindingsDone), appDone)))
 		}
 		podsDone := make(chan struct{})
-		g.Go(signalWhenDone(func() error {
+		g.Go(recovering(ctx, promql.QPodInfo, signalWhenDone(func() error {
 			return readScopedPods(ctx, q, window, end, opts, sel, plan.pods, plan.applicationRoots, &v, &scopeMu,
 				bindingsDone, appDone, pvcAnnotationsDone, &recovered)
-		}, podsDone))
-		g.Go(func() error {
+		}, podsDone)))
+		g.Go(recovering(ctx, promql.QNodeInfo, func() error {
 			return readScopedNodes(ctx, q, window, end, opts, sel, plan.nodeRoots, &v, &scopeMu, podsDone)
-		})
-		g.Go(func() error {
+		}))
+		g.Go(recovering(ctx, promql.QPodOwner, func() error {
 			return readScopedControllers(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone)
-		})
-		g.Go(func() error {
+		}))
+		g.Go(recovering(ctx, promql.QAppMetadata, func() error {
 			return readScopedAppMetadata(ctx, q, window, end, opts, sel, &v, &scopeMu, podsDone, pvcInfoDone)
-		})
+		}))
 	}
 	if err := g.Wait(); err != nil {
 		return Topology{}, fmt.Errorf("topology fan-out: %w", err)

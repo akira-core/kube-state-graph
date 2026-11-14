@@ -88,9 +88,39 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	)
 	defer span.End()
 
+	// The three service-graph queries depend on nothing the topology read
+	// returns — they take no request matcher and no label keys; only the
+	// parse joins them against topology — so an unfiltered build issues them
+	// beside the topology fan-out instead of after it, and a cold build costs
+	// the longer of the two rather than their sum. A filtered build still
+	// issues them only after topology, because it skips them entirely when
+	// the selector loaded nothing (see below), and prefetching would spend
+	// the most expensive leg of the fan-out on exactly that request.
+	//
+	// The prefetch runs under its own cancel, and its error — context.Canceled
+	// included — is read only on the path that uses its vectors, so a
+	// cancellation this build caused can never be classified as the caller's
+	// (499). A topology failure cancels it: the build has already failed and
+	// must not wait on the slowest store. outside_retention instead gives it a
+	// bounded grace to finish (see outsideRetentionPrefetchGrace).
+	//
+	// Cancellation can also arrive from ANOTHER build: these three queries are
+	// identical across every unfiltered build at one aligned instant, so a
+	// guarded store coalesces them into one flight per query, and a flight led
+	// by a build whose topology failed ends in that build's context.Canceled.
+	// The guard retries a waiter once; a second such leader still hands the
+	// waiter a cancellation it did not cause. serviceGraphFrom refetches once
+	// under this build's own context, and classifyReadError maps a Canceled to
+	// 499 only when this build's context is the one that ended.
+	var prefetch *serviceGraphPrefetch
+	if !filtered {
+		prefetch = startServiceGraphPrefetch(ctx, q, window, end)
+		defer prefetch.stop()
+	}
+
 	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
 	if err != nil {
-		return nil, classifyReadError(span, "topology read failed", err)
+		return nil, classifyReadError(ctx, span, "topology read failed", err)
 	}
 
 	// Outside-retention check: zero pods + healthy upstream ⇒ retention miss.
@@ -135,6 +165,9 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 				"pod_info_query", promql.Render(promql.QPodInfo, window, b.opts.LabelKeys, sel),
 				"node_info_query", promql.Render(promql.QNodeInfo, window, b.opts.LabelKeys, sel),
 			)
+			// Discarded: the deferred stop cancels whatever is still in
+			// flight once the grace has passed.
+			prefetch.waitAtMost(outsideRetentionPrefetchGrace)
 			return nil, err
 		}
 	}
@@ -159,11 +192,12 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		slog.DebugContext(ctx, "service-graph read skipped: selector matched no topology",
 			"reason", "filtered_empty_topology")
 	} else {
-		sg, err = ReadServiceGraph(ctx, q, window, end, topology,
-			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
+		vecs, err := serviceGraphFrom(ctx, prefetch, q, window, end)
 		if err != nil {
-			return nil, classifyReadError(span, "service-graph read failed", err)
+			return nil, classifyReadError(ctx, span, "service-graph read failed", err)
 		}
+		sg = resolveServiceGraph(ctx, vecs, end, topology,
+			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
 	}
 
 	nodes, edges := assemble(topology, sg)
@@ -218,6 +252,88 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		attribute.Int("kube_state_graph.cross_cluster_edges", crossCluster),
 	)
 	return g, nil
+}
+
+// outsideRetentionPrefetchGrace bounds how long an outside_retention build
+// waits for its discarded service-graph prefetch before cancelling it. Letting
+// the prefetch finish keeps a client-classifiable 400 from counting its
+// in-flight queries in kube_state_graph_upstream_query_failures_total and
+// logging them at Error, and an empty window answers in milliseconds on a
+// store that holds nothing for it. But under a split routing table the
+// service-graph store can still hold the window the kube_pod_info store has
+// aged out, and an unbounded wait would make the 400 as slow as that scan —
+// up to the build timeout. Past the grace the build cancels and returns.
+const outsideRetentionPrefetchGrace = time.Second
+
+// serviceGraphFrom returns the build's service-graph vectors: the prefetch's
+// when there is one, else a fetch issued now.
+//
+// A prefetch that comes back with a context.Canceled — as its error or as a
+// degraded RED companion's — while ctx is still alive was cancelled by another
+// build sharing its flights (see Build), not by this one: its own cancel runs
+// only after Build returns. It is fetched once more under ctx, which a guard
+// hands to a flight this build then leads or joins afresh. Once, not in a
+// loop: a refetch handed a cancellation again surfaces it, and
+// classifyReadError reports it as the upstream failure it is.
+func serviceGraphFrom(ctx context.Context, prefetch *serviceGraphPrefetch, q promql.Querier, window time.Duration, end time.Time) (serviceGraphVectors, error) {
+	if prefetch == nil {
+		return fetchServiceGraph(ctx, q, window, end)
+	}
+	vecs, err := prefetch.wait()
+	if ctx.Err() == nil && (errors.Is(err, context.Canceled) ||
+		errors.Is(vecs.failErr, context.Canceled) || errors.Is(vecs.durErr, context.Canceled)) {
+		slog.DebugContext(ctx, "service-graph prefetch cancelled by a shared flight; refetching")
+		return fetchServiceGraph(ctx, q, window, end)
+	}
+	return vecs, err
+}
+
+// serviceGraphPrefetch is a service-graph fetch running beside the topology
+// read. Its context is a child of the build's, so the build timeout and the
+// caller's cancellation reach it unchanged; stop ends it early.
+type serviceGraphPrefetch struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	vecs   serviceGraphVectors
+	err    error
+}
+
+// startServiceGraphPrefetch issues the three service-graph queries on their
+// own goroutine. The caller must call stop on every return path.
+func startServiceGraphPrefetch(ctx context.Context, q promql.Querier, window time.Duration, end time.Time) *serviceGraphPrefetch {
+	pctx, cancel := context.WithCancel(ctx)
+	p := &serviceGraphPrefetch{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(p.done)
+		p.vecs, p.err = fetchServiceGraph(pctx, q, window, end)
+	}()
+	return p
+}
+
+// stop cancels the fetch and waits for its goroutine, so no query of this
+// build outlives Build. A fetch that already returned makes it a no-op.
+func (p *serviceGraphPrefetch) stop() {
+	p.cancel()
+	<-p.done
+}
+
+// wait blocks until the fetch has returned. The fetch observes the build's
+// context, so it returns once that context is done even if an upstream does
+// not answer.
+func (p *serviceGraphPrefetch) wait() (serviceGraphVectors, error) {
+	<-p.done
+	return p.vecs, p.err
+}
+
+// waitAtMost blocks until the fetch has returned or d has passed, whichever
+// comes first. It neither cancels nor reads the fetch; stop does the former.
+func (p *serviceGraphPrefetch) waitAtMost(d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-p.done:
+	case <-t.C:
+	}
 }
 
 // BuildStorage builds the storage-flow graph served by GET /v1/storage-graph.
@@ -334,7 +450,7 @@ func (b *Builder) buildStorage(ctx context.Context, window time.Duration, end ti
 
 	topology, err := readTopology(ctx, q, window, end, b.opts, sel, plan)
 	if err != nil {
-		return nil, classifyReadError(span, "topology read failed", err)
+		return nil, classifyReadError(ctx, span, "topology read failed", err)
 	}
 
 	nodes, edges := run.assemble(topology)
@@ -427,17 +543,22 @@ func (b *Builder) freeze(ctx context.Context, topology Topology, nodes []graph.G
 // records it on the build span. context.Canceled (client disconnect) is NOT a
 // server/upstream fault: it is recorded as a span event but does not set the
 // span Error status, and downstream maps to a 4xx rather than a 5xx so it does
-// not pollute error-rate metrics/traces. DeadlineExceeded (build timeout) and
+// not pollute error-rate metrics/traces. That holds only while ctx — the
+// build's own context — is the one that ended: a guarded store coalesces
+// identical queries across builds, so a Canceled can also be another build's
+// (a shared flight whose leader went away, a sibling chunk a failed read
+// cancelled), and a build whose own context is alive reports it as the
+// upstream failure it is rather than as a 499. DeadlineExceeded (build timeout) and
 // any other upstream error are genuine failures and mark the span Error. An
 // invalid_scope rejection raised inside the read (a cap that needs the bound
 // querier, such as the application-metadata seed's) is the caller's fault and
 // passes through unchanged rather than becoming an upstream failure.
-func classifyReadError(span trace.Span, what string, err error) error {
+func classifyReadError(ctx context.Context, span trace.Span, what string, err error) error {
 	if be, ok := errors.AsType[*Error](err); ok && be.Reason == ReasonInvalidScope {
 		span.RecordError(err)
 		return err
 	}
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		span.RecordError(err)
 		return NewError(ReasonCanceled, "request canceled", err)
 	}

@@ -75,63 +75,92 @@ func ReadServiceGraph(
 	resolveTimeout time.Duration,
 	filtered bool,
 ) (ServiceGraphResult, error) {
-	// Fan the three service-graph queries out under an errgroup.
-	// The total query's error still fails the build; the two OPTIONAL RED
-	// queries record their error and yield a nil vector so the parse can
-	// degrade field-by-field without failing the request.
+	vecs, err := fetchServiceGraph(ctx, q, window, end)
+	if err != nil {
+		return ServiceGraphResult{}, err
+	}
+	return resolveServiceGraph(ctx, vecs, end, topology, resolver, resolveTimeout, filtered), nil
+}
+
+// serviceGraphVectors are the three service-graph vectors of one window: the
+// required request total and the two OPTIONAL RED companions, each with the
+// error that degraded it (nil vector and non-nil error when it failed).
+type serviceGraphVectors struct {
+	total, failed, duration model.Vector
+	failErr, durErr         error
+}
+
+// fetchServiceGraph issues the three service-graph queries. It depends on
+// nothing but the window: the three queries carry no request matcher and no
+// label keys, and topology is consulted only by resolveServiceGraph — which is
+// what lets Builder.Build issue it beside the topology fan-out.
+//
+// The total query's error fails the fetch; the two OPTIONAL RED queries record
+// their error and yield a nil vector so the parse can degrade field-by-field,
+// unless ctx itself is done.
+func fetchServiceGraph(ctx context.Context, q promql.Querier, window time.Duration, end time.Time) (serviceGraphVectors, error) {
 	var (
-		vec      model.Vector
+		out      serviceGraphVectors
 		totalErr error
-		failed   model.Vector
-		failErr  error
-		duration model.Vector
-		durErr   error
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphTotal),
 			promql.Render(promql.QServiceGraphTotal, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		vec, totalErr = out, err
+		out.total, totalErr = vec, err
 		return err // only the total query's error fails the group
 	})
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphFailedTotal),
 			promql.Render(promql.QServiceGraphFailedTotal, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		failed, failErr = out, err
+		out.failed, out.failErr = vec, err
 		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
 	})
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphServerSecondsBucket),
 			promql.Render(promql.QServiceGraphServerSecondsBucket, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		duration, durErr = out, err
+		out.duration, out.durErr = vec, err
 		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
 	})
 	if err := g.Wait(); err != nil {
 		// Prefer the total-query error message when present.
 		if totalErr != nil {
-			return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", totalErr)
+			return serviceGraphVectors{}, fmt.Errorf("service-graph query: %w", totalErr)
 		}
-		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
+		return serviceGraphVectors{}, fmt.Errorf("service-graph query: %w", err)
 	}
+	return out, nil
+}
 
+// resolveServiceGraph joins fetched service-graph vectors against topology:
+// the RED degradation line, the route-engine prescan and the parse.
+func resolveServiceGraph(
+	ctx context.Context,
+	vecs serviceGraphVectors,
+	end time.Time,
+	topology Topology,
+	resolver RouteResolver,
+	resolveTimeout time.Duration,
+	filtered bool,
+) ServiceGraphResult {
 	// One aggregated degradation line naming which optional RED query failed
 	// and why — never per edge (graceful degradation).
-	if failErr != nil || durErr != nil {
+	if vecs.failErr != nil || vecs.durErr != nil {
 		attrs := []any{}
-		if failErr != nil {
-			attrs = append(attrs, "failed_total_error", failErr.Error())
+		if vecs.failErr != nil {
+			attrs = append(attrs, "failed_total_error", vecs.failErr.Error())
 		}
-		if durErr != nil {
-			attrs = append(attrs, "server_seconds_bucket_error", durErr.Error())
+		if vecs.durErr != nil {
+			attrs = append(attrs, "server_seconds_bucket_error", vecs.durErr.Error())
 		}
 		slog.Warn("service-graph RED query degraded; metrics will be partial", attrs...)
 	}
@@ -148,14 +177,14 @@ func ReadServiceGraph(
 		// engine gets ONLY end — the single instant it evaluates the ingress
 		// config at.
 		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
-			collectRouteQueriesWith(vec, res), end)
+			collectRouteQueriesWith(vecs.total, res), end)
 	}
-	return parseWithResolver(vec, res, routes, redInputs{
-		Failed:      failed,
-		FailedErr:   failErr,
-		Duration:    duration,
-		DurationErr: durErr,
-	}), nil
+	return parseWithResolver(vecs.total, res, routes, redInputs{
+		Failed:      vecs.failed,
+		FailedErr:   vecs.failErr,
+		Duration:    vecs.duration,
+		DurationErr: vecs.durErr,
+	})
 }
 
 // optionalQueryFatal decides whether an OPTIONAL RED query's error should fail

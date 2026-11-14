@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"maps"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -264,16 +263,16 @@ func claimKeyOf(m model.Metric, keys promql.LabelKeys, claim string) claimKey {
 
 // readHubClaimFamilies reads the claim-binding family,
 // kube_persistentvolumeclaim_annotations and the two kubelet volume-stats
-// families restricted to the claims the claim-info read returned — one query
-// group per namespace, each on `namespace` and `persistentvolumeclaim`
-// (promql.RenderNamesInNamespace) — and keeps only the rows whose claim IS one
-// of them.
+// families restricted to the claims the claim-info read returned — their
+// (namespace, persistentvolumeclaim) pairs, grouped across namespaces
+// (issueClaimFamiliesByPair) — and keeps only the rows whose claim IS one of
+// them.
 //
 // A claim is identified by (namespace, name), so a name alone (`data`, `cache`)
 // would be read in every namespace of every selected cluster and zone, which a
 // large estate can push past the upstream series limits — and /v1/storage-graph
-// fails closed on that. The namespace equality bounds the read to the namespaces
-// the claim-info read actually returned.
+// fails closed on that. The namespace alternation bounds the read to the
+// namespaces the claim-info read actually returned.
 //
 // The filter still runs before the pod scope is computed and before the parse:
 // a namespace is shared by every selected cluster and zone, so the read also
@@ -318,21 +317,23 @@ func readHubClaimFamilies(
 			"claims", len(claims),
 			"bindings", len(v.PVC))
 	}()
-	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, claimTargets(v)[1:], claims)
+	return issueClaimFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, claimTargets(v)[1:], claims)
 }
 
-// issueClaimFamiliesByNamespace reads every target family restricted to the
-// tracked claims, one query group per namespace on `namespace` and
-// `persistentvolumeclaim` (promql.RenderNamesInNamespace, chunked under the
-// shared byte budget, the namespace equality charged once per chunk), and keeps
-// only the rows whose (az, env, cluster, namespace, claim) is tracked. A
-// namespace is shared by every selected cluster and zone, so the read can still
-// return a same-named claim of another cluster; the filter drops it.
+// issueClaimFamiliesByPair reads every target family restricted to the
+// tracked claims' (namespace, persistentvolumeclaim) pairs, grouped across
+// namespaces — one query per chunk carrying a namespace alternation beside a
+// claim-name alternation (promql.RenderNamesAcrossNamespaces), chunked under
+// the shared byte budget and promql.MaxAlternationValues per alternation — and
+// keeps only the rows whose (az, env, cluster, namespace, claim) is tracked.
+// The alternations are independent and a namespace is shared by every selected
+// cluster and zone, so a read can return a cross pair or a same-named claim of
+// another cluster; the filter drops it and the tally still counts it as read.
 //
-// Each target's vector is the merge of its namespaces' results in namespace
-// order, so it is a pure function of the claim set rather than of upstream
-// timing. No tracked claim issues nothing and leaves every target untouched.
-func issueClaimFamiliesByNamespace(
+// Each target's vector keeps its rows in chunk order, so it is a pure function
+// of the claim set rather than of upstream timing. No tracked claim issues
+// nothing and leaves every target untouched.
+func issueClaimFamiliesByPair(
 	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
@@ -344,49 +345,32 @@ func issueClaimFamiliesByNamespace(
 	targets []scopedTarget,
 	claims map[claimKey]struct{},
 ) error {
-	byNS := make(map[string][]string)
+	pairs := make([]promql.NamePair, 0, len(claims))
 	for k := range claims {
-		if k.claim != "" {
-			byNS[k.namespace] = append(byNS[k.namespace], k.claim)
-		}
+		pairs = append(pairs, promql.NamePair{Namespace: k.namespace, Name: k.claim})
 	}
-	if len(byNS) == 0 {
+	pairs = promql.SortedNamePairs(pairs)
+	if len(pairs) == 0 {
 		return nil
 	}
-	namespaces := slices.Sorted(maps.Keys(byNS))
+	reads := make([]pairRead, len(targets))
+	for i, t := range targets {
+		reads[i] = pairRead{query: t.query, label: promql.ClaimLabel, pairs: pairs}
+	}
+	if err := issuePairReads(ctx, q, window, end, opts, sel, v, scopeMu, reads); err != nil {
+		return err
+	}
 	keys := opts.LabelKeys.OrDefault()
 	isTracked := func(m model.Metric) bool {
 		_, ok := claims[claimKeyOf(m, keys, string(m[promql.ClaimLabel]))]
 		return ok
 	}
-	parts := make([][]model.Vector, len(targets))
-	fams := make([]claimFamily, 0, len(targets)*len(namespaces))
-	for ti, t := range targets {
-		parts[ti] = make([]model.Vector, len(namespaces))
-		for ni, ns := range namespaces {
-			fams = append(fams, claimFamily{
-				scopedFamily: scopedFamily{
-					query: t.query,
-					dst:   &parts[ti][ni],
-					scope: sortedNames(byNS[ns]),
-					render: func(chunk []string) (string, bool) {
-						return promql.RenderNamesInNamespace(t.query, window, opts.LabelKeys, sel, ns, promql.ClaimLabel, chunk)
-					},
-					budgetReserve: promql.NamespaceEqualityCost(ns),
-				},
-				keep: isTracked,
-			})
+	for i, t := range targets {
+		kept := keepRows(reads[i].rows, isTracked)
+		if dropped := len(reads[i].rows) - len(kept); dropped > 0 {
+			addExtraSeries(v, scopeMu, t.query, dropped)
 		}
-	}
-	if err := issueClaimKeyed(ctx, q, window, end, opts, sel, v, scopeMu, fams); err != nil {
-		return err
-	}
-	for ti, t := range targets {
-		var merged model.Vector
-		for _, part := range parts[ti] {
-			merged = append(merged, part...)
-		}
-		*t.dst = merged
+		*t.dst = kept
 	}
 	return nil
 }

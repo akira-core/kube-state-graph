@@ -135,12 +135,16 @@ func readScopedQoS(
 		}
 	}
 
-	var wave errgroup.Group
+	// wctx is cancelled by the first chunk that fails the wave. Only a
+	// fail-closed plan (or the caller's own cancellation) returns an error
+	// from a chunk, and either way the build is already decided: siblings
+	// still running would hold a per-store slot for answers nobody reads.
+	wave, wctx := errgroup.WithContext(ctx)
 	wave.SetLimit(scopeConcurrency)
 	for ti, t := range deltaTargets {
 		for ci, chunk := range deltaChunks {
 			wave.Go(func() error {
-				out, err := instantQoSDeltaChunk(ctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed)
+				out, err := instantQoSDeltaChunk(wctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed)
 				if err != nil {
 					return err
 				}
@@ -152,7 +156,7 @@ func readScopedQoS(
 	for ti, t := range targets {
 		for ci, chunk := range chunks {
 			wave.Go(func() error {
-				out, err := instantQoSChunk(ctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed, rollup)
+				out, err := instantQoSChunk(wctx, callerCtx, q, t.query, window, end, opts.LabelKeys, sel, chunk, failClosed, rollup)
 				if err != nil {
 					return err
 				}

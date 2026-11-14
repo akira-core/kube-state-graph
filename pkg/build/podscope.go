@@ -47,7 +47,8 @@ func bindingPodRefs(bindings model.Vector) []graph.PodRef {
 // application root — on the application recovery and on
 // kube_persistentvolumeclaim_annotations. The scope is the (namespace, pod) of
 // every pod the kept bindings bind (bindingPodRefs), the pod roots and the
-// recovered pods, read one query per namespace (issuePodFamiliesByNamespace).
+// recovered pods, read as grouped (namespace, pod) pairs
+// (issuePodFamiliesByPair).
 //
 // An empty scope issues no query at all and leaves both families unread: no pod
 // could be bound or is a root, so no pod could be drawn. That mirrors the QoS
@@ -101,5 +102,5 @@ func readScopedPods(
 	if recovered != nil {
 		refs = append(refs, podRefsOfKeys(*recovered)...)
 	}
-	return issuePodFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, podTargets(v), refs)
+	return issuePodFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, podTargets(v), refs)
 }

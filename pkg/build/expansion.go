@@ -2,7 +2,6 @@ package build
 
 import (
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -16,8 +15,8 @@ import (
 // readWorkloadClaims is the claim side of a workload root (node, pod,
 // application). The seed already named the claims, so every claim family but
 // the bindings — those the seed re-read by claim, which is the mounter
-// completion — is read per namespace on (namespace, persistentvolumeclaim)
-// and kept only when the row's (az, env, cluster, namespace, claim) is
+// completion — is read on the tracked (namespace, persistentvolumeclaim)
+// pairs, grouped across namespaces, and kept only when the row's (az, env, cluster, namespace, claim) is
 // tracked. An empty set issues nothing.
 func readWorkloadClaims(
 	ctx context.Context,
@@ -51,7 +50,7 @@ func readWorkloadClaims(
 	if n := len(v.PVCAnnotations); n > 0 {
 		addExtraSeries(v, scopeMu, promql.QPVCAnnotations, n)
 	}
-	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{
+	return issueClaimFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{
 		{promql.QPVCInfo, &v.PVCInfo},
 		{promql.QPVCAnnotations, &v.PVCAnnotations},
 		{promql.QKubeletVolumeUsedBytes, &v.KubeletVolumeUsed},
@@ -227,7 +226,19 @@ func controllersAlreadyRead(plan topologyPlan, v *topologyVectors) map[string]st
 	return out
 }
 
+// uncoveredAggrPairs is the (ONTAP cluster, aggregate) set the rows name that
+// no root read already fetched whole. The root lists are turned into sets once,
+// so the cost is one pass over the rows rather than one pass over every root
+// list per row.
 func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]string {
+	clusters := stringSet(plan.volumeClusters)
+	aggrs := stringSet(plan.volumeAggrs)
+	qualified := make(map[ontapPair]struct{})
+	for cluster, names := range plan.volumeAggrPairs {
+		for _, n := range names {
+			qualified[ontapPair{cluster, n}] = struct{}{}
+		}
+	}
 	out := map[string][]string{}
 	for _, s := range rows {
 		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
@@ -235,8 +246,13 @@ func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]strin
 		if cluster == "" || aggr == "" {
 			continue
 		}
-		if slices.Contains(plan.volumeClusters, cluster) || slices.Contains(plan.volumeAggrs, aggr) ||
-			slices.Contains(plan.volumeAggrPairs[cluster], aggr) {
+		if _, ok := clusters[cluster]; ok {
+			continue
+		}
+		if _, ok := aggrs[aggr]; ok {
+			continue
+		}
+		if _, ok := qualified[ontapPair{cluster, aggr}]; ok {
 			continue
 		}
 		out[cluster] = append(out[cluster], aggr)
@@ -244,7 +260,22 @@ func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]strin
 	return compactPairs(out)
 }
 
+// ontapPair is one component qualified by its ONTAP cluster.
+type ontapPair struct{ cluster, name string }
+
+// stringSet is the set of the non-empty values of names.
+func stringSet(names []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n != "" {
+			out[n] = struct{}{}
+		}
+	}
+	return out
+}
+
 func uncoveredControllerPairs(rows []model.Vector, plan topologyPlan, alreadyByName map[string]struct{}) map[string][]string {
+	clusters := stringSet(plan.volumeClusters)
 	out := map[string][]string{}
 	for _, vec := range rows {
 		for _, s := range vec {
@@ -255,7 +286,7 @@ func uncoveredControllerPairs(rows []model.Vector, plan topologyPlan, alreadyByN
 			if cluster == "" || node == "" {
 				continue
 			}
-			if slices.Contains(plan.volumeClusters, cluster) {
+			if _, ok := clusters[cluster]; ok {
 				continue
 			}
 			if _, ok := alreadyByName[node]; ok {
@@ -308,6 +339,11 @@ func compactPairs(in map[string][]string) map[string][]string {
 // issueHarvestPairMap reads each family one query per ONTAP cluster, chunked,
 // and merges the rows into the vector a flowless read may already have
 // written. An empty map issues nothing.
+//
+// Every chunk of every family runs under ONE scopeConcurrency bound, so the
+// read never holds more upstream slots than any other scoped wave. Each
+// family's rows land after the flowless read's, then in chunk order,
+// de-duplicated by label set in a single pass.
 func issueHarvestPairMap(
 	ctx context.Context,
 	q promql.Querier,
@@ -323,8 +359,13 @@ func issueHarvestPairMap(
 	if len(byCluster) == 0 {
 		return nil
 	}
-	wave, wctx := errgroup.WithContext(ctx)
-	wave.SetLimit(scopeConcurrency)
+	type pairFamily struct {
+		query  promql.Query
+		dst    *model.Vector
+		chunks []promql.HarvestNameChunk
+		parts  []model.Vector
+	}
+	fams := make([]pairFamily, 0, len(families))
 	for _, fam := range families {
 		dst := harvestDst(v, fam)
 		if dst == nil {
@@ -334,39 +375,36 @@ func issueHarvestPairMap(
 		if len(chunks) == 0 {
 			continue
 		}
-		wave.Go(func() (err error) {
-			defer recoverScopedPanic(wctx, fam, &err)
-			parts := make([]model.Vector, len(chunks))
-			partWave, pctx := errgroup.WithContext(wctx)
-			partWave.SetLimit(scopeConcurrency)
-			for i, chunk := range chunks {
-				partWave.Go(func() (err error) {
-					defer recoverScopedPanic(pctx, fam, &err)
-					query, ok := promql.RenderHarvestPair(fam, window, opts.LabelKeys, sel, chunk.Cluster, chunk.Names)
-					if !ok {
-						return nil
-					}
-					out, err := q.Instant(pctx, string(fam), query, end)
-					if err != nil {
-						return wrapQueryError(fam, err)
-					}
-					parts[i] = out
-					return nil
-				})
-			}
-			if err := partWave.Wait(); err != nil {
-				return err
-			}
-			var merged model.Vector
-			for _, part := range parts {
-				merged = mergeVolumeLabels(merged, part)
-			}
-			scopeMu.Lock()
-			*dst = mergeVolumeLabels(*dst, merged)
-			scopeMu.Unlock()
-			markScopeIssued(v, scopeMu, fam)
-			return nil
-		})
+		fams = append(fams, pairFamily{query: fam, dst: dst, chunks: chunks, parts: make([]model.Vector, len(chunks))})
 	}
-	return wave.Wait()
+	wave, wctx := errgroup.WithContext(ctx)
+	wave.SetLimit(scopeConcurrency)
+	for fi := range fams {
+		fam := fams[fi].query
+		for ci, chunk := range fams[fi].chunks {
+			wave.Go(func() (err error) {
+				defer recoverScopedPanic(wctx, fam, &err)
+				query, ok := promql.RenderHarvestPair(fam, window, opts.LabelKeys, sel, chunk.Cluster, chunk.Names)
+				if !ok {
+					return nil
+				}
+				out, err := q.Instant(wctx, string(fam), query, end)
+				if err != nil {
+					return wrapQueryError(fam, err)
+				}
+				fams[fi].parts[ci] = out
+				return nil
+			})
+		}
+	}
+	if err := wave.Wait(); err != nil {
+		return err
+	}
+	for _, f := range fams {
+		scopeMu.Lock()
+		*f.dst = mergeVolumeLabels(*f.dst, f.parts...)
+		scopeMu.Unlock()
+		markScopeIssued(v, scopeMu, f.query)
+	}
+	return nil
 }
