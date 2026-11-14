@@ -147,9 +147,9 @@ var actualMarker = []byte("actual: [")
 // line re-points the current index — cannot distinguish a test name from a stray
 // numeric line the tool prints for its own reasons, and the scraped text format
 // is not a stable contract (correctness rests on the MATCHER being Envoy's, not on
-// its output format). Today only a single query is ever posed, so a stray line
-// already fails closed; requiring a full result set makes that hold for any
-// batch size instead of by accident.
+// its output format). The route engine poses one batch per RouteConfiguration,
+// so a stray line must fail the whole batch closed rather than mis-assign a
+// cluster to some query; the engine then retries the batch one query per run.
 func parseActuals(out []byte, n int) ([]string, error) {
 	res := make([]string, n)
 	filled := make([]bool, n)

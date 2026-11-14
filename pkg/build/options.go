@@ -20,7 +20,10 @@ type Options struct {
 	RouteResolver RouteResolver
 	// RouteResolveTimeout bounds each individual RouteResolver call made
 	// during the pre-parse resolution pass. Zero means each call inherits
-	// only the build context's deadline.
+	// only the build context's deadline. A BatchRouteResolver receives it as
+	// RouteBatchLimits.PerCallTimeout and bounds each stage call with it — a
+	// key's preparation and each matcher run separately — so one key may
+	// spend up to two timeouts.
 	RouteResolveTimeout time.Duration
 	// LabelKeys names the upstream labels the request's `az` / `env` filter
 	// dimensions are matched against. The zero value means the defaults
