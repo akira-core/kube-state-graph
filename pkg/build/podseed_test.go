@@ -95,3 +95,39 @@ func TestPodSeed_OverCapRejected(t *testing.T) {
 	require.Equal(t, ReasonInvalidScope, AsReason(err))
 	assert.Empty(t, q.Issued())
 }
+
+// Spec: "A pod root's namespace side is bounded by the root cap" and "Many
+// namespaces under one pod name". One pod name paired with more namespaces than
+// the cap's chunk count times 100 fits the name cap in one chunk, but its
+// (namespace, name) pairs take more chunks than the cap, so both endpoints
+// reject it before any query. At the cap it is still accepted.
+func TestPodSeed_NamespaceSideIsBoundedByTheCap(t *testing.T) {
+	refsAcross := func(namespaces int) []string {
+		refs := make([]string, namespaces)
+		for i := range refs {
+			refs[i] = "ns-" + itoa(10000+i) + "/web-0"
+		}
+		return refs
+	}
+	atCap := maxRootedVolumeLabelChunks * promql.MaxAlternationValues
+
+	q := promqlfake.New(nil)
+	_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+		vlrScope(t, graph.StorageRootPod, refsAcross(atCap)).Roots)
+	require.NoError(t, err, "a pair set filling the cap exactly is accepted")
+	assert.Len(t, q.QueriesFor(promql.QPVCBindings), 1,
+		"the seed's own split is unchanged: one name is one query")
+
+	over := refsAcross(atCap + 1)
+	q = promqlfake.New(nil)
+	_, err = New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+		vlrScope(t, graph.StorageRootPod, over).Roots)
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, q.Issued(), "storage: rejected before any query")
+
+	q = promqlfake.New(nil)
+	_, err = New(q, Options{}, nil, nil).BuildK8s(t.Context(), time.Minute, vlrEnd, vlrSel,
+		k8sRootsOf(t, graph.StorageRootPod, over...))
+	require.Equal(t, ReasonInvalidScope, AsReason(err))
+	assert.Empty(t, q.Issued(), "k8s: rejected before any query")
+}

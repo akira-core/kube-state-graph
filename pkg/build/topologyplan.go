@@ -524,6 +524,14 @@ func (p topologyPlan) preparePodSeed(window time.Duration, budget int, keys prom
 		return p, nil
 	}
 	budget -= promql.RequestMatcherCost(promql.QPVCBindings, keys, sel)
+	// The namespace side is bounded too: the roots' (namespace, name) pairs,
+	// chunked as the grouped pair reads chunk them, must fit the same cap. One
+	// name paired with thousands of namespaces fits the name cap in one chunk
+	// and would otherwise drive the storage build into a read per namespace.
+	// Only the count is taken; the seed below keeps its name-driven split.
+	if len(promql.ChunkNamePairs(podRefPairs(p.pods), promql.PodLabel, max(budget, 1))) > maxRootedVolumeLabelChunks {
+		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
+	}
 	if nsCost := promql.MatcherCost(promql.NamespaceLabel, podRefNamespaces(p.pods)); nsCost > 0 {
 		budget -= nsCost + 1 // the comma before the pod alternation
 	}
@@ -555,6 +563,14 @@ func podRefNames(refs []graph.PodRef) []string {
 		}
 	}
 	return slices.Sorted(maps.Keys(seen))
+}
+
+func podRefPairs(refs []graph.PodRef) []promql.NamePair {
+	out := make([]promql.NamePair, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, promql.NamePair{Namespace: ref.Namespace, Name: ref.Name})
+	}
+	return out
 }
 
 func podRefNamespaces(refs []graph.PodRef) []string {
