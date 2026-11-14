@@ -1,6 +1,7 @@
 package build
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/prometheus/common/model"
@@ -44,6 +45,39 @@ func TestParseTopology_DuplicateUIDAcrossClusters_DeterministicWinner(t *testing
 		assert.Equalf(t, "cluster-a/shared-uid", winner.ID(),
 			"PodsByUID winner must be the lexically-smaller ID on every run (run %d)", i)
 	}
+}
+
+// TestParseTopology_DuplicateUIDs_OneAggregatedWarn: a cross-cluster UID
+// collision is an estate-wide anomaly (a cloned etcd, a restored backup), so
+// it can affect every pod at once. One Warn per colliding pod would emit
+// thousands of lines per build; the parse reports one aggregated line naming
+// the count and a bounded, sorted sample of the UIDs.
+func TestParseTopology_DuplicateUIDs_OneAggregatedWarn(t *testing.T) {
+	pod := func(cluster, name, uid string) model.Sample {
+		return model.Sample{
+			Metric: model.Metric{
+				"cluster": model.LabelValue(cluster), "namespace": "shop",
+				"pod": model.LabelValue(name), "uid": model.LabelValue(uid), "node": "worker-0",
+			},
+			Value: 1, Timestamp: 100,
+		}
+	}
+	buf := captureLogs(t)
+	tp := parseTopology(topologyVectors{Pod: sampleVec(
+		pod("cluster-a", "checkout", "uid-1"), pod("cluster-b", "checkout", "uid-1"), pod("cluster-c", "checkout", "uid-1"),
+		pod("cluster-a", "orders", "uid-2"), pod("cluster-b", "orders", "uid-2"),
+		pod("cluster-a", "unique", "uid-3"),
+	)}, promql.LabelKeys{})
+
+	require.Len(t, tp.Pods, 6)
+	assert.Equal(t, "cluster-a/uid-1", tp.PodsByUID["uid-1"].ID())
+	assert.Equal(t, "cluster-a/uid-2", tp.PodsByUID["uid-2"].ID())
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "duplicate pod UID across clusters"), out)
+	assert.Contains(t, out, "uids=2", "two distinct UIDs collided")
+	assert.Contains(t, out, "pods=3", "three pods lost the index to a lexically-smaller id")
+	assert.Contains(t, out, "uid-1")
+	assert.Contains(t, out, "uid-2")
 }
 
 // TestParseTopology_EqualTimestampUIDChurn_DeterministicCanonical guards N8:
