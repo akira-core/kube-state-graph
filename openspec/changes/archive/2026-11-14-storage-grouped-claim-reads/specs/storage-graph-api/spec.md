@@ -227,7 +227,19 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 - **WHEN** a restriction renders its values as a literal alternation — every by-reference read, both alternations of the grouped pod and claim reads (each counted on its own distinct values), the pair-keyed Harvest reads and the root-derived reads on their identity label
 - **THEN** no chunk carries more than 100 values in that alternation, whatever the byte budget admits, so the upstream resolves it by exact value lookup rather than by evaluating a regex against every value of the label
 - **AND** the bound holds when the byte budget is unset or non-positive, and the split stays a pure function of the value set, so the body is byte-identical to the one an unbounded split produces
-- **AND** the namespace alternation of a `pod` root's seed is taken from the request's roots, like a repeated `namespace` parameter, and is not bounded
+- **AND** a `pod` root's seed is split by `(namespace, name)` pair, so both alternations of every seed chunk are split by value count and hold at most 100 distinct values
+
+#### Scenario: A pod root's namespace side is bounded by the root cap
+
+- **WHEN** a `pod` root set's `(namespace, name)` pairs, chunked under the seed's byte budget (less the request matchers) and the alternation value bound counted separately for namespaces and names, take more chunks than the root cap
+- **THEN** the request is rejected 400 with `reason: "invalid_scope"` before any upstream query, even when the pod NAMES alone fit the cap — one name paired with more than the cap's chunk count times 100 namespaces is such a set
+- **AND** the chunks counted are the chunks issued: the seed renders one query per pair chunk, so a root set the cap accepts never renders an alternation past 100 values or the byte budget
+
+#### Scenario: A pod root set is bounded by its pair count
+
+- **WHEN** a `pod` root set holds more than 1600 distinct `(namespace, name)` pairs (the root chunk cap times 100), even when its pairs fit the chunk cap because they form a cross product of few namespaces and few names
+- **THEN** the request is rejected 400 with `reason: "invalid_scope"` before any upstream query, on both `/v1/storage-graph` and `/v1/k8s-graph`
+- **AND** a 40 x 40 cross product (1600 pairs) is accepted and seeded as one chunk
 
 #### Scenario: A suffix-token alternation is chunked by bytes alone
 

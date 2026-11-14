@@ -228,7 +228,7 @@ The build SHALL walk from the root and read every family by reference — each r
 #### Scenario: The storage graph keeps its own reads
 
 - **WHEN** a `/v1/storage-graph` request roots at the same `node` or `pod`
-- **THEN** it issues its reads of known pods and claims one query per namespace, in the order the `storage-graph-api` capability defines, none of this capability's grouping, ordering or early controller read applies to it, and its body is unchanged
+- **THEN** it groups its reads of known pods and claims across namespaces exactly as "Known pods and claims are read across namespaces in one restriction" defines, but issues them in the order the `storage-graph-api` capability defines: none of this capability's ordering, claimless-pod loading or early controller read applies to it, and its body is unchanged
 
 ### Requirement: Known pods and claims are read across namespaces in one restriction
 

@@ -614,8 +614,14 @@ From the tracked claim set, the build SHALL read everything the body draws for t
 #### Scenario: The claim side is read by namespace and claim
 
 - **WHEN** the tracked claim set is non-empty
-- **THEN** `kube_persistentvolumeclaim_info` (when the root's reads did not already return the claim), `kube_persistentvolumeclaim_annotations`, the two kubelet volume-stats families and the claim-binding family are each restricted to the tracked `(namespace, claim)` pairs — one query per namespace, carrying that namespace as an equality and its tracked claim names as the alternation on `persistentvolumeclaim` — so a same-named claim in another namespace is never read
-- **AND** rows are kept only when their `(az, env, cluster, namespace, claim)` names a tracked claim
+- **THEN** `kube_persistentvolumeclaim_info` (when the root's reads did not already return the claim), `kube_persistentvolumeclaim_annotations`, the two kubelet volume-stats families and the claim-binding family are each restricted to the tracked `(namespace, claim)` pairs — grouped across namespaces, one query per chunk carrying the chunk's namespaces as an alternation on `namespace` and its tracked claim names as an alternation on `persistentvolumeclaim` — so a claim name is never read outside the namespaces that track it
+- **AND** rows are kept only when their `(az, env, cluster, namespace, claim)` names a tracked claim, so a cross pair the two alternations admit — a tracked name in a namespace that tracks another claim — and a same-named claim of another cluster are discarded before any later read's restriction is computed from them, and still counted in the family's tally
+
+#### Scenario: Claims in many namespaces share one query
+
+- **WHEN** the tracked claims are `shop/orders-data` and `platform/redis-data`
+- **THEN** each claim-keyed family is issued as one query restricted to `namespace=~"platform|shop"` and `persistentvolumeclaim=~"orders-data|redis-data"` beside the request matchers, not one query per namespace
+- **AND** a node root whose 40 mounting pods live in 40 namespaces issues each claim-keyed family once, where a per-namespace read issued it 40 times, and the body is byte-identical
 
 #### Scenario: Mounter completion loads every mounting pod
 
@@ -698,7 +704,8 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 #### Scenario: Pods are read one query per namespace
 
 - **WHEN** the pods to read are `shop/orders-0`, `shop/web-0` and `platform/orders-0`
-- **THEN** `kube_pod_info` and `kube_pod_owner` are each issued as `{namespace="platform",pod="orders-0"}` and `{namespace="shop",pod=~"orders-0|web-0"}` beside the request matchers, `platform/web-0` is never read, and the merged vector follows namespace order
+- **THEN** `kube_pod_info` and `kube_pod_owner` are each issued as one query `{namespace=~"platform|shop",pod=~"orders-0|web-0"}` beside the request matchers, not one query per namespace
+- **AND** a returned `platform/web-0` row — a cross pair the two independent alternations admit — is discarded before the node, controller or claim reads are scoped from the result, and is still counted in the family's tally
 
 #### Scenario: A same-named pod in another namespace never widens the node or controller read
 
@@ -779,7 +786,7 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 
 #### Scenario: A literal alternation holds at most 100 values
 
-- **WHEN** a restriction renders its values as a literal alternation — every by-reference read, the per-namespace pod and claim reads, the pair-keyed Harvest reads and the root-derived reads on their identity label
+- **WHEN** a restriction renders its values as a literal alternation — every by-reference read, both alternations of the grouped pod and claim reads (each counted on its own distinct values), the pair-keyed Harvest reads and the root-derived reads on their identity label
 - **THEN** no chunk carries more than 100 values in that alternation, whatever the byte budget admits, so the upstream resolves it by exact value lookup rather than by evaluating a regex against every value of the label
 - **AND** the bound holds when the byte budget is unset or non-positive, and the split stays a pure function of the value set, so the body is byte-identical to the one an unbounded split produces
 - **AND** a `pod` root's seed is split by `(namespace, name)` pair, so both alternations of every seed chunk are split by value count and hold at most 100 distinct values
@@ -815,8 +822,8 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 #### Scenario: Pods are read by namespace and name
 
 - **WHEN** the build reads pods
-- **THEN** `kube_pod_info` and `kube_pod_owner` are restricted to the `(namespace, pod)` pairs of the mounters of the tracked claims, the `pod` roots, the pods a `node` root placed on a root node, and the pods an `application` root recovered — one query per namespace, carrying that namespace as an equality and its pod names as the alternation — because a pod is identified by its namespace and name, never by its name alone
-- **AND** no pair outside the set is read, and a same-named pod in another namespace — with its node and its controllers, which the next waves scope from what this read returns — is never fetched
+- **THEN** `kube_pod_info` and `kube_pod_owner` are restricted to the `(namespace, pod)` pairs of the mounters of the tracked claims, the `pod` roots, the pods a `node` root placed on a root node, and the pods an `application` root recovered — grouped across namespaces, one query per chunk carrying the chunk's namespaces as one alternation and its pod names as another, chunked under the shared byte budget so that neither alternation holds more than 100 distinct values — because a pod is identified by its namespace and name, never by its name alone
+- **AND** a row whose `(namespace, pod)` is outside the set — a cross pair the independent alternations admit — is discarded before the next waves are scoped from what this read returns, so a same-named pod in another namespace never reaches the node, controller or claim reads and never reaches the body
 
 #### Scenario: Every read of known pods is pair-keyed
 
@@ -984,7 +991,7 @@ When a `/v1/storage-graph` request's root kind is `application`, the build SHALL
 #### Scenario: Recovered pods' bindings name the tracked claims
 
 - **WHEN** the recovered pods are known
-- **THEN** the claim-binding family is read restricted to their `(namespace, pod)` pairs — the namespace the recovering `kube_pod_owner` row carries, one query per namespace — keeping only rows whose `(cluster, namespace, pod)` is a recovered pod, so a same-named pod elsewhere contributes no claim
+- **THEN** the claim-binding family is read restricted to their `(namespace, pod)` pairs — the namespace the recovering `kube_pod_owner` row carries, grouped across namespaces as every read of known pods is — keeping only rows whose `(cluster, namespace, pod)` is a recovered pod, so a same-named pod elsewhere contributes no claim
 - **AND** the claims those rows bind, together with the own-annotated claims, form the tracked claim set of "Every root kind is tracked from its own tier to its claims", and every mounter of a tracked claim is then loaded by the mounter completion of "The tracked claims expand to both ends of the chain"
 
 #### Scenario: The forward resolution alone decides a root
