@@ -57,11 +57,24 @@ type backendEntry struct {
 // Read reads and parses the routing table at path. A nil lookup reads the
 // process environment.
 func Read(path string, lookup LookupEnvFunc) (*promql.Table, error) {
+	table, _, err := ReadWithContent(path, lookup)
+	return table, err
+}
+
+// ReadWithContent is Read that also returns the exact bytes the table was
+// parsed from. Pass them as ReloaderOptions.Content so the reloader compares
+// later reads against what is actually live, never against a second read of
+// the file that may already hold newer content.
+func ReadWithContent(path string, lookup LookupEnvFunc) (*promql.Table, []byte, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path
 	if err != nil {
-		return nil, fmt.Errorf("backends file %s: %w", path, err)
+		return nil, nil, fmt.Errorf("backends file %s: %w", path, err)
 	}
-	return Parse(data, lookup)
+	table, err := Parse(data, lookup)
+	if err != nil {
+		return nil, nil, err
+	}
+	return table, data, nil
 }
 
 // Parse parses a routing table and resolves each backend's credentials from the

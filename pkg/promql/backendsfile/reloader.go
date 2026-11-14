@@ -29,6 +29,13 @@ type ReloaderOptions struct {
 	Logger *slog.Logger
 	// Metrics counts reload attempts by result. Nil records nothing.
 	Metrics promql.RouterMetrics
+	// Content is the exact bytes the router's live table was parsed from, as
+	// ReadWithContent returns them. It seeds the change digest, so the first
+	// tick after boot neither re-parses an unchanged file nor mistakes a
+	// change made since that parse for the live content. Nil leaves the digest
+	// unseeded: the first tick re-parses and swaps once (clients are reused
+	// by identity, so that swap is cheap).
+	Content []byte
 }
 
 // Reloader re-reads the routing table on a ticker and swaps it into the live
@@ -58,8 +65,10 @@ type Reloader struct {
 // NewReloader constructs a Reloader over the router serving the table that
 // opts.Path was last parsed into.
 //
-// The digest is seeded from the file the caller's startup table was built from,
-// so the first tick after boot does not re-parse an unchanged file.
+// The digest is seeded from opts.Content, the bytes the caller's startup table
+// was parsed from — never from a second read of the file, which would take a
+// change written between the startup parse and this call for the live table
+// and never apply it.
 func NewReloader(r *promql.Router, opts ReloaderOptions) *Reloader {
 	rl := &Reloader{
 		router:  r,
@@ -74,8 +83,8 @@ func NewReloader(r *promql.Router, opts ReloaderOptions) *Reloader {
 	if rl.metrics == nil {
 		rl.metrics = noopRouterMetrics{}
 	}
-	if data, err := os.ReadFile(opts.Path); err == nil { //nolint:gosec // operator-supplied config path
-		rl.lastDigest = sha256.Sum256(data)
+	if opts.Content != nil {
+		rl.lastDigest = sha256.Sum256(opts.Content)
 	}
 	return rl
 }
