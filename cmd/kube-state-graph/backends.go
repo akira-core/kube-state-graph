@@ -26,7 +26,8 @@ func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, looku
 	warnUnservedAppMetadata(cfg, table, logger)
 	// Values are passed explicitly — config.Defaults() already carries the
 	// library defaults — so an operator's 0 disables rather than defaulting.
-	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m),
+	r, err := promql.NewRouter(table, m,
+		promql.DefaultClientFactory(m, promql.WithMaxResponseBytes(cfg.UpstreamMaxResponseBytes)),
 		promql.WithMaxConcurrency(cfg.UpstreamMaxConcurrency),
 		promql.WithQueryCache(cfg.QueryCacheMaxSeries, cfg.QueryCacheTTL),
 	)
@@ -35,6 +36,7 @@ func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, looku
 	}
 	logger.Info("upstream load controls",
 		"max_concurrency_per_store", cfg.UpstreamMaxConcurrency,
+		"max_response_bytes", cfg.UpstreamMaxResponseBytes,
 		"query_cache_max_series", cfg.QueryCacheMaxSeries,
 		"query_cache_ttl", cfg.QueryCacheTTL,
 		"end_align", cfg.EndAlign,

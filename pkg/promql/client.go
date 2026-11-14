@@ -48,6 +48,10 @@ type clientOptions struct {
 	username string
 	password string
 	backend  string
+	// maxResponseBytes is WithMaxResponseBytes' value (0 = unbounded), used
+	// only when maxResponseBytesSet; otherwise DefaultMaxResponseBytes.
+	maxResponseBytes    int64
+	maxResponseBytesSet bool
 }
 
 // WithBasicAuth attaches HTTP Basic Auth credentials to outbound upstream
@@ -96,12 +100,15 @@ func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // newTransport assembles the outbound transport chain: otelhttp → basicAuth
-// (when credentials are configured) → base. The traced request is the final
-// authenticated one; otelhttp records method/URL/status only, never headers.
-// target scopes the credentials to the configured upstream's scheme and host
-// (see basicAuthTransport).
+// (when credentials are configured) → response-size bound (unless disabled) →
+// base. The traced request is the final authenticated one; otelhttp records
+// method/URL/status only, never headers. target scopes the credentials to the
+// configured upstream's scheme and host (see basicAuthTransport).
 func newTransport(o clientOptions, target *url.URL, base http.RoundTripper) http.RoundTripper {
 	rt := base
+	if bound := o.responseBound(); bound > 0 {
+		rt = &responseLimitTransport{inner: rt, max: bound}
+	}
 	if o.username != "" || o.password != "" {
 		rt = &basicAuthTransport{
 			inner: rt, scheme: target.Scheme, host: target.Host,

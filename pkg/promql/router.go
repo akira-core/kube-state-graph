@@ -20,9 +20,12 @@ type ClientFactory func(b Backend) (Querier, error)
 // carrying that backend's own resolved basic-auth pair. The credentials are
 // held on the transport only, scoped to the backend's own host, so a
 // cross-host redirect carries no Authorization header.
-func DefaultClientFactory(m Metrics) ClientFactory {
+//
+// opts apply to every backend's client after its own BackendClientOptions —
+// process-wide client settings such as WithMaxResponseBytes.
+func DefaultClientFactory(m Metrics, opts ...Option) ClientFactory {
 	return func(b Backend) (Querier, error) {
-		return New(b.URL(), m, BackendClientOptions(b)...)
+		return New(b.URL(), m, append(BackendClientOptions(b), opts...)...)
 	}
 }
 
