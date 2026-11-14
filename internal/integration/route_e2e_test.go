@@ -945,17 +945,21 @@ func (s *RouteStoreSuite) TestClustersWithIngressIPProbe() {
 	s.Empty(none, "an IP no ingress Service ever carried names no cluster")
 
 	// The cluster-gone pair: its closing rewrite (higher ingest_seq, valid_to
-	// two hours before the instant) must win the client-side dedup, so the
-	// stale open row's far-future valid_to never resurrects the cluster.
+	// two hours before the instant) must win the server-side per-slot dedup
+	// BEFORE the outer liveness filter runs, so the stale open row's
+	// far-future valid_to never resurrects the cluster. Were the liveness
+	// predicate pushed into the deduplicating scan, the closing row would be
+	// dropped first and the stale twin would name the cluster here.
 	gone, err := st.ClustersWithIngressIP(ctx, ingressLBIPGone, fixedNow)
 	s.Require().NoError(err)
 	s.Empty(gone, "a version closed before the instant must not name its cluster")
-	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
+	s.Zero(st.CollapsedRows(),
+		"the server collapsed the stale-open/closing pair; the client-side safety net saw one row per slot")
 }
 
 // TestTrafficSnapshotNoFinalDedupAndBareRef pins the snapshot-load behaviours
 // off the IP-rooted load: only the gateway version LIVE AT the instant is
-// returned (the rewritten/closed one collapses client-side and the superseded
+// returned (the rewritten/closed one collapses server-side and the superseded
 // version is filtered out), the bare-name VS binding survives the gwRefs
 // superset load into ScopedFor, and the load is strictly scoped to the
 // requested cluster.
@@ -969,7 +973,7 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	s.Require().NoError(err)
 	// Exactly 2: public-gw's current version + public-gw-http (both selected
 	// by the ingress deployment's labels). The seeded stale-open/closing row
-	// pair for public-gw MUST collapse client-side — without the no-FINAL
+	// pair for public-gw MUST collapse server-side — without the no-FINAL
 	// dedup the stale open row (valid_to = far future) reads as live at the
 	// instant and a third row appears here. The closed version that ended an
 	// hour before fixedNow is likewise absent: the point-in-time load returns
@@ -994,7 +998,8 @@ func (s *RouteStoreSuite) TestTrafficSnapshotNoFinalDedupAndBareRef() {
 	s.Len(w.VSes, 4)
 	s.NotEmpty(w.Services, "ingress + backend services in one window")
 	s.NotEmpty(w.Deploys, "the IP 3-hop loads the ingress deployment")
-	s.Positive(st.CollapsedRows(), "the stale-open/closing pair must be counted as a collapse")
+	s.Zero(st.CollapsedRows(),
+		"the stale-open/closing pair collapses server-side (LIMIT 1 BY), before the client sees it")
 
 	// boundTo: the bare-name binding ("public-gw-http" in the gateway's own
 	// namespace) must reach ScopedFor's translate input.

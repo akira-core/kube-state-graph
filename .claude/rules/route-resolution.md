@@ -114,12 +114,21 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
   `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
   tables stay interval-versioned and are written by the metadata-exporter repo;
-  schema drift fails fast at startup; reads use the no-FINAL pattern —
-  `valid_to` NEVER filtered in SQL, SQL carries only `valid_from <= at` plus the
-  join keys, client-side dedup per version slot by max ingest_seq, and the
-  liveness test `valid_from <= at < valid_to` applied post-dedup — because the
-  exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
-  opts into SQL-side pruning for update-close writers ONLY; time operands are
+  schema drift fails fast at startup; reads use the no-FINAL pattern
+  (`CH.versionRead`) — the SCANNING query never filters `valid_to` (it carries
+  only `valid_from <= at` plus the join keys) and keeps the newest row per
+  version slot server-side (`ORDER BY ingest_seq DESC LIMIT 1 BY cluster,
+  namespace, name, valid_from`); an OUTER query then applies the liveness
+  test `at < valid_to` to the survivors (ClickHouse does not push a predicate
+  into a `LIMIT BY` subquery), so ended versions and stale twins never cross
+  the wire; the client repeats dedup + liveness as a safety net — all because
+  the exporter closes a version by REWRITING the open row;
+  `--route-store-unique-rows` keeps its single-query SQL-side pruning for
+  update-close writers ONLY (no server-side dedup, so its collapse alarm still
+  sees duplicates); a VS bound by BARE name loads only from a candidate
+  gateway's namespace (qualified bindings from any); a VS or Service row whose
+  `spec_json` does not parse is skipped with a Warn, never failing the IP;
+  time operands are
   `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
   the **multi-IP union is deduped by resource-version identity**
   `(cluster, namespace, name, valid_from)` — a dual-stack ingress Service makes
