@@ -212,7 +212,8 @@ func TestBuild_TopologyFailureCancelsServiceGraphPrefetch(t *testing.T) {
 
 // The outside-retention classification is the other path that discards the
 // prefetch. It stays a 400 outside_retention, never a cancellation, and the
-// prefetch is left to finish rather than cancelled: a cancelled in-flight
+// prefetch that answers within outsideRetentionPrefetchGrace is left to finish
+// rather than cancelled: a cancelled in-flight
 // query would count as an upstream failure and log at Error on a request
 // that is the client's to fix.
 func TestBuild_OutsideRetentionDiscardsServiceGraphPrefetch(t *testing.T) {
@@ -229,6 +230,27 @@ func TestBuild_OutsideRetentionDiscardsServiceGraphPrefetch(t *testing.T) {
 	defer q.mu.Unlock()
 	assert.Zero(t, q.sgCancelled, "the prefetch is not cancelled on outside_retention")
 	assert.Equal(t, 3, q.sgRan, "all three service-graph queries ran to completion")
+}
+
+// The wait is bounded: a split routing table can leave the service-graph store
+// holding the window the kube_pod_info store has aged out, and the 400 must
+// not take as long as that scan. Past outsideRetentionPrefetchGrace the build
+// cancels the prefetch and returns.
+func TestBuild_OutsideRetentionBoundsTheServiceGraphPrefetchWait(t *testing.T) {
+	q := &failingTopologyQuerier{fallback: 10 * time.Second}
+	upQ := &upAnsweringQuerier{inner: q}
+
+	start := time.Now()
+	_, err := New(upQ, Options{}, nil, nil).Build(t.Context(), 5*time.Minute, probeTestEnd, promql.Selector{})
+	took := time.Since(start)
+
+	require.Equal(t, ReasonOutsideRetention, AsReason(err))
+	assert.GreaterOrEqual(t, took, outsideRetentionPrefetchGrace, "a slow prefetch is given the grace")
+	assert.Less(t, took, q.fallback, "but the 400 does not wait for the slow store")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	assert.Equal(t, 3, q.sgCancelled, "the prefetch still in flight past the grace is cancelled")
+	assert.Zero(t, q.sgRan)
 }
 
 // upAnsweringQuerier answers the retention probe as healthy and everything

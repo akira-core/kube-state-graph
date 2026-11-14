@@ -16,20 +16,27 @@ import (
 func TestClassifyReadError_MapsByCause(t *testing.T) {
 	t.Parallel()
 	span := trace.SpanFromContext(t.Context()) // non-recording no-op span
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
 	cases := []struct {
 		name string
+		ctx  context.Context
 		err  error
 		want Reason
 	}{
-		{"canceled", fmt.Errorf("fan-out: %w", context.Canceled), ReasonCanceled},
-		{"deadline", fmt.Errorf("fan-out: %w", context.DeadlineExceeded), ReasonTimeout},
-		{"upstream", errors.New("dial tcp: connection refused"), ReasonUpstream},
-		{"invalid scope passes through", NewError(ReasonInvalidScope, RootScopeCapMessage, nil), ReasonInvalidScope},
+		{"canceled", cancelled, fmt.Errorf("fan-out: %w", context.Canceled), ReasonCanceled},
+		// A Canceled the build's own context did not produce is another
+		// build's (a shared guard flight, a cancelled sibling chunk): the
+		// caller is still there, so it is not a 499.
+		{"canceled by another build", context.Background(), fmt.Errorf("fan-out: %w", context.Canceled), ReasonUpstream},
+		{"deadline", context.Background(), fmt.Errorf("fan-out: %w", context.DeadlineExceeded), ReasonTimeout},
+		{"upstream", context.Background(), errors.New("dial tcp: connection refused"), ReasonUpstream},
+		{"invalid scope passes through", context.Background(), NewError(ReasonInvalidScope, RootScopeCapMessage, nil), ReasonInvalidScope},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := classifyReadError(span, "topology read failed", tc.err)
+			got := classifyReadError(tc.ctx, span, "topology read failed", tc.err)
 			if AsReason(got) != tc.want {
 				t.Errorf("classifyReadError reason=%q want %q", AsReason(got), tc.want)
 			}
@@ -111,6 +118,10 @@ func TestError_Unwrap_NilCause(t *testing.T) {
 func TestClassifyReadError_CarriesQueryFamily(t *testing.T) {
 	t.Parallel()
 	span := trace.SpanFromContext(t.Context())
+	// The build's own context ended, so the "named cancel" case is the
+	// caller's; the other cases do not consult it.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
 	cases := []struct {
 		name      string
 		err       error
@@ -125,7 +136,7 @@ func TestClassifyReadError_CarriesQueryFamily(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := classifyReadError(span, "topology read failed", tc.err)
+			got := classifyReadError(cancelled, span, "topology read failed", tc.err)
 			be, ok := errors.AsType[*Error](got)
 			if !ok {
 				t.Fatalf("not a build.Error: %v", got)
