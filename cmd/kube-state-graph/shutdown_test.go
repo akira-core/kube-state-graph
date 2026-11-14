@@ -83,9 +83,9 @@ func TestShutdown_FlushRunsAfterATimedOutDrain(t *testing.T) {
 		quietLogger(), &stderr)
 
 	require.Error(t, err)
-	assert.ErrorIs(t, err, context.DeadlineExceeded, "the drain error is kept")
-	assert.ErrorContains(t, err, "otlp shutdown: collector unreachable", "and the flush error beside it")
-	assert.NoError(t, flushed.errAtCall, "the flush must not be handed an expired context")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the drain error is kept")
+	require.ErrorContains(t, err, "otlp shutdown: collector unreachable", "and the flush error beside it")
+	require.NoError(t, flushed.errAtCall, "the flush must not be handed an expired context")
 	assert.Greater(t, remaining, reserve/2, "the flush keeps (most of) the reserve")
 	assert.Contains(t, stderr.String(), "otlp shutdown timed out")
 }
