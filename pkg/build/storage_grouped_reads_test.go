@@ -94,7 +94,7 @@ func TestIssuePodFamilies_DropsCrossPairs(t *testing.T) {
 		[]graph.PodRef{{Namespace: "tenant-a", Name: "db-0"}, {Namespace: "tenant-b", Name: "web-0"}})
 	require.NoError(t, err)
 
-	var got []string
+	got := make([]string, 0, len(out))
 	for _, s := range out {
 		got = append(got, string(s.Metric["uid"]))
 	}

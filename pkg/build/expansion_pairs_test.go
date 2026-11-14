@@ -43,7 +43,7 @@ func TestUncoveredPairs_RootCoverage(t *testing.T) {
 // BenchmarkUncoveredAggrPairs measures the reached-component scope over a
 // large rooted read: every row is tested against every root list.
 func BenchmarkUncoveredAggrPairs(b *testing.B) {
-	var rows model.Vector
+	rows := make(model.Vector, 0, 20000)
 	for i := range 20000 {
 		rows = append(rows, &model.Sample{Metric: model.Metric{
 			"cluster": model.LabelValue(fmt.Sprintf("ontap-%03d", i%200)),

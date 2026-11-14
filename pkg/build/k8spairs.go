@@ -87,11 +87,6 @@ type k8sRead struct {
 // pairBudget is the byte budget one chunk of q's pair restriction may spend on
 // its two alternations: the shared batch size less the request matchers every
 // chunk repeats.
-func (r *k8sRead) pairBudget(q promql.Query) int {
-	return pairBudget(q, r.opts, r.sel)
-}
-
-// pairBudget is k8sRead.pairBudget for a caller without a k8sRead.
 func pairBudget(q promql.Query, opts Options, sel promql.Selector) int {
 	return max(opts.qosScopeBatchBytes()-promql.RequestMatcherCost(q, opts.LabelKeys, sel), 1)
 }

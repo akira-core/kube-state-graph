@@ -69,7 +69,7 @@ func TestMergeVolumeLabels_VariadicKeepsOrderAndDeduplicates(t *testing.T) {
 	base := model.Vector{s("a"), s("b")}
 	got := mergeVolumeLabels(base, model.Vector{s("b"), s("c")}, nil, model.Vector{s("c"), s("d"), s("a")})
 
-	var names []string
+	names := make([]string, 0, len(got))
 	for _, x := range got {
 		names = append(names, string(x.Metric["volume"]))
 	}

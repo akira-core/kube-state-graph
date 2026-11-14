@@ -64,9 +64,9 @@ func TestReadScopedQoS_FailClosedChunkCancelsItsSiblings(t *testing.T) {
 		Options{QoSScopeBatchBytes: 21}, promql.Selector{}, &v, &mu, true, "", false, done, done)
 
 	require.Error(t, err)
-	qe, ok := errors.AsType[*QueryError](err)
+	_, ok := errors.AsType[*QueryError](err)
 	require.True(t, ok, "the first chunk error is the one reported, got %v", err)
-	assert.NotErrorIs(t, qe, context.Canceled, "a cancelled sibling's error must not displace the real failure")
+	require.NotErrorIs(t, err, context.Canceled, "a cancelled sibling's error must not displace the real failure")
 	assert.Zero(t, f.timedOut.Load(), "no sibling may run to completion after the read already failed")
 	assert.Less(t, time.Since(start), f.fallback, "the read returns as soon as the failure is known")
 }
