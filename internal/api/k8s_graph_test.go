@@ -81,7 +81,7 @@ func TestK8sGraph_SuccessBodyShape(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -136,7 +136,7 @@ func TestK8sGraph_ParameterErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Get(k8sGraphURL(srv.URL, tc.extra))
+			resp, err := httpGet(t, k8sGraphURL(srv.URL, tc.extra))
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -161,7 +161,7 @@ func TestK8sGraph_OverCapNodeRootIssuesNothing(t *testing.T) {
 	for i := range names {
 		names[i] = fmt.Sprintf("node%04d%s", i, pad)
 	}
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": names}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": names}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -173,7 +173,7 @@ func TestK8sGraph_OverCapNodeRootIssuesNothing(t *testing.T) {
 
 func TestK8sGraph_RequiresKey(t *testing.T) {
 	srv := authServer(t, "k1")
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -184,7 +184,7 @@ func TestK8sGraph_Timeout504(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
@@ -201,7 +201,7 @@ func TestK8sGraph_FailsClosedNamingFamily(t *testing.T) {
 			srv := httptest.NewServer(s.Handler())
 			t.Cleanup(srv.Close)
 
-			resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+			resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -217,7 +217,7 @@ func TestK8sGraph_FailsClosedNamingFamily(t *testing.T) {
 		srv := httptest.NewServer(s.Handler())
 		t.Cleanup(srv.Close)
 
-		resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+		resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -232,7 +232,7 @@ func TestK8sGraph_UnknownRootIsAnEmptyOK(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"pod": {"shop/nope"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"pod": {"shop/nope"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -252,7 +252,7 @@ func TestK8sGraph_QuerySet(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"namespace": {"shop"}, "node": {"worker-1"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"namespace": {"shop"}, "node": {"worker-1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -279,7 +279,7 @@ func TestK8sGraph_PruneIsIgnored(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	get := func(extra url.Values) string {
-		resp, err := http.Get(k8sGraphURL(srv.URL, extra))
+		resp, err := httpGet(t, k8sGraphURL(srv.URL, extra))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -319,14 +319,14 @@ func TestK8sGraph_LeavesLastBuildGaugesAlone(t *testing.T) {
 		return out
 	}
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&prune=false")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&prune=false")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	afterGraph := gauges()
 	require.NotEmpty(t, afterGraph, "the /v1/graph build wrote the gauges")
 
-	resp, err = http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
+	resp, err = httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}}))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -340,7 +340,7 @@ func TestK8sGraph_EmbedderAndServerAgree(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	vals := k8sGraphParams(url.Values{"node": {"worker-1"}})
-	resp, err := http.Get(srv.URL + "/v1/k8s-graph?" + vals.Encode())
+	resp, err := httpGet(t, srv.URL+"/v1/k8s-graph?"+vals.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

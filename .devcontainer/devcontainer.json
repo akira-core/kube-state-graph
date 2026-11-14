@@ -41,7 +41,7 @@
   ],
 
   // Reuse the repo's own bootstrap as the single source of truth for pinned tool
-  // versions: init-go (go mod download) + init-tools (golangci-lint v2.11.4 +
+  // versions: init-go (go mod download) + init-tools (golangci-lint v2.15.0 +
   // govulncheck into /go/bin). mockery/swag need no install (go.mod tool dirs).
   "postCreateCommand": "make init",
 

@@ -19,7 +19,7 @@ func TestDocs_ServesScalarUI(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/docs")
+	resp, err := httpGet(t, srv.URL+"/docs")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -41,7 +41,7 @@ func TestOpenAPIYAMLEndpoint(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	resp, err := httpGet(t, srv.URL+"/openapi.yaml")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -59,7 +59,7 @@ func TestOpenAPIJSONEndpoint(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/openapi.json")
+	resp, err := httpGet(t, srv.URL+"/openapi.json")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

@@ -13,16 +13,23 @@ on:
 permissions:
   contents: read
 
+# Same policy as ci.yml: a new push cancels a PR's superseded run; main runs
+# are grouped per commit and never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # An empty `ng-words` input is a SKIP (exit 0), not a failure — so a
       # missing/renamed org secret makes this job pass green without scanning.
       # Same for pull_request runs from a fork: GitHub withholds secrets there,
       # so the input resolves empty and the scan is skipped.
-      - uses: akira-core/action-workflow@v1
+      - uses: akira-core/action-workflow@b3beff5f40ccb8eb394cd056d9f57a9ccb404ccd # v1
         with:
           ng-words: ${{ secrets.NG_WORDS }}

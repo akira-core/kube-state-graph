@@ -91,7 +91,7 @@ func TestPanicRecovery_Returns500Envelope(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// Without recovery middleware this Get fails with a connection reset (EOF).
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err, "a handler panic must not reset the connection")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
@@ -118,7 +118,7 @@ func TestPanicRecovery_ErrAbortHandlerPassesThrough(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/readyz") //nolint:bodyclose // the request must fail without a response
+	resp, err := httpGet(t, srv.URL+"/readyz") //nolint:bodyclose // the request must fail without a response
 	if err == nil {
 		resp.Body.Close()
 		t.Fatalf("expected an aborted connection, got HTTP %d", resp.StatusCode)
@@ -130,7 +130,7 @@ func TestPanicRecovery_ErrAbortHandlerPassesThrough(t *testing.T) {
 	// instead — it is incremented in the same deferred block, after any
 	// recovery log would have been written.
 	require.Eventually(t, func() bool {
-		mresp, err := http.Get(srv.URL + "/metrics") //nolint:noctx,gosec // test server URL
+		mresp, err := httpGet(t, srv.URL+"/metrics") //nolint:gosec // test server URL
 		if err != nil {
 			return false
 		}
@@ -151,7 +151,7 @@ func TestPanicRecovery_AccessLogAndMetricStillRecorded(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
@@ -178,7 +178,7 @@ func TestPanicRecovery_AccessLogAndMetricStillRecorded(t *testing.T) {
 	assert.True(t, sawAccessLog, "access log must record the 500 despite the panic: %s", logs.String())
 
 	// HTTP requests metric with the 5xx class.
-	mresp, err := http.Get(srv.URL + "/metrics")
+	mresp, err := httpGet(t, srv.URL+"/metrics")
 	require.NoError(t, err)
 	defer mresp.Body.Close()
 	mbody, _ := io.ReadAll(mresp.Body)

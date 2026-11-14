@@ -25,8 +25,12 @@ fi
 # 2. lint — golangci-lint's govet linter subsumes a standalone `go vet`. Fall
 #    back to plain vet when the linter isn't installed (e.g. a fresh clone), so
 #    a missing dev tool never blocks a commit; pre-push/CI still enforces lint.
-if command -v golangci-lint >/dev/null 2>&1; then
-	golangci-lint run --timeout=5m
+#    Prefers the pinned binary `make init-tools` installs (same GOBIN default as
+#    the Makefile) over whichever golangci-lint comes first on PATH.
+lint_bin="${GOBIN:-$(go env GOPATH)/bin}/golangci-lint"
+[ -x "$lint_bin" ] || lint_bin=golangci-lint
+if command -v "$lint_bin" >/dev/null 2>&1; then
+	"$lint_bin" run --timeout=5m
 else
 	echo "pre-commit: golangci-lint not installed; falling back to go vet" >&2
 	go vet ./...

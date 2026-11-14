@@ -67,7 +67,7 @@ func TestEndAlign_AppliedOnBothGraphEndpoints(t *testing.T) {
 				})
 				srv := httptest.NewServer(s.Handler())
 				t.Cleanup(srv.Close)
-				resp, err := http.Get(srv.URL + path) //nolint:noctx // test server URL
+				resp, err := httpGet(t, srv.URL+path)
 				require.NoError(t, err)
 				resp.Body.Close()
 				require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -87,14 +87,14 @@ func TestEndAlign_ValidationUsesCallerValues(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-02T12:19:40Z&end=2026-05-02T12:19:50Z") //nolint:noctx // test server URL
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-02T12:19:40Z&end=2026-05-02T12:19:50Z")
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	want, _ := time.Parse(time.RFC3339, "2026-05-02T12:19:30Z")
 	assert.Equal(t, map[time.Time]bool{want: true}, seen())
 
-	resp, err = http.Get(srv.URL + "/v1/graph?start=2026-05-02T12:19:50Z&end=2026-05-02T12:19:40Z") //nolint:noctx // test server URL
+	resp, err = httpGet(t, srv.URL+"/v1/graph?start=2026-05-02T12:19:50Z&end=2026-05-02T12:19:40Z")
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "end before start still rejected")

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
@@ -160,4 +161,16 @@ func vec(samples ...map[string]string) model.Vector {
 		out = append(out, &model.Sample{Metric: metric, Value: 1, Timestamp: 0})
 	}
 	return out
+}
+
+// httpGet is http.Get bound to t's context. The noctx linter forbids the
+// context-free form; binding the request to the test means a test that ends
+// (or times out) cancels a request still in flight instead of leaking it.
+func httpGet(t testing.TB, rawURL string) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(req)
 }

@@ -29,7 +29,7 @@ func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 // inner transport received.
 func roundTrip(t *testing.T, rt http.RoundTripper, inner *fakeRoundTripper, rawURL string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
 	require.NoError(t, err)
 	resp, err := rt.RoundTrip(req)
 	require.NoError(t, err)

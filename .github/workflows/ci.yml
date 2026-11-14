@@ -1,8 +1,8 @@
 name: CI
 
-# `lint`, `vuln`, `embedder-go`, `test`, `docs-drift`, `route-containment`, and
-# `mocks-drift` are separate jobs; they run in parallel (no `needs` edges) so PR feedback
-# latency = max, not sum.
+# `lint`, `vuln`, `embedder-go`, `test`, `docs-drift`, `route-containment`,
+# `mocks-drift`, and `image-build` are separate jobs; they run in parallel (no
+# `needs` edges) so PR feedback latency = max, not sum.
 on:
   pull_request:
   # Also run on direct pushes / merges to the default branch so post-merge
@@ -14,36 +14,58 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR cancels that PR's superseded run. Pushes to main are
+# grouped per commit (github.sha) and never cancelled: a shared group would
+# still drop a QUEUED main run when the next commit lands, leaving that commit
+# without a status.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every job carries timeout-minutes: the 360-minute default lets a hung step
+# (a wedged container, a stuck download) hold a runner for six hours.
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: golangci/golangci-lint-action@v9
+      # Single source: the Makefile's GOLANGCI_LINT_VERSION, so `make lint`
+      # (after `make init-tools`) and this job run the same linter. Without
+      # `version` the action resolves "latest" at run time.
+      - name: Read pinned golangci-lint version
+        id: lint-version
+        run: |
+          v=$(sed -n 's/^GOLANGCI_LINT_VERSION ?= //p' Makefile)
+          test -n "$v" || { echo "GOLANGCI_LINT_VERSION not found in Makefile" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
+          version: ${{ steps.lint-version.outputs.version }}
           args: --timeout=5m
 
   vuln:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
+      # `make vuln` runs govulncheck at the Makefile's GOVULNCHECK_VERSION
+      # through `go run`: one pin for local and CI, no separate install step.
       - name: Run govulncheck
-        run: govulncheck ./...
+        run: make vuln
 
   # Modules importing pkg/ may be on Go 1.27.1. go.mod's `toolchain` line binds
   # only this module, never an importer, so pkg/ is built, vetted and tested on
@@ -51,12 +73,13 @@ jobs:
   # dependency or a language feature needing newer Go fails here.
   embedder-go:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: '1.27.1'
           cache: true
@@ -70,10 +93,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # The container-backed integration suites dominate; go test aborts a
+    # package at 10m, so 30 leaves room for module and image pulls.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
@@ -100,10 +126,11 @@ jobs:
 
   docs-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
@@ -128,10 +155,11 @@ jobs:
   # enforced anywhere.
   route-containment:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
@@ -144,10 +172,11 @@ jobs:
 
   mocks-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
@@ -159,3 +188,20 @@ jobs:
       # `go tool mockery`, so no separate install step is needed.
       - name: Verify mocks in sync
         run: make verify-mocks
+
+  # Builds deploy/docker/server.Dockerfile, never pushes. It is the gate for the
+  # digest-pinned image inputs: a Dependabot docker PR moving a FROM digest
+  # would otherwise pass every other job without the image ever being built.
+  # It also catches a golang base image that disagrees with go.mod's
+  # `toolchain` (the build stage runs GOTOOLCHAIN=local). Host arch only: the
+  # runner's default buildx driver cannot export a multi-platform image, and
+  # each FROM digest is a multi-arch index, so the other platforms resolve from
+  # the same pinned index at `make docker-push` time.
+  image-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Build server image (no push)
+        run: make docker-build

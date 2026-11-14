@@ -37,7 +37,7 @@ func TestAuth_Disabled_AllRoutesPassThrough(t *testing.T) {
 	srv := authServer(t) // no keys = auth disabled
 
 	for _, path := range []string{"/livez", graphProbePath, "/metrics"} {
-		resp, err := http.Get(srv.URL + path)
+		resp, err := httpGet(t, srv.URL+path)
 		require.NoError(t, err)
 		_ = resp.Body.Close()
 		assert.Equalf(t, http.StatusOK, resp.StatusCode, "path %s", path)
@@ -47,7 +47,7 @@ func TestAuth_Disabled_AllRoutesPassThrough(t *testing.T) {
 func TestAuth_MissingHeader_Returns401(t *testing.T) {
 	srv := authServer(t, "k1")
 
-	resp, err := http.Get(srv.URL + graphProbePath)
+	resp, err := httpGet(t, srv.URL+graphProbePath)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -61,7 +61,7 @@ func TestAuth_MissingHeader_Returns401(t *testing.T) {
 func TestAuth_WrongKey_Returns401(t *testing.T) {
 	srv := authServer(t, "k1")
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+graphProbePath, nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+graphProbePath, nil)
 	req.Header.Set(APIKeyHeader, "wrong-key")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -73,7 +73,7 @@ func TestAuth_ValidKey_Passes(t *testing.T) {
 	srv := authServer(t, "k1", "k2")
 
 	for _, key := range []string{"k1", "k2"} {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+graphProbePath, nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+graphProbePath, nil)
 		req.Header.Set(APIKeyHeader, key)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
@@ -86,7 +86,7 @@ func TestAuth_OpenPaths_BypassWithoutKey(t *testing.T) {
 	srv := authServer(t, "k1")
 
 	for _, path := range []string{"/livez", "/metrics", "/openapi.yaml", "/openapi.json", "/docs"} {
-		resp, err := http.Get(srv.URL + path)
+		resp, err := httpGet(t, srv.URL+path)
 		require.NoErrorf(t, err, "path %s", path)
 		_ = resp.Body.Close()
 		assert.Equalf(t, http.StatusOK, resp.StatusCode, "open path %s should not require key", path)
@@ -96,7 +96,7 @@ func TestAuth_OpenPaths_BypassWithoutKey(t *testing.T) {
 func TestAuth_GraphRoute_RequiresKey(t *testing.T) {
 	srv := authServer(t, "k1")
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)

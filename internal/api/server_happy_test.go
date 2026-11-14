@@ -74,7 +74,7 @@ func TestGraphEndpoint_HappyPath(t *testing.T) {
 
 	end := time.Now().UTC()
 	start := end.Add(-15 * time.Minute)
-	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	resp, err := httpGet(t, graphURL(srv.URL+"/v1/graph", start, end))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -121,7 +121,7 @@ func TestGraphEndpoint_NodeInternalIPFallback(t *testing.T) {
 
 	end := time.Now().UTC()
 	start := end.Add(-15 * time.Minute)
-	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	resp, err := httpGet(t, graphURL(srv.URL+"/v1/graph", start, end))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -154,7 +154,7 @@ func TestGraphEndpoint_OutsideRetention_ReturnsError(t *testing.T) {
 
 	end := time.Now().UTC()
 	start := end.Add(-15 * time.Minute)
-	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	resp, err := httpGet(t, graphURL(srv.URL+"/v1/graph", start, end))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -172,7 +172,7 @@ func TestGraphEndpoint_UpstreamError_Returns502(t *testing.T) {
 
 	end := time.Now().UTC()
 	start := end.Add(-15 * time.Minute)
-	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	resp, err := httpGet(t, graphURL(srv.URL+"/v1/graph", start, end))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -196,7 +196,7 @@ func TestClustersEndpoint_Removed(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/clusters")
+	resp, err := httpGet(t, srv.URL+"/v1/clusters")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
@@ -209,7 +209,7 @@ func TestGraphEndpoint_ClustersFieldListsObservedClusters(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&prune=false")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&prune=false")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

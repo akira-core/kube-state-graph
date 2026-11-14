@@ -1,0 +1,49 @@
+# Dependency update proposals for the three pinned surfaces: Go modules
+# (go.mod / go.sum), the SHA-pinned GitHub Actions, and the digest-pinned
+# images of deploy/docker/server.Dockerfile. Weekly, one grouped PR per
+# ecosystem, so pins move forward in batches CI can judge instead of drifting
+# silently or arriving as a PR per dependency.
+#
+# A proposal is not automatically safe to merge:
+#   - gomod: pkg/ must keep building on Go 1.27.1 (CLAUDE.md). A bump whose
+#     module declares a newer `go` directive fails the `embedder-go` job; that
+#     job is the gate, so do not merge around it.
+#   - docker: tracks the two FROM images only. CI's `image-build` job builds
+#     the image for every proposal, and the golang base image must match
+#     go.mod's `toolchain` line (GOTOOLCHAIN=local makes a mismatch a build
+#     error in that job). Neither the `# syntax=` frontend line nor the
+#     ARG-held ENVOY_TOOLS_IMAGE is tracked; re-pin both by hand with
+#     `docker buildx imagetools inspect <image>:<tag>`.
+#   - Tool versions in the Makefile (GOLANGCI_LINT_VERSION,
+#     GOVULNCHECK_VERSION) are outside every ecosystem here; bump them by hand.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+    groups:
+      docker-images:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
