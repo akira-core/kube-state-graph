@@ -13,8 +13,8 @@
 ## 3. Gate per-series Debug argument construction (audit #26, design D5)
 
 - [x] 3.1 Commit `BenchmarkParseServiceGraph_DebugOff` / `_DebugOn` first and record the baseline.
-- [ ] 3.2 Write failing zero-allocation tests: with an Info-level handler, `noteExternal`, `noteConnStringShadowed` and the missing-UID fallback allocate nothing beyond resolution itself.
-- [ ] 3.3 Add `debugEnabled`, split `noteExternal` into `countExternal` and `logExternal`, and gate every per-series Debug site in `servicegraph.go`. Counters and the rollback journal stay unconditional. Verify 3.2 passes and the benchmark's allocations drop.
+- [x] 3.2 Write failing zero-allocation tests: with an Info-level handler, `noteExternal`, `noteConnStringShadowed` and the missing-UID fallback allocate nothing beyond resolution itself.
+- [x] 3.3 Add `debugEnabled`, split `noteExternal` into `countExternal` and `logExternal`, and gate every per-series Debug site in `servicegraph.go`. Counters and the rollback journal stay unconditional. Verify 3.2 passes and the benchmark's allocations drop.
 
 ## 4. Docs and verification
 
