@@ -269,9 +269,29 @@ type routeAnswer struct {
 const prescanConcurrency = 4
 
 // resolveBuild drives one build's keys through r exactly as pkg/build's
-// resolveRouteQueries does: one BuildScoped scope per build, keys resolved
-// under bounded concurrency.
+// resolveRouteQueries does: one BuildScoped scope per build, then the whole
+// key set in one batch when the scope offers it.
 func resolveBuild(ctx context.Context, r build.RouteResolver, reqs []build.RouteRequest) []routeAnswer {
+	if s, ok := r.(build.BuildScopedRouteResolver); ok {
+		r = s.BuildScoped()
+	}
+	if b, ok := r.(build.BatchRouteResolver); ok {
+		answers := b.ResolveRoutes(ctx, reqs, build.RouteBatchLimits{Concurrency: prescanConcurrency})
+		out := make([]routeAnswer, len(reqs))
+		for i, a := range answers {
+			out[i] = routeAnswer{Dest: a.Dest, Outcome: a.Outcome}
+			if a.Err != nil {
+				out[i].Err = a.Err.Error()
+			}
+		}
+		return out
+	}
+	return resolveBuildPerKey(ctx, r, reqs)
+}
+
+// resolveBuildPerKey is the pre-batch prescan: one BuildScoped scope per
+// build, keys resolved one by one under bounded concurrency.
+func resolveBuildPerKey(ctx context.Context, r build.RouteResolver, reqs []build.RouteRequest) []routeAnswer {
 	if s, ok := r.(build.BuildScopedRouteResolver); ok {
 		r = s.BuildScoped()
 	}

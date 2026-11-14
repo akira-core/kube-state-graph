@@ -460,6 +460,12 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	if s, ok := resolver.(BuildScopedRouteResolver); ok {
 		resolver = s.BuildScoped()
 	}
+	// Upgrade again when the (scoped) resolver takes the whole key set at once
+	// (BatchRouteResolver): the engine then matches every key that shares a
+	// RouteConfiguration in one router_check_tool run.
+	if b, ok := resolver.(BatchRouteResolver); ok {
+		return resolveRouteBatch(ctx, b, perCallTimeout, keys, at)
+	}
 	idx := make(routeIndex, len(keys))
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
@@ -502,6 +508,53 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	}
 	_ = g.Wait() // no goroutine returns an error; resolution never fails a build
 	return idx
+}
+
+// resolveRouteBatch is resolveRouteQueries' batch branch: the whole (capped,
+// sorted) key set goes to the resolver in one call, carrying the prescan's own
+// concurrency and per-call timeout, and the answers are recorded under exactly
+// the per-key rules — an unanswered key and an error after the build deadline
+// record nothing, any other error records a failed entry.
+func resolveRouteBatch(ctx context.Context, resolver BatchRouteResolver, perCallTimeout time.Duration, keys []routeKey, at time.Time) routeIndex {
+	reqs := make([]RouteRequest, len(keys))
+	for i, k := range keys {
+		reqs[i] = k.request(at)
+	}
+	answers := resolveRoutesRecovering(ctx, resolver, reqs,
+		RouteBatchLimits{Concurrency: routeResolveConcurrency, PerCallTimeout: perCallTimeout})
+
+	idx := make(routeIndex, len(keys))
+	for i, k := range keys {
+		if i >= len(answers) || !answers[i].Answered {
+			continue // never reached: keeps the pre-change external reason
+		}
+		a := answers[i]
+		if a.Err != nil {
+			slog.Debug("route-engine resolution errored (endpoint degrades to external)",
+				"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips,
+				"error", a.Err)
+			if ctx.Err() == nil {
+				idx[k] = routeEntry{failed: true}
+			}
+			continue
+		}
+		idx[k] = routeEntry{dest: a.Dest, outcome: a.Outcome}
+	}
+	return idx
+}
+
+// resolveRoutesRecovering is resolver.ResolveRoutes with a panic on the
+// calling goroutine turned into "no key answered" — every endpoint keeps its
+// pre-change external reason, and the build goes on.
+func resolveRoutesRecovering(ctx context.Context, resolver BatchRouteResolver, reqs []RouteRequest, limits RouteBatchLimits) (answers []RouteAnswer) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.ErrorContext(ctx, "panic in batched route resolution (every endpoint degrades to external)",
+				"keys", len(reqs), "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			answers = nil
+		}
+	}()
+	return resolver.ResolveRoutes(ctx, reqs, limits)
 }
 
 // errRoutePanic marks a key whose resolution panicked: recorded like any other

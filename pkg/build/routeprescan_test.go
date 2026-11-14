@@ -256,6 +256,122 @@ func TestResolveRouteQueries_DrivesTheScopeConcurrently(t *testing.T) {
 	assert.Len(t, scope.memo, len(keys))
 }
 
+// fakeBatchScope is a BatchRouteResolver scope: ResolveRoutes answers through
+// fn (per request) unless answer overrides the whole batch.
+type fakeBatchScope struct {
+	fakeRouteResolver
+	limits RouteBatchLimits
+	calls  int
+	answer func(ctx context.Context, reqs []RouteRequest) []RouteAnswer
+}
+
+func (f *fakeBatchScope) ResolveRoutes(ctx context.Context, reqs []RouteRequest, limits RouteBatchLimits) []RouteAnswer {
+	f.calls++
+	f.limits = limits
+	if f.answer != nil {
+		return f.answer(ctx, reqs)
+	}
+	out := make([]RouteAnswer, len(reqs))
+	for i, req := range reqs {
+		dest, outcome, err := f.fn(req)
+		out[i] = RouteAnswer{Dest: dest, Outcome: outcome, Err: err, Answered: true}
+	}
+	return out
+}
+
+type batchScopedResolver struct {
+	fakeRouteResolver
+	scope *fakeBatchScope
+}
+
+func (r *batchScopedResolver) BuildScoped() RouteResolver { return r.scope }
+
+func batchKeys(n int) []routeKey {
+	keys := make([]routeKey, n)
+	for i := range keys {
+		keys[i] = routeKey{
+			callerCluster: "cluster-alpha",
+			host:          "svc-" + strconv.Itoa(i) + ".example.com",
+			path:          "/", port: 443, ips: testDNSAnswer,
+		}
+	}
+	return keys
+}
+
+// A scope offering BatchRouteResolver gets the whole key set in ONE call with
+// the prescan's own limits, and the index equals the per-key path's.
+func TestResolveRouteQueries_BatchIndexMatchesPerKey(t *testing.T) {
+	keys := batchKeys(6)
+	answer := func(req RouteRequest) (RouteDestination, RouteOutcome, error) {
+		switch req.Host {
+		case "svc-1.example.com":
+			return RouteDestination{}, "", errors.New("store unreachable")
+		case "svc-2.example.com":
+			return RouteDestination{}, RouteNoRoute, nil
+		}
+		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: req.Host}, RouteHit, nil
+	}
+	at := time.Unix(1_700_000_300, 0).UTC()
+
+	want := resolveRouteQueries(t.Context(), &fakeRouteResolver{fn: answer}, 0, keys, at)
+
+	scope := &fakeBatchScope{fakeRouteResolver: fakeRouteResolver{fn: answer}}
+	got := resolveRouteQueries(t.Context(), &batchScopedResolver{scope: scope}, 3*time.Second, keys, at)
+
+	assert.Equal(t, want, got)
+	assert.Equal(t, 1, scope.calls)
+	assert.Equal(t, RouteBatchLimits{Concurrency: routeResolveConcurrency, PerCallTimeout: 3 * time.Second}, scope.limits)
+	assert.Empty(t, scope.requests(), "the per-key entry point is not used once batched")
+}
+
+// An answer the batch never reached gets NO entry, so its endpoint keeps the
+// pre-change external reason — same as a key the per-key loop never reached.
+func TestResolveRouteQueries_BatchUnansweredKeysHaveNoEntry(t *testing.T) {
+	keys := batchKeys(3)
+	scope := &fakeBatchScope{answer: func(_ context.Context, reqs []RouteRequest) []RouteAnswer {
+		out := make([]RouteAnswer, len(reqs))
+		out[0] = RouteAnswer{Outcome: RouteNoIngress, Answered: true}
+		return out
+	}}
+
+	idx := resolveRouteQueries(t.Context(), &batchScopedResolver{scope: scope}, 0, keys, time.Unix(1_700_000_300, 0).UTC())
+
+	assert.Equal(t, routeIndex{keys[0]: {outcome: RouteNoIngress}}, idx)
+}
+
+// Errors observed after the build deadline record nothing: the deadline is not
+// an engine failure.
+func TestResolveRouteQueries_BatchErrorsAfterTheDeadlineRecordNothing(t *testing.T) {
+	keys := batchKeys(2)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	scope := &fakeBatchScope{answer: func(_ context.Context, reqs []RouteRequest) []RouteAnswer {
+		cancel() // the build deadline fires while the batch runs
+		out := make([]RouteAnswer, len(reqs))
+		for i := range out {
+			out[i] = RouteAnswer{Err: context.Canceled, Answered: true}
+		}
+		return out
+	}}
+
+	idx := resolveRouteQueries(ctx, &batchScopedResolver{scope: scope}, 0, keys, time.Unix(1_700_000_300, 0).UTC())
+
+	assert.Empty(t, idx)
+}
+
+// A batch that panics on the calling goroutine answers nothing, and the build
+// goes on.
+func TestResolveRouteQueries_BatchPanicIsRecovered(t *testing.T) {
+	scope := &fakeBatchScope{answer: func(context.Context, []RouteRequest) []RouteAnswer {
+		panic("engine blew up")
+	}}
+
+	idx := resolveRouteQueries(t.Context(), &batchScopedResolver{scope: scope}, 0, batchKeys(2), time.Unix(1_700_000_300, 0).UTC())
+
+	assert.NotNil(t, idx, "engine on: the index is non-nil even when empty")
+	assert.Empty(t, idx)
+}
+
 // unknownPeerSample builds one server="unknown" sample whose client resolves
 // to the real topology pod "abc" (cluster-alpha), with peer set on
 // client_net_peer_name, the default client_dns_answers IP, and any extra

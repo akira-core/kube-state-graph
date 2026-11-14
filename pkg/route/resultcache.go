@@ -148,6 +148,10 @@ func (l *resultLease) finish(val routeResult, err error) {
 	close(l.f.done)
 }
 
+// isDone reports whether the lease has been finished. A nil lease (disabled
+// cache) has nothing to finish.
+func (l *resultLease) isDone() bool { return l == nil || l.done }
+
 // run resolves under the lease and publishes the result; a panic in fn
 // releases the waiters before it continues up the caller's goroutine.
 func (l *resultLease) run(ctx context.Context, fn func(context.Context) (routeResult, error)) (val routeResult, err error) {

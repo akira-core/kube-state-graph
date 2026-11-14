@@ -45,7 +45,21 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   Concurrency cannot change the index's CONTENTS (entries are keyed by
   `routeKey` and independent); it changes only which keys are answered when
   the build deadline fires first, which is wall-clock dependent under any
-  schedule. **(3) Listener port
+  schedule. Every per-key goroutine recovers a panic into that key's
+  `route_engine_error`. When the (scoped) resolver also implements the
+  optional `build.BatchRouteResolver`, the whole capped key set goes to
+  `ResolveRoutes` in ONE call with `RouteBatchLimits{routeResolveConcurrency,
+  --route-resolve-timeout}`; answers are recorded under the per-key rules
+  (`Answered=false` or an error after the build deadline → no entry). The
+  engine's batch prepares each key (cache lookup, probe, load, gateway pick,
+  listener gate, LB fallback, memoised translation) under the per-call
+  timeout, then runs ONE `router_check_tool` invocation per distinct
+  `rcKey` (queries de-duplicated), each under its own per-call timeout — so a
+  key may spend up to two timeouts — and retries a failed run query by query
+  while its context is live (`parseActuals` is all-or-nothing). Keys another
+  build is already resolving are awaited only AFTER the batch has released its
+  own cache leases (waiting while holding them deadlocks two builds on each
+  other's keys). Batch answers equal per-key answers. **(3) Listener port
   precedence**: the `:<port>` on the peer-address value (returned by
   `splitPeerAddressPort`) → the optional
   `client_server_port` / `client_net_peer_port` dimension → default **443**

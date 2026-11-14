@@ -181,3 +181,41 @@ type BuildScopedRouteResolver interface {
 	// for the duration of one build and then discard it.
 	BuildScoped() RouteResolver
 }
+
+// RouteBatchLimits carries the prescan's own bounds into a batch resolution:
+// at most Concurrency requests (or matcher groups) in progress at once, and
+// each request's preparation and each group's matcher run bounded by
+// PerCallTimeout independently (zero = the batch context only).
+type RouteBatchLimits struct {
+	Concurrency    int
+	PerCallTimeout time.Duration
+}
+
+// RouteAnswer is one request's result in a batch: the same (destination,
+// outcome, error) triple ResolveRoute returns, under the same contract (an
+// error carries no meaningful outcome). Answered is false when the batch
+// never reached the request — the batch context ended first — and such a
+// request gets no index entry, exactly like a key the per-key loop never
+// reached.
+type RouteAnswer struct {
+	Dest     RouteDestination
+	Outcome  RouteOutcome
+	Err      error
+	Answered bool
+}
+
+// BatchRouteResolver is an OPTIONAL upgrade interface a RouteResolver (or the
+// scope a BuildScopedRouteResolver mints) may implement to receive a build's
+// whole key set at once. The engine in pkg/route uses it to run ONE matcher
+// invocation per distinct RouteConfiguration instead of one per key.
+// resolveRouteQueries uses it when available and otherwise resolves key by
+// key, so a resolver without it — mocks and embedders included — runs exactly
+// as before.
+//
+// ResolveRoutes returns one RouteAnswer per request, in request order. Each
+// answer MUST equal what ResolveRoute returns for that request alone, and the
+// implementation MUST NOT panic out of goroutines it starts.
+type BatchRouteResolver interface {
+	RouteResolver
+	ResolveRoutes(ctx context.Context, reqs []RouteRequest, limits RouteBatchLimits) []RouteAnswer
+}
