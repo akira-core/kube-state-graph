@@ -3,7 +3,6 @@ package build
 import (
 	"bytes"
 	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/prometheus/common/model"
@@ -145,7 +144,7 @@ func TestParseServiceGraph_DebugLogsNeverCarryUserinfo(t *testing.T) {
 			out := buf.String()
 			require.NotEmpty(t, out, "the scenario must reach at least one Debug site")
 			assert.NotContains(t, out, userinfoSecret)
-			assert.False(t, strings.Contains(out, "app:"), "no username either: %s", out)
+			assert.NotContains(t, out, "app:", "no username either")
 		})
 	}
 }

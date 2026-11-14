@@ -58,7 +58,7 @@ func TestDebugOff_MissingUIDFallbackAllocatesOnlyTheNodeID(t *testing.T) {
 	idOnly := testing.AllocsPerRun(200, func() { _ = r.external(label) })
 	fallback := testing.AllocsPerRun(200, func() { _ = r.resolveEmptyUID(label, anchor, tr) })
 
-	assert.Equal(t, idOnly+1, fallback, "one []string result, nothing for the Debug record")
+	assert.InDelta(t, idOnly+1, fallback, 0, "one []string result, nothing for the Debug record")
 }
 
 // A "://" label shadowed by a populated UID costs nothing over the same
@@ -75,6 +75,6 @@ func TestDebugOff_ShadowedConnStringAllocatesNothingExtra(t *testing.T) {
 	before := r.shadowed
 	connAllocs := testing.AllocsPerRun(200, func() { _, _ = r.resolveClient(conn, cluster, uid, ns, tr) })
 
-	assert.Equal(t, plainAllocs, connAllocs)
+	assert.InDelta(t, plainAllocs, connAllocs, 0)
 	assert.Equal(t, before+201, r.shadowed, "the shadow counter is not gated")
 }
