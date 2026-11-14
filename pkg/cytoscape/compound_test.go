@@ -247,7 +247,7 @@ func TestSerialiseCytoscape_ClusterNodesSortedFirst(t *testing.T) {
 // divergence in all three tiers, so sorting by key fields would fail here even
 // where the goldens are too small to notice.
 func TestSerialiseCytoscape_GroupTiersSortByID(t *testing.T) {
-	var nodes []graph.GraphNode
+	nodes := make([]graph.GraphNode, 0, 24)
 	i := 0
 	for _, c := range []string{"c", "c-1"} {
 		for _, ns := range []string{"n", "n-b"} {
