@@ -14,9 +14,20 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR cancels that PR's superseded run. Pushes to main are
+# grouped per commit (github.sha) and never cancelled: a shared group would
+# still drop a QUEUED main run when the next commit lands, leaving that commit
+# without a status.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every job carries timeout-minutes: the 360-minute default lets a hung step
+# (a wedged container, a stuck download) hold a runner for six hours.
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -42,6 +53,7 @@ jobs:
 
   vuln:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -61,6 +73,7 @@ jobs:
   # dependency or a language feature needing newer Go fails here.
   embedder-go:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       GOTOOLCHAIN: local
     steps:
@@ -80,6 +93,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # The container-backed integration suites dominate; go test aborts a
+    # package at 10m, so 30 leaves room for module and image pulls.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -110,6 +126,7 @@ jobs:
 
   docs-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -138,6 +155,7 @@ jobs:
   # enforced anywhere.
   route-containment:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -154,6 +172,7 @@ jobs:
 
   mocks-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
