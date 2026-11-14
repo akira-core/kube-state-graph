@@ -339,6 +339,11 @@ func compactPairs(in map[string][]string) map[string][]string {
 // issueHarvestPairMap reads each family one query per ONTAP cluster, chunked,
 // and merges the rows into the vector a flowless read may already have
 // written. An empty map issues nothing.
+//
+// Every chunk of every family runs under ONE scopeConcurrency bound, so the
+// read never holds more upstream slots than any other scoped wave. Each
+// family's rows land after the flowless read's, then in chunk order,
+// de-duplicated by label set in a single pass.
 func issueHarvestPairMap(
 	ctx context.Context,
 	q promql.Querier,
@@ -354,8 +359,13 @@ func issueHarvestPairMap(
 	if len(byCluster) == 0 {
 		return nil
 	}
-	wave, wctx := errgroup.WithContext(ctx)
-	wave.SetLimit(scopeConcurrency)
+	type pairFamily struct {
+		query  promql.Query
+		dst    *model.Vector
+		chunks []promql.HarvestNameChunk
+		parts  []model.Vector
+	}
+	fams := make([]pairFamily, 0, len(families))
 	for _, fam := range families {
 		dst := harvestDst(v, fam)
 		if dst == nil {
@@ -365,39 +375,36 @@ func issueHarvestPairMap(
 		if len(chunks) == 0 {
 			continue
 		}
-		wave.Go(func() (err error) {
-			defer recoverScopedPanic(wctx, fam, &err)
-			parts := make([]model.Vector, len(chunks))
-			partWave, pctx := errgroup.WithContext(wctx)
-			partWave.SetLimit(scopeConcurrency)
-			for i, chunk := range chunks {
-				partWave.Go(func() (err error) {
-					defer recoverScopedPanic(pctx, fam, &err)
-					query, ok := promql.RenderHarvestPair(fam, window, opts.LabelKeys, sel, chunk.Cluster, chunk.Names)
-					if !ok {
-						return nil
-					}
-					out, err := q.Instant(pctx, string(fam), query, end)
-					if err != nil {
-						return wrapQueryError(fam, err)
-					}
-					parts[i] = out
-					return nil
-				})
-			}
-			if err := partWave.Wait(); err != nil {
-				return err
-			}
-			var merged model.Vector
-			for _, part := range parts {
-				merged = mergeVolumeLabels(merged, part)
-			}
-			scopeMu.Lock()
-			*dst = mergeVolumeLabels(*dst, merged)
-			scopeMu.Unlock()
-			markScopeIssued(v, scopeMu, fam)
-			return nil
-		})
+		fams = append(fams, pairFamily{query: fam, dst: dst, chunks: chunks, parts: make([]model.Vector, len(chunks))})
 	}
-	return wave.Wait()
+	wave, wctx := errgroup.WithContext(ctx)
+	wave.SetLimit(scopeConcurrency)
+	for fi := range fams {
+		fam := fams[fi].query
+		for ci, chunk := range fams[fi].chunks {
+			wave.Go(func() (err error) {
+				defer recoverScopedPanic(wctx, fam, &err)
+				query, ok := promql.RenderHarvestPair(fam, window, opts.LabelKeys, sel, chunk.Cluster, chunk.Names)
+				if !ok {
+					return nil
+				}
+				out, err := q.Instant(wctx, string(fam), query, end)
+				if err != nil {
+					return wrapQueryError(fam, err)
+				}
+				fams[fi].parts[ci] = out
+				return nil
+			})
+		}
+	}
+	if err := wave.Wait(); err != nil {
+		return err
+	}
+	for _, f := range fams {
+		scopeMu.Lock()
+		*f.dst = mergeVolumeLabels(*f.dst, f.parts...)
+		scopeMu.Unlock()
+		markScopeIssued(v, scopeMu, f.query)
+	}
+	return nil
 }

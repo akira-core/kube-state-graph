@@ -259,8 +259,11 @@ func matchedClaimTokens(pvcInfo, phaseOne model.Vector, rw *VolumeKeyRewriter) [
 	return slices.Compact(tokens)
 }
 
-// mergeVolumeLabels appends to base every series of extra whose label set base
-// does not already hold, preserving base's order and then extra's.
+// mergeVolumeLabels appends to base every series of each extra vector, in
+// argument order, whose label set base and the earlier extras do not already
+// hold, preserving base's order and then each extra's. Every label set is
+// fingerprinted once, however many vectors are merged, and base is never
+// appended to in place.
 //
 // The de-duplication is mandatory rather than tidy. The two phases overlap by
 // construction — a volume on a rooted aggregate that matches a claim's token is
@@ -268,22 +271,28 @@ func matchedClaimTokens(pvcInfo, phaseOne model.Vector, rw *VolumeKeyRewriter) [
 // undeduplicated merge would make that series vote twice in pickOwner and count
 // twice in every per-aggregate tally. It is the same reason the routing layer
 // de-duplicates a multi-backend fan-out by label-set fingerprint.
-func mergeVolumeLabels(base, extra model.Vector) model.Vector {
-	if len(extra) == 0 {
+func mergeVolumeLabels(base model.Vector, extras ...model.Vector) model.Vector {
+	n := 0
+	for _, extra := range extras {
+		n += len(extra)
+	}
+	if n == 0 {
 		return base
 	}
-	seen := make(map[model.Fingerprint]struct{}, len(base))
+	seen := make(map[model.Fingerprint]struct{}, len(base)+n)
 	for _, s := range base {
 		seen[s.Metric.Fingerprint()] = struct{}{}
 	}
-	out := slices.Clone(base)
-	for _, s := range extra {
-		fp := s.Metric.Fingerprint()
-		if _, dup := seen[fp]; dup {
-			continue
+	out := slices.Grow(slices.Clone(base), n)
+	for _, extra := range extras {
+		for _, s := range extra {
+			fp := s.Metric.Fingerprint()
+			if _, dup := seen[fp]; dup {
+				continue
+			}
+			seen[fp] = struct{}{}
+			out = append(out, s)
 		}
-		seen[fp] = struct{}{}
-		out = append(out, s)
 	}
 	return out
 }
@@ -771,6 +780,6 @@ func readVolumeLabelsTail(
 			return err
 		}
 	}
-	v.VolumeLabels = mergeVolumeLabels(mergeVolumeLabels(mergeVolumeLabels(v.VolumeLabels, completion), phaseTwo), late)
+	v.VolumeLabels = mergeVolumeLabels(v.VolumeLabels, completion, phaseTwo, late)
 	return nil
 }
