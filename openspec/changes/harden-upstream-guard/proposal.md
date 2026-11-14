@@ -47,6 +47,7 @@ A performance and security audit of the upstream query layer (`pkg/promql`) foun
   - per-query evaluation timeout;
   - response-size bound.
 - `otlp-observability`: bounded `db.statement` plus length and digest attributes.
+- `cluster-topology-source`: the probe query under request selectors is `count(up)`, and literal escaping covers control characters itself.
 
 ## Impact
 
