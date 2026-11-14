@@ -281,7 +281,8 @@ func TestSeenIndex_CollisionConfirmedByEquality(t *testing.T) {
 	x := sample("kube_pod_info", map[string]string{"pod": "x"}, 1)
 	y := sample("kube_pod_info", map[string]string{"pod": "y"}, 1)
 	yCopy := sample("kube_pod_info", map[string]string{"pod": "y"}, 2)
-	out := model.Vector{x}
+	out := make(model.Vector, 1, 2)
+	out[0] = x
 	idx := newSeenIndex(2)
 	const fp = model.Fingerprint(42)
 	idx.add(fp, 0)

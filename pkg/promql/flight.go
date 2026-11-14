@@ -39,6 +39,7 @@ type flight struct {
 	unbounded bool        // some waiter has no deadline
 	timer     *time.Timer // fires at deadline; nil until a bounded waiter joins
 	finished  bool        // removed from the map; never rejoined
+	expired   bool        // ended by its deadline timer (see expire)
 }
 
 // flightContext is a flight's context. Deadline reports the flight's current
@@ -117,6 +118,7 @@ func (g *guard) expire(key cacheKey, f *flight) {
 		g.mu.Unlock()
 		return
 	}
+	f.expired = true
 	g.forgetLocked(key, f)
 	g.mu.Unlock()
 	f.cancel(context.DeadlineExceeded)
@@ -181,14 +183,21 @@ func (g *guard) await(ctx context.Context, key cacheKey, f *flight, leader bool,
 	case <-f.done:
 	}
 	if f.err != nil {
-		// Only the flight's deadline can end it while a waiter remains, and
-		// that deadline is the latest waiter's — so a waiter handed the
-		// flight's context error is at (or within a timer tick of) its own
-		// deadline. Report its OWN error, which keeps the ordinary 504
-		// mapping instead of surfacing the shared context's Canceled as 499.
+		// A waiter handed a context error whose own context has ended
+		// reports its OWN error, so the 504 / 499 mapping follows the caller
+		// rather than the shared context's Canceled.
+		//
+		// Only the flight's deadline timer can end it while a waiter remains,
+		// and that deadline is the latest waiter's — so a waiter of an
+		// EXPIRED flight is at (or within a timer tick of) its own deadline
+		// and waits it out. Any other context error (an inner querier's own
+		// per-call timeout, say) is returned as-is, never waited on.
 		if isContextErr(f.err) {
 			if ctx.Err() == nil {
-				if _, bounded := ctx.Deadline(); !bounded {
+				g.mu.Lock()
+				expired := f.expired
+				g.mu.Unlock()
+				if _, bounded := ctx.Deadline(); !expired || !bounded {
 					return nil, f.err
 				}
 				<-ctx.Done()

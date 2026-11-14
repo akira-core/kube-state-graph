@@ -196,7 +196,7 @@ func TestGuard_SharedFetchUsesLatestWaiterDeadline(t *testing.T) {
 	})
 	q := Guard(inner)
 
-	short, cancelShort := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	short, cancelShort := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancelShort()
 	shortDone := make(chan error, 1)
 	go func() {
@@ -269,6 +269,22 @@ func TestGuard_DeadlineCutFlightReportsDeadlineExceeded(t *testing.T) {
 	_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.NotErrorIs(t, err, context.Canceled)
+}
+
+// A context error the inner querier produced on its own (its per-call
+// timeout, say) is returned at once: only a flight its deadline timer ended
+// makes a waiter wait out its own deadline.
+func TestGuard_InnerContextErrorIsNotWaitedOut(t *testing.T) {
+	inner := querierFunc(func(context.Context, string, string, time.Time) (model.Vector, error) {
+		return nil, context.DeadlineExceeded
+	})
+	q := Guard(inner)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second, "the caller is not held until its own deadline")
 }
 
 // waitForWaiters blocks until the flight for query has n waiters.
