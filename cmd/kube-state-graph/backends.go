@@ -84,7 +84,7 @@ func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEn
 		}
 		logger.Info("upstream routing disabled — serving from a single implicit backend",
 			"backend", config.DefaultBackendName,
-			"prom_url", cfg.PromURL,
+			"prom_url", config.RedactURL(cfg.PromURL),
 		)
 		return table, nil
 	}
@@ -98,12 +98,13 @@ func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEn
 	}
 	if cfg.PromURL != "" && cfg.PromURL != config.Defaults().PromURL {
 		logger.Warn("--prom-url is ignored because --backends-file is set",
-			"prom_url", cfg.PromURL,
+			"prom_url", config.RedactURL(cfg.PromURL),
 			"backends_file", cfg.BackendsFile,
 		)
 	}
-	// The table's rendered form names backends, endpoints, families and zones,
-	// and reports only WHETHER credentials are configured — never a value.
+	// The table's rendered form names backends, endpoints (userinfo password
+	// redacted), families and zones, and reports only WHETHER credentials are
+	// configured — never a value.
 	logger.Info("upstream routing enabled",
 		"backends_file", cfg.BackendsFile,
 		"reload_interval", cfg.BackendsReloadInterval,

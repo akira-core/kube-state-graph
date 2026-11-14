@@ -321,7 +321,9 @@ func (c Config) Validate() error {
 	}
 	u, err := url.Parse(c.PromURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("prom-url is not a valid URL: %q", c.PromURL)
+		// RedactURL, never %q of the raw value: a URL carrying userinfo would
+		// otherwise put its password in the fatal startup error.
+		return fmt.Errorf("prom-url is not a valid URL: %s", RedactURL(c.PromURL))
 	}
 	// Upstream basic-auth credentials must be configured as a pair. The error
 	// names the env vars only — never echo the configured values.

@@ -2,6 +2,7 @@ package promql
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -90,11 +91,39 @@ func (b Backend) coversZone(az []string) bool {
 // String renders the backend for logs. It names the backend, its endpoint, its
 // families and its zones — and NEVER a credential value. It reports only
 // WHETHER credentials are configured, mirroring the startup log's
-// `prom_basic_auth` boolean.
+// `prom_basic_auth` boolean, and renders the endpoint with any userinfo
+// password redacted (redactURL).
 func (b Backend) String() string {
 	return fmt.Sprintf("%s{url=%s families=%s zones=%s auth=%t}",
-		b.name, b.url, joinFamilies(b.families), strings.Join(b.zones, ","),
+		b.name, redactURL(b.url), joinFamilies(b.families), strings.Join(b.zones, ","),
 		b.username != "" || b.password != "")
+}
+
+// unparseableURL is what redactURL renders for an input it cannot safely
+// redact.
+const unparseableURL = "<unparseable url>"
+
+// redactURL renders an endpoint for a log line or an error with any userinfo
+// password replaced (url.URL.Redacted prints it as "xxxxx"). An input
+// url.Parse rejects is never echoed, nor is an opaque one ("user:pass@host"
+// parses as scheme "user" with the rest opaque, which Redacted prints whole).
+// The dial target, Backend.URL, stays raw.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" {
+		return unparseableURL
+	}
+	return u.Redacted()
+}
+
+// parseErrDetail returns the cause of a url.Parse failure without the input
+// it quotes: a *url.Error's Error() embeds the whole URL, userinfo included.
+func parseErrDetail(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 func joinFamilies(fs []Family) string {
@@ -190,15 +219,17 @@ func validateBackendURL(name, raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return fmt.Errorf("backend %q: declares an empty url", name)
 	}
+	// No error below echoes the raw URL: it may carry userinfo, and a rejected
+	// routing file is re-reported on every reload tick.
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("backend %q: url is not parseable: %w", name, err)
+		return fmt.Errorf("backend %q: url is not parseable: %w", name, parseErrDetail(err))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("backend %q: url scheme %q is not http or https", name, u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("backend %q: url %q has no host", name, raw)
+		return fmt.Errorf("backend %q: url %s has no host", name, redactURL(raw))
 	}
 	return nil
 }

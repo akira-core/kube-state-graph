@@ -78,7 +78,8 @@ func run() error {
 	logger := slog.New(telemetry.NewSlogHandler(localHandler, observability.ParseLevel(cfg.LogLevel)))
 	slog.SetDefault(logger)
 	logger.Info("starting kube-state-graph",
-		"prom_url", cfg.PromURL,
+		// Userinfo password redacted; the dial target is unchanged.
+		"prom_url", config.RedactURL(cfg.PromURL),
 		"listen_addr", cfg.ListenAddr,
 		"build_timeout", cfg.BuildTimeout,
 		"api_timeout", cfg.APITimeout,
