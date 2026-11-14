@@ -72,16 +72,18 @@ make build
   --listen-addr=:8080
 ```
 
-Then:
+Then (`start` / `end` are Unix seconds; this form works on both macOS and Linux):
 
 ```bash
-curl 'http://localhost:8080/v1/graph?start=$(date -u -d "-5 min" +%s)&end=$(date -u +%s)' | jq '.elements'
+end=$(date -u +%s)
+start=$((end - 300))
+curl "http://localhost:8080/v1/graph?start=${start}&end=${end}" | jq '.elements'
 
 # One namespace's storage topology, including workload with no traffic.
-curl 'http://localhost:8080/v1/graph?start=…&end=…&namespace=payments&prune=false' | jq '.elements'
+curl "http://localhost:8080/v1/graph?start=${start}&end=${end}&namespace=payments&prune=false" | jq '.elements'
 
 # One zone / environment.
-curl 'http://localhost:8080/v1/graph?start=…&end=…&az=eu-west-1a&env=prod' | jq '.clusters'
+curl "http://localhost:8080/v1/graph?start=${start}&end=${end}&az=eu-west-1a&env=prod" | jq '.clusters'
 ```
 
 When the server is started with API keys configured (`--api-keys-file` or
@@ -98,7 +100,7 @@ the middleware is a no-op and every route is open.
 
 ## Request filters
 
-`GET /v1/graph` takes `start`, `end` (both required) plus six optional
+`GET /v1/graph` takes `start`, `end` (both required) plus five optional
 parameters. Values within one parameter are OR-combined, different parameters
 are AND-combined.
 
@@ -183,13 +185,14 @@ set past the query cap is `400 invalid_scope` before any query. In-process, use
 
 ## Upstream metrics consumed
 
-The complete operator catalog — all **41** series, PromQL wrappers, fixed
+The complete operator catalog — all **47** series, PromQL wrappers, fixed
 selectors, query-error vs empty-vector semantics, and the per-request fan-out
 — is [`docs/upstream-metrics.md`](docs/upstream-metrics.md).
 
 Summary: one `/v1/graph` request fans out **37** topology queries in parallel
-(20 kube-state-metrics abort-on-error + 2 accumulating-cardinality
-annotation families log-and-continue + 13 Harvest + 2 kubelet
+(19 kube-state-metrics abort-on-error + 3 kube-state-metrics
+log-and-continue — the 2 accumulating-cardinality annotation families and
+`kube_pod_container_info` — + 12 Harvest + 2 kubelet + `ALERTS`
 log-and-continue), then **3** service-graph queries (skipped when a filtered
 build loaded neither pods nor services), plus `up{}` only for an unfiltered
 empty topology. There is **no metric-name prefix**; every series is queried at
@@ -270,6 +273,9 @@ external-label requirements are in `docs/kube-state-metrics-preconditions.md`.
 | `aggr_new_status` | Aggregate `data.health` (`online` if sample is `1`, else `degraded`; omitted if no series) | `cluster`, `node`, `aggr` | Optional |
 | `aggr_space_used` / `aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `node`, `aggr` | Optional |
 | `node_new_status` | Controller `data.health` (same mapping as aggregate) | `cluster`, `node` | Optional |
+| `node_labels` | Controller `data.hardware` `{model, serial, version, vendor, location}` from like-named labels. An info series: its value is ignored, only its labels are read | `cluster`, `node`, `model`, `serial`, `version`, `vendor`, `location` | Optional (absent ⇒ no `data.hardware`) |
+| `node_cpu_busy` | Controller `data.perf.cpu_busy_pct` (percent, verbatim) | `cluster`, `node` | Optional (absent ⇒ field omitted) |
+| `node_total_ops` / `node_total_latency` / `node_total_data` | Controller `data.perf.total_ops`, `total_latency_us`, `total_bytes_per_sec` | `cluster`, `node` | Optional (absent ⇒ field omitted) |
 | `kubelet_volume_stats_used_bytes` / `kubelet_volume_stats_capacity_bytes` | PVC `data.usage` `{used_bytes, capacity_bytes}` | `cluster`, `namespace`, `persistentvolumeclaim` | Optional |
 
 Every label above is **stock Harvest output** — no relabel rule is required, and none is read. ONTAP volume names admit no `-`, so the bridge to Kubernetes is built in the backend: the PVC's bound PV name is rewritten into a match token (default: replace `-` with `_`) and matched against `volume` (default: as a suffix, so the provisioner's `storagePrefix` need not be declared). Both are configurable. See `docs/netapp-harvest-preconditions.md`.
@@ -427,8 +433,8 @@ API's own `/metrics` self-metrics.
 | `pod-to-node` | `kube_pod_info` (`node` label; one per scheduled pod, intra-cluster) |
 | `pvc-to-netapp-aggr` | Harvest `volume_labels`, matching the stock `volume` label against a token derived from the PVC's `volumename` (PV name) |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
-| `pod-calls-service` | `traces_service_graph_request_total` (when target resolves to a service node via connection-string resolution) |
-| `service-selects-pod` | `traces_service_graph_request_total` (connection-string resolution + `kube_endpointslice_*` join) |
+| `pod-calls-service` | `traces_service_graph_request_total` (when the target resolves to a service node — connection-string resolution, the `server="unknown"` peer-address ladder, or the route engine) |
+| `service-selects-pod` | `traces_service_graph_request_total` (on-demand fan-out from a resolved service node + `kube_endpointslice_*` join) |
 
 ### Multi-cluster and cross-cluster coverage
 
@@ -456,7 +462,7 @@ service-graph behaviour.
 | `--az-label`                    | `KSG_AZ_LABEL`                   | `az`                 | Upstream label the `?az=` parameter is matched against. The request parameter name never changes — only the label binding. Must be a valid PromQL label name and differ from `--env-label`. |
 | `--env-label`                   | `KSG_ENV_LABEL`                  | `env`                | Upstream label the `?env=` parameter is matched against. |
 | `--app-metadata-metric`         | `KSG_APP_METADATA_METRIC`        | (empty)              | Name of the optional per-pod application-metadata metric (routing family `appmeta`). Empty disables it: no query is issued and every body stays byte-identical. A configured metric whose family no backend serves logs one Warn at startup and behaves as unset. |
-| `--app-metadata-labels`         | `KSG_APP_METADATA_LABELS`        | (empty)              | Comma-separated `field=label` overrides for `app` (default `argocd_app`), `user` (`user`), `ns_owner` (`owner`), `namespace` (`namespace`) and `pod` (`pod`). Omitted fields keep their defaults. Requires `--app-metadata-metric`. `cluster` stays the label `cluster`; az/env use `--az-label` / `--env-label`. |
+| `--app-metadata-labels`         | `KSG_APP_METADATA_LABELS`        | (empty)              | Comma-separated `field=label` overrides for `app` (default `argocd_app`), `user` (`user`), `ns_owner` (`owner`), `namespace` (`namespace`), `pod` (`pod`), `deploy_time` (`deploy_time`), `ns_group` (`namespace_group`), `ns_group_owner` (`namespace_group_owner`) and `ns_alias` (`namespace_alias`). Omitted fields keep their defaults. Requires `--app-metadata-metric`. `cluster` stays the label `cluster`; az/env use `--az-label` / `--env-label`. |
 | —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
 | —                               | `KSG_PROM_PASSWORD`              | (empty)              | HTTP Basic Auth password for the upstream. Env-only, paired with `KSG_PROM_USERNAME` — setting exactly one of the two fails startup. Rotation requires a restart (no hot reload); changing a Secret-backed env var in a Deployment triggers a rollout anyway. |
 
@@ -484,8 +490,9 @@ env:
       secretKeyRef: { name: ksg-upstream-auth, key: password }
 ```
 
-Every upstream request (topology, service-graph, cluster discovery, the
-`/readyz` probe) then carries `Authorization: Basic …`. The credential values
+These two variables configure the single implicit backend used when no
+`--backends-file` is set; every upstream request to it (topology,
+service-graph, the `/readyz` probe) then carries `Authorization: Basic …`. The credential values
 never appear in logs, traces, metrics, or error responses.
 
 ### Embedding the engine in-process
@@ -501,7 +508,7 @@ selector parameter, the root chunk caps — apply in-process too.
 
 ## Documentation
 
-- **Upstream metrics catalog (all 41 series):** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
+- **Upstream metrics catalog (all 47 series):** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
 - **kube-state-metrics install / RBAC / allowlists:** [`docs/kube-state-metrics-preconditions.md`](docs/kube-state-metrics-preconditions.md)
 - **NetApp Harvest relabel and hops:** [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)
 
@@ -526,10 +533,10 @@ tracked via go.mod's `tool` directive (Go 1.24+) and invoked through
 ```bash
 make init           # go mod download + dev tools
 make doctor         # verify toolchain (go, golangci-lint, govulncheck, mockery, docker)
-make init-hooks     # (optional) install pre-commit hook (gofmt + go vet)
+make init-hooks     # (optional) install the pre-commit (gofmt + golangci-lint + quick tests) and pre-push (make ci) hooks
 ```
 
-Required: Go 1.26+. The toolchain pinned in `go.mod` (currently `go1.27.3`)
+Required: Go 1.26+. The toolchain pinned in `go.mod` (currently `go1.27.4`)
 will be auto-fetched by Go on first build.
 
 ### Day-to-day commands
@@ -547,7 +554,7 @@ make cover          # coverage profile
 Production-side dependencies are exposed as small interfaces (`promql.Querier`,
 `auth.Validator`, `clock.Clock`) so unit tests can substitute mockery-generated
 mocks instead of fronting real services with `httptest.NewServer`. Mocks live
-under `internal/<pkg>/mocks/` and are committed to git so CI does not need
+under `<pkg>/mocks/` next to each interface and are committed to git so CI does not need
 mockery installed.
 
 ```bash
