@@ -166,7 +166,7 @@ func (g *guard) instant(ctx context.Context, backend, name, query string, ts tim
 		return g.fetch(ctx, backend, name, query, ts)
 	}
 
-	key := cacheKey{store: g.store, query: query, ts: ts.UnixNano()}
+	key := cacheKeyFor(g.store, query, ts)
 	if v, ok := g.cache.get(key); ok {
 		g.cm.IncCacheHit()
 		return v, nil

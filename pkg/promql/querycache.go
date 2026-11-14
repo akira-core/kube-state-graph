@@ -61,6 +61,11 @@ type cacheKey struct {
 	ts    int64
 }
 
+// cacheKeyFor composes the key one query at one instant is cached under.
+func cacheKeyFor(store uint64, query string, ts time.Time) cacheKey {
+	return cacheKey{store: store, query: query, ts: ts.UnixNano()}
+}
+
 type cacheEntry struct {
 	key     cacheKey
 	vec     model.Vector
