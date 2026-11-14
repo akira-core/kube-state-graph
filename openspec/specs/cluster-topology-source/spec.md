@@ -1327,7 +1327,7 @@ The build SHALL accept four request-scoped selector dimensions — `az`, `env`, 
 #### Scenario: Service-graph series are never narrowed
 
 - **WHEN** a build runs with any non-empty combination of the four dimensions
-- **THEN** the three `traces_service_graph_*` queries are issued exactly as for an unfiltered build (sentinel and link matchers only), and the `up{}` probe query is the bare `up`
+- **THEN** the three `traces_service_graph_*` queries are issued exactly as for an unfiltered build (sentinel and link matchers only), and the readiness / retention probe query is `count(up)`, with no request matcher
 
 ### Requirement: Request-scoped matcher rendering
 
@@ -1338,6 +1338,7 @@ Request-scoped matcher rendering SHALL be a pure function of the sorted, de-dupl
 - **WHEN** a matcher value is rendered
 - **THEN** a single value has `"` and `\` escaped
 - **AND** the alternatives of an alternation are regex-quoted and THEN string-escaped: a backslash introduced by regex-quoting is doubled, because a PromQL string literal rejects an unknown escape sequence
+- **AND** the string escaping covers control characters itself rather than relying on request validation: `\n`, `\r` and `\t` render as those named escapes, and every other byte in 0x00–0x1F and 0x7F renders as `\xHH`, so no value can break out of, or terminate, the string literal
 
 #### Scenario: Matchers appear in a fixed order
 
