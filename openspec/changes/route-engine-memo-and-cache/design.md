@@ -9,7 +9,7 @@ See proposal.md — Why. The relevant current state:
 - `.claude/rules/route-resolution.md` (4b) says the shared `*Resolver` stays stateless because "an instance cache would leak"; (5) says "one translate + one check per resolution … no config-signature cache".
 - `matchcheck.Runner.Resolve` already accepts a batch: it writes one test file with one case per query, and `parseActuals` requires a result for every case or fails the whole call.
 - `store.CH` reads every version with `valid_from <= at` and dedups (max `ingest_seq` per slot) and filters liveness client-side, because a `valid_to` predicate in the scanning query drops a closing rewrite before dedup and lets its stale open twin win. `--route-store-unique-rows` restores the predicate for update-close writers and turns the client collapse count into an alarm.
-- Baseline (`BenchmarkResolveRoute_SharedIngress`, 32 keys behind one IP, stage latencies scaled ~10× down): ~86 ms/build, 4 probes, 32 loads, 32 translates, 32 execs per build; the repeat-build benchmark is identical.
+- Baseline (`BenchmarkResolveRoute_SharedIngress`, 32 keys behind one IP, stage latencies scaled ~10× down): ~86 ms/build, 4 probes, 32 loads, 32 translates, 32 execs per build; the repeat-build benchmark is identical. After: see Measurements.
 
 ## Goals / Non-Goals
 
@@ -59,7 +59,9 @@ type RouteBatchLimits struct { Concurrency int; PerCallTimeout time.Duration }
 type RouteAnswer struct { Dest RouteDestination; Outcome RouteOutcome; Err error; Answered bool }
 ```
 
-`resolveRouteQueries` upgrades to the scope, then to `BatchRouteResolver`, and hands it the whole (capped, sorted) key list with its own concurrency and per-call timeout. The engine runs in two phases: (1) each key's preparation — cache lookup, probe, load, 3-hop, gateway pick, listener gate, memoised translation — under the concurrency limit with its own per-call timeout, ending either in a final answer or in a pending match; (2) one matcher invocation per distinct translation memo key, each under its own per-call timeout, with the group's queries de-duplicated by `(host, path)`. A failed group invocation whose context is still live is retried one query per invocation, so `parseActuals`' all-or-nothing rule never fails a sibling. The prescan records answers with the existing rules: `Answered == false` (never reached) and errors while the build context has ended record nothing.
+`resolveRouteQueries` upgrades to the scope, then to `BatchRouteResolver`, and hands it the whole (capped, sorted) key list with its own concurrency and per-call timeout. The engine runs in three phases: (1) each key's cross-build cache lookup and, on a miss, its preparation — probe, load, 3-hop, gateway pick, listener gate, LB fallback, memoised translation — under the concurrency limit with its own per-call timeout, ending in a final answer (cached at once) or in a pending match that holds the key's cache lease; (2) one matcher invocation per distinct translation memo key, each under its own per-call timeout, with the group's queries de-duplicated by `(host, path)` (two callers can pose one host), finishing every lease; (3) the keys another build was already resolving are awaited, and resolved alone through the single-key path if that resolution failed. A failed group invocation whose context is still live and whose error is not a context error is retried one query per invocation, so `parseActuals`' all-or-nothing rule never fails a sibling. Identical keys inside one batch share the first occurrence's answer. The prescan records answers with the existing rules: `Answered == false` (never reached) and errors while the build context has ended record nothing; a panic on the calling goroutine records nothing.
+
+Phase 3 exists because of a deadlock found in review: if phase 1 waited on another build's flight while its own build held leases that only phase 2 releases, two concurrent builds over the same keys in different orders would each wait on the other forever. A batch therefore never waits on a foreign flight while it holds a lease. Waits on the per-build memos (D1) are safe in phase 1: their leaders never wait on a cache flight.
 
 Per-call timeout: it bounds each phase per key independently, so a key's total wall time is at most two timeouts plus queueing. One timeout over both phases would make a group's deadline depend on which key arrived first.
 
@@ -73,7 +75,7 @@ Per-call timeout: it bounds each phase per key independently, so a key's total w
 
 ### D6. Cross-build result cache (C10 b) — relaxing "stateless `*Resolver`"
 
-`resultCache` (pkg/route): TTL + LRU, 4096 entries, 60 s TTL, keyed by `(caller cluster, host, path, port, joined IPs, at.UnixMilli())`, holding `(RouteDestination, RouteOutcome)` — both plain values. Only successful answers are stored. Concurrent identical misses across builds coalesce with the same never-share-a-failure rule as D1. Both `ResolveRoute` and the batch path consult it (a batch key that finds another build's flight waits for it in phase 1; on that flight's failure it resolves alone).
+`resultCache` (pkg/route): TTL + LRU, 4096 entries, 60 s TTL, keyed by `(caller cluster, host, path, port, joined IPs, at.UnixMilli())`, holding `(RouteDestination, RouteOutcome)` — both plain values. Only successful answers are stored. Concurrent identical misses across builds coalesce with the same never-share-a-failure rule as D1. Both `ResolveRoute` and the batch path consult it (a batch key that finds another build's flight waits for it in phase 3, after its own leases are released; on that flight's failure it resolves alone).
 
 `at` is the build's aligned window end (30 s grid by default), so repeated dashboard builds share it. Staleness: the answer for an instant can change only if the exporter later writes a version whose `valid_from` is at or before that instant — a late write. 60 s bounds that window, the same TTL the PromQL query cache uses.
 
@@ -114,11 +116,28 @@ Every goroutine the prescan or the engine starts for a key or a group defers a r
 
 ### D11. DSN redaction and plaintext warning (#18, #19)
 
-A `*url.Error` from `clickhouse.ParseDSN` is replaced by a fixed message ("route-store DSN is not a valid URL; not shown because it may carry credentials"): unwrapping is not enough, since the inner error can quote an authority fragment (a password containing `/` splits the authority and surfaces as an invalid port). Other `ParseDSN` errors name a query parameter and its value, not the userinfo, and pass through. After `applyAuth`, if the effective password is non-empty and the options carry no TLS config, `Open` logs a Warn without values. `CH.TLS()` reports whether TLS is configured, and the startup log adds `route_store_tls`.
+A `*url.Error` from `clickhouse.ParseDSN` is replaced by a fixed message ("parse route-store dsn: not a valid URL (the value is not shown because it may carry credentials)"): unwrapping is not enough, since the inner error can quote an authority fragment (a password containing `/` splits the authority and surfaces as an invalid port). Other `ParseDSN` errors name a query parameter and its value, not the userinfo, and pass through. After `applyAuth`, if the effective password is non-empty and the options carry no TLS config, `Open` logs a Warn without values. `CH.TLS()` reports whether TLS is configured, and the startup log adds `route_store_tls`.
 
 ### D12. Documentation of the build scope (#25)
 
 `BuildScopedRouteResolver`'s doc now says the scope MUST be safe for concurrent use (the prescan calls it from up to `routeResolveConcurrency` goroutines). A `pkg/build` test proves the prescan does call it concurrently and a `pkg/route` `-race` test drives the real scope with concurrent keys through a non-empty snapshot.
+
+### D13. Seams and fakes for the expensive stages
+
+`Resolver` holds its translate and match stages behind two unexported interfaces (`translator`, `matcher`) built by an unexported `newResolver`; `NewResolver` keeps its signature. Tests use hand-written, counting, sleep-based fakes for the store, translator and matcher, keeping snapshot / gwresolve / `ListenerFor` real.
+
+*Rejected:* exported interfaces registered in `.mockery.yaml` — they would widen `pkg/route`'s API for no caller, and the tests need blocking, latency and in-flight gauges that mockery expectations express poorly.
+
+## Measurements
+
+`go test ./pkg/route -run '^$' -bench SharedIngress -benchmem -count=5` (32 keys behind one IP and one listener; fake stage latencies: load 2 ms, probe 0.5 ms, translate 2 ms, exec 5 ms; Apple M-series, 14 threads). Medians:
+
+| Benchmark | Baseline | + per-build memo | + result cache | + batched matching |
+|---|---|---|---|---|
+| `SharedIngress` (cold build) | 85.7 ms; 4 probes, 32 loads, 32 translates, 32 execs | 54.2 ms; 1 / 1 / 1 / 32 | 54.6 ms (no hits by design) | 11.4 ms; 1 / 1 / 1 / 1 |
+| `SharedIngressRepeat` (same instant) | 87.5 ms; 4 / 32 / 32 / 32 | 52.7 ms | 25 µs; no stage work | 33 µs; no stage work |
+
+Allocations per cold build stay ~5.4 k (≈0.3 MB); a cache-hit build allocates ~26 kB.
 
 ## Risks / Trade-offs
 
