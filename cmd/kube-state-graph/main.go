@@ -147,6 +147,9 @@ func run() error {
 			"route_resolve_timeout", cfg.RouteResolveTimeout,
 			"route_store_unique_rows", cfg.RouteStoreUniqueRows,
 			"route_store_auth", cfg.RouteStoreUsername != "",
+			// Whether the ClickHouse connection is encrypted; Open already
+			// warned if a password is sent without it.
+			"route_store_tls", routeStore.TLS(),
 		)
 	}
 

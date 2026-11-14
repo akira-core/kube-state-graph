@@ -32,6 +32,7 @@
 package translate
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -103,9 +104,15 @@ func NewTranslator() *Translator {
 
 // Translate runs istio's config-generator core over one ingress's scoped config
 // and returns the RouteConfiguration istiod would push to it for the listener
-// port in.Port (default 80). It starts no goroutines: the scoped world is
-// assembled statically and discarded when this returns.
-func (tr *Translator) Translate(in ScopedInput) (*route.RouteConfiguration, error) {
+// port in.Port (default 80). The scoped world's krt controllers run goroutines
+// for the duration of the call only: they are stopped before Translate
+// returns, on every path. ctx bounds the call: an ended context returns its
+// cause before any world is built, and ends the wait for the controllers to
+// synchronise.
+func (tr *Translator) Translate(ctx context.Context, in ScopedInput) (*route.RouteConfiguration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, context.Cause(ctx)
+	}
 	port := in.Port
 	if port <= 0 {
 		port = 80
@@ -121,7 +128,7 @@ func (tr *Translator) Translate(in ScopedInput) (*route.RouteConfiguration, erro
 		return &route.RouteConfiguration{Name: fmt.Sprintf("http.%d", port)}, nil
 	}
 
-	env, cleanup, err := buildScopedEnv(in)
+	env, cleanup, err := buildScopedEnv(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +287,7 @@ func routeConfigNameFor(gwCfg config.Config, port int, reqHost string) (string, 
 // requires a *multicluster.Controller, which would mean building Kubernetes
 // clients — forbidden here — so the registry that was never
 // consulted is gone rather than faked.
-func buildScopedEnv(in ScopedInput) (*model.Environment, func(), error) {
+func buildScopedEnv(ctx context.Context, in ScopedInput) (*model.Environment, func(), error) {
 	// NewController, not the removed NewSyncController: the memory store is
 	// built on krt now and no longer distinguishes a synchronous monitor.
 	cc := memory.NewController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
@@ -319,7 +326,7 @@ func buildScopedEnv(in ScopedInput) (*model.Environment, func(), error) {
 	go configController.Run(done)
 	go vsController.Run(done)
 	cleanup := func() { close(done) }
-	if err := waitSynced(configController.HasSynced, vsController.HasSynced); err != nil {
+	if err := waitSynced(ctx, configController.HasSynced, vsController.HasSynced); err != nil {
 		cleanup()
 		return nil, nil, err
 	}
@@ -349,33 +356,50 @@ func buildScopedEnv(in ScopedInput) (*model.Environment, func(), error) {
 	return env, cleanup, nil
 }
 
-// waitSynced blocks until every krt-backed controller reports synced, or gives
-// up. The collections are populated by event delivery, so InitContext must not
-// run before they have caught up — an unsynced MergedVirtualServices lists
-// nothing and every route resolves to no cluster.
-func waitSynced(checks ...func() bool) error {
+// waitSynced blocks until every krt-backed controller reports synced, gives
+// up after syncTimeout, or returns ctx's cause when ctx ends first. The
+// collections are populated by event delivery, so InitContext must not run
+// before they have caught up — an unsynced MergedVirtualServices lists nothing
+// and every route resolves to no cluster.
+//
+// The poll interval backs off exponentially from syncPollMin to syncPollMax: a
+// small world syncs within the first few polls, and a slow one no longer
+// spins a core at a fixed 100µs interval for up to syncTimeout.
+func waitSynced(ctx context.Context, checks ...func() bool) error {
 	deadline := time.Now().Add(syncTimeout)
+	poll := syncPollMin
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
 	for {
-		synced := true
-		for _, ok := range checks {
-			if !ok() {
-				synced = false
-				break
-			}
-		}
-		if synced {
+		if allSynced(checks) {
 			return nil
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("translate: scoped config controllers did not sync within %s", syncTimeout)
 		}
-		time.Sleep(syncPoll)
+		timer.Reset(poll)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("translate: waiting for scoped config controllers: %w", context.Cause(ctx))
+		case <-timer.C:
+		}
+		poll = min(2*poll, syncPollMax)
 	}
+}
+
+func allSynced(checks []func() bool) bool {
+	for _, ok := range checks {
+		if !ok() {
+			return false
+		}
+	}
+	return true
 }
 
 const (
 	syncTimeout = 5 * time.Second
-	syncPoll    = 100 * time.Microsecond
+	syncPollMin = 100 * time.Microsecond
+	syncPollMax = 2 * time.Millisecond
 )
 
 // setupProxy fills the same proxy defaults core.ConfigGenTest.SetupProxy does

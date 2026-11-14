@@ -35,7 +35,8 @@ outcome；沒有跨窗切段、沒有 per-version 結果列表。
 | path | 固定 `"/"`（metric 無 path 維度） |
 
 I/O 不進 parse：`ReadServiceGraph` 先做純函式 prescan（`collectRouteQueries`），
-序列解析去重後的 key（各受 `--route-resolve-timeout` 約束），再把預取索引交給
+以有界並發解析去重後的 key（每次呼叫各受 `--route-resolve-timeout` 約束；批次
+模式下，每個 key 的準備階段與每次 `router_check_tool` 執行各自受此約束），再把預取索引交給
 `parseServiceGraphRoutes`。miss / error **永不 fail build**，一律退回
 `external/<peer_address>`。
 
@@ -221,10 +222,15 @@ caller pod ──pod-calls-service──► ingress LB Service   labels.role=ing
 - `LoadTrafficAt(cluster, ip, at)` — 單 cluster、as-of 快照
 - `ClustersWithIngressIP(ip, at)` — 唯一跨 cluster 讀
 
-**no-FINAL 模式**：SQL 只帶 immutable 條件與 `valid_from <= at`；client 端依
-`ingest_seq` 去重後再套 `valid_from <= at < valid_to`。時間運算元用 `dt64Lit`，
-不用 `?` bind。`--route-store-unique-rows` 可把 `valid_to` 放回 SQL（僅適用
-update-close 寫入端）。`spec_json` 以 `DiscardUnknown` 解析。
+**no-FINAL 模式**：掃描用的內層查詢只帶 immutable 條件與 `valid_from <= at`，
+並在 server 端依 version slot 保留 `ingest_seq` 最大的一列
+（`ORDER BY ingest_seq DESC LIMIT 1 BY cluster, namespace, name, valid_from`）；
+外層查詢再套 `at < valid_to`，所以已結束的版本與過期的 rewrite 雙胞胎不會傳回。
+client 端仍依 `ingest_seq` 去重並檢查 `valid_from <= at < valid_to`，作為安全網。
+時間運算元用 `dt64Lit`，不用 `?` bind。`--route-store-unique-rows` 維持原本的
+單層查詢，把 `valid_to` 放回掃描條件（僅適用 update-close 寫入端）。
+`spec_json` 以 `DiscardUnknown` 解析；解析失敗的 VirtualService / Service 列會
+被略過並記一筆 Warn，不會讓整個 IP 的載入失敗。
 
 **`cluster` 欄位的命名契約**：寫入 cluster 身分字串 `<az>-<env>-<cluster>`，
 與 kube-state-metrics / kubelet 系列上 `az` + `env` + `cluster` 三個 label 合成的

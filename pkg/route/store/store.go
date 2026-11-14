@@ -269,9 +269,9 @@ type Store interface {
 	// external_ips or loadbalancer_ips was live at `at`. It feeds the
 	// ingress-cluster selection — ClickHouse's whole job there
 	// is answering "ip → []cluster". The same no-FINAL semantics as the
-	// snapshot load apply (valid_to never filtered in SQL except under the
-	// uniqueRows prune; client-side dedup per version slot by max
-	// ingest_seq; liveness checked post-dedup). The result is deduplicated
-	// and sorted for determinism.
+	// snapshot load apply (valid_to never filtered in the scanning query
+	// except under the uniqueRows prune; dedup per version slot by max
+	// ingest_seq, server-side and again client-side; liveness checked only
+	// after dedup). The result is deduplicated and sorted for determinism.
 	ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error)
 }

@@ -45,7 +45,21 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   Concurrency cannot change the index's CONTENTS (entries are keyed by
   `routeKey` and independent); it changes only which keys are answered when
   the build deadline fires first, which is wall-clock dependent under any
-  schedule. **(3) Listener port
+  schedule. Every per-key goroutine recovers a panic into that key's
+  `route_engine_error`. When the (scoped) resolver also implements the
+  optional `build.BatchRouteResolver`, the whole capped key set goes to
+  `ResolveRoutes` in ONE call with `RouteBatchLimits{routeResolveConcurrency,
+  --route-resolve-timeout}`; answers are recorded under the per-key rules
+  (`Answered=false` or an error after the build deadline → no entry). The
+  engine's batch prepares each key (cache lookup, probe, load, gateway pick,
+  listener gate, LB fallback, memoised translation) under the per-call
+  timeout, then runs ONE `router_check_tool` invocation per distinct
+  `rcKey` (queries de-duplicated), each under its own per-call timeout — so a
+  key may spend up to two timeouts — and retries a failed run query by query
+  while its context is live (`parseActuals` is all-or-nothing). Keys another
+  build is already resolving are awaited only AFTER the batch has released its
+  own cache leases (waiting while holding them deadlocks two builds on each
+  other's keys). Batch answers equal per-key answers. **(3) Listener port
   precedence**: the `:<port>` on the peer-address value (returned by
   `splitPeerAddressPort`) → the optional
   `client_server_port` / `client_net_peer_port` dimension → default **443**
@@ -80,27 +94,55 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
   `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
   `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
-  The `ClustersWithIngressIP` probe is a pure function of `(ip, at)` (both
-  constant across a build's keys), so it is **memoised per build**: when
-  the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
-  (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
-  drives the whole build through one `scopedResolver` scope that caches the
-  probe by `(ip, at)`, collapsing keys that share a destination IP to a
-  single store read. The scope is one-build and mutex-guarded (keys resolve
-  concurrently; the store read stays outside the lock, so a racing duplicate
-  probe is possible and harmless); the shared `*Resolver` stays stateless (an
-  instance cache would leak). Errors are not cached; no outcome/determinism
-  change.
+  **Work sharing** (change `route-engine-memo-and-cache`). Within a build `at`
+  is constant, so three stages are pure functions many keys share, and all
+  three are **memoised per build**: when the resolver implements the optional
+  `build.BuildScopedRouteResolver` upgrade (`RouteResolver` +
+  `BuildScoped() RouteResolver`), `resolveRouteQueries` drives the whole build
+  through one `scopedResolver` scope that memoises the probe by `(ip, at)`, the
+  per-IP `LoadTrafficAt` by `(cluster, ip, at)`, and the istiod translation by
+  `rcKey` = `(cluster, IP list in request order, gateway ns, gateway name,
+  RouteConfiguration name)` — the RC name (`translate.ListenerFor`) is the only
+  thing `Translate` reads from port + host. The scope MUST be concurrency-safe
+  (the prescan calls it from `routeResolveConcurrency` goroutines); every memo
+  is a `flightMemo`: concurrent callers share one execution, a failure is
+  NEVER remembered and NEVER handed to another caller (a waiter whose leader
+  failed — even on the leader's own per-call timeout — runs the work itself),
+  and a panicking leader releases its waiters. Shared rows and the shared
+  `*RouteConfiguration` are read-only. Across builds, the `*Resolver` holds a
+  **bounded result cache** (`resultCache`: LRU, 4096 entries, 60 s TTL, keyed
+  by every `RouteRequest` field with `at` in ms) of successful answers only,
+  with concurrent identical misses coalesced under the same never-share-a-failure
+  rule; the old "`*Resolver` stays stateless" rule is relaxed because a size
+  bound and a TTL answer its leak concern. Its one staleness source is a late
+  store write at or before an already-answered instant, bounded by the TTL.
+  The `*Resolver` also holds the **process-wide engine limit**: every
+  translation and every `router_check_tool` run, across all builds, holds one
+  of `GOMAXPROCS` slots; waiting honours the caller's context and gives up
+  with `errEngineSaturated` (an error with NO outcome → `route_engine_error`,
+  never cached, never the LB-fallback gate). A slot is taken only by the
+  caller doing the work, never while waiting on a shared flight.
+  `LoadTrafficAt` is not limited (I/O behind the driver's pool). No
+  outcome/determinism change.
   **(5) The engine** (`pkg/route`) loads an **ingress-cluster-scoped,
   read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
   `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
   tables stay interval-versioned and are written by the metadata-exporter repo;
-  schema drift fails fast at startup; reads use the no-FINAL pattern —
-  `valid_to` NEVER filtered in SQL, SQL carries only `valid_from <= at` plus the
-  join keys, client-side dedup per version slot by max ingest_seq, and the
-  liveness test `valid_from <= at < valid_to` applied post-dedup — because the
-  exporter closes a version by REWRITING the open row; `--route-store-unique-rows`
-  opts into SQL-side pruning for update-close writers ONLY; time operands are
+  schema drift fails fast at startup; reads use the no-FINAL pattern
+  (`CH.versionRead`) — the SCANNING query never filters `valid_to` (it carries
+  only `valid_from <= at` plus the join keys) and keeps the newest row per
+  version slot server-side (`ORDER BY ingest_seq DESC LIMIT 1 BY cluster,
+  namespace, name, valid_from`); an OUTER query then applies the liveness
+  test `at < valid_to` to the survivors (ClickHouse does not push a predicate
+  into a `LIMIT BY` subquery), so ended versions and stale twins never cross
+  the wire; the client repeats dedup + liveness as a safety net — all because
+  the exporter closes a version by REWRITING the open row;
+  `--route-store-unique-rows` keeps its single-query SQL-side pruning for
+  update-close writers ONLY (no server-side dedup, so its collapse alarm still
+  sees duplicates); a VS bound by BARE name loads only from a candidate
+  gateway's namespace (qualified bindings from any); a VS or Service row whose
+  `spec_json` does not parse is skipped with a Warn, never failing the IP;
+  time operands are
   `dt64Lit` literals, never `?` binds; `spec_json` parses with `DiscardUnknown`;
   the **multi-IP union is deduped by resource-version identity**
   `(cluster, namespace, name, valid_from)` — a dual-stack ingress Service makes
@@ -121,8 +163,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   in-process istiod (`ConfigGenerator`, no istiod pod, no Kubernetes client —
   see the client-go rule) and matches with the native `router_check_tool`
   binary (`--router-check-bin`; copied into the image from the Envoy tools
-  image; ~50–60 ms per config — one translate + one check per resolution, so
-  there is no segment loop and no config-signature cache). **Hop 3 is
+  image; ~50–60 ms per invocation — one configuration state per resolution,
+  so there is no segment loop and no config-signature cache; translations are
+  shared per `rcKey` within a build, see (4b)). **Hop 3 is
   namespace-scoped**: a
   candidate Gateway must live in the ingress Service's OWN namespace —
   enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1

@@ -203,7 +203,7 @@ func TestOracle(t *testing.T) {
 
 		scoped := oScopedFor(i, vsPerGW)
 		scoped.Port = 80
-		rc, err := tr.Translate(scoped)
+		rc, err := tr.Translate(t.Context(), scoped)
 		if err != nil {
 			t.Fatalf("translate gw %d: %v", i, err)
 		}

@@ -36,8 +36,9 @@ type Config struct {
 	// startup when RouteStoreDSN is set; ignored otherwise.
 	RouterCheckBin string
 	// RouteResolveTimeout bounds each individual route-engine call made during
-	// a build's pre-parse resolution pass. Zero means each call inherits only
-	// the build deadline (--build-timeout).
+	// a build's pre-parse resolution pass — under batched matching, a key's
+	// preparation and each router_check_tool run separately. Zero means each
+	// call inherits only the build deadline (--build-timeout).
 	RouteResolveTimeout time.Duration
 	// RouteStoreUniqueRows enables the route store's pruned read mode: the
 	// valid_to predicate is pushed back into SQL, so closed versions are
@@ -234,7 +235,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.DurationVar(&cfg.MaxWindow, "max-window", cfg.MaxWindow, "Longest graph request window (end - start) accepted; a longer one is 400 invalid_range. 0 applies no cap.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
-	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
+	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Timeout for each route-engine call during a build: a key's preparation, and each batched router_check_tool run. 0 inherits the build deadline only.")
 	fs.BoolVar(&cfg.RouteStoreUniqueRows, "route-store-unique-rows", cfg.RouteStoreUniqueRows, "Enable the route store's pruned read mode (server-side valid_to filtering). ONLY when the exporter guarantees one physical row per version (closeMode=update); never against the default rewrite-close exporter.")
 
 	if err := fs.Parse(args); err != nil {

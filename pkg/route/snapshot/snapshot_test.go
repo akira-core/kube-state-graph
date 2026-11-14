@@ -216,7 +216,7 @@ func TestScopedForDedupsDuplicateRows(t *testing.T) {
 	if len(in.Services) != 1 {
 		t.Fatalf("backend services = %d, want 1 — duplicates must collapse", len(in.Services))
 	}
-	if _, err := translate.NewTranslator().Translate(in); err != nil {
+	if _, err := translate.NewTranslator().Translate(t.Context(), in); err != nil {
 		t.Fatalf("translate rejected the deduped input: %v", err)
 	}
 }
@@ -240,7 +240,7 @@ func TestScopedForResolvesBareShortDestinationHost(t *testing.T) {
 		t.Fatalf("backend services = %v, want the short name resolved in the VS namespace", in.Services)
 	}
 
-	rc, err := translate.NewTranslator().Translate(in)
+	rc, err := translate.NewTranslator().Translate(t.Context(), in)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}

@@ -18,6 +18,12 @@
 // config-signature dedup. Destination IPs are REQUIRED: an IP-less
 // request misses with RouteNoIngress before touching the store.
 //
+// Work is shared, never changing an answer: a build's scope (BuildScoped)
+// memoises the probe, the per-IP load and the translation per distinct input;
+// the Resolver caches successful answers across builds (resultCache, bounded
+// and TTL'd) and bounds translations and matcher runs process-wide (the engine
+// limit).
+//
 // pkg/build MUST NOT import this package; only cmd/kube-state-graph
 // or an opting-in embedder constructs a Resolver and injects it via
 // build.Options.RouteResolver. Nothing here constructs a Kubernetes client,
@@ -26,267 +32,134 @@ package route
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+
 	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
 	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
-	"github.com/akira-core/kube-state-graph/pkg/route/snapshot"
 	"github.com/akira-core/kube-state-graph/pkg/route/store"
 	"github.com/akira-core/kube-state-graph/pkg/route/translate"
 )
 
 // Resolver folds store → snapshot → gwresolve → translate → matchcheck into
 // the build.RouteResolver contract. Safe for concurrent use: the store is a
-// connection pool, the Translator is stateless, and every ResolveRoute call
-// builds its own throwaway snapshot.
+// connection pool, the Translator is stateless, every ResolveRoute call
+// builds its own throwaway snapshot, and the only process-wide state — the
+// engine limit — is a channel.
 type Resolver struct {
 	st  store.Store
-	tr  *translate.Translator
-	run matchcheck.Runner
+	tr  translator
+	run matcher
+
+	// engine is the process-wide limit on CPU-heavy engine work: every istiod
+	// translation and every router_check_tool invocation, across every
+	// concurrent build, holds one slot for its duration. The per-build
+	// routeResolveConcurrency bounds one build; without this, R concurrent
+	// builds ran up to 4R istiod worlds and 4R child processes.
+	engine chan struct{}
+
+	// results is the bounded, TTL'd cross-build answer cache (resultCache).
+	results *resultCache
+}
+
+// errEngineSaturated is returned when a caller's context ended before an
+// engine slot freed up. It carries no outcome, so the key degrades to an
+// external node (route_engine_error), is never cached, and never opens the
+// RouteNoGateway-gated LB fallback.
+var errEngineSaturated = errors.New("route engine saturated")
+
+// defaultEngineSlots sizes the engine limit: translation is CPU-bound and
+// router_check_tool is a CPU-bound child process, so more than one per usable
+// CPU only queues inside the scheduler instead of here.
+func defaultEngineSlots() int { return max(1, runtime.GOMAXPROCS(0)) }
+
+// acquireEngine takes an engine slot, waiting at most until ctx ends. The
+// caller MUST call the returned release exactly once. It is only ever called by
+// the caller doing the work — never while waiting on another caller's memo or
+// cache flight — so waiting for a slot cannot deadlock against the limit.
+func (r *Resolver) acquireEngine(ctx context.Context) (release func(), err error) {
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("%w: %w", errEngineSaturated, context.Cause(ctx))
+	}
+	select {
+	case r.engine <- struct{}{}:
+		return func() { <-r.engine }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %w", errEngineSaturated, context.Cause(ctx))
+	}
 }
 
 var _ build.RouteResolver = (*Resolver)(nil)
 
+// translator is the istiod translation stage: one gateway's scoped config in,
+// the RouteConfiguration istiod would push out. *translate.Translator is the
+// production implementation; the seam exists so the resolver's orchestration
+// (memoisation, batching, the engine limit) can be exercised without building
+// an istiod world per call.
+type translator interface {
+	Translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
+}
+
+// matcher is the router_check_tool stage: one RouteConfiguration plus a batch
+// of host+path queries in, one Envoy cluster string per query out ("" = no
+// route). matchcheck.Runner is the production implementation.
+type matcher interface {
+	Resolve(ctx context.Context, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error)
+}
+
 // NewResolver wires a Resolver over an opened store and a verified
 // router_check_tool runner.
 func NewResolver(st store.Store, run matchcheck.Runner) *Resolver {
-	return &Resolver{st: st, tr: translate.NewTranslator(), run: run}
+	return newResolver(st, translate.NewTranslator(), run)
+}
+
+// newResolver is NewResolver over any translator and matcher.
+func newResolver(st store.Store, tr translator, run matcher) *Resolver {
+	return &Resolver{
+		st:      st,
+		tr:      tr,
+		run:     run,
+		engine:  make(chan struct{}, defaultEngineSlots()),
+		results: newResultCache(resultCacheMaxEntries, resultCacheTTL, time.Now),
+	}
 }
 
 // ResolveRoute implements build.RouteResolver. The configuration is evaluated
 // at req.At — one snapshot load, one gateway pick, at most one translate + one
-// router_check_tool invocation, one outcome.
+// router_check_tool invocation, one outcome — unless the cross-build cache
+// already holds the answer. A standalone call runs through a throwaway scope;
+// a build drives all its keys through one BuildScoped scope.
 func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
-	return r.resolve(ctx, req, r.st.ClustersWithIngressIP)
+	return r.newScope().ResolveRoute(ctx, req)
 }
 
-// ingressIPProbe answers "which clusters had an ingress Service carrying ip
-// live at `at`?" — the shape of store.ClustersWithIngressIP. resolve takes it
-// as a seam so a per-build scope (scopedResolver) can memoise the probe without
-// duplicating the pipeline.
-type ingressIPProbe func(ctx context.Context, ip string, at time.Time) ([]string, error)
-
-// resolve is ResolveRoute's body with the ingress-IP probe injected. The base
-// resolver passes r.st.ClustersWithIngressIP directly; the per-build scope
-// passes a memoising wrapper. Everything downstream is identical.
-//
-// When the returned error is non-nil the outcome is meaningless and MUST be the
-// empty value: RouteNoGateway is the ingress-LB-fallback gate below, so
-// returning it alongside an infrastructure failure would let a store outage read
-// as "no Istio Gateway serves this host".
-func (r *Resolver) resolve(ctx context.Context, req build.RouteRequest, probe ingressIPProbe) (build.RouteDestination, build.RouteOutcome, error) {
-	if len(req.IPs) == 0 {
-		// Defensive: the prescan never emits an IP-less request —
-		// without a destination IP no ingress cluster can be selected.
-		return build.RouteDestination{}, build.RouteNoIngress, nil
-	}
-
-	// Select the ingress cluster from the destination IPs before
-	// touching any snapshot. One probe per IP; the candidate sets stay separate
-	// so multi-IP answers must agree — never unioned across clusters.
-	perIP := make([][]string, len(req.IPs))
-	for i, ip := range req.IPs {
-		cands, err := probe(ctx, ip, req.At)
-		if err != nil {
-			return build.RouteDestination{}, "", err
-		}
-		perIP[i] = cands
-	}
-	cluster, pickMiss, ok := pickIngressCluster(req.CallerCluster, perIP)
-	if !ok {
-		return build.RouteDestination{}, pickMiss, nil
-	}
-
-	rows, err := r.loadSnapshot(ctx, cluster, req)
+// match runs one router_check_tool invocation over rc for queries, holding an
+// engine slot for its duration.
+func (r *Resolver) match(ctx context.Context, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error) {
+	release, err := r.acquireEngine(ctx)
 	if err != nil {
-		return build.RouteDestination{}, "", err
+		return nil, err
 	}
-	snap := snapshot.New(rows, req.At)
+	defer release()
+	return r.run.Resolve(ctx, rc, queries)
+}
 
-	dest, outcome, err := r.resolveConfig(ctx, snap, req)
+// translate runs one istiod translation, holding an engine slot for its
+// duration.
+func (r *Resolver) translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
+	release, err := r.acquireEngine(ctx)
 	if err != nil {
-		return build.RouteDestination{}, "", err
+		return nil, err
 	}
-
-	if outcome == build.RouteHit {
-		// The destination lives in the selected ingress cluster:
-		// ParseEnvoyCluster cannot know it — the Envoy cluster string carries
-		// only (port, subset, service, namespace) — so it is stamped here.
-		dest.Cluster = cluster
-		// Ingress chain: recover the ingress LB Service the
-		// destination IPs uniquely map to in the already-loaded snapshot (same
-		// identity dedup as the LB fallback, zero new store reads) so the parse
-		// can emit the full caller → ingress → backend chain. Ambiguous or
-		// incomplete identity leaves the fields empty — the chain degrades to
-		// the direct edge; a hit is NEVER demoted.
-		if id, status := ingressServiceIdentity(snap, req.IPs); status == identityUnique {
-			dest.IngressNamespace, dest.IngressService = id.ns, id.name
-		}
-		return dest, build.RouteHit, nil
-	}
-
-	// Ingress LB Service fallback, gated
-	// on the miss being RouteNoGateway: the nginx-ingress signature is Hop 3
-	// finding no Istio Gateway CR, so resolution never got past gateway
-	// selection — yet the loaded snapshot may still map the destination IPs to
-	// exactly one ingress LB Service. A DEEPER miss (no_listener_on_port /
-	// no_server_for_host / no_route) means an Istio Gateway DID serve the host
-	// and its diagnostic reason must not be masked by an LB-entry-point edge.
-	// A routed hit above always wins; a fallback that finds nothing keeps the
-	// pipeline's own miss.
-	if outcome == build.RouteNoGateway {
-		if lbDest, out, ok := resolveIngressLBService(snap, req.IPs); ok {
-			if out == build.RouteIngressLBService {
-				lbDest.Cluster = cluster // same ingress-cluster stamp as a RouteHit
-				return lbDest, out, nil
-			}
-			return build.RouteDestination{}, out, nil // ambiguous_ingress_service
-		}
-	}
-	return build.RouteDestination{}, outcome, nil
-}
-
-// loadSnapshot loads the selected ingress cluster's configuration state at
-// req.At: one store.LoadTrafficAt per destination IP, rows unioned —
-// multi-A-record DNS answers are a union of candidates WITHIN the one selected
-// cluster (cross-cluster unions are forbidden).
-//
-// The union is deduplicated by resource-version identity. Two destination IPs
-// published by the SAME ingress Service (a dual-stack Service carrying an A and
-// an AAAA address, or several addresses of one load balancer) make each per-IP
-// load return the same gateway/VS rows, and the store's own dedup only spans a
-// single call. Without this, ScopedFor would hand istiod the same
-// VirtualService twice and its config store would reject it ("item already
-// exists"), failing the whole resolution.
-func (r *Resolver) loadSnapshot(ctx context.Context, cluster string, req build.RouteRequest) (store.TrafficSnapshot, error) {
-	var out store.TrafficSnapshot
-	svcSeen, depSeen := map[versionKey]bool{}, map[versionKey]bool{}
-	gwSeen, vsSeen := map[versionKey]bool{}, map[versionKey]bool{}
-	for _, ip := range req.IPs {
-		w, err := r.st.LoadTrafficAt(ctx, cluster, ip, req.At)
-		if err != nil {
-			return store.TrafficSnapshot{}, err
-		}
-		for _, row := range w.Services {
-			appendUnseen(&out.Services, svcSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
-		}
-		for _, row := range w.Deploys {
-			appendUnseen(&out.Deploys, depSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
-		}
-		for _, row := range w.Gateways {
-			appendUnseen(&out.Gateways, gwSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
-		}
-		for _, row := range w.VSes {
-			appendUnseen(&out.VSes, vsSeen, keyOf(row.Cluster, row.Namespace, row.Name, row.ValidFrom), row)
-		}
-	}
-	return out, nil
-}
-
-// versionKey identifies ONE resource version across per-IP loads. ValidFrom is
-// part of the identity so two genuine versions of one resource both survive;
-// IngestSeq deliberately is NOT — a rewrite twin and its closing row share a
-// version slot and the store collapses them before the union sees either.
-// ValidFrom is stored as UnixNano because a time.Time (monotonic reading +
-// *Location pointer) is not a sound map key.
-type versionKey struct {
-	cluster, namespace, name string
-	validFrom                int64
-}
-
-func keyOf(cluster, namespace, name string, validFrom time.Time) versionKey {
-	return versionKey{cluster: cluster, namespace: namespace, name: name, validFrom: validFrom.UnixNano()}
-}
-
-// appendUnseen appends row to dst the first time its key is seen.
-func appendUnseen[T any](dst *[]T, seen map[versionKey]bool, k versionKey, row T) {
-	if seen[k] {
-		return
-	}
-	seen[k] = true
-	*dst = append(*dst, row)
-}
-
-// candidates returns the gateway candidates for the request: the union of the
-// per-IP 3-hop results within the loaded (single-cluster) snapshot.
-func candidates(snap *snapshot.Snapshot, ips []string) []store.GatewayCand {
-	var cands []store.GatewayCand
-	seen := map[string]bool{}
-	for _, ip := range ips {
-		for _, c := range snap.ResolveIPToGateways(ip) {
-			key := c.Namespace + "/" + c.Name
-			if !seen[key] {
-				seen[key] = true
-				cands = append(cands, c)
-			}
-		}
-	}
-	return cands
-}
-
-// resolveConfig runs the whole in-memory + expensive chain for the request:
-// 3-hop candidates → host disambiguation → in-memory ScopedFor → listener check
-// → istiod translate → router_check_tool → Envoy cluster-string parse.
-func (r *Resolver) resolveConfig(ctx context.Context, snap *snapshot.Snapshot, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
-	cands := candidates(snap, req.IPs)
-	gwName, ok := gwresolve.New(candsToGateways(cands)).ResolveAmong(req.Host, candNames(cands))
-	if !ok {
-		return build.RouteDestination{}, build.RouteNoGateway, nil // no gateway serves the host
-	}
-	gw, ok := pickCandidate(cands, gwName)
-	if !ok {
-		// Two candidates share a bare name across namespaces — only reachable
-		// when a multi-IP request's per-IP hop 1 landed in different namespaces.
-		// Neither is more correct than the other, so degrade instead of
-		// guessing; the caller's LB fallback still applies.
-		return build.RouteDestination{}, build.RouteNoGateway, nil
-	}
-
-	scoped, found, err := snap.ScopedFor(gw.Namespace, gw.Name)
-	if err != nil {
-		return build.RouteDestination{}, "", err
-	}
-	if !found {
-		// Named by the 3-hop but no live config at the instant.
-		return build.RouteDestination{}, build.RouteNoGateway, nil
-	}
-	scoped.Port = req.Port
-	// The host decides WHICH server on the port owns the RouteConfiguration
-	// (each TLS-terminated HTTPS server carries its own).
-	scoped.Host = req.Host
-
-	// Listener gate: both misses are decided from config alone — no translate
-	// round-trip, no router_check_tool exec. A port with no routable HTTP
-	// listener is the mis-guessed-port signature; a port whose servers all
-	// serve OTHER hosts is the distinct no-server-for-host miss (translating
-	// anyway could only reach RouteNoRoute — istiod builds vhosts from the
-	// server-hosts ∩ VS-hosts intersection).
-	switch _, st := translate.ListenerFor(scoped); st {
-	case translate.ListenerNoneOnPort:
-		return build.RouteDestination{}, build.RouteNoListenerOnPort, nil
-	case translate.ListenerNoServerForHost:
-		return build.RouteDestination{}, build.RouteNoServerForHost, nil
-	case translate.ListenerFound:
-		// fall through to the translate + router_check_tool stages
-	}
-
-	rc, err := r.tr.Translate(scoped)
-	if err != nil {
-		return build.RouteDestination{}, "", err
-	}
-	clusters, err := r.run.Resolve(ctx, rc, []matchcheck.Query{{Host: req.Host, Path: req.Path}})
-	if err != nil {
-		return build.RouteDestination{}, "", err
-	}
-	dest, ok := ParseEnvoyCluster(clusters[0])
-	if !ok {
-		// "" (no route matched) or a non-Service cluster string — both a miss.
-		return build.RouteDestination{}, build.RouteNoRoute, nil
-	}
-	return dest, build.RouteHit, nil
+	defer release()
+	return r.tr.Translate(ctx, in)
 }
 
 // ParseEnvoyCluster parses an istiod outbound cluster string —
