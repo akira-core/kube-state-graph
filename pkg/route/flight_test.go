@@ -85,12 +85,13 @@ func TestFlightMemo_ErrorsAreNotMemoised(t *testing.T) {
 func TestFlightMemo_WaiterRetriesAfterTheLeadersContextEnds(t *testing.T) {
 	var m flightMemo[string, int]
 	leaderCtx, cancelLeader := context.WithCancel(t.Context())
+	// A send that gives up when nobody is receiving yet would be lost whenever
+	// the leader reaches it before the test reaches <-entered, and the test
+	// would then wait forever. Closing under a Once cannot be missed.
 	entered := make(chan struct{})
+	var enteredOnce sync.Once
 	fn := func(ctx context.Context) (int, error) {
-		select {
-		case entered <- struct{}{}:
-		default:
-		}
+		enteredOnce.Do(func() { close(entered) })
 		<-ctx.Done()
 		return 0, context.Cause(ctx)
 	}
