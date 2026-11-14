@@ -177,7 +177,12 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 			c.metrics.ObserveQueryDuration(name, time.Since(start).Seconds())
 		}
 	}()
-	val, warns, err := c.api.Query(ctx, query, ts)
+	var qopts []v1.Option
+	deadline, bounded := ctx.Deadline()
+	if t, ok := evaluationTimeout(deadline, bounded, time.Now()); ok {
+		qopts = append(qopts, v1.WithTimeout(t))
+	}
+	val, warns, err := c.api.Query(ctx, query, ts, qopts...)
 	if len(warns) > 0 {
 		// VictoriaMetrics signals truncated / partial responses (e.g. a
 		// -search.* limit hit) via the warnings return; dropping them hides
@@ -225,6 +230,33 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		"ts", ts.UTC().Format(time.RFC3339),
 	)
 	return vec, nil
+}
+
+// evaluationTimeoutMargin is kept back from the caller's remaining time when
+// the upstream evaluation timeout is derived from it, so the store gives up
+// (and the query's slot frees) before the caller's own deadline fires.
+const evaluationTimeoutMargin = 500 * time.Millisecond
+
+// evaluationTimeout derives the upstream API's `timeout` parameter from the
+// query context's deadline: the remaining time less evaluationTimeoutMargin,
+// truncated to whole seconds. ok is false when there is no deadline or less
+// than one whole second would remain; the context deadline alone then bounds
+// the query.
+//
+// Whole seconds because the parameter is sent as time.Duration.String() and
+// Prometheus' duration parser rejects a fractional form such as "14.75s";
+// "14s" and "2m0s" parse in Prometheus and VictoriaMetrics alike. Without it a
+// store keeps evaluating a query the build has already abandoned, holding its
+// concurrency slot until the store's own -search.maxQueryDuration.
+func evaluationTimeout(deadline time.Time, bounded bool, now time.Time) (time.Duration, bool) {
+	if !bounded {
+		return 0, false
+	}
+	t := (deadline.Sub(now) - evaluationTimeoutMargin).Truncate(time.Second)
+	if t < time.Second {
+		return 0, false
+	}
+	return t, true
 }
 
 // FormatDuration renders d as a PromQL duration literal (e.g., 90s, 5m, 3h).
