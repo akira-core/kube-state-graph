@@ -186,11 +186,14 @@ func (g *guard) await(ctx context.Context, key cacheKey, f *flight, leader bool,
 		// flight's context error is at (or within a timer tick of) its own
 		// deadline. Report its OWN error, which keeps the ordinary 504
 		// mapping instead of surfacing the shared context's Canceled as 499.
-		if isContextErr(f.err) && ctx.Err() == nil {
-			if _, bounded := ctx.Deadline(); bounded {
+		if isContextErr(f.err) {
+			if ctx.Err() == nil {
+				if _, bounded := ctx.Deadline(); !bounded {
+					return nil, f.err
+				}
 				<-ctx.Done()
-				return nil, fmt.Errorf("prom query %s: %w", name, ctx.Err())
 			}
+			return nil, fmt.Errorf("prom query %s: %w", name, ctx.Err())
 		}
 		return nil, f.err
 	}
