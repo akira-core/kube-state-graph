@@ -72,19 +72,22 @@ func WithBackendName(name string) Option {
 // basicAuthTransport sets an Authorization: Basic header on a clone of each
 // request (RoundTrippers must not mutate the caller's request) and delegates
 // to the inner transport. The header is added ONLY for requests addressed to
-// the configured upstream host: net/http strips Authorization when following
-// a cross-host redirect, and stamping per-hop at the transport layer would
-// silently re-attach the credentials below that protection — so a redirect
-// to a foreign host must pass through unauthenticated.
+// the configured upstream's scheme AND host: net/http strips Authorization
+// when following a cross-host redirect, and stamping per-hop at the transport
+// layer would silently re-attach the credentials below that protection — so a
+// redirect to a foreign host must pass through unauthenticated. The scheme is
+// compared as well because net/http keeps the header on a same-host
+// https→http redirect, which would otherwise send the credentials in clear.
 type basicAuthTransport struct {
 	inner    http.RoundTripper
-	host     string // only requests to this host carry credentials
+	scheme   string // only requests on this scheme …
+	host     string // … to this host carry credentials
 	username string
 	password string
 }
 
 func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if !strings.EqualFold(req.URL.Host, t.host) {
+	if !strings.EqualFold(req.URL.Scheme, t.scheme) || !strings.EqualFold(req.URL.Host, t.host) {
 		return t.inner.RoundTrip(req)
 	}
 	clone := req.Clone(req.Context())
@@ -95,12 +98,15 @@ func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 // newTransport assembles the outbound transport chain: otelhttp → basicAuth
 // (when credentials are configured) → base. The traced request is the final
 // authenticated one; otelhttp records method/URL/status only, never headers.
-// authHost scopes the credentials to the configured upstream host (see
-// basicAuthTransport).
-func newTransport(o clientOptions, authHost string, base http.RoundTripper) http.RoundTripper {
+// target scopes the credentials to the configured upstream's scheme and host
+// (see basicAuthTransport).
+func newTransport(o clientOptions, target *url.URL, base http.RoundTripper) http.RoundTripper {
 	rt := base
 	if o.username != "" || o.password != "" {
-		rt = &basicAuthTransport{inner: rt, host: authHost, username: o.username, password: o.password}
+		rt = &basicAuthTransport{
+			inner: rt, scheme: target.Scheme, host: target.Host,
+			username: o.username, password: o.password,
+		}
 	}
 	return otelhttp.NewTransport(rt)
 }
@@ -127,7 +133,7 @@ func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
 	}
 	c, err := promapi.NewClient(promapi.Config{
 		Address:      promURL,
-		RoundTripper: newTransport(o, u.Host, base),
+		RoundTripper: newTransport(o, u, base),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prometheus client: %w", err)
