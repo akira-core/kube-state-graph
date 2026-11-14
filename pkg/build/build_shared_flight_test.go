@@ -135,10 +135,10 @@ func receiveN(t *testing.T, ch <-chan struct{}, n int, what string) {
 
 // The service-graph queries carry no request matcher, so concurrent unfiltered
 // builds at one aligned instant share each one's flight in the guard. Build A
-// leads them and fails its topology; its prefetch is cancelled and the flights
-// end in context.Canceled. The guard retries a waiter once, so B and C re-join
-// — and when C leads a second flight and also fails its topology, the guard
-// hands B the second cancellation. B is healthy and must answer 200.
+// leads them and fails its topology; its prefetch is cancelled, but the guard's
+// refcounted flights stay alive while B and C still wait, so no flight ends in
+// context.Canceled and nobody re-leads. When C then fails its topology too, B
+// is the last waiter and is healthy: it must answer 200.
 func TestBuild_SharedServiceGraphFlightLeaderFailureDoesNotCancelWaiter(t *testing.T) {
 	const sgQueries = 3
 	settle := func() { time.Sleep(50 * time.Millisecond) } // let a waiter register its join
@@ -174,11 +174,13 @@ func TestBuild_SharedServiceGraphFlightLeaderFailureDoesNotCancelWaiter(t *testi
 
 	close(failA)
 	require.Equal(t, ReasonUpstream, AsReason(<-errA), "A fails on its own topology")
-	receiveN(t, up.led, sgQueries, "B and C re-join; one of them leads each flight")
 	settle()
+	assert.Empty(t, up.led, "the flights outlive their first leader: no waiter re-leads")
 
 	close(failC)
 	require.Equal(t, ReasonUpstream, AsReason(<-errC), "C fails on its own topology")
+	settle()
+	assert.Empty(t, up.led, "B still holds every flight open")
 
 	close(up.release)
 	select {
