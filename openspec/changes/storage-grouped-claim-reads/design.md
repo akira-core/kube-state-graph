@@ -65,6 +65,13 @@ The golden pins every storage query; this change intends to move exactly the Kub
 
 *Rejected — REMOVED + ADDED of the whole requirement.* "Storage build reads every family by reference" holds 38 scenarios; removing and re-adding it to retitle one would hide the real delta in a 200-line churn.
 
+### D8. Audit items decided beside this change: P-9 and P-11 are kept
+
+The same audit raised two more storage-build cost items, both recorded here as "keep current behaviour":
+
+- **P-9 — the storage build chains dependent upstream rounds** (`pkg/build/nodeseed.go`: seed → incarnation → bindings → mounters → pods → nodes / controllers). Porting the Kubernetes-only build's round overlap would move the fan-out golden again and save little: the Harvest chain (phase 1 → claim info → candidate completion → owner completion → QoS / gauges) is the storage build's critical path and runs beside the Kubernetes waves already. *Rejected — port the overlap (option B)*: a second golden move and a second orchestration to keep in step for no change to the critical path.
+- **P-11 — the scoped QoS wave issues 6 × ceil(V/100) queries per unfiltered `/v1/graph`** (`pkg/build/qosscope.go`). The scope is what keeps the wave from reading workloads no loaded claim can join, and the rules (`.claude/rules/netapp-storage-join.md`, `docs/netapp-harvest-preconditions.md`) reject an unscoped read explicitly; the measured cost is 100–300 ms of tail latency. *Rejected — an unscoped `last_over_time(qos_*[w])` past a chunk threshold (option B)* re-opens the whole-filer read the scope was introduced to remove; *rejected — raise `scopeConcurrency` for this wave (option C)*: it takes slots from the build's other waves on the same store. To be revisited with per-build query metrics rather than changed blind.
+
 ## Risks / Trade-offs
 
 - **Cross-pair over-read.** A grouped chunk can return up to (namespaces × names) − pairs extra rows. Bounded by the 100-value cap per side and discarded before anything is scoped from it; in practice pod and claim names are rarely shared across a tracked set's namespaces (StatefulSet ordinals `db-0`, claim names `data` are the common exception, and those are exactly the reads that used to cost one query per namespace).
