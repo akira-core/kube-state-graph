@@ -75,63 +75,92 @@ func ReadServiceGraph(
 	resolveTimeout time.Duration,
 	filtered bool,
 ) (ServiceGraphResult, error) {
-	// Fan the three service-graph queries out under an errgroup.
-	// The total query's error still fails the build; the two OPTIONAL RED
-	// queries record their error and yield a nil vector so the parse can
-	// degrade field-by-field without failing the request.
+	vecs, err := fetchServiceGraph(ctx, q, window, end)
+	if err != nil {
+		return ServiceGraphResult{}, err
+	}
+	return resolveServiceGraph(ctx, vecs, end, topology, resolver, resolveTimeout, filtered), nil
+}
+
+// serviceGraphVectors are the three service-graph vectors of one window: the
+// required request total and the two OPTIONAL RED companions, each with the
+// error that degraded it (nil vector and non-nil error when it failed).
+type serviceGraphVectors struct {
+	total, failed, duration model.Vector
+	failErr, durErr         error
+}
+
+// fetchServiceGraph issues the three service-graph queries. It depends on
+// nothing but the window: the three queries carry no request matcher and no
+// label keys, and topology is consulted only by resolveServiceGraph — which is
+// what lets Builder.Build issue it beside the topology fan-out.
+//
+// The total query's error fails the fetch; the two OPTIONAL RED queries record
+// their error and yield a nil vector so the parse can degrade field-by-field,
+// unless ctx itself is done.
+func fetchServiceGraph(ctx context.Context, q promql.Querier, window time.Duration, end time.Time) (serviceGraphVectors, error) {
 	var (
-		vec      model.Vector
+		out      serviceGraphVectors
 		totalErr error
-		failed   model.Vector
-		failErr  error
-		duration model.Vector
-		durErr   error
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphTotal),
 			promql.Render(promql.QServiceGraphTotal, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		vec, totalErr = out, err
+		out.total, totalErr = vec, err
 		return err // only the total query's error fails the group
 	})
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphFailedTotal),
 			promql.Render(promql.QServiceGraphFailedTotal, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		failed, failErr = out, err
+		out.failed, out.failErr = vec, err
 		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
 	})
 	g.Go(func() error {
-		out, err := q.Instant(gctx,
+		vec, err := q.Instant(gctx,
 			string(promql.QServiceGraphServerSecondsBucket),
 			promql.Render(promql.QServiceGraphServerSecondsBucket, window, promql.LabelKeys{}, promql.Selector{}),
 			end,
 		)
-		duration, durErr = out, err
+		out.duration, out.durErr = vec, err
 		return optionalQueryFatal(ctx, err) // non-fatal except on caller cancellation
 	})
 	if err := g.Wait(); err != nil {
 		// Prefer the total-query error message when present.
 		if totalErr != nil {
-			return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", totalErr)
+			return serviceGraphVectors{}, fmt.Errorf("service-graph query: %w", totalErr)
 		}
-		return ServiceGraphResult{}, fmt.Errorf("service-graph query: %w", err)
+		return serviceGraphVectors{}, fmt.Errorf("service-graph query: %w", err)
 	}
+	return out, nil
+}
 
+// resolveServiceGraph joins fetched service-graph vectors against topology:
+// the RED degradation line, the route-engine prescan and the parse.
+func resolveServiceGraph(
+	ctx context.Context,
+	vecs serviceGraphVectors,
+	end time.Time,
+	topology Topology,
+	resolver RouteResolver,
+	resolveTimeout time.Duration,
+	filtered bool,
+) ServiceGraphResult {
 	// One aggregated degradation line naming which optional RED query failed
 	// and why — never per edge (graceful degradation).
-	if failErr != nil || durErr != nil {
+	if vecs.failErr != nil || vecs.durErr != nil {
 		attrs := []any{}
-		if failErr != nil {
-			attrs = append(attrs, "failed_total_error", failErr.Error())
+		if vecs.failErr != nil {
+			attrs = append(attrs, "failed_total_error", vecs.failErr.Error())
 		}
-		if durErr != nil {
-			attrs = append(attrs, "server_seconds_bucket_error", durErr.Error())
+		if vecs.durErr != nil {
+			attrs = append(attrs, "server_seconds_bucket_error", vecs.durErr.Error())
 		}
 		slog.Warn("service-graph RED query degraded; metrics will be partial", attrs...)
 	}
@@ -148,14 +177,14 @@ func ReadServiceGraph(
 		// engine gets ONLY end — the single instant it evaluates the ingress
 		// config at.
 		routes = resolveRouteQueries(ctx, resolver, resolveTimeout,
-			collectRouteQueriesWith(vec, res), end)
+			collectRouteQueriesWith(vecs.total, res), end)
 	}
-	return parseWithResolver(vec, res, routes, redInputs{
-		Failed:      failed,
-		FailedErr:   failErr,
-		Duration:    duration,
-		DurationErr: durErr,
-	}), nil
+	return parseWithResolver(vecs.total, res, routes, redInputs{
+		Failed:      vecs.failed,
+		FailedErr:   vecs.failErr,
+		Duration:    vecs.duration,
+		DurationErr: vecs.durErr,
+	})
 }
 
 // optionalQueryFatal decides whether an OPTIONAL RED query's error should fail
@@ -295,20 +324,43 @@ func (r *sgResolver) anyLoaded(ids []string) bool {
 // sgTrace carries the identity of the service-graph series currently being
 // resolved, threaded into the resolver purely so the debug logs can name WHICH
 // upstream metric fell back (and why). It never influences resolution.
+//
+// Its labels are NOT raw: parseWithResolver strips connection-string userinfo
+// (stripConnStringUserinfo) before building it, because every field here ends
+// up in a log record. Resolution never reads them.
 type sgTrace struct {
 	side                               string // "client" | "server" — which endpoint is being resolved
-	label                              string // this side's raw client/server label
+	label                              string // this side's client/server label, userinfo stripped
 	clientLabel, serverLabel           string
 	clientUID, serverUID, traceCluster string
 }
 
-// noteExternal records (for the aggregated summary) and logs one endpoint that
-// fell back to an external node, tagged with the precise reason and the full
-// series identity so an operator can grep the offending metric out of the logs.
-func (r *sgResolver) noteExternal(reason string, t sgTrace, attrs ...any) {
+// debugEnabled reports whether the default logger would emit a Debug record —
+// the question slog.Debug asks itself, asked BEFORE the per-series Debug sites
+// build their arguments. Those sites run once per series (or per endpoint), and
+// building a record's attribute slice boxes every string in it: with Debug off
+// that was pure allocation for a record the handler then discarded. Asked per
+// call rather than cached on the resolver, so a logger swapped mid-process is
+// honoured; it is an atomic load and a level compare.
+func debugEnabled() bool {
+	return slog.Default().Enabled(context.Background(), slog.LevelDebug)
+}
+
+// countExternal records one external fallback for the aggregated Info summary
+// and the filtered-build rollback journal. It is never gated: both consumers
+// need it whatever the log level.
+func (r *sgResolver) countExternal(reason string) {
 	r.extReasons[reason]++
 	r.note(jExtReason, reason, "")
-	args := append([]any{
+}
+
+// logExternal emits the Debug record for one endpoint that fell back to an
+// external node, tagged with the precise reason and the full series identity
+// so an operator can grep the offending metric out of the logs. Callers in
+// this file gate it — and the construction of attrs — on debugEnabled.
+func (r *sgResolver) logExternal(reason string, t sgTrace, attrs ...any) {
+	args := make([]any, 0, 16+len(attrs))
+	args = append(args,
 		"reason", reason,
 		"side", t.side,
 		"label", t.label,
@@ -317,30 +369,47 @@ func (r *sgResolver) noteExternal(reason string, t sgTrace, attrs ...any) {
 		"client_uid", t.clientUID,
 		"server_uid", t.serverUID,
 		"trace_cluster", t.traceCluster,
-	}, attrs...)
+	)
+	args = append(args, attrs...)
 	slog.Debug("service-graph endpoint fell back to external", args...)
+}
+
+// noteExternal is countExternal plus a Debug-gated logExternal, for callers
+// whose extra attributes are cheap or rare (the opt-in route-engine sites).
+// A hot per-series site calls the two halves itself, so that it builds its
+// attrs only when Debug is enabled: arguments passed here are boxed at the
+// call whether or not the record is emitted.
+func (r *sgResolver) noteExternal(reason string, t sgTrace, attrs ...any) {
+	r.countExternal(reason)
+	if debugEnabled() {
+		r.logExternal(reason, t, attrs...)
+	}
 }
 
 // noteConnStringShadowed records (for the aggregated summary) and logs one
 // "://" label that a populated pod UID short-circuited (endpoint resolution
 // order). Shared by resolveClient and resolveServer so the counter and the
-// message cannot drift; each side passes its own extra dimensions. Both call it
-// only on a path that really does resolve the endpoint to a pod — a filtered
-// build's out-of-scope UID resolves the "://" label instead, and must not be
-// counted here.
-func (r *sgResolver) noteConnStringShadowed(t sgTrace, label, podUID string, attrs ...any) {
+// message cannot drift. Both call it only on a path that really does resolve
+// the endpoint to a pod — a filtered build's out-of-scope UID resolves the
+// "://" label instead, and must not be counted here. Its dimensions are plain
+// parameters, not variadic attributes, so a call with Debug off boxes nothing.
+func (r *sgResolver) noteConnStringShadowed(t sgTrace, label, podUID string, uidKnown bool, anchorCluster string) {
 	r.shadowed++
-	args := append([]any{
+	if !debugEnabled() {
+		return
+	}
+	slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)",
 		"reason", "conn_string_shadowed_by_uid",
 		"side", t.side,
-		"label", label,
+		"label", stripConnStringUserinfo(label),
 		"pod_uid", podUID,
+		"uid_known_to_topology", uidKnown,
+		"anchor_cluster", anchorCluster,
 		"client", t.clientLabel,
 		"server", t.serverLabel,
 		"client_uid", t.clientUID,
 		"server_uid", t.serverUID,
-	}, attrs...)
-	slog.Debug("service-graph :// label SHADOWED by populated UID (resolved as pod, not service)", args...)
+		"trace_cluster", t.traceCluster)
 }
 
 // famSvcKey keys the connection-string candidate index: the service identity a
@@ -642,21 +711,26 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		// (service / external nodes plus service-selects-pod fan-out) as an
 		// orphan subgraph — including the cross-cluster service-selects-pod fan-out.
 		if (clientUID == "" && clientLabel == "") || (serverUID == "" && serverLabel == "") {
-			slog.Debug("service-graph series dropped (one side wholly empty: no UID and no label)",
-				"client", clientLabel, "server", serverLabel,
-				"client_uid", clientUID, "server_uid", serverUID, "trace_cluster", traceCluster)
+			if debugEnabled() {
+				slog.Debug("service-graph series dropped (one side wholly empty: no UID and no label)",
+					"client", stripConnStringUserinfo(clientLabel), "server", stripConnStringUserinfo(serverLabel),
+					"client_uid", clientUID, "server_uid", serverUID, "trace_cluster", traceCluster)
+			}
 			continue
 		}
 
-		// Series identity threaded into the resolver for debug logging only.
+		// Series identity threaded into the resolver for debug logging only, so
+		// its labels are stripped of connection-string userinfo HERE, once: every
+		// Debug site that names the series (this file's and routeprescan.go's)
+		// reads them from the trace. Zero-cost for a label with no userinfo.
 		base := sgTrace{
-			clientLabel: clientLabel, serverLabel: serverLabel,
+			clientLabel: stripConnStringUserinfo(clientLabel), serverLabel: stripConnStringUserinfo(serverLabel),
 			clientUID: clientUID, serverUID: serverUID, traceCluster: traceCluster,
 		}
 		ctClient := base
-		ctClient.side, ctClient.label = "client", clientLabel
+		ctClient.side, ctClient.label = "client", base.clientLabel
 		ctServer := base
-		ctServer.side, ctServer.label = "server", serverLabel
+		ctServer.side, ctServer.label = "server", base.serverLabel
 
 		// Each side resolves to a (possibly empty) slice of node IDs. With the
 		// localised model a "://" endpoint resolves to AT MOST ONE service node —
@@ -833,7 +907,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 			slog.Warn("service-graph failure counter joined no request series; error_rate reads 0 on every edge",
 				"reason", "failed_total_label_set_mismatch",
 				"unmatched_series", unmatched)
-		case unmatched > 0:
+		case unmatched > 0 && debugEnabled():
 			slog.Debug("service-graph failure series with no matching request series",
 				"unmatched_series", unmatched, "matched_series", matched)
 		}
@@ -850,7 +924,7 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 			slog.Warn("service-graph duration histogram joined no request series; p90_server_ms omitted on every edge",
 				"reason", "server_seconds_bucket_label_set_mismatch",
 				"unmatched_series", unmatched)
-		case unmatched > 0:
+		case unmatched > 0 && debugEnabled():
 			slog.Debug("service-graph duration series with no matching request series",
 				"unmatched_series", unmatched, "matched_series", matched)
 		}
@@ -1059,7 +1133,10 @@ func (r *sgResolver) resolveEmptyUID(label, anchorCluster string, t sgTrace) []s
 		return r.resolveConnString(label, anchorCluster, t) // Stage 0 — service or external, never a pod
 	}
 	if label != "" {
-		r.noteExternal("missing_uid_nonurl_label", t, "anchor_cluster", anchorCluster) // external fallback (non-URL only)
+		r.countExternal("missing_uid_nonurl_label") // external fallback (non-URL only)
+		if debugEnabled() {
+			r.logExternal("missing_uid_nonurl_label", t, "anchor_cluster", anchorCluster)
+		}
 		return []string{r.external(label)}
 	}
 	return nil // drop
@@ -1095,7 +1172,7 @@ func (r *sgResolver) resolveClient(label, traceCluster, podUID, namespace string
 	// debug evidence because it is the usual reason a "://" peer resolves on
 	// one side (empty UID) but collapses to a pod on the other (populated UID).
 	if isConnString(label) {
-		r.noteConnStringShadowed(t, label, podUID, "trace_cluster", traceCluster)
+		r.noteConnStringShadowed(t, label, podUID, pod != nil, traceCluster)
 	}
 	if pod != nil {
 		return []string{pod.ID()}, true
@@ -1321,9 +1398,7 @@ func (r *sgResolver) resolveServer(label, anchorCluster, podUID, namespace strin
 	// fires for label == "unknown" — isConnString("unknown") is false — so this
 	// evidence path and the enrichment branch above are mutually exclusive.
 	if isConnString(label) {
-		r.noteConnStringShadowed(t, label, podUID,
-			"uid_known_to_topology", known, "anchor_cluster", anchorCluster,
-			"trace_cluster", t.traceCluster)
+		r.noteConnStringShadowed(t, label, podUID, known, anchorCluster)
 	}
 	if known {
 		return []string{pod.ID()}
@@ -1393,14 +1468,28 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 	// routeExternal is the shared external fallback: consult the route index
 	// first; only when it does not save the endpoint, record the classify
 	// reason (unless the index already recorded a route_engine_* reason for
-	// this endpoint) and emit the external node.
-	routeExternal := func(reason string, attrs ...any) []string {
+	// this endpoint) and emit the external node. Its Debug dimensions are
+	// plain parameters (svc / ns name the classified Service, empty when the
+	// host did not classify; withFamily adds the anchor's family) and the
+	// record is assembled only when Debug is enabled.
+	routeExternal := func(reason, svc, ns string, withFamily bool) []string {
 		ids, noted := r.routeIndexResolve(key, value, reason, t)
 		if len(ids) > 0 {
 			return ids
 		}
 		if !noted {
-			r.noteExternal(reason, t, attrs...)
+			r.countExternal(reason)
+			if debugEnabled() {
+				attrs := make([]any, 0, 12)
+				if svc != "" {
+					attrs = append(attrs, "service", svc, "namespace", ns)
+				}
+				attrs = append(attrs, "host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+				if withFamily {
+					attrs = append(attrs, "anchor_family", ClusterFamilyKey(anchorCluster))
+				}
+				r.logExternal(reason, t, attrs...)
+			}
 		}
 		return []string{r.external(value)}
 	}
@@ -1419,39 +1508,37 @@ func (r *sgResolver) resolveUnknownServerPeer(clientPod *graph.PodNode, peer pee
 			// target-driven rule makes the edge pod-calls-pod.
 			pod, ambiguous := r.lookupPeerPodIP(anchorCluster, host)
 			if pod != nil {
-				slog.Debug("service-graph unknown-server peer IP resolved to pod",
-					"side", t.side, "peer_address", value, "host", host,
-					"anchor_cluster", anchorCluster, "pod_cluster", pod.Labels()["cluster"],
-					"pod_id", pod.ID(),
-					"client", t.clientLabel, "server", t.serverLabel)
+				if debugEnabled() {
+					slog.Debug("service-graph unknown-server peer IP resolved to pod",
+						"side", t.side, "peer_address", value, "host", host,
+						"anchor_cluster", anchorCluster, "pod_cluster", pod.Labels()["cluster"],
+						"pod_id", pod.ID(),
+						"client", t.clientLabel, "server", t.serverLabel)
+				}
 				return []string{pod.ID()}
 			}
 			if ambiguous {
 				// Two or more family clusters hold the address: their pod CIDRs
 				// overlap here, so picking one would fabricate a dependency.
-				return routeExternal("unknown_server_peer_pod_ip_ambiguous",
-					"host", host, "peer_address", value, "anchor_cluster", anchorCluster,
-					"anchor_family", ClusterFamilyKey(anchorCluster))
+				return routeExternal("unknown_server_peer_pod_ip_ambiguous", "", "", true)
 			}
-			return routeExternal("unknown_server_peer_ip_literal_no_match",
-				"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+			return routeExternal("unknown_server_peer_ip_literal_no_match", "", "", false)
 		}
-		return routeExternal("unknown_server_peer_not_k8s_dns",
-			"host", host, "peer_address", value, "anchor_cluster", anchorCluster)
+		return routeExternal("unknown_server_peer_not_k8s_dns", "", "", false)
 	}
 	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
-		slog.Debug("service-graph unknown-server peer-label resolved to service node",
-			"side", t.side, "peer_address", value, "service", svc, "namespace", ns,
-			"anchor_cluster", anchorCluster, "service_id", ids[0],
-			"client", t.clientLabel, "server", t.serverLabel)
+		if debugEnabled() {
+			slog.Debug("service-graph unknown-server peer-label resolved to service node",
+				"side", t.side, "peer_address", value, "service", svc, "namespace", ns,
+				"anchor_cluster", anchorCluster, "service_id", ids[0],
+				"client", t.clientLabel, "server", t.serverLabel)
+		}
 		return ids
 	}
 	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
 	// hold that Service in its own family — external, not dropped (mirrors
 	// resolveConnString's anchor_cluster_lacks_service outcome).
-	return routeExternal("unknown_server_peer_anchor_lacks_service",
-		"service", svc, "namespace", ns, "host", host, "peer_address", value,
-		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
+	return routeExternal("unknown_server_peer_anchor_lacks_service", svc, ns, true)
 }
 
 // viaNodeID is the LOOKUP-ONLY mirror of resolveUnknownServerPeer's
@@ -1565,35 +1652,50 @@ func classifyBareShortName(host string) (service string, ok bool) {
 func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) []string {
 	// Each early return below is a distinct, separately-logged external-fallback
 	// reason so an operator can tell exactly why a "://" peer did not resolve.
+	// Resolution reads the RAW label; only the external node built from it is
+	// stripped of userinfo (stripConnStringUserinfo), so a credential never
+	// becomes a node id or name while a credentialled label naming a held
+	// Service resolves exactly as before.
 	host := connStringHost(label)
 	if host == "" {
 		// url.Parse produced no host: opaque double-scheme (e.g. "jdbc:postgresql://…")
 		// or otherwise unparseable authority.
-		r.noteExternal("conn_host_unparseable", t, "anchor_cluster", anchorCluster)
-		return []string{r.external(label)}
+		r.countExternal("conn_host_unparseable")
+		if debugEnabled() {
+			r.logExternal("conn_host_unparseable", t, "anchor_cluster", anchorCluster)
+		}
+		return []string{r.external(stripConnStringUserinfo(label))}
 	}
 	svc, ns, ok := classifyK8sDNS(host)
 	if !ok {
 		// Host is not a 2/3-label Kubernetes .svc DNS name (single-label short
 		// name, 4+-label custom/mesh domain, IP literal, comma-joined multi-host…).
-		r.noteExternal("conn_host_not_k8s_dns", t, "host", host, "anchor_cluster", anchorCluster)
-		return []string{r.external(label)}
+		r.countExternal("conn_host_not_k8s_dns")
+		if debugEnabled() {
+			r.logExternal("conn_host_not_k8s_dns", t, "host", host, "anchor_cluster", anchorCluster)
+		}
+		return []string{r.external(stripConnStringUserinfo(label))}
 	}
 	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
-		slog.Debug("service-graph :// resolved to service node",
-			"side", t.side, "label", label, "service", svc, "namespace", ns,
-			"anchor_cluster", anchorCluster, "service_id", ids[0],
-			"client", t.clientLabel, "server", t.serverLabel)
+		if debugEnabled() {
+			slog.Debug("service-graph :// resolved to service node",
+				"side", t.side, "label", stripConnStringUserinfo(label), "service", svc, "namespace", ns,
+				"anchor_cluster", anchorCluster, "service_id", ids[0],
+				"client", t.clientLabel, "server", t.serverLabel)
+		}
 		return ids
 	}
 	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
 	// hold that Service in its own family (same-cluster precondition; a family
-	// sibling holding it is not enough) → external node (labels={}, verbatim
-	// label as name).
-	r.noteExternal("anchor_cluster_lacks_service", t,
-		"service", svc, "namespace", ns, "host", host,
-		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
-	return []string{r.external(label)}
+	// sibling holding it is not enough) → external node (labels={}, the label
+	// minus any userinfo as name).
+	r.countExternal("anchor_cluster_lacks_service")
+	if debugEnabled() {
+		r.logExternal("anchor_cluster_lacks_service", t,
+			"service", svc, "namespace", ns, "host", host,
+			"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
+	}
+	return []string{r.external(stripConnStringUserinfo(label))}
 }
 
 // resolveServiceLevel resolves a `<service>.<namespace>` record to a SINGLE
@@ -1789,12 +1891,14 @@ func (r *sgResolver) addRouteChainEdge(srcPodID, backendSvcID, cluster string) {
 // ingress funnel.
 func (r *sgResolver) resolveRouteChain(dest RouteDestination, backendSvcID string, t sgTrace) ([]string, bool) {
 	degrade := func(reason string) ([]string, bool) {
-		slog.Debug("route chain degraded to direct edge",
-			"chain_degrade_reason", reason,
-			"ingress_cluster", dest.Cluster,
-			"ingress_namespace", dest.IngressNamespace, "ingress_service", dest.IngressService,
-			"namespace", dest.Namespace, "service", dest.Service,
-			"client", t.clientLabel, "server", t.serverLabel)
+		if debugEnabled() {
+			slog.Debug("route chain degraded to direct edge",
+				"chain_degrade_reason", reason,
+				"ingress_cluster", dest.Cluster,
+				"ingress_namespace", dest.IngressNamespace, "ingress_service", dest.IngressService,
+				"namespace", dest.Namespace, "service", dest.Service,
+				"client", t.clientLabel, "server", t.serverLabel)
+		}
 		return nil, false
 	}
 	if dest.IngressService == "" {
@@ -1864,6 +1968,48 @@ func (r *sgResolver) synthPod(id, cluster, namespace, podUID string) {
 		labels["namespace"] = namespace
 	}
 	r.synthPods[id] = &graph.PodNode{IDValue: id, NameValue: podUID, LabelsValue: labels}
+}
+
+// stripConnStringUserinfo removes the userinfo (`user:password@`, or a bare
+// `user@`) from every "://"-delimited authority in label, and returns every
+// other byte unchanged. It is what stands between a credential an
+// instrumentation wrote into a connection-string label and the response body
+// (an unresolvable "://" label becomes an external node's id and name) or the
+// Debug log.
+//
+// It is a string scan, not url.Parse: url.Parse leaves an opaque
+// double-scheme label ("jdbc:postgresql://user:pw@h/db") with no User at all,
+// rejects a password holding an invalid escape, and re-serialising its result
+// would normalise labels that carry no credential — changing node ids that
+// have nothing to hide. The authority runs from just after "://" to the first
+// '/', '?' or '#', and the userinfo ends at the LAST '@' inside it (an
+// unescaped '@' in a password is common in practice). An '@' in a path, query
+// or fragment is not userinfo and is kept. A credential holding an unescaped
+// '/', '?' or '#' is not a valid URI authority and is not recognised.
+//
+// The userinfo is removed entirely rather than masked (url.URL.Redacted's
+// "xxxxx"): the result is then the same whatever the credential, so a rotation
+// keeps one node id, and no placeholder suggests a secret is still there.
+// Labels carrying no userinfo are returned as-is, without an allocation.
+func stripConnStringUserinfo(label string) string {
+	const sep = "://"
+	out := label
+	from := 0
+	for {
+		i := strings.Index(out[from:], sep)
+		if i < 0 {
+			return out
+		}
+		start := from + i + len(sep)
+		end := len(out)
+		if j := strings.IndexAny(out[start:], "/?#"); j >= 0 {
+			end = start + j
+		}
+		if at := strings.LastIndexByte(out[start:end], '@'); at >= 0 {
+			out = out[:start] + out[start+at+1:]
+		}
+		from = start
+	}
 }
 
 // connStringHost extracts the host of a "://" connection string (scheme,

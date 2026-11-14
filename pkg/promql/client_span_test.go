@@ -2,6 +2,7 @@ package promql
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
@@ -147,10 +148,10 @@ func TestBackendClientOptions_NoCredentialsAttachesNoAuth(t *testing.T) {
 
 	// And the assembled transport is the bare traced one, with no basic-auth
 	// layer in the chain.
-	rt := newTransport(o, "vm-a:8428", &fakeRoundTripper{})
+	rt := newTransport(o, &url.URL{Scheme: "http", Host: "vm-a:8428"}, &fakeRoundTripper{})
 	assert.NotNil(t, rt)
 	var inner fakeRoundTripper
-	authed := newTransport(clientOptions{username: "u", password: "p"}, "vm-a:8428", &inner)
+	authed := newTransport(clientOptions{username: "u", password: "p"}, &url.URL{Scheme: "http", Host: "vm-a:8428"}, &inner)
 	got := roundTrip(t, authed, &inner, "http://vm-a:8428/api/v1/query")
 	assert.NotEmpty(t, got.Header.Get("Authorization"),
 		"the authenticated chain is the contrast: credentials reach the wire only when configured")

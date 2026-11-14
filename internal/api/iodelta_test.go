@@ -91,7 +91,7 @@ func getStorage(t *testing.T, srv *httptest.Server, extra url.Values) (int, []by
 	for k, v := range extra {
 		base[k] = v
 	}
-	resp, err := http.Get(storageGraphURL(srv.URL, base))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, base))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -283,7 +283,7 @@ func TestGraphAndK8sGraph_IgnoreIODelta(t *testing.T) {
 		k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}, "io_delta": {"yes"}}),
 		k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}, "io_delta": {"true"}}),
 	} {
-		resp, err := http.Get(u)
+		resp, err := httpGet(t, u)
 		require.NoError(t, err)
 		raw, err := io.ReadAll(resp.Body)
 		resp.Body.Close()

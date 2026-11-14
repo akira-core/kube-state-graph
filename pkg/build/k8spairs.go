@@ -11,10 +11,11 @@ import (
 	"github.com/akira-core/kube-state-graph/pkg/promql"
 )
 
-// The read primitives of the Kubernetes-only build (readK8sWorkload). A read of
-// known pods or claims is restricted on a namespace alternation and a name
-// alternation together, one query per chunk, instead of one query per
-// namespace. The two alternations are independent, so a chunk can match a cross
+// The grouped read primitives of the Kubernetes-only build (readK8sWorkload),
+// which the storage build's reads of known pods and claims share
+// (issuePodFamiliesByPair, issueClaimFamiliesByPair). A read of known pods or
+// claims is restricted on a namespace alternation and a name alternation
+// together, one query per chunk, instead of one query per namespace. The two alternations are independent, so a chunk can match a cross
 // pair — a name requested in one namespace that also exists in another — and the
 // caller drops those rows before anything is scoped from them.
 
@@ -86,8 +87,8 @@ type k8sRead struct {
 // pairBudget is the byte budget one chunk of q's pair restriction may spend on
 // its two alternations: the shared batch size less the request matchers every
 // chunk repeats.
-func (r *k8sRead) pairBudget(q promql.Query) int {
-	return max(r.opts.qosScopeBatchBytes()-promql.RequestMatcherCost(q, r.opts.LabelKeys, r.sel), 1)
+func pairBudget(q promql.Query, opts Options, sel promql.Selector) int {
+	return max(opts.qosScopeBatchBytes()-promql.RequestMatcherCost(q, opts.LabelKeys, sel), 1)
 }
 
 // parallel runs fns concurrently as one round and returns the first error. Each
@@ -111,12 +112,29 @@ func (r *k8sRead) parallel(name promql.Query, fns ...func(ctx context.Context) e
 // means never read" contract every other second wave keeps. The first chunk
 // error fails the read, named with its family.
 func (r *k8sRead) issuePairReads(ctx context.Context, reads []pairRead) error {
+	return issuePairReads(ctx, r.q, r.window, r.end, r.opts, r.sel, r.v, r.mu, reads)
+}
+
+// issuePairReads is the grouped (namespace, name) read both the
+// Kubernetes-only build and the storage build issue for pods and claims they
+// already know: k8sRead.issuePairReads for a caller without a k8sRead.
+func issuePairReads(
+	ctx context.Context,
+	q promql.Querier,
+	window time.Duration,
+	end time.Time,
+	opts Options,
+	sel promql.Selector,
+	v *topologyVectors,
+	mu *sync.Mutex,
+	reads []pairRead,
+) error {
 	chunks := make([][]pairChunk, len(reads))
 	parts := make([][]model.Vector, len(reads))
 	for i := range reads {
 		chunks[i] = reads[i].chunks
 		if chunks[i] == nil && len(reads[i].pairs) > 0 {
-			chunks[i] = chunksOfPairs(reads[i].pairs, reads[i].label, r.pairBudget(reads[i].query))
+			chunks[i] = chunksOfPairs(reads[i].pairs, reads[i].label, pairBudget(reads[i].query, opts, sel))
 		}
 		parts[i] = make([]model.Vector, len(chunks[i]))
 	}
@@ -127,9 +145,9 @@ func (r *k8sRead) issuePairReads(ctx context.Context, reads []pairRead) error {
 		read := reads[ri]
 		for ci, chunk := range chunks[ri] {
 			wave.Go(func() error {
-				out, err := issueScopedChunk(wctx, r.q, read.query, r.window, r.end, r.opts.LabelKeys, r.sel, nil,
+				out, err := issueScopedChunk(wctx, q, read.query, window, end, opts.LabelKeys, sel, nil,
 					func([]string) (string, bool) {
-						return promql.RenderNamesAcrossNamespaces(read.query, r.window, r.opts.LabelKeys, r.sel,
+						return promql.RenderNamesAcrossNamespaces(read.query, window, opts.LabelKeys, sel,
 							read.label, chunk.namespaces, chunk.names)
 					})
 				if err != nil {
@@ -151,7 +169,7 @@ func (r *k8sRead) issuePairReads(ctx context.Context, reads []pairRead) error {
 		for _, part := range parts[ri] {
 			reads[ri].rows = append(reads[ri].rows, part...)
 		}
-		markScopeIssued(r.v, r.mu, reads[ri].query)
+		markScopeIssued(v, mu, reads[ri].query)
 	}
 	return nil
 }

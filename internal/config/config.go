@@ -36,8 +36,9 @@ type Config struct {
 	// startup when RouteStoreDSN is set; ignored otherwise.
 	RouterCheckBin string
 	// RouteResolveTimeout bounds each individual route-engine call made during
-	// a build's pre-parse resolution pass. Zero means each call inherits only
-	// the build deadline (--build-timeout).
+	// a build's pre-parse resolution pass — under batched matching, a key's
+	// preparation and each router_check_tool run separately. Zero means each
+	// call inherits only the build deadline (--build-timeout).
 	RouteResolveTimeout time.Duration
 	// RouteStoreUniqueRows enables the route store's pruned read mode: the
 	// valid_to predicate is pushed back into SQL, so closed versions are
@@ -119,6 +120,11 @@ type Config struct {
 	// KSG_UPSTREAM_MAX_CONCURRENCY). A query finding its store saturated
 	// waits for a slot until its build deadline. 0 disables the bound.
 	UpstreamMaxConcurrency int
+	// UpstreamMaxResponseBytes bounds every upstream response body
+	// (--upstream-max-response-bytes / KSG_UPSTREAM_MAX_RESPONSE_BYTES). A
+	// larger answer fails its query like any upstream error. 0 disables the
+	// bound.
+	UpstreamMaxResponseBytes int64
 	// QueryCacheMaxSeries is the upstream query-result cache's total
 	// resident-series budget (--query-cache-max-series /
 	// KSG_QUERY_CACHE_MAX_SERIES). 0 disables the cache.
@@ -130,7 +136,25 @@ type Config struct {
 	// by the same amount (--end-align / KSG_END_ALIGN). 0 passes start/end
 	// through verbatim.
 	EndAlign time.Duration
+	// APIKeysFromFlag is derived, not configured: Parse sets it when
+	// --api-keys appeared on the command line (KSG_API_KEYS leaves it false).
+	// Keys passed that way are visible in the process listing, so the server
+	// warns at startup. It carries no key value.
+	APIKeysFromFlag bool
+	// MaxInflightBuilds bounds the /v1/* requests admitted at once
+	// (--max-inflight-builds / KSG_MAX_INFLIGHT_BUILDS). A request arriving at
+	// the bound is answered 503 overloaded immediately. 0 disables the bound.
+	MaxInflightBuilds int
+	// MaxWindow caps a graph request's caller-supplied end - start
+	// (--max-window / KSG_MAX_WINDOW); a longer window is 400 invalid_range.
+	// 0 (the default) applies no cap.
+	MaxWindow time.Duration
 }
+
+// DefaultMaxInflightBuilds is the default admission bound. It matches
+// promql.DefaultMaxConcurrency, so a replica holds no more graphs in memory
+// than it can have upstream queries in flight to one store.
+const DefaultMaxInflightBuilds = 32
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
 type LookupEnvFunc func(string) (string, bool)
@@ -167,10 +191,13 @@ func Defaults() Config {
 		BackendsReloadInterval: 30 * time.Second,
 		// The library's exported defaults, so the server and an embedder that
 		// writes no option run with identical limits.
-		UpstreamMaxConcurrency: promql.DefaultMaxConcurrency,
-		QueryCacheMaxSeries:    promql.DefaultQueryCacheMaxSeries,
-		QueryCacheTTL:          promql.DefaultQueryCacheTTL,
-		EndAlign:               kubegraph.DefaultEndAlign,
+		UpstreamMaxConcurrency:   promql.DefaultMaxConcurrency,
+		UpstreamMaxResponseBytes: promql.DefaultMaxResponseBytes,
+		QueryCacheMaxSeries:      promql.DefaultQueryCacheMaxSeries,
+		QueryCacheTTL:            promql.DefaultQueryCacheTTL,
+		EndAlign:                 kubegraph.DefaultEndAlign,
+		MaxInflightBuilds:        DefaultMaxInflightBuilds,
+		MaxWindow:                0,
 	}
 }
 
@@ -200,17 +227,28 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries; a literal alternation is also split at 100 values, independently of this budget.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
+	fs.Int64Var(&cfg.UpstreamMaxResponseBytes, "upstream-max-response-bytes", cfg.UpstreamMaxResponseBytes, "Maximum size of one upstream response body; a larger answer fails its query like any upstream error. 0 disables the bound.")
 	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
 	fs.DurationVar(&cfg.QueryCacheTTL, "query-cache-ttl", cfg.QueryCacheTTL, "How long a cached upstream query result may be served.")
 	fs.DurationVar(&cfg.EndAlign, "end-align", cfg.EndAlign, "Grid a graph request's end is floored to (start shifted by the same amount, window length kept), so requests within one step share cached upstream results. 0 passes start/end through verbatim.")
+	fs.IntVar(&cfg.MaxInflightBuilds, "max-inflight-builds", cfg.MaxInflightBuilds, "Maximum /v1/* graph requests admitted at once per replica. A request past the bound is answered 503 (reason overloaded, Retry-After: 1) immediately. 0 disables the bound.")
+	fs.DurationVar(&cfg.MaxWindow, "max-window", cfg.MaxWindow, "Longest graph request window (end - start) accepted; a longer one is 400 invalid_range. 0 applies no cap.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
-	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
+	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Timeout for each route-engine call during a build: a key's preparation, and each batched router_check_tool run. 0 inherits the build deadline only.")
 	fs.BoolVar(&cfg.RouteStoreUniqueRows, "route-store-unique-rows", cfg.RouteStoreUniqueRows, "Enable the route store's pruned read mode (server-side valid_to filtering). ONLY when the exporter guarantees one physical row per version (closeMode=update); never against the default rewrite-close exporter.")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	// Visit walks only the flags actually set on the command line, so this
+	// answers every spelling (-api-keys, --api-keys=…, --api-keys …) without
+	// re-parsing argv.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "api-keys" {
+			cfg.APIKeysFromFlag = true
+		}
+	})
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -241,6 +279,17 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	getInt := func(env string, dst *int) error {
 		if v, ok := lookup(env); ok {
 			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: must be an integer", env, v)
+			}
+			*dst = n
+		}
+		return nil
+	}
+
+	getInt64 := func(env string, dst *int64) error {
+		if v, ok := lookup(env); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
 				return fmt.Errorf("invalid %s=%q: must be an integer", env, v)
 			}
@@ -286,6 +335,9 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	if err := getInt("KSG_UPSTREAM_MAX_CONCURRENCY", &cfg.UpstreamMaxConcurrency); err != nil {
 		return err
 	}
+	if err := getInt64("KSG_UPSTREAM_MAX_RESPONSE_BYTES", &cfg.UpstreamMaxResponseBytes); err != nil {
+		return err
+	}
 	if err := getInt("KSG_QUERY_CACHE_MAX_SERIES", &cfg.QueryCacheMaxSeries); err != nil {
 		return err
 	}
@@ -293,6 +345,12 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		return err
 	}
 	if err := getDur("KSG_END_ALIGN", &cfg.EndAlign); err != nil {
+		return err
+	}
+	if err := getInt("KSG_MAX_INFLIGHT_BUILDS", &cfg.MaxInflightBuilds); err != nil {
+		return err
+	}
+	if err := getDur("KSG_MAX_WINDOW", &cfg.MaxWindow); err != nil {
 		return err
 	}
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
@@ -321,7 +379,9 @@ func (c Config) Validate() error {
 	}
 	u, err := url.Parse(c.PromURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("prom-url is not a valid URL: %q", c.PromURL)
+		// RedactURL, never %q of the raw value: a URL carrying userinfo would
+		// otherwise put its password in the fatal startup error.
+		return fmt.Errorf("prom-url is not a valid URL: %s", RedactURL(c.PromURL))
 	}
 	// Upstream basic-auth credentials must be configured as a pair. The error
 	// names the env vars only — never echo the configured values.
@@ -344,6 +404,9 @@ func (c Config) Validate() error {
 	if c.UpstreamMaxConcurrency < 0 {
 		return errors.New("upstream-max-concurrency must not be negative (0 disables the bound)")
 	}
+	if c.UpstreamMaxResponseBytes < 0 {
+		return errors.New("upstream-max-response-bytes must not be negative (0 disables the bound)")
+	}
 	if c.QueryCacheMaxSeries < 0 {
 		return errors.New("query-cache-max-series must not be negative (0 disables the cache)")
 	}
@@ -355,6 +418,12 @@ func (c Config) Validate() error {
 	}
 	if c.APITimeout <= 0 {
 		return errors.New("api-timeout must be positive")
+	}
+	if c.MaxInflightBuilds < 0 {
+		return errors.New("max-inflight-builds must not be negative (0 disables the bound)")
+	}
+	if c.MaxWindow < 0 {
+		return errors.New("max-window must not be negative (0 applies no cap)")
 	}
 	if c.APIKeysReloadInterval < 0 {
 		return errors.New("api-keys-reload-interval must be >= 0 (0 disables hot reload)")

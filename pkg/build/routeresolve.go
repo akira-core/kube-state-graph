@@ -165,11 +165,12 @@ type RouteResolver interface {
 // when this is implemented and drives every ResolveRoute of that build through
 // the returned scope, so identical probes collapse to one store read.
 //
-// The scope lives for exactly ONE build, is called SERIALLY (the prescan loop),
-// and therefore need NOT be safe for concurrent use — unlike the base resolver,
-// which is shared across concurrent builds and must stay stateless. A cache on
-// the shared resolver would instead grow unbounded across builds; the per-build
-// scope is the correct lifetime.
+// The scope lives for exactly ONE build, but within it the prescan resolves
+// keys CONCURRENTLY (up to routeResolveConcurrency at once), so the scope MUST
+// be safe for concurrent use, exactly like the base resolver, which is shared
+// across concurrent builds. Per-build memoisation belongs in the scope because
+// that is its natural lifetime; anything the base resolver keeps across builds
+// must be bounded.
 //
 // This is an optional interface (idiomatic Go, cf. http.Flusher) so the base
 // RouteResolver contract is unchanged: a resolver that does not implement it
@@ -179,4 +180,42 @@ type BuildScopedRouteResolver interface {
 	// BuildScoped returns a resolver scoped to a single build. Callers use it
 	// for the duration of one build and then discard it.
 	BuildScoped() RouteResolver
+}
+
+// RouteBatchLimits carries the prescan's own bounds into a batch resolution:
+// at most Concurrency requests (or matcher groups) in progress at once, and
+// each request's preparation and each group's matcher run bounded by
+// PerCallTimeout independently (zero = the batch context only).
+type RouteBatchLimits struct {
+	Concurrency    int
+	PerCallTimeout time.Duration
+}
+
+// RouteAnswer is one request's result in a batch: the same (destination,
+// outcome, error) triple ResolveRoute returns, under the same contract (an
+// error carries no meaningful outcome). Answered is false when the batch
+// never reached the request — the batch context ended first — and such a
+// request gets no index entry, exactly like a key the per-key loop never
+// reached.
+type RouteAnswer struct {
+	Dest     RouteDestination
+	Outcome  RouteOutcome
+	Err      error
+	Answered bool
+}
+
+// BatchRouteResolver is an OPTIONAL upgrade interface a RouteResolver (or the
+// scope a BuildScopedRouteResolver mints) may implement to receive a build's
+// whole key set at once. The engine in pkg/route uses it to run ONE matcher
+// invocation per distinct RouteConfiguration instead of one per key.
+// resolveRouteQueries uses it when available and otherwise resolves key by
+// key, so a resolver without it — mocks and embedders included — runs exactly
+// as before.
+//
+// ResolveRoutes returns one RouteAnswer per request, in request order. Each
+// answer MUST equal what ResolveRoute returns for that request alone, and the
+// implementation MUST NOT panic out of goroutines it starts.
+type BatchRouteResolver interface {
+	RouteResolver
+	ResolveRoutes(ctx context.Context, reqs []RouteRequest, limits RouteBatchLimits) []RouteAnswer
 }

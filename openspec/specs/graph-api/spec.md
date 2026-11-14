@@ -65,9 +65,9 @@ The server SHALL derive the upstream evaluation window from the caller's `start`
 
 #### Scenario: No window cap or future-time guard
 
-- **WHEN** a client sends an arbitrarily long window or an `end` in the future
+- **WHEN** the server runs with `--max-window` unset or `0` and a client sends an arbitrarily long window, or any client sends an `end` in the future
 - **THEN** the server applies no window cap and no future-time guard
-- **AND** operators relying on bounded query cost configure upstream VictoriaMetrics search limits (e.g. `-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`)
+- **AND** operators relying on bounded query cost configure upstream VictoriaMetrics search limits (e.g. `-search.maxQueryDuration`, `-search.maxSamplesPerQuery`, `-search.maxPointsPerTimeseries`) as a deployment precondition, and may additionally set `--max-window` ("Optional window cap")
 
 #### Scenario: Caller timestamps drive PromQL
 
@@ -454,7 +454,7 @@ The selector-level filters `cluster`, `namespace`, `az`, `env` SHALL be rendered
 
 ### Requirement: Selector values are validated before rendering
 
-Selector-level values and `prune` SHALL be validated before any upstream query is rendered, and an invalid value SHALL be rejected with `400 Bad Request` and `reason: "invalid_scope"`.
+Selector-level values and `prune` SHALL be validated before any upstream query is rendered, and an invalid value SHALL be rejected with `400 Bad Request` and `reason: "invalid_scope"`. Each of `cluster`, `namespace`, `az` and `env` SHALL carry at most 100 DISTINCT non-empty values (`promql.MaxAlternationValues`, the upstream's exact-lookup limit for one alternation) on every graph endpoint; a repeated identical value and an empty value do not count.
 
 #### Scenario: Over-long value rejected
 
@@ -470,6 +470,21 @@ Selector-level values and `prune` SHALL be validated before any upstream query i
 
 - **WHEN** the `prune` value is not exactly `true` / `false`
 - **THEN** the server returns `400 Bad Request` with `reason: "invalid_scope"`
+
+#### Scenario: One hundred distinct values are accepted
+
+- **WHEN** a client sends 100 distinct `namespace` values, or 101 values of which only 100 are distinct
+- **THEN** the request is accepted
+
+#### Scenario: More than one hundred distinct values are rejected before any query
+
+- **WHEN** a client sends 101 distinct values of `cluster`, `namespace`, `az` or `env` to `/v1/graph`, `/v1/storage-graph` or `/v1/k8s-graph`
+- **THEN** the server returns `400 Bad Request` with `reason: "invalid_scope"` and a message naming the parameter and the limit and repeating no value, and issues no upstream query
+
+#### Scenario: Required parameters are checked first
+
+- **WHEN** a `/v1/storage-graph` request carries 101 distinct `namespace` values and no `az`
+- **THEN** the server returns 400 with `reason: "missing_az"`
 
 ### Requirement: Projection-level filters
 
@@ -990,12 +1005,17 @@ When a build carrying **no selector-level filter** finds zero pods and zero node
 
 ### Requirement: Structured request logging
 
-Every served HTTP request SHALL emit exactly one structured log line via `log/slog` JSON handler containing at least `method`, `path`, `status`, `duration_ms`, `request_id`, and applied `cluster` filter values.
+Every served HTTP request SHALL emit exactly one structured log line via `log/slog` JSON handler containing at least `method`, `path`, `status`, `duration_ms`, `request_id`, and applied `cluster` filter values. The `clusters` field SHALL carry at most the first 10 `cluster` values in request order, each cut to at most 64 bytes, and the line SHALL carry `clusters_truncated: true` when any value or count was cut.
 
 #### Scenario: Request log line
 
 - **WHEN** the server serves a request
 - **THEN** stdout receives a JSON object with the listed fields and a top-level `level` field set to `INFO` for non-error responses
+
+#### Scenario: Many cluster values are truncated in the log
+
+- **WHEN** a request carries 50 `cluster` values, one of them 200 bytes long
+- **THEN** the log line's `clusters` holds the first 10 values, none longer than 64 bytes, and `clusters_truncated` is `true`
 
 ### Requirement: OpenAPI specification served by the API
 
@@ -1018,7 +1038,7 @@ Both responses SHALL carry `Cache-Control: public, max-age=3600`. The spec SHALL
 
 ### Requirement: Scalar API Reference UI served at /docs
 
-The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the same-origin OpenAPI spec from `/openapi.json` via `Scalar.createApiReference`, and the `/docs` response SHALL set `Content-Security-Policy`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers.
+The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the same-origin OpenAPI spec from `/openapi.json` via `Scalar.createApiReference`, and the `/docs` response SHALL set `Content-Security-Policy`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers. The policy's `script-src` SHALL allow the page's one inline script by its `sha256` hash and SHALL NOT carry `'unsafe-inline'`.
 
 #### Scenario: Pinned, integrity-checked CDN bundle
 
@@ -1030,6 +1050,12 @@ The server SHALL serve the Scalar API Reference UI at `GET /docs`, rendering the
 
 - **WHEN** a client sends `GET /docs`
 - **THEN** the response is 200, `Content-Type: text/html`, and the page loads the version-pinned `@scalar/api-reference` standalone bundle from `cdn.jsdelivr.net` with an `integrity` hash, then calls `Scalar.createApiReference` against the same-origin `/openapi.json`, and the response carries `Content-Security-Policy`, `X-Frame-Options`, and `X-Content-Type-Options` headers
+
+#### Scenario: The inline script is allowed by hash only
+
+- **WHEN** a client sends `GET /docs`
+- **THEN** the `Content-Security-Policy` `script-src` directive carries `'sha256-<base64>'` equal to the SHA-256 of the page's one inline `<script>` body, plus `'self'` and `https://cdn.jsdelivr.net`, and does not carry `'unsafe-inline'`
+- **AND** `style-src` keeps `'unsafe-inline'`, because Scalar injects its styles at runtime
 
 ### Requirement: Route ↔ spec drift guard
 
@@ -2092,3 +2118,174 @@ For each value the `app-metadata-source` capability resolves, a `namespace` grou
 
 - **WHEN** the metric is configured and none of its rows carries a `deploy_time`, `namespace_group`, `namespace_group_owner` or `namespace_alias` label
 - **THEN** no group carries `namespace_group`, `namespace_group_owner`, `namespace_alias` or `deployed_at`, and the body equals that of the same build before this change
+
+### Requirement: Boot warning when a configured key source yields no keys
+
+The server SHALL log a warning at boot, identifying that authentication is disabled, when a configured API-key source yields zero keys, and SHALL NOT log an "auth enabled" line in that case. The warning SHALL carry no key value and SHALL NOT change which requests are accepted.
+
+#### Scenario: Key file with no keys
+
+- **WHEN** the server starts with `--api-keys-file` naming a file that is empty or holds only comments
+- **THEN** the boot log carries a warning that API-key auth is disabled because the file yielded no keys, and no line claims auth is enabled
+- **AND** every `/v1/*` route accepts requests with no `X-API-Key` header
+- **AND** when `--api-keys-reload-interval` is positive the file is still re-read on that cadence, so keys written to it later enable auth without a restart
+
+#### Scenario: Key list with no keys
+
+- **WHEN** the server starts with `--api-keys=,` (or `KSG_API_KEYS=,`) and no `--api-keys-file`
+- **THEN** the boot log carries a warning that API-key auth is disabled, and no line claims auth is enabled
+
+### Requirement: Boot warning for API keys passed as a literal flag
+
+The server SHALL log one warning at boot when keys were supplied as a literal `--api-keys` command-line flag, whether or not `--api-keys-file` takes precedence over it, naming `--api-keys-file` and `KSG_API_KEYS` as the alternatives. The warning SHALL carry no key value and SHALL NOT change which requests are accepted.
+
+#### Scenario: Keys passed as a literal flag
+
+- **WHEN** the server starts with `--api-keys=k1` on the command line and no `--api-keys-file`
+- **THEN** the server enforces `k1` exactly as before, and the boot log carries one warning that the keys are visible in the process command line, naming `--api-keys-file` and `KSG_API_KEYS`
+- **AND** the warning does not contain `k1`
+
+#### Scenario: Keys from the environment
+
+- **WHEN** the server starts with `KSG_API_KEYS=k1` and no `--api-keys` flag
+- **THEN** no literal-flag warning is logged
+
+### Requirement: Bounded request line
+
+The server SHALL set `http.Server.MaxHeaderBytes` explicitly to 256 KiB. At the default byte budget it SHALL admit the largest request the parsers and root caps accept with bare roots or with `pod=` roots in a Kubernetes-legal (≤63-byte) namespace. A root set with a far longer repeated prefix MAY receive 431.
+
+#### Scenario: The largest Kubernetes-legal pod root set is admitted
+
+- **WHEN** a client sends `/v1/storage-graph` with the largest `pod=` root set the caps admit, every root in one 63-byte namespace
+- **THEN** the server reads the request and answers it with a status other than 431
+
+#### Scenario: A long repeated prefix can exceed the bound
+
+- **WHEN** a client sends 1600 `pod=` roots sharing one 170-byte namespace
+- **THEN** the server answers `431 Request Header Fields Too Large`, because the namespace repeats in every value while the chunk budget charges it once per chunk
+
+#### Scenario: The largest legal request is admitted
+
+- **WHEN** a client sends a `/v1/storage-graph` request carrying 100 distinct 253-byte values for each of `cluster`, `namespace`, `az` and `env` and a root set that fills the root chunk cap at the default byte budget
+- **THEN** the server reads the request and answers it with a status other than `431 Request Header Fields Too Large`
+
+#### Scenario: An oversized request line is refused before parsing
+
+- **WHEN** a client sends a request whose request line exceeds the bound
+- **THEN** the server answers `431 Request Header Fields Too Large` and no handler runs
+
+### Requirement: Build admission control
+
+The server SHALL bound the number of `/v1/*` requests in flight with `--max-inflight-builds` / `KSG_MAX_INFLIGHT_BUILDS` (default `32`, `0` disables), applied after API-key authentication. A request arriving at the bound SHALL be answered immediately with `503 Service Unavailable`, `reason: "overloaded"` and `Retry-After: 1`, and SHALL issue no upstream query. Routes outside `/v1` SHALL never be subject to the bound.
+
+#### Scenario: A request past the bound is shed
+
+- **WHEN** the server runs with `--max-inflight-builds=2`, two graph requests are still building, and a third arrives
+- **THEN** the third receives 503 with `reason: "overloaded"` and `Retry-After: 1` at once, and issues no upstream query
+- **AND** once one of the two completes, the next request is admitted
+
+#### Scenario: Authentication runs first
+
+- **WHEN** API keys are configured and the bound is reached
+- **THEN** a request without a valid `X-API-Key` still receives 401, and only an authenticated request can receive 503 `overloaded`
+
+#### Scenario: Operational routes are never limited
+
+- **WHEN** the bound is reached
+- **THEN** `GET /livez`, `GET /readyz`, `GET /metrics`, `GET /docs`, `GET /openapi.json` and `GET /openapi.yaml` are served as if no graph request were in flight
+
+#### Scenario: Zero disables the bound
+
+- **WHEN** the server runs with `--max-inflight-builds=0`
+- **THEN** no request is ever answered `overloaded`
+
+#### Scenario: Admission self-metrics
+
+- **WHEN** a client scrapes `GET /metrics`
+- **THEN** the exposition includes `kube_state_graph_inflight_builds` (gauge, no labels: the `/v1/*` requests currently admitted) and `kube_state_graph_admission_rejected_total` (counter, no labels: requests answered `overloaded`)
+- **AND** the gauge returns to its previous value when an admitted request finishes, also when its handler panics
+
+### Requirement: Optional window cap
+
+The server SHALL accept `--max-window` / `KSG_MAX_WINDOW` (a duration, default `0` = no cap; a negative value is a startup error). When it is non-zero, a request to `/v1/graph`, `/v1/storage-graph` or `/v1/k8s-graph` whose caller-supplied `end - start` exceeds it SHALL be rejected `400 Bad Request` with `reason: "invalid_range"`, after every other parameter check and before any upstream query. A window equal to the cap SHALL be accepted.
+
+#### Scenario: A window past the cap
+
+- **WHEN** the server runs with `--max-window=24h` and a client sends `/v1/graph` with a 25-hour window
+- **THEN** the server returns 400 with `reason: "invalid_range"` and issues no upstream query
+
+#### Scenario: Every graph endpoint applies it
+
+- **WHEN** the same over-cap window is sent to `/v1/storage-graph` or `/v1/k8s-graph` with an otherwise valid request
+- **THEN** each returns 400 with `reason: "invalid_range"`
+
+#### Scenario: Other parameter errors win
+
+- **WHEN** an over-cap window is sent to `/v1/storage-graph` with no root
+- **THEN** the server returns 400 with `reason: "missing_root"`
+
+#### Scenario: The cap reads the caller's window
+
+- **WHEN** a window equal to the cap is sent
+- **THEN** it is accepted, and end alignment, which preserves the window length, cannot push it over the cap
+
+### Requirement: The build deadline bounds every stage of a graph request
+
+The `--build-timeout` deadline SHALL bound the whole graph request — build, projection, serialisation and JSON encoding — and the server SHALL check the request's context before each of the last three. A passed deadline SHALL be answered `504` `timeout` (counted in `kube_state_graph_build_rejected_total{reason="timeout"}`), a disconnected client `499` `canceled`.
+
+#### Scenario: A request that completes every stage
+
+- **WHEN** a graph request finishes every stage before its deadline
+- **THEN** its status and body are exactly those it had before this requirement
+
+#### Scenario: A client that leaves during the build
+
+- **WHEN** the client disconnects while the build is running and the build then returns a graph
+- **THEN** the projection, serialisation and encoding are not run, and the request is logged with status 499
+
+#### Scenario: A build that finishes at its deadline
+
+- **WHEN** the build returns a graph after the `--build-timeout` deadline has passed
+- **THEN** the projection is not run and the response is 504 with `reason: "timeout"`
+
+### Requirement: Non-finite upstream values are dropped
+
+A Harvest or kubelet sample whose value is NaN or ±Inf SHALL be skipped by its reader, as if the series were absent, exactly as the RED and alert readers already skip them, so a non-finite value can never reach the JSON encoder.
+
+#### Scenario: A NaN usage sample
+
+- **WHEN** `kubelet_volume_stats_used_bytes` for a claim is NaN and its capacity is finite
+- **THEN** the response is 200, the claim's `data.usage` carries `capacity_bytes` and no `used_bytes`
+
+#### Scenario: A non-finite sample does not shadow a finite one
+
+- **WHEN** two series of one aggregate's `aggr_space_used` return NaN and `100`
+- **THEN** `data.usage.used_bytes` is `100`, whatever order the series arrive in
+
+### Requirement: Bounded request ID
+
+The server SHALL accept an inbound `X-Request-ID` only when it is 1 to 128 bytes long and every byte is in `[A-Za-z0-9._:=+/@-]`. Any other value SHALL be replaced by a generated id. The accepted or generated id SHALL be the one echoed in the `X-Request-ID` response header and written to the access log.
+
+#### Scenario: A well-formed id is kept
+
+- **WHEN** a client sends `X-Request-ID: 3f1c-9a/b.7:x=y+z@1` (128 bytes or fewer)
+- **THEN** the response header and the access log carry exactly that value
+
+#### Scenario: An oversized or malformed id is replaced
+
+- **WHEN** a client sends an `X-Request-ID` of 129 bytes, or one containing a space, a quote or a non-ASCII byte
+- **THEN** the response header and the access log carry a generated id instead, and the inbound value appears in neither
+
+### Requirement: Rejected raw values are echoed only when bounded
+
+A 400 message naming a malformed `start`, `end` or `prune` value SHALL repeat the raw value only when it passes the selector-value checks (at most 253 bytes, valid UTF-8, no control character); otherwise the message SHALL name the parameter's expected form without the value. The `reason` codes are unchanged.
+
+#### Scenario: A short malformed timestamp is echoed
+
+- **WHEN** a client sends `start=yesterday`
+- **THEN** the response is 400 with `reason: "invalid_start"` and the message `timestamp must be RFC 3339 or Unix seconds: "yesterday"`, exactly as before
+
+#### Scenario: An oversized malformed value is not echoed
+
+- **WHEN** a client sends a 300-byte `end` or `prune` value that does not parse
+- **THEN** the response is 400 with `reason: "invalid_end"` or `"invalid_scope"` respectively, and the message does not contain the value

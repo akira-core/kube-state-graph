@@ -1,3 +1,64 @@
+# BREAKING — `translate.Translator.Translate` takes a context
+
+*Change: `route-engine-memo-and-cache`.*
+
+**What changed.** `pkg/route/translate`'s `(*Translator).Translate(in ScopedInput)` is now `Translate(ctx context.Context, in ScopedInput)`. An ended context returns its cause before any istiod world is built, and ends the wait for the world's config controllers to synchronise, which now backs off from 100 µs to 2 ms instead of polling every 100 µs. The returned RouteConfiguration is unchanged. The HTTP API, flag names and response bodies are unchanged; only the scope of `--route-resolve-timeout` moves, below.
+
+`--route-resolve-timeout` / `KSG_ROUTE_RESOLVE_TIMEOUT` now bounds each route-engine CALL rather than each endpoint's resolution: a key's preparation gets one budget, and each batched `router_check_tool` run gets one, shared by every key in that batch. The default (`5s`) and `0` (inherit the build deadline) are unchanged. A deployment that lowered the value to fit a single endpoint should re-check it: a batch that exceeds it marks its keys `route_engine_error`.
+
+**Who is affected.** In-process embedders that call the istiod translation stage directly (the `Translate` signature), and operators who tuned `--route-resolve-timeout` (its scope, above). `pkg/route` is linked only by `cmd/kube-state-graph` and by embedders that opt into route resolution; a plain `pkg/kubegraph` embedder never sees the package.
+
+**Migration.** Pass the caller's context: `tr.Translate(ctx, in)`. Rollback is a revert.
+
+---
+
+# BREAKING — connection-string external nodes drop URL userinfo
+
+*Change: `redact-connection-string-userinfo`.*
+
+**What changed.** An unresolvable `"://"` service-graph label still becomes an `external` node. Its `id` and `name` no longer carry the URL userinfo (`user:password@`, or a bare `user@`). `mongodb://app:pw@mongo.example:27017/db` is now `external/mongodb://mongo.example:27017/db`. Every other byte of the label is unchanged, and a label without userinfo is byte-identical. Labels that differ only in their credentials now share one node and one edge. The per-series Debug records of the service-graph parse carry the same stripped form.
+
+**Who is affected.** Only a client that pinned the `id` of such a node, or of one of its edges, which are UUIDv5 over the endpoint ids. Every other node and edge is unchanged.
+
+**Migration.** Re-read the id from a fresh body. Rollback is a revert.
+
+---
+
+# BREAKING — graph requests are admission-controlled and selector values are capped
+
+*Change: `bound-request-admission`.*
+
+**What changed.**
+
+- At most `--max-inflight-builds` / `KSG_MAX_INFLIGHT_BUILDS` `/v1/*` requests (default **32**) run at once per replica. The next one is answered at once with `503 Service Unavailable`, `reason: "overloaded"`, `Retry-After: 1`, and issues no upstream query. Before, every request was admitted and queued on the per-store upstream slot until `--build-timeout` turned it into a 504. `/livez`, `/readyz`, `/metrics`, `/docs` and `/openapi.*` are never limited. New self-metrics: `kube_state_graph_inflight_builds`, `kube_state_graph_admission_rejected_total`.
+- Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values on every graph endpoint; more is `400 invalid_scope` before any query.
+- A `pod=` root set is `400 invalid_scope` on `/v1/storage-graph` and `/v1/k8s-graph` when it holds more than 1600 distinct `(namespace, name)` pairs or its pairs take more than 16 chunks; an admitted set's seed is now issued as one query per pair chunk, at most 100 namespaces and 100 names each.
+- `http.Server.MaxHeaderBytes` is 256 KiB (was net/http's 1 MiB default): a longer request line is `431`. At the default byte budget every request with bare roots, and every `pod=` root set in a Kubernetes-legal (≤63-byte) namespace, fits; a root set whose repeated prefix (namespace, ONTAP cluster) is far longer than any real name can exceed it.
+- The `--build-timeout` deadline now also bounds projection, serialisation and encoding, so a request that finished building just inside the deadline but encoded past it is `504` instead of `200`.
+
+**Who is affected.** A deployment that runs more than 32 concurrent graph requests per replica (it starts seeing 503s under load), a client sending more than 100 distinct values of one selector parameter, and a client relying on a request line above 256 KiB.
+
+**Migration.** Raise `--max-inflight-builds` to the replica's real capacity, or set it to `0` to restore the unbounded behaviour; alert on `kube_state_graph_admission_rejected_total`. Clients retry a 503 after `Retry-After`. Split a request with more than 100 values of one selector parameter into several. Rollback is `KSG_MAX_INFLIGHT_BUILDS=0` for admission, a revert for the rest.
+
+---
+
+# BREAKING — upstream guard hardening
+
+*Change: `harden-upstream-guard`.*
+
+**What changed.** Response bodies are unchanged. Behaviour an operator or embedder can observe:
+
+- **Upstream response size bound.** Every upstream response body is bounded by `--upstream-max-response-bytes` / `KSG_UPSTREAM_MAX_RESPONSE_BYTES` (default 512 MiB). A larger answer fails its query like any upstream error: a required leg fails the build with `502`, an optional leg degrades. Embedders get the same default from `promql.New`; `promql.WithMaxResponseBytes(0)` disables it.
+- **Evaluation timeout sent upstream.** Every query issued under a deadline carries the Prometheus API `timeout` parameter (time left less 500 ms, whole seconds). A store that rejects the parameter would fail those queries; Prometheus and VictoriaMetrics accept it.
+- **Readiness probe is `count(up)`** instead of `up`, and concurrent `/readyz` calls share one probe of each backend whose outcome is reused for up to one second.
+- **Basic auth follows scheme as well as host.** A same-host `http`→`https` (or reverse) redirect no longer carries credentials.
+- **Query-cache budget charges query length.** An entry costs its series plus one unit per KiB of rendered query, so a budget holds slightly fewer long-query entries than before; `kube_state_graph_query_cache_series` still reports series.
+- **Embedders:** `backendsfile.ReloaderOptions` gains `Content`; without it the first reload tick re-parses and swaps once instead of trusting a second read of the file. `promql.DefaultClientFactory` takes optional `...promql.Option`.
+
+**Restoring the previous behaviour.** `--upstream-max-response-bytes=0` removes the size bound. The others are not configurable; rollback is a revert.
+
+---
+
 # BREAKING — root sets are capped by value count as well as bytes
 
 *Change: `cap-alternation-values`.*

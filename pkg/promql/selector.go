@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
@@ -282,14 +283,40 @@ func normaliseValues(values []string) []string {
 	return out
 }
 
-// escapeLiteral escapes a value for a double-quoted PromQL string literal.
-// Control characters are rejected by the request parser before they reach
-// here, so backslash and double quote are the whole set.
+// literalEscaper rewrites every byte a double-quoted PromQL / MetricsQL string
+// literal cannot carry verbatim: backslash and double quote, \n \r \t by name,
+// and every other C0 control byte and DEL as \xHH. All are Go-style escapes
+// both query languages accept. Built once; a Replacer is safe for concurrent
+// use.
+var literalEscaper = newLiteralEscaper()
+
+func newLiteralEscaper() *strings.Replacer {
+	pairs := []string{`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`}
+	for b := range byte(0x20) {
+		if b == '\n' || b == '\r' || b == '\t' {
+			continue
+		}
+		pairs = append(pairs, string(rune(b)), fmt.Sprintf(`\x%02x`, b))
+	}
+	return strings.NewReplacer(append(pairs, "\x7f", `\x7f`)...)
+}
+
+// needsLiteralEscape reports whether r is one of the characters literalEscaper
+// rewrites.
+func needsLiteralEscape(r rune) bool {
+	return r == '\\' || r == '"' || r < 0x20 || r == 0x7f
+}
+
+// escapeLiteral escapes a value for a double-quoted PromQL string literal. It
+// does not rely on the request parser having rejected control characters: a
+// value reaching here from any caller (an embedder, a label read back from the
+// store) can never break out of or terminate the literal. A value needing no
+// escape — the overwhelming case — is returned as-is without allocating.
 func escapeLiteral(s string) string {
-	if !strings.ContainsAny(s, "\\\"") {
+	if strings.IndexFunc(s, needsLiteralEscape) < 0 {
 		return s
 	}
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+	return literalEscaper.Replace(s)
 }
 
 // Reaches reports whether any dimension this selector actually carries is one

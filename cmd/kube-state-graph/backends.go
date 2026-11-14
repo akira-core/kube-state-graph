@@ -17,29 +17,34 @@ import (
 // only --prom-url routes through exactly the same dispatch, with one candidate
 // per query, so every rendered query string and response body is byte-identical
 // to the same deployment before backend routing existed.
-func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, lookup config.LookupEnvFunc) (*promql.Router, error) {
-	table, err := initialTable(cfg, logger, lookup)
+//
+// content is the routing file's bytes the table was parsed from (nil with no
+// routing file); startBackendReload seeds its change digest from them.
+func buildRouter(cfg config.Config, m promql.Metrics, logger *slog.Logger, lookup config.LookupEnvFunc) (r *promql.Router, content []byte, err error) {
+	table, content, err := initialTable(cfg, logger, lookup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	logUnservedFamilies(table, logger)
 	warnUnservedAppMetadata(cfg, table, logger)
 	// Values are passed explicitly — config.Defaults() already carries the
 	// library defaults — so an operator's 0 disables rather than defaulting.
-	r, err := promql.NewRouter(table, m, promql.DefaultClientFactory(m),
+	r, err = promql.NewRouter(table, m,
+		promql.DefaultClientFactory(m, promql.WithMaxResponseBytes(cfg.UpstreamMaxResponseBytes)),
 		promql.WithMaxConcurrency(cfg.UpstreamMaxConcurrency),
 		promql.WithQueryCache(cfg.QueryCacheMaxSeries, cfg.QueryCacheTTL),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	logger.Info("upstream load controls",
 		"max_concurrency_per_store", cfg.UpstreamMaxConcurrency,
+		"max_response_bytes", cfg.UpstreamMaxResponseBytes,
 		"query_cache_max_series", cfg.QueryCacheMaxSeries,
 		"query_cache_ttl", cfg.QueryCacheTTL,
 		"end_align", cfg.EndAlign,
 	)
-	return r, nil
+	return r, content, nil
 }
 
 // logUnservedFamilies reports each OPTIONAL family the live table leaves
@@ -76,54 +81,57 @@ func warnUnservedAppMetadata(cfg config.Config, table *promql.Table, logger *slo
 	)
 }
 
-func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEnvFunc) (*promql.Table, error) {
+func initialTable(cfg config.Config, logger *slog.Logger, lookup config.LookupEnvFunc) (*promql.Table, []byte, error) {
 	if cfg.BackendsFile == "" {
 		table, err := config.SingleBackendTable(cfg.PromURL, cfg.PromUsername, cfg.PromPassword)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		logger.Info("upstream routing disabled — serving from a single implicit backend",
 			"backend", config.DefaultBackendName,
-			"prom_url", cfg.PromURL,
+			"prom_url", config.RedactURL(cfg.PromURL),
 		)
-		return table, nil
+		return table, nil, nil
 	}
 
 	// An invalid file at BOOT is fatal, unlike the reload path: there is no
 	// previously-good table to fall back to, and starting on a guess would
 	// route queries somewhere the operator did not ask for.
-	table, err := config.ReadBackendsFile(cfg.BackendsFile, lookup)
+	table, content, err := config.ReadBackendsFileWithContent(cfg.BackendsFile, lookup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if cfg.PromURL != "" && cfg.PromURL != config.Defaults().PromURL {
 		logger.Warn("--prom-url is ignored because --backends-file is set",
-			"prom_url", cfg.PromURL,
+			"prom_url", config.RedactURL(cfg.PromURL),
 			"backends_file", cfg.BackendsFile,
 		)
 	}
-	// The table's rendered form names backends, endpoints, families and zones,
-	// and reports only WHETHER credentials are configured — never a value.
+	// The table's rendered form names backends, endpoints (userinfo password
+	// redacted), families and zones, and reports only WHETHER credentials are
+	// configured — never a value.
 	logger.Info("upstream routing enabled",
 		"backends_file", cfg.BackendsFile,
 		"reload_interval", cfg.BackendsReloadInterval,
 		"backends", table.String(),
 	)
-	return table, nil
+	return table, content, nil
 }
 
 // startBackendReload arms the reload loop when a routing file and a positive
 // interval are both configured. A zero interval leaves the startup table
-// serving for the process lifetime.
+// serving for the process lifetime. content is what buildRouter returned: the
+// bytes the live table was parsed from, which seed the change digest.
 //
 // The loop itself lives in pkg/promql/backendsfile, so an embedding module arms
 // the identical behaviour instead of re-deriving the digest short-circuit and
 // the keep-the-previous-table rule.
-func startBackendReload(ctx context.Context, r *promql.Router, cfg config.Config, logger *slog.Logger, m promql.RouterMetrics, lookup config.LookupEnvFunc) {
+func startBackendReload(ctx context.Context, r *promql.Router, content []byte, cfg config.Config, logger *slog.Logger, m promql.RouterMetrics, lookup config.LookupEnvFunc) {
 	backendsfile.Start(ctx, r, backendsfile.ReloaderOptions{
 		Path:    cfg.BackendsFile,
 		Lookup:  backendsfile.LookupEnvFunc(lookup),
 		Logger:  logger,
 		Metrics: m,
+		Content: content,
 	}, cfg.BackendsReloadInterval)
 }

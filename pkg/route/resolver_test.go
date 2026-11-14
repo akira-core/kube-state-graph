@@ -192,7 +192,7 @@ func TestLoadSnapshot_DedupsOverlappingPerIPLoads(t *testing.T) {
 	}
 	r := NewResolver(st, matchcheck.Runner{})
 
-	got, err := r.loadSnapshot(t.Context(), "prod-01",
+	got, err := r.newScope().loadSnapshot(t.Context(), "prod-01",
 		testRequest("prod-01", "198.51.100.7", "2001:db8::7"))
 	require.NoError(t, err)
 	assert.Len(t, got.Services, 1, "same Service version loaded via two IPs must appear once")
@@ -218,7 +218,7 @@ func TestLoadSnapshot_KeepsDistinctVersionsOfOneResource(t *testing.T) {
 		Return(store.TrafficSnapshot{Gateways: []store.GatewayRow{older, newer}}, nil).Once()
 	r := NewResolver(st, matchcheck.Runner{})
 
-	got, err := r.loadSnapshot(t.Context(), "prod-01", testRequest("prod-01", "198.51.100.7"))
+	got, err := r.newScope().loadSnapshot(t.Context(), "prod-01", testRequest("prod-01", "198.51.100.7"))
 	require.NoError(t, err)
 	assert.Len(t, got.Gateways, 2, "two version slots of one gateway are not duplicates")
 }

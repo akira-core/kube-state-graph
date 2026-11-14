@@ -110,13 +110,68 @@ func (noopQuerier) Instant(context.Context, string, string, time.Time) (model.Ve
 
 func newTestReloader(t *testing.T, path string, m *recordingMetrics, logger *slog.Logger) (*promql.Router, *Reloader) {
 	t.Helper()
-	tbl, err := Read(path, noEnv())
+	tbl, content, err := ReadWithContent(path, noEnv())
 	require.NoError(t, err)
 	r, err := promql.NewRouter(tbl, m, func(promql.Backend) (promql.Querier, error) {
 		return noopQuerier{}, nil
 	})
 	require.NoError(t, err)
-	return r, NewReloader(r, ReloaderOptions{Path: path, Lookup: noEnv(), Logger: logger, Metrics: m})
+	return r, NewReloader(r, ReloaderOptions{Path: path, Lookup: noEnv(), Logger: logger, Metrics: m, Content: content})
+}
+
+// A file rewritten after the startup parse but before the reloader is built
+// is applied on the first tick: the digest is that of the bytes the live table
+// came from, not of a second read of the file.
+func TestReloader_ChangeBeforeConstructionIsApplied(t *testing.T) {
+	path := writeTable(t, twoBackends)
+	tbl, content, err := ReadWithContent(path, noEnv())
+	require.NoError(t, err)
+	r, err := promql.NewRouter(tbl, nil, func(promql.Backend) (promql.Querier, error) {
+		return noopQuerier{}, nil
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path, []byte(threeBackends), 0o600))
+	m := &recordingMetrics{}
+	rl := NewReloader(r, ReloaderOptions{Path: path, Lookup: noEnv(), Metrics: m, Content: content})
+	rl.Once()
+	assert.Equal(t, 3, r.Table().Len(), "the change made before construction is not mistaken for the live table")
+	assert.Equal(t, 1, m.count(promql.ReloadResultOK))
+}
+
+// With no Content the digest is unseeded: the first tick re-parses and swaps
+// once, then an unchanged file is recognised as unchanged.
+func TestReloader_NoContentSwapsOnceThenSettles(t *testing.T) {
+	path := writeTable(t, twoBackends)
+	tbl, err := Read(path, noEnv())
+	require.NoError(t, err)
+	r, err := promql.NewRouter(tbl, nil, func(promql.Backend) (promql.Querier, error) {
+		return noopQuerier{}, nil
+	})
+	require.NoError(t, err)
+
+	m := &recordingMetrics{}
+	rl := NewReloader(r, ReloaderOptions{Path: path, Lookup: noEnv(), Metrics: m})
+	rl.Once()
+	rl.Once()
+	assert.Equal(t, 1, m.count(promql.ReloadResultOK))
+	assert.Equal(t, 1, m.count(promql.ReloadResultUnchanged))
+	assert.Equal(t, 2, r.Table().Len())
+}
+
+// ReadWithContent returns exactly the bytes it parsed, and nothing on error.
+func TestReadWithContent(t *testing.T) {
+	path := writeTable(t, twoBackends)
+	tbl, content, err := ReadWithContent(path, noEnv())
+	require.NoError(t, err)
+	assert.Equal(t, 2, tbl.Len())
+	assert.Equal(t, twoBackends, string(content))
+
+	require.NoError(t, os.WriteFile(path, []byte("backends: []"), 0o600))
+	tbl, content, err = ReadWithContent(path, noEnv())
+	require.Error(t, err)
+	assert.Nil(t, tbl)
+	assert.Nil(t, content)
 }
 
 func TestReloader_SwapsWhenTheFileChanges(t *testing.T) {

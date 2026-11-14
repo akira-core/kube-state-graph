@@ -228,7 +228,7 @@ The build SHALL walk from the root and read every family by reference — each r
 #### Scenario: The storage graph keeps its own reads
 
 - **WHEN** a `/v1/storage-graph` request roots at the same `node` or `pod`
-- **THEN** it issues its reads of known pods and claims one query per namespace, in the order the `storage-graph-api` capability defines, none of this capability's grouping, ordering or early controller read applies to it, and its body is unchanged
+- **THEN** it groups its reads of known pods and claims across namespaces exactly as "Known pods and claims are read across namespaces in one restriction" defines, but issues them in the order the `storage-graph-api` capability defines: none of this capability's ordering, claimless-pod loading or early controller read applies to it, and its body is unchanged
 
 ### Requirement: Known pods and claims are read across namespaces in one restriction
 
@@ -268,7 +268,13 @@ A read of known pods or claims SHALL be issued one query per chunk, carrying the
 #### Scenario: A pod root's first read follows the seed's split
 
 - **WHEN** a client roots at `pod=` values
-- **THEN** the roots' own reads follow the seed's split: no chunk's pod-name alternation holds more than 100 values, and each chunk's namespace alternation is the namespaces of its roots, taken from the request like a repeated `namespace` parameter and not bounded
+- **THEN** the roots' own reads follow the seed's split: the roots' pairs are split by `(namespace, name)`, no chunk's pod-name or namespace alternation holds more than 100 values, and the `kube_pod_info` / `kube_pod_owner` reads use the same pair chunks
+- **AND** the root set is bounded before any query: by the seed's chunk count against the `/v1/storage-graph` root cap, and by 1600 distinct `(namespace, name)` pairs; a set past either is 400 `invalid_scope` and issues no upstream query
+
+#### Scenario: Many namespaces under one pod name
+
+- **WHEN** a client sends `pod=` roots that share one pod name across more namespaces than the cap's chunk count times 100
+- **THEN** the server returns 400 with `reason: "invalid_scope"` and issues no upstream query
 
 ### Requirement: Reads follow their real dependencies
 

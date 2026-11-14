@@ -70,6 +70,14 @@ type Options struct {
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
 // pipeline as a single call. Construct one per upstream Querier.
+//
+// An Engine applies NO default build deadline and no admission bound. The
+// server's --build-timeout, --max-inflight-builds and --max-window live in
+// its HTTP layer, not here: every Build* method runs for as long as ctx allows,
+// waiting on upstream slots and queries until ctx is done. An embedder bounds
+// a build by passing a context with a deadline (context.WithTimeout), and its
+// own concurrency if it needs one. Options.APITimeout bounds only the cheap
+// up{} retention probe inside a build, not the build itself.
 type Engine struct {
 	builder  *build.Builder
 	q        promql.Querier // unguarded: Probe must observe the live upstream
@@ -129,10 +137,11 @@ func NewRouted(r *promql.Router, opts Options) *Engine {
 	return New(r, opts)
 }
 
-// Probe reports upstream reachability via a cheap up{} instant query — the same
+// Probe reports upstream reachability via a cheap count(up) instant query — the same
 // signal the build's retention check uses — suitable for a readiness check.
 func (e *Engine) Probe(ctx context.Context) error {
-	_, err := e.q.Instant(ctx, string(promql.QUpProbe), string(promql.QUpProbe), e.clk.Now().UTC())
+	_, err := e.q.Instant(ctx, string(promql.QUpProbe),
+		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), e.clk.Now().UTC())
 	return err
 }
 

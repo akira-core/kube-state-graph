@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -59,12 +60,40 @@ func NewRunner(bin string) (Runner, error) {
 		}
 		bin = p
 	}
-	// --version exits 0 and proves the binary runs on this OS/arch (a Linux
-	// ELF on the wrong host fails here, not mid-build).
-	if out, err := exec.Command(bin, "--version").CombinedOutput(); err != nil {
-		return Runner{}, fmt.Errorf("router_check_tool %q not executable: %w: %s", bin, err, bytes.TrimSpace(out))
+	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	if err := probeVersion(ctx, bin); err != nil {
+		return Runner{}, err
 	}
 	return Runner{bin: bin}, nil
+}
+
+// versionProbeTimeout bounds the startup --version probe. The tool answers in
+// milliseconds; the bound exists so a wedged binary (a hung loader, a wrapper
+// script that never returns) fails startup instead of blocking it forever.
+const versionProbeTimeout = 10 * time.Second
+
+// probeWaitDelay bounds how long CombinedOutput waits for the output pipes to
+// close once the probe's process is killed: a grandchild that inherited them
+// would otherwise keep the call blocked past ctx's deadline.
+const probeWaitDelay = time.Second
+
+// probeVersion runs `bin --version` under ctx. It exits 0 and proves the binary
+// runs on this OS/arch (a Linux ELF on the wrong host fails here, not
+// mid-build); a ctx that expires first kills the process and fails the probe.
+func probeVersion(ctx context.Context, bin string) error {
+	// #nosec G204 -- bin is the operator-configured --router-check-bin path (or
+	// the PATH lookup of router_check_tool); the only argument is a fixed flag.
+	cmd := exec.CommandContext(ctx, bin, "--version")
+	cmd.WaitDelay = probeWaitDelay
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("router_check_tool %q --version did not finish: %w: %w", bin, ctxErr, err)
+		}
+		return fmt.Errorf("router_check_tool %q not executable: %w: %s", bin, err, bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 // Query is one host+path to resolve (method is fixed to GET).
@@ -147,9 +176,9 @@ var actualMarker = []byte("actual: [")
 // line re-points the current index — cannot distinguish a test name from a stray
 // numeric line the tool prints for its own reasons, and the scraped text format
 // is not a stable contract (correctness rests on the MATCHER being Envoy's, not on
-// its output format). Today only a single query is ever posed, so a stray line
-// already fails closed; requiring a full result set makes that hold for any
-// batch size instead of by accident.
+// its output format). The route engine poses one batch per RouteConfiguration,
+// so a stray line must fail the whole batch closed rather than mis-assign a
+// cluster to some query; the engine then retries the batch one query per run.
 func parseActuals(out []byte, n int) ([]string, error) {
 	res := make([]string, n)
 	filled := make([]bool, n)

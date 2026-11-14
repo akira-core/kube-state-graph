@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -62,16 +63,58 @@ type VMSuite struct {
 
 // SkipIfDockerUnavailable short-circuits the suite when Docker isn't usable.
 // Used by `go test ./...` runs on developer machines without Docker so the
-// rest of the test tree still runs.
+// rest of the test tree still runs. Under CI the same conditions FAIL the
+// test: `go test` prints a skipped suite as `ok`, so a skip there would merge
+// every container-backed regression green (TestRouteSuite applies the same
+// rule to router_check_tool).
 func SkipIfDockerUnavailable(t *testing.T) {
 	t.Helper()
+	inCI := os.Getenv("CI") != ""
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker binary not in PATH; skipping integration suite")
+		dockerUnavailable(t, inCI, fmt.Sprintf("docker binary not in PATH: %v", err))
+		return
 	}
-	cmd := exec.Command("docker", "info")
+	// Bounded: a wedged daemon socket would otherwise hang `docker info`, and
+	// with it every suite, until the package-level test timeout dumps
+	// goroutines.
+	ctx, cancel := context.WithTimeout(t.Context(), dockerInfoTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "info")
+	cmd.WaitDelay = time.Second
 	if err := cmd.Run(); err != nil {
-		t.Skip("docker daemon unreachable; skipping integration suite")
+		dockerUnavailable(t, inCI, dockerProbeFailure(ctx.Err(), err))
 	}
+}
+
+// dockerInfoTimeout bounds the `docker info` reachability probe.
+const dockerInfoTimeout = 30 * time.Second
+
+// skipFataler is the subset of testing.TB dockerUnavailable drives, so its
+// skip-or-fail decision is unit-testable without failing the calling test.
+type skipFataler interface {
+	Helper()
+	Skipf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
+// dockerUnavailable skips the suite outside CI and fails it under CI.
+func dockerUnavailable(t skipFataler, inCI bool, reason string) {
+	t.Helper()
+	if inCI {
+		t.Fatalf("%s — CI must run the container-backed integration suites", reason)
+		return
+	}
+	t.Skipf("%s; skipping integration suite", reason)
+}
+
+// dockerProbeFailure describes a failed `docker info`, naming a probe that ran
+// out of time separately from a daemon that answered with an error: the first
+// is a wedged daemon or socket, the second one that is not running.
+func dockerProbeFailure(ctxErr, runErr error) string {
+	if ctxErr != nil {
+		return fmt.Sprintf("docker info did not answer within %s (%v)", dockerInfoTimeout, ctxErr)
+	}
+	return fmt.Sprintf("docker daemon unreachable: %v", runErr)
 }
 
 // SetupSuite starts the VictoriaMetrics container and waits for readiness.

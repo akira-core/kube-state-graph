@@ -22,6 +22,9 @@ linters:
     # Error handling
     - errorlint
     - nilerr
+    # Cancellation: every network call and exec must carry a context, so a
+    # hung upstream or a wedged child process cannot outlive its caller.
+    - noctx
     # Performance
     - bodyclose
     - unconvert

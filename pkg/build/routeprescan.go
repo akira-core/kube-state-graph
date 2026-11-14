@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -398,10 +400,12 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 	return keys
 }
 
-// Bounds on the per-build route-resolution work. Each key costs one
+// Bounds on the per-build route-resolution work. A key can cost one
 // cross-cluster probe, a handful of ClickHouse round-trips per destination IP,
 // one in-process istiod translation and one router_check_tool fork/exec
-// (~50-60ms) — all on the request path, with no result cache to amortise it.
+// (~50-60ms), all on the request path. A resolver may amortise that — the
+// engine in pkg/route shares work per build, caches answers across builds and
+// bounds its own work process-wide — but these bounds hold for any resolver.
 //
 // routeResolveConcurrency is a fixed constant rather than a flag: the useful
 // value is bounded by the matcher's process cost, not by anything an operator
@@ -456,6 +460,12 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	if s, ok := resolver.(BuildScopedRouteResolver); ok {
 		resolver = s.BuildScoped()
 	}
+	// Upgrade again when the (scoped) resolver takes the whole key set at once
+	// (BatchRouteResolver): the engine then matches every key that shares a
+	// RouteConfiguration in one router_check_tool run.
+	if b, ok := resolver.(BatchRouteResolver); ok {
+		return resolveRouteBatch(ctx, b, perCallTimeout, keys, at)
+	}
 	idx := make(routeIndex, len(keys))
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
@@ -471,7 +481,7 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 			if perCallTimeout > 0 {
 				callCtx, cancel = context.WithTimeoutCause(ctx, perCallTimeout, errRouteCallTimeout)
 			}
-			dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
+			dest, outcome, err := resolveRouteRecovering(callCtx, resolver, k.request(at))
 			// Read before cancel(), which would otherwise stamp context.Canceled.
 			cause := context.Cause(callCtx)
 			cancel()
@@ -498,6 +508,74 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	}
 	_ = g.Wait() // no goroutine returns an error; resolution never fails a build
 	return idx
+}
+
+// resolveRouteBatch is resolveRouteQueries' batch branch: the whole (capped,
+// sorted) key set goes to the resolver in one call, carrying the prescan's own
+// concurrency and per-call timeout, and the answers are recorded under exactly
+// the per-key rules — an unanswered key and an error after the build deadline
+// record nothing, any other error records a failed entry.
+func resolveRouteBatch(ctx context.Context, resolver BatchRouteResolver, perCallTimeout time.Duration, keys []routeKey, at time.Time) routeIndex {
+	reqs := make([]RouteRequest, len(keys))
+	for i, k := range keys {
+		reqs[i] = k.request(at)
+	}
+	answers := resolveRoutesRecovering(ctx, resolver, reqs,
+		RouteBatchLimits{Concurrency: routeResolveConcurrency, PerCallTimeout: perCallTimeout})
+
+	idx := make(routeIndex, len(keys))
+	for i, k := range keys {
+		if i >= len(answers) || !answers[i].Answered {
+			continue // never reached: keeps the pre-change external reason
+		}
+		a := answers[i]
+		if a.Err != nil {
+			slog.Debug("route-engine resolution errored (endpoint degrades to external)",
+				"caller_cluster", k.callerCluster, "host", k.host, "port", k.port, "ips", k.ips,
+				"error", a.Err)
+			if ctx.Err() == nil {
+				idx[k] = routeEntry{failed: true}
+			}
+			continue
+		}
+		idx[k] = routeEntry{dest: a.Dest, outcome: a.Outcome}
+	}
+	return idx
+}
+
+// resolveRoutesRecovering is resolver.ResolveRoutes with a panic on the
+// calling goroutine turned into "no key answered" — every endpoint keeps its
+// pre-change external reason, and the build goes on.
+func resolveRoutesRecovering(ctx context.Context, resolver BatchRouteResolver, reqs []RouteRequest, limits RouteBatchLimits) (answers []RouteAnswer) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.ErrorContext(ctx, "panic in batched route resolution (every endpoint degrades to external)",
+				"keys", len(reqs), "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			answers = nil
+		}
+	}()
+	return resolver.ResolveRoutes(ctx, reqs, limits)
+}
+
+// errRoutePanic marks a key whose resolution panicked: recorded like any other
+// engine error (route_engine_error), never propagated.
+var errRoutePanic = errors.New("route resolution panicked")
+
+// resolveRouteRecovering is resolver.ResolveRoute with a panic turned into that
+// key's engine error. Route resolution can never fail a build, and a goroutine
+// panic that escapes the errgroup would end the process: errgroup does not
+// propagate a goroutine panic to Wait, and the engine links istiod, whose
+// translation is far from panic-free on unexpected config.
+func resolveRouteRecovering(ctx context.Context, resolver RouteResolver, req RouteRequest) (dest RouteDestination, outcome RouteOutcome, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.ErrorContext(ctx, "panic in route resolution (endpoint degrades to external)",
+				"caller_cluster", req.CallerCluster, "host", req.Host, "port", req.Port,
+				"panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			dest, outcome, err = RouteDestination{}, "", fmt.Errorf("%w: %v", errRoutePanic, rec)
+		}
+	}()
+	return resolver.ResolveRoute(ctx, req)
 }
 
 // routeIndexResolve is the parse-side consult: given the entry for one

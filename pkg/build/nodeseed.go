@@ -84,7 +84,7 @@ func readNodeSeed(
 	}
 	// The node read returned each pod's namespace, so incarnation completion
 	// re-reads exactly those (namespace, pod) pairs, without the node matcher.
-	incarnation, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPodInfo, onNodeRefs)
+	incarnation, err := queryPodsByPair(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPodInfo, onNodeRefs)
 	if err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func readNodeSeed(
 	for k := range onRoot {
 		rootKeys = append(rootKeys, k)
 	}
-	byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(rootKeys))
+	byPod, err := queryPodsByPair(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(rootKeys))
 	if err != nil {
 		return err
 	}
@@ -113,9 +113,9 @@ func readNodeSeed(
 }
 
 // readMountersOf is mounter completion: every pod mounting a claim the seed's
-// bindings name. The binding family is re-read by claim — per namespace, on
-// (namespace, persistentvolumeclaim), so a common claim name is never read
-// across the estate — and kept only when the row's claim is one the seed
+// bindings name. The binding family is re-read by claim — on the tracked
+// (namespace, persistentvolumeclaim) pairs, grouped across namespaces, so a
+// common claim name is never read across the estate — and kept only when the row's claim is one the seed
 // tracked. No tracked claim issues nothing and keeps the seed's own rows.
 func readMountersOf(
 	ctx context.Context,
@@ -133,7 +133,7 @@ func readMountersOf(
 		v.PVC = tracked
 		return nil
 	}
-	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, claims)
+	return issueClaimFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, claims)
 }
 
 // podsNewestOn returns the pods whose newest incarnation runs on a root node.

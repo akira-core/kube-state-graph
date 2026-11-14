@@ -22,7 +22,7 @@ func scrapeMetrics(t *testing.T, m *observability.Metrics) string {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/metrics") //nolint:noctx // test server URL
+	resp, err := httpGet(t, srv.URL+"/metrics")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

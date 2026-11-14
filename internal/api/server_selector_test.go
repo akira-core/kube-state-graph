@@ -91,7 +91,7 @@ func TestGraph_SelectorQueriesCaptured(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400" +
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400"+
 		"&cluster=cluster-alpha&namespace=shop&az=zone-a&env=prod")
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -129,7 +129,7 @@ func TestGraph_UnfilteredQueriesCarryNoRequestMatchers(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -150,7 +150,7 @@ func TestGraph_ConfiguredLabelKeyUsedInMatcher(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&az=zone-a")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&az=zone-a")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -164,7 +164,7 @@ func TestGraph_FilteredEmptyResultReturns200(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&env=staging")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&env=staging")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -191,7 +191,7 @@ func TestGraph_InvalidSelectorValuesRejected(t *testing.T) {
 		"&env=prod%0A",
 		"&prune=maybe",
 	} {
-		resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400" + qs)
+		resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400"+qs)
 		require.NoError(t, err)
 		func() {
 			defer resp.Body.Close()
@@ -209,7 +209,7 @@ func TestGraph_WithdrawnParametersReturn200(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&name=web-1&root=test/uid-web-1&depth=9")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&name=web-1&root=test/uid-web-1&depth=9")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)

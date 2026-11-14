@@ -20,14 +20,16 @@ func TestDefaults_LimitCacheAlignMatchLibrary(t *testing.T) {
 	assert.Equal(t, promql.DefaultQueryCacheMaxSeries, cfg.QueryCacheMaxSeries)
 	assert.Equal(t, promql.DefaultQueryCacheTTL, cfg.QueryCacheTTL)
 	assert.Equal(t, kubegraph.DefaultEndAlign, cfg.EndAlign)
+	assert.Equal(t, promql.DefaultMaxResponseBytes, cfg.UpstreamMaxResponseBytes)
 }
 
 func TestParse_LimitCacheAlignFlagsOverrideEnv(t *testing.T) {
 	env := map[string]string{
-		"KSG_UPSTREAM_MAX_CONCURRENCY": "8",
-		"KSG_QUERY_CACHE_MAX_SERIES":   "500",
-		"KSG_QUERY_CACHE_TTL":          "10s",
-		"KSG_END_ALIGN":                "15s",
+		"KSG_UPSTREAM_MAX_CONCURRENCY":    "8",
+		"KSG_QUERY_CACHE_MAX_SERIES":      "500",
+		"KSG_QUERY_CACHE_TTL":             "10s",
+		"KSG_END_ALIGN":                   "15s",
+		"KSG_UPSTREAM_MAX_RESPONSE_BYTES": "1048576",
 	}
 	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
 
@@ -37,14 +39,17 @@ func TestParse_LimitCacheAlignFlagsOverrideEnv(t *testing.T) {
 	assert.Equal(t, 500, cfg.QueryCacheMaxSeries)
 	assert.Equal(t, 10*time.Second, cfg.QueryCacheTTL)
 	assert.Equal(t, 15*time.Second, cfg.EndAlign)
+	assert.EqualValues(t, 1<<20, cfg.UpstreamMaxResponseBytes)
 
 	cfg, err = Parse([]string{
 		"--upstream-max-concurrency=0", "--query-cache-max-series=0", "--end-align=0",
+		"--upstream-max-response-bytes=0",
 	}, lookup)
 	require.NoError(t, err)
 	assert.Zero(t, cfg.UpstreamMaxConcurrency)
 	assert.Zero(t, cfg.QueryCacheMaxSeries)
 	assert.Zero(t, cfg.EndAlign)
+	assert.Zero(t, cfg.UpstreamMaxResponseBytes, "0 disables the response bound")
 }
 
 func TestValidate_LimitCacheAlignRejections(t *testing.T) {
@@ -54,6 +59,7 @@ func TestValidate_LimitCacheAlignRejections(t *testing.T) {
 		"zero ttl with cache on":  func(c *Config) { c.QueryCacheTTL = 0 },
 		"negative ttl with cache": func(c *Config) { c.QueryCacheTTL = -time.Second },
 		"negative end alignment":  func(c *Config) { c.EndAlign = -time.Second },
+		"negative response bound": func(c *Config) { c.UpstreamMaxResponseBytes = -1 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -71,10 +77,11 @@ func TestValidate_LimitCacheAlignRejections(t *testing.T) {
 
 func TestParse_RejectsInvalidLimitEnv(t *testing.T) {
 	for env, val := range map[string]string{
-		"KSG_UPSTREAM_MAX_CONCURRENCY": "lots",
-		"KSG_QUERY_CACHE_MAX_SERIES":   "1e5",
-		"KSG_QUERY_CACHE_TTL":          "60",
-		"KSG_END_ALIGN":                "30",
+		"KSG_UPSTREAM_MAX_CONCURRENCY":    "lots",
+		"KSG_QUERY_CACHE_MAX_SERIES":      "1e5",
+		"KSG_QUERY_CACHE_TTL":             "60",
+		"KSG_END_ALIGN":                   "30",
+		"KSG_UPSTREAM_MAX_RESPONSE_BYTES": "512MiB",
 	} {
 		t.Run(env, func(t *testing.T) {
 			_, err := Parse(nil, func(k string) (string, bool) {

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 
 	"github.com/prometheus/common/model"
@@ -179,6 +180,14 @@ func nodeKeyOf(m model.Metric) (nodeKey, bool) {
 	}
 	return nodeKey{oc, node}, true
 }
+
+// finite reports whether a sample value is neither NaN nor ±Inf. Every Harvest
+// and kubelet value reader skips a non-finite sample as if the series were
+// absent, exactly as the RED and alert readers already do: json.Marshal cannot
+// encode one (a valid build would answer 500), and a NaN read first would
+// otherwise stick in a smallest-value pick, since every comparison with it is
+// false. Skipping, not rewriting, leaves the shared cached sample untouched.
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // aggrKeyOf is nodeKeyOf for the aggregate-scoped families.
 func aggrKeyOf(m model.Metric) (aggrKey, bool) {
@@ -677,7 +686,7 @@ func indexQoSFamily(dst map[string][]qosCandidate, vec model.Vector, fam ioFamil
 	for _, s := range vec {
 		vol := string(s.Metric[promql.HarvestVolumeLabel])
 		oc := string(s.Metric["cluster"])
-		if vol == "" || oc == "" {
+		if vol == "" || oc == "" || !finite(float64(s.Value)) {
 			continue
 		}
 		z, _ := zoneOf(s.Metric, keys)
@@ -838,11 +847,11 @@ func indexPolicyCeilings(maxIOPS, maxMBps model.Vector) map[policyKey]*graph.IOM
 			if policy == "" {
 				policy = string(s.Metric["policy_group"])
 			}
-			if oc == "" || svm == "" || policy == "" {
+			v := float64(s.Value)
+			if oc == "" || svm == "" || policy == "" || !finite(v) {
 				continue
 			}
 			k := policyKey{oc, svm, policy}
-			v := float64(s.Value)
 			if !seen[k] || v < out[k] {
 				out[k] = v
 				seen[k] = true
@@ -1276,7 +1285,7 @@ func perfByNode(v topologyVectors) map[nodeKey]*graph.NodePerf {
 	for _, leg := range legs {
 		for _, s := range leg.vec {
 			k, ok := nodeKeyOf(s.Metric)
-			if !ok {
+			if !ok || !finite(float64(s.Value)) {
 				continue
 			}
 			p := acc[k]
@@ -1327,10 +1336,10 @@ func usageByAggr(used, total model.Vector) map[aggrKey]*graph.UsageBytes {
 		seen := map[aggrKey]bool{}
 		for _, s := range vec {
 			k, ok := aggrKeyOf(s.Metric)
-			if !ok {
+			v := float64(s.Value)
+			if !ok || !finite(v) {
 				continue
 			}
-			v := float64(s.Value)
 			if !seen[k] || v < out[k] {
 				out[k] = v
 				seen[k] = true
@@ -1367,14 +1376,14 @@ func resolvePVCUsage(used, capacity model.Vector, mc *clusterResolver) map[pvcKe
 	usedBy := map[pvcKey]float64{}
 	usedSeen := map[pvcKey]bool{}
 	for _, s := range used {
-		cluster := mc.bucket(promql.QKubeletVolumeUsedBytes, s.Metric)
-		ns := string(s.Metric["namespace"])
+		v := float64(s.Value)
 		claim := string(s.Metric["persistentvolumeclaim"])
-		if claim == "" {
+		if claim == "" || !finite(v) {
 			continue
 		}
+		cluster := mc.bucket(promql.QKubeletVolumeUsedBytes, s.Metric)
+		ns := string(s.Metric["namespace"])
 		k := pvcKey{cluster, ns, claim}
-		v := float64(s.Value)
 		if !usedSeen[k] || v < usedBy[k] {
 			usedBy[k] = v
 			usedSeen[k] = true
@@ -1383,14 +1392,14 @@ func resolvePVCUsage(used, capacity model.Vector, mc *clusterResolver) map[pvcKe
 	capBy := map[pvcKey]float64{}
 	capSeen := map[pvcKey]bool{}
 	for _, s := range capacity {
-		cluster := mc.bucket(promql.QKubeletVolumeCapacityBytes, s.Metric)
-		ns := string(s.Metric["namespace"])
+		v := float64(s.Value)
 		claim := string(s.Metric["persistentvolumeclaim"])
-		if claim == "" {
+		if claim == "" || !finite(v) {
 			continue
 		}
+		cluster := mc.bucket(promql.QKubeletVolumeCapacityBytes, s.Metric)
+		ns := string(s.Metric["namespace"])
 		k := pvcKey{cluster, ns, claim}
-		v := float64(s.Value)
 		if !capSeen[k] || v < capBy[k] {
 			capBy[k] = v
 			capSeen[k] = true

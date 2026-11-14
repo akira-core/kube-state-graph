@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,9 @@ type Server struct {
 	logger  *slog.Logger
 	keys    auth.Validator
 	clk     clock.Clock
+	// slots is the --max-inflight-builds semaphore shared by every handler the
+	// server builds; nil when the bound is disabled.
+	slots chan struct{}
 }
 
 // New wires up a Server. keys may be nil to run with API-key authentication
@@ -43,6 +47,10 @@ func New(cfg config.Config, builder *build.Builder, prom promql.Querier, m *obse
 	if keys == nil {
 		keys = auth.NewKeySet()
 	}
+	var slots chan struct{}
+	if cfg.MaxInflightBuilds > 0 {
+		slots = make(chan struct{}, cfg.MaxInflightBuilds)
+	}
 	return &Server{
 		cfg:     cfg,
 		builder: builder,
@@ -51,6 +59,7 @@ func New(cfg config.Config, builder *build.Builder, prom promql.Querier, m *obse
 		logger:  logger,
 		keys:    keys,
 		clk:     clk,
+		slots:   slots,
 	}
 }
 
@@ -71,6 +80,8 @@ func (s *Server) Handler() http.Handler {
 		otelgin.Middleware(telemetry.ServiceName),
 		s.apiKeyMiddleware(),
 		s.spanEnrichMiddleware(),
+		// Last: only an authenticated request can take (or be refused) a slot.
+		s.admissionMiddleware(),
 	)
 	v1.GET("/graph", s.handleGraph)
 	v1.GET("/storage-graph", s.handleStorageGraph)
@@ -99,16 +110,41 @@ func (s *Server) handleNotFound(c *gin.Context) {
 }
 
 // requestIDMiddleware injects a unique X-Request-ID into context and response.
+// An inbound id is kept only when validRequestID accepts it; anything else is
+// replaced by a generated one, so the value echoed in the response header and
+// written to every log line is bounded and log-safe.
 func (s *Server) requestIDMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
-		if id == "" {
+		if !validRequestID(id) {
 			id = uuid.NewString()
 		}
 		c.Set("request_id", id)
 		c.Header("X-Request-ID", id)
 		c.Next()
 	}
+}
+
+// maxRequestIDLen bounds an accepted inbound X-Request-ID.
+const maxRequestIDLen = 128
+
+// validRequestID accepts 1 to maxRequestIDLen bytes of [A-Za-z0-9._:=+/@-]:
+// enough for UUIDs, ULIDs, W3C trace ids and most load-balancer formats, and
+// nothing that could split a log line, smuggle markup or carry a payload.
+// Replacing a rejected id rather than truncating it keeps one id per request.
+func validRequestID(id string) bool {
+	if id == "" || len(id) > maxRequestIDLen {
+		return false
+	}
+	for i := range len(id) {
+		switch b := id[i]; {
+		case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		case strings.IndexByte("._:=+/@-", b) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // quietLogPaths are silent on success: kubelet probes and Prometheus scrape
@@ -149,17 +185,48 @@ func (s *Server) loggingMiddleware() gin.HandlerFunc {
 			if _, quiet := quietLogPaths[path]; quiet && status < 400 {
 				return
 			}
-			s.logger.InfoContext(c.Request.Context(), "http",
+			clusters, truncated := logClusters(c.Request.URL.Query()["cluster"])
+			attrs := []any{
 				"method", c.Request.Method,
 				"path", path,
 				"status", status,
 				"duration_ms", duration.Milliseconds(),
 				"request_id", c.GetString("request_id"),
-				"clusters", c.Request.URL.Query()["cluster"],
-			)
+				"clusters", clusters,
+			}
+			if truncated {
+				attrs = append(attrs, "clusters_truncated", true)
+			}
+			s.logger.InfoContext(c.Request.Context(), "http", attrs...)
 		}()
 		c.Next()
 	}
+}
+
+// Access-log bounds on the `clusters` field. The values are read before the
+// request is parsed — a rejected request is logged too — so they carry no
+// validation and could otherwise copy an arbitrarily large query string into
+// every log line.
+const (
+	maxLogClusters     = 10
+	maxLogClusterBytes = 64
+)
+
+// logClusters returns at most the first maxLogClusters values, each cut to
+// maxLogClusterBytes at a UTF-8 boundary, in a new slice, and whether anything
+// was cut.
+func logClusters(values []string) ([]string, bool) {
+	truncated := len(values) > maxLogClusters
+	values = values[:min(len(values), maxLogClusters)]
+	out := make([]string, len(values))
+	for i, v := range values {
+		if len(v) > maxLogClusterBytes {
+			v = strings.ToValidUTF8(v[:maxLogClusterBytes], "")
+			truncated = true
+		}
+		out[i] = v
+	}
+	return out, truncated
 }
 
 func statusClass(s int) string {

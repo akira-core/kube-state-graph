@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,25 +36,31 @@ import (
 // FINAL does that server-side but pays the part-merge machinery on every
 // query (~10x lookup latency on the POC bench corpus) and silently depends on
 // the server not moving the WHERE into PREWHERE ahead of the merge. Every
-// reader here follows the POC's no-FINAL pattern instead:
+// reader here follows a no-FINAL pattern instead (versionRead):
 //
-//  1. SQL WHERE carries only IMMUTABLE predicates (cluster, join keys,
-//     valid_from). valid_to must NEVER be filtered in SQL: the closing
-//     rewrite (small valid_to) would be dropped pre-dedup while its stale
-//     twin (sentinel valid_to) passes — the stale row would then win dedup
-//     unopposed and a dead version would appear live. Same trap as putting
-//     valid_to in WHERE instead of HAVING with an argMax rewrite.
-//  2. The client dedups rows per version slot (cluster, namespace, name,
-//     valid_from), keeping the highest ingest_seq (dedupLatest) — the exact
-//     collapse ReplacingMergeTree performs at merge time.
-//  3. The liveness predicate on valid_to (`at < valid_to`) is applied AFTER
-//     dedup, in Go (dedupLiveAtCounted).
+//  1. The scanning query's WHERE carries only IMMUTABLE predicates (cluster,
+//     join keys, valid_from). valid_to must NEVER be filtered there: the
+//     closing rewrite (small valid_to) would be dropped pre-dedup while its
+//     stale twin (sentinel valid_to) passes — the stale row would then win
+//     dedup unopposed and a dead version would appear live. Same trap as
+//     putting valid_to in WHERE instead of HAVING with an argMax rewrite.
+//  2. The same query keeps, per version slot (cluster, namespace, name,
+//     valid_from), only the row with the highest ingest_seq —
+//     `ORDER BY ingest_seq DESC LIMIT 1 BY <slot>`, the exact collapse
+//     ReplacingMergeTree performs at merge time.
+//  3. An OUTER query applies the liveness predicate (`at < valid_to`) to the
+//     deduplicated rows. ClickHouse does not push a predicate into a subquery
+//     carrying LIMIT BY (that would change its result), so the order
+//     dedup-then-liveness holds and neither ended versions nor stale twins
+//     cross the wire.
 //
-// Trade-off: step 1 fetches every version of the scoped keys with
-// valid_from <= at, including versions that ended before that instant —
-// bounded by per-key version counts (and table TTL), still scoped by the same
-// join predicates. In exchange, scans run at plain-MergeTree speed with skip
-// indexes fully effective.
+// The client repeats steps 2 and 3 (dedupLatest / dedupLiveAtCounted) as a
+// zero-cost safety net; in this mode it normally collapses nothing.
+//
+// Trade-off: the scan still reads every version of the scoped keys with
+// valid_from <= at (bounded by per-key version counts and the table TTL) and
+// sorts the scoped rows by ingest_seq; in exchange it runs at plain-MergeTree
+// speed with skip indexes fully effective, and only live rows are returned.
 //
 // # Pruned mode (WithUniqueRows — update-close writers only)
 //
@@ -78,6 +86,9 @@ type CH struct {
 	uniqueRows bool
 	collapsed  atomic.Uint64
 	warnOnce   sync.Once
+
+	// tls records whether the connection was configured with TLS.
+	tls bool
 }
 
 var _ Store = (*CH)(nil)
@@ -130,11 +141,18 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	chOpts, err := clickhouse.ParseDSN(dsn)
+	chOpts, err := parseDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse route-store dsn: %w", err)
+		return nil, err
 	}
 	applyAuth(chOpts, cfg)
+	if plaintextCredentials(chOpts) {
+		// Values never logged — only the fact, so an operator can see the
+		// exposure the DSN's missing `secure=true` creates.
+		slog.Warn("route store credentials are sent without TLS: the ClickHouse connection is unencrypted; "+
+			"set secure=true on --route-store-dsn / KSG_ROUTE_STORE_DSN to encrypt it",
+			"route_store_tls", false)
+	}
 	conn, err := clickhouse.Open(chOpts)
 	if err != nil {
 		return nil, err
@@ -143,7 +161,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping route store: %w", err)
 	}
-	s := &CH{conn: conn, uniqueRows: cfg.uniqueRows}
+	s := &CH{conn: conn, uniqueRows: cfg.uniqueRows, tls: chOpts.TLS != nil}
 	if err := s.validateSchema(ctx, chOpts.Auth.Database); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -152,6 +170,37 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 }
 
 func (s *CH) Close() error { return s.conn.Close() }
+
+// TLS reports whether the store's connection is configured with TLS (the
+// DSN's secure=true). Logged at startup as route_store_tls.
+func (s *CH) TLS() bool { return s.tls }
+
+// errMalformedDSN is reported for a route-store DSN that does not parse as a
+// URL. It deliberately quotes nothing: the URL parser's own error embeds the
+// whole input, and even its inner error can quote a fragment of the userinfo
+// (a password containing '/' ends the authority early and surfaces as an
+// invalid port; a bad '%' escape is quoted verbatim).
+var errMalformedDSN = errors.New("parse route-store dsn: not a valid URL (the value is not shown because it may carry credentials)")
+
+// parseDSN is clickhouse.ParseDSN with its URL-syntax errors redacted. The
+// remaining ParseDSN errors name a query parameter and its value (dial_timeout,
+// secure, …), never the userinfo, and pass through.
+func parseDSN(dsn string) (*clickhouse.Options, error) {
+	chOpts, err := clickhouse.ParseDSN(dsn)
+	if err == nil {
+		return chOpts, nil
+	}
+	if urlErr := (*url.Error)(nil); errors.As(err, &urlErr) {
+		return nil, errMalformedDSN
+	}
+	return nil, fmt.Errorf("parse route-store dsn: %w", err)
+}
+
+// plaintextCredentials reports whether a password will be sent over a
+// connection without TLS. A username alone is an identity, not a secret.
+func plaintextCredentials(o *clickhouse.Options) bool {
+	return o.Auth.Password != "" && o.TLS == nil
+}
 
 // CollapsedRows reports how many rows the client-side dedup has discarded
 // over this store's lifetime. Under uniqueRows it is the writer-uniqueness
@@ -200,6 +249,40 @@ func (s *CH) prune(at time.Time) string {
 		return ""
 	}
 	return " AND " + dt64Lit(at) + " < valid_to"
+}
+
+// versionSlot is the version-slot identity the server-side dedup groups by —
+// the same identity versionRow.slot uses client-side.
+const versionSlot = "cluster, namespace, name, valid_from"
+
+// versionRead renders one as-of read of a version table: cols (which MUST
+// include the slot columns, valid_to and ingest_seq) from table, scoped by the
+// immutable predicate where (carrying its own `?` placeholders), as of at.
+//
+// Default mode: the inner query scans and keeps the newest row per version
+// slot; the outer query keeps the versions live at `at` — see the CH doc.
+// Pruned (uniqueRows) mode keeps its single-query shape, valid_to in the scan:
+// the writer promised one row per slot, and running the dedup server-side
+// would also hide the duplicates the client-side collapse alarm exists to see.
+func (s *CH) versionRead(cols, table, where string, at time.Time) string {
+	if s.uniqueRows {
+		return fmt.Sprintf("SELECT %s FROM %s WHERE %s AND valid_from <= %s%s",
+			cols, table, where, dt64Lit(at), s.prune(at))
+	}
+	return fmt.Sprintf("SELECT %s FROM (SELECT %s FROM %s WHERE %s AND valid_from <= %s "+
+		"ORDER BY ingest_seq DESC LIMIT 1 BY %s) WHERE %s < valid_to",
+		cols, cols, table, where, dt64Lit(at), versionSlot, dt64Lit(at))
+}
+
+// errUnparseableSpec marks a row whose stored spec_json does not parse. Such a
+// row is skipped with a warning (warnSkippedRow) instead of failing the load of
+// the destination IP it was read for: one malformed row written by the
+// exporter must not blind route resolution for every host behind that IP.
+var errUnparseableSpec = errors.New("unparseable spec_json")
+
+func warnSkippedRow(kind, cluster, ns, name string, err error) {
+	slog.Warn("route store: skipping a row whose spec does not parse",
+		"kind", kind, "cluster", cluster, "namespace", ns, "name", name, "error", err)
 }
 
 // versionRow is the dedup/liveness envelope every no-FINAL read scans
@@ -351,12 +434,22 @@ func svcVer(r ServiceRow) versionRow {
 	return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 }
 
+// Column lists of the version reads. Each carries the version-slot identity,
+// valid_to and ingest_seq that versionRead and the client-side dedup need.
+const (
+	serviceCols = "cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq"
+	deployCols  = "cluster, namespace, name, valid_from, valid_to, pod_labels_kv, ingest_seq"
+	gatewayCols = "cluster, namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq"
+	vsCols      = "cluster, namespace, name, valid_from, valid_to, bound_gateways, spec_json, ingest_seq"
+	envelopeCol = "cluster, namespace, name, valid_from, valid_to, ingest_seq"
+)
+
 // LoadTrafficAt fetches every resource version live at `at` reachable from
-// destination IP in cluster. SQL keeps only the immutable predicates (join
-// keys + valid_from <= at, plus the uniqueRows prune); rows are then deduped
-// per version slot (max ingest_seq) and the liveness predicate on the
-// materialized valid_to (at < valid_to) is applied client-side AFTER dedup —
-// the no-FINAL pattern in the CH doc comment.
+// destination IP in cluster. Every read goes through versionRead: the scan
+// keeps only the immutable predicates (join keys + valid_from <= at), the
+// server keeps the newest row per version slot and only then filters liveness
+// (at < valid_to); the client repeats both as a safety net — the no-FINAL
+// pattern in the CH doc comment.
 //
 // Each hop loads a correct SUPERSET of what the resolution actually needs
 // (e.g. gateways whose selector ⊆ the union of the ingress deployment's pod
@@ -364,29 +457,23 @@ func svcVer(r ServiceRow) versionRow {
 // predicates, so extra rows are harmless. The hops stay narrowly scoped
 // (deploys are still selector-filtered) so the superset does not blow up on a
 // shared ingress namespace.
+//
+// A Service or VirtualService row whose spec_json does not parse is skipped
+// with a warning rather than failing the whole load.
 func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time) (TrafficSnapshot, error) {
 	var w TrafficSnapshot
 
 	// 1. Ingress Service versions serving this IP (either external_ips or
 	// loadbalancer_ips — either array counts).
-	svcRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
-		 FROM service_versions
-		 WHERE cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+	svcRows, err := s.conn.Query(ctx,
+		s.versionRead(serviceCols, "service_versions",
+			"cluster = ? AND (has(external_ips, ?) OR has(loadbalancer_ips, ?))", at),
 		cluster, ip, ip)
 	if err != nil {
 		return w, fmt.Errorf("load ingress services: %w", err)
 	}
-	var ingSvcs []ServiceRow
-	for svcRows.Next() {
-		r, err := scanServiceRow(svcRows)
-		if err != nil {
-			_ = svcRows.Close()
-			return w, err
-		}
-		ingSvcs = append(ingSvcs, r)
-	}
-	if err := closeRows(svcRows); err != nil {
+	ingSvcs, err := scanServiceRows(svcRows)
+	if err != nil {
 		return w, fmt.Errorf("load ingress services: %w", err)
 	}
 	// Dedup BEFORE deriving selectors — a stale rewrite twin must not
@@ -420,10 +507,9 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 	// match several selectors).
 	var deps []DeployRow
 	for _, sel := range selectors {
-		depRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT cluster, namespace, name, valid_from, valid_to, pod_labels_kv, ingest_seq
-			 FROM deploy_versions
-			 WHERE cluster = ? AND has(?, namespace) AND hasAll(pod_labels_kv, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+		depRows, err := s.conn.Query(ctx,
+			s.versionRead(deployCols, "deploy_versions",
+				"cluster = ? AND has(?, namespace) AND hasAll(pod_labels_kv, ?)", at),
 			cluster, nsList, sel)
 		if err != nil {
 			return w, fmt.Errorf("load deploys: %w", err)
@@ -461,17 +547,16 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 	// selector attachment is deliberately out of scope. nsList unions all
 	// matching ingress Services' namespaces, so this is still a superset;
 	// pkg/route/snapshot re-applies the exact per-service-namespace predicate.
-	var gwRefs []string
+	var binds gatewayBindings
 	if len(labelUnion) > 0 {
-		gwRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT cluster, namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
-			 FROM gw_versions
-			 WHERE cluster = ? AND has(?, namespace) AND hasAll(?, selector_kv) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+		gwRows, err := s.conn.Query(ctx,
+			s.versionRead(gatewayCols, "gw_versions",
+				"cluster = ? AND has(?, namespace) AND hasAll(?, selector_kv)", at),
 			cluster, nsList, labelUnion)
 		if err != nil {
 			return w, fmt.Errorf("load gateways: %w", err)
 		}
-		gwRefs, err = s.appendGateways(&w, gwRows, at)
+		binds, err = s.appendGateways(&w, gwRows, at)
 		if err != nil {
 			return w, err
 		}
@@ -479,7 +564,7 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 
 	// 4 + 5. VirtualServices bound to the candidate gateways, then the backend
 	// Services those VS route to.
-	if err := s.loadVSAndBackends(ctx, &w, cluster, gwRefs, at); err != nil {
+	if err := s.loadVSAndBackends(ctx, &w, cluster, binds, at); err != nil {
 		return w, err
 	}
 	return w, nil
@@ -490,16 +575,14 @@ func (s *CH) LoadTrafficAt(ctx context.Context, cluster, ip string, at time.Time
 // at `at`. It deliberately carries no cluster predicate — that is its whole
 // job — bounded by the small number of ingress-LB Service versions
 // (has(external_ips, ...) OR has(loadbalancer_ips, ...) only matches ingress
-// rows) and valid_from <= at. The same no-FINAL pattern as the snapshot loads
-// applies: only the dedup envelope is selected, valid_to is never filtered in
-// SQL (except under the uniqueRows prune), the client dedups per version slot
-// and applies the liveness check after. The result is deduplicated and sorted
-// for determinism.
+// rows) and valid_from <= at. The same versionRead pattern as the snapshot
+// loads applies, selecting only the dedup envelope; the client repeats the
+// dedup and liveness check. The result is deduplicated and sorted for
+// determinism.
 func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, at time.Time) ([]string, error) {
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT cluster, namespace, name, valid_from, valid_to, ingest_seq
-		 FROM service_versions
-		 WHERE (has(external_ips, ?) OR has(loadbalancer_ips, ?)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+	rows, err := s.conn.Query(ctx,
+		s.versionRead(envelopeCol, "service_versions",
+			"(has(external_ips, ?) OR has(loadbalancer_ips, ?))", at),
 		ip, ip)
 	if err != nil {
 		return nil, fmt.Errorf("ingress-cluster probe: %w", err)
@@ -530,44 +613,72 @@ func (s *CH) ClustersWithIngressIP(ctx context.Context, ip string, at time.Time)
 	return clusters, nil
 }
 
+// gatewayBindings is what the VirtualService hop binds against: every
+// candidate gateway's reference in BOTH binding forms (the index-friendly
+// superset), the qualified "<ns>/<name>" forms alone, and the candidate
+// gateways' namespaces.
+type gatewayBindings struct {
+	refs       []string
+	qualified  []string
+	namespaces []string
+}
+
+// bindingsOf derives the bindings for the live candidate gateways, each list
+// de-duplicated in first-seen order.
+func bindingsOf(gws []GatewayRow) gatewayBindings {
+	var b gatewayBindings
+	refSeen, qualSeen, nsSeen := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	add := func(list *[]string, seen map[string]bool, v string) {
+		if !seen[v] {
+			seen[v] = true
+			*list = append(*list, v)
+		}
+	}
+	for _, r := range gws {
+		q := r.Namespace + "/" + r.Name
+		// A VS may bind a gateway by qualified "<ns>/<name>" OR by bare
+		// "<name>" (legal Istio shorthand for a same-namespace gateway; the
+		// exporter stores spec.gateways[*] verbatim, unnormalized).
+		add(&b.refs, refSeen, q)
+		add(&b.refs, refSeen, r.Name)
+		add(&b.qualified, qualSeen, q)
+		add(&b.namespaces, nsSeen, r.Namespace)
+	}
+	return b
+}
+
+// vsBindingWhere scopes the VirtualService hop. The first conjunct is the
+// index-friendly superset (any candidate reference in either form). The
+// second narrows the bare form to where it can bind: a bare "<name>" only
+// names a gateway in the VirtualService's OWN namespace, so a VS outside every
+// candidate gateway's namespace can only bind by the qualified form — without
+// it, a bare "public-gw" in any team's namespace matched a candidate
+// "public-gw" anywhere. Still a superset: pkg/route/snapshot's boundTo
+// re-applies the exact (namespace, name) rule.
+const vsBindingWhere = "cluster = ? AND hasAny(bound_gateways, ?) AND (hasAny(bound_gateways, ?) OR has(?, namespace))"
+
 // appendGateways drains one gw_versions result set, dedups + liveness-filters
-// it, appends the survivors to the snapshot, and returns the distinct gateway
-// refs for the bound-VS lookup — in BOTH binding forms.
-func (s *CH) appendGateways(w *TrafficSnapshot, gwRows driver.Rows, at time.Time) ([]string, error) {
+// it, appends the survivors to the snapshot, and returns their bindings for
+// the bound-VS lookup.
+func (s *CH) appendGateways(w *TrafficSnapshot, gwRows driver.Rows, at time.Time) (gatewayBindings, error) {
 	var gws []GatewayRow
 	for gwRows.Next() {
 		var r GatewayRow
 		if err := gwRows.Scan(&r.Cluster, &r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo,
 			&r.SelectorKV, &r.ServerHosts, &r.SpecJSON, &r.IngestSeq); err != nil {
 			_ = gwRows.Close()
-			return nil, err
+			return gatewayBindings{}, err
 		}
 		gws = append(gws, r)
 	}
 	if err := closeRows(gwRows); err != nil {
-		return nil, err
+		return gatewayBindings{}, err
 	}
 	gws = dedupLiveAtCounted(s, gws, func(r GatewayRow) versionRow {
 		return versionRow{cluster: r.Cluster, ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 	}, at)
-
-	var gwRefs []string
-	refSeen := map[string]bool{}
-	for _, r := range gws {
-		w.Gateways = append(w.Gateways, r)
-		// A VS may bind a gateway by qualified "<ns>/<name>" OR by bare
-		// "<name>" (legal Istio shorthand for a same-namespace gateway; the
-		// exporter stores spec.gateways[*] verbatim, unnormalized). Load the
-		// superset by matching both forms — pkg/route/snapshot re-applies
-		// the exact predicate (boundTo) with the namespace check.
-		for _, ref := range []string{r.Namespace + "/" + r.Name, r.Name} {
-			if !refSeen[ref] {
-				refSeen[ref] = true
-				gwRefs = append(gwRefs, ref)
-			}
-		}
-	}
-	return gwRefs, nil
+	w.Gateways = append(w.Gateways, gws...)
+	return bindingsOf(gws), nil
 }
 
 // loadVSAndBackends loads the VirtualService versions bound to any candidate
@@ -575,14 +686,11 @@ func (s *CH) appendGateways(w *TrafficSnapshot, gwRows driver.Rows, at time.Time
 // (namespace, name) parsed from each route's destination.host FQDN). Backend
 // lookups are chunked so a gateway with very many routes can't inline a key
 // list past ClickHouse's max_query_size.
-func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster string, gwRefs []string, at time.Time) error {
+func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster string, binds gatewayBindings, at time.Time) error {
 	var destHosts []string
-	if len(gwRefs) > 0 {
-		vsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT cluster, namespace, name, valid_from, valid_to, bound_gateways, spec_json, ingest_seq
-			 FROM vs_versions
-			 WHERE cluster = ? AND hasAny(bound_gateways, ?) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
-			cluster, gwRefs)
+	if len(binds.refs) > 0 {
+		vsRows, err := s.conn.Query(ctx, s.versionRead(vsCols, "vs_versions", vsBindingWhere, at),
+			cluster, binds.refs, binds.qualified, binds.namespaces)
 		if err != nil {
 			return fmt.Errorf("load virtualservices: %w", err)
 		}
@@ -606,11 +714,13 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 		}, at)
 		hostSeen := map[string]bool{}
 		for _, r := range vses {
-			w.VSes = append(w.VSes, r)
 			var vsSpec networking.VirtualService
 			if err := pjUnmarshal.Unmarshal([]byte(r.SpecJSON), &vsSpec); err != nil {
-				return fmt.Errorf("unmarshal vs %s/%s: %w", r.Namespace, r.Name, err)
+				// Dropped from the snapshot too: ScopedFor would fail on it.
+				warnSkippedRow("VirtualService", r.Cluster, r.Namespace, r.Name, err)
+				continue
 			}
+			w.VSes = append(w.VSes, r)
 			for _, h := range VSDestHosts(&vsSpec, r.Namespace) {
 				if !hostSeen[h] {
 					hostSeen[h] = true
@@ -622,32 +732,48 @@ func (s *CH) loadVSAndBackends(ctx context.Context, w *TrafficSnapshot, cluster 
 
 	var backends []ServiceRow
 	for _, chunk := range chunkStrings(backendKeys(destHosts), hostChunk) {
-		bsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT cluster, namespace, name, valid_from, valid_to, external_ips, loadbalancer_ips, selector_kv, spec_json, ingest_seq
-			 FROM service_versions
-			 WHERE cluster = ? AND has(?, concat(namespace, '/', name)) AND valid_from <= %s%s`, dt64Lit(at), s.prune(at)),
+		bsRows, err := s.conn.Query(ctx,
+			s.versionRead(serviceCols, "service_versions",
+				"cluster = ? AND has(?, concat(namespace, '/', name))", at),
 			cluster, chunk)
 		if err != nil {
 			return fmt.Errorf("load backend services: %w", err)
 		}
-		for bsRows.Next() {
-			r, err := scanServiceRow(bsRows)
-			if err != nil {
-				_ = bsRows.Close()
-				return err
-			}
-			backends = append(backends, r)
-		}
-		if err := closeRows(bsRows); err != nil {
+		rows, err := scanServiceRows(bsRows)
+		if err != nil {
 			return err
 		}
+		backends = append(backends, rows...)
 	}
 	w.Services = append(w.Services, dedupLiveAtCounted(s, backends, svcVer, at)...)
 	return nil
 }
 
+// scanServiceRows drains one service_versions result set, skipping (with a
+// warning) every row whose spec_json does not parse.
+func scanServiceRows(rows driver.Rows) ([]ServiceRow, error) {
+	var out []ServiceRow
+	for rows.Next() {
+		r, err := scanServiceRow(rows)
+		if errors.Is(err, errUnparseableSpec) {
+			warnSkippedRow("Service", r.Cluster, r.Namespace, r.Name, err)
+			continue
+		}
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := closeRows(rows); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // scanServiceRow scans one full service_versions row, decoding spec_json into
-// Ports. Shared by the ingress and backend loads.
+// Ports. A spec that does not parse is reported as errUnparseableSpec with the
+// row's identity filled in.
 func scanServiceRow(rows driver.Rows) (ServiceRow, error) {
 	var r ServiceRow
 	var specJSON string
@@ -657,7 +783,7 @@ func scanServiceRow(rows driver.Rows) (ServiceRow, error) {
 	}
 	ports, err := ParsePorts(specJSON)
 	if err != nil {
-		return r, fmt.Errorf("parse ports %s/%s: %w", r.Namespace, r.Name, err)
+		return r, fmt.Errorf("%w: ports of %s/%s: %w", errUnparseableSpec, r.Namespace, r.Name, err)
 	}
 	r.Ports = ports
 	return r, nil

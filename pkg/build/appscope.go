@@ -246,7 +246,7 @@ func readApplicationBindings(
 	ann := annotatedClaimKeys(v.PVCAnnotations, roots, lk)
 	var tracked model.Vector
 	if len(pods) > 0 {
-		byPod, err := queryPodsByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(pods))
+		byPod, err := queryPodsByPair(ctx, q, window, end, opts, sel, v, scopeMu, promql.QPVCBindings, podRefsOfKeys(pods))
 		if err != nil {
 			return err
 		}
@@ -267,7 +267,7 @@ func readApplicationBindings(
 		v.PVC = tracked
 		return nil
 	}
-	return issueClaimFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, keys)
+	return issueClaimFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu, []scopedTarget{{promql.QPVCBindings, &v.PVC}}, keys)
 }
 
 func namesFromTracking(vec model.Vector, label model.LabelName, apps map[string]struct{}) []string {

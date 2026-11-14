@@ -57,7 +57,7 @@ func TestHandleReadyz_UsesInjectedClock(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
 
-	resp, err := http.Get(httpSrv.URL + "/readyz") //nolint:noctx,gosec // test server URL
+	resp, err := httpGet(t, httpSrv.URL+"/readyz") //nolint:gosec // test server URL
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

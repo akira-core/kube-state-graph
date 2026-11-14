@@ -16,9 +16,9 @@ import (
 )
 
 // A pod is identified by (namespace, pod). Every read a storage build issues
-// for known pods is keyed by that pair, one query per namespace, so a
-// same-named pod in another namespace is never read — nor its node, nor its
-// controllers, nor its claims.
+// for known pods is keyed by that pair, grouped across namespaces, so a
+// same-named pod in another namespace never reaches a slot — nor its node,
+// nor its controllers, nor its claims.
 
 func flatScope(q *promqlfake.Querier, name promql.Query, label string) []string {
 	var out []string
@@ -65,9 +65,10 @@ func TestPodWave_SameNamedPodInAnotherNamespaceIsNotRead(t *testing.T) {
 		"the other namespace's pod never reaches the controller wave")
 }
 
-// Pods from several namespaces are read one query per namespace, in
-// namespace order, and the merged vectors hold exactly those pods.
-func TestPodWave_OneQueryPerNamespace(t *testing.T) {
+// Pods from several namespaces are read in ONE grouped query, and the vectors
+// hold exactly the requested pairs: platform/web-0 matches both alternations
+// but mounts nothing, so it is dropped (and tallied) rather than kept.
+func TestPodWave_GroupedAcrossNamespaces(t *testing.T) {
 	bindings := model.Vector{
 		planKSM("namespace", "shop", "pod", "orders-0", "persistentvolumeclaim", "shared"),
 		planKSM("namespace", "shop", "pod", "web-0", "persistentvolumeclaim", "shared"),
@@ -85,15 +86,15 @@ func TestPodWave_OneQueryPerNamespace(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{
-		`last_over_time(kube_pod_info{namespace="platform",pod="orders-0"}[1m])`,
-		`last_over_time(kube_pod_info{namespace="shop",pod=~"orders-0|web-0"}[1m])`,
-	}, sortedCopy(f.QueriesFor(promql.QPodInfo)))
+		`last_over_time(kube_pod_info{namespace=~"platform|shop",pod=~"orders-0|web-0"}[1m])`,
+	}, f.QueriesFor(promql.QPodInfo))
 	got := make([]string, 0, len(v.Pod))
 	for _, s := range v.Pod {
 		got = append(got, string(s.Metric["namespace"])+"/"+string(s.Metric["pod"]))
 	}
-	assert.Equal(t, []string{"platform/orders-0", "shop/orders-0", "shop/web-0"}, got,
-		"merged in namespace order; platform/web-0 mounts nothing and is never read")
+	assert.ElementsMatch(t, []string{"platform/orders-0", "shop/orders-0", "shop/web-0"}, got,
+		"platform/web-0 is a cross pair and never reaches the vector")
+	assert.Equal(t, 1, v.ExtraSeriesCount[promql.QPodInfo], "the dropped cross pair is tallied as read")
 }
 
 // The node seed's incarnation completion and its claim-binding read are keyed

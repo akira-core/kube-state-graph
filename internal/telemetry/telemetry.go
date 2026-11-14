@@ -1,9 +1,9 @@
 // Package telemetry wires the OpenTelemetry Go SDK into kube-state-graph.
 //
-// Configuration is OTel-standard environment variables only. When
-// OTEL_EXPORTER_OTLP_ENDPOINT (and the per-signal _TRACES_/_LOGS_ overrides)
-// are unset the package installs no-op tracer and logger providers so
-// telemetry is disabled by default with zero export overhead.
+// Configuration is OTel-standard environment variables only. Each signal is
+// enabled by OTEL_EXPORTER_OTLP_ENDPOINT or its own _TRACES_ / _LOGS_
+// endpoint; a signal with neither keeps a no-op provider, so telemetry is
+// disabled by default with zero export overhead.
 package telemetry
 
 import (
@@ -54,74 +54,113 @@ func noopShutdown(context.Context) error { return nil }
 // Init configures the OpenTelemetry global TracerProvider, LoggerProvider, and
 // text-map propagator. Reads only OTel-standard environment variables.
 //
+// Each signal is enabled on its own (signalEnabled): a signal with no endpoint
+// keeps its no-op provider and builds no exporter. Otherwise the SDK would
+// point that exporter at its localhost default, where nothing listens in a
+// pod, and it would retry and queue for the life of the process.
+//
 // Returns Providers whose Shutdown closure must be invoked during graceful
 // shutdown so buffered spans and log records flush within the supplied
-// context's deadline.
+// context's deadline. Shutdown covers only the providers Init built.
 func Init(ctx context.Context, version string) (Providers, error) {
-	enabled := exporterEnabled()
 	res, err := buildResource(ctx, version)
 	if err != nil {
 		return Providers{Shutdown: noopShutdown}, fmt.Errorf("build resource: %w", err)
 	}
 
-	if !enabled {
-		tp := tracenoop.NewTracerProvider()
-		lp := lognoop.NewLoggerProvider()
-		otel.SetTracerProvider(tp)
-		logglobal.SetLoggerProvider(lp)
-		setPropagator()
-		return Providers{
-			Tracer:   tp,
-			Logger:   lp,
-			Enabled:  false,
-			Shutdown: noopShutdown,
-		}, nil
+	var (
+		tp        trace.TracerProvider   = tracenoop.NewTracerProvider()
+		lp        otellog.LoggerProvider = lognoop.NewLoggerProvider()
+		shutdowns []namedShutdown
+	)
+	if signalEnabled("traces") {
+		sdkTP, err := newTracerProvider(ctx, res)
+		if err != nil {
+			return Providers{Shutdown: noopShutdown}, err
+		}
+		tp = sdkTP
+		shutdowns = append(shutdowns, namedShutdown{"tracer provider", sdkTP.Shutdown})
+	}
+	if signalEnabled("logs") {
+		sdkLP, err := newLoggerProvider(ctx, res)
+		if err != nil {
+			_ = joinShutdowns(shutdowns)(ctx)
+			return Providers{Shutdown: noopShutdown}, err
+		}
+		lp = sdkLP
+		shutdowns = append(shutdowns, namedShutdown{"logger provider", sdkLP.Shutdown})
 	}
 
-	traceExporter, err := newTraceExporter(ctx)
-	if err != nil {
-		return Providers{Shutdown: noopShutdown}, fmt.Errorf("trace exporter: %w", err)
-	}
-	logExporter, err := newLogExporter(ctx)
-	if err != nil {
-		_ = traceExporter.Shutdown(ctx)
-		return Providers{Shutdown: noopShutdown}, fmt.Errorf("log exporter: %w", err)
-	}
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExporter),
-		sdktrace.WithResource(res),
-	)
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
-		sdklog.WithResource(res),
-	)
 	otel.SetTracerProvider(tp)
 	logglobal.SetLoggerProvider(lp)
 	setPropagator()
 
-	shutdown := func(sctx context.Context) error {
+	if len(shutdowns) == 0 {
+		return Providers{Tracer: tp, Logger: lp, Enabled: false, Shutdown: noopShutdown}, nil
+	}
+	return Providers{Tracer: tp, Logger: lp, Enabled: true, Shutdown: joinShutdowns(shutdowns)}, nil
+}
+
+// namedShutdown is one built provider's Shutdown, named for the joined error.
+type namedShutdown struct {
+	name string
+	fn   func(context.Context) error
+}
+
+// joinShutdowns runs every Shutdown under the one context — none is skipped
+// because an earlier one failed — and joins their errors.
+func joinShutdowns(shutdowns []namedShutdown) func(context.Context) error {
+	return func(sctx context.Context) error {
 		var errs []error
-		if err := tp.Shutdown(sctx); err != nil {
-			errs = append(errs, fmt.Errorf("tracer provider: %w", err))
-		}
-		if err := lp.Shutdown(sctx); err != nil {
-			errs = append(errs, fmt.Errorf("logger provider: %w", err))
+		for _, s := range shutdowns {
+			if err := s.fn(sctx); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", s.name, err))
+			}
 		}
 		return errors.Join(errs...)
 	}
-	return Providers{Tracer: tp, Logger: lp, Enabled: true, Shutdown: shutdown}, nil
 }
 
-// exporterEnabled reports whether at least one OTLP endpoint env var is set.
-func exporterEnabled() bool {
+func newTracerProvider(ctx context.Context, res *resource.Resource) (*sdktrace.TracerProvider, error) {
+	exp, err := newTraceExporter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("trace exporter: %w", err)
+	}
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+	), nil
+}
+
+func newLoggerProvider(ctx context.Context, res *resource.Resource) (*sdklog.LoggerProvider, error) {
+	exp, err := newLogExporter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("log exporter: %w", err)
+	}
+	return sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
+		sdklog.WithResource(res),
+	), nil
+}
+
+// signalEnabled reports whether the given signal ("traces" or "logs") has an
+// endpoint: the shared OTEL_EXPORTER_OTLP_ENDPOINT or its own
+// OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT.
+func signalEnabled(signal string) bool {
 	return env("OTEL_EXPORTER_OTLP_ENDPOINT") != "" ||
-		env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != "" ||
-		env("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") != ""
+		env("OTEL_EXPORTER_OTLP_"+strings.ToUpper(signal)+"_ENDPOINT") != ""
 }
 
 // buildResource combines detected SDK / process / host attributes with
 // OTEL_RESOURCE_ATTRIBUTES and the explicit service identity overrides.
+//
+// The process detectors are named one by one rather than through
+// resource.WithProcess(): that aggregate also detects process.command_args,
+// which carries argv — and argv can hold --api-keys or a DSN with userinfo,
+// which would then ride on every exported span and log record. The
+// executable path and the OS owner are left out with it. Naming the detectors
+// is an allowlist, so a detector a later SDK adds to WithProcess() cannot slip
+// in unnoticed.
 func buildResource(ctx context.Context, version string) (*resource.Resource, error) {
 	serviceName := env("OTEL_SERVICE_NAME")
 	if serviceName == "" {
@@ -134,7 +173,11 @@ func buildResource(ctx context.Context, version string) (*resource.Resource, err
 	)
 	detected, err := resource.New(ctx,
 		resource.WithFromEnv(),
-		resource.WithProcess(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
+		resource.WithProcessRuntimeDescription(),
 		resource.WithHost(),
 		resource.WithTelemetrySDK(),
 	)

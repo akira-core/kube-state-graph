@@ -69,7 +69,7 @@ func TestTracing_LivezProbeEmitsNoSpan(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/livez")
+	resp, err := httpGet(t, srv.URL+"/livez")
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -82,7 +82,7 @@ func TestTracing_MetricsScrapeEmitsNoSpan(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/metrics")
+	resp, err := httpGet(t, srv.URL+"/metrics")
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -98,7 +98,7 @@ func TestTracing_RemovedEdgeTypesRouteEmitsNoSpan(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/edge-types")
+	resp, err := httpGet(t, srv.URL+"/v1/edge-types")
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
@@ -115,7 +115,7 @@ func TestTracing_GraphEmitsServerSpan(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + graphProbePath)
+	resp, err := httpGet(t, srv.URL+graphProbePath)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -141,7 +141,7 @@ func TestTracing_InboundTraceparentBecomesParent(t *testing.T) {
 
 	const wantTraceID = "0af7651916cd43dd8448eb211c80319c"
 	const wantParent = "b7ad6b7169203331"
-	req, err := http.NewRequest(http.MethodGet, srv.URL+graphProbePath, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+graphProbePath, nil)
 	require.NoError(t, err)
 	req.Header.Set("traceparent", "00-"+wantTraceID+"-"+wantParent+"-01")
 
@@ -172,7 +172,7 @@ func TestTracing_FailedGraphRecordsErrorSpan(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -212,7 +212,7 @@ func TestTracing_OutsideRetention400_LeavesServerSpanUnset(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -253,7 +253,7 @@ func TestAuth_NoAPIKeyInLogs(t *testing.T) {
 	srv := httptest.NewServer(server.Handler())
 	t.Cleanup(srv.Close)
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+graphProbePath, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+graphProbePath, nil)
 	require.NoError(t, err)
 	req.Header.Set(APIKeyHeader, sentinelKey)
 	resp, err := http.DefaultClient.Do(req)
@@ -278,7 +278,7 @@ func TestTracing_BodyStableAcrossTracingState(t *testing.T) {
 
 	// First fetch with no tracer overrides (default is whatever the test
 	// process has installed — typically the noop tracer).
-	r1, err := http.Get(url)
+	r1, err := httpGet(t, url)
 	require.NoError(t, err)
 	body1, err := io.ReadAll(r1.Body)
 	r1.Body.Close()
@@ -293,7 +293,7 @@ func TestTracing_BodyStableAcrossTracingState(t *testing.T) {
 		otel.SetTracerProvider(prevTP)
 	})
 
-	r2, err := http.Get(url)
+	r2, err := httpGet(t, url)
 	require.NoError(t, err)
 	body2, err := io.ReadAll(r2.Body)
 	r2.Body.Close()

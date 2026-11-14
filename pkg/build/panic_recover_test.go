@@ -38,3 +38,29 @@ func TestReadTopology_QueryPanicBecomesError(t *testing.T) {
 	assert.Contains(t, err.Error(), "panic in kube_pod_info query")
 	assert.Contains(t, err.Error(), "decoder exploded")
 }
+
+// A panic while a SECOND-WAVE goroutine computes its scope — before any
+// per-query recover is armed — must surface as a build error too. A nil
+// sample in volume_labels panics inside the QoS wave's scope computation
+// (qosVolumeScope reads s.Metric); without the launch-site recover it would
+// take down the process instead of failing the request.
+func TestReadTopology_SecondWaveScopePanicBecomesError(t *testing.T) {
+	q := promqlmocks.NewMockQuerier(t)
+	q.EXPECT().
+		Instant(mock.Anything, string(promql.QPVCInfo), mock.Anything, mock.Anything).
+		Return(model.Vector{claimSample("db", "data", "pvc-aaaaaaaa")}, nil).
+		Maybe()
+	q.EXPECT().
+		Instant(mock.Anything, string(promql.QVolumeLabels), mock.Anything, mock.Anything).
+		Return(model.Vector{nil}, nil).
+		Maybe()
+	q.EXPECT().
+		Instant(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(model.Vector{}, nil).
+		Maybe()
+
+	_, err := ReadTopology(t.Context(), q, 5*time.Minute, probeTestEnd, Options{}, promql.Selector{})
+
+	require.Error(t, err, "a second-wave scope panic must convert to a build error")
+	assert.Contains(t, err.Error(), "panic in")
+}

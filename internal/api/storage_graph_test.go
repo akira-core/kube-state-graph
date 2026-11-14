@@ -38,7 +38,7 @@ func TestStorageGraph_SuccessBodyShape(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -56,7 +56,7 @@ func TestStorageGraph_MissingAZ(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/storage-graph?start=1746442800&end=1746446400&env=prod")
+	resp, err := httpGet(t, srv.URL+"/v1/storage-graph?start=1746442800&end=1746446400&env=prod")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -79,7 +79,7 @@ func TestStorageGraph_RepeatedAZAndEnvAreAccepted(t *testing.T) {
 		"env":   {"prod", "dev"},
 		"aggr":  {"aggr1"},
 	}
-	resp, err := http.Get(srv.URL + "/v1/storage-graph?" + q.Encode())
+	resp, err := httpGet(t, srv.URL+"/v1/storage-graph?"+q.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode, "az and env are repeatable")
@@ -91,7 +91,7 @@ func TestStorageGraph_RepeatedAZAndEnvAreAccepted(t *testing.T) {
 
 func TestStorageGraph_RequiresKey(t *testing.T) {
 	srv := authServer(t, "k1")
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -103,7 +103,7 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"namespace": {"shop"}, "node": {"worker-1"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"namespace": {"shop"}, "node": {"worker-1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -130,9 +130,9 @@ func TestStorageGraph_SelectorQueriesCaptured(t *testing.T) {
 	assert.NotContains(t, seen, "up", "no retention probe on a filtered build")
 }
 
-// A pod root reads kube_pod_info for the root (namespace, pod) pairs, one query
-// per namespace, and does not derive a namespace matcher onto the controller
-// wave. Harvest is read only for the claims the roots mount; this fixture
+// A pod root reads kube_pod_info for the root (namespace, pod) pairs, grouped
+// across namespaces in one query, and does not derive a namespace matcher onto
+// the controller wave. Harvest is read only for the claims the roots mount; this fixture
 // mounts none.
 func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 	q, captured := recordingQuerierWith(t, map[string]model.Vector{
@@ -145,18 +145,15 @@ func TestStorageGraph_PodOnlyRootsNarrowTheRead(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"pod": {"shop/orders-0", "platform/redis-0"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"pod": {"shop/orders-0", "platform/redis-0"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	seen := captured()
-	// The recorder keeps the last query per family, and the two namespaces'
-	// queries run concurrently, so either may be the one kept.
-	assert.Contains(t, []string{
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="platform",pod="redis-0"}[1h])`,
-		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace="shop",pod="orders-0"}[1h])`,
-	}, seen["kube_pod_info"], "each namespace's pods are read by their own query")
+	assert.Equal(t,
+		`last_over_time(kube_pod_info{az="zone-a",env="prod",namespace=~"platform|shop",pod=~"orders-0|redis-0"}[1h])`,
+		seen["kube_pod_info"], "both namespaces' pods are read by one grouped query")
 	assert.Equal(t,
 		`tlast_over_time(ALERTS{alertstate="firing",az="zone-a",env="prod"}[1h])`,
 		seen["ALERTS"])
@@ -173,7 +170,7 @@ func TestStorageGraph_Timeout504(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
@@ -190,7 +187,7 @@ func TestStorageGraph_ApplicationRootIssuesRecovery(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"application": {"checkout"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"application": {"checkout"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -217,7 +214,7 @@ func TestStorageGraph_OverCapAggregateRootIssuesNothing(t *testing.T) {
 	for i := range names {
 		names[i] = fmt.Sprintf("aggr%04d%s", i, pad)
 	}
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": names}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": names}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -245,7 +242,7 @@ func TestStorageGraph_MixedRootKindsRejected(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{
 		"pod":         {"shop/x"},
 		"application": {"y"},
 	}))
@@ -273,7 +270,7 @@ func TestStorageGraph_EmbedderAndServerAgree(t *testing.T) {
 		"env":   {"prod"},
 		"aggr":  {"aggr1"},
 	}
-	resp, err := http.Get(srv.URL + "/v1/storage-graph?" + vals.Encode())
+	resp, err := httpGet(t, srv.URL+"/v1/storage-graph?"+vals.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -295,7 +292,7 @@ func TestStorageGraph_EmbedderAndServerAgree(t *testing.T) {
 		{"empty root", url.Values{"start": {"1746442800"}, "end": {"1746446400"}, "az": {"zone-a"}, "env": {"prod"}, "aggr": {""}}, "missing_root"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Get(srv.URL + "/v1/storage-graph?" + tc.values.Encode())
+			resp, err := httpGet(t, srv.URL+"/v1/storage-graph?"+tc.values.Encode())
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode)

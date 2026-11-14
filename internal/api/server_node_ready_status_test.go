@@ -34,7 +34,7 @@ func TestGraphEndpoint_NodeReadyStatus(t *testing.T) {
 
 	end := time.Now().UTC()
 	start := end.Add(-15 * time.Minute)
-	resp, err := http.Get(graphURL(srv.URL+"/v1/graph", start, end))
+	resp, err := httpGet(t, graphURL(srv.URL+"/v1/graph", start, end))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

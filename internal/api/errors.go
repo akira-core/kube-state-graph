@@ -16,6 +16,9 @@ import (
 // is not a server/upstream fault.
 const statusClientClosedRequest = 499
 
+// retryAfterOverloaded is the Retry-After (seconds) of a 503 overloaded.
+const retryAfterOverloaded = "1"
+
 type errorBody struct {
 	APIVersion string     `json:"apiVersion"`
 	Error      errorField `json:"error"`
@@ -84,6 +87,11 @@ func (s *Server) mapBuildError(c *gin.Context, err error) {
 			msg = be.Message
 		}
 		writeError(c, http.StatusBadRequest, "invalid_scope", msg)
+	case build.ReasonOverloaded:
+		// Shed load, not a fault: a static message, and Retry-After so a
+		// client backs off for about one build rather than retrying at once.
+		c.Header("Retry-After", retryAfterOverloaded)
+		writeError(c, http.StatusServiceUnavailable, "overloaded", build.OverloadedMessage)
 	default:
 		s.logger.ErrorContext(c.Request.Context(), "graph build failed",
 			"err", err, "request_id", c.GetString("request_id"))

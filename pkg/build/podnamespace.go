@@ -16,30 +16,13 @@ import (
 // unique within a namespace only. Every read a storage build issues for pods it
 // already knows — the pod wave, the node seed's incarnation completion, and the
 // claim bindings of node-seeded and recovered pods — is therefore keyed by that
-// pair, one query per namespace (promql.RenderNamesInNamespace). A same-named
-// pod in another namespace is never read, so it cannot widen the node,
-// controller or claim reads that are scoped from what these reads return.
-
-// groupPodRefs groups refs by namespace. Namespaces are returned sorted and
-// each namespace's pod names sorted and de-duplicated, so the issued queries
-// and their merge order are a pure function of the ref set. A ref with no pod
-// name is dropped. It does not mutate refs.
-func groupPodRefs(refs []graph.PodRef) ([]string, map[string][]string) {
-	byNS := make(map[string][]string)
-	for _, ref := range refs {
-		if ref.Name != "" {
-			byNS[ref.Namespace] = append(byNS[ref.Namespace], ref.Name)
-		}
-	}
-	namespaces := make([]string, 0, len(byNS))
-	for ns, pods := range byNS {
-		slices.Sort(pods)
-		byNS[ns] = slices.Compact(pods)
-		namespaces = append(namespaces, ns)
-	}
-	slices.Sort(namespaces)
-	return namespaces, byNS
-}
+// pair. The pairs are read GROUPED, one query per chunk carrying a namespace
+// alternation beside a name alternation (promql.RenderNamesAcrossNamespaces,
+// chunked by promql.ChunkNamePairs), as the Kubernetes-only build reads them,
+// rather than one query per namespace. The two alternations are independent,
+// so a chunk can match a cross pair — a name requested in one namespace that
+// also exists in another — and the read drops those rows (tallying them) before
+// the node, controller or claim reads are scoped from what it returns.
 
 // podRefsOf returns the (namespace, pod) of every row naming a pod.
 func podRefsOf(rows model.Vector) []graph.PodRef {
@@ -53,8 +36,8 @@ func podRefsOf(rows model.Vector) []graph.PodRef {
 }
 
 // podRefsOfKeys drops the zone and cluster of each key: a pod-keyed read is
-// issued per namespace across the clusters and zones the request selects, and
-// the key filters the rows it returns.
+// issued on (namespace, pod) pairs across the clusters and zones the request
+// selects, and the key filters the rows it returns.
 func podRefsOfKeys(keys []podSeriesKey) []graph.PodRef {
 	out := make([]graph.PodRef, 0, len(keys))
 	for _, k := range keys {
@@ -76,16 +59,28 @@ func podKeysOf(rows model.Vector, keys promql.LabelKeys) []podSeriesKey {
 	return slices.Compact(out)
 }
 
-// issuePodFamiliesByNamespace reads every target family restricted to refs, one
-// query per namespace (chunked under the shared byte budget, the namespace
-// equality charged once per chunk), all under one bounded wave. Each target's
-// vector is the merge of its namespaces' results in namespace order, so it is
-// a pure function of refs rather than of upstream timing.
+// podNamePairs is the (namespace, pod) pair of every ref. A ref with no
+// namespace or no pod name names no pod and is dropped.
+func podNamePairs(refs []graph.PodRef) []promql.NamePair {
+	out := make([]promql.NamePair, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, promql.NamePair{Namespace: ref.Namespace, Name: ref.Name})
+	}
+	return promql.SortedNamePairs(out)
+}
+
+// issuePodFamiliesByPair reads every target family restricted to the
+// (namespace, pod) pairs of refs, grouped across namespaces and chunked under
+// the shared byte budget and promql.MaxAlternationValues per alternation, all
+// under one bounded wave. Each target keeps only the rows of a requested pair,
+// in chunk order, so its vector is a pure function of refs rather than of
+// upstream timing; a cross pair the independent alternations matched is
+// dropped and tallied as read.
 //
 // No ref issues nothing and leaves every target untouched: an empty scope is
 // neither read nor tallied. A chunk error fails the read, as every
 // by-reference read of a storage build does.
-func issuePodFamiliesByNamespace(
+func issuePodFamiliesByPair(
 	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
@@ -97,42 +92,30 @@ func issuePodFamiliesByNamespace(
 	targets []scopedTarget,
 	refs []graph.PodRef,
 ) error {
-	namespaces, byNS := groupPodRefs(refs)
-	if len(namespaces) == 0 {
+	pairs := podNamePairs(refs)
+	if len(pairs) == 0 {
 		return nil
 	}
-	parts := make([][]model.Vector, len(targets))
-	families := make([]scopedFamily, 0, len(targets)*len(namespaces))
-	for ti, t := range targets {
-		parts[ti] = make([]model.Vector, len(namespaces))
-		for ni, ns := range namespaces {
-			families = append(families, scopedFamily{
-				query: t.query,
-				dst:   &parts[ti][ni],
-				scope: byNS[ns],
-				render: func(chunk []string) (string, bool) {
-					return promql.RenderNamesInNamespace(t.query, window, opts.LabelKeys, sel, ns, promql.PodLabel, chunk)
-				},
-				budgetReserve: promql.NamespaceEqualityCost(ns),
-			})
-		}
+	reads := make([]pairRead, len(targets))
+	for i, t := range targets {
+		reads[i] = pairRead{query: t.query, label: promql.PodLabel, pairs: pairs}
 	}
-	if err := issueScopedFamilies(ctx, q, window, end, opts, sel, v, scopeMu, families); err != nil {
+	if err := issuePairReads(ctx, q, window, end, opts, sel, v, scopeMu, reads); err != nil {
 		return err
 	}
-	for ti, t := range targets {
-		var merged model.Vector
-		for _, part := range parts[ti] {
-			merged = append(merged, part...)
+	for i, t := range targets {
+		kept := promql.KeepNamePairs(reads[i].rows, promql.PodLabel, pairs)
+		if dropped := len(reads[i].rows) - len(kept); dropped > 0 {
+			addExtraSeries(v, scopeMu, t.query, dropped)
 		}
-		*t.dst = merged
+		*t.dst = kept
 	}
 	return nil
 }
 
-// queryPodsByNamespace is issuePodFamiliesByNamespace for one family whose rows
-// the caller filters itself rather than landing them in a topology slot.
-func queryPodsByNamespace(
+// queryPodsByPair is issuePodFamiliesByPair for one family whose rows the
+// caller filters itself rather than landing them in a topology slot.
+func queryPodsByPair(
 	ctx context.Context,
 	q promql.Querier,
 	window time.Duration,
@@ -145,7 +128,7 @@ func queryPodsByNamespace(
 	refs []graph.PodRef,
 ) (model.Vector, error) {
 	var out model.Vector
-	err := issuePodFamiliesByNamespace(ctx, q, window, end, opts, sel, v, scopeMu,
+	err := issuePodFamiliesByPair(ctx, q, window, end, opts, sel, v, scopeMu,
 		[]scopedTarget{{query: name, dst: &out}}, refs)
 	return out, err
 }

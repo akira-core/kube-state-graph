@@ -80,7 +80,7 @@ func regex(s string) *networking.StringMatch {
 // carries no test-only entry point).
 func translateOK(t *testing.T, in translate.ScopedInput) *envoyroute.RouteConfiguration {
 	t.Helper()
-	rc, err := translate.NewTranslator().Translate(in)
+	rc, err := translate.NewTranslator().Translate(t.Context(), in)
 	if err != nil {
 		t.Fatalf("scoped translate: %v", err)
 	}
@@ -175,14 +175,14 @@ func TestTranslatorNoGoroutineLeak(t *testing.T) {
 	}
 	tr := translate.NewTranslator()
 
-	if _, err := tr.Translate(in); err != nil { // warm up
+	if _, err := tr.Translate(t.Context(), in); err != nil { // warm up
 		t.Fatal(err)
 	}
 	runtime.GC()
 	before := runtime.NumGoroutine()
 
 	for i := range 200 {
-		if _, err := tr.Translate(in); err != nil {
+		if _, err := tr.Translate(t.Context(), in); err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
 	}
@@ -326,7 +326,7 @@ func TestTranslatePortSelectsRouteConfig(t *testing.T) {
 				Proxy:    proxy,
 				Port:     c.port,
 			}
-			rc, err := tr.Translate(in)
+			rc, err := tr.Translate(t.Context(), in)
 			if err != nil {
 				t.Fatalf("Translate: %v", err)
 			}

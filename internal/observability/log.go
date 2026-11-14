@@ -16,16 +16,22 @@ func NewLogger(level string) *slog.Logger {
 // the telemetry package) can wrap it in additional handlers before installing
 // the global logger.
 func NewLogHandler(level string) slog.Handler {
-	var lvl slog.Level
+	return slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: ParseLevel(level)})
+}
+
+// ParseLevel maps a configured --log-level (debug | info | warn | error, any
+// case) to its slog.Level; anything else is Info. It is the ONE parser: the
+// local handler and the OTLP bridge's level filter both read it, so the two
+// sinks cannot disagree about which records exist.
+func ParseLevel(level string) slog.Level {
 	switch strings.ToLower(level) {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "warn":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
+		return slog.LevelError
 	default:
-		lvl = slog.LevelInfo
+		return slog.LevelInfo
 	}
-	return slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
 }

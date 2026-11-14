@@ -467,10 +467,15 @@ func resolveStorageRoots(g *Graph, scope StorageScope) (storage, workload, claim
 // by n (mounter count in the built graph). svm-pvc keeps the claim's latency
 // and ceiling verbatim. Unmeasured claims contribute nothing; an edge whose
 // every unit is unmeasured carries no IO. Contributions are added in
-// ascending (claim id, pod id) order so the sum is order-free.
+// ascending (claim id, pod id) order so the sum is order-free. The per-edge
+// sort runs even when retained already arrives in that order: it is the
+// guarantee, so no caller's ordering can reach the rounded wire figures, and
+// its cost is small beside the projection. Keep it.
 //
 // Edges are returned as new values (NewEdge + WithIO) so the built graph is
 // never mutated and the internal claim_aggr label never leaves this package.
+// NewEdge re-derives the edge id from (type, source, target) rather than
+// copying it, so a projected edge's id can never disagree with its endpoints.
 func weightRetained(retained []flowUnit) []*Edge {
 	type acc struct {
 		edge    *Edge

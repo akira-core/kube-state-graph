@@ -273,16 +273,17 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 	pods := make([]*graph.PodNode, 0, len(v.Pod))
 	podsByUID := map[string]*graph.PodNode{}
 	podsByNameNS := map[podNameKey]*graph.PodNode{}
+	// dupUIDs counts, per colliding UID, the pods that shared it with an
+	// already-indexed pod. Reported once after the loop: a collision is an
+	// estate-wide anomaly (a cloned etcd, a restored backup), so one line per
+	// pod would scale with the estate.
+	dupUIDs := map[string]int{}
 	addPodToIndex := func(uid string, pod *graph.PodNode) {
 		if uid == "" {
 			return
 		}
 		if existing, dup := podsByUID[uid]; dup {
-			slog.Warn("duplicate pod UID across clusters",
-				"uid", uid,
-				"existing_id", existing.ID(),
-				"new_id", pod.ID(),
-			)
+			dupUIDs[uid]++
 			// Deterministic dedupe: the lexically-smaller cluster-scoped ID
 			// wins so the winner is a pure function of the data, independent of
 			// the randomised map-iteration order this runs in (determinism).
@@ -348,6 +349,7 @@ func parseTopology(v topologyVectors, keys promql.LabelKeys) Topology {
 		addPodToIndex(canonical.uid, canonicalPod)
 		podsByNameNS[nk] = canonicalPod
 	}
+	warnDuplicatePodUIDs(dupUIDs)
 
 	// PVCs + pod-PVC bindings.
 	// Each kube_pod_spec_volumes_persistentvolumeclaims_info series wires one
@@ -649,4 +651,28 @@ func mergeSameUIDLabels(group []podObs) map[string]map[string]string {
 		}
 	}
 	return out
+}
+
+// duplicateUIDSample bounds how many colliding UIDs the aggregated Warn names.
+const duplicateUIDSample = 10
+
+// warnDuplicatePodUIDs reports every cross-cluster pod-UID collision of one
+// parse as ONE Warn: how many distinct UIDs collided, how many pods lost the
+// PodsByUID entry to a lexically-smaller id, and the first few UIDs in sorted
+// order, so the line is a pure function of the data.
+func warnDuplicatePodUIDs(dups map[string]int) {
+	if len(dups) == 0 {
+		return
+	}
+	uids := slices.Sorted(maps.Keys(dups))
+	pods := 0
+	for _, n := range dups {
+		pods += n
+	}
+	slog.Warn("duplicate pod UID across clusters",
+		"uids", len(uids),
+		"pods", pods,
+		"sample", uids[:min(len(uids), duplicateUIDSample)],
+		"detail", "the lexically-smaller pod id keeps the UID; service-graph endpoints naming it resolve to that pod",
+	)
 }

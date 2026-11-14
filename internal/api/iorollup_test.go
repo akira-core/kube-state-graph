@@ -34,7 +34,7 @@ func TestStorageGraph_IORollupMaxChangesOnlyQoS(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}, "io_rollup": {"max"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}, "io_rollup": {"max"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -64,7 +64,7 @@ func TestStorageGraph_InvalidIORollup(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}, "io_rollup": {"p99"}}))
+	resp, err := httpGet(t, storageGraphURL(srv.URL, url.Values{"aggr": {"aggr1"}, "io_rollup": {"p99"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -82,7 +82,7 @@ func TestGraph_IORollupIsIgnored(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=1746442800&end=1746446400&az=zone-a&env=prod&io_rollup=max")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=1746442800&end=1746446400&az=zone-a&env=prod&io_rollup=max")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -95,7 +95,7 @@ func TestK8sGraph_IORollupIsIgnored(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}, "io_rollup": {"p99"}}))
+	resp, err := httpGet(t, k8sGraphURL(srv.URL, url.Values{"node": {"worker-1"}, "io_rollup": {"p99"}}))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

@@ -44,6 +44,12 @@ type VolumeKeyRewriter struct {
 type compiledVolumeKeyRule struct {
 	re          *regexp.Regexp
 	replacement string
+	// literal is set when the pattern matches exactly one fixed, non-empty
+	// string and the replacement expands nothing, so strings.ReplaceAll over
+	// pattern is byte-for-byte what re.ReplaceAllString returns. pattern then
+	// holds that string.
+	literal bool
+	pattern string
 }
 
 // NewVolumeKeyRewriter compiles the ordered rewrite rules. An uncompilable
@@ -64,7 +70,17 @@ func NewVolumeKeyRewriter(rules []VolumeKeyRule) (*VolumeKeyRewriter, error) {
 			return nil, fmt.Errorf("volume key rewrite rule %d: pattern %q does not compile: %w",
 				i+1, r.Pattern, err)
 		}
-		out.rules = append(out.rules, compiledVolumeKeyRule{re: re, replacement: r.Replacement})
+		rule := compiledVolumeKeyRule{re: re, replacement: r.Replacement}
+		// A pattern that is one fixed string (the default `-` is) with a
+		// replacement that names no capture group is a plain substring
+		// replacement, which strings.ReplaceAll does without the regexp
+		// engine. An empty literal matches between every byte and stays on the
+		// regexp path, as does any `$` in the replacement, which
+		// ReplaceAllString would expand.
+		if lit, complete := re.LiteralPrefix(); complete && lit != "" && !strings.Contains(r.Replacement, "$") {
+			rule.literal, rule.pattern = true, lit
+		}
+		out.rules = append(out.rules, rule)
 	}
 	return out, nil
 }
@@ -110,6 +126,10 @@ func (r *VolumeKeyRewriter) token(pvName string) string {
 		return ""
 	}
 	for _, rule := range r.rules {
+		if rule.literal {
+			pvName = strings.ReplaceAll(pvName, rule.pattern, rule.replacement)
+			continue
+		}
 		pvName = rule.re.ReplaceAllString(pvName, rule.replacement)
 	}
 	return pvName

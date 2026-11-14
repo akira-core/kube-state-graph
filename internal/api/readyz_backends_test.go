@@ -69,7 +69,7 @@ func getReadyz(t *testing.T, s *Server) (int, string) {
 	t.Helper()
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
-	resp, err := http.Get(srv.URL + "/readyz") //nolint:noctx // test server URL
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)

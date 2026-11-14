@@ -19,7 +19,7 @@ func Example() {
 
 	// A nil lookup reads the process environment for the credential variables
 	// the file names.
-	table, err := backendsfile.Read("/etc/ksg/backends.yaml", nil)
+	table, content, err := backendsfile.ReadWithContent("/etc/ksg/backends.yaml", nil)
 	if err != nil {
 		// An invalid file at startup is fatal: there is no previously-good
 		// table to fall back to.
@@ -33,9 +33,12 @@ func Example() {
 		return
 	}
 
-	// Optional logger and metrics: nil means silent and unrecorded.
+	// Optional logger and metrics: nil means silent and unrecorded. Content
+	// is what the live table was parsed from, so the first reload compares
+	// against it rather than against a second read of the file.
 	backendsfile.Start(ctx, router, backendsfile.ReloaderOptions{
-		Path: "/etc/ksg/backends.yaml",
+		Path:    "/etc/ksg/backends.yaml",
+		Content: content,
 	}, 30*time.Second)
 
 	engine := kubegraph.NewRouted(router, kubegraph.Options{APITimeout: 30 * time.Second})
