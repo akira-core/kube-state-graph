@@ -1,6 +1,7 @@
 package kubegraph_test
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -143,6 +144,7 @@ func TestParse_RejectedRawValuesAreEchoedOnlyWhenBounded(t *testing.T) {
 }
 
 func errAsParse(err error) (*kubegraph.ParseError, bool) {
-	pe, ok := err.(*kubegraph.ParseError)
+	var pe *kubegraph.ParseError
+	ok := errors.As(err, &pe)
 	return pe, ok
 }

@@ -29,7 +29,7 @@ func TestStorageGraph_NonFiniteUpstreamValueIsDropped(t *testing.T) {
 	srv := httptest.NewServer(newServerWithMocks(t, newMockQuerier(t, fixtures), nil).Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/storage-graph?start=1746442800&end=1746446400&az=zone-a&env=prod&aggr=aggr1")
+	resp, err := httpGet(t, srv.URL+"/v1/storage-graph?start=1746442800&end=1746446400&az=zone-a&env=prod&aggr=aggr1")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode, "a non-finite sample is not an encode error")

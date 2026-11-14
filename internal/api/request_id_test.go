@@ -40,7 +40,7 @@ func TestRequestID_IsBoundedAndCharsetRestricted(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			buf.Reset()
-			req := httptest.NewRequest(http.MethodGet, "/v1/graph?start=1746442800&end=1746446400", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph?start=1746442800&end=1746446400", nil)
 			if tc.in != "" {
 				req.Header["X-Request-Id"] = []string{tc.in}
 			}
@@ -56,7 +56,7 @@ func TestRequestID_IsBoundedAndCharsetRestricted(t *testing.T) {
 				return
 			}
 			_, err := uuid.Parse(got)
-			assert.NoError(t, err, "a rejected id is replaced by a generated UUID, got %q", got)
+			require.NoError(t, err, "a rejected id is replaced by a generated UUID, got %q", got)
 			if tc.in != "" {
 				assert.NotContains(t, buf.String(), tc.in, "the inbound value is not logged")
 			}

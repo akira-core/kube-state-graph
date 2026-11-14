@@ -85,7 +85,11 @@ func metricIs(base, name, want string) func() bool {
 }
 
 func scrapeLine(base, name string) (string, error) {
-	resp, err := http.Get(base + "/metrics")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, base+"/metrics", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -106,14 +110,33 @@ func scrapeLine(base, name string) (string, error) {
 // recognisable among those of concurrent requests.
 func getGraphNS(t *testing.T, base, ns string, header http.Header) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, base+"/v1/graph?start=1746442800&end=1746446400&namespace="+ns, nil)
+	resp, err := fetchGraphNS(t.Context(), base, ns, header)
 	require.NoError(t, err)
+	return resp
+}
+
+// fetchGraphNS is getGraphNS without test assertions, so a goroutine other
+// than the test's own can call it.
+func fetchGraphNS(ctx context.Context, base, ns string, header http.Header) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/graph?start=1746442800&end=1746446400&namespace="+ns, nil)
+	if err != nil {
+		return nil, err
+	}
 	for k, v := range header {
 		req.Header[k] = v
 	}
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	return resp
+	return http.DefaultClient.Do(req)
+}
+
+// statusOfGraphNS returns the status of fetchGraphNS, or 0 when the request
+// failed, so a goroutine can report it over a channel the test asserts on.
+func statusOfGraphNS(ctx context.Context, base, ns string, header http.Header) int {
+	resp, err := fetchGraphNS(ctx, base, ns, header)
+	if err != nil {
+		return 0
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
 }
 
 // Spec: "A request past the bound is shed", "Operational routes are never
@@ -127,9 +150,7 @@ func TestAdmission_ShedsPastTheBoundAndNeverLimitsOperationalRoutes(t *testing.T
 	statuses := make(chan int, 2)
 	for _, ns := range []string{"held-a", "held-b"} {
 		go func() {
-			resp := getGraphNS(t, srv.URL, ns, nil)
-			resp.Body.Close()
-			statuses <- resp.StatusCode
+			statuses <- statusOfGraphNS(t.Context(), srv.URL, ns, nil)
 		}()
 	}
 	require.Eventually(t, metricIs(srv.URL, "kube_state_graph_inflight_builds", "kube_state_graph_inflight_builds 2"),
@@ -148,7 +169,7 @@ func TestAdmission_ShedsPastTheBoundAndNeverLimitsOperationalRoutes(t *testing.T
 		metricValue(t, srv.URL, "kube_state_graph_admission_rejected_total"))
 
 	for _, path := range []string{"/livez", "/readyz", "/metrics", "/docs", "/openapi.json", "/openapi.yaml"} {
-		r, err := http.Get(srv.URL + path)
+		r, err := httpGet(t, srv.URL+path)
 		require.NoError(t, err)
 		r.Body.Close()
 		assert.Equal(t, http.StatusOK, r.StatusCode, "%s is never limited", path)
@@ -177,8 +198,7 @@ func TestAdmission_AuthenticationRunsFirst(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		resp := getGraphNS(t, srv.URL, "held", http.Header{"X-Api-Key": {"k1"}})
-		resp.Body.Close()
+		statusOfGraphNS(t.Context(), srv.URL, "held", http.Header{"X-Api-Key": {"k1"}})
 	}()
 	require.Eventually(t, metricIs(srv.URL, "kube_state_graph_inflight_builds", "kube_state_graph_inflight_builds 1"),
 		5*time.Second, 5*time.Millisecond)
@@ -207,9 +227,7 @@ func TestAdmission_ZeroDisablesTheBound(t *testing.T) {
 	statuses := make(chan int, n)
 	for i := range n {
 		go func() {
-			resp := getGraphNS(t, srv.URL, "ns-"+string(rune('a'+i)), nil)
-			resp.Body.Close()
-			statuses <- resp.StatusCode
+			statuses <- statusOfGraphNS(t.Context(), srv.URL, "ns-"+string(rune('a'+i)), nil)
 		}()
 	}
 	require.Eventually(t, func() bool {
@@ -239,11 +257,11 @@ func TestAdmission_APanickingHandlerReleasesItsSlot(t *testing.T) {
 
 	for range 3 {
 		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+		r.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/boom", nil))
 		require.Equal(t, http.StatusInternalServerError, rec.Code)
 	}
 	assert.Empty(t, s.slots, "every slot was released")
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	r.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/ok", nil))
 	assert.Equal(t, http.StatusOK, rec.Code, "the bound of 1 still admits after three panics")
 }

@@ -136,7 +136,7 @@ func validRequestID(id string) bool {
 	if id == "" || len(id) > maxRequestIDLen {
 		return false
 	}
-	for i := 0; i < len(id); i++ {
+	for i := range len(id) {
 		switch b := id[i]; {
 		case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
 		case strings.IndexByte("._:=+/@-", b) >= 0:

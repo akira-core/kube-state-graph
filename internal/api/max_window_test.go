@@ -28,7 +28,7 @@ func windowOf(params url.Values, d time.Duration) url.Values {
 
 func getStatus(t *testing.T, srv *httptest.Server, path string, params url.Values) (int, errorBody) {
 	t.Helper()
-	resp, err := http.Get(srv.URL + path + "?" + params.Encode())
+	resp, err := httpGet(t, srv.URL+path+"?"+params.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	var body errorBody

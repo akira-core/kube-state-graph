@@ -62,7 +62,7 @@ func TestSelectorValueCap_RejectedBeforeAnyQuery(t *testing.T) {
 				t.Cleanup(srv.Close)
 
 				params := withParams(ep.params, url.Values{param: longValues(param, promql.MaxAlternationValues+1, 20)})
-				resp, err := http.Get(srv.URL + ep.path + "?" + params.Encode())
+				resp, err := httpGet(t, srv.URL+ep.path+"?"+params.Encode())
 				require.NoError(t, err)
 				defer resp.Body.Close()
 				require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -110,20 +110,20 @@ func TestMaxHeaderBytes_AdmitsTheLargestLegalRequest(t *testing.T) {
 	t.Logf("largest legal request line: %d bytes, %d aggr roots", len(target), len(params["aggr"]))
 	require.Greater(t, len(target), 128<<10, "the request is near the bound, not trivially under it")
 
-	resp, err := http.Get(target)
+	resp, err := httpGet(t, target)
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "admitted and answered, not 431")
 
 	// One more root fills a seventeenth chunk: still read, then refused by the cap.
 	over := withParams(params, url.Values{"aggr": longValues("aggr", len(params["aggr"])+1, 253)})
-	resp, err = http.Get(base + "/v1/storage-graph?" + over.Encode())
+	resp, err = httpGet(t, base+"/v1/storage-graph?"+over.Encode())
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "a root set past the cap is a 400, not a 431")
 
 	huge := base + "/v1/graph?start=1746442800&end=1746446400&x=" + strings.Repeat("y", MaxHeaderBytes+8192)
-	resp, err = http.Get(huge)
+	resp, err = httpGet(t, huge)
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusRequestHeaderFieldsTooLarge, resp.StatusCode)
@@ -140,7 +140,7 @@ func startProductionServer(t *testing.T) string {
 	require.Equal(t, MaxHeaderBytes, httpSrv.MaxHeaderBytes)
 	require.Equal(t, 256<<10, httpSrv.MaxHeaderBytes)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	go func() { _ = httpSrv.Serve(ln) }()
 	t.Cleanup(func() { _ = httpSrv.Close() })
@@ -188,13 +188,13 @@ func TestMaxHeaderBytes_PrefixedRoots(t *testing.T) {
 	}
 	target := base + "/v1/storage-graph?" + worst.Encode()
 	t.Logf("largest Kubernetes-legal pod root request line: %d bytes, %d pods", len(target), len(worst["pod"]))
-	resp, err := http.Get(target)
+	resp, err := httpGet(t, target)
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "admitted by the bound and by both pod caps")
 
 	corner := podRootRequest("ns-"+strings.Repeat("n", 167), 1600, 70)
-	resp, err = http.Get(base + "/v1/storage-graph?" + corner.Encode())
+	resp, err = httpGet(t, base+"/v1/storage-graph?"+corner.Encode())
 	require.NoError(t, err)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusRequestHeaderFieldsTooLarge, resp.StatusCode,
@@ -212,7 +212,7 @@ func TestAccessLog_ClustersAreTruncated(t *testing.T) {
 	clusters[3] = strings.Repeat("é", 100) // 200 bytes, cut at a rune boundary
 	params := withParams(graphEndpoints[0].params, url.Values{"cluster": clusters})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/graph?"+params.Encode(), nil))
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph?"+params.Encode(), nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	line := accessLogLine(t, &buf)
@@ -231,7 +231,7 @@ func TestAccessLog_ClustersAreTruncated(t *testing.T) {
 	buf.Reset()
 	params = withParams(graphEndpoints[0].params, url.Values{"cluster": {"c1", "c2"}})
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/graph?"+params.Encode(), nil))
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph?"+params.Encode(), nil))
 	line = accessLogLine(t, &buf)
 	assert.Equal(t, []any{"c1", "c2"}, line["clusters"])
 	assert.NotContains(t, line, "clusters_truncated")

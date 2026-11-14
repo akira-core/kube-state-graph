@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +23,7 @@ func serveWith(t *testing.T, s *Server, reqCtx context.Context, run buildFunc) (
 	t.Helper()
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodGet, "/v1/graph", nil).WithContext(reqCtx)
+	c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph", nil).WithContext(reqCtx)
 	projected := false
 	start := time.Unix(1746442800, 0).UTC()
 	s.serveGraph(c, start, start.Add(time.Hour), promql.Selector{}, run, "kube-state-graph.project",
@@ -78,7 +77,7 @@ func TestServeGraph_AProjectionPastTheDeadlineStopsBeforeEncoding(t *testing.T) 
 	s := newServerWithMocks(t, newMockQuerier(t, nil), func(c *config.Config) { c.BuildTimeout = 20 * time.Millisecond })
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodGet, "/v1/graph", nil)
+	c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph", nil)
 	var buildCtx context.Context
 	start := time.Unix(1746442800, 0).UTC()
 	s.serveGraph(c, start, start.Add(time.Hour), promql.Selector{},
@@ -91,7 +90,7 @@ func TestServeGraph_AProjectionPastTheDeadlineStopsBeforeEncoding(t *testing.T) 
 			return graph.Project(g, graph.Scope{})
 		})
 	assert.Equal(t, http.StatusGatewayTimeout, rec.Code)
-	assert.False(t, strings.Contains(rec.Body.String(), `"elements"`), "no graph body is written")
+	assert.NotContains(t, rec.Body.String(), `"elements"`, "no graph body is written")
 }
 
 // Spec: "A request that completes every stage".
