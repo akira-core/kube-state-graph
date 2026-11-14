@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+
 	"github.com/akira-core/kube-state-graph/pkg/build"
 	"github.com/akira-core/kube-state-graph/pkg/route/gwresolve"
 	"github.com/akira-core/kube-state-graph/pkg/route/matchcheck"
@@ -44,16 +46,37 @@ import (
 // builds its own throwaway snapshot.
 type Resolver struct {
 	st  store.Store
-	tr  *translate.Translator
-	run matchcheck.Runner
+	tr  translator
+	run matcher
 }
 
 var _ build.RouteResolver = (*Resolver)(nil)
 
+// translator is the istiod translation stage: one gateway's scoped config in,
+// the RouteConfiguration istiod would push out. *translate.Translator is the
+// production implementation; the seam exists so the resolver's orchestration
+// (memoisation, batching, the engine limit) can be exercised without building
+// an istiod world per call.
+type translator interface {
+	Translate(in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
+}
+
+// matcher is the router_check_tool stage: one RouteConfiguration plus a batch
+// of host+path queries in, one Envoy cluster string per query out ("" = no
+// route). matchcheck.Runner is the production implementation.
+type matcher interface {
+	Resolve(ctx context.Context, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error)
+}
+
 // NewResolver wires a Resolver over an opened store and a verified
 // router_check_tool runner.
 func NewResolver(st store.Store, run matchcheck.Runner) *Resolver {
-	return &Resolver{st: st, tr: translate.NewTranslator(), run: run}
+	return newResolver(st, translate.NewTranslator(), run)
+}
+
+// newResolver is NewResolver over any translator and matcher.
+func newResolver(st store.Store, tr translator, run matcher) *Resolver {
+	return &Resolver{st: st, tr: tr, run: run}
 }
 
 // ResolveRoute implements build.RouteResolver. The configuration is evaluated
