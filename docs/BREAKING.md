@@ -1,3 +1,15 @@
+# BREAKING — connection-string external nodes drop URL userinfo
+
+*Change: `redact-connection-string-userinfo`.*
+
+**What changed.** An unresolvable `"://"` service-graph label still becomes an `external` node. Its `id` and `name` no longer carry the URL userinfo (`user:password@`, or a bare `user@`). `mongodb://app:pw@mongo.example:27017/db` is now `external/mongodb://mongo.example:27017/db`. Every other byte of the label is unchanged, and a label without userinfo is byte-identical. Labels that differ only in their credentials now share one node and one edge. The per-series Debug records of the service-graph parse carry the same stripped form.
+
+**Who is affected.** Only a client that pinned the `id` of such a node, or of one of its edges, which are UUIDv5 over the endpoint ids. Every other node and edge is unchanged.
+
+**Migration.** Re-read the id from a fresh body. Rollback is a revert.
+
+---
+
 # BREAKING — root sets are capped by value count as well as bytes
 
 *Change: `cap-alternation-values`.*

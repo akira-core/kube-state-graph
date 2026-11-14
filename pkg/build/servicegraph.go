@@ -295,9 +295,13 @@ func (r *sgResolver) anyLoaded(ids []string) bool {
 // sgTrace carries the identity of the service-graph series currently being
 // resolved, threaded into the resolver purely so the debug logs can name WHICH
 // upstream metric fell back (and why). It never influences resolution.
+//
+// Its labels are NOT raw: parseWithResolver strips connection-string userinfo
+// (stripConnStringUserinfo) before building it, because every field here ends
+// up in a log record. Resolution never reads them.
 type sgTrace struct {
 	side                               string // "client" | "server" — which endpoint is being resolved
-	label                              string // this side's raw client/server label
+	label                              string // this side's client/server label, userinfo stripped
 	clientLabel, serverLabel           string
 	clientUID, serverUID, traceCluster string
 }
@@ -333,7 +337,7 @@ func (r *sgResolver) noteConnStringShadowed(t sgTrace, label, podUID string, att
 	args := append([]any{
 		"reason", "conn_string_shadowed_by_uid",
 		"side", t.side,
-		"label", label,
+		"label", stripConnStringUserinfo(label),
 		"pod_uid", podUID,
 		"client", t.clientLabel,
 		"server", t.serverLabel,
@@ -643,20 +647,23 @@ func parseWithResolver(vec model.Vector, res *sgResolver, routes routeIndex, red
 		// orphan subgraph — including the cross-cluster service-selects-pod fan-out.
 		if (clientUID == "" && clientLabel == "") || (serverUID == "" && serverLabel == "") {
 			slog.Debug("service-graph series dropped (one side wholly empty: no UID and no label)",
-				"client", clientLabel, "server", serverLabel,
+				"client", stripConnStringUserinfo(clientLabel), "server", stripConnStringUserinfo(serverLabel),
 				"client_uid", clientUID, "server_uid", serverUID, "trace_cluster", traceCluster)
 			continue
 		}
 
-		// Series identity threaded into the resolver for debug logging only.
+		// Series identity threaded into the resolver for debug logging only, so
+		// its labels are stripped of connection-string userinfo HERE, once: every
+		// Debug site that names the series (this file's and routeprescan.go's)
+		// reads them from the trace. Zero-cost for a label with no userinfo.
 		base := sgTrace{
-			clientLabel: clientLabel, serverLabel: serverLabel,
+			clientLabel: stripConnStringUserinfo(clientLabel), serverLabel: stripConnStringUserinfo(serverLabel),
 			clientUID: clientUID, serverUID: serverUID, traceCluster: traceCluster,
 		}
 		ctClient := base
-		ctClient.side, ctClient.label = "client", clientLabel
+		ctClient.side, ctClient.label = "client", base.clientLabel
 		ctServer := base
-		ctServer.side, ctServer.label = "server", serverLabel
+		ctServer.side, ctServer.label = "server", base.serverLabel
 
 		// Each side resolves to a (possibly empty) slice of node IDs. With the
 		// localised model a "://" endpoint resolves to AT MOST ONE service node —
@@ -1565,35 +1572,39 @@ func classifyBareShortName(host string) (service string, ok bool) {
 func (r *sgResolver) resolveConnString(label, anchorCluster string, t sgTrace) []string {
 	// Each early return below is a distinct, separately-logged external-fallback
 	// reason so an operator can tell exactly why a "://" peer did not resolve.
+	// Resolution reads the RAW label; only the external node built from it is
+	// stripped of userinfo (stripConnStringUserinfo), so a credential never
+	// becomes a node id or name while a credentialled label naming a held
+	// Service resolves exactly as before.
 	host := connStringHost(label)
 	if host == "" {
 		// url.Parse produced no host: opaque double-scheme (e.g. "jdbc:postgresql://…")
 		// or otherwise unparseable authority.
 		r.noteExternal("conn_host_unparseable", t, "anchor_cluster", anchorCluster)
-		return []string{r.external(label)}
+		return []string{r.external(stripConnStringUserinfo(label))}
 	}
 	svc, ns, ok := classifyK8sDNS(host)
 	if !ok {
 		// Host is not a 2/3-label Kubernetes .svc DNS name (single-label short
 		// name, 4+-label custom/mesh domain, IP literal, comma-joined multi-host…).
 		r.noteExternal("conn_host_not_k8s_dns", t, "host", host, "anchor_cluster", anchorCluster)
-		return []string{r.external(label)}
+		return []string{r.external(stripConnStringUserinfo(label))}
 	}
 	if ids := r.resolveServiceLevel(anchorCluster, ns, svc); len(ids) > 0 {
 		slog.Debug("service-graph :// resolved to service node",
-			"side", t.side, "label", label, "service", svc, "namespace", ns,
+			"side", t.side, "label", stripConnStringUserinfo(label), "service", svc, "namespace", ns,
 			"anchor_cluster", anchorCluster, "service_id", ids[0],
 			"client", t.clientLabel, "server", t.serverLabel)
 		return ids
 	}
 	// Host classified to (ns, svc) fine, but the anchor cluster does not itself
 	// hold that Service in its own family (same-cluster precondition; a family
-	// sibling holding it is not enough) → external node (labels={}, verbatim
-	// label as name).
+	// sibling holding it is not enough) → external node (labels={}, the label
+	// minus any userinfo as name).
 	r.noteExternal("anchor_cluster_lacks_service", t,
 		"service", svc, "namespace", ns, "host", host,
 		"anchor_cluster", anchorCluster, "anchor_family", ClusterFamilyKey(anchorCluster))
-	return []string{r.external(label)}
+	return []string{r.external(stripConnStringUserinfo(label))}
 }
 
 // resolveServiceLevel resolves a `<service>.<namespace>` record to a SINGLE
@@ -1864,6 +1875,48 @@ func (r *sgResolver) synthPod(id, cluster, namespace, podUID string) {
 		labels["namespace"] = namespace
 	}
 	r.synthPods[id] = &graph.PodNode{IDValue: id, NameValue: podUID, LabelsValue: labels}
+}
+
+// stripConnStringUserinfo removes the userinfo (`user:password@`, or a bare
+// `user@`) from every "://"-delimited authority in label, and returns every
+// other byte unchanged. It is what stands between a credential an
+// instrumentation wrote into a connection-string label and the response body
+// (an unresolvable "://" label becomes an external node's id and name) or the
+// Debug log.
+//
+// It is a string scan, not url.Parse: url.Parse leaves an opaque
+// double-scheme label ("jdbc:postgresql://user:pw@h/db") with no User at all,
+// rejects a password holding an invalid escape, and re-serialising its result
+// would normalise labels that carry no credential — changing node ids that
+// have nothing to hide. The authority runs from just after "://" to the first
+// '/', '?' or '#', and the userinfo ends at the LAST '@' inside it (an
+// unescaped '@' in a password is common in practice). An '@' in a path, query
+// or fragment is not userinfo and is kept. A credential holding an unescaped
+// '/', '?' or '#' is not a valid URI authority and is not recognised.
+//
+// The userinfo is removed entirely rather than masked (url.URL.Redacted's
+// "xxxxx"): the result is then the same whatever the credential, so a rotation
+// keeps one node id, and no placeholder suggests a secret is still there.
+// Labels carrying no userinfo are returned as-is, without an allocation.
+func stripConnStringUserinfo(label string) string {
+	const sep = "://"
+	out := label
+	from := 0
+	for {
+		i := strings.Index(out[from:], sep)
+		if i < 0 {
+			return out
+		}
+		start := from + i + len(sep)
+		end := len(out)
+		if j := strings.IndexAny(out[start:], "/?#"); j >= 0 {
+			end = start + j
+		}
+		if at := strings.LastIndexByte(out[start:end], '@'); at >= 0 {
+			out = out[:start] + out[start+at+1:]
+		}
+		from = start
+	}
 }
 
 // connStringHost extracts the host of a "://" connection string (scheme,

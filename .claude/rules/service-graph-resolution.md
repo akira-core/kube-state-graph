@@ -153,7 +153,17 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
     is emitted between them.
   - **unresolvable** (host not a 2/3-label `.svc` name, or the anchor cluster
     does not itself hold the service in its own family) → an `external` node
-    (`id="external/<label>"`, `labels={}`) with the verbatim label as `name`.
+    (`id="external/<label>"`, `labels={}`) with the label as `name` — verbatim
+    EXCEPT that every URL userinfo (`user:pw@`, bare `user@`) is removed
+    (`stripConnStringUserinfo`: string scan, authority up to the first
+    `/?#`, cut at its LAST `@`; never `url.Parse`, which misses
+    `jdbc:…://` and errors on bad escapes, and never `url.Redacted`'s mask,
+    so labels differing only in credentials share one node). Applied at the
+    three `resolveConnString` fallbacks ONLY — never inside `r.external`,
+    whose peer-ladder callers and `routeNodeID` must keep the raw peer value
+    in lock-step — and never to the label resolution reads. `sgTrace` is
+    built from the stripped labels, so no per-series Debug record carries
+    the credential either.
   - A series with a **wholly empty side** (no UID, no label) is dropped before
     any resolution — the other side's `"://"` label must not leak service /
     external nodes or fan-out edges as an orphan subgraph.
