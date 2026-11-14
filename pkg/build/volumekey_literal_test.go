@@ -24,19 +24,29 @@ func regexToken(t *testing.T, rules []VolumeKeyRule, pv string) string {
 
 func TestVolumeKeyRewriter_LiteralFastPathAgreesWithRegexp(t *testing.T) {
 	ruleSets := map[string][]VolumeKeyRule{
-		"default":              nil,
-		"identity":             {},
-		"literal multi-byte":   {{Pattern: "pvc-", Replacement: "vol_"}},
-		"literal then literal": {{Pattern: "-", Replacement: "_"}, {Pattern: "pvc_", Replacement: ""}},
-		"escaped metachar":     {{Pattern: `\.`, Replacement: "_"}},
-		"regexp class":         {{Pattern: "[-.]", Replacement: "_"}},
-		"anchored":             {{Pattern: "^pvc-", Replacement: "x_"}},
-		"capture replacement":  {{Pattern: "(pvc)-", Replacement: "${1}_"}},
-		"dollar in literal":    {{Pattern: "-", Replacement: "$0"}},
-		"empty pattern":        {{Pattern: "", Replacement: "_"}},
-		"case-insensitive":     {{Pattern: "(?i)PVC", Replacement: "v"}},
+		"default":               nil,
+		"identity":              {},
+		"literal multi-byte":    {{Pattern: "pvc-", Replacement: "vol_"}},
+		"literal then literal":  {{Pattern: "-", Replacement: "_"}, {Pattern: "pvc_", Replacement: ""}},
+		"escaped metachar":      {{Pattern: `\.`, Replacement: "_"}},
+		"regexp class":          {{Pattern: "[-.]", Replacement: "_"}},
+		"anchored":              {{Pattern: "^pvc-", Replacement: "x_"}},
+		"end-anchored":          {{Pattern: "pvc-$", Replacement: "x_"}},
+		"end-anchored word":     {{Pattern: "abc$", Replacement: "_"}},
+		"literal then boundary": {{Pattern: `a\b`, Replacement: "_"}},
+		"literal then any":      {{Pattern: "(?s)a.b", Replacement: "_"}},
+		"capture replacement":   {{Pattern: "(pvc)-", Replacement: "${1}_"}},
+		"dollar in literal":     {{Pattern: "-", Replacement: "$0"}},
+		"empty pattern":         {{Pattern: "", Replacement: "_"}},
+		"case-insensitive":      {{Pattern: "(?i)PVC", Replacement: "v"}},
 	}
-	pvs := []string{"", "pvc-ab12-cd34", "pvc.ab.12", "PVC-x", "plain", "a-b-c-"}
+	// The inputs repeat each literal past the start and before the end, so a
+	// rule whose literal prefix is not its whole pattern (an anchor, a
+	// boundary, a wildcard after it) diverges from strings.ReplaceAll on them.
+	pvs := []string{
+		"", "pvc-ab12-cd34", "pvc.ab.12", "PVC-x", "plain", "a-b-c-",
+		"pvc-pvc-1", "a-pvc-b", "x-pvc-", "abcabc", "abc-x", "axb",
+	}
 	for name, rules := range ruleSets {
 		rw, err := NewVolumeKeyRewriter(rules)
 		require.NoError(t, err, name)
