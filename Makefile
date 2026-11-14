@@ -56,6 +56,13 @@ GOBIN ?= $(shell go env GOPATH)/bin
 # supported version 2".
 GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION   ?= v1.9.0
+# The binary init-tools installs. `make lint` runs it whenever it exists, so a
+# different golangci-lint earlier on PATH (e.g. Homebrew's) can neither
+# satisfy init-tools' version check nor run in place of the pin; PATH is only
+# the fallback for a tree where init-tools never ran.
+GOLANGCI_LINT_BIN := $(GOBIN)/golangci-lint
+GOVULNCHECK_BIN   := $(GOBIN)/govulncheck
+GOLANGCI_LINT      = $(if $(wildcard $(GOLANGCI_LINT_BIN)),$(GOLANGCI_LINT_BIN),golangci-lint)
 
 init: init-go init-tools
 	@echo ""
@@ -85,16 +92,18 @@ init-tools:
 	@echo ">> golangci-lint $(GOLANGCI_LINT_VERSION)"
 	@# Built from the tagged module version through the Go module proxy and
 	@# checksum database, never from an unpinned script fetched off a branch.
-	@if ! command -v golangci-lint >/dev/null 2>&1 || ! golangci-lint --version 2>/dev/null | grep -q "version $$(echo $(GOLANGCI_LINT_VERSION) | sed 's/^v//') "; then \
+	@# Checks the binary in $(GOBIN) — the one this target installs and
+	@# `make lint` runs — never whichever comes first on PATH.
+	@if ! $(GOLANGCI_LINT_BIN) --version 2>/dev/null | grep -q "version $$(echo $(GOLANGCI_LINT_VERSION) | sed 's/^v//') "; then \
 	    GOBIN=$(GOBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
-	    echo "  already installed: $$(golangci-lint --version)"; \
+	    echo "  already installed: $$($(GOLANGCI_LINT_BIN) --version)"; \
 	fi
 	@echo ">> govulncheck $(GOVULNCHECK_VERSION)"
-	@if ! command -v govulncheck >/dev/null 2>&1 || ! govulncheck -version 2>/dev/null | grep -q "govulncheck@$(GOVULNCHECK_VERSION)$$"; then \
+	@if ! $(GOVULNCHECK_BIN) -version 2>/dev/null | grep -q "govulncheck@$(GOVULNCHECK_VERSION)$$"; then \
 	    GOBIN=$(GOBIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 	else \
-	    echo "  already installed at $$(command -v govulncheck)"; \
+	    echo "  already installed at $(GOVULNCHECK_BIN)"; \
 	fi
 	@echo ">> mockery (via go tool — no install needed)"
 	@go tool mockery --version 2>/dev/null | tail -1 | awk '{print "  " $$0}' || echo "  WARN: 'go tool mockery' failed; check go.mod tool directive."
@@ -117,8 +126,8 @@ init-hooks:
 doctor:
 	@echo "go         : $$(go version 2>/dev/null || echo MISSING)"
 	@echo "GOBIN      : $(GOBIN)"
-	@echo "golangci   : $$(golangci-lint --version 2>/dev/null | head -1 || echo MISSING)"
-	@echo "govulncheck: $$(command -v govulncheck >/dev/null && echo present || echo MISSING)"
+	@echo "golangci   : $$(test -x $(GOLANGCI_LINT_BIN) && $(GOLANGCI_LINT_BIN) --version 2>/dev/null | head -1 || echo "MISSING from $(GOBIN) (run make init-tools)") [pin $(GOLANGCI_LINT_VERSION)]"
+	@echo "govulncheck: $$(test -x $(GOVULNCHECK_BIN) && $(GOVULNCHECK_BIN) -version 2>/dev/null | grep -o 'govulncheck@[^ ]*' || echo "MISSING from $(GOBIN) (run make init-tools)") [pin $(GOVULNCHECK_VERSION)]"
 	@echo "swag (tool): $$(go tool swag -v 2>/dev/null | head -1 || echo MISSING)"
 	@echo "mockery    : $$(go tool mockery --version 2>/dev/null | tail -1 || echo MISSING)"
 	@echo "docker     : $$(docker --version 2>/dev/null || echo MISSING)"
@@ -158,9 +167,11 @@ test:
 vet:
 	go vet ./...
 
+## Runs $(GOBIN)/golangci-lint (the pinned one init-tools installs) when it
+## exists, else golangci-lint from PATH.
 lint:
-	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed: https://golangci-lint.run/usage/install/"; exit 1; }
-	golangci-lint run --timeout=5m
+	@command -v $(GOLANGCI_LINT) >/dev/null 2>&1 || { echo "golangci-lint not installed: run 'make init-tools'"; exit 1; }
+	$(GOLANGCI_LINT) run --timeout=5m
 
 ## Always the pinned govulncheck (go run caches the build), never whatever
 ## happens to be on PATH: CI runs this target, so local and CI scans agree.
@@ -218,10 +229,12 @@ router-check-tool:
 	@chmod +x $(ROUTER_CHECK_BIN)
 	@echo "router_check_tool -> $(ROUTER_CHECK_BIN)"
 
-## Full local CI mirror — runs the same checks as the five GitHub Actions jobs
-## in .github/workflows/ci.yml (lint, vuln, test, docs-drift, mocks-drift), in
-## order. Invoked by the pre-push hook (see `make init-hooks`). Run directly to
-## reproduce CI locally before pushing.
+## Full local CI mirror — runs the checks of the GitHub Actions jobs in
+## .github/workflows/ci.yml (lint, vuln, test, docs-drift, mocks-drift,
+## route-containment), in order. It leaves out `embedder-go` (needs Go 1.27.1)
+## and `image-build` (needs Docker; run `make docker-build`). Invoked by the
+## pre-push hook (see `make init-hooks`). Run directly to reproduce CI locally
+## before pushing.
 ci: lint vuln test check-docs verify-mocks check-route-containment check-parser-containment
 	@echo "ci: all checks passed (lint + vuln + test + docs + mocks + containment)"
 
