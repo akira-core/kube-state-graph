@@ -33,10 +33,13 @@ cluster N: kube-state-metrics ──┤
   pod or node (`/v1/k8s-graph`).
 - The set of clusters with data is the `clusters` field of any `/v1/graph`
   response.
-- Builds the graph on every request — v1 ships **no in-process result cache**,
-  **no singleflight**, and **no HTTP cache validators** (`ETag` /
-  `If-None-Match` / `304`). A horizontally scalable cache mechanism for
-  distributed deployment is anticipated as a future change. Caller-supplied
+- Builds the graph on every request — v1 ships **no built-graph or response
+  cache** and **no HTTP cache validators** (`ETag` / `If-None-Match` / `304`).
+  Upstream query results are cached in-process per backend store for a short
+  TTL, and identical concurrent queries are coalesced (on by default; see
+  [`docs/upstream-backend-routing.md`](docs/upstream-backend-routing.md)). A
+  horizontally scalable cache mechanism for distributed deployment is
+  anticipated as a future change. Caller-supplied
   `start` / `end` accept RFC 3339 or Unix seconds; the server enforces
   `end > start` and, only when `--max-window` is set, a maximum window length
   (`400 invalid_range`; off by default). There is no future-time guard.
@@ -190,7 +193,7 @@ annotation families log-and-continue + 13 Harvest + 2 kubelet
 log-and-continue), then **3** service-graph queries (skipped when a filtered
 build loaded neither pods nor services), plus `up{}` only for an unfiltered
 empty topology. There is **no metric-name prefix**; every series is queried at
-its bare name. v1 has no result cache.
+its bare name. Query results are cached per backend store for a short TTL (see above); built graphs are not cached.
 
 Every Kubernetes-shaped series is expected to carry a `cluster` external label
 (injected by `vmagent` / Prometheus `external_labels` per source cluster).

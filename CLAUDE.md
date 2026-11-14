@@ -55,11 +55,11 @@ Module path: `github.com/akira-core/kube-state-graph`. Minimum Go 1.26 (`go.mod`
 HTTP /v1/graph?start=&end=&...
    │
    ▼
+admission middleware (`/v1/*` only, after API-key auth, BEFORE the handler parses)  ── --max-inflight-builds (default 32, 0 = off); full → 503 `overloaded` + `Retry-After: 1`; a parse error (400) is reachable only once admitted
+   ▼
 parseGraphRequest        ── kubegraph.ParseValues → Request{Start, End, Scope, Selector}
    │                        validates start/end (RFC 3339 or Unix seconds; only `end > start`),
    │                        selector values (≤253 bytes, no control chars; at most 100 DISTINCT values of cluster/namespace/az/env → `invalid_scope`) and `prune`
-   ▼
-admission middleware (`/v1/*` only, after API-key auth)  ── --max-inflight-builds (default 32, 0 = off); full → 503 `overloaded` + `Retry-After: 1`
    ▼
 --max-window (internal/api, default off) on the caller's end-start  ── longer → 400 `invalid_range`
    ▼
@@ -68,7 +68,7 @@ kubegraph.AlignWindow(start, end, --end-align)  ── runBuild, AFTER validatio
 context.WithTimeout(ctx, --build-timeout)   ── graph endpoints only; bounds build, projection, serialisation AND encoding (checked between stages); deadline exceeded → 504 timeout, client gone → 499
    └─ Builder.Build(ctx, window, end, sel)
          ├─ ReadTopology  (errgroup of 37 PromQL queries in parallel — KSM topology incl. node ready_status + 3 service/endpointslice + 2 owner + PVC-info + container-info + 6 controller-annotation families + kube_job_owner + 12 Harvest + 2 kubelet + ALERTS; 19 fetch + 18 fetchOptional — kube_replicaset_annotations, kube_job_annotations and kube_pod_container_info degrade with Harvest/kubelet/ALERTS; one table, `topologyLegs`, drives both the launch and the RawSeriesCount tally — plus a SECOND WAVE of the 6 Harvest QoS workload legs, gated on kube_persistentvolumeclaim_info + volume_labels and scoped to the FlexVol names the loaded claims matched, so a build where none matched issues 37 queries and one where some did issues 43; a configured application-metadata metric adds one more `fetchOptional` leg, `app_metadata`, so 38 / 44)
-         ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector; joined with topology)
+         ├─ ReadServiceGraph (errgroup of 3 PromQL queries in parallel; an UNFILTERED build prefetches them BESIDE the topology fan-out — startServiceGraphPrefetch — and joins before the parse, a filtered build reads them after topology and skips them when the selector loaded nothing: the required request total + 2 OPTIONAL RED — failed total + server-seconds histogram; `user`/`unknown` peers excluded at selector; joined with topology)
          └─ assemble → attachAlerts → attachStatus → graph.NewGraph (immutable)
    (every upstream query passes its store's guard: query-result cache → miss coalescing → per-store slot, see .claude/rules/upstream-queries.md)
    ▼

@@ -701,7 +701,7 @@ The storage build SHALL NOT issue `kube_pod_container_info`, `kube_service_info`
 - **WHEN** claim-binding series name `shop/web-0` and the estate also holds a claimless `platform/web-0`
 - **THEN** the pod read carries `namespace="shop",pod="web-0"`, `platform/web-0` is never fetched, and the body is byte-identical to the body an unrestricted pod read would produce
 
-#### Scenario: Pods are read one query per namespace
+#### Scenario: Pods are read in one grouped query, not one per namespace
 
 - **WHEN** the pods to read are `shop/orders-0`, `shop/web-0` and `platform/orders-0`
 - **THEN** `kube_pod_info` and `kube_pod_owner` are each issued as one query `{namespace=~"platform|shop",pod=~"orders-0|web-0"}` beside the request matchers, not one query per namespace
