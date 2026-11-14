@@ -68,11 +68,20 @@ func SkipIfDockerUnavailable(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker binary not in PATH; skipping integration suite")
 	}
-	cmd := exec.Command("docker", "info")
+	// Bounded: a wedged daemon socket would otherwise hang `docker info`, and
+	// with it every suite, until the package-level test timeout dumps
+	// goroutines. A daemon that cannot answer in time is unreachable.
+	ctx, cancel := context.WithTimeout(t.Context(), dockerInfoTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "info")
+	cmd.WaitDelay = time.Second
 	if err := cmd.Run(); err != nil {
 		t.Skip("docker daemon unreachable; skipping integration suite")
 	}
 }
+
+// dockerInfoTimeout bounds the `docker info` reachability probe.
+const dockerInfoTimeout = 30 * time.Second
 
 // SetupSuite starts the VictoriaMetrics container and waits for readiness.
 func (s *VMSuite) SetupSuite() {
