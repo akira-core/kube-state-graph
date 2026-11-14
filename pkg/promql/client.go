@@ -2,6 +2,8 @@ package promql
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	promapi "github.com/prometheus/client_golang/api"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
@@ -146,9 +149,12 @@ func (c *Client) CloseIdleConnections() {
 // metrics labelled with the supplied query name and emitting a `prometheus.query`
 // span carrying the rendered statement.
 func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) (model.Vector, error) {
+	stmt := boundStatement(query)
 	attrs := []attribute.KeyValue{
 		semconv.DBSystemKey.String("prometheus"),
-		attribute.String("db.statement", query),
+		attribute.String("db.statement", stmt.text),
+		attribute.Int("kube_state_graph.query_bytes", stmt.bytes),
+		attribute.String("kube_state_graph.query_sha256", stmt.sha256),
 		attribute.String("kube_state_graph.query_name", name),
 	}
 	if c.backend != "" {
@@ -167,7 +173,9 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 
 	slog.DebugContext(ctx, "promql query",
 		"name", name,
-		"query", query,
+		"query", stmt.text,
+		"query_bytes", stmt.bytes,
+		"query_sha256", stmt.sha256,
 		"ts", ts.UTC().Format(time.RFC3339),
 	)
 
@@ -203,7 +211,9 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		span.SetStatus(codes.Error, err.Error())
 		slog.ErrorContext(ctx, "promql query failed",
 			"name", name,
-			"query", query,
+			"query", stmt.text,
+			"query_bytes", stmt.bytes,
+			"query_sha256", stmt.sha256,
 			"ts", ts.UTC().Format(time.RFC3339),
 			"err", err,
 		)
@@ -230,6 +240,42 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		"ts", ts.UTC().Format(time.RFC3339),
 	)
 	return vec, nil
+}
+
+// maxStatementBytes bounds the rendered query a span or log record carries. A
+// request matcher is caller-controlled, so an unbounded statement let one cheap
+// request write megabytes of span attributes and Error logs — on every leg, and
+// on every repetition, since a failed query is never cached.
+const maxStatementBytes = 2048
+
+// statement is the bounded form of a rendered query for spans and logs: the
+// text truncated to maxStatementBytes, the full length, and a short SHA-256
+// prefix, so a truncated statement can still be told apart from another and
+// matched against an upstream log line.
+type statement struct {
+	text   string
+	bytes  int
+	sha256 string
+}
+
+func boundStatement(query string) statement {
+	sum := sha256.Sum256([]byte(query))
+	return statement{
+		text:   truncateUTF8(query, maxStatementBytes),
+		bytes:  len(query),
+		sha256: hex.EncodeToString(sum[:6]),
+	}
+}
+
+// truncateUTF8 returns at most n bytes of s, cut on a character boundary.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // evaluationTimeoutMargin is kept back from the caller's remaining time when
