@@ -23,7 +23,7 @@ cluster N: kube-state-metrics ──┤
 - Join 成多叢集圖，節點鍵為帶叢集範圍的 pod UID 與 node 名稱。
 - 回傳 Cytoscape.js JSON（`/v1/graph`）、其儲存流向檢視（`/v1/storage-graph`），以及某個 pod 或 node 周邊僅含 Kubernetes 的鄰域（`/v1/k8s-graph`）。
 - 有資料的叢集清單由任一 `/v1/graph` 回應的 `clusters` 欄位提供。
-- 每次請求都重新建圖——v1 **不附帶 built-graph 或 response cache**，也**不發 HTTP cache validator**（無 `ETag` / `If-None-Match` / `304`）。上游 query 結果會依 backend store 在 process 內快取一小段 TTL，且相同的並行 query 會被合併（預設開啟，見 [`docs/upstream-backend-routing.md`](docs/upstream-backend-routing.md)）。後續分散式部署的水平擴展 cache 機制留待另案。`start` / `end` 接受 RFC 3339 或 Unix 秒，server 強制 `end > start`，且僅在設定 `--max-window` 時才限制視窗長度上限（`400 invalid_range`；預設關閉）。沒有未來時間擋板。**部署前提：**bounded query cost 交由 VictoriaMetrics 搜尋限制負責——不論 `--max-window` 設多少，都請在 vmselect 設定 `-search.maxQueryDuration` 與 `-search.maxSamplesPerQuery`（以及 `-search.maxPointsPerTimeseries`），因為視窗上限只約束請求的視窗本身（`io_delta=true` 的 storage 請求會讀兩倍視窗）。`cluster`、`namespace`、`az`、`env` 各自最多接受 100 個相異值（`400 invalid_scope`），且每個 replica 同時最多執行 `--max-inflight-builds` 個 `/v1/*` 請求（預設 32；超過時回 `503 overloaded` 並帶 `Retry-After: 1`）。序列化輸出為確定性 body，僅含 `apiVersion`、`clusters`、`elements`，不回顯時間欄位；pod／node／service 的 IP 在頂層 `ipaddress`，不在 `labels`。Pod 另帶具型別的 `data` 屬性——`owner`（`{kind, name}`）、`application`（ArgoCD 應用）、`containers`（`[{name, image}]`）——皆 `omitempty` 且絕不在 `labels`。
+- 每次請求都重新建圖——v1 **不附帶 built-graph 或 response cache**，也**不發 HTTP cache validator**（無 `ETag` / `If-None-Match` / `304`）。上游 query 結果會依 backend store 在 process 內快取一小段 TTL，且相同的並行 query 會被合併（預設開啟，見 [`docs/upstream-backend-routing.md`](docs/upstream-backend-routing.md)）。後續分散式部署的水平擴展 cache 機制留待另案。`start` / `end` 接受 RFC 3339 或 Unix 秒，server 強制 `end > start`，且僅在設定 `--max-window` 時才限制視窗長度上限（`400 invalid_range`；預設關閉）。沒有未來時間擋板。**部署前提**：bounded query cost 交由 VictoriaMetrics 搜尋限制負責——不論 `--max-window` 設多少，都請在 vmselect 設定 `-search.maxQueryDuration` 與 `-search.maxSamplesPerQuery`（以及 `-search.maxPointsPerTimeseries`），因為視窗上限只約束請求的視窗本身（`io_delta=true` 的 storage 請求會讀兩倍視窗）。`cluster`、`namespace`、`az`、`env` 各自最多接受 100 個相異值（`400 invalid_scope`），且每個 replica 同時最多執行 `--max-inflight-builds` 個 `/v1/*` 請求（預設 32；超過時回 `503 overloaded` 並帶 `Retry-After: 1`）。序列化輸出為確定性 body，僅含 `apiVersion`、`clusters`、`elements`，不回顯時間欄位；pod／node／service 的 IP 在頂層 `ipaddress`，不在 `labels`。Pod 另帶具型別的 `data` 屬性——`owner`（`{kind, name}`）、`application`（ArgoCD 應用）、`containers`（`[{name, image}]`）——皆 `omitempty` 且絕不在 `labels`。
 - **在來源端收斂**：`cluster`、`namespace`、`az`、`env` 會被渲染成上游 PromQL 的 label matcher，由 VictoriaMetrics 先過濾，樣本才上線。service-graph 系列刻意完整讀取，詳見[請求過濾參數](#請求過濾參數)。
 
 ## 快速開始
@@ -60,7 +60,7 @@ curl -H 'X-API-Key: my-secret-key' \
 
 ## 請求過濾參數
 
-`GET /v1/graph` 必填 `start`、`end`，另有六個選填參數。同一參數多值為 OR，不同參數為 AND。
+`GET /v1/graph` 必填 `start`、`end`，另有五個選填參數。同一參數多值為 OR，不同參數為 AND。
 
 | 參數 | 生效層 | 說明 |
 |---|---|---|
@@ -108,13 +108,13 @@ body 帶 `pod`、`node`、`pvc` 節點、`pod-to-node` 與 `pod-mounts-pvc` 邊�
 
 ## 上游指標
 
-完整營運者目錄（全部 **41** 條系列、PromQL 包裝、固定 selector、query 失敗 vs 空向量、每次請求的 fan-out）見 [`docs/upstream-metrics.md`](docs/upstream-metrics.md)（英文）。
+完整營運者目錄（全部 **47** 條系列、PromQL 包裝、固定 selector、query 失敗 vs 空向量、每次請求的 fan-out）見 [`docs/upstream-metrics.md`](docs/upstream-metrics.md)（英文）。
 
-摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；13 條 Harvest + 2 條 kubelet 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。Query 結果依 backend store 快取一小段 TTL（見上文）；built graph 不快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），並改依參照讀 pod、Kubernetes node 與 controller：`kube_pod_info`／`kube_pod_owner` 只讀 claim binding、`pod=` root，或（請求以 `application=<argo-app>` 為 root 時）該 Application 的 recovery 讀回的 pod——即使這些 pod 沒有掛載任何 claim 也會載入。`application=` 是 workload 側 root：路徑上的 pod 或 claim 帶有該 Application 就保留，而且會抑制「只有 pod root 才推導 namespace」。其餘依參照讀取不變：四條 `kube_node_*` 只讀這些 pod 排程所在的節點或 `node=` root 點名的節點；八條 controller-owner／controller-annotation 只讀這些 pod 解析出的 owner 名稱。以 `ontap_cluster=`、`aggr=` 或 `svm=` 為 root 的請求改走 **volume hub**：claim 系列改從被指名元件的 `volume_labels` rows 反查（FlexVol 名稱內嵌的 `pvc_<uid>` 即 PV `pvc-<uid>`）。claim 查詢帶請求的 `az`／`env` matcher；Harvest 依 `az` routing、不帶 matcher。查詢不會送到其他 zone 的 store，因此跨 zone 共用的 filer 只畫出所請求 zone 的 claim。靜態佈建的 PV 無法從 storage root 找到，詳見 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)。
+摘要：一次 `/v1/graph` 會平行發出 **37** 條拓樸查詢（19 條 kube-state-metrics 遇 query 錯誤會失敗整次建圖；3 條為 log-and-continue——2 條基數隨歷史累積的 annotation 族，以及基數隨容器、image 變體與 pod 汰換倍增的 `kube_pod_container_info`；12 條 Harvest、2 條 kubelet 與 `ALERTS` 為 log-and-continue），再發 **3** 條 service-graph 查詢（帶過濾且未載入任何 pod／service 時整組跳過），`up{}` 只在未過濾且拓樸為空時探測。**沒有 metric-name prefix**，一律用裸名查詢。Query 結果依 backend store 快取一小段 TTL（見上文）；built graph 不快取。`/v1/storage-graph` 讀得更少：不發 `kube_pod_container_info` 與四條 Service／EndpointSlice 查詢（body 不帶 `data.containers`、也沒有 service 節點），並改依參照讀 pod、Kubernetes node 與 controller：`kube_pod_info`／`kube_pod_owner` 只讀 claim binding、`pod=` root，或（請求以 `application=<argo-app>` 為 root 時）該 Application 的 recovery 讀回的 pod——即使這些 pod 沒有掛載任何 claim 也會載入。`application=` 是 workload 側 root：路徑上的 pod 或 claim 帶有該 Application 就保留，而且會抑制 pod-only 的 namespace 推導。其餘依參照讀取不變：四條 `kube_node_*` 只讀這些 pod 排程所在的節點或 `node=` root 點名的節點；八條 controller-owner／controller-annotation 只讀這些 pod 解析出的 owner 名稱。以 `ontap_cluster=`、`aggr=` 或 `svm=` 為 root 的請求改走 **volume hub**：claim 系列改從被指名元件的 `volume_labels` rows 反查（FlexVol 名稱內嵌的 `pvc_<uid>` 即 PV `pvc-<uid>`）。claim 查詢帶請求的 `az`／`env` matcher；Harvest 依 `az` routing、不帶 matcher。查詢不會送到其他 zone 的 store，因此跨 zone 共用的 filer 只畫出所請求 zone 的 claim。靜態佈建的 PV 無法從 storage root 找到，詳見 [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)。
 
 K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫入的 `cluster` 標籤。Harvest 的 `cluster` 是 **ONTAP** 叢集，不用來當 `?cluster=`。
 
-下表「必填？」指的是**空向量**會不會丟掉該功能。kube-state-metrics 19 條 abort-on-error 或 `traces_service_graph_request_total` 的 **query 錯誤**（逾時／5xx）會失敗整次建圖；`kube_replicaset_annotations` 與 `kube_job_annotations`（基數隨歷史累積、不是活物件數）、`kube_pod_container_info`（基數隨容器、image 變體與 pod 汰換倍增）、Harvest、kubelet 與兩條 RED 系列在 `/v1/graph` 上則 log-and-continue。`/v1/storage-graph` 則 fail closed：除 `ALERTS` 外任何 family 的 query 錯誤都回 502 `upstream`，`message` 為 `upstream query failed: <family>`。細節見目錄。
+下表「必填？」談的是**空向量**（該系列不在 store 中，或在視窗內沒有匹配）。kube-state-metrics 19 條 abort-on-error 或 `traces_service_graph_request_total` 的 **query 錯誤**（逾時／5xx）會失敗整次建圖；`kube_replicaset_annotations` 與 `kube_job_annotations`（基數隨歷史累積、不是活物件數）、`kube_pod_container_info`（基數隨容器、image 變體與 pod 汰換倍增）、Harvest、kubelet 與兩條 RED 系列在 `/v1/graph` 上則 log-and-continue。`/v1/storage-graph` 則 fail closed：除 `ALERTS` 外任何 family 的 query 錯誤都回 502 `upstream`，`message` 為 `upstream query failed: <family>`。細節見目錄。
 
 ### 拓樸指標 — 由 [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics) 產出
 
@@ -134,7 +134,7 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 | `kube_pod_container_info` | Pod 容器清單 `data.containers` = `[{name, image}]`，依 `(name, image)` 排序；視窗內換 image 時每容器取最新觀測到的 image | `cluster`, `namespace`, `pod`, `container`, `image` | 選填（缺或 query 錯誤則無 `data.containers`）；屬 KSM 預設。`/v1/storage-graph` 不讀 |
 | `kube_service_info` | `://` 連線字串解析用的 Service 索引；`cluster_ip`（headless `None` ⇒ 無 `data.ipaddress`） | `cluster`, `namespace`, `service`, `cluster_ip` | 選填（缺則 `://` endpoint 退成 `external`） |
 | `kube_service_annotations` | Service 的 ArgoCD Application `data.application`（tracking-id 第一個 `:` 前的片段），並把 service 放進 `application` compound group | `cluster`, `namespace`, `service`, `annotation_argocd_argoproj_io_tracking_id` | 選填（缺則無 `data.application`）。**需要** `--metric-annotations-allowlist=services=[argocd.argoproj.io/tracking-id]`（非 KSM 預設） |
-| `kube_persistentvolumeclaim_annotations` | PVC 自己的 ArgoCD Application `data.application`（解析同 service）。沒有 annotation 的 PVC 會再**繼承**掛載它的 pod 之中詞彙最小的 Application | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | 選填（缺則無自己的 annotation；繼承仍可能填上 `data.application`）。**需要** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`（非 KSM 預設） |
+| `kube_persistentvolumeclaim_annotations` | PVC 自己的 ArgoCD Application `data.application`（解析同 service），並把 PVC 放進 `application` compound group。沒有 annotation 的 PVC 會再**繼承**掛載它的 pod 之中詞彙最小的 Application | `cluster`, `namespace`, `persistentvolumeclaim`, `annotation_argocd_argoproj_io_tracking_id` | 選填（缺則無自己的 annotation；繼承仍可能填上 `data.application`）。**需要** `--metric-annotations-allowlist=persistentvolumeclaims=[argocd.argoproj.io/tracking-id]`（非 KSM 預設） |
 | `kube_endpointslice_endpoints` | Service → 後端 pod fan-out（`service-selects-pod` 邊） | `cluster`, `namespace`, `endpointslice`, `targetref_kind`, `targetref_namespace`, `targetref_name` | 選填 |
 | `kube_endpointslice_labels` | 把 EndpointSlice join 到所屬 Service | `cluster`, `namespace`, `endpointslice`, `label_kubernetes_io_service_name` | 選填——**需要** `--metric-labels-allowlist=endpointslices=[kubernetes.io/service-name]`（非 KSM 預設）；缺則無法做 `service-selects-pod` 解析 |
 
@@ -150,6 +150,9 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 | `aggr_new_status` | Aggregate `data.health`（sample 為 `1` 則 `online`，否則 `degraded`；無 series 則省略） | `cluster`、`node`、`aggr` | 選填 |
 | `aggr_space_used`／`aggr_space_total` | Aggregate `data.usage` `{used_bytes, capacity_bytes}` | `cluster`、`node`、`aggr` | 選填 |
 | `node_new_status` | Controller `data.health`（對應方式同 aggregate） | `cluster`、`node` | 選填 |
+| `node_labels` | Controller `data.hardware` `{model, serial, version, vendor, location}`，取自同名標籤。info series：只讀 labels、丟棄 sample 值 | `cluster`、`node`、`model`、`serial`、`version`、`vendor`、`location` | 選填（缺則無 `data.hardware`） |
+| `node_cpu_busy` | Controller `data.perf.cpu_busy_pct`（百分比，原樣） | `cluster`、`node` | 選填（缺則省略該欄位） |
+| `node_total_ops`／`node_total_latency`／`node_total_data` | Controller `data.perf.total_ops`、`total_latency_us`、`total_bytes_per_sec` | `cluster`、`node` | 選填（缺則省略該欄位） |
 | `kubelet_volume_stats_used_bytes`／`kubelet_volume_stats_capacity_bytes` | PVC `data.usage` `{used_bytes, capacity_bytes}` | `cluster`、`namespace`、`persistentvolumeclaim` | 選填 |
 
 上述標籤全部是 **stock Harvest 輸出**——不需要、也不會讀取任何 relabel 規則。ONTAP volume 名稱不允許 `-`，因此接往 Kubernetes 的橋樑由 backend 自行搭建：把 PVC 綁定的 PV 名改寫成 match token（預設把 `-` 換成 `_`），再與 `volume` 比對（預設以 suffix 比對，因此不必宣告 provisioner 的 `storagePrefix`）。兩者皆可設定。見 `docs/netapp-harvest-preconditions.md`。
@@ -192,9 +195,9 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 
 兩條新系列皆為**選填**並優雅降級：指標缺漏、空結果或 query 錯誤只會省略受影響的欄位（或只剩 rate），絕不失敗建圖。三個值皆為四捨五入到 **6 位有效數字**的 JSON 數字，且**可能以指數形式出現**（例如 30 天視窗內一次請求會是 `3.86e-7`）。消費端不可假設固定小數位渲染（`toFixed`），且必須把 `0` 與極小的非零值視為語意不同。
 
-**RED 涵蓋範圍的 producer 前提：**collector 的 `dimensions` 必須在三條系列間**完全一致**——failure counter 與 histogram 以精確 label identity 與 request counter join，因此只套用在某一族的 relabel 或額外維度會讓 join 落空（以獨立的 warn 顯示：`failed_total_label_set_mismatch`／`server_seconds_bucket_label_set_mismatch`）。`add_metric_suffixes` 必須開啟，histogram 才會命名為 `..._server_seconds_bucket`（而非 `..._server_bucket`）。Pod UID（`client_k8s_pod_uid`／`server_k8s_pod_uid`）已不再是量測的必要條件，但能給出最精確的端點 identity；多 replica collector 需要 trace-ID 感知的 routing（`loadbalancing` exporter 搭配 `routing_key: traceID`），否則 client／server span 永遠配不成對，未成對的邊會經由 peer-address 階梯解析——仍會被量測，但其 `_server_seconds` 是 **client** 觀測到的值，因此 `p90_server_ms` 會包含 server 從未看到的網路時間。
+**RED 涵蓋範圍的 producer 前提**：collector 的 `dimensions` 必須在三條系列間**完全一致**——failure counter 與 histogram 以精確 label identity 與 request counter join，因此只套用在某一族的 relabel 或額外維度會讓 join 落空（以獨立的 warn 顯示：`failed_total_label_set_mismatch`／`server_seconds_bucket_label_set_mismatch`）。`add_metric_suffixes` 必須開啟，histogram 才會命名為 `..._server_seconds_bucket`（而非 `..._server_bucket`）。Pod UID（`client_k8s_pod_uid`／`server_k8s_pod_uid`）已不再是量測的必要條件，但能給出最精確的端點 identity；多 replica collector 需要 trace-ID 感知的 routing（`loadbalancing` exporter 搭配 `routing_key: traceID`），否則 client／server span 永遠配不成對，未成對的邊會經由 peer-address 階梯解析——仍會被量測，但其 `_server_seconds` 是 **client** 觀測到的值，因此 `p90_server_ms` 會包含 server 從未看到的網路時間。
 
-**Query 成本。**histogram 以原樣讀取（`rate(..._bucket{...}[w])`，不做 `sum by`），因此約有 `edge 基數 × bucket 數` 條 series 過線。這是刻意的：當端點可能來自 peer 位址或連線字串時，沒有任何低基數 label 子集能辨識一條邊，而 group-by 會悄悄把不相干邊的延遲分布合併。此指標為選填——store 拒絕該 query 時，行為與缺漏完全相同（無 `p90_server_ms`，建圖不失敗）。
+**Query 成本**。histogram 以原樣讀取（`rate(..._bucket{...}[w])`，不做 `sum by`），因此約有 `edge 基數 × bucket 數` 條 series 過線。這是刻意的：當端點可能來自 peer 位址或連線字串時，沒有任何低基數 label 子集能辨識一條邊，而 group-by 會悄悄把不相干邊的延遲分布合併。此指標為選填——store 拒絕該 query 時，行為與缺漏完全相同（無 `p90_server_ms`，建圖不失敗）。
 
 `servicegraph` connector 產生的**虛擬節點**——`client="user"`（未被 instrument 的呼叫端）與 `unknown`（無法解析的對端）——會在 query 層排除（`client!~"user|unknown",server!~"user"`），通常不會出現為任何節點或邊。比對為精確且大小寫敏感，因此 host 只是「包含」`user` 的 `://` 連線字串不受影響。**Server 端收窄為 `server!~"user"`**，因此 `server="unknown"` 的 series 仍會到達 reader：當其 client 端解析為**真實** pod、且 client 端記錄的對端位址（依序 `client_server_address`、`client_network_peer_address`、`client_net_peer_name`，第一個非空者勝出）指向某個 Kubernetes Service 時，該對端會被還原成 `pod-calls-service` 邊（非叢集位址則成為 `external` 節點），而非直接丟棄；其餘所有 `server="unknown"` 情況仍如舊 byte-for-byte 丟棄。同一段 sentinel 片段也套用在兩條 RED series selector 上，它們各帶一個自己的 matcher——`edge_relation!="link"`（見上表）。
 
@@ -216,12 +219,12 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 | `pod-to-node` | `kube_pod_info`（`node` 標籤；每個已排程 pod 一條，叢集內） |
 | `pvc-to-netapp-aggr` | Harvest `volume_labels`，以 PVC `volumename`（PV 名）推導出的 token 比對 stock `volume` 標籤 |
 | `pod-calls-pod` | `traces_service_graph_request_total` |
-| `pod-calls-service` | `traces_service_graph_request_total`（目標透過連線字串／peer-address／route engine 解析為 service 節點時） |
-| `service-selects-pod` | `traces_service_graph_request_total`（連線字串解析 + `kube_endpointslice_*` join，隨需產生） |
+| `pod-calls-service` | `traces_service_graph_request_total`（目標解析為 service 節點時——連線字串解析、`server="unknown"` 的 peer-address 階梯，或 route engine） |
+| `service-selects-pod` | `traces_service_graph_request_total`（由已解析的 service 節點隨需 fan-out + `kube_endpointslice_*` join） |
 
-### 驗證
+### 多叢集與跨叢集涵蓋
 
-多叢集／跨叢集／service-graph 情境由 **`internal/integration/`** 搭配 testcontainers-go 起的 VictoriaMetrics 容器涵蓋：手工製作的 fixture series 以 Prometheus 文字曝露格式（`POST /api/v1/import/prometheus`）推進容器後，再對 in-process API server 驗證。
+多叢集／跨叢集／service-graph 情境由 **`internal/integration/`** 搭配 testcontainers-go 起的 VictoriaMetrics 容器涵蓋：手工製作的 fixture series 以 Prometheus 文字曝露格式（`POST /api/v1/import/prometheus`）推進容器後，再對 in-process API server 驗證——這是多叢集、跨叢集與 service-graph 行為唯一的驗證途徑。
 
 ## 設定
 
@@ -240,7 +243,7 @@ K8s 形狀的系列預期帶有由 `vmagent`／Prometheus `external_labels` 寫�
 | `--az-label` | `KSG_AZ_LABEL` | `az` | `?az=` 參數比對的上游 label。請求參數名稱固定不變，只有 label 綁定會改；必須是合法 PromQL label name 且與 `--env-label` 不同。 |
 | `--env-label` | `KSG_ENV_LABEL` | `env` | `?env=` 參數比對的上游 label。 |
 | `--app-metadata-metric` | `KSG_APP_METADATA_METRIC` | （空） | 選用的 per-pod application-metadata 指標名稱（routing family `appmeta`）。空白代表關閉：不發出查詢，回應內容與未啟用時逐 byte 相同。已設定指標但沒有 backend 服務 `appmeta` 時，啟動會記一則 Warn，行為與未設定相同。 |
-| `--app-metadata-labels` | `KSG_APP_METADATA_LABELS` | （空） | 逗號分隔的 `field=label` 覆寫。欄位：`app`（預設 `argocd_app`）、`user`（`user`）、`ns_owner`（`owner`）、`namespace`（`namespace`）、`pod`（`pod`）。省略的欄位保留預設。必須同時設定 `--app-metadata-metric`。`cluster` 固定讀 label `cluster`；az/env 沿用 `--az-label` / `--env-label`。 |
+| `--app-metadata-labels` | `KSG_APP_METADATA_LABELS` | （空） | 逗號分隔的 `field=label` 覆寫。欄位：`app`（預設 `argocd_app`）、`user`（`user`）、`ns_owner`（`owner`）、`namespace`（`namespace`）、`pod`（`pod`）、`deploy_time`（`deploy_time`）、`ns_group`（`namespace_group`）、`ns_group_owner`（`namespace_group_owner`）、`ns_alias`（`namespace_alias`）。省略的欄位保留預設。必須同時設定 `--app-metadata-metric`。`cluster` 固定讀 label `cluster`；az/env 沿用 `--az-label` / `--env-label`。 |
 | — | `KSG_PROM_USERNAME` | （空） | 上游 VictoriaMetrics endpoint 的 HTTP Basic Auth 使用者名稱。**僅環境變數、沒有旗標**，因為帶憑證的旗標會經由 `ps` 與容器 spec 洩漏。必須與 `KSG_PROM_PASSWORD` 一起設定。 |
 | — | `KSG_PROM_PASSWORD` | （空） | 上游的 HTTP Basic Auth 密碼。僅環境變數，與 `KSG_PROM_USERNAME` 成對——只設其中一個會使啟動失敗。輪替需重啟（無熱重載）；更動 Deployment 中由 Secret 供應的環境變數本來就會觸發 rollout。 |
 
@@ -260,7 +263,7 @@ env:
       secretKeyRef: { name: ksg-upstream-auth, key: password }
 ```
 
-之後每個上游請求（拓樸、service-graph、叢集探索、`/readyz` 探針）都會帶 `Authorization: Basic …`。憑證值絕不出現在 log、trace、metrics 或錯誤回應中。
+這兩個變數設定的是未指定 `--backends-file` 時使用的單一隱含 backend；對它的每個上游請求（拓樸、service-graph、`/readyz` 探針）都會帶 `Authorization: Basic …`。憑證值絕不出現在 log、trace、metrics 或錯誤回應中。
 
 ### 在 process 內嵌入 engine
 
@@ -268,7 +271,7 @@ env:
 
 ## 文件
 
-- **上游指標目錄（全部 41 條）：** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
+- **上游指標目錄（全部 47 條）：** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
 - **kube-state-metrics 安裝／RBAC／allowlist：** [`docs/kube-state-metrics-preconditions.md`](docs/kube-state-metrics-preconditions.md)
 - **NetApp Harvest relabel 與 hops：** [`docs/netapp-harvest-preconditions.md`](docs/netapp-harvest-preconditions.md)
 
@@ -290,7 +293,7 @@ clone 後**只跑一次**。下載 modules、安裝 host-level 工具（`golangc
 ```bash
 make init           # go mod download + dev tools
 make doctor         # 檢查工具版本（go、golangci-lint、govulncheck、mockery、docker）
-make init-hooks     # （選用）安裝 pre-commit hook（gofmt + go vet）
+make init-hooks     # （選用）安裝 pre-commit（gofmt + golangci-lint + 快速測試）與 pre-push（make ci）hook
 ```
 
 需求：Go 1.26+。`go.mod` 中 pin 的 toolchain（目前 `go1.27.4`）會在第一次 build 時自動下載。
@@ -307,7 +310,7 @@ make cover          # coverage profile
 
 ### Mocks（mockery）
 
-production-side 依賴透過小介面（`promql.Querier`、`auth.Validator`、`clock.Clock`）暴露，單元測試用 mockery 生成的 mock 注入，**不再用 `httptest.NewServer` 假冒上游服務**。Mock 放在 `internal/<pkg>/mocks/` 並 commit 進 git，CI 不需安裝 mockery。
+production-side 依賴透過小介面（`promql.Querier`、`auth.Validator`、`clock.Clock`）暴露，單元測試用 mockery 生成的 mock 注入，**不再用 `httptest.NewServer` 假冒上游服務**。Mock 放在 各介面旁的 `<pkg>/mocks/` 並 commit 進 git，CI 不需安裝 mockery。
 
 ```bash
 make mocks          # 編輯介面後重新產生 mocks
@@ -325,7 +328,7 @@ make verify-mocks   # CI 風格的 freshness 檢查（regen + git diff）
 | Golden | `internal/api/golden_test.go` + `testdata/golden/*.json` | 無。執行 `-update` 重新生成 snapshot。 |
 | Integration | `internal/integration/*` | **需 Docker。** testcontainers-go 啟動真實 VictoriaMetrics 容器；`SkipIfDockerUnavailable` 在沒有 Docker 的本機自動跳過，CI 跑全套。 |
 
-unit 與 integration 邊界嚴格：**任何透過 TCP socket 連到上游的測試都歸類為 integration**。單元測試必須能在無外部相依下執行。整合測試走 `internal/integration/` + testcontainers-go：直接以 Prometheus 文字曝露格式把 fixture series 推進臨時 VictoriaMetrics 容器。
+unit 與 integration 邊界嚴格：**任何透過 TCP socket 連到上游的測試都歸類為 integration**。單元測試必須能在無外部相依下執行。
 
 ## 授權
 
