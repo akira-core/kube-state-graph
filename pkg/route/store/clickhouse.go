@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +80,9 @@ type CH struct {
 	uniqueRows bool
 	collapsed  atomic.Uint64
 	warnOnce   sync.Once
+
+	// tls records whether the connection was configured with TLS.
+	tls bool
 }
 
 var _ Store = (*CH)(nil)
@@ -130,11 +135,18 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	chOpts, err := clickhouse.ParseDSN(dsn)
+	chOpts, err := parseDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse route-store dsn: %w", err)
+		return nil, err
 	}
 	applyAuth(chOpts, cfg)
+	if plaintextCredentials(chOpts) {
+		// Values never logged — only the fact, so an operator can see the
+		// exposure the DSN's missing `secure=true` creates.
+		slog.Warn("route store credentials are sent without TLS: the ClickHouse connection is unencrypted; "+
+			"set secure=true on --route-store-dsn / KSG_ROUTE_STORE_DSN to encrypt it",
+			"route_store_tls", false)
+	}
 	conn, err := clickhouse.Open(chOpts)
 	if err != nil {
 		return nil, err
@@ -143,7 +155,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping route store: %w", err)
 	}
-	s := &CH{conn: conn, uniqueRows: cfg.uniqueRows}
+	s := &CH{conn: conn, uniqueRows: cfg.uniqueRows, tls: chOpts.TLS != nil}
 	if err := s.validateSchema(ctx, chOpts.Auth.Database); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -152,6 +164,37 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*CH, error) {
 }
 
 func (s *CH) Close() error { return s.conn.Close() }
+
+// TLS reports whether the store's connection is configured with TLS (the
+// DSN's secure=true). Logged at startup as route_store_tls.
+func (s *CH) TLS() bool { return s.tls }
+
+// errMalformedDSN is reported for a route-store DSN that does not parse as a
+// URL. It deliberately quotes nothing: the URL parser's own error embeds the
+// whole input, and even its inner error can quote a fragment of the userinfo
+// (a password containing '/' ends the authority early and surfaces as an
+// invalid port; a bad '%' escape is quoted verbatim).
+var errMalformedDSN = errors.New("parse route-store dsn: not a valid URL (the value is not shown because it may carry credentials)")
+
+// parseDSN is clickhouse.ParseDSN with its URL-syntax errors redacted. The
+// remaining ParseDSN errors name a query parameter and its value (dial_timeout,
+// secure, …), never the userinfo, and pass through.
+func parseDSN(dsn string) (*clickhouse.Options, error) {
+	chOpts, err := clickhouse.ParseDSN(dsn)
+	if err == nil {
+		return chOpts, nil
+	}
+	if urlErr := (*url.Error)(nil); errors.As(err, &urlErr) {
+		return nil, errMalformedDSN
+	}
+	return nil, fmt.Errorf("parse route-store dsn: %w", err)
+}
+
+// plaintextCredentials reports whether a password will be sent over a
+// connection without TLS. A username alone is an identity, not a secret.
+func plaintextCredentials(o *clickhouse.Options) bool {
+	return o.Auth.Password != "" && o.TLS == nil
+}
 
 // CollapsedRows reports how many rows the client-side dedup has discarded
 // over this store's lifetime. Under uniqueRows it is the writer-uniqueness
