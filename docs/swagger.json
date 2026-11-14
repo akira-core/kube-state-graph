@@ -646,6 +646,24 @@
                         },
                         "description": "A required upstream query returned an error (RFC 9110 §15.6.3); the message names the family (`upstream query failed: \u003cfamily\u003e`). Optional families — Harvest, kubelet, ALERTS and the degrading annotation / container families — log and continue instead"
                     },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`",
+                        "headers": {
+                            "Retry-After": {
+                                "description": "Seconds to wait before retrying (always 1)",
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
                     "504": {
                         "content": {
                             "application/json": {
@@ -821,6 +839,24 @@
                             }
                         },
                         "description": "An upstream query of ANY family except ALERTS returned an error; the message names the family (`upstream query failed: \u003cfamily\u003e`)"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`",
+                        "headers": {
+                            "Retry-After": {
+                                "description": "Seconds to wait before retrying (always 1)",
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        }
                     },
                     "504": {
                         "content": {
@@ -1110,6 +1146,24 @@
                             }
                         },
                         "description": "An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: \u003cfamily\u003e`)"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/internal_api.errorBody"
+                                }
+                            }
+                        },
+                        "description": "Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`",
+                        "headers": {
+                            "Retry-After": {
+                                "description": "Seconds to wait before retrying (always 1)",
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        }
                     },
                     "504": {
                         "content": {

@@ -33,6 +33,9 @@ type Server struct {
 	logger  *slog.Logger
 	keys    auth.Validator
 	clk     clock.Clock
+	// slots is the --max-inflight-builds semaphore shared by every handler the
+	// server builds; nil when the bound is disabled.
+	slots chan struct{}
 }
 
 // New wires up a Server. keys may be nil to run with API-key authentication
@@ -44,6 +47,10 @@ func New(cfg config.Config, builder *build.Builder, prom promql.Querier, m *obse
 	if keys == nil {
 		keys = auth.NewKeySet()
 	}
+	var slots chan struct{}
+	if cfg.MaxInflightBuilds > 0 {
+		slots = make(chan struct{}, cfg.MaxInflightBuilds)
+	}
 	return &Server{
 		cfg:     cfg,
 		builder: builder,
@@ -52,6 +59,7 @@ func New(cfg config.Config, builder *build.Builder, prom promql.Querier, m *obse
 		logger:  logger,
 		keys:    keys,
 		clk:     clk,
+		slots:   slots,
 	}
 }
 
@@ -72,6 +80,8 @@ func (s *Server) Handler() http.Handler {
 		otelgin.Middleware(telemetry.ServiceName),
 		s.apiKeyMiddleware(),
 		s.spanEnrichMiddleware(),
+		// Last: only an authenticated request can take (or be refused) a slot.
+		s.admissionMiddleware(),
 	)
 	v1.GET("/graph", s.handleGraph)
 	v1.GET("/storage-graph", s.handleStorageGraph)

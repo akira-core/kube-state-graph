@@ -75,6 +75,8 @@ import (
 //	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, invalid_range, invalid_scope, outside_retention)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502			{object}	errorBody	"A required upstream query returned an error (RFC 9110 §15.6.3); the message names the family (`upstream query failed: <family>`). Optional families — Harvest, kubelet, ALERTS and the degrading annotation / container families — log and continue instead"
+//	@Failure		503			{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503			{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout (RFC 9110 §15.6.5)"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/graph [get]
@@ -123,6 +125,8 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
 //	@Failure		401				{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502				{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: <family>`)"
+//	@Failure		503				{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503				{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504				{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/storage-graph [get]
@@ -170,6 +174,8 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 //	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_cluster, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502			{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error; the message names the family (`upstream query failed: <family>`)"
+//	@Failure		503			{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503			{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/k8s-graph [get]

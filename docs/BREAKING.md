@@ -1,3 +1,21 @@
+# BREAKING — graph requests are admission-controlled and selector values are capped
+
+*Change: `bound-request-admission`.*
+
+**What changed.**
+
+- At most `--max-inflight-builds` / `KSG_MAX_INFLIGHT_BUILDS` `/v1/*` requests (default **32**) run at once per replica. The next one is answered at once with `503 Service Unavailable`, `reason: "overloaded"`, `Retry-After: 1`, and issues no upstream query. Before, every request was admitted and queued on the per-store upstream slot until `--build-timeout` turned it into a 504. `/livez`, `/readyz`, `/metrics`, `/docs` and `/openapi.*` are never limited. New self-metrics: `kube_state_graph_inflight_builds`, `kube_state_graph_admission_rejected_total`.
+- Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values on every graph endpoint; more is `400 invalid_scope` before any query.
+- A `pod=` root set whose `(namespace, name)` pairs exceed the root chunk cap (about 1600 namespaces under one name) is `400 invalid_scope` on `/v1/storage-graph` and `/v1/k8s-graph`.
+- `http.Server.MaxHeaderBytes` is 256 KiB (was net/http's 1 MiB default): a longer request line is `431`. Every request the parsers accept at the default byte budget fits.
+- The `--build-timeout` deadline now also bounds projection, serialisation and encoding, so a request that finished building just inside the deadline but encoded past it is `504` instead of `200`.
+
+**Who is affected.** A deployment that runs more than 32 concurrent graph requests per replica (it starts seeing 503s under load), a client sending more than 100 distinct values of one selector parameter, and a client relying on a request line above 256 KiB.
+
+**Migration.** Raise `--max-inflight-builds` to the replica's real capacity, or set it to `0` to restore the unbounded behaviour; alert on `kube_state_graph_admission_rejected_total`. Clients retry a 503 after `Retry-After`. Split a request with more than 100 values of one selector parameter into several. Rollback is `KSG_MAX_INFLIGHT_BUILDS=0` for admission, a revert for the rest.
+
+---
+
 # BREAKING — root sets are capped by value count as well as bytes
 
 *Change: `cap-alternation-values`.*
