@@ -5,8 +5,11 @@
 # what it is, the digest says exactly which bytes, so a re-pushed tag cannot
 # change the build. Each digest is the multi-arch INDEX (not a per-platform
 # manifest), so multi-platform builds still resolve per platform. Re-pin with
-# `docker buildx imagetools inspect <tag>` (the top-level `Digest:` line);
-# Dependabot's docker ecosystem proposes the bumps.
+# `docker buildx imagetools inspect <tag>` (the top-level `Digest:` line).
+# Dependabot's docker ecosystem proposes bumps for the two FROM images ONLY,
+# and CI's `image-build` job builds every such proposal. It tracks neither the
+# `# syntax=` frontend nor the ARG-held ENVOY_TOOLS_IMAGE: re-pin those two by
+# hand with the command above.
 
 # Envoy tools image supplying router_check_tool. SINGLE SOURCE of that
 # reference: `make router-check-tool` greps this line so CI installs the exact

@@ -1,8 +1,8 @@
 name: CI
 
-# `lint`, `vuln`, `embedder-go`, `test`, `docs-drift`, `route-containment`, and
-# `mocks-drift` are separate jobs; they run in parallel (no `needs` edges) so PR feedback
-# latency = max, not sum.
+# `lint`, `vuln`, `embedder-go`, `test`, `docs-drift`, `route-containment`,
+# `mocks-drift`, and `image-build` are separate jobs; they run in parallel (no
+# `needs` edges) so PR feedback latency = max, not sum.
 on:
   pull_request:
   # Also run on direct pushes / merges to the default branch so post-merge
@@ -188,3 +188,20 @@ jobs:
       # `go tool mockery`, so no separate install step is needed.
       - name: Verify mocks in sync
         run: make verify-mocks
+
+  # Builds deploy/docker/server.Dockerfile, never pushes. It is the gate for the
+  # digest-pinned image inputs: a Dependabot docker PR moving a FROM digest
+  # would otherwise pass every other job without the image ever being built.
+  # It also catches a golang base image that disagrees with go.mod's
+  # `toolchain` (the build stage runs GOTOOLCHAIN=local). Host arch only: the
+  # runner's default buildx driver cannot export a multi-platform image, and
+  # each FROM digest is a multi-arch index, so the other platforms resolve from
+  # the same pinned index at `make docker-push` time.
+  image-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Build server image (no push)
+        run: make docker-build
