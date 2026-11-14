@@ -101,11 +101,11 @@ func run() error {
 	// or a backend's own usernameEnv / passwordEnv); config.Validate
 	// guarantees the global pair is set together or not at all. Neither the
 	// startup log nor the routing table's rendered form carries a value.
-	promRouter, err := buildRouter(cfg, metrics, logger, os.LookupEnv)
+	promRouter, routingContent, err := buildRouter(cfg, metrics, logger, os.LookupEnv)
 	if err != nil {
 		return fmt.Errorf("upstream backends: %w", err)
 	}
-	startBackendReload(appCtx, promRouter, cfg, logger, metrics, os.LookupEnv)
+	startBackendReload(appCtx, promRouter, routingContent, cfg, logger, metrics, os.LookupEnv)
 
 	keys, err := loadAPIKeys(appCtx, cfg, logger)
 	if err != nil {

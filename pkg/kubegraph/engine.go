@@ -129,10 +129,11 @@ func NewRouted(r *promql.Router, opts Options) *Engine {
 	return New(r, opts)
 }
 
-// Probe reports upstream reachability via a cheap up{} instant query — the same
+// Probe reports upstream reachability via a cheap count(up) instant query — the same
 // signal the build's retention check uses — suitable for a readiness check.
 func (e *Engine) Probe(ctx context.Context) error {
-	_, err := e.q.Instant(ctx, string(promql.QUpProbe), string(promql.QUpProbe), e.clk.Now().UTC())
+	_, err := e.q.Instant(ctx, string(promql.QUpProbe),
+		promql.Render(promql.QUpProbe, 0, promql.LabelKeys{}, promql.Selector{}), e.clk.Now().UTC())
 	return err
 }
 

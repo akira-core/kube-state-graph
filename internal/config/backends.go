@@ -17,6 +17,12 @@ func ReadBackendsFile(path string, lookup LookupEnvFunc) (*promql.Table, error) 
 	return backendsfile.Read(path, backendsfile.LookupEnvFunc(lookup))
 }
 
+// ReadBackendsFileWithContent is ReadBackendsFile that also returns the bytes
+// the table was parsed from, which seed the reloader's change digest.
+func ReadBackendsFileWithContent(path string, lookup LookupEnvFunc) (*promql.Table, []byte, error) {
+	return backendsfile.ReadWithContent(path, backendsfile.LookupEnvFunc(lookup))
+}
+
 // ParseBackendsFile parses a routing table and resolves each backend's
 // credentials from the environment through lookup.
 func ParseBackendsFile(data []byte, lookup LookupEnvFunc) (*promql.Table, error) {

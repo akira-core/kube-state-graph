@@ -94,7 +94,7 @@ func TestInitialTable_ImplicitSingleBackend(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.PromURL = "http://vm.example:8428"
 
-	tbl, err := initialTable(cfg, quietLogger(), noEnv)
+	tbl, _, err := initialTable(cfg, quietLogger(), noEnv)
 	require.NoError(t, err)
 	require.Equal(t, 1, tbl.Len())
 
@@ -112,7 +112,7 @@ func TestInitialTable_ImplicitBackendCarriesGlobalCredentials(t *testing.T) {
 	cfg.PromUsername = "u"
 	cfg.PromPassword = "p"
 
-	tbl, err := initialTable(cfg, quietLogger(), noEnv)
+	tbl, _, err := initialTable(cfg, quietLogger(), noEnv)
 	require.NoError(t, err)
 	u, p := tbl.Backends()[0].Credentials()
 	assert.Equal(t, "u", u)
@@ -123,9 +123,10 @@ func TestInitialTable_FromFile(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.BackendsFile = writeTable(t, twoBackends)
 
-	tbl, err := initialTable(cfg, quietLogger(), noEnv)
+	tbl, content, err := initialTable(cfg, quietLogger(), noEnv)
 	require.NoError(t, err)
 	assert.Equal(t, 2, tbl.Len())
+	assert.Equal(t, twoBackends, string(content), "the parsed bytes seed the reloader")
 }
 
 // An invalid file at BOOT is fatal, unlike the reload path: there is no
@@ -134,7 +135,7 @@ func TestInitialTable_InvalidFileIsFatal(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.BackendsFile = writeTable(t, "backends:\n  - name: broken\n    url: not-a-url\n    families: [ksm]\n")
 
-	_, err := initialTable(cfg, quietLogger(), noEnv)
+	_, _, err := initialTable(cfg, quietLogger(), noEnv)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `backend "broken"`)
 }
@@ -143,7 +144,7 @@ func TestInitialTable_MissingFileIsFatal(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.BackendsFile = filepath.Join(t.TempDir(), "absent.yaml")
 
-	_, err := initialTable(cfg, quietLogger(), noEnv)
+	_, _, err := initialTable(cfg, quietLogger(), noEnv)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "absent.yaml")
 }
@@ -157,7 +158,7 @@ func TestBuildRouter_WarnsWhenAppMetadataUnserved(t *testing.T) {
 	cfg.BackendsFile = writeTable(t, twoBackends)
 
 	var buf bytes.Buffer
-	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	r, _, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 	require.Equal(t, 2, r.Table().Len(), "startup proceeds on the loaded table")
@@ -175,7 +176,7 @@ func TestBuildRouter_NoAppMetadataWarnWhenUnset(t *testing.T) {
 	cfg.BackendsFile = writeTable(t, twoBackends)
 
 	var buf bytes.Buffer
-	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	r, _, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 	assert.NotContains(t, buf.String(), "application-metadata metric is configured")
@@ -188,7 +189,7 @@ func TestBuildRouter_NoAppMetadataWarnWhenFamilyServed(t *testing.T) {
 	cfg.PromURL = "http://vm.example:8428"
 
 	var buf bytes.Buffer
-	r, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
+	r, _, err := buildRouter(cfg, nil, capturingLogger(&buf), noEnv)
 	require.NoError(t, err)
 	require.NotNil(t, r)
 	assert.NotContains(t, buf.String(), "application-metadata metric is configured")
@@ -196,7 +197,7 @@ func TestBuildRouter_NoAppMetadataWarnWhenFamilyServed(t *testing.T) {
 
 func TestBuildRouter_ImplicitBackendRoutesEveryFamily(t *testing.T) {
 	cfg := config.Defaults()
-	r, err := buildRouter(cfg, nil, quietLogger(), noEnv)
+	r, _, err := buildRouter(cfg, nil, quietLogger(), noEnv)
 	require.NoError(t, err)
 	require.Equal(t, 1, r.Table().Len())
 
@@ -214,15 +215,15 @@ func TestBuildRouter_ImplicitBackendRoutesEveryFamily(t *testing.T) {
 // left to prove here is the wiring: which config values arm it, and that the
 // loop stops with its context.
 
-func newTestRouter(t *testing.T, path string, m *recordingMetrics) *promql.Router {
+func newTestRouter(t *testing.T, path string, m *recordingMetrics) (*promql.Router, []byte) {
 	t.Helper()
-	tbl, err := config.ReadBackendsFile(path, noEnv)
+	tbl, content, err := config.ReadBackendsFileWithContent(path, noEnv)
 	require.NoError(t, err)
 	r, err := promql.NewRouter(tbl, m, func(promql.Backend) (promql.Querier, error) {
 		return promqlNoopQuerier{}, nil
 	})
 	require.NoError(t, err)
-	return r
+	return r, content
 }
 
 // promqlNoopQuerier stands in for an upstream client: the reload tests care
@@ -238,7 +239,7 @@ func (promqlNoopQuerier) Instant(context.Context, string, string, time.Time) (mo
 func TestStartBackendReload_SwapsThroughTheLiveRouter(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r := newTestRouter(t, path, m)
+	r, content := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = path
@@ -246,7 +247,7 @@ func TestStartBackendReload_SwapsThroughTheLiveRouter(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	startBackendReload(ctx, r, cfg, quietLogger(), m, noEnv)
+	startBackendReload(ctx, r, content, cfg, quietLogger(), m, noEnv)
 
 	require.NoError(t, os.WriteFile(path, []byte(threeBackends), 0o600))
 	require.Eventually(t, func() bool { return r.Table().Len() == 3 }, time.Second, 5*time.Millisecond)
@@ -257,7 +258,7 @@ func TestStartBackendReload_SwapsThroughTheLiveRouter(t *testing.T) {
 func TestStartBackendReload_DisabledByZeroInterval(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r := newTestRouter(t, path, m)
+	r, content := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = path
@@ -265,7 +266,7 @@ func TestStartBackendReload_DisabledByZeroInterval(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	startBackendReload(ctx, r, cfg, quietLogger(), m, noEnv)
+	startBackendReload(ctx, r, content, cfg, quietLogger(), m, noEnv)
 
 	require.NoError(t, os.WriteFile(path, []byte(threeBackends), 0o600))
 	// Give any (incorrectly) started goroutine ample opportunity to fire.
@@ -278,7 +279,7 @@ func TestStartBackendReload_DisabledByZeroInterval(t *testing.T) {
 func TestStartBackendReload_DisabledWithoutAFile(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r := newTestRouter(t, path, m)
+	r, content := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = ""
@@ -286,7 +287,7 @@ func TestStartBackendReload_DisabledWithoutAFile(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	startBackendReload(ctx, r, cfg, quietLogger(), m, noEnv)
+	startBackendReload(ctx, r, content, cfg, quietLogger(), m, noEnv)
 
 	time.Sleep(100 * time.Millisecond)
 	assert.Zero(t, m.reloadCount())
@@ -296,14 +297,14 @@ func TestStartBackendReload_DisabledWithoutAFile(t *testing.T) {
 func TestStartBackendReload_StopsWithContext(t *testing.T) {
 	path := writeTable(t, twoBackends)
 	m := &recordingMetrics{}
-	r := newTestRouter(t, path, m)
+	r, content := newTestRouter(t, path, m)
 
 	cfg := config.Defaults()
 	cfg.BackendsFile = path
 	cfg.BackendsReloadInterval = 5 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(t.Context())
-	startBackendReload(ctx, r, cfg, quietLogger(), m, noEnv)
+	startBackendReload(ctx, r, content, cfg, quietLogger(), m, noEnv)
 	require.Eventually(t, func() bool { return m.reloadCount() > 0 }, time.Second, 5*time.Millisecond)
 	cancel()
 
@@ -328,7 +329,7 @@ func TestInitialTable_FileOverridesPromURLAndSaysSo(t *testing.T) {
 	cfg.BackendsFile = writeTable(t, twoBackends)
 
 	var buf bytes.Buffer
-	tbl, err := initialTable(cfg, capturingLogger(&buf), noEnv)
+	tbl, _, err := initialTable(cfg, capturingLogger(&buf), noEnv)
 	require.NoError(t, err)
 	assert.Equal(t, 2, tbl.Len(), "the file's backends serve, not --prom-url")
 
@@ -349,7 +350,7 @@ func TestInitialTable_DefaultPromURLDoesNotWarn(t *testing.T) {
 	cfg.BackendsFile = writeTable(t, twoBackends)
 
 	var buf bytes.Buffer
-	_, err := initialTable(cfg, capturingLogger(&buf), noEnv)
+	_, _, err := initialTable(cfg, capturingLogger(&buf), noEnv)
 	require.NoError(t, err)
 	assert.NotContains(t, buf.String(), "--prom-url is ignored")
 }
@@ -368,7 +369,7 @@ backends:
 `)
 
 	var buf bytes.Buffer
-	_, err := initialTable(cfg, capturingLogger(&buf), func(k string) (string, bool) {
+	_, _, err := initialTable(cfg, capturingLogger(&buf), func(k string) (string, bool) {
 		switch k {
 		case "KSG_PROM_USERNAME_A":
 			return "ksg", true

@@ -100,25 +100,47 @@ func siblingCancelled(ctx, gctx context.Context, err error) bool {
 // The result is a pure function of the value SETS returned, never of response
 // arrival order, which is what keeps the serialised response body
 // byte-deterministic.
+//
+// When exactly one part carries samples — every single-backend deployment, and
+// every zone-restricted query — there is nothing to de-duplicate against: one
+// store answers an instant vector with distinct label sets. That part is
+// returned as-is (it is already the caller's own slice header, handed out by
+// the guard), and a fresh slice is allocated only when a nil sample has to be
+// dropped. It is never filtered in place: a cached vector's backing array is
+// shared with every other reader.
+//
+// Across several parts a hash only proposes a duplicate; Metric.Equal confirms
+// it, so two distinct series whose hashes collide both survive.
 func mergeVectors(parts []model.Vector, keepMax bool) (model.Vector, int) {
-	total := 0
-	for _, p := range parts {
+	total, only := 0, -1
+	for i, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
 		total += len(p)
+		if only == -1 {
+			only = i
+		} else {
+			only = -2
+		}
 	}
 	if total == 0 {
 		return model.Vector{}, 0
 	}
+	if only >= 0 {
+		return withoutNilSamples(parts[only]), 0
+	}
 
 	out := make(model.Vector, 0, total)
-	seen := make(map[model.Fingerprint]int, total) // fingerprint → index in out
+	seen := newSeenIndex(total)
 	conflicts := 0
 	for _, part := range parts {
 		for _, s := range part {
 			if s == nil {
 				continue
 			}
-			fp := s.Metric.Fingerprint()
-			if i, dup := seen[fp]; dup {
+			fp := s.Metric.FastFingerprint()
+			if i, dup := seen.find(fp, s.Metric, out); dup {
 				// A duplicate carrying a DIFFERENT value is a genuine data
 				// ambiguity — two stores disagreeing about one series. Keeping
 				// the first (lexically-smallest backend) is deterministic;
@@ -132,11 +154,71 @@ func mergeVectors(parts []model.Vector, keepMax bool) (model.Vector, int) {
 				}
 				continue
 			}
-			seen[fp] = len(out)
+			seen.add(fp, len(out))
 			out = append(out, s)
 		}
 	}
 	return out, conflicts
+}
+
+// withoutNilSamples returns v unchanged when it holds no nil sample, and
+// otherwise a NEW vector without them; v itself is never written to. A vector
+// holding only nils yields the empty, non-nil vector every merge returns.
+func withoutNilSamples(v model.Vector) model.Vector {
+	first := slices.Index(v, nil)
+	if first < 0 {
+		return v
+	}
+	out := make(model.Vector, first, len(v)-1)
+	copy(out, v[:first])
+	for _, s := range v[first+1:] {
+		if s != nil {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// seenIndex maps a label-set hash to the positions in the merged vector of the
+// series carrying it. The first position per hash lives in a flat map; a hash
+// shared by DISTINCT series (a collision, confirmed by Metric.Equal) spills
+// into more, which stays nil in every ordinary merge.
+type seenIndex struct {
+	first map[model.Fingerprint]int
+	more  map[model.Fingerprint][]int
+}
+
+func newSeenIndex(n int) *seenIndex {
+	return &seenIndex{first: make(map[model.Fingerprint]int, n)}
+}
+
+// find returns the position of the series in out whose label set equals m.
+func (s *seenIndex) find(fp model.Fingerprint, m model.Metric, out model.Vector) (int, bool) {
+	i, ok := s.first[fp]
+	if !ok {
+		return 0, false
+	}
+	if out[i].Metric.Equal(m) {
+		return i, true
+	}
+	for _, j := range s.more[fp] {
+		if out[j].Metric.Equal(m) {
+			return j, true
+		}
+	}
+	return 0, false
+}
+
+// add records that the series at position i of the merged vector hashes to fp.
+func (s *seenIndex) add(fp model.Fingerprint, i int) {
+	if _, ok := s.first[fp]; !ok {
+		s.first[fp] = i
+		return
+	}
+	if s.more == nil {
+		s.more = make(map[model.Fingerprint][]int)
+	}
+	s.more[fp] = append(s.more[fp], i)
 }
 
 // fanoutQuerier is the Querier a Router hands to one build. It closes over a

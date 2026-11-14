@@ -1,3 +1,20 @@
+# BREAKING — upstream guard hardening
+
+*Change: `harden-upstream-guard`.*
+
+**What changed.** Response bodies are unchanged. Behaviour an operator or embedder can observe:
+
+- **Upstream response size bound.** Every upstream response body is bounded by `--upstream-max-response-bytes` / `KSG_UPSTREAM_MAX_RESPONSE_BYTES` (default 512 MiB). A larger answer fails its query like any upstream error: a required leg fails the build with `502`, an optional leg degrades. Embedders get the same default from `promql.New`; `promql.WithMaxResponseBytes(0)` disables it.
+- **Evaluation timeout sent upstream.** Every query issued under a deadline carries the Prometheus API `timeout` parameter (time left less 500 ms, whole seconds). A store that rejects the parameter would fail those queries; Prometheus and VictoriaMetrics accept it.
+- **Readiness probe is `count(up)`** instead of `up`, and concurrent `/readyz` calls share one probe of each backend whose outcome is reused for up to one second.
+- **Basic auth follows scheme as well as host.** A same-host `http`→`https` (or reverse) redirect no longer carries credentials.
+- **Query-cache budget charges query length.** An entry costs its series plus one unit per KiB of rendered query, so a budget holds slightly fewer long-query entries than before; `kube_state_graph_query_cache_series` still reports series.
+- **Embedders:** `backendsfile.ReloaderOptions` gains `Content`; without it the first reload tick re-parses and swaps once instead of trusting a second read of the file. `promql.DefaultClientFactory` takes optional `...promql.Option`.
+
+**Restoring the previous behaviour.** `--upstream-max-response-bytes=0` removes the size bound. The others are not configurable; rollback is a revert.
+
+---
+
 # BREAKING — root sets are capped by value count as well as bytes
 
 *Change: `cap-alternation-values`.*

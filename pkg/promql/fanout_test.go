@@ -3,6 +3,7 @@ package promql
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -226,6 +227,77 @@ func TestMergeVectors_EmptyInputs(t *testing.T) {
 	got, _ = mergeVectors([]model.Vector{{}, nil, {}}, false)
 	assert.Empty(t, got)
 	assert.NotNil(t, got, "an empty merge is an empty vector, never nil")
+}
+
+// One non-empty part is returned as the caller's own slice header: no copy, no
+// hashing. Empty sibling parts do not disable the fast path.
+func TestMergeVectors_SinglePartReturnedAsIs(t *testing.T) {
+	part := model.Vector{
+		sample("kube_pod_info", map[string]string{"pod": "a"}, 1),
+		sample("kube_pod_info", map[string]string{"pod": "b"}, 1),
+	}
+	for name, parts := range map[string][]model.Vector{
+		"one part":          {part},
+		"empty siblings":    {nil, part, {}},
+		"single then empty": {part, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, conflicts := mergeVectors(parts, false)
+			assert.Zero(t, conflicts)
+			require.Len(t, got, 2)
+			assert.Same(t, &part[0], &got[0], "the part's own backing array is returned")
+		})
+	}
+}
+
+// A nil sample in a single part is dropped into a NEW vector; the input — which
+// may be a cached vector shared by other readers — is left untouched.
+func TestMergeVectors_SinglePartNilSampleNeverFilteredInPlace(t *testing.T) {
+	a := sample("kube_pod_info", map[string]string{"pod": "a"}, 1)
+	b := sample("kube_pod_info", map[string]string{"pod": "b"}, 1)
+	for name, tc := range map[string]struct {
+		in   model.Vector
+		want model.Vector
+	}{
+		"nil first":  {model.Vector{nil, a, b}, model.Vector{a, b}},
+		"nil middle": {model.Vector{a, nil, b}, model.Vector{a, b}},
+		"nil last":   {model.Vector{a, b, nil}, model.Vector{a, b}},
+		"only nils":  {model.Vector{nil, nil}, model.Vector{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := slices.Clone(tc.in)
+			got, _ := mergeVectors([]model.Vector{tc.in}, false)
+			assert.Equal(t, tc.want, got)
+			assert.NotNil(t, got)
+			assert.Equal(t, before, tc.in, "the shared input vector is not rewritten")
+		})
+	}
+}
+
+// A hash collision between DISTINCT series must not drop either: Metric.Equal
+// confirms every proposed duplicate. The index is exercised directly because a
+// real 64-bit collision cannot be constructed in a test.
+func TestSeenIndex_CollisionConfirmedByEquality(t *testing.T) {
+	x := sample("kube_pod_info", map[string]string{"pod": "x"}, 1)
+	y := sample("kube_pod_info", map[string]string{"pod": "y"}, 1)
+	yCopy := sample("kube_pod_info", map[string]string{"pod": "y"}, 2)
+	out := make(model.Vector, 1, 2)
+	out[0] = x
+	idx := newSeenIndex(2)
+	const fp = model.Fingerprint(42)
+	idx.add(fp, 0)
+
+	_, dup := idx.find(fp, y.Metric, out)
+	assert.False(t, dup, "same hash, different label set: not a duplicate")
+	idx.add(fp, len(out))
+	out = append(out, y)
+
+	i, dup := idx.find(fp, yCopy.Metric, out)
+	require.True(t, dup, "a genuine duplicate behind a collision is still found")
+	assert.Equal(t, 1, i)
+	i, dup = idx.find(fp, x.Metric, out)
+	require.True(t, dup)
+	assert.Zero(t, i)
 }
 
 // --- fan-out dispatch ----------------------------------------------------

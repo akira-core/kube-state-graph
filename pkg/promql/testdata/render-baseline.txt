@@ -49,5 +49,5 @@ qos_write_ops	last_over_time(qos_write_ops[5m])
 traces_service_graph_request_failed_total	rate(traces_service_graph_request_failed_total{client!~"user|unknown",server!~"user",edge_relation!="link"}[5m])
 traces_service_graph_request_server_seconds_bucket	rate(traces_service_graph_request_server_seconds_bucket{client!~"user|unknown",server!~"user",edge_relation!="link"}[5m])
 traces_service_graph_request_total	rate(traces_service_graph_request_total{client!~"user|unknown",server!~"user"}[5m])
-up	up
+up	count(up)
 volume_labels	last_over_time(volume_labels[5m])

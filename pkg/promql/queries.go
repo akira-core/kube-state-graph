@@ -921,7 +921,12 @@ func Render(q Query, window time.Duration, keys LabelKeys, sel Selector) string 
 		// and goes through RenderAppMetadata, never through Render.
 		return ""
 	case QUpProbe:
-		return `up`
+		// count(up), not the bare up: every consumer tests only success and
+		// emptiness (count of an empty vector is empty, so an up-less store
+		// still answers empty), and one series per store keeps an
+		// unauthenticated readiness probe's cost independent of how many
+		// targets the store scrapes.
+		return `count(up)`
 	}
 	return ""
 }

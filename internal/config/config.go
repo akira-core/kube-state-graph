@@ -119,6 +119,11 @@ type Config struct {
 	// KSG_UPSTREAM_MAX_CONCURRENCY). A query finding its store saturated
 	// waits for a slot until its build deadline. 0 disables the bound.
 	UpstreamMaxConcurrency int
+	// UpstreamMaxResponseBytes bounds every upstream response body
+	// (--upstream-max-response-bytes / KSG_UPSTREAM_MAX_RESPONSE_BYTES). A
+	// larger answer fails its query like any upstream error. 0 disables the
+	// bound.
+	UpstreamMaxResponseBytes int64
 	// QueryCacheMaxSeries is the upstream query-result cache's total
 	// resident-series budget (--query-cache-max-series /
 	// KSG_QUERY_CACHE_MAX_SERIES). 0 disables the cache.
@@ -172,10 +177,11 @@ func Defaults() Config {
 		BackendsReloadInterval: 30 * time.Second,
 		// The library's exported defaults, so the server and an embedder that
 		// writes no option run with identical limits.
-		UpstreamMaxConcurrency: promql.DefaultMaxConcurrency,
-		QueryCacheMaxSeries:    promql.DefaultQueryCacheMaxSeries,
-		QueryCacheTTL:          promql.DefaultQueryCacheTTL,
-		EndAlign:               kubegraph.DefaultEndAlign,
+		UpstreamMaxConcurrency:   promql.DefaultMaxConcurrency,
+		UpstreamMaxResponseBytes: promql.DefaultMaxResponseBytes,
+		QueryCacheMaxSeries:      promql.DefaultQueryCacheMaxSeries,
+		QueryCacheTTL:            promql.DefaultQueryCacheTTL,
+		EndAlign:                 kubegraph.DefaultEndAlign,
 	}
 }
 
@@ -205,6 +211,7 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.Var(&volumeKeyRewriteFlag{dst: &cfg.NetAppVolumeKeyRewrite}, "netapp-volume-key-rewrite", "Ordered `<regex>=<replacement>` rule deriving the Harvest match token from a PVC's bound PV name. Repeat for several rules, applied in order. Unset uses `-=_`. Splits on the first `=`; write \\x3d for a literal one.")
 	fs.IntVar(&cfg.NetAppQoSScopeBatchBytes, "netapp-qos-scope-batch-bytes", cfg.NetAppQoSScopeBatchBytes, "Byte budget for one data-derived alternation: a scoped QoS query's `volume`, a storage-graph pod/node/controller-name read's scope, an application recovery's tracking-id or owner-name alternation, or a storage-rooted volume_labels read's aggregate / cluster / token set. A larger set is split across several queries; a literal alternation is also split at 100 values, independently of this budget.")
 	fs.IntVar(&cfg.UpstreamMaxConcurrency, "upstream-max-concurrency", cfg.UpstreamMaxConcurrency, "Maximum upstream queries in flight to each backend store, shared by every request. Excess queries wait until their build deadline. 0 disables the bound.")
+	fs.Int64Var(&cfg.UpstreamMaxResponseBytes, "upstream-max-response-bytes", cfg.UpstreamMaxResponseBytes, "Maximum size of one upstream response body; a larger answer fails its query like any upstream error. 0 disables the bound.")
 	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
 	fs.DurationVar(&cfg.QueryCacheTTL, "query-cache-ttl", cfg.QueryCacheTTL, "How long a cached upstream query result may be served.")
 	fs.DurationVar(&cfg.EndAlign, "end-align", cfg.EndAlign, "Grid a graph request's end is floored to (start shifted by the same amount, window length kept), so requests within one step share cached upstream results. 0 passes start/end through verbatim.")
@@ -262,6 +269,17 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		return nil
 	}
 
+	getInt64 := func(env string, dst *int64) error {
+		if v, ok := lookup(env); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid %s=%q: must be an integer", env, v)
+			}
+			*dst = n
+		}
+		return nil
+	}
+
 	getStr("KSG_PROM_URL", &cfg.PromURL)
 	// Env-only by design — no matching flags are registered in Parse.
 	getStr("KSG_PROM_USERNAME", &cfg.PromUsername)
@@ -297,6 +315,9 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 		return err
 	}
 	if err := getInt("KSG_UPSTREAM_MAX_CONCURRENCY", &cfg.UpstreamMaxConcurrency); err != nil {
+		return err
+	}
+	if err := getInt64("KSG_UPSTREAM_MAX_RESPONSE_BYTES", &cfg.UpstreamMaxResponseBytes); err != nil {
 		return err
 	}
 	if err := getInt("KSG_QUERY_CACHE_MAX_SERIES", &cfg.QueryCacheMaxSeries); err != nil {
@@ -358,6 +379,9 @@ func (c Config) Validate() error {
 	}
 	if c.UpstreamMaxConcurrency < 0 {
 		return errors.New("upstream-max-concurrency must not be negative (0 disables the bound)")
+	}
+	if c.UpstreamMaxResponseBytes < 0 {
+		return errors.New("upstream-max-response-bytes must not be negative (0 disables the bound)")
 	}
 	if c.QueryCacheMaxSeries < 0 {
 		return errors.New("query-cache-max-series must not be negative (0 disables the cache)")

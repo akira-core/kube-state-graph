@@ -93,7 +93,7 @@ Every query belongs to exactly one family. The mapping is hardcoded
 | `kubelet` | `kubelet_volume_stats_used_bytes`, `kubelet_volume_stats_capacity_bytes` | yes |
 | `harvest` | every NetApp Harvest series: `volume_labels`, the six `qos_*` families, the two `qos_policy_fixed_max_throughput_*`, `aggr_new_status`, `aggr_space_used`, `aggr_space_total`, `node_new_status`, `node_labels`, `node_cpu_busy`, `node_total_ops`, `node_total_latency`, `node_total_data` | yes — **without a matcher** |
 | `servicegraph` | the three `traces_service_graph_*` series | **no** |
-| `probe` | the `up{}` store-health probe | **no** |
+| `probe` | the `count(up)` store-health probe | **no** |
 | `alerts` | the Prometheus / vmalert `ALERTS` series | yes (matcher AND route). **Optional**: a table serving it on no backend is valid — the overlay is simply off |
 | `appmeta` | the operator-named application-metadata metric, classified as the logical query `app_metadata` whatever metric name is configured. The issued PromQL is `tlast_over_time(<metric>{…}[w])`; `az` / `env` / `cluster` / `namespace` are matchers, and the namespace matcher uses the configured namespace label | yes (matcher AND route). **Optional**: a table serving it on no backend is valid — the feature stays off |
 
@@ -189,7 +189,8 @@ names the environment variables holding its pair; a file carrying a literal
 - A backend naming neither variable falls back to the global
   `KSG_PROM_USERNAME` / `KSG_PROM_PASSWORD` pair.
 - Credentials are attached only to requests addressed to that backend's own
-  host, so a cross-host redirect carries no `Authorization` header.
+  scheme AND host, so neither a cross-host redirect nor a same-host
+  `https`→`http` downgrade carries an `Authorization` header.
 
 Rotating a credential **value** requires a restart; only the variable **names**
 are reloadable.
@@ -200,6 +201,12 @@ The file is re-read on `--backends-reload-interval`. When its content changed it
 is parsed, validated, and the live table is replaced **atomically**. A build in
 flight keeps the table it started with, so a reload never changes which backends
 a single request reaches part-way through.
+
+"Changed" is measured against the exact bytes the live table was parsed from,
+so an edit landing between startup and the first tick is applied. An embedder
+passes those bytes as `backendsfile.ReloaderOptions.Content` (from
+`backendsfile.ReadWithContent`); without them the first tick re-parses and
+swaps once.
 
 A file that fails to read, parse, or validate is rejected **wholesale**: the
 previous table keeps serving, an `ERROR` names the reason, and
@@ -241,12 +248,19 @@ entries naming the same VictoriaMetrics share one — is fronted by a guard
 applied in this order:
 
 1. **Query-result cache.** A successful result is kept under
-   `(store, rendered query, evaluation instant)`; an identical query at the
-   same instant is answered in process. Bounded by total resident series
-   (`--query-cache-max-series`, default 100000, least-recently-used eviction)
-   and per-entry age (`--query-cache-ttl`, default 60s). Errors are never
-   cached; an empty result is. Concurrent misses on one key issue ONE upstream
-   query and every caller receives its result.
+   `(store, SHA-256 of the rendered query, evaluation instant)`; an identical
+   query at the same instant is answered in process. The key holds the 32-byte
+   digest, never the query. Bounded by a budget in series units
+   (`--query-cache-max-series`, default 100000, least-recently-used eviction):
+   an entry costs its series count (at least 1) plus one unit per KiB of
+   rendered query. Entries expire after `--query-cache-ttl` (default 60s); an
+   insertion first releases expired entries from the least-recently-used end.
+   Errors are never cached; an empty result is.
+   Concurrent misses on one key issue ONE upstream query and every caller
+   receives its result. That shared query is not bound to any one caller: it
+   runs until it completes, until every caller waiting on it has left, or until
+   the latest of their deadlines — so a client that disconnects never fails
+   another request sharing its query.
 2. **Concurrency slot.** At most `--upstream-max-concurrency` (default 32)
    queries are in flight to the store at once, across every request the
    process serves. A query finding the store saturated WAITS (first come,
@@ -254,9 +268,22 @@ applied in this order:
    waiting is the ordinary `504 timeout`. A cache hit or a coalesced wait holds
    no slot, and one saturated store never delays a query to another.
 
+Every query issued under a deadline also sends the upstream API's `timeout`
+parameter — the time left less 500 ms, in whole seconds, omitted below one
+second — so the store stops evaluating, and the slot frees, before the build
+gives up rather than at the store's own `-search.maxQueryDuration`.
+
+Every upstream response body is bounded by `--upstream-max-response-bytes`
+(default 512 MiB, `0` disables): a larger answer fails its query like any
+upstream error.
+
 The guard survives a routing-table reload for every store the reload keeps.
-Readiness and the outside-retention `up{}` probe bypass both steps: they must
-observe the live upstream and must never queue behind builds.
+Readiness and the outside-retention probe bypass both steps: they must
+observe the live upstream and must never queue behind builds. The probe query
+is `count(up)` — one series per store, empty exactly when `up` is. Concurrent
+`/readyz` probes share one probe of each backend, and a completed outcome is
+reused for one second (not one cut short by its own deadline); the retention
+probe is always live.
 
 With `--end-align` (default 30s) a request's `end` is floored to the grid and
 `start` shifted by the same amount, so requests issued within one step render
@@ -277,7 +304,11 @@ Setting any of the three to `0` disables that control.
 | `kube_state_graph_query_cache_hits_total` / `_misses_total` | counter | Cache lookups |
 | `kube_state_graph_query_cache_coalesced_total` | counter | Misses answered by another caller's identical query instead of their own |
 | `kube_state_graph_query_cache_evictions_total` | counter | Entries evicted to fit the budget |
-| `kube_state_graph_query_cache_series` | gauge | Series resident in the cache |
+| `kube_state_graph_query_cache_series` | gauge | Series resident in the cache (not budget units) |
+
+A reload that removes a backend removes its `upstream_inflight` and
+`upstream_slot_wait_seconds` series; a query still in flight on it does not
+bring them back.
 
 A query that waited carries `kube_state_graph.slot_wait_ms` on its
 `prometheus.query` span. A cache hit issues no upstream query and so records no

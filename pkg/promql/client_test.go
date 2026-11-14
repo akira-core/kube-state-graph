@@ -3,6 +3,7 @@ package promql
 import (
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -43,7 +44,7 @@ func roundTrip(t *testing.T, rt http.RoundTripper, inner *fakeRoundTripper, rawU
 
 func TestNewTransport_WithBasicAuth_SetsHeader(t *testing.T) {
 	inner := &fakeRoundTripper{}
-	rt := newTransport(clientOptions{username: "ksg", password: "s3cret"}, "upstream.invalid", inner)
+	rt := newTransport(clientOptions{username: "ksg", password: "s3cret"}, upstreamURL, inner)
 
 	got := roundTrip(t, rt, inner, "http://upstream.invalid/api/v1/query")
 	user, pass, ok := got.BasicAuth()
@@ -56,7 +57,7 @@ func TestNewTransport_WithoutBasicAuth_NoAuthHeader(t *testing.T) {
 	// The real chain New assembles, minus only the concrete base transport: no
 	// WithBasicAuth options → no Authorization header reaches the wire.
 	inner := &fakeRoundTripper{}
-	rt := newTransport(clientOptions{}, "upstream.invalid", inner)
+	rt := newTransport(clientOptions{}, upstreamURL, inner)
 
 	got := roundTrip(t, rt, inner, "http://upstream.invalid/api/v1/query")
 	assert.Empty(t, got.Header.Get("Authorization"))
@@ -67,10 +68,29 @@ func TestNewTransport_BasicAuth_NotSentCrossHost(t *testing.T) {
 	// sensitive-header stripping; the transport itself must withhold the
 	// credentials for any host other than the configured upstream.
 	inner := &fakeRoundTripper{}
-	rt := newTransport(clientOptions{username: "ksg", password: "s3cret"}, "upstream.invalid", inner)
+	rt := newTransport(clientOptions{username: "ksg", password: "s3cret"}, upstreamURL, inner)
 
 	got := roundTrip(t, rt, inner, "http://evil.invalid/api/v1/query")
 	assert.Empty(t, got.Header.Get("Authorization"), "credentials leaked to a foreign host")
+}
+
+// upstreamURL is the configured upstream the transport tests scope
+// credentials to.
+var upstreamURL = &url.URL{Scheme: "http", Host: "upstream.invalid"}
+
+// net/http keeps Authorization on a same-host redirect even when it downgrades
+// https to http, so the transport compares the scheme as well as the host.
+func TestNewTransport_BasicAuth_NotSentOnSchemeChange(t *testing.T) {
+	inner := &fakeRoundTripper{}
+	target := &url.URL{Scheme: "https", Host: "upstream.invalid"}
+	rt := newTransport(clientOptions{username: "ksg", password: "s3cret"}, target, inner)
+
+	got := roundTrip(t, rt, inner, "https://upstream.invalid/api/v1/query")
+	_, _, ok := got.BasicAuth()
+	assert.True(t, ok, "the configured scheme and host carry credentials")
+
+	got = roundTrip(t, rt, inner, "http://upstream.invalid/api/v1/query")
+	assert.Empty(t, got.Header.Get("Authorization"), "credentials sent in clear after an https->http downgrade")
 }
 
 func TestNew_OptionVariants(t *testing.T) {

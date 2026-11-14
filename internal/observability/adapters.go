@@ -56,12 +56,43 @@ func (m *Metrics) SetClustersObserved(n int) {
 // Satisfies pkg/promql.RouterMetrics — the OPTIONAL upgrade over
 // pkg/promql.Metrics, so an embedder supplying only the two required methods
 // keeps working unchanged.
+//
+// The per-backend limiter series follow the table too: the in-flight gauge
+// and slot-wait histogram of every backend the new table no longer names are
+// deleted. They are deleted rather than Reset: a reset would zero a KEPT
+// backend's in-flight count while its queries are still running, and their
+// decrements would then drive it negative.
 func (m *Metrics) SetBackends(names []string) {
 	m.UpstreamBackends.Set(float64(len(names)))
 	m.BackendQueryFailed.Reset()
 	for _, n := range names {
 		m.BackendQueryFailed.WithLabelValues(n)
 	}
+
+	live := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		live[n] = struct{}{}
+	}
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
+	for n := range m.liveBackends {
+		if _, kept := live[n]; !kept {
+			m.UpstreamInflight.DeleteLabelValues(n)
+			m.UpstreamSlotWait.DeleteLabelValues(n)
+		}
+	}
+	m.liveBackends = live
+}
+
+// observesBackend reports whether per-backend limiter series are kept for
+// backend. Callers hold liveMu for reading across the check and the write, so
+// a concurrent SetBackends cannot delete the series in between.
+func (m *Metrics) observesBackend(backend string) bool {
+	if m.liveBackends == nil {
+		return true
+	}
+	_, ok := m.liveBackends[backend]
+	return ok
 }
 
 // IncBackendQueryFailure increments the per-backend upstream failure counter.
@@ -80,14 +111,27 @@ func (m *Metrics) IncBackendConfigReload(result string) {
 
 // AddInflight moves the per-backend in-flight gauge. Satisfies
 // pkg/promql.LimiterMetrics.
+//
+// A backend a reload removed is ignored: a query still in flight on it (a
+// build bound to the previous table) would otherwise recreate its deleted
+// series, at -1 once the query finished.
 func (m *Metrics) AddInflight(backend string, delta int) {
-	m.UpstreamInflight.WithLabelValues(backend).Add(float64(delta))
+	m.liveMu.RLock()
+	defer m.liveMu.RUnlock()
+	if m.observesBackend(backend) {
+		m.UpstreamInflight.WithLabelValues(backend).Add(float64(delta))
+	}
 }
 
 // ObserveSlotWait records a query's wait for its store's concurrency slot.
-// Satisfies pkg/promql.LimiterMetrics.
+// Satisfies pkg/promql.LimiterMetrics. A removed backend is ignored, as in
+// AddInflight.
 func (m *Metrics) ObserveSlotWait(backend string, seconds float64) {
-	m.UpstreamSlotWait.WithLabelValues(backend).Observe(seconds)
+	m.liveMu.RLock()
+	defer m.liveMu.RUnlock()
+	if m.observesBackend(backend) {
+		m.UpstreamSlotWait.WithLabelValues(backend).Observe(seconds)
+	}
 }
 
 // IncCacheHit / IncCacheMiss / IncCacheCoalesced / IncCacheEviction /

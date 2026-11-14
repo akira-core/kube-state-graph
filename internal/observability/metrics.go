@@ -1,6 +1,8 @@
 package observability
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -43,6 +45,13 @@ type Metrics struct {
 	QueryCacheShared  prometheus.Counter
 	QueryCacheEvicted prometheus.Counter
 	QueryCacheSeries  prometheus.Gauge
+
+	// liveBackends is the live routing table's backend names, set by
+	// SetBackends. Per-backend limiter series are kept only for these names
+	// (see AddInflight). nil until the first SetBackends: every name is then
+	// accepted. liveMu orders a check-and-write against a swap.
+	liveMu       sync.RWMutex
+	liveBackends map[string]struct{}
 }
 
 // NewMetrics registers and returns a fresh Metrics bundle.

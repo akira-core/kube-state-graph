@@ -2,6 +2,8 @@ package promql
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	promapi "github.com/prometheus/client_golang/api"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
@@ -45,6 +48,10 @@ type clientOptions struct {
 	username string
 	password string
 	backend  string
+	// maxResponseBytes is WithMaxResponseBytes' value (0 = unbounded), used
+	// only when maxResponseBytesSet; otherwise DefaultMaxResponseBytes.
+	maxResponseBytes    int64
+	maxResponseBytesSet bool
 }
 
 // WithBasicAuth attaches HTTP Basic Auth credentials to outbound upstream
@@ -69,19 +76,22 @@ func WithBackendName(name string) Option {
 // basicAuthTransport sets an Authorization: Basic header on a clone of each
 // request (RoundTrippers must not mutate the caller's request) and delegates
 // to the inner transport. The header is added ONLY for requests addressed to
-// the configured upstream host: net/http strips Authorization when following
-// a cross-host redirect, and stamping per-hop at the transport layer would
-// silently re-attach the credentials below that protection — so a redirect
-// to a foreign host must pass through unauthenticated.
+// the configured upstream's scheme AND host: net/http strips Authorization
+// when following a cross-host redirect, and stamping per-hop at the transport
+// layer would silently re-attach the credentials below that protection — so a
+// redirect to a foreign host must pass through unauthenticated. The scheme is
+// compared as well because net/http keeps the header on a same-host
+// https→http redirect, which would otherwise send the credentials in clear.
 type basicAuthTransport struct {
 	inner    http.RoundTripper
-	host     string // only requests to this host carry credentials
+	scheme   string // only requests on this scheme …
+	host     string // … to this host carry credentials
 	username string
 	password string
 }
 
 func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if !strings.EqualFold(req.URL.Host, t.host) {
+	if !strings.EqualFold(req.URL.Scheme, t.scheme) || !strings.EqualFold(req.URL.Host, t.host) {
 		return t.inner.RoundTrip(req)
 	}
 	clone := req.Clone(req.Context())
@@ -90,14 +100,20 @@ func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // newTransport assembles the outbound transport chain: otelhttp → basicAuth
-// (when credentials are configured) → base. The traced request is the final
-// authenticated one; otelhttp records method/URL/status only, never headers.
-// authHost scopes the credentials to the configured upstream host (see
-// basicAuthTransport).
-func newTransport(o clientOptions, authHost string, base http.RoundTripper) http.RoundTripper {
+// (when credentials are configured) → response-size bound (unless disabled) →
+// base. The traced request is the final authenticated one; otelhttp records
+// method/URL/status only, never headers. target scopes the credentials to the
+// configured upstream's scheme and host (see basicAuthTransport).
+func newTransport(o clientOptions, target *url.URL, base http.RoundTripper) http.RoundTripper {
 	rt := base
+	if bound := o.responseBound(); bound > 0 {
+		rt = &responseLimitTransport{inner: rt, max: bound}
+	}
 	if o.username != "" || o.password != "" {
-		rt = &basicAuthTransport{inner: rt, host: authHost, username: o.username, password: o.password}
+		rt = &basicAuthTransport{
+			inner: rt, scheme: target.Scheme, host: target.Host,
+			username: o.username, password: o.password,
+		}
 	}
 	return otelhttp.NewTransport(rt)
 }
@@ -126,7 +142,7 @@ func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
 	}
 	c, err := promapi.NewClient(promapi.Config{
 		Address:      promURL,
-		RoundTripper: newTransport(o, u.Host, base),
+		RoundTripper: newTransport(o, u, base),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prometheus client: %w", err)
@@ -148,9 +164,12 @@ func (c *Client) CloseIdleConnections() {
 // metrics labelled with the supplied query name and emitting a `prometheus.query`
 // span carrying the rendered statement.
 func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) (model.Vector, error) {
+	stmt := boundStatement(query)
 	attrs := []attribute.KeyValue{
 		semconv.DBSystemKey.String("prometheus"),
-		attribute.String("db.statement", query),
+		attribute.String("db.statement", stmt.text),
+		attribute.Int("kube_state_graph.query_bytes", stmt.bytes),
+		attribute.String("kube_state_graph.query_sha256", stmt.sha256),
 		attribute.String("kube_state_graph.query_name", name),
 	}
 	if c.backend != "" {
@@ -169,7 +188,9 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 
 	slog.DebugContext(ctx, "promql query",
 		"name", name,
-		"query", query,
+		"query", stmt.text,
+		"query_bytes", stmt.bytes,
+		"query_sha256", stmt.sha256,
 		"ts", ts.UTC().Format(time.RFC3339),
 	)
 
@@ -179,7 +200,12 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 			c.metrics.ObserveQueryDuration(name, time.Since(start).Seconds())
 		}
 	}()
-	val, warns, err := c.api.Query(ctx, query, ts)
+	var qopts []v1.Option
+	deadline, bounded := ctx.Deadline()
+	if t, ok := evaluationTimeout(deadline, bounded, time.Now()); ok {
+		qopts = append(qopts, v1.WithTimeout(t))
+	}
+	val, warns, err := c.api.Query(ctx, query, ts, qopts...)
 	if len(warns) > 0 {
 		// VictoriaMetrics signals truncated / partial responses (e.g. a
 		// -search.* limit hit) via the warnings return; dropping them hides
@@ -200,7 +226,9 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		span.SetStatus(codes.Error, err.Error())
 		slog.ErrorContext(ctx, "promql query failed",
 			"name", name,
-			"query", query,
+			"query", stmt.text,
+			"query_bytes", stmt.bytes,
+			"query_sha256", stmt.sha256,
 			"ts", ts.UTC().Format(time.RFC3339),
 			"err", err,
 		)
@@ -227,6 +255,69 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 		"ts", ts.UTC().Format(time.RFC3339),
 	)
 	return vec, nil
+}
+
+// maxStatementBytes bounds the rendered query a span or log record carries. A
+// request matcher is caller-controlled, so an unbounded statement let one cheap
+// request write megabytes of span attributes and Error logs — on every leg, and
+// on every repetition, since a failed query is never cached.
+const maxStatementBytes = 2048
+
+// statement is the bounded form of a rendered query for spans and logs: the
+// text truncated to maxStatementBytes, the full length, and a short SHA-256
+// prefix, so a truncated statement can still be told apart from another and
+// matched against an upstream log line.
+type statement struct {
+	text   string
+	bytes  int
+	sha256 string
+}
+
+func boundStatement(query string) statement {
+	sum := sha256.Sum256([]byte(query))
+	return statement{
+		text:   truncateUTF8(query, maxStatementBytes),
+		bytes:  len(query),
+		sha256: hex.EncodeToString(sum[:6]),
+	}
+}
+
+// truncateUTF8 returns at most n bytes of s, cut on a character boundary.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// evaluationTimeoutMargin is kept back from the caller's remaining time when
+// the upstream evaluation timeout is derived from it, so the store gives up
+// (and the query's slot frees) before the caller's own deadline fires.
+const evaluationTimeoutMargin = 500 * time.Millisecond
+
+// evaluationTimeout derives the upstream API's `timeout` parameter from the
+// query context's deadline: the remaining time less evaluationTimeoutMargin,
+// truncated to whole seconds. ok is false when there is no deadline or less
+// than one whole second would remain; the context deadline alone then bounds
+// the query.
+//
+// Whole seconds because the parameter is sent as time.Duration.String() and
+// Prometheus' duration parser rejects a fractional form such as "14.75s";
+// "14s" and "2m0s" parse in Prometheus and VictoriaMetrics alike. Without it a
+// store keeps evaluating a query the build has already abandoned, holding its
+// concurrency slot until the store's own -search.maxQueryDuration.
+func evaluationTimeout(deadline time.Time, bounded bool, now time.Time) (time.Duration, bool) {
+	if !bounded {
+		return 0, false
+	}
+	t := (deadline.Sub(now) - evaluationTimeoutMargin).Truncate(time.Second)
+	if t < time.Second {
+		return 0, false
+	}
+	return t, true
 }
 
 // FormatDuration renders d as a PromQL duration literal (e.g., 90s, 5m, 3h).

@@ -110,7 +110,10 @@ func TestGuard_WaiterDeadlineDoesNotCancelLeader(t *testing.T) {
 	require.NoError(t, <-leaderDone, "the leader still receives its result")
 }
 
-func TestGuard_LeaderCancellationMakesLiveWaiterRetry(t *testing.T) {
+// The caller that started a shared fetch leaving — a client disconnect — does
+// not fail a waiter whose own context is live, and no second upstream query is
+// issued for it.
+func TestGuard_LeaderCancellationDoesNotFailLiveWaiter(t *testing.T) {
 	gate := newGate()
 	gate.vec = vecN(1)
 	q := Guard(gate)
@@ -128,14 +131,173 @@ func TestGuard_LeaderCancellationMakesLiveWaiterRetry(t *testing.T) {
 		_, err := q.Instant(t.Context(), string(QPodInfo), "q", ts0)
 		waiterDone <- err
 	}()
-	time.Sleep(10 * time.Millisecond) // waiter joins the in-flight call
+	waitForWaiters(t, q, "q", 2)
 	cancelLeader()
-	require.ErrorIs(t, <-leaderDone, context.Canceled)
+	require.ErrorIs(t, <-leaderDone, context.Canceled, "the leaving caller gets its own error")
 
-	<-gate.started // the waiter's retry reached upstream as the new leader
 	close(gate.release)
-	require.NoError(t, <-waiterDone)
-	assert.EqualValues(t, 2, gate.calls.Load())
+	require.NoError(t, <-waiterDone, "the shared fetch outlived the caller that started it")
+	assert.EqualValues(t, 1, gate.calls.Load(), "no second upstream query")
+}
+
+// When every waiter has left, the shared fetch is cancelled — nobody is
+// waiting for it — and a later miss starts a new one.
+func TestGuard_LastWaiterLeavingCancelsTheFetch(t *testing.T) {
+	causes := make(chan error, 2)
+	entered := make(chan struct{})
+	var calls atomic.Int64
+	inner := querierFunc(func(ctx context.Context, _, _ string, _ time.Time) (model.Vector, error) {
+		if calls.Add(1) > 1 {
+			return vecN(1), nil
+		}
+		close(entered)
+		<-ctx.Done()
+		causes <- context.Cause(ctx)
+		return nil, ctx.Err()
+	})
+	q := Guard(inner)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
+		done <- err
+	}()
+	// Wait for the fetch to reach upstream: a flight abandoned before that
+	// fails at its slot acquisition and never calls the inner querier.
+	<-entered
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.ErrorIs(t, <-causes, errFlightAbandoned)
+
+	v, err := q.Instant(t.Context(), string(QPodInfo), "q", ts0)
+	require.NoError(t, err)
+	assert.Len(t, v, 1)
+	assert.EqualValues(t, 2, calls.Load(), "an abandoned flight is never rejoined")
+}
+
+// The shared fetch is bounded by the LATEST waiter deadline: the starting
+// caller's short deadline passing neither cancels it nor shortens what the
+// client sees as its deadline.
+func TestGuard_SharedFetchUsesLatestWaiterDeadline(t *testing.T) {
+	release := make(chan struct{})
+	seen := make(chan time.Time, 1)
+	var calls atomic.Int64
+	inner := querierFunc(func(ctx context.Context, _, _ string, _ time.Time) (model.Vector, error) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		d, _ := ctx.Deadline()
+		seen <- d
+		return vecN(1), nil
+	})
+	q := Guard(inner)
+
+	short, cancelShort := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancelShort()
+	shortDone := make(chan error, 1)
+	go func() {
+		_, err := q.Instant(short, string(QPodInfo), "q", ts0)
+		shortDone <- err
+	}()
+	waitForWaiters(t, q, "q", 1)
+
+	long, cancelLong := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelLong()
+	longDeadline, _ := long.Deadline()
+	longDone := make(chan error, 1)
+	go func() {
+		_, err := q.Instant(long, string(QPodInfo), "q", ts0)
+		longDone <- err
+	}()
+	waitForWaiters(t, q, "q", 2)
+	require.ErrorIs(t, <-shortDone, context.DeadlineExceeded)
+	time.Sleep(20 * time.Millisecond) // well past the short deadline
+	close(release)
+
+	require.NoError(t, <-longDone)
+	assert.Equal(t, longDeadline, <-seen, "the client sees the latest waiter's deadline")
+	assert.EqualValues(t, 1, calls.Load())
+}
+
+// A waiter with no deadline leaves the shared fetch with none.
+func TestGuard_WaiterWithoutDeadlineUnboundsTheFetch(t *testing.T) {
+	release := make(chan struct{})
+	bounded := make(chan bool, 1)
+	inner := querierFunc(func(ctx context.Context, _, _ string, _ time.Time) (model.Vector, error) {
+		<-release
+		_, ok := ctx.Deadline()
+		bounded <- ok
+		return vecN(1), nil
+	})
+	q := Guard(inner)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	first := make(chan error, 1)
+	go func() {
+		_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
+		first <- err
+	}()
+	waitForWaiters(t, q, "q", 1)
+	second := make(chan error, 1)
+	go func() {
+		_, err := q.Instant(context.Background(), string(QPodInfo), "q", ts0)
+		second <- err
+	}()
+	waitForWaiters(t, q, "q", 2)
+	close(release)
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+	assert.False(t, <-bounded)
+}
+
+// A flight ended by its (latest-waiter) deadline reports the waiter's OWN
+// DeadlineExceeded — the 504 mapping — never the shared context's Canceled,
+// which the API would map to 499.
+func TestGuard_DeadlineCutFlightReportsDeadlineExceeded(t *testing.T) {
+	inner := querierFunc(func(ctx context.Context, _, _ string, _ time.Time) (model.Vector, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	q := Guard(inner)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NotErrorIs(t, err, context.Canceled)
+}
+
+// A context error the inner querier produced on its own (its per-call
+// timeout, say) is returned at once: only a flight its deadline timer ended
+// makes a waiter wait out its own deadline.
+func TestGuard_InnerContextErrorIsNotWaitedOut(t *testing.T) {
+	inner := querierFunc(func(context.Context, string, string, time.Time) (model.Vector, error) {
+		return nil, context.DeadlineExceeded
+	})
+	q := Guard(inner)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 5*time.Second, "the caller is not held until its own deadline")
+}
+
+// waitForWaiters blocks until the flight for query has n waiters.
+func waitForWaiters(t *testing.T, q Querier, query string, n int) {
+	t.Helper()
+	g := q.(*guard)
+	key := cacheKeyFor(g.store, query, ts0)
+	require.Eventually(t, func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		f, ok := g.flights[key]
+		return ok && f.waiters == n
+	}, time.Second, time.Millisecond)
 }
 
 func TestGuard_ErrorsAreNotCached(t *testing.T) {
