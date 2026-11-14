@@ -2,7 +2,6 @@ package build
 
 import (
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -227,7 +226,19 @@ func controllersAlreadyRead(plan topologyPlan, v *topologyVectors) map[string]st
 	return out
 }
 
+// uncoveredAggrPairs is the (ONTAP cluster, aggregate) set the rows name that
+// no root read already fetched whole. The root lists are turned into sets once,
+// so the cost is one pass over the rows rather than one pass over every root
+// list per row.
 func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]string {
+	clusters := stringSet(plan.volumeClusters)
+	aggrs := stringSet(plan.volumeAggrs)
+	qualified := make(map[ontapPair]struct{})
+	for cluster, names := range plan.volumeAggrPairs {
+		for _, n := range names {
+			qualified[ontapPair{cluster, n}] = struct{}{}
+		}
+	}
 	out := map[string][]string{}
 	for _, s := range rows {
 		cluster := string(s.Metric[promql.VolumeLabelsClusterLabel])
@@ -235,8 +246,13 @@ func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]strin
 		if cluster == "" || aggr == "" {
 			continue
 		}
-		if slices.Contains(plan.volumeClusters, cluster) || slices.Contains(plan.volumeAggrs, aggr) ||
-			slices.Contains(plan.volumeAggrPairs[cluster], aggr) {
+		if _, ok := clusters[cluster]; ok {
+			continue
+		}
+		if _, ok := aggrs[aggr]; ok {
+			continue
+		}
+		if _, ok := qualified[ontapPair{cluster, aggr}]; ok {
 			continue
 		}
 		out[cluster] = append(out[cluster], aggr)
@@ -244,7 +260,22 @@ func uncoveredAggrPairs(rows model.Vector, plan topologyPlan) map[string][]strin
 	return compactPairs(out)
 }
 
+// ontapPair is one component qualified by its ONTAP cluster.
+type ontapPair struct{ cluster, name string }
+
+// stringSet is the set of the non-empty values of names.
+func stringSet(names []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n != "" {
+			out[n] = struct{}{}
+		}
+	}
+	return out
+}
+
 func uncoveredControllerPairs(rows []model.Vector, plan topologyPlan, alreadyByName map[string]struct{}) map[string][]string {
+	clusters := stringSet(plan.volumeClusters)
 	out := map[string][]string{}
 	for _, vec := range rows {
 		for _, s := range vec {
@@ -255,7 +286,7 @@ func uncoveredControllerPairs(rows []model.Vector, plan topologyPlan, alreadyByN
 			if cluster == "" || node == "" {
 				continue
 			}
-			if slices.Contains(plan.volumeClusters, cluster) {
+			if _, ok := clusters[cluster]; ok {
 				continue
 			}
 			if _, ok := alreadyByName[node]; ok {
