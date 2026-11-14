@@ -2,9 +2,9 @@
 
 ## ADDED Requirements
 
-### Requirement: Boot warnings for inert or exposed API keys
+### Requirement: Boot warning when a configured key source yields no keys
 
-The server SHALL log a warning at boot when a configured API-key source yields zero keys, identifying that authentication is disabled, and SHALL NOT log an "auth enabled" line in that case. It SHALL log a warning at boot when the active keys were supplied as a literal `--api-keys` command-line flag, naming `--api-keys-file` and `KSG_API_KEYS` as the alternatives. Neither warning SHALL carry a key value, and neither SHALL change which requests are accepted.
+The server SHALL log a warning at boot, identifying that authentication is disabled, when a configured API-key source yields zero keys, and SHALL NOT log an "auth enabled" line in that case. The warning SHALL carry no key value and SHALL NOT change which requests are accepted.
 
 #### Scenario: Key file with no keys
 
@@ -17,6 +17,10 @@ The server SHALL log a warning at boot when a configured API-key source yields z
 
 - **WHEN** the server starts with `--api-keys=,` (or `KSG_API_KEYS=,`) and no `--api-keys-file`
 - **THEN** the boot log carries a warning that API-key auth is disabled, and no line claims auth is enabled
+
+### Requirement: Boot warning for API keys passed as a literal flag
+
+The server SHALL log one warning at boot when keys were supplied as a literal `--api-keys` command-line flag, whether or not `--api-keys-file` takes precedence over it, naming `--api-keys-file` and `KSG_API_KEYS` as the alternatives. The warning SHALL carry no key value and SHALL NOT change which requests are accepted.
 
 #### Scenario: Keys passed as a literal flag
 
