@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
 	"golang.org/x/sync/semaphore"
-	"golang.org/x/sync/singleflight"
 )
 
 // LimiterMetrics is the OPTIONAL upgrade interface a Metrics implementation may
@@ -106,9 +104,12 @@ type guard struct {
 	store   uint64
 	sem     *semaphore.Weighted // nil ⇒ no bound
 	cache   *queryCache         // shared across stores; nil ⇒ disabled
-	flight  singleflight.Group
 	limiter LimiterMetrics
 	cm      CacheMetrics
+
+	// mu guards flights and every mutable field of each flight in it.
+	mu      sync.Mutex
+	flights map[cacheKey]*flight // in-flight coalesced misses (see flight)
 }
 
 var _ Querier = (*guard)(nil)
@@ -173,47 +174,15 @@ func (g *guard) instant(ctx context.Context, backend, name, query string, ts tim
 	}
 	g.cm.IncCacheMiss()
 
-	// The flight is keyed like the cache entry it fills: the query's digest,
-	// never the query, so an in-flight key is fixed-size too.
-	flightKey := string(key.digest[:]) + strconv.FormatInt(key.ts, 10)
-	// Two attempts: a waiter whose shared call died of the LEADER's context
-	// (not its own) retries once, becoming the leader itself.
-	for attempt := 0; ; attempt++ {
-		var mine, reused atomic.Bool
-		ch := g.flight.DoChan(flightKey, func() (any, error) {
-			mine.Store(true)
-			// A flight that completed between our lookup and this join has
-			// already been forgotten by the group but left its entry behind:
-			// a flight puts before the group forgets its key, so this lookup
-			// sees it and no second upstream query is issued.
-			if v, ok := g.cache.get(key); ok {
-				reused.Store(true)
-				return v, nil
-			}
-			v, err := g.fetch(ctx, backend, name, query, ts)
-			if err == nil {
-				g.cache.put(key, v)
-			}
-			return v, err
-		})
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("prom query %s: %w", name, ctx.Err())
-		case r := <-ch:
-			led := mine.Load()
-			if r.Err != nil {
-				if !led && attempt == 0 && ctx.Err() == nil && isContextErr(r.Err) {
-					continue
-				}
-				return nil, r.Err
-			}
-			if !led || reused.Load() {
-				g.cm.IncCacheCoalesced()
-			}
-			v, _ := r.Val.(model.Vector)
-			return cloneVector(v), nil
-		}
+	// Concurrent misses on one key share one upstream query (see flight).
+	// The fetch runs in its own goroutine so that every caller, the one that
+	// started it included, waits on its OWN context and can leave without
+	// ending the query for the others.
+	f, leader := g.join(ctx, key)
+	if leader {
+		go g.run(key, f, backend, name, query, ts)
 	}
+	return g.await(ctx, key, f, leader, name)
 }
 
 func isContextErr(err error) bool {
