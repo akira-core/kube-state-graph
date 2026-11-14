@@ -144,11 +144,13 @@ func TestGuard_LeaderCancellationDoesNotFailLiveWaiter(t *testing.T) {
 // waiting for it — and a later miss starts a new one.
 func TestGuard_LastWaiterLeavingCancelsTheFetch(t *testing.T) {
 	causes := make(chan error, 2)
+	entered := make(chan struct{})
 	var calls atomic.Int64
 	inner := querierFunc(func(ctx context.Context, _, _ string, _ time.Time) (model.Vector, error) {
 		if calls.Add(1) > 1 {
 			return vecN(1), nil
 		}
+		close(entered)
 		<-ctx.Done()
 		causes <- context.Cause(ctx)
 		return nil, ctx.Err()
@@ -161,7 +163,9 @@ func TestGuard_LastWaiterLeavingCancelsTheFetch(t *testing.T) {
 		_, err := q.Instant(ctx, string(QPodInfo), "q", ts0)
 		done <- err
 	}()
-	waitForWaiters(t, q, "q", 1)
+	// Wait for the fetch to reach upstream: a flight abandoned before that
+	// fails at its slot acquisition and never calls the inner querier.
+	<-entered
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 	require.ErrorIs(t, <-causes, errFlightAbandoned)
