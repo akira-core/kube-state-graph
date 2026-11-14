@@ -429,12 +429,12 @@ The reader SHALL emit one `pod-calls-service` edge per `(resolved source node, r
 
 ### Requirement: Unresolvable connection string falls back to an external node
 
-When a `"://"` label is unresolvable, because its host is not a parseable Kubernetes `.svc` name or because the anchor cluster does not itself hold the addressed Service in its own family, the reader SHALL fall back to an external node named by the verbatim label value.
+When a `"://"` label is unresolvable, because its host is not a parseable Kubernetes `.svc` name or because the anchor cluster does not itself hold the addressed Service in its own family, the reader SHALL fall back to an external node named by the label value with any URL userinfo removed, as "Connection-string userinfo never leaves the reader" defines.
 
 #### Scenario: Shape of the external node
 
 - **WHEN** a `"://"` label is unresolvable
-- **THEN** the endpoint becomes a node with `id` = `external/<label_value>`, `name` = `<label_value>` (verbatim, no normalisation, no trimming), `type` = `"external"`, and `labels` = `{}` (empty map, no `cluster` key)
+- **THEN** the endpoint becomes a node with `id` = `external/<label_value>`, `name` = `<label_value>` (verbatim apart from removed URL userinfo: no other normalisation, no trimming), `type` = `"external"`, and `labels` = `{}` (empty map, no `cluster` key)
 
 #### Scenario: External endpoints stay visible
 
@@ -1791,7 +1791,7 @@ When any request-scoped selector dimension (`az`, `env`, `cluster`, `namespace`)
 #### Scenario: Forms of an out-of-scope endpoint
 
 - **WHEN** an endpoint of an admitted series does not reach loaded topology
-- **THEN** it resolves to `external/<raw label>` with `labels={}`: a non-empty pod UID that is not loaded falls to that side's `client` / `server` human label exactly as the missing-UID human-label fallback does (`external/cart`), a `"://"` connection string whose Service is not loaded keeps the verbatim label, and a peer address that matches no loaded Service `ClusterIP` or Pod IP keeps the raw peer value
+- **THEN** it resolves to `external/<raw label>` with `labels={}`: a non-empty pod UID that is not loaded falls to that side's `client` / `server` human label exactly as the missing-UID human-label fallback does (`external/cart`), a `"://"` connection string whose Service is not loaded keeps its label with any URL userinfo removed (as "Unresolvable connection string falls back to an external node" defines), and a peer address that matches no loaded Service `ClusterIP` or Pod IP keeps the raw peer value
 - **AND** a side whose UID is not loaded AND whose human label is empty is dropped together with its series, as a wholly empty side is
 
 #### Scenario: Two-phase materialisation
@@ -2438,3 +2438,47 @@ When route resolution is enabled and the route-store DSN (`--route-store-dsn` / 
 
 - **WHEN** the server starts with `--route-store-dsn=clickhouse://ch:9000/routing`
 - **THEN** no DSN-userinfo warning is logged
+
+### Requirement: Connection-string userinfo never leaves the reader
+
+No response body and no per-series Debug log record derived from a service-graph `client` / `server` label containing `"://"` SHALL carry the URL userinfo of that label. Removing it SHALL leave every other byte of the label unchanged, and SHALL NOT change which node an endpoint resolves to.
+
+#### Scenario: What counts as userinfo
+
+- **WHEN** a label contains `"://"`
+- **THEN** each `"://"`-delimited authority runs to the first `/`, `?` or `#` (or the end of the label), its userinfo is everything up to and including the LAST `@` inside it, and a label with no `@` in any authority is unchanged byte for byte
+
+#### Scenario: Credentials are removed from an external node
+
+- **WHEN** a series' `server` label is `mongodb://app:pw@mongo.example:27017/db` with an empty server UID, and the host is not a Kubernetes Service name
+- **THEN** the endpoint becomes `external/mongodb://mongo.example:27017/db` with `name` `mongodb://mongo.example:27017/db`, and neither `app` nor `pw` appears in the response body
+
+#### Scenario: A bare username is removed too
+
+- **WHEN** an unresolvable `"://"` label is `mongodb+srv://admin@cluster0.example/db`
+- **THEN** the external node is `external/mongodb+srv://cluster0.example/db`
+
+#### Scenario: Opaque and malformed labels are covered
+
+- **WHEN** an unresolvable `"://"` label is `jdbc:postgresql://app:pw@db.example:5432/orders`, or carries a password that is not a valid URL escape such as `postgres://app:%zz@db.example/x`
+- **THEN** the external node is `external/jdbc:postgresql://db.example:5432/orders`, respectively `external/postgres://db.example/x`
+
+#### Scenario: An @ outside the authority is kept
+
+- **WHEN** an unresolvable `"://"` label is `https://api.example/users/@me` or `https://api.example/x?email=a@b.example`
+- **THEN** the external node carries the label unchanged
+
+#### Scenario: Labels that differ only in credentials are one endpoint
+
+- **WHEN** two series from the same client carry `server` labels `amqp://app:old@queue.example:5672` and `amqp://app:new@queue.example:5672`, both unresolvable
+- **THEN** the build emits one external node `external/amqp://queue.example:5672` and one edge to it
+
+#### Scenario: A credentialled label still resolves to its Service
+
+- **WHEN** a `"://"` label is `nats://app:pw@nats.messaging.svc:4222` and the anchor cluster holds `messaging/nats`
+- **THEN** the endpoint resolves to that Service node exactly as `nats://nats.messaging.svc:4222` does
+
+#### Scenario: Debug records carry no credentials
+
+- **WHEN** Debug logging is enabled and a series whose `client` or `server` label carries userinfo falls back to an external node, resolves to a Service, is shadowed by a populated pod UID, or is dropped for a wholly empty side
+- **THEN** every Debug record emitted for that series names the label with its userinfo removed
