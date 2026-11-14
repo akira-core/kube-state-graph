@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"golang.org/x/sync/singleflight"
 )
 
 // ClientFactory builds the Querier one backend's queries are dispatched
@@ -93,6 +94,13 @@ type Router struct {
 	nextStore uint64
 
 	state atomic.Pointer[routerState]
+
+	// probeFlight coalesces concurrent readiness probes; probeLast is the
+	// most recent completed outcome, reused for probeOutcomeTTL (see
+	// probeShared). probeMu guards probeLast.
+	probeFlight singleflight.Group
+	probeMu     sync.Mutex
+	probeLast   *probeOutcome
 	// mu serialises Swap so two concurrent reloads cannot interleave client
 	// construction. Readers never take it — they load the state pointer.
 	mu sync.Mutex
@@ -322,14 +330,23 @@ func (e *ProbeError) Error() string {
 // ProbeAll issues the up{} probe to every backend serving the probe family and
 // reports which of them did not answer.
 //
-// Every probe runs concurrently under the caller's context, so the probe
+// Every probe runs concurrently under one shared context, so the probe
 // latency is that of the slowest backend rather than the sum, and a single
 // deadline covers them all. Unlike a query fan-out this does NOT cancel the
 // remaining probes on the first failure: a probe that stopped at the first
 // error could only ever name one backend, and "one of your six upstreams is
 // down" is not actionable.
+//
+// Concurrent calls share one probe of each backend (see probeShared), and a
+// completed outcome is reused for probeOutcomeTTL, so a burst of
+// unauthenticated readiness requests costs the upstream one probe rather than
+// one per request.
 func (r *Router) ProbeAll(ctx context.Context, ts time.Time) error {
-	st := r.state.Load()
+	return r.probeShared(ctx, ts)
+}
+
+// probeBackends is one probe of every probe-serving backend.
+func (r *Router) probeBackends(ctx context.Context, st *routerState, ts time.Time) error {
 	selected := st.table.Select(FamilyProbe, nil)
 	if len(selected) == 0 {
 		// Unreachable through NewTable, which requires every family to be
