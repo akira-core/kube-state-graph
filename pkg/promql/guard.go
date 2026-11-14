@@ -173,7 +173,9 @@ func (g *guard) instant(ctx context.Context, backend, name, query string, ts tim
 	}
 	g.cm.IncCacheMiss()
 
-	flightKey := query + "\x00" + strconv.FormatInt(key.ts, 10)
+	// The flight is keyed like the cache entry it fills: the query's digest,
+	// never the query, so an in-flight key is fixed-size too.
+	flightKey := string(key.digest[:]) + strconv.FormatInt(key.ts, 10)
 	// Two attempts: a waiter whose shared call died of the LEADER's context
 	// (not its own) retries once, becoming the leader itself.
 	for attempt := 0; ; attempt++ {
