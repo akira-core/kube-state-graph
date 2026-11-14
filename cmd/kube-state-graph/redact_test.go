@@ -22,7 +22,7 @@ func TestInitialTable_PromURLUserinfoIsRedacted(t *testing.T) {
 		cfg := config.Defaults()
 		cfg.PromURL = raw
 		var buf bytes.Buffer
-		tbl, err := initialTable(cfg, capturingLogger(&buf), noEnv)
+		tbl, _, err := initialTable(cfg, capturingLogger(&buf), noEnv)
 		require.NoError(t, err)
 		assert.NotContains(t, buf.String(), promURLSecret)
 		assert.Contains(t, buf.String(), "http://ksg:xxxxx@vm.example:8428")
@@ -34,7 +34,7 @@ func TestInitialTable_PromURLUserinfoIsRedacted(t *testing.T) {
 		cfg.PromURL = raw
 		cfg.BackendsFile = writeTable(t, twoBackends)
 		var buf bytes.Buffer
-		_, err := initialTable(cfg, capturingLogger(&buf), noEnv)
+		_, _, err := initialTable(cfg, capturingLogger(&buf), noEnv)
 		require.NoError(t, err)
 		assert.Contains(t, buf.String(), "--prom-url is ignored")
 		assert.NotContains(t, buf.String(), promURLSecret)
@@ -49,7 +49,7 @@ backends:
     families: [ksm, kubelet, harvest, servicegraph, probe]
 `)
 		var buf bytes.Buffer
-		_, err := initialTable(cfg, capturingLogger(&buf), noEnv)
+		_, _, err := initialTable(cfg, capturingLogger(&buf), noEnv)
 		require.NoError(t, err)
 		assert.Contains(t, buf.String(), "url=http://ksg:xxxxx@vm-a:8428")
 		assert.NotContains(t, buf.String(), promURLSecret)

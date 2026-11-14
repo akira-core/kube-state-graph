@@ -41,7 +41,7 @@ func (c *closeRecorder) Close() error { *c.closed = true; return nil }
 
 func readThrough(t *testing.T, rt http.RoundTripper) (string, error) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, "http://upstream.invalid/api/v1/query", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://upstream.invalid/api/v1/query", nil)
 	require.NoError(t, err)
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
