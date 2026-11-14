@@ -175,13 +175,7 @@ func run() error {
 	}, metrics, nil)
 	server := api.New(cfg, builder, promRouter, metrics, logger, keys, nil)
 
-	httpSrv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           server.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      cfg.BuildTimeout + 5*time.Second,
-	}
+	httpSrv := api.NewHTTPServer(cfg, server.Handler())
 
 	errCh := make(chan error, 1)
 	go func() {

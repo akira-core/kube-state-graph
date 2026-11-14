@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -149,17 +150,48 @@ func (s *Server) loggingMiddleware() gin.HandlerFunc {
 			if _, quiet := quietLogPaths[path]; quiet && status < 400 {
 				return
 			}
-			s.logger.InfoContext(c.Request.Context(), "http",
+			clusters, truncated := logClusters(c.Request.URL.Query()["cluster"])
+			attrs := []any{
 				"method", c.Request.Method,
 				"path", path,
 				"status", status,
 				"duration_ms", duration.Milliseconds(),
 				"request_id", c.GetString("request_id"),
-				"clusters", c.Request.URL.Query()["cluster"],
-			)
+				"clusters", clusters,
+			}
+			if truncated {
+				attrs = append(attrs, "clusters_truncated", true)
+			}
+			s.logger.InfoContext(c.Request.Context(), "http", attrs...)
 		}()
 		c.Next()
 	}
+}
+
+// Access-log bounds on the `clusters` field. The values are read before the
+// request is parsed — a rejected request is logged too — so they carry no
+// validation and could otherwise copy an arbitrarily large query string into
+// every log line.
+const (
+	maxLogClusters     = 10
+	maxLogClusterBytes = 64
+)
+
+// logClusters returns at most the first maxLogClusters values, each cut to
+// maxLogClusterBytes at a UTF-8 boundary, in a new slice, and whether anything
+// was cut.
+func logClusters(values []string) ([]string, bool) {
+	truncated := len(values) > maxLogClusters
+	values = values[:min(len(values), maxLogClusters)]
+	out := make([]string, len(values))
+	for i, v := range values {
+		if len(v) > maxLogClusterBytes {
+			v = strings.ToValidUTF8(v[:maxLogClusterBytes], "")
+			truncated = true
+		}
+		out[i] = v
+	}
+	return out, truncated
 }
 
 func statusClass(s int) string {

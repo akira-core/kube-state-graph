@@ -1,6 +1,7 @@
 package kubegraph
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -45,6 +46,19 @@ type Request struct {
 // generous ceiling for the operator-defined zone / environment vocabularies.
 const maxSelectorValueLen = 253
 
+// maxSelectorValues bounds how many DISTINCT non-empty values one selector
+// parameter (cluster, namespace, az, env) may carry. Each parameter renders as
+// ONE request-matcher alternation in every leg of a build and is never chunked,
+// so the bound is the upstream's exact-lookup limit for one alternation: past
+// it VictoriaMetrics evaluates the regex against every value of the label, and
+// the matcher's bytes are repeated into every query, every cache key and every
+// data-derived chunk's budget.
+const maxSelectorValues = promql.MaxAlternationValues
+
+// selectorParams are the request-matcher parameters maxSelectorValues bounds.
+// Root parameters are bounded by the build's chunk caps instead.
+var selectorParams = []string{"cluster", "namespace", "az", "env"}
+
 // ParseValues parses the /v1/graph query parameters into a Request. It is the
 // single source of truth for the request contract, shared by the
 // kube-state-graph HTTP handler and by any embedding application (via
@@ -72,8 +86,8 @@ func ParseValues(v url.Values) (Request, error) {
 	// code. Rejecting control characters and absurd lengths (quoting already
 	// makes injection impossible) keeps a malformed request out of the
 	// upstream query rather than turning it into an obscure store error.
-	for _, p := range []string{"cluster", "namespace", "az", "env"} {
-		if err := validateSelectorValues(p, v[p]); err != nil {
+	for _, p := range selectorParams {
+		if err := validateParam(p, v[p]); err != nil {
 			return req, err
 		}
 	}
@@ -139,7 +153,7 @@ func ParseStorageValues(v url.Values) (StorageRequest, error) {
 	}
 
 	for _, p := range []string{"cluster", "namespace", "az", "env", "ontap_cluster", "ontap_node", "node", "aggr", "svm", "pod", "pvc", "pv", "application"} {
-		if err := validateSelectorValues(p, v[p]); err != nil {
+		if err := validateParam(p, v[p]); err != nil {
 			return req, err
 		}
 	}
@@ -274,8 +288,8 @@ func ParseK8sValues(v url.Values) (K8sRequest, error) {
 		return req, err
 	}
 
-	for _, p := range append([]string{"cluster", "namespace", "az", "env"}, k8sRootParams...) {
-		if err := validateSelectorValues(p, v[p]); err != nil {
+	for _, p := range append(slices.Clone(selectorParams), k8sRootParams...) {
+		if err := validateParam(p, v[p]); err != nil {
 			return req, err
 		}
 	}
@@ -348,11 +362,11 @@ func parseWindow(v url.Values) (start, end time.Time, err error) {
 	if endStr == "" {
 		return start, end, &ParseError{"missing_end", "end query parameter is required"}
 	}
-	start, perr := parseTimestamp(startStr)
+	start, perr := parseTimestamp("start", startStr)
 	if perr != nil {
 		return start, end, &ParseError{"invalid_start", perr.Error()}
 	}
-	end, perr = parseTimestamp(endStr)
+	end, perr = parseTimestamp("end", endStr)
 	if perr != nil {
 		return start, end, &ParseError{"invalid_end", perr.Error()}
 	}
@@ -400,8 +414,37 @@ func parsePrune(raw string) (bool, error) {
 	case "false":
 		return false, nil
 	default:
-		return false, &ParseError{"invalid_scope", fmt.Sprintf("prune must be true or false, got %q", raw)}
+		const msg = "prune must be true or false"
+		if !echoable("prune", raw) {
+			return false, &ParseError{"invalid_scope", msg}
+		}
+		return false, &ParseError{"invalid_scope", fmt.Sprintf(msg+", got %q", raw)}
 	}
+}
+
+// validateParam validates one parameter's values. A selector parameter is also
+// bounded to maxSelectorValues distinct non-empty values, checked after the
+// per-value validation so a malformed value is still reported as such. The
+// message names the parameter and the limit, never a value.
+func validateParam(param string, values []string) error {
+	if err := validateSelectorValues(param, values); err != nil {
+		return err
+	}
+	if len(values) <= maxSelectorValues || !slices.Contains(selectorParams, param) {
+		return nil
+	}
+	if len(nonEmptySorted(values)) > maxSelectorValues {
+		return &ParseError{"invalid_scope", fmt.Sprintf("%s carries more than %d distinct values", param, maxSelectorValues)}
+	}
+	return nil
+}
+
+// echoable reports whether a rejected raw value may be quoted back in a 400
+// message: only when it passes the selector-value checks (bounded length,
+// valid UTF-8, no control character), the rule io_rollup and io_delta apply,
+// so a hostile value is never reflected into a response body.
+func echoable(param, raw string) bool {
+	return validateSelectorValues(param, []string{raw}) == nil
 }
 
 // validateSelectorValues rejects values that must never reach an upstream
@@ -435,12 +478,17 @@ func validateSelectorValues(param string, values []string) error {
 }
 
 // parseTimestamp accepts an RFC 3339 timestamp or Unix seconds, returning UTC.
-func parseTimestamp(s string) (time.Time, error) {
+// A value that parses as neither is quoted back only when echoable.
+func parseTimestamp(param, s string) (time.Time, error) {
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return time.Unix(n, 0).UTC(), nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t.UTC(), nil
 	}
-	return time.Time{}, fmt.Errorf("timestamp must be RFC 3339 or Unix seconds: %q", s)
+	const msg = "timestamp must be RFC 3339 or Unix seconds"
+	if !echoable(param, s) {
+		return time.Time{}, errors.New(msg)
+	}
+	return time.Time{}, fmt.Errorf(msg+": %q", s)
 }
