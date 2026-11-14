@@ -75,8 +75,18 @@ type scopedResolver struct {
 
 var _ build.RouteResolver = (*scopedResolver)(nil)
 
+// ResolveRoute answers from the cross-build cache, joins a resolution of the
+// same key already running in any build, or resolves through this scope's
+// memos and caches a success.
 func (s *scopedResolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
-	return s.resolve(ctx, req)
+	res, err := s.r.results.do(ctx, resultKeyOf(req), func(ctx context.Context) (routeResult, error) {
+		dest, outcome, err := s.resolve(ctx, req)
+		return routeResult{dest: dest, outcome: outcome}, err
+	})
+	if err != nil {
+		return build.RouteDestination{}, "", err
+	}
+	return res.dest, res.outcome, nil
 }
 
 // probe is the memoised ingress-IP probe. A successful result (including a nil

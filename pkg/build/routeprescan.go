@@ -400,10 +400,12 @@ func collectRouteQueriesWith(vec model.Vector, r *sgResolver) []routeKey {
 	return keys
 }
 
-// Bounds on the per-build route-resolution work. Each key costs one
+// Bounds on the per-build route-resolution work. A key can cost one
 // cross-cluster probe, a handful of ClickHouse round-trips per destination IP,
 // one in-process istiod translation and one router_check_tool fork/exec
-// (~50-60ms) — all on the request path, with no result cache to amortise it.
+// (~50-60ms), all on the request path. A resolver may amortise that — the
+// engine in pkg/route shares work per build, caches answers across builds and
+// bounds its own work process-wide — but these bounds hold for any resolver.
 //
 // routeResolveConcurrency is a fixed constant rather than a flag: the useful
 // value is bounded by the matcher's process cost, not by anything an operator

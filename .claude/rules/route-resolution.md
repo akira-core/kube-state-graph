@@ -80,17 +80,36 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   `route_engine_no_ingress` / `route_engine_ambiguous_ingress_cluster`;
   `RouteRequest.CallerCluster` feeds ONLY the family key + tie-break, and
   `RouteDestination.Cluster` carries the locked cluster the parse anchors on.
-  The `ClustersWithIngressIP` probe is a pure function of `(ip, at)` (both
-  constant across a build's keys), so it is **memoised per build**: when
-  the resolver implements the optional `build.BuildScopedRouteResolver` upgrade
-  (`RouteResolver` + `BuildScoped() RouteResolver`), `resolveRouteQueries`
-  drives the whole build through one `scopedResolver` scope that caches the
-  probe by `(ip, at)`, collapsing keys that share a destination IP to a
-  single store read. The scope is one-build and mutex-guarded (keys resolve
-  concurrently; the store read stays outside the lock, so a racing duplicate
-  probe is possible and harmless); the shared `*Resolver` stays stateless (an
-  instance cache would leak). Errors are not cached; no outcome/determinism
-  change.
+  **Work sharing** (change `route-engine-memo-and-cache`). Within a build `at`
+  is constant, so three stages are pure functions many keys share, and all
+  three are **memoised per build**: when the resolver implements the optional
+  `build.BuildScopedRouteResolver` upgrade (`RouteResolver` +
+  `BuildScoped() RouteResolver`), `resolveRouteQueries` drives the whole build
+  through one `scopedResolver` scope that memoises the probe by `(ip, at)`, the
+  per-IP `LoadTrafficAt` by `(cluster, ip, at)`, and the istiod translation by
+  `rcKey` = `(cluster, IP list in request order, gateway ns, gateway name,
+  RouteConfiguration name)` — the RC name (`translate.ListenerFor`) is the only
+  thing `Translate` reads from port + host. The scope MUST be concurrency-safe
+  (the prescan calls it from `routeResolveConcurrency` goroutines); every memo
+  is a `flightMemo`: concurrent callers share one execution, a failure is
+  NEVER remembered and NEVER handed to another caller (a waiter whose leader
+  failed — even on the leader's own per-call timeout — runs the work itself),
+  and a panicking leader releases its waiters. Shared rows and the shared
+  `*RouteConfiguration` are read-only. Across builds, the `*Resolver` holds a
+  **bounded result cache** (`resultCache`: LRU, 4096 entries, 60 s TTL, keyed
+  by every `RouteRequest` field with `at` in ms) of successful answers only,
+  with concurrent identical misses coalesced under the same never-share-a-failure
+  rule; the old "`*Resolver` stays stateless" rule is relaxed because a size
+  bound and a TTL answer its leak concern. Its one staleness source is a late
+  store write at or before an already-answered instant, bounded by the TTL.
+  The `*Resolver` also holds the **process-wide engine limit**: every
+  translation and every `router_check_tool` run, across all builds, holds one
+  of `GOMAXPROCS` slots; waiting honours the caller's context and gives up
+  with `errEngineSaturated` (an error with NO outcome → `route_engine_error`,
+  never cached, never the LB-fallback gate). A slot is taken only by the
+  caller doing the work, never while waiting on a shared flight.
+  `LoadTrafficAt` is not limited (I/O behind the driver's pool). No
+  outcome/determinism change.
   **(5) The engine** (`pkg/route`) loads an **ingress-cluster-scoped,
   read-only, as-of** ClickHouse snapshot (`store.LoadTrafficAt` →
   `store.TrafficSnapshot`, resolved in memory by `pkg/route/snapshot`; the
@@ -121,8 +140,9 @@ Disclosed reference for `CLAUDE.md`. The text is the authoritative statement of 
   in-process istiod (`ConfigGenerator`, no istiod pod, no Kubernetes client —
   see the client-go rule) and matches with the native `router_check_tool`
   binary (`--router-check-bin`; copied into the image from the Envoy tools
-  image; ~50–60 ms per config — one translate + one check per resolution, so
-  there is no segment loop and no config-signature cache). **Hop 3 is
+  image; ~50–60 ms per invocation — one configuration state per resolution,
+  so there is no segment loop and no config-signature cache; translations are
+  shared per `rcKey` within a build, see (4b)). **Hop 3 is
   namespace-scoped**: a
   candidate Gateway must live in the ingress Service's OWN namespace —
   enforced in both the gw_versions SQL (`has(?, namespace)` on the hop-1

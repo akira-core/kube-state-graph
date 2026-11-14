@@ -18,6 +18,12 @@
 // config-signature dedup. Destination IPs are REQUIRED: an IP-less
 // request misses with RouteNoIngress before touching the store.
 //
+// Work is shared, never changing an answer: a build's scope (BuildScoped)
+// memoises the probe, the per-IP load and the translation per distinct input;
+// the Resolver caches successful answers across builds (resultCache, bounded
+// and TTL'd) and bounds translations and matcher runs process-wide (the engine
+// limit).
+//
 // pkg/build MUST NOT import this package; only cmd/kube-state-graph
 // or an opting-in embedder constructs a Resolver and injects it via
 // build.Options.RouteResolver. Nothing here constructs a Kubernetes client,
@@ -31,6 +37,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 
@@ -57,6 +64,9 @@ type Resolver struct {
 	// routeResolveConcurrency bounds one build; without this, R concurrent
 	// builds ran up to 4R istiod worlds and 4R child processes.
 	engine chan struct{}
+
+	// results is the bounded, TTL'd cross-build answer cache (resultCache).
+	results *resultCache
 }
 
 // errEngineSaturated is returned when a caller's context ended before an
@@ -112,15 +122,22 @@ func NewResolver(st store.Store, run matchcheck.Runner) *Resolver {
 
 // newResolver is NewResolver over any translator and matcher.
 func newResolver(st store.Store, tr translator, run matcher) *Resolver {
-	return &Resolver{st: st, tr: tr, run: run, engine: make(chan struct{}, defaultEngineSlots())}
+	return &Resolver{
+		st:      st,
+		tr:      tr,
+		run:     run,
+		engine:  make(chan struct{}, defaultEngineSlots()),
+		results: newResultCache(resultCacheMaxEntries, resultCacheTTL, time.Now),
+	}
 }
 
 // ResolveRoute implements build.RouteResolver. The configuration is evaluated
 // at req.At — one snapshot load, one gateway pick, at most one translate + one
-// router_check_tool invocation, one outcome. A standalone call runs through a
-// throwaway scope; a build drives all its keys through one BuildScoped scope.
+// router_check_tool invocation, one outcome — unless the cross-build cache
+// already holds the answer. A standalone call runs through a throwaway scope;
+// a build drives all its keys through one BuildScoped scope.
 func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (build.RouteDestination, build.RouteOutcome, error) {
-	return r.newScope().resolve(ctx, req)
+	return r.newScope().ResolveRoute(ctx, req)
 }
 
 // match runs one router_check_tool invocation over rc for queries, holding an
