@@ -235,7 +235,17 @@ func betterOwner(next, cur string) bool {
 // instant beats an earlier one. A non-empty raw value that fails to parse is
 // counted against its cohort, so only the winning cohort's failures survive.
 // An empty user is the caller's concern.
+//
+// The (time, user) comparison runs first and a row that loses it returns
+// before its deploy time is parsed: the metric returns one row per past
+// deploy, and every one but the newest loses.
 func keepDeployer(dst map[appDeployerKey]deployerCandidate, key appDeployerKey, user, raw string, at model.SampleValue) {
+	cur, exists := dst[key]
+	replace := !exists || at > cur.at || (at == cur.at && user < cur.user)
+	refine := !replace && at == cur.at && user == cur.user
+	if !replace && !refine {
+		return
+	}
 	var when time.Time
 	var parsed bool
 	if raw != "" {
@@ -245,17 +255,15 @@ func keepDeployer(dst map[appDeployerKey]deployerCandidate, key appDeployerKey, 
 	if raw != "" && !parsed {
 		failed = 1
 	}
-	cur, exists := dst[key]
-	switch {
-	case !exists || at > cur.at || (at == cur.at && user < cur.user):
+	if replace {
 		dst[key] = deployerCandidate{user: user, at: at, when: when, ok: parsed, unparsed: failed}
-	case at == cur.at && user == cur.user:
-		if parsed && (!cur.ok || when.After(cur.when)) {
-			cur.when, cur.ok = when, true
-		}
-		cur.unparsed += failed
-		dst[key] = cur
+		return
 	}
+	if parsed && (!cur.ok || when.After(cur.when)) {
+		cur.when, cur.ok = when, true
+	}
+	cur.unparsed += failed
+	dst[key] = cur
 }
 
 func metricLabel(m model.Metric, name string) string {
