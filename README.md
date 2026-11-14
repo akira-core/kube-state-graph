@@ -439,15 +439,23 @@ service-graph behaviour.
 | `--build-timeout`               | `KSG_BUILD_TIMEOUT`              | `15s`                | Per-build context timeout for `/v1/graph`. |
 | `--api-timeout`                 | `KSG_API_TIMEOUT`                | `5s`                 | Per-request timeout for upstream calls outside a graph build (`/readyz` probe, outside-retention probe). |
 | `--api-keys-file`               | `KSG_API_KEYS_FILE`              | (empty)              | Path to a file holding accepted API keys (one per line, `#` comments allowed). Designed for K8s `Secret` mounts. Reloaded periodically. |
-| `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. |
+| `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. Passing it as a command-line flag logs a startup Warn (the keys are visible in the process listing); the env var does not. A key source that yields zero keys logs a Warn that auth is disabled. |
 | `--api-keys-reload-interval`    | `KSG_API_KEYS_RELOAD_INTERVAL`   | `30s`                | How often `--api-keys-file` is re-read. Set to `0` to disable hot reload. |
-| `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug \| info \| warn \| error`. |
+| `--log-level`                   | `KSG_LOG_LEVEL`                  | `info`               | `debug \| info \| warn \| error`. Applies to the OTLP log pipeline too: a record below it reaches neither sink. |
 | `--az-label`                    | `KSG_AZ_LABEL`                   | `az`                 | Upstream label the `?az=` parameter is matched against. The request parameter name never changes — only the label binding. Must be a valid PromQL label name and differ from `--env-label`. |
 | `--env-label`                   | `KSG_ENV_LABEL`                  | `env`                | Upstream label the `?env=` parameter is matched against. |
 | `--app-metadata-metric`         | `KSG_APP_METADATA_METRIC`        | (empty)              | Name of the optional per-pod application-metadata metric (routing family `appmeta`). Empty disables it: no query is issued and every body stays byte-identical. A configured metric whose family no backend serves logs one Warn at startup and behaves as unset. |
 | `--app-metadata-labels`         | `KSG_APP_METADATA_LABELS`        | (empty)              | Comma-separated `field=label` overrides for `app` (default `argocd_app`), `user` (`user`), `ns_owner` (`owner`), `namespace` (`namespace`) and `pod` (`pod`). Omitted fields keep their defaults. Requires `--app-metadata-metric`. `cluster` stays the label `cluster`; az/env use `--az-label` / `--env-label`. |
 | —                               | `KSG_PROM_USERNAME`              | (empty)              | HTTP Basic Auth username for the upstream VictoriaMetrics endpoint. **Env-only — no flag exists**, because credential-carrying flags leak via `ps` and container specs. Must be set together with `KSG_PROM_PASSWORD`. |
 | —                               | `KSG_PROM_PASSWORD`              | (empty)              | HTTP Basic Auth password for the upstream. Env-only, paired with `KSG_PROM_USERNAME` — setting exactly one of the two fails startup. Rotation requires a restart (no hot reload); changing a Secret-backed env var in a Deployment triggers a rollout anyway. |
+
+OpenTelemetry export is configured by the standard `OTEL_*` variables only.
+Each signal is enabled on its own: traces when `OTEL_EXPORTER_OTLP_ENDPOINT`
+or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set, logs when
+`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set; a
+signal with neither stays a no-op. The exported resource carries the process
+id, executable name and Go runtime, never the command line. Telemetry is
+flushed on shutdown inside the same grace period as the HTTP drain.
 
 ### Upstream basic auth
 

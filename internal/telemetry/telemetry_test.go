@@ -54,7 +54,7 @@ func TestSlogHandler_TraceCorrelation(t *testing.T) {
 
 	var buf bytes.Buffer
 	local := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	logger := slog.New(NewSlogHandler(local))
+	logger := slog.New(NewSlogHandler(local, slog.LevelDebug))
 
 	tracer := otel.Tracer("test")
 	// noop tracer's span context is not valid; but the handler must not crash.

@@ -112,7 +112,9 @@ func New(promURL string, metrics Metrics, opts ...Option) (*Client, error) {
 	}
 	u, err := url.Parse(promURL)
 	if err != nil {
-		return nil, fmt.Errorf("prom url: %w", err)
+		// The cause only: a *url.Error quotes the whole input, userinfo
+		// included.
+		return nil, fmt.Errorf("prom url is not parseable: %w", parseErrDetail(err))
 	}
 	// The idle pool is sized to keep one build's scoped second waves warm: a
 	// storage build can hold two waves of pkg/build's scopeConcurrency (16)

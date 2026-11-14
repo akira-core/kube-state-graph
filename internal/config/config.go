@@ -130,6 +130,11 @@ type Config struct {
 	// by the same amount (--end-align / KSG_END_ALIGN). 0 passes start/end
 	// through verbatim.
 	EndAlign time.Duration
+	// APIKeysFromFlag is derived, not configured: Parse sets it when
+	// --api-keys appeared on the command line (KSG_API_KEYS leaves it false).
+	// Keys passed that way are visible in the process listing, so the server
+	// warns at startup. It carries no key value.
+	APIKeysFromFlag bool
 }
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
@@ -211,6 +216,14 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	// Visit walks only the flags actually set on the command line, so this
+	// answers every spelling (-api-keys, --api-keys=…, --api-keys …) without
+	// re-parsing argv.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "api-keys" {
+			cfg.APIKeysFromFlag = true
+		}
+	})
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -321,7 +334,9 @@ func (c Config) Validate() error {
 	}
 	u, err := url.Parse(c.PromURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("prom-url is not a valid URL: %q", c.PromURL)
+		// RedactURL, never %q of the raw value: a URL carrying userinfo would
+		// otherwise put its password in the fatal startup error.
+		return fmt.Errorf("prom-url is not a valid URL: %s", RedactURL(c.PromURL))
 	}
 	// Upstream basic-auth credentials must be configured as a pair. The error
 	// names the env vars only — never echo the configured values.

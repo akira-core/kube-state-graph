@@ -13,11 +13,45 @@ import (
 // OTLP LoggerProvider via otelslog. The local handler's output is enriched
 // with trace_id / span_id keys whenever a record is emitted from a context
 // carrying an active span.
-func NewSlogHandler(local slog.Handler) slog.Handler {
+//
+// level is the configured --log-level, and it gates the OTLP bridge: the
+// bridge's own Enabled asks the SDK LoggerProvider, whose batch processor
+// accepts every level, so without this filter every Debug record would be
+// built and exported whatever the operator configured — and a burst of them
+// overflows the batch queue and drops the Info / Warn records that matter.
+// Pass the SAME level the local handler uses (observability.ParseLevel), so a
+// record is written once to each sink or to neither. Nil means Info.
+func NewSlogHandler(local slog.Handler, level slog.Leveler) slog.Handler {
+	if level == nil {
+		level = slog.LevelInfo
+	}
 	return &fanoutHandler{
 		local:  &spanCorrelatedHandler{inner: local},
-		bridge: otelslog.NewHandler(ServiceName),
+		bridge: &levelFilter{inner: otelslog.NewHandler(ServiceName), level: level},
 	}
+}
+
+// levelFilter drops records below level before they reach inner. WithAttrs
+// and WithGroup re-wrap, so a logger derived with With(...) keeps the filter.
+type levelFilter struct {
+	inner slog.Handler
+	level slog.Leveler
+}
+
+func (h *levelFilter) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= h.level.Level() && h.inner.Enabled(ctx, level)
+}
+
+func (h *levelFilter) Handle(ctx context.Context, record slog.Record) error {
+	return h.inner.Handle(ctx, record)
+}
+
+func (h *levelFilter) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &levelFilter{inner: h.inner.WithAttrs(attrs), level: h.level}
+}
+
+func (h *levelFilter) WithGroup(name string) slog.Handler {
+	return &levelFilter{inner: h.inner.WithGroup(name), level: h.level}
 }
 
 // fanoutHandler delivers each record to two underlying handlers. The bridge

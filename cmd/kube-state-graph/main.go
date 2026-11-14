@@ -72,11 +72,14 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "telemetry init failed (continuing without OTLP exports): %v\n", telErr)
 	}
 
+	// Both sinks read the one level parser, so the OTLP bridge carries exactly
+	// the records the local handler writes.
 	localHandler := observability.NewLogHandler(cfg.LogLevel)
-	logger := slog.New(telemetry.NewSlogHandler(localHandler))
+	logger := slog.New(telemetry.NewSlogHandler(localHandler, observability.ParseLevel(cfg.LogLevel)))
 	slog.SetDefault(logger)
 	logger.Info("starting kube-state-graph",
-		"prom_url", cfg.PromURL,
+		// Userinfo password redacted; the dial target is unchanged.
+		"prom_url", config.RedactURL(cfg.PromURL),
 		"listen_addr", cfg.ListenAddr,
 		"build_timeout", cfg.BuildTimeout,
 		"api_timeout", cfg.APITimeout,
@@ -86,6 +89,7 @@ func run() error {
 		"backends_file", cfg.BackendsFile,
 		"route_store_auth", cfg.RouteStoreUsername != "",
 	)
+	warnArgvSecrets(cfg, logger)
 
 	metrics := observability.NewMetrics()
 	// Every upstream call is dispatched through the router, including the
@@ -201,32 +205,12 @@ func run() error {
 		return err
 	}
 
-	// The drain window must cover the slowest legitimate in-flight request, so
-	// derive it from the server's own WriteTimeout (with a 10s floor for very
-	// short build timeouts) instead of re-deriving the formula.
-	shutdownTimeout := max(httpSrv.WriteTimeout, 10*time.Second)
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-
-	// Telemetry shutdown MUST run even when the HTTP drain fails — otherwise
-	// buffered OTLP spans/logs are dropped. Collect both errors.
-	var errs []error
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http server shutdown failed", "err", err)
-		errs = append(errs, fmt.Errorf("shutdown: %w", err))
-	}
-	// The telemetry flush gets its OWN budget: a timed-out drain has exhausted
-	// shutdownCtx, and the OTel SDK Shutdowns bail immediately on an expired
-	// context — exporting nothing in exactly the abnormal-shutdown case whose
-	// spans/logs matter most (including the drain-failure record just emitted).
-	telCtx, telCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer telCancel()
-	if err := telemetryProviders.Shutdown(telCtx); err != nil {
-		// Bypass the slog OTLP bridge — providers are tearing down.
-		fmt.Fprintf(os.Stderr, "otlp shutdown timed out: %v\n", err)
-		errs = append(errs, fmt.Errorf("otlp shutdown: %w", err))
-	}
-	return errors.Join(errs...)
+	// One grace deadline covers the HTTP drain AND the telemetry flush, so the
+	// exporter never extends the grace period; the drain stops a flush reserve
+	// early so a timed-out drain still leaves the flush time. See shutdown.
+	grace, reserve := shutdownBudget(httpSrv.WriteTimeout)
+	return shutdown(context.Background(), grace, reserve,
+		httpSrv.Shutdown, telemetryProviders.Shutdown, logger, os.Stderr)
 }
 
 // loadAPIKeys returns a populated KeySet (file or CSV) or an empty one when
@@ -240,17 +224,31 @@ func loadAPIKeys(ctx context.Context, cfg config.Config, logger *slog.Logger) (*
 		if err := ks.LoadFile(cfg.APIKeysFile); err != nil {
 			return nil, err
 		}
-		logger.Info("api key auth enabled (file)",
-			"path", cfg.APIKeysFile,
-			"keys", ks.Snapshot(),
-			"reload_interval", cfg.APIKeysReloadInterval,
-		)
+		// An empty or comment-only file is the documented auth-disabled state,
+		// not an error — but it must not be reported as auth ENABLED. The
+		// reload loop is still armed, so keys written later turn auth on.
+		if ks.Empty() {
+			logger.Warn("api key auth DISABLED — --api-keys-file yielded no keys",
+				"path", cfg.APIKeysFile,
+				"reload_interval", cfg.APIKeysReloadInterval,
+			)
+		} else {
+			logger.Info("api key auth enabled (file)",
+				"path", cfg.APIKeysFile,
+				"keys", ks.Snapshot(),
+				"reload_interval", cfg.APIKeysReloadInterval,
+			)
+		}
 		if cfg.APIKeysReloadInterval > 0 {
 			go reloadAPIKeys(ctx, ks, cfg.APIKeysFile, cfg.APIKeysReloadInterval, logger)
 		}
 	case cfg.APIKeys != "":
 		ks.LoadCSV(cfg.APIKeys)
-		logger.Info("api key auth enabled (env)", "keys", ks.Snapshot())
+		if ks.Empty() {
+			logger.Warn("api key auth DISABLED — --api-keys / KSG_API_KEYS yielded no keys")
+		} else {
+			logger.Info("api key auth enabled (env)", "keys", ks.Snapshot())
+		}
 	default:
 		logger.Warn("api key auth DISABLED — no --api-keys-file or --api-keys configured")
 	}
