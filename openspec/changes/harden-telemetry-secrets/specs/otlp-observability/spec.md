@@ -60,7 +60,7 @@ The server SHALL build its `*slog.Logger` using `go.opentelemetry.io/contrib/bri
 
 #### Scenario: Tracing disabled logs locally only
 
-- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` is unset and the server emits a `slog` record
+- **WHEN** `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are both unset and the server emits a `slog` record
 - **THEN** the record is written to the local stderr handler only and no OTLP log record is emitted
 
 ### Requirement: Resource attributes and service identity

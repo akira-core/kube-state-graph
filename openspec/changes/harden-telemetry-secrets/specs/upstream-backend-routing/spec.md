@@ -19,5 +19,5 @@ Wherever the server renders an upstream endpoint URL for humans — `--prom-url`
 
 #### Scenario: Invalid URL errors do not echo the input
 
-- **WHEN** `--prom-url` or a routing-file `url` carries userinfo and is rejected as invalid (unparseable, hostless, or with an unsupported scheme)
+- **WHEN** `--prom-url` or a routing-file `url` carries a password and is rejected as invalid (unparseable, opaque, hostless — including `http:/user:pass@host`, which keeps the credentials in the path — or with an unsupported scheme)
 - **THEN** the startup or reload error names the setting or backend and contains no password from the input
