@@ -388,6 +388,29 @@ type nsKey struct{ cluster, ns string }
 type appKey struct{ cluster, ns, app string }
 type ctrlKey struct{ cluster, ns, app, kind, name string }
 
+// group pairs a compound-group key with its path-encoded id, composed once.
+type group[K comparable] struct {
+	id  string
+	key K
+}
+
+// sortedGroups returns the collected keys of one compound tier ordered by
+// their emitted id, which is what keeps the body byte-deterministic. The id is
+// composed once per key and reused for the node itself; composing it inside the
+// comparator allocated two strings per comparison, O(n log n) of them per tier.
+// Ordering is by the id STRING, never by the key fields: the two orders differ
+// whenever a shorter segment is followed by "/" ('-' < '/'). A tie needs two
+// keys composing one id, which the "/"-free Kubernetes names in every
+// non-cluster segment rule out.
+func sortedGroups[K comparable](seen map[K]struct{}, id func(K) string) []group[K] {
+	out := make([]group[K], 0, len(seen))
+	for k := range seen {
+		out = append(out, group[K]{id: id(k), key: k})
+	}
+	slices.SortFunc(out, func(a, b group[K]) int { return cmp.Compare(a.id, b.id) })
+	return out
+}
+
 // Serialise renders a projected view into the deterministic Cytoscape body.
 // The view supplies the in-scope nodes and edges; the response `clusters` field
 // is derived from the clusters actually present in that view (see below).
@@ -467,11 +490,9 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
 			storageClusterParentID(oc), oc, nodeTypeStorageCluster, ""))
 	}
-	nsKeys := slices.SortedFunc(maps.Keys(nsSeen), func(a, b nsKey) int {
-		return cmp.Compare(namespaceParentID(a.cluster, a.ns), namespaceParentID(b.cluster, b.ns))
-	})
-	for _, k := range nsKeys {
-		n := groupNode(namespaceParentID(k.cluster, k.ns), k.ns, nodeTypeNamespace, clusterParentID(k.cluster))
+	for _, grp := range sortedGroups(nsSeen, func(k nsKey) string { return namespaceParentID(k.cluster, k.ns) }) {
+		k := grp.key
+		n := groupNode(grp.id, k.ns, nodeTypeNamespace, clusterParentID(k.cluster))
 		meta := namespaceMeta(g, k.cluster, k.ns)
 		n.Data.NamespaceOwner = meta.Owner
 		n.Data.NamespaceGroup = meta.Group
@@ -479,11 +500,9 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		n.Data.NamespaceAlias = meta.Alias
 		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
-	appKeys := slices.SortedFunc(maps.Keys(appSeen), func(a, b appKey) int {
-		return cmp.Compare(applicationParentID(a.cluster, a.ns, a.app), applicationParentID(b.cluster, b.ns, b.app))
-	})
-	for _, k := range appKeys {
-		n := groupNode(applicationParentID(k.cluster, k.ns, k.app), k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns))
+	for _, grp := range sortedGroups(appSeen, func(k appKey) string { return applicationParentID(k.cluster, k.ns, k.app) }) {
+		k := grp.key
+		n := groupNode(grp.id, k.app, nodeTypeApplication, namespaceParentID(k.cluster, k.ns))
 		appMeta := applicationMeta(g, k.cluster, k.ns, k.app)
 		n.Data.DeployedBy = appMeta.DeployedBy
 		if !appMeta.DeployedAt.IsZero() {
@@ -491,18 +510,15 @@ func Serialise(g *graph.Graph, view graph.View) Body {
 		}
 		body.Elements.Nodes = append(body.Elements.Nodes, n)
 	}
-	ctrlKeys := slices.SortedFunc(maps.Keys(ctrlSeen), func(a, b ctrlKey) int {
-		return cmp.Compare(
-			controllerParentID(a.cluster, a.ns, a.app, a.kind, a.name),
-			controllerParentID(b.cluster, b.ns, b.app, b.kind, b.name))
-	})
-	for _, k := range ctrlKeys {
+	for _, grp := range sortedGroups(ctrlSeen, func(k ctrlKey) string {
+		return controllerParentID(k.cluster, k.ns, k.app, k.kind, k.name)
+	}) {
+		k := grp.key
 		parent := namespaceParentID(k.cluster, k.ns)
 		if k.app != "" {
 			parent = applicationParentID(k.cluster, k.ns, k.app)
 		}
-		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(
-			controllerParentID(k.cluster, k.ns, k.app, k.kind, k.name), k.name, nodeTypeController, parent))
+		body.Elements.Nodes = append(body.Elements.Nodes, groupNode(grp.id, k.name, nodeTypeController, parent))
 	}
 
 	for _, n := range view.Nodes {
