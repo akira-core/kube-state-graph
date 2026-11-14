@@ -1,6 +1,7 @@
 package cytoscape
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -236,6 +237,50 @@ func TestSerialiseCytoscape_ClusterNodesSortedFirst(t *testing.T) {
 	require.GreaterOrEqual(t, len(body.Elements.Nodes), 2)
 	assert.Equal(t, "cluster/c-alpha", body.Elements.Nodes[0].Data.ID)
 	assert.Equal(t, "cluster/c-beta", body.Elements.Nodes[1].Data.ID)
+}
+
+// Every synthesised group tier is ordered by its emitted id string, not by the
+// fields that compose it. The two orders diverge whenever a shorter segment is
+// followed by "/" ("c-1/…" sorts before "c/…" because '-' < '/'), and a
+// controller under an application sorts before one directly under the
+// namespace ("…/application/…" < "…/controller/…"). The estate below hits every
+// divergence in all three tiers, so sorting by key fields would fail here even
+// where the goldens are too small to notice.
+func TestSerialiseCytoscape_GroupTiersSortByID(t *testing.T) {
+	var nodes []graph.GraphNode
+	i := 0
+	for _, c := range []string{"c", "c-1"} {
+		for _, ns := range []string{"n", "n-b"} {
+			for _, app := range []string{"", "x", "x-1"} {
+				for _, owner := range []string{"d", "d-1"} {
+					i++
+					nodes = append(nodes, &graph.PodNode{
+						IDValue:          graph.PodID(c, "uid-"+string(rune('a'+i))),
+						NameValue:        "p",
+						LabelsValue:      map[string]string{"cluster": c, "namespace": ns},
+						ApplicationValue: app,
+						OwnerValue:       &graph.Owner{Kind: "Deployment", Name: owner},
+					})
+				}
+			}
+		}
+	}
+
+	body := cy(t, nodes, nil)
+
+	tiers := map[string][]string{}
+	for _, n := range body.Elements.Nodes {
+		tiers[n.Data.Type] = append(tiers[n.Data.Type], n.Data.ID)
+	}
+	want := map[string]int{nodeTypeNamespace: 4, nodeTypeApplication: 8, nodeTypeController: 24}
+	for typ, count := range want {
+		ids := tiers[typ]
+		require.Len(t, ids, count, "tier %s", typ)
+		assert.Truef(t, slices.IsSorted(ids), "tier %s is not in id order: %v", typ, ids)
+	}
+	assert.Equal(t, "c-1/namespace/n", tiers[nodeTypeNamespace][0])
+	assert.Equal(t, "c-1/namespace/n-b/application/x", tiers[nodeTypeApplication][0])
+	assert.Equal(t, "c-1/namespace/n-b/application/x-1/controller/Deployment/d", tiers[nodeTypeController][0])
 }
 
 // TestSerialiseCytoscape_ClusterIdentityGroups is the serialiser's half of the

@@ -218,7 +218,12 @@ func ontapRoots(kind StorageRootKind, values []string) (StorageRoots, error) {
 		return cmp.Or(cmp.Compare(a.ONTAPCluster, b.ONTAPCluster), cmp.Compare(a.Name, b.Name))
 	})
 	qualified = slices.Compact(qualified)
-	qualified = slices.DeleteFunc(qualified, func(r ONTAPRef) bool { return slices.Contains(bare, r.Name) })
+	// bare is sorted and de-duplicated above, so each subsumption check is a
+	// binary search rather than a scan: O((b+q) log b) instead of O(b*q).
+	qualified = slices.DeleteFunc(qualified, func(r ONTAPRef) bool {
+		_, found := slices.BinarySearch(bare, r.Name)
+		return found
+	})
 	if len(qualified) == 0 {
 		qualified = nil
 	}
