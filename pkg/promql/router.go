@@ -171,8 +171,12 @@ func (r *Router) Swap(t *Table) error {
 	if err != nil {
 		return err
 	}
-	r.state.Store(next)
+	// Recorded BEFORE the table goes live: a recorder keeping per-backend
+	// series only for live names must already know a newly added backend
+	// when its first query observes it, or that query's +1 would be dropped
+	// and its -1 recorded.
 	routerMetricsOf(r.metrics).SetBackends(backendNames(t.Backends()))
+	r.state.Store(next)
 
 	if prev != nil {
 		for key, q := range prev.byKey {
