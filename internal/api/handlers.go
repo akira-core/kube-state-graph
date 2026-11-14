@@ -202,19 +202,55 @@ func (s *Server) serveGraph(c *gin.Context, start, end time.Time, sel promql.Sel
 	if !s.windowWithinCap(c, start, end) {
 		return
 	}
-	g, err := s.runBuild(c.Request.Context(), start, end, sel, run)
+	// One --build-timeout deadline bounds every stage — build, projection,
+	// serialisation and encoding — and the context is checked between them, so
+	// a client that has gone or a deadline that has passed stops the CPU work
+	// instead of finishing a body nobody will read. The stages themselves are
+	// pure and are not interrupted mid-way.
+	ctx, cancel := context.WithTimeoutCause(c.Request.Context(), s.cfg.BuildTimeout, errBuildTimeout)
+	defer cancel()
+
+	g, err := s.runBuild(ctx, start, end, sel, run)
 	if err != nil {
 		s.mapBuildError(c, err)
 		return
 	}
-
-	view := s.projectWithSpan(c.Request.Context(), projectSpan, func() graph.View {
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
+	view := s.projectWithSpan(ctx, projectSpan, func() graph.View {
 		return project(g)
 	})
-	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
+	body := s.serialiseWithSpan(ctx, "cytoscape", func() any {
 		return cytoscape.Serialise(g, view)
 	}, view)
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
 	s.writeJSON(c, body, "cytoscape")
+}
+
+// stageErr classifies a graph request's context between two stages: nil while
+// it is live, ReasonTimeout (504, counted like a build timeout) once the
+// --build-timeout deadline has passed, ReasonCanceled (499) once the client has
+// gone. The messages are the static ones runBuild and the builder use.
+func (s *Server) stageErr(ctx context.Context) error {
+	err := ctx.Err()
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		s.metrics.BuildRejected.WithLabelValues("timeout").Inc()
+		return build.NewError(build.ReasonTimeout, "build timeout", fmt.Errorf("%w: %w", context.Cause(ctx), err))
+	default:
+		return build.NewError(build.ReasonCanceled, "request canceled", err)
+	}
 }
 
 // windowWithinCap enforces --max-window on the caller's own start / end, after
@@ -267,17 +303,16 @@ func (s *Server) serialiseWithSpan(ctx context.Context, format string, fn func()
 // every graph endpoint and the timeout normalisation cannot drift between them.
 type buildFunc func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error)
 
-// runBuild wraps a build in a per-request build-timeout context. On
-// context.DeadlineExceeded the error is normalised to ReasonTimeout (504) so
-// the handler-side mapBuildError surfaces the RFC 9110 §15.6.5 status.
+// runBuild runs a build under buildCtx, which serveGraph bounds by the
+// request's --build-timeout deadline. On context.DeadlineExceeded the error is
+// normalised to ReasonTimeout (504) so the handler-side mapBuildError surfaces
+// the RFC 9110 §15.6.5 status.
 //
 // start/end arrive already validated; they are aligned to --end-align HERE, the
 // one point every graph endpoint passes through, so validation errors always
 // name the caller's own values and the endpoints cannot align differently.
-func (s *Server) runBuild(ctx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
+func (s *Server) runBuild(buildCtx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
 	start, end = kubegraph.AlignWindow(start, end, s.cfg.EndAlign)
-	buildCtx, cancel := context.WithTimeoutCause(ctx, s.cfg.BuildTimeout, errBuildTimeout)
-	defer cancel()
 
 	began := time.Now()
 	g, err := run(buildCtx, end.Sub(start), end, sel)
