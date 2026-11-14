@@ -1711,7 +1711,9 @@ func (s *GraphSuite) TestAPIKey_FileBacked_Enforced() {
 	s.Equal(http.StatusOK, resp3.StatusCode)
 
 	// /livez stays open even with auth enabled.
-	live, err := http.Get(srv.URL + "/livez") //nolint:noctx,gosec // local httptest URL
+	livez, err := http.NewRequestWithContext(s.T().Context(), http.MethodGet, srv.URL+"/livez", nil)
+	s.Require().NoError(err)
+	live, err := http.DefaultClient.Do(livez)
 	s.Require().NoError(err)
 	_ = live.Body.Close()
 	s.Equal(http.StatusOK, live.StatusCode)
