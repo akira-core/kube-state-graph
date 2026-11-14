@@ -74,7 +74,7 @@ func TestGraphEndpoint_UnregisteredEdgeTypeValueIsNotAnError(t *testing.T) {
 	q.Set("end", "2026-05-01T12:00:00Z")
 	q.Set("edge_type", "pod-calls-pods")
 
-	resp, err := http.Get(srv.URL + "/v1/graph?" + q.Encode())
+	resp, err := httpGet(t, srv.URL+"/v1/graph?"+q.Encode())
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -82,7 +82,7 @@ func TestGraphEndpoint_UnregisteredEdgeTypeValueIsNotAnError(t *testing.T) {
 
 func getBody(t *testing.T, u string) []byte {
 	t.Helper()
-	resp, err := http.Get(u)
+	resp, err := httpGet(t, u)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

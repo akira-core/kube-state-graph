@@ -29,7 +29,7 @@ func TestReadyz_Healthy200(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -45,7 +45,7 @@ func TestReadyz_UpstreamUnreachable503(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -64,7 +64,7 @@ func TestReadyz_Timeout503(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := httpGet(t, srv.URL+"/readyz")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -77,7 +77,7 @@ func TestGraph_BuildTimeout504(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
@@ -86,7 +86,7 @@ func TestGraph_BuildTimeout504(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	assert.Equal(t, "timeout", body.Error.Reason)
 
-	mresp, err := http.Get(srv.URL + "/metrics")
+	mresp, err := httpGet(t, srv.URL+"/metrics")
 	require.NoError(t, err)
 	defer mresp.Body.Close()
 	mbody, _ := io.ReadAll(mresp.Body)

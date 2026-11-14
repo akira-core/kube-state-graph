@@ -47,7 +47,7 @@ func TestGraphEndpoint_Upstream502_SanitisedMessage(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -126,7 +126,7 @@ func TestStorageGraphEndpoint_FailsClosedNamingFamily(t *testing.T) {
 			srv := httptest.NewServer(s.Handler())
 			t.Cleanup(srv.Close)
 
-			resp, err := http.Get(srv.URL + path)
+			resp, err := httpGet(t, srv.URL+path)
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -146,7 +146,7 @@ func TestStorageGraphEndpoint_FailsClosedNamingFamily(t *testing.T) {
 		srv := httptest.NewServer(s.Handler())
 		t.Cleanup(srv.Close)
 
-		resp, err := http.Get(srv.URL + path)
+		resp, err := httpGet(t, srv.URL+path)
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -164,7 +164,7 @@ func TestStorageGraphEndpoint_FailsClosedNamingFamily(t *testing.T) {
 		srv := httptest.NewServer(s.Handler())
 		t.Cleanup(srv.Close)
 
-		resp, err := http.Get(srv.URL + path)
+		resp, err := httpGet(t, srv.URL+path)
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -177,7 +177,7 @@ func TestGraphEndpoint_OptionalFamilyStillDegrades(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.NotEqual(t, http.StatusBadGateway, resp.StatusCode)
@@ -197,7 +197,7 @@ func TestGraphEndpoint_Timeout504_SanitisedMessage(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Get(srv.URL + "/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
+	resp, err := httpGet(t, srv.URL+"/v1/graph?start=2026-05-01T12:00:00Z&end=2026-05-01T12:05:00Z")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
@@ -217,7 +217,7 @@ func TestMapBuildError_DefaultInternal_SanitisedMessage(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodGet, "/v1/graph", nil)
+	c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/graph", nil)
 
 	s.mapBuildError(c, upstreamDialErr())
 

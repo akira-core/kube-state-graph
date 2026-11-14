@@ -23,7 +23,7 @@ func TestUnmatchedRoutes_BucketedMetricLabel(t *testing.T) {
 
 	attackerPaths := []string{"/aaa-attacker", "/bbb-attacker", "/v1/ccc-attacker"}
 	for _, p := range attackerPaths {
-		resp, err := http.Get(srv.URL + p)
+		resp, err := httpGet(t, srv.URL+p)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
@@ -34,7 +34,7 @@ func TestUnmatchedRoutes_BucketedMetricLabel(t *testing.T) {
 		assert.Equal(t, "not_found", errField["reason"])
 	}
 
-	metricsResp, err := http.Get(srv.URL + "/metrics")
+	metricsResp, err := httpGet(t, srv.URL+"/metrics")
 	require.NoError(t, err)
 	defer metricsResp.Body.Close()
 	raw, err := io.ReadAll(metricsResp.Body)
