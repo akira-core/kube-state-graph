@@ -2,7 +2,6 @@ package translate
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,8 +20,7 @@ func TestWaitSynced_StopsWhenTheContextEnds(t *testing.T) {
 	start := time.Now()
 	err := waitSynced(ctx, func() bool { return false })
 
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, context.DeadlineExceeded), "the context's cause is returned: %v", err)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the context's cause is returned")
 	assert.Less(t, time.Since(start), time.Second, "returns on the context, not on syncTimeout")
 }
 

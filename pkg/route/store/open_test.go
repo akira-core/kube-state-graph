@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
@@ -90,5 +89,5 @@ func TestOpen_WarnsOnPlaintextCredentialsWithoutValues(t *testing.T) {
 	assert.Contains(t, logged, "without TLS")
 	assert.Contains(t, logged, "route_store_tls=false")
 	assert.NotContains(t, logged, "s3cret")
-	assert.False(t, strings.Contains(logged, "ksg:"), "no userinfo in the log")
+	assert.NotContains(t, logged, "ksg:", "no userinfo in the log")
 }

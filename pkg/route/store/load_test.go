@@ -147,7 +147,7 @@ func TestLoadTrafficAt_SkipsUnparseableRows(t *testing.T) {
 
 	require.Len(t, w.VSes, 1, "the unparseable VirtualService is dropped from the snapshot too")
 	assert.Equal(t, "vs-good", w.VSes[0].Name)
-	var names []string
+	names := make([]string, 0, len(w.Services))
 	for _, r := range w.Services {
 		names = append(names, r.Namespace+"/"+r.Name)
 	}

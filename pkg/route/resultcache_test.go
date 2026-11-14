@@ -46,7 +46,7 @@ func countingFn(calls *atomic.Int64, val routeResult, err error) func(context.Co
 
 func TestResultCache_HitAndTTL(t *testing.T) {
 	clk := &testClock{t: time.Unix(1_700_000_000, 0)}
-	c := newResultCache(8, time.Minute, clk.now)
+	c := newResultCache(8, resultCacheTTL, clk.now)
 	k := resultKey{host: "api.example.com", at: 1}
 	var calls atomic.Int64
 	fn := countingFn(&calls, hitResult("api"), nil)
@@ -68,7 +68,7 @@ func TestResultCache_HitAndTTL(t *testing.T) {
 }
 
 func TestResultCache_DifferentInstantMisses(t *testing.T) {
-	c := newResultCache(8, time.Minute, time.Now)
+	c := newResultCache(8, time.Hour, time.Now)
 	var calls atomic.Int64
 	fn := countingFn(&calls, hitResult("api"), nil)
 	_, _ = c.do(t.Context(), resultKey{host: "api.example.com", at: 1}, fn)
@@ -77,7 +77,7 @@ func TestResultCache_DifferentInstantMisses(t *testing.T) {
 }
 
 func TestResultCache_ErrorsAreNotCached(t *testing.T) {
-	c := newResultCache(8, time.Minute, time.Now)
+	c := newResultCache(8, time.Hour, time.Now)
 	k := resultKey{host: "api.example.com", at: 1}
 	boom := errors.New("store unreachable")
 	var calls atomic.Int64
@@ -93,7 +93,7 @@ func TestResultCache_ErrorsAreNotCached(t *testing.T) {
 }
 
 func TestResultCache_LRUBound(t *testing.T) {
-	c := newResultCache(2, time.Minute, time.Now)
+	c := newResultCache(2, time.Hour, time.Now)
 	var calls atomic.Int64
 	fn := countingFn(&calls, hitResult("x"), nil)
 	a, b, d := resultKey{host: "a"}, resultKey{host: "b"}, resultKey{host: "d"}
@@ -113,7 +113,7 @@ func TestResultCache_LRUBound(t *testing.T) {
 
 // Concurrent identical misses — from different builds — share one resolution.
 func TestResultCache_CoalescesConcurrentMisses(t *testing.T) {
-	c := newResultCache(8, time.Minute, time.Now)
+	c := newResultCache(8, time.Hour, time.Now)
 	k := resultKey{host: "api.example.com", at: 1}
 	var calls atomic.Int64
 	release := make(chan struct{})
@@ -124,24 +124,26 @@ func TestResultCache_CoalescesConcurrentMisses(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for range 6 {
-		wg.Go(func() {
-			v, err := c.do(t.Context(), k, fn)
-			assert.NoError(t, err)
-			assert.Equal(t, hitResult("api"), v)
-		})
+	vals := make([]routeResult, 6)
+	errs := make([]error, 6)
+	for i := range 6 {
+		wg.Go(func() { vals[i], errs[i] = c.do(t.Context(), k, fn) })
 	}
 	require.Eventually(t, func() bool { return calls.Load() == 1 }, time.Second, time.Millisecond)
 	time.Sleep(10 * time.Millisecond)
 	close(release)
 	wg.Wait()
 	assert.Equal(t, int64(1), calls.Load())
+	for i := range 6 {
+		require.NoError(t, errs[i])
+		assert.Equal(t, hitResult("api"), vals[i])
+	}
 }
 
 // A waiter whose resolver failed is not handed that failure: it resolves for
 // itself under its own context.
 func TestResultCache_WaiterResolvesAfterLeaderFailure(t *testing.T) {
-	c := newResultCache(8, time.Minute, time.Now)
+	c := newResultCache(8, time.Hour, time.Now)
 	k := resultKey{host: "api.example.com", at: 1}
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -173,7 +175,7 @@ func TestResultCache_WaiterResolvesAfterLeaderFailure(t *testing.T) {
 
 // A panicking resolver releases its waiters.
 func TestResultCache_PanicReleasesWaiters(t *testing.T) {
-	c := newResultCache(8, time.Minute, time.Now)
+	c := newResultCache(8, time.Hour, time.Now)
 	k := resultKey{host: "api.example.com", at: 1}
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -202,7 +204,7 @@ func TestResultCache_PanicReleasesWaiters(t *testing.T) {
 }
 
 func TestResultCache_DisabledRunsEveryTime(t *testing.T) {
-	var c *resultCache = newResultCache(0, time.Minute, time.Now)
+	c := newResultCache(0, time.Hour, time.Now)
 	require.Nil(t, c)
 	var calls atomic.Int64
 	fn := countingFn(&calls, hitResult("api"), nil)
