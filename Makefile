@@ -53,7 +53,8 @@ GOBIN ?= $(shell go env GOPATH)/bin
 # runs cannot drift. Keep the `NAME ?= value` shape — CI seds it. golangci-lint
 # must be >= v2.13.0, the first release that reads go1.27 export data; older
 # ones fail every package with "export data version 5 is greater than maximum
-# supported version 2".
+# supported version 2". Dependabot does not track either line: bump them by
+# hand (pick the release tag, edit the line, run `make init-tools`).
 GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION   ?= v1.9.0
 # The binary init-tools installs. `make lint` runs it whenever it exists, so a

@@ -30,7 +30,7 @@ See proposal.md, section Why. The current state before this change:
 
 ### D1. Actions pinned by full commit SHA with a version comment
 
-Each `uses:` names the 40-hex commit with a trailing `# vX.Y.Z`. The SHA is resolved with `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, and an annotated tag is dereferenced through `git/tags/<sha>`. The comment is what Dependabot's `github-actions` ecosystem rewrites alongside the SHA. The first-party `akira-core/action-workflow` is pinned the same way, because a moving `v1` tag is the same exposure whoever owns it.
+Each `uses:` names the 40-hex commit with a trailing `# vX.Y.Z`. The SHA is resolved with `gh api repos/<owner>/<repo>/commits/<tag>`, which returns the commit an annotated or lightweight tag points to, after `gh api repos/<owner>/<repo>/tags` confirms the name is a tag and not a branch. (`git/ref/tags/<tag>` followed by `git/tags/<sha>` for an annotated tag gives the same commit.) The comment is what Dependabot's `github-actions` ecosystem rewrites alongside the SHA. The first-party `akira-core/action-workflow` is pinned the same way, because a moving `v1` tag is the same exposure whoever owns it.
 
 - *Alternative: keep major tags and trust the publishers.* Rejected. A tag is mutable, and a compromised or re-pointed tag runs with the job's token.
 - *Alternative: pin the SHA without the comment.* Rejected. Reviewers and Dependabot both need the version beside the SHA.

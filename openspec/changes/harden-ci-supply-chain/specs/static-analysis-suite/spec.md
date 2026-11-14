@@ -33,7 +33,7 @@ The repository SHALL ship a `.golangci.yml` at its root enabling at minimum the 
 
 ### Requirement: golangci-lint runs on every PR
 
-The repository SHALL include a CI workflow that runs `golangci-lint` on every pull request via `golangci/golangci-lint-action@v8` (or newer-major) with `args: --timeout=5m`. The workflow SHALL gate merges on lint success. The job SHALL pass the action an explicit `version` read from the Makefile's `GOLANGCI_LINT_VERSION` declaration, which SHALL be the only place that version is declared. The job SHALL fail when it cannot read that declaration, rather than letting the action resolve a version at run time.
+The repository SHALL include a CI workflow that runs `golangci-lint` on every pull request via `golangci/golangci-lint-action` v8 or a newer major, referenced by commit SHA, with `args: --timeout=5m`. The workflow SHALL gate merges on lint success. The job SHALL pass the action an explicit `version` read from the Makefile's `GOLANGCI_LINT_VERSION` declaration, which SHALL be the only place that version is declared. The job SHALL fail when it cannot read that declaration, rather than letting the action resolve a version at run time.
 
 #### Scenario: Lint job runs on PR
 
@@ -153,7 +153,7 @@ Every job in `.github/workflows/` SHALL set `timeout-minutes`. Each workflow SHA
 
 ### Requirement: Automated dependency update proposals
 
-The repository SHALL carry a `.github/dependabot.yml` that proposes updates weekly for the `gomod`, `github-actions` and `docker` (`/deploy/docker`) ecosystems, with one grouped pull request per ecosystem. Every pinned input that Dependabot does not track SHALL be named, with its re-pin procedure, in the file that declares it.
+The repository SHALL carry a `.github/dependabot.yml` that proposes updates weekly for the `gomod`, `github-actions` and `docker` (`/deploy/docker`) ecosystems, with one grouped pull request per ecosystem. The pinned supply-chain inputs Dependabot does not track — the Dockerfile's `# syntax=` frontend, its `ENVOY_TOOLS_IMAGE` ARG, and the Makefile's `GOLANGCI_LINT_VERSION` and `GOVULNCHECK_VERSION` — SHALL each be named, with how to re-pin it, in the file that declares it.
 
 #### Scenario: Pins move forward through a reviewable PR
 
