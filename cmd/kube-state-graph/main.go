@@ -89,6 +89,7 @@ func run() error {
 		"backends_file", cfg.BackendsFile,
 		"route_store_auth", cfg.RouteStoreUsername != "",
 	)
+	warnArgvSecrets(cfg, logger)
 
 	metrics := observability.NewMetrics()
 	// Every upstream call is dispatched through the router, including the
@@ -223,17 +224,31 @@ func loadAPIKeys(ctx context.Context, cfg config.Config, logger *slog.Logger) (*
 		if err := ks.LoadFile(cfg.APIKeysFile); err != nil {
 			return nil, err
 		}
-		logger.Info("api key auth enabled (file)",
-			"path", cfg.APIKeysFile,
-			"keys", ks.Snapshot(),
-			"reload_interval", cfg.APIKeysReloadInterval,
-		)
+		// An empty or comment-only file is the documented auth-disabled state,
+		// not an error — but it must not be reported as auth ENABLED. The
+		// reload loop is still armed, so keys written later turn auth on.
+		if ks.Empty() {
+			logger.Warn("api key auth DISABLED — --api-keys-file yielded no keys",
+				"path", cfg.APIKeysFile,
+				"reload_interval", cfg.APIKeysReloadInterval,
+			)
+		} else {
+			logger.Info("api key auth enabled (file)",
+				"path", cfg.APIKeysFile,
+				"keys", ks.Snapshot(),
+				"reload_interval", cfg.APIKeysReloadInterval,
+			)
+		}
 		if cfg.APIKeysReloadInterval > 0 {
 			go reloadAPIKeys(ctx, ks, cfg.APIKeysFile, cfg.APIKeysReloadInterval, logger)
 		}
 	case cfg.APIKeys != "":
 		ks.LoadCSV(cfg.APIKeys)
-		logger.Info("api key auth enabled (env)", "keys", ks.Snapshot())
+		if ks.Empty() {
+			logger.Warn("api key auth DISABLED — --api-keys / KSG_API_KEYS yielded no keys")
+		} else {
+			logger.Info("api key auth enabled (env)", "keys", ks.Snapshot())
+		}
 	default:
 		logger.Warn("api key auth DISABLED — no --api-keys-file or --api-keys configured")
 	}
