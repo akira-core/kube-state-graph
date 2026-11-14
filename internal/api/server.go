@@ -110,16 +110,41 @@ func (s *Server) handleNotFound(c *gin.Context) {
 }
 
 // requestIDMiddleware injects a unique X-Request-ID into context and response.
+// An inbound id is kept only when validRequestID accepts it; anything else is
+// replaced by a generated one, so the value echoed in the response header and
+// written to every log line is bounded and log-safe.
 func (s *Server) requestIDMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
-		if id == "" {
+		if !validRequestID(id) {
 			id = uuid.NewString()
 		}
 		c.Set("request_id", id)
 		c.Header("X-Request-ID", id)
 		c.Next()
 	}
+}
+
+// maxRequestIDLen bounds an accepted inbound X-Request-ID.
+const maxRequestIDLen = 128
+
+// validRequestID accepts 1 to maxRequestIDLen bytes of [A-Za-z0-9._:=+/@-]:
+// enough for UUIDs, ULIDs, W3C trace ids and most load-balancer formats, and
+// nothing that could split a log line, smuggle markup or carry a payload.
+// Replacing a rejected id rather than truncating it keeps one id per request.
+func validRequestID(id string) bool {
+	if id == "" || len(id) > maxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		switch b := id[i]; {
+		case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		case strings.IndexByte("._:=+/@-", b) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // quietLogPaths are silent on success: kubelet probes and Prometheus scrape
