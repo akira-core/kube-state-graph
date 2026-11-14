@@ -181,6 +181,81 @@ func TestResolveRouteQueries_CapsKeySet(t *testing.T) {
 	}
 }
 
+// A panic inside one key's resolution must not escape the errgroup goroutine —
+// that would end the process — and must not touch any other key: the panicking
+// key records an engine error (route_engine_error), the rest answer as usual.
+func TestResolveRouteQueries_PanicDegradesOneKey(t *testing.T) {
+	keys := []routeKey{
+		{callerCluster: "cluster-alpha", host: "boom.example.com", path: "/", port: 443, ips: testDNSAnswer},
+		{callerCluster: "cluster-alpha", host: "ok.example.com", path: "/", port: 443, ips: testDNSAnswer},
+	}
+	resolver := &fakeRouteResolver{fn: func(req RouteRequest) (RouteDestination, RouteOutcome, error) {
+		if req.Host == "boom.example.com" {
+			panic("istiod blew up")
+		}
+		return RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "ok"}, RouteHit, nil
+	}}
+
+	idx := resolveRouteQueries(t.Context(), resolver, 0, keys, time.Unix(1_700_000_300, 0).UTC())
+
+	assert.Equal(t, routeIndex{
+		keys[0]: {failed: true},
+		keys[1]: {dest: RouteDestination{Cluster: "cluster-alpha", Namespace: "shop", Service: "ok"}, outcome: RouteHit},
+	}, idx)
+}
+
+// countingScope is a BuildScoped scope that records the peak number of
+// ResolveRoute calls in flight at once.
+type countingScope struct {
+	mu             sync.Mutex
+	inflight, peak int
+	memo           map[string]int // deliberately shared state, guarded by mu
+}
+
+func (c *countingScope) ResolveRoute(_ context.Context, req RouteRequest) (RouteDestination, RouteOutcome, error) {
+	c.mu.Lock()
+	c.inflight++
+	c.peak = max(c.peak, c.inflight)
+	c.memo[req.Host]++
+	c.mu.Unlock()
+	time.Sleep(5 * time.Millisecond) // long enough for the other workers to enter
+	c.mu.Lock()
+	c.inflight--
+	c.mu.Unlock()
+	return RouteDestination{}, RouteNoIngress, nil
+}
+
+type countingScopedResolver struct {
+	fakeRouteResolver
+	scope *countingScope
+}
+
+func (r *countingScopedResolver) BuildScoped() RouteResolver { return r.scope }
+
+// The BuildScopedRouteResolver contract says the scope MUST be safe for
+// concurrent use; this pins WHY: the prescan drives one scope from several
+// goroutines at once. Run under -race, the scope's guarded shared state is
+// exactly what an unguarded memo would race on.
+func TestResolveRouteQueries_DrivesTheScopeConcurrently(t *testing.T) {
+	keys := make([]routeKey, routeResolveConcurrency*2)
+	for i := range keys {
+		keys[i] = routeKey{
+			callerCluster: "cluster-alpha",
+			host:          "svc-" + strconv.Itoa(i) + ".example.com",
+			path:          "/", port: 443, ips: testDNSAnswer,
+		}
+	}
+	scope := &countingScope{memo: map[string]int{}}
+	res := &countingScopedResolver{scope: scope}
+
+	idx := resolveRouteQueries(t.Context(), res, 0, keys, time.Unix(1_700_000_300, 0).UTC())
+
+	require.Len(t, idx, len(keys))
+	assert.Greater(t, scope.peak, 1, "the scope must be called concurrently, so it must be concurrency-safe")
+	assert.LessOrEqual(t, scope.peak, routeResolveConcurrency)
+	assert.Len(t, scope.memo, len(keys))
+}
+
 // unknownPeerSample builds one server="unknown" sample whose client resolves
 // to the real topology pod "abc" (cluster-alpha), with peer set on
 // client_net_peer_name, the default client_dns_answers IP, and any extra

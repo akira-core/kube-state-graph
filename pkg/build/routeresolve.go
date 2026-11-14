@@ -165,11 +165,12 @@ type RouteResolver interface {
 // when this is implemented and drives every ResolveRoute of that build through
 // the returned scope, so identical probes collapse to one store read.
 //
-// The scope lives for exactly ONE build, is called SERIALLY (the prescan loop),
-// and therefore need NOT be safe for concurrent use — unlike the base resolver,
-// which is shared across concurrent builds and must stay stateless. A cache on
-// the shared resolver would instead grow unbounded across builds; the per-build
-// scope is the correct lifetime.
+// The scope lives for exactly ONE build, but within it the prescan resolves
+// keys CONCURRENTLY (up to routeResolveConcurrency at once), so the scope MUST
+// be safe for concurrent use, exactly like the base resolver, which is shared
+// across concurrent builds. Per-build memoisation belongs in the scope because
+// that is its natural lifetime; anything the base resolver keeps across builds
+// must be bounded.
 //
 // This is an optional interface (idiomatic Go, cf. http.Flusher) so the base
 // RouteResolver contract is unchanged: a resolver that does not implement it

@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -471,7 +473,7 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 			if perCallTimeout > 0 {
 				callCtx, cancel = context.WithTimeoutCause(ctx, perCallTimeout, errRouteCallTimeout)
 			}
-			dest, outcome, err := resolver.ResolveRoute(callCtx, k.request(at))
+			dest, outcome, err := resolveRouteRecovering(callCtx, resolver, k.request(at))
 			// Read before cancel(), which would otherwise stamp context.Canceled.
 			cause := context.Cause(callCtx)
 			cancel()
@@ -498,6 +500,27 @@ func resolveRouteQueries(ctx context.Context, resolver RouteResolver, perCallTim
 	}
 	_ = g.Wait() // no goroutine returns an error; resolution never fails a build
 	return idx
+}
+
+// errRoutePanic marks a key whose resolution panicked: recorded like any other
+// engine error (route_engine_error), never propagated.
+var errRoutePanic = errors.New("route resolution panicked")
+
+// resolveRouteRecovering is resolver.ResolveRoute with a panic turned into that
+// key's engine error. Route resolution can never fail a build, and a goroutine
+// panic that escapes the errgroup would end the process: errgroup does not
+// propagate a goroutine panic to Wait, and the engine links istiod, whose
+// translation is far from panic-free on unexpected config.
+func resolveRouteRecovering(ctx context.Context, resolver RouteResolver, req RouteRequest) (dest RouteDestination, outcome RouteOutcome, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.ErrorContext(ctx, "panic in route resolution (endpoint degrades to external)",
+				"caller_cluster", req.CallerCluster, "host", req.Host, "port", req.Port,
+				"panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			dest, outcome, err = RouteDestination{}, "", fmt.Errorf("%w: %v", errRoutePanic, rec)
+		}
+	}()
+	return resolver.ResolveRoute(ctx, req)
 }
 
 // routeIndexResolve is the parse-side consult: given the entry for one
