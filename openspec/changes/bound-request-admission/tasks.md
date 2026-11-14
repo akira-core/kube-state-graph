@@ -41,5 +41,6 @@
 
 ## 7. Documentation and verification
 
-- [x] 7.1 Update `.claude/rules/upstream-queries.md` (no window cap by default; request matchers capped at 100 distinct values; pod root namespace side bounded by the cap) and `.claude/rules/storage-graph.md`.
+- [x] 7.1 Update `.claude/rules/upstream-queries.md` (no window cap by default; request matchers capped at 100 distinct values; the pod root seed split by pair and bounded by the chunk cap and the pair cap) and `.claude/rules/storage-graph.md`.
+- [x] 7.1a Split the pod root seed by `promql.ChunkNamePairs` and cap its distinct pairs at `maxPodRootPairs` (design D3); `TestPodSeed_PairCountIsCapped` pins "A pod root set is bounded by its pair count".
 - [x] 7.2 `openspec validate bound-request-admission`; `go build ./... && go vet ./...`; `go test -race` on every touched package; `GOTOOLCHAIN=go1.27.1 go build ./pkg/...`; `gofmt -l .` empty; goldens unchanged.

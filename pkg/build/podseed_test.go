@@ -1,6 +1,8 @@
 package build
 
 import (
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -100,12 +102,17 @@ func TestPodSeed_OverCapRejected(t *testing.T) {
 // namespaces under one pod name". One pod name paired with more namespaces than
 // the cap's chunk count times 100 fits the name cap in one chunk, but its
 // (namespace, name) pairs take more chunks than the cap, so both endpoints
-// reject it before any query. At the cap it is still accepted.
+// reject it before any query. At the cap it is still accepted, and what makes
+// the cap meaningful is that every query it admits is bounded too: the seed is
+// split by pair, so no issued chunk carries more than MaxAlternationValues
+// namespaces or a restriction longer than the byte budget. The namespaces are
+// 63 bytes, the longest a Kubernetes namespace may be.
 func TestPodSeed_NamespaceSideIsBoundedByTheCap(t *testing.T) {
 	refsAcross := func(namespaces int) []string {
 		refs := make([]string, namespaces)
 		for i := range refs {
-			refs[i] = "ns-" + itoa(10000+i) + "/web-0"
+			ns := "ns-" + itoa(10000+i)
+			refs[i] = ns + strings.Repeat("x", 63-len(ns)) + "/web-0"
 		}
 		return refs
 	}
@@ -115,8 +122,19 @@ func TestPodSeed_NamespaceSideIsBoundedByTheCap(t *testing.T) {
 	_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
 		vlrScope(t, graph.StorageRootPod, refsAcross(atCap)).Roots)
 	require.NoError(t, err, "a pair set filling the cap exactly is accepted")
-	assert.Len(t, q.QueriesFor(promql.QPVCBindings), 1,
-		"the seed's own split is unchanged: one name is one query")
+	seed := q.QueriesFor(promql.QPVCBindings)
+	assert.Len(t, seed, maxRootedVolumeLabelChunks, "the seed is split by pair, one query per pair chunk")
+	assertPodSeedChunksBounded(t, seed)
+
+	q = promqlfake.New(nil)
+	_, err = New(q, Options{}, nil, nil).BuildK8s(t.Context(), time.Minute, vlrEnd, vlrSel,
+		k8sRootsOf(t, graph.StorageRootPod, refsAcross(atCap)...))
+	require.NoError(t, err, "k8s: a pair set filling the cap exactly is accepted")
+	for _, fam := range []promql.Query{promql.QPVCBindings, promql.QPodInfo, promql.QPodOwner} {
+		issued := q.QueriesFor(fam)
+		assert.Len(t, issued, maxRootedVolumeLabelChunks, "k8s %s follows the seed's pair split", fam)
+		assertPodSeedChunksBounded(t, issued)
+	}
 
 	over := refsAcross(atCap + 1)
 	q = promqlfake.New(nil)
@@ -130,4 +148,63 @@ func TestPodSeed_NamespaceSideIsBoundedByTheCap(t *testing.T) {
 		k8sRootsOf(t, graph.StorageRootPod, over...))
 	require.Equal(t, ReasonInvalidScope, AsReason(err))
 	assert.Empty(t, q.Issued(), "k8s: rejected before any query")
+}
+
+// Spec: "A pod root set is bounded by its pair count". A cross product of 40
+// namespaces and 40 names packs into ONE pair chunk (each side is far under 100
+// values), so the chunk cap alone would admit it at any size. The pair count is
+// capped at maxRootedVolumeLabelChunks × MaxAlternationValues, the most values
+// any other root kind admits.
+func TestPodSeed_PairCountIsCapped(t *testing.T) {
+	crossProduct := func(namespaces, names int) []string {
+		refs := make([]string, 0, namespaces*names)
+		for i := range namespaces {
+			for j := range names {
+				refs = append(refs, "n"+itoa(i)+"/p"+itoa(j))
+			}
+		}
+		return refs
+	}
+	atCap := crossProduct(40, 40)
+	require.Len(t, atCap, maxPodRootPairs)
+
+	q := promqlfake.New(nil)
+	_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+		vlrScope(t, graph.StorageRootPod, atCap).Roots)
+	require.NoError(t, err, "a pair set filling the cap exactly is accepted")
+	assert.Len(t, q.QueriesFor(promql.QPVCBindings), 1, "the cross product is one pair chunk")
+
+	over := append(slices.Clone(atCap), "n0/p40")
+	for name, build := range map[string]func(*promqlfake.Querier) error{
+		"storage": func(q *promqlfake.Querier) error {
+			_, err := New(q, Options{}, nil, nil).BuildStorage(t.Context(), time.Minute, vlrEnd, vlrSel,
+				vlrScope(t, graph.StorageRootPod, over).Roots)
+			return err
+		},
+		"k8s": func(q *promqlfake.Querier) error {
+			_, err := New(q, Options{}, nil, nil).BuildK8s(t.Context(), time.Minute, vlrEnd, vlrSel,
+				k8sRootsOf(t, graph.StorageRootPod, over...))
+			return err
+		},
+	} {
+		q := promqlfake.New(nil)
+		require.Equal(t, ReasonInvalidScope, AsReason(build(q)), name)
+		assert.Empty(t, q.Issued(), "%s: rejected before any query", name)
+	}
+}
+
+// assertPodSeedChunksBounded checks every pod-restricted query: neither of its
+// two alternations holds more than MaxAlternationValues values, and the
+// restriction (both alternations and their wrappers) fits the default byte
+// budget.
+func assertPodSeedChunksBounded(t *testing.T, queries []string) {
+	t.Helper()
+	restriction := regexp.MustCompile(`namespace=~?"([^"]*)",pod=~?"([^"]*)"`)
+	for _, query := range queries {
+		m := restriction.FindStringSubmatch(query)
+		require.NotNil(t, m, "a pod-restricted query: %.120s", query)
+		assert.LessOrEqual(t, len(strings.Split(m[1], "|")), promql.MaxAlternationValues, "namespace values")
+		assert.LessOrEqual(t, len(strings.Split(m[2], "|")), promql.MaxAlternationValues, "pod values")
+		assert.LessOrEqual(t, len(m[0]), DefaultQoSScopeBatchBytes, "restriction bytes")
+	}
 }

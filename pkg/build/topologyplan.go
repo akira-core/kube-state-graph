@@ -511,10 +511,16 @@ func (p topologyPlan) prepareClaimSeed(budget int, keys promql.LabelKeys, sel pr
 // restricted on namespace and pod. A seed past the chunk cap returns
 // ReasonInvalidScope before any query. Idempotent, like prepareNodeSeed.
 //
-// The namespace matcher is charged whole, once, because every chunk repeats
-// it. Pod names are what the byte budget then splits. A chunk renders only
-// the namespaces of the refs whose name it carries; the independent
-// alternations can still match a cross pair, and the seed drops those rows.
+// The roots' (namespace, name) pairs are split by promql.ChunkNamePairs, the
+// split every grouped pair read uses, so BOTH alternations of every issued
+// chunk fit the byte budget and promql.MaxAlternationValues. Splitting on the
+// names alone would leave the namespace side unbounded: one pod name paired
+// with a thousand namespaces is one name chunk but a thousand-value namespace
+// alternation, which the upstream evaluates as a regex scan or rejects past
+// -search.maxQueryLen. The chunks counted against the cap are the chunks
+// issued, so a root set the cap accepts never fails on a query it renders. The
+// independent alternations can still match a cross pair, and the seed drops
+// those rows.
 func (p topologyPlan) preparePodSeed(window time.Duration, budget int, keys promql.LabelKeys, sel promql.Selector) (topologyPlan, error) {
 	if p.podPrepared {
 		return p, nil
@@ -524,45 +530,28 @@ func (p topologyPlan) preparePodSeed(window time.Duration, budget int, keys prom
 		return p, nil
 	}
 	budget -= promql.RequestMatcherCost(promql.QPVCBindings, keys, sel)
-	// The namespace side is bounded too: the roots' (namespace, name) pairs,
-	// chunked as the grouped pair reads chunk them, must fit the same cap. One
-	// name paired with thousands of namespaces fits the name cap in one chunk
-	// and would otherwise drive the storage build into a read per namespace.
-	// Only the count is taken; the seed below keeps its name-driven split.
-	if len(promql.ChunkNamePairs(podRefPairs(p.pods), promql.PodLabel, max(budget, 1))) > maxRootedVolumeLabelChunks {
+	pairs := podRefPairs(p.pods)
+	// A chunk bounds its DISTINCT namespaces and names, not its pairs, so a
+	// cross product of 100 namespaces and 100 names is one chunk. The pair
+	// count is bounded separately, at the same number of values every other
+	// root kind's chunk cap admits, so a pod root set is never larger than the
+	// largest root set of any other kind.
+	if len(promql.SortedNamePairs(pairs)) > maxPodRootPairs {
 		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
-	if nsCost := promql.MatcherCost(promql.NamespaceLabel, podRefNamespaces(p.pods)); nsCost > 0 {
-		budget -= nsCost + 1 // the comma before the pod alternation
-	}
-	if budget < 1 {
-		budget = 1
-	}
-	names := podRefNames(p.pods)
-	chunks := promql.ChunkScope(names, budget)
+	chunks := chunksOfPairs(pairs, promql.PodLabel, max(budget, 1))
 	if len(chunks) > maxRootedVolumeLabelChunks {
 		return p, NewError(ReasonInvalidScope, RootScopeCapMessage, nil)
 	}
 	for _, chunk := range chunks {
-		namespaces := namespacesForNames(p.pods, chunk)
-		rendered, ok := promql.RenderClaimBindingsByPod(window, keys, sel, namespaces, chunk)
+		rendered, ok := promql.RenderClaimBindingsByPod(window, keys, sel, chunk.namespaces, chunk.names)
 		if !ok {
 			continue
 		}
 		p.podSeed = append(p.podSeed, rendered)
-		p.podSeedChunks = append(p.podSeedChunks, pairChunk{namespaces: namespaces, names: chunk})
+		p.podSeedChunks = append(p.podSeedChunks, chunk)
 	}
 	return p, nil
-}
-
-func podRefNames(refs []graph.PodRef) []string {
-	seen := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		if ref.Name != "" {
-			seen[ref.Name] = struct{}{}
-		}
-	}
-	return slices.Sorted(maps.Keys(seen))
 }
 
 func podRefPairs(refs []graph.PodRef) []promql.NamePair {
@@ -571,30 +560,6 @@ func podRefPairs(refs []graph.PodRef) []promql.NamePair {
 		out = append(out, promql.NamePair{Namespace: ref.Namespace, Name: ref.Name})
 	}
 	return out
-}
-
-func podRefNamespaces(refs []graph.PodRef) []string {
-	seen := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		if ref.Namespace != "" {
-			seen[ref.Namespace] = struct{}{}
-		}
-	}
-	return slices.Sorted(maps.Keys(seen))
-}
-
-func namespacesForNames(refs []graph.PodRef, names []string) []string {
-	want := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		want[name] = struct{}{}
-	}
-	seen := make(map[string]struct{})
-	for _, ref := range refs {
-		if _, ok := want[ref.Name]; ok && ref.Namespace != "" {
-			seen[ref.Namespace] = struct{}{}
-		}
-	}
-	return slices.Sorted(maps.Keys(seen))
 }
 
 // issuesFirstWave reports whether the plan launches q in the first wave.

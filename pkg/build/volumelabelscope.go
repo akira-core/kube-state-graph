@@ -147,6 +147,12 @@ func rootedNodeLabelChunks(nodes []string, budget int) ([]rootedVolumeLabelsQuer
 // a root kind admits at most maxRootedVolumeLabelChunks × 100 of them.
 const maxRootedVolumeLabelChunks = scopeConcurrency
 
+// maxPodRootPairs bounds a pod root set's distinct (namespace, name) pairs at
+// the most values the chunk cap admits for any other root kind. A pair chunk
+// bounds its distinct namespaces and names separately, so without this a
+// cross product of the two would let one chunk carry 10000 roots.
+const maxPodRootPairs = maxRootedVolumeLabelChunks * promql.MaxAlternationValues
+
 // rootedVolumeLabelsChunks splits the phase-1 restriction across as many
 // queries as the byte budget and promql.MaxAlternationValues require, in
 // (group, chunk) order: the bare

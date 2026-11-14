@@ -6,7 +6,7 @@
 
 - At most `--max-inflight-builds` / `KSG_MAX_INFLIGHT_BUILDS` `/v1/*` requests (default **32**) run at once per replica. The next one is answered at once with `503 Service Unavailable`, `reason: "overloaded"`, `Retry-After: 1`, and issues no upstream query. Before, every request was admitted and queued on the per-store upstream slot until `--build-timeout` turned it into a 504. `/livez`, `/readyz`, `/metrics`, `/docs` and `/openapi.*` are never limited. New self-metrics: `kube_state_graph_inflight_builds`, `kube_state_graph_admission_rejected_total`.
 - Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values on every graph endpoint; more is `400 invalid_scope` before any query.
-- A `pod=` root set whose `(namespace, name)` pairs exceed the root chunk cap (about 1600 namespaces under one name) is `400 invalid_scope` on `/v1/storage-graph` and `/v1/k8s-graph`.
+- A `pod=` root set is `400 invalid_scope` on `/v1/storage-graph` and `/v1/k8s-graph` when it holds more than 1600 distinct `(namespace, name)` pairs or its pairs take more than 16 chunks; an admitted set's seed is now issued as one query per pair chunk, at most 100 namespaces and 100 names each.
 - `http.Server.MaxHeaderBytes` is 256 KiB (was net/http's 1 MiB default): a longer request line is `431`. At the default byte budget every request with bare roots, and every `pod=` root set in a Kubernetes-legal (≤63-byte) namespace, fits; a root set whose repeated prefix (namespace, ONTAP cluster) is far longer than any real name can exceed it.
 - The `--build-timeout` deadline now also bounds projection, serialisation and encoding, so a request that finished building just inside the deadline but encoded past it is `504` instead of `200`.
 
