@@ -216,6 +216,32 @@ func TestNewStorageScope_BareSubsumesQualified(t *testing.T) {
 	assert.Equal(t, []ONTAPRef{{ONTAPCluster: "ontap-lab", Name: "svm_shop"}}, s.Roots.Qualified)
 }
 
+// The subsumption lookup searches the sorted bare set, so it must hold for a
+// bare name at either end and in the middle of that set whatever order the
+// values arrive in, keep a qualified ref whose name sorts between two bare
+// names, and leave Qualified nil once every ref is subsumed.
+func TestNewStorageScope_BareSubsumesQualifiedAcrossManyNames(t *testing.T) {
+	for _, kind := range []StorageRootKind{StorageRootAggr, StorageRootSVM} {
+		t.Run(string(kind), func(t *testing.T) {
+			s, err := NewStorageScope(nil, nil, kind, []string{
+				"oc2/m", "z", "oc1/a", "m", "oc1/n", "a", "oc2/z", "oc1/b", "a", "oc3/zz",
+			})
+			require.NoError(t, err)
+			assert.Equal(t, []string{"a", "m", "z"}, s.Roots.Names)
+			assert.Equal(t, []ONTAPRef{
+				{ONTAPCluster: "oc1", Name: "b"},
+				{ONTAPCluster: "oc1", Name: "n"},
+				{ONTAPCluster: "oc3", Name: "zz"},
+			}, s.Roots.Qualified)
+
+			all, err := NewStorageScope(nil, nil, kind, []string{"oc1/m", "a", "oc2/a", "m"})
+			require.NoError(t, err)
+			assert.Equal(t, []string{"a", "m"}, all.Roots.Names)
+			assert.Nil(t, all.Roots.Qualified, "every qualified ref subsumed leaves Qualified nil")
+		})
+	}
+}
+
 func TestNewStorageScope_RejectsMalformedQualifiedRoot(t *testing.T) {
 	for _, kind := range []StorageRootKind{StorageRootAggr, StorageRootSVM} {
 		for _, bad := range []string{
