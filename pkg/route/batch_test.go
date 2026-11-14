@@ -75,8 +75,9 @@ func aloneAnswers(t *testing.T, reqs []build.RouteRequest) []routeAnswer {
 // The mixed key set really does cover every outcome — otherwise the parity
 // test below would prove less than it claims.
 func TestMixedRequests_CoverEveryOutcome(t *testing.T) {
-	var got []build.RouteOutcome
-	for _, a := range aloneAnswers(t, mixedRequests()) {
+	answers := aloneAnswers(t, mixedRequests())
+	got := make([]build.RouteOutcome, 0, len(answers))
+	for _, a := range answers {
 		require.Empty(t, a.Err)
 		got = append(got, a.Outcome)
 	}
@@ -151,6 +152,48 @@ func TestResolveRoutes_FailedRunIsRetriedQueryByQuery(t *testing.T) {
 	assert.Empty(t, got[1].Outcome)
 	assert.Equal(t, build.RouteHit, got[2].Outcome)
 	assert.Equal(t, int64(1+3), mt.execs.Load(), "one batched run, then one run per query")
+}
+
+// A run that ran out of its per-call time is NOT retried query by query, even
+// though the real router_check_tool reports a killed run as an exit / parse
+// error rather than a context error: re-running every query under fresh
+// timeouts is the load amplification the engine limit exists to prevent.
+func TestResolveRoutes_TimedOutRunIsNotRetried(t *testing.T) {
+	r, _, _, mt := mixedWorld(t)
+	killed := errors.New("router_check_tool resolve: parsed 0 of 3 per-case results: signal: killed")
+	mt.hook = func(ctx context.Context, _ *envoyroute.RouteConfiguration, _ []matchcheck.Query) ([]string, error) {
+		<-ctx.Done()
+		return nil, killed // deliberately NOT a context error
+	}
+	reqs := sharedIngressRequests(3, batchAt)
+
+	answers := r.newScope().ResolveRoutes(t.Context(), reqs,
+		build.RouteBatchLimits{Concurrency: 4, PerCallTimeout: 20 * time.Millisecond})
+
+	for _, a := range answers {
+		require.True(t, a.Answered)
+		require.ErrorIs(t, a.Err, killed)
+		assert.Empty(t, a.Outcome)
+	}
+	assert.Equal(t, int64(1), mt.execs.Load(), "one timed-out batched run, no per-query retries")
+}
+
+// The per-call timeout bounds each phase separately: a slow preparation and a
+// slow matcher run each fit their own budget, so a key whose two stages each
+// take most of the timeout still answers.
+func TestResolveRoutes_PerCallTimeoutBoundsEachPhase(t *testing.T) {
+	// prepare ≈ probe 12.5ms + load 50ms; match 50ms; together > 90ms.
+	st := &fakeStore{snap: sharedIngressSnapshot(t, batchAt), latency: 50 * time.Millisecond}
+	mt := &fakeMatcher{latency: 50 * time.Millisecond}
+	r := newResolver(st, &fakeTranslator{}, mt)
+
+	answers := r.newScope().ResolveRoutes(t.Context(), sharedIngressRequests(2, batchAt),
+		build.RouteBatchLimits{Concurrency: 4, PerCallTimeout: 90 * time.Millisecond})
+
+	for _, a := range answers {
+		require.NoError(t, a.Err)
+		assert.Equal(t, build.RouteHit, a.Outcome)
+	}
 }
 
 // A batch whose context has already ended answers nothing: every request

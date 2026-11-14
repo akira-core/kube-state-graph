@@ -39,37 +39,56 @@ func referenceAnswers(t *testing.T, snap store.TrafficSnapshot, reqs []build.Rou
 // RouteConfiguration once per build — under concurrent keys (-race) — and
 // every key's answer equals its stand-alone answer.
 func TestBuildScoped_SharedIngressDoesEachStageOnce(t *testing.T) {
-	snap := sharedIngressSnapshot(t, memoAt)
-	reqs := sharedIngressRequests(32, memoAt)
-	st := &fakeStore{snap: snap, latency: time.Millisecond}
-	tr := &fakeTranslator{latency: time.Millisecond}
-	r := newResolver(st, tr, &fakeMatcher{})
+	for _, d := range buildDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			snap := sharedIngressSnapshot(t, memoAt)
+			reqs := sharedIngressRequests(32, memoAt)
+			st := &fakeStore{snap: snap, latency: time.Millisecond}
+			tr := &fakeTranslator{latency: time.Millisecond}
+			r := newResolver(st, tr, &fakeMatcher{})
 
-	got := resolveBuild(t.Context(), r, reqs)
+			got := d.run(t.Context(), r, reqs)
 
-	assert.Equal(t, referenceAnswers(t, snap, reqs), got)
-	assert.Equal(t, int64(1), st.probes.Load(), "one probe per (ip, at)")
-	assert.Equal(t, int64(1), st.loads.Load(), "one configuration load per (cluster, ip, at)")
-	assert.Equal(t, int64(1), tr.calls.Load(), "one translation per RouteConfiguration")
+			assert.Equal(t, referenceAnswers(t, snap, reqs), got)
+			assert.Equal(t, int64(1), st.probes.Load(), "one probe per (ip, at)")
+			assert.Equal(t, int64(1), st.loads.Load(), "one configuration load per (cluster, ip, at)")
+			assert.Equal(t, int64(1), tr.calls.Load(), "one translation per RouteConfiguration")
+		})
+	}
+}
+
+// buildDrivers are the two ways a build reaches the engine: the batch the
+// prescan uses when the scope offers it, and the per-key path every other
+// resolver (and a batch-less scope) takes. Per-build sharing must hold on both.
+var buildDrivers = []struct {
+	name string
+	run  func(context.Context, build.RouteResolver, []build.RouteRequest) []routeAnswer
+}{
+	{"batch", resolveBuild},
+	{"per_key", resolveBuildPerKey},
 }
 
 // Different ports select different listeners, so different
 // RouteConfigurations: each is translated once, never shared across names.
 func TestBuildScoped_TranslationKeyedByRouteConfiguration(t *testing.T) {
-	snap := sharedIngressSnapshot(t, memoAt)
-	reqs := sharedIngressRequests(6, memoAt)
-	for i := range reqs {
-		if i%2 == 1 {
-			reqs[i].Port = 80
-		}
+	for _, d := range buildDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			snap := sharedIngressSnapshot(t, memoAt)
+			reqs := sharedIngressRequests(6, memoAt)
+			for i := range reqs {
+				if i%2 == 1 {
+					reqs[i].Port = 80
+				}
+			}
+			tr := &fakeTranslator{}
+			r := newResolver(&fakeStore{snap: snap}, tr, &fakeMatcher{})
+
+			got := d.run(t.Context(), r, reqs)
+
+			assert.Equal(t, referenceAnswers(t, snap, reqs), got)
+			assert.Equal(t, int64(2), tr.calls.Load(), "https.443 and http.80 are two RouteConfigurations")
+		})
 	}
-	tr := &fakeTranslator{}
-	r := newResolver(&fakeStore{snap: snap}, tr, &fakeMatcher{})
-
-	got := resolveBuild(t.Context(), r, reqs)
-
-	assert.Equal(t, referenceAnswers(t, snap, reqs), got)
-	assert.Equal(t, int64(2), tr.calls.Load(), "https.443 and http.80 are two RouteConfigurations")
 }
 
 // A failed configuration load is not remembered: the next key behind the same

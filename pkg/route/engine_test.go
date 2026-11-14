@@ -24,27 +24,39 @@ func TestDefaultEngineSlots(t *testing.T) {
 // prescan's per-build concurrency, yet translations and matcher runs in
 // progress at once never exceed the process-wide limit.
 func TestEngineLimit_BoundsConcurrentBuilds(t *testing.T) {
-	const slots = 2
-	base := time.Unix(1_700_000_000, 0).UTC()
-	gauge := &inflightGauge{}
-	st := &fakeStore{snap: sharedIngressSnapshot(t, base)}
-	r := newResolver(st, &fakeTranslator{latency: 2 * time.Millisecond, gauge: gauge},
-		&fakeMatcher{latency: 2 * time.Millisecond, gauge: gauge})
-	r.engine = make(chan struct{}, slots)
+	for _, d := range buildDrivers {
+		t.Run(d.name, func(t *testing.T) {
+			const slots = 2
+			base := time.Unix(1_700_000_000, 0).UTC()
+			gauge := &inflightGauge{}
+			st := &fakeStore{snap: sharedIngressSnapshot(t, base)}
+			r := newResolver(st, &fakeTranslator{latency: 2 * time.Millisecond, gauge: gauge},
+				&fakeMatcher{latency: 2 * time.Millisecond, gauge: gauge})
+			r.engine = make(chan struct{}, slots)
 
-	var wg sync.WaitGroup
-	for b := range 4 {
-		wg.Go(func() {
-			at := base.Add(time.Duration(b) * time.Millisecond)
-			for _, a := range resolveBuild(t.Context(), r, sharedIngressRequests(8, at)) {
-				assert.Empty(t, a.Err)
+			var wg sync.WaitGroup
+			for b := range 4 {
+				wg.Go(func() {
+					// Distinct instants and ports: no memo or cache sharing
+					// between builds, two RouteConfigurations per build.
+					at := base.Add(time.Duration(b) * time.Millisecond)
+					reqs := sharedIngressRequests(8, at)
+					for i := range reqs {
+						if i%2 == 1 {
+							reqs[i].Port = 80
+						}
+					}
+					for _, a := range d.run(t.Context(), r, reqs) {
+						assert.Empty(t, a.Err)
+					}
+				})
 			}
+			wg.Wait()
+
+			assert.LessOrEqual(t, gauge.max(), slots, "engine work in flight must never exceed the limit")
+			assert.Equal(t, slots, gauge.max(), "the limit is reached, so the test really contends")
 		})
 	}
-	wg.Wait()
-
-	assert.LessOrEqual(t, gauge.max(), slots, "engine work in flight must never exceed the limit")
-	assert.Positive(t, gauge.max())
 }
 
 // A key that cannot get a slot before its context ends degrades with an error

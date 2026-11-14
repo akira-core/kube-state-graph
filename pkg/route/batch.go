@@ -96,7 +96,7 @@ func (s *scopedResolver) ResolveRoutes(ctx context.Context, reqs []build.RouteRe
 	_ = g.Wait()
 
 	// Phase 2: one matcher run per RouteConfiguration.
-	s.batchMatch(ctx, conc, limits.PerCallTimeout, reqs, answers, items)
+	s.batchMatch(ctx, conc, limits.PerCallTimeout, answers, items)
 
 	// Phase 3: requests another build was resolving.
 	var g3 errgroup.Group
@@ -174,7 +174,7 @@ func (s *scopedResolver) batchPrepare(ctx context.Context, perCall time.Duration
 // batchMatch is phase 2: group the items by RouteConfiguration, run one
 // matcher invocation per group, and finish every item's lease — including the
 // items of groups the context ended before (answered=false).
-func (s *scopedResolver) batchMatch(ctx context.Context, conc int, perCall time.Duration, reqs []build.RouteRequest,
+func (s *scopedResolver) batchMatch(ctx context.Context, conc int, perCall time.Duration,
 	answers []build.RouteAnswer, items []*batchItem) {
 	var order []rcKey
 	groups := map[rcKey][]*batchItem{}
@@ -196,14 +196,14 @@ func (s *scopedResolver) batchMatch(ctx context.Context, conc int, perCall time.
 		}
 		group := groups[k]
 		g.Go(func() error {
-			s.matchGroup(ctx, perCall, group, answers)
+			s.matchGroup(ctx, conc, perCall, group, answers)
 			return nil
 		})
 	}
 	_ = g.Wait()
 
-	// Groups never run (the context ended first): release their leases; the
-	// requests stay unanswered.
+	// Groups (or single-query retries) never run because the context ended
+	// first: release their leases; the requests stay unanswered.
 	for _, it := range items {
 		if it != nil && !it.lease.isDone() {
 			it.lease.finish(routeResult{}, context.Cause(ctx))
@@ -213,7 +213,7 @@ func (s *scopedResolver) batchMatch(ctx context.Context, conc int, perCall time.
 
 // matchGroup runs one RouteConfiguration's queries in a single matcher
 // invocation and answers every item of the group.
-func (s *scopedResolver) matchGroup(ctx context.Context, perCall time.Duration, group []*batchItem, answers []build.RouteAnswer) {
+func (s *scopedResolver) matchGroup(ctx context.Context, conc int, perCall time.Duration, group []*batchItem, answers []build.RouteAnswer) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			logBatchPanic(ctx, rec, len(group))
@@ -245,49 +245,88 @@ func (s *scopedResolver) matchGroup(ctx context.Context, perCall time.Duration, 
 	}
 	rc := group[0].check.rc
 
-	clusters, err := s.matchWithTimeout(ctx, perCall, rc, queries)
-	if err != nil && len(queries) > 1 && ctx.Err() == nil && !isContextErr(err) {
-		// The run failed for a reason other than time — router_check_tool
-		// reports all-or-nothing, so one query it cannot answer fails the
-		// whole run. Retry query by query: each request then fails or
-		// succeeds exactly as it would alone.
-		s.matchSingly(ctx, perCall, group, answers)
+	callCtx, cancel := withPerCall(ctx, perCall)
+	clusters, err := s.r.match(callCtx, rc, queries)
+	// Judged by the run's OWN context, never by the error's type: a
+	// router_check_tool killed at its deadline surfaces as an exit / parse
+	// error, not as a context error, and retrying a run that ran out of time
+	// query by query is exactly the load amplification the engine limit
+	// exists to prevent.
+	ranOutOfTime := callCtx.Err() != nil
+	cancel()
+
+	if err != nil && len(queries) > 1 && !ranOutOfTime {
+		// The run failed within its time — router_check_tool reports
+		// all-or-nothing, so one query it cannot answer fails the whole run.
+		// Retry query by query: each request then fails or succeeds exactly as
+		// it would alone.
+		results, errs, ran := s.matchSingly(ctx, conc, perCall, rc, queries)
+		for j, it := range group {
+			qi := slot[j]
+			if !ran[qi] {
+				continue // the context ended first: released by batchMatch
+			}
+			s.answerItem(it, results[qi], errs[qi], answers)
+		}
 		return
 	}
 	for j, it := range group {
 		if err != nil {
-			it.lease.finish(routeResult{}, err)
-			answers[it.idx] = answered(routeResult{}, err)
+			s.answerItem(it, "", err, answers)
 			continue
 		}
-		dest, outcome := it.check.finish(clusters[slot[j]])
-		res := routeResult{dest: dest, outcome: outcome}
-		it.lease.finish(res, nil)
-		answers[it.idx] = answered(res, nil)
+		s.answerItem(it, clusters[slot[j]], nil, answers)
 	}
+}
+
+// answerItem turns one matched cluster string (or the run's error) into the
+// item's answer and publishes it on the item's lease.
+func (s *scopedResolver) answerItem(it *batchItem, envoyCluster string, err error, answers []build.RouteAnswer) {
+	if err != nil {
+		it.lease.finish(routeResult{}, err)
+		answers[it.idx] = answered(routeResult{}, err)
+		return
+	}
+	dest, outcome := it.check.finish(envoyCluster)
+	res := routeResult{dest: dest, outcome: outcome}
+	it.lease.finish(res, nil)
+	answers[it.idx] = answered(res, nil)
 }
 
 // matchSingly is the fallback for a failed group run: one matcher invocation
-// per item, each under its own per-call timeout.
-func (s *scopedResolver) matchSingly(ctx context.Context, perCall time.Duration, group []*batchItem, answers []build.RouteAnswer) {
-	for _, it := range group {
-		clusters, err := s.matchWithTimeout(ctx, perCall, it.check.rc, []matchcheck.Query{it.check.query})
-		if err != nil {
-			it.lease.finish(routeResult{}, err)
-			answers[it.idx] = answered(routeResult{}, err)
-			continue
+// per distinct query, under the batch's concurrency, each with its own
+// per-call timeout. It stops launching once ctx ends; ran reports which
+// queries were attempted.
+func (s *scopedResolver) matchSingly(ctx context.Context, conc int, perCall time.Duration,
+	rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) (results []string, errs []error, ran []bool) {
+	results, errs, ran = make([]string, len(queries)), make([]error, len(queries)), make([]bool, len(queries))
+	var g errgroup.Group
+	g.SetLimit(conc)
+	for qi := range queries {
+		if ctx.Err() != nil {
+			break
 		}
-		dest, outcome := it.check.finish(clusters[0])
-		res := routeResult{dest: dest, outcome: outcome}
-		it.lease.finish(res, nil)
-		answers[it.idx] = answered(res, nil)
+		g.Go(func() error {
+			defer func() {
+				if rec := recover(); rec != nil {
+					logBatchPanic(ctx, rec, 1)
+					errs[qi] = fmt.Errorf("%w: %v", errBatchPanic, rec)
+				}
+			}()
+			ran[qi] = true
+			callCtx, cancel := withPerCall(ctx, perCall)
+			defer cancel()
+			out, err := s.r.match(callCtx, rc, queries[qi:qi+1])
+			if err != nil {
+				errs[qi] = err
+				return nil
+			}
+			results[qi] = out[0]
+			return nil
+		})
 	}
-}
-
-func (s *scopedResolver) matchWithTimeout(ctx context.Context, perCall time.Duration, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error) {
-	callCtx, cancel := withPerCall(ctx, perCall)
-	defer cancel()
-	return s.r.match(callCtx, rc, queries)
+	_ = g.Wait()
+	return results, errs, ran
 }
 
 // batchAwait is phase 3 for one request: wait (bounded by the per-call
@@ -324,10 +363,6 @@ func withPerCall(ctx context.Context, perCall time.Duration) (context.Context, c
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, perCall)
-}
-
-func isContextErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func logBatchPanic(ctx context.Context, rec any, keys int) {
