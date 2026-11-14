@@ -13,10 +13,11 @@
 ARG ENVOY_TOOLS_IMAGE=envoyproxy/envoy:tools-v1.34-latest@sha256:74a4aebd5cc9ca03889189f96f0164015bcd1e087953528ad557cb389816d0d6
 
 # ---- build stage ---------------------------------------------------------
-# Base image Go must match go.mod's `toolchain` directive (go1.27.3); a lower
-# base would trigger a silent mid-build toolchain download from dl.google.com
-# (GOTOOLCHAIN is not pinned to local), breaking reproducibility.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
+# Base image Go must match go.mod's `toolchain` directive (go1.27.4).
+# GOTOOLCHAIN=local turns a drift between the two into a hard build error
+# instead of a silent mid-build toolchain download from dl.google.com.
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
+ENV GOTOOLCHAIN=local
 
 ARG TARGETOS
 ARG TARGETARCH
