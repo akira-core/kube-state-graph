@@ -52,6 +52,11 @@ type Metrics struct {
 	// accepted. liveMu orders a check-and-write against a swap.
 	liveMu       sync.RWMutex
 	liveBackends map[string]struct{}
+
+	// Build admission control (--max-inflight-builds). Unlabelled: the bound
+	// is process-wide, not per route or per client.
+	InflightBuilds    prometheus.Gauge
+	AdmissionRejected prometheus.Counter
 }
 
 // NewMetrics registers and returns a fresh Metrics bundle.
@@ -153,6 +158,14 @@ func NewMetrics() *Metrics {
 			Name: "kube_state_graph_query_cache_series",
 			Help: "Series currently resident in the query-result cache.",
 		}),
+		InflightBuilds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kube_state_graph_inflight_builds",
+			Help: "Graph requests (/v1/*) currently admitted by the --max-inflight-builds bound.",
+		}),
+		AdmissionRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kube_state_graph_admission_rejected_total",
+			Help: "Graph requests (/v1/*) answered 503 overloaded because the --max-inflight-builds bound was reached.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -178,6 +191,8 @@ func NewMetrics() *Metrics {
 		m.QueryCacheShared,
 		m.QueryCacheEvicted,
 		m.QueryCacheSeries,
+		m.InflightBuilds,
+		m.AdmissionRejected,
 	)
 	// The reload results are a closed set, so every one is materialised at
 	// zero: a reload counter that appears only after the first failure gives

@@ -70,6 +70,14 @@ type Options struct {
 
 // Engine wraps a build.Builder and exposes the build → project → serialise
 // pipeline as a single call. Construct one per upstream Querier.
+//
+// An Engine applies NO default build deadline and no admission bound. The
+// server's --build-timeout, --max-inflight-builds and --max-window live in
+// its HTTP layer, not here: every Build* method runs for as long as ctx allows,
+// waiting on upstream slots and queries until ctx is done. An embedder bounds
+// a build by passing a context with a deadline (context.WithTimeout), and its
+// own concurrency if it needs one. Options.APITimeout bounds only the cheap
+// up{} retention probe inside a build, not the build itself.
 type Engine struct {
 	builder  *build.Builder
 	q        promql.Querier // unguarded: Probe must observe the live upstream

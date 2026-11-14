@@ -398,7 +398,7 @@ paths:
       description: |-
         Returns the joined multi-cluster pod / node / PVC graph for the supplied `[start, end]` window in Cytoscape.js JSON shape (`{ elements: { nodes:[…], edges:[…] } }`).
 
-        **Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced, on the values as sent. The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits.
+        **Window**: `start`/`end` accept RFC 3339 or Unix seconds. `end > start` is enforced on the values as sent, and, only when the server runs with `--max-window`, a maximum `end - start` (400 `invalid_range`, checked after every other parameter on all three graph endpoints). The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits (`-search.maxQueryDuration`, `-search.maxSamplesPerQuery`). Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values (400 `invalid_scope`).
 
         **Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 
@@ -536,6 +536,19 @@ paths:
             the message names the family (`upstream query failed: <family>`). Optional
             families — Harvest, kubelet, ALERTS and the degrading annotation / container
             families — log and continue instead'
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: 'Overloaded: the server already runs --max-inflight-builds
+            graph requests (default 32). Answered at once, before any upstream query,
+            with reason `overloaded` and `Retry-After: 1`'
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (always 1)
+              schema:
+                type: string
         "504":
           content:
             application/json:
@@ -668,6 +681,19 @@ paths:
                 $ref: '#/components/schemas/internal_api.errorBody'
           description: 'An upstream query of ANY family except ALERTS returned an
             error; the message names the family (`upstream query failed: <family>`)'
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: 'Overloaded: the server already runs --max-inflight-builds
+            graph requests (default 32). Answered at once, before any upstream query,
+            with reason `overloaded` and `Retry-After: 1`'
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (always 1)
+              schema:
+                type: string
         "504":
           content:
             application/json:
@@ -911,6 +937,19 @@ paths:
           description: 'An upstream query of ANY family except ALERTS returned an
             error — Harvest, kubelet and annotation families included; the message
             names the family (`upstream query failed: <family>`)'
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/internal_api.errorBody'
+          description: 'Overloaded: the server already runs --max-inflight-builds
+            graph requests (default 32). Answered at once, before any upstream query,
+            with reason `overloaded` and `Retry-After: 1`'
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (always 1)
+              schema:
+                type: string
         "504":
           content:
             application/json:

@@ -28,7 +28,7 @@ import (
 //	@Summary		Get multi-cluster graph (Cytoscape.js)
 //	@Description	Returns the joined multi-cluster pod / node / PVC graph for the supplied `[start, end]` window in Cytoscape.js JSON shape (`{ elements: { nodes:[…], edges:[…] } }`).
 //	@Description
-//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced, on the values as sent. The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits.
+//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. `end > start` is enforced on the values as sent, and, only when the server runs with `--max-window`, a maximum `end - start` (400 `invalid_range`, checked after every other parameter on all three graph endpoints). The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits (`-search.maxQueryDuration`, `-search.maxSamplesPerQuery`). Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values (400 `invalid_scope`).
 //	@Description
 //	@Description	**Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 //	@Description
@@ -75,6 +75,8 @@ import (
 //	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, invalid_range, invalid_scope, outside_retention)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502			{object}	errorBody	"A required upstream query returned an error (RFC 9110 §15.6.3); the message names the family (`upstream query failed: <family>`). Optional families — Harvest, kubelet, ALERTS and the degrading annotation / container families — log and continue instead"
+//	@Failure		503			{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503			{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout (RFC 9110 §15.6.5)"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/graph [get]
@@ -123,6 +125,8 @@ func (s *Server) handleGraph(c *gin.Context) {
 //	@Failure		400				{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
 //	@Failure		401				{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502				{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error — Harvest, kubelet and annotation families included; the message names the family (`upstream query failed: <family>`)"
+//	@Failure		503				{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503				{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504				{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/storage-graph [get]
@@ -170,6 +174,8 @@ func (s *Server) handleStorageGraph(c *gin.Context) {
 //	@Failure		400			{object}	errorBody	"Invalid parameters (missing/invalid start|end, missing_cluster, missing_az, missing_env, missing_root, invalid_scope, invalid_range)"
 //	@Failure		401			{object}	errorBody	"Missing or invalid `X-API-Key` (only when API key auth is configured)"
 //	@Failure		502			{object}	errorBody	"An upstream query of ANY family except ALERTS returned an error; the message names the family (`upstream query failed: <family>`)"
+//	@Failure		503			{object}	errorBody	"Overloaded: the server already runs --max-inflight-builds graph requests (default 32). Answered at once, before any upstream query, with reason `overloaded` and `Retry-After: 1`"
+//	@Header		503			{string}	Retry-After	"Seconds to wait before retrying (always 1)"
 //	@Failure		504			{object}	errorBody	"Build exceeded --build-timeout"
 //	@Security		ApiKeyAuth
 //	@Router			/v1/k8s-graph [get]
@@ -193,19 +199,73 @@ func (s *Server) handleK8sGraph(c *gin.Context) {
 // between them.
 func (s *Server) serveGraph(c *gin.Context, start, end time.Time, sel promql.Selector, run buildFunc,
 	projectSpan string, project func(*graph.Graph) graph.View) {
-	g, err := s.runBuild(c.Request.Context(), start, end, sel, run)
+	if !s.windowWithinCap(c, start, end) {
+		return
+	}
+	// One --build-timeout deadline bounds every stage — build, projection,
+	// serialisation and encoding — and the context is checked between them, so
+	// a client that has gone or a deadline that has passed stops the CPU work
+	// instead of finishing a body nobody will read. The stages themselves are
+	// pure and are not interrupted mid-way.
+	ctx, cancel := context.WithTimeoutCause(c.Request.Context(), s.cfg.BuildTimeout, errBuildTimeout)
+	defer cancel()
+
+	g, err := s.runBuild(ctx, start, end, sel, run)
 	if err != nil {
 		s.mapBuildError(c, err)
 		return
 	}
-
-	view := s.projectWithSpan(c.Request.Context(), projectSpan, func() graph.View {
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
+	view := s.projectWithSpan(ctx, projectSpan, func() graph.View {
 		return project(g)
 	})
-	body := s.serialiseWithSpan(c.Request.Context(), "cytoscape", func() any {
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
+	body := s.serialiseWithSpan(ctx, "cytoscape", func() any {
 		return cytoscape.Serialise(g, view)
 	}, view)
+	if err := s.stageErr(ctx); err != nil {
+		s.mapBuildError(c, err)
+		return
+	}
 	s.writeJSON(c, body, "cytoscape")
+}
+
+// stageErr classifies a graph request's context between two stages: nil while
+// it is live, ReasonTimeout (504, counted like a build timeout) once the
+// --build-timeout deadline has passed, ReasonCanceled (499) once the client has
+// gone. The messages are the static ones runBuild and the builder use.
+func (s *Server) stageErr(ctx context.Context) error {
+	err := ctx.Err()
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		s.metrics.BuildRejected.WithLabelValues("timeout").Inc()
+		return build.NewError(build.ReasonTimeout, "build timeout", fmt.Errorf("%w: %w", context.Cause(ctx), err))
+	default:
+		return build.NewError(build.ReasonCanceled, "request canceled", err)
+	}
+}
+
+// windowWithinCap enforces --max-window on the caller's own start / end, after
+// the endpoint's parser accepted the request (so every parse error wins) and
+// before any query. Alignment preserves the window length, so checking before
+// it is exact. A window equal to the cap passes. It writes the 400 and returns
+// false when the window is too long. The parsers stay config-free, which is why
+// the check lives here and not in kubegraph.
+func (s *Server) windowWithinCap(c *gin.Context, start, end time.Time) bool {
+	if s.cfg.MaxWindow <= 0 || end.Sub(start) <= s.cfg.MaxWindow {
+		return true
+	}
+	writeError(c, http.StatusBadRequest, "invalid_range",
+		"window (end - start) exceeds the maximum of "+s.cfg.MaxWindow.String())
+	return false
 }
 
 // projectWithSpan wraps a projection callback (graph.Project, ProjectStorage
@@ -243,17 +303,16 @@ func (s *Server) serialiseWithSpan(ctx context.Context, format string, fn func()
 // every graph endpoint and the timeout normalisation cannot drift between them.
 type buildFunc func(ctx context.Context, window time.Duration, end time.Time, sel promql.Selector) (*graph.Graph, error)
 
-// runBuild wraps a build in a per-request build-timeout context. On
-// context.DeadlineExceeded the error is normalised to ReasonTimeout (504) so
-// the handler-side mapBuildError surfaces the RFC 9110 §15.6.5 status.
+// runBuild runs a build under buildCtx, which serveGraph bounds by the
+// request's --build-timeout deadline. On context.DeadlineExceeded the error is
+// normalised to ReasonTimeout (504) so the handler-side mapBuildError surfaces
+// the RFC 9110 §15.6.5 status.
 //
 // start/end arrive already validated; they are aligned to --end-align HERE, the
 // one point every graph endpoint passes through, so validation errors always
 // name the caller's own values and the endpoints cannot align differently.
-func (s *Server) runBuild(ctx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
+func (s *Server) runBuild(buildCtx context.Context, start, end time.Time, sel promql.Selector, run buildFunc) (*graph.Graph, error) {
 	start, end = kubegraph.AlignWindow(start, end, s.cfg.EndAlign)
-	buildCtx, cancel := context.WithTimeoutCause(ctx, s.cfg.BuildTimeout, errBuildTimeout)
-	defer cancel()
 
 	began := time.Now()
 	g, err := run(buildCtx, end.Sub(start), end, sel)

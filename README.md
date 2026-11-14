@@ -37,12 +37,18 @@ cluster N: kube-state-metrics ──┤
   **no singleflight**, and **no HTTP cache validators** (`ETag` /
   `If-None-Match` / `304`). A horizontally scalable cache mechanism for
   distributed deployment is anticipated as a future change. Caller-supplied
-  `start` / `end` accept RFC 3339 or Unix seconds; the server enforces only
-  `end > start`, then passes the window through to upstream PromQL verbatim —
-  no server-side bucketing, alignment, max-window cap, or future-time guard.
-  Bounded query cost is delegated to VictoriaMetrics search limits
-  (`-search.maxQueryDuration`, `-search.maxPointsPerTimeseries`,
-  `-search.maxSamplesPerQuery`). The serialiser produces a deterministic body
+  `start` / `end` accept RFC 3339 or Unix seconds; the server enforces
+  `end > start` and, only when `--max-window` is set, a maximum window length
+  (`400 invalid_range`; off by default). There is no future-time guard.
+  **Deployment precondition:** bounded query cost is delegated to
+  VictoriaMetrics search limits — set `-search.maxQueryDuration` and
+  `-search.maxSamplesPerQuery` (and `-search.maxPointsPerTimeseries`) on
+  vmselect whatever `--max-window` says, because the window cap bounds only
+  the requested window (an `io_delta=true` storage request reads twice it).
+  Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct
+  values (`400 invalid_scope`), and at most `--max-inflight-builds` `/v1/*`
+  requests run at once per replica (default 32; past it `503 overloaded` with
+  `Retry-After: 1`). The serialiser produces a deterministic body
   (`apiVersion`, `clusters`, `elements` only — no echoed time fields). Pod,
   node, and service IPs appear on the top-level `ipaddress` attribute, not in
   `labels`. Pods additionally carry typed `data` attributes — `owner`
@@ -436,7 +442,9 @@ service-graph behaviour.
 |---------------------------------|----------------------------------|----------------------|-------|
 | `--prom-url`                    | `KSG_PROM_URL`                   | `http://localhost:8428` | VictoriaMetrics Prometheus-compatible endpoint. |
 | `--listen-addr`                 | `KSG_LISTEN_ADDR`                | `:8080`              | HTTP listen address. |
-| `--build-timeout`               | `KSG_BUILD_TIMEOUT`              | `15s`                | Per-build context timeout for `/v1/graph`. |
+| `--build-timeout`               | `KSG_BUILD_TIMEOUT`              | `15s`                | Deadline of one graph request (`/v1/graph`, `/v1/storage-graph`, `/v1/k8s-graph`): the build, the projection, the serialisation and the encoding. Past it: `504 timeout`. |
+| `--max-inflight-builds`         | `KSG_MAX_INFLIGHT_BUILDS`        | `32`                 | `/v1/*` requests admitted at once per replica, after API-key auth. Past it a request is answered `503` (`reason: "overloaded"`, `Retry-After: 1`) at once, with no upstream query. `/livez`, `/readyz`, `/metrics`, `/docs`, `/openapi.*` are never limited. `0` disables the bound. Self-metrics `kube_state_graph_inflight_builds`, `kube_state_graph_admission_rejected_total`. |
+| `--max-window`                  | `KSG_MAX_WINDOW`                 | `0` (off)            | Longest `end - start` a graph request may ask for (the caller's values, before end alignment); longer is `400 invalid_range`, after every other parameter check. Complements, never replaces, VictoriaMetrics' `-search.maxQueryDuration` / `-search.maxSamplesPerQuery`. |
 | `--api-timeout`                 | `KSG_API_TIMEOUT`                | `5s`                 | Per-request timeout for upstream calls outside a graph build (`/readyz` probe, outside-retention probe). |
 | `--api-keys-file`               | `KSG_API_KEYS_FILE`              | (empty)              | Path to a file holding accepted API keys (one per line, `#` comments allowed). Designed for K8s `Secret` mounts. Reloaded periodically. |
 | `--api-keys`                    | `KSG_API_KEYS`                   | (empty)              | Comma-separated literal keys. Dev only; ignored when `--api-keys-file` is set. Passing it as a command-line flag logs a startup Warn (the keys are visible in the process listing); the env var does not. A key source that yields zero keys logs a Warn that auth is disabled. |
@@ -476,6 +484,17 @@ env:
 Every upstream request (topology, service-graph, cluster discovery, the
 `/readyz` probe) then carries `Authorization: Basic …`. The credential values
 never appear in logs, traces, metrics, or error responses.
+
+### Embedding the engine in-process
+
+`pkg/kubegraph.Engine` runs the same parse → build → project → serialise
+pipeline without HTTP, but **applies no default build deadline** and none of
+the server's request bounds (`--build-timeout`, `--max-inflight-builds`,
+`--max-window` live in the HTTP layer). A `Build*` call runs for as long as its
+context allows, so pass one with a deadline (`context.WithTimeout`) and bound
+your own concurrency. `Options.APITimeout` bounds only the retention probe
+inside a build. The parser bounds — at most 100 distinct values of each
+selector parameter, the root chunk caps — apply in-process too.
 
 ## Documentation
 

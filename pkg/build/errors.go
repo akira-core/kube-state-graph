@@ -22,7 +22,15 @@ const (
 	// queries than the cap. It is a client condition: the build issues nothing,
 	// and the API maps it to 400 invalid_scope.
 	ReasonInvalidScope Reason = "invalid_scope"
+	// ReasonOverloaded marks a request refused before any build because the
+	// server already runs as many graph requests as its admission bound allows.
+	// The builder never returns it: the API layer's admission control does, so
+	// the reason / status mapping stays in one table (503 overloaded).
+	ReasonOverloaded Reason = "overloaded"
 )
+
+// OverloadedMessage is the client-facing text for ReasonOverloaded.
+const OverloadedMessage = "too many graph requests in flight; retry later"
 
 // RootScopeCapMessage is the client-facing text for ReasonInvalidScope. It
 // names no root value and no upstream detail.

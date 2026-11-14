@@ -140,7 +140,20 @@ type Config struct {
 	// Keys passed that way are visible in the process listing, so the server
 	// warns at startup. It carries no key value.
 	APIKeysFromFlag bool
+	// MaxInflightBuilds bounds the /v1/* requests admitted at once
+	// (--max-inflight-builds / KSG_MAX_INFLIGHT_BUILDS). A request arriving at
+	// the bound is answered 503 overloaded immediately. 0 disables the bound.
+	MaxInflightBuilds int
+	// MaxWindow caps a graph request's caller-supplied end - start
+	// (--max-window / KSG_MAX_WINDOW); a longer window is 400 invalid_range.
+	// 0 (the default) applies no cap.
+	MaxWindow time.Duration
 }
+
+// DefaultMaxInflightBuilds is the default admission bound. It matches
+// promql.DefaultMaxConcurrency, so a replica holds no more graphs in memory
+// than it can have upstream queries in flight to one store.
+const DefaultMaxInflightBuilds = 32
 
 // LookupEnvFunc matches os.LookupEnv signature so tests can inject env values.
 type LookupEnvFunc func(string) (string, bool)
@@ -182,6 +195,8 @@ func Defaults() Config {
 		QueryCacheMaxSeries:      promql.DefaultQueryCacheMaxSeries,
 		QueryCacheTTL:            promql.DefaultQueryCacheTTL,
 		EndAlign:                 kubegraph.DefaultEndAlign,
+		MaxInflightBuilds:        DefaultMaxInflightBuilds,
+		MaxWindow:                0,
 	}
 }
 
@@ -215,6 +230,8 @@ func Parse(args []string, lookup LookupEnvFunc) (Config, error) {
 	fs.IntVar(&cfg.QueryCacheMaxSeries, "query-cache-max-series", cfg.QueryCacheMaxSeries, "Total series the in-process upstream query-result cache may hold (least-recently-used eviction). 0 disables the cache.")
 	fs.DurationVar(&cfg.QueryCacheTTL, "query-cache-ttl", cfg.QueryCacheTTL, "How long a cached upstream query result may be served.")
 	fs.DurationVar(&cfg.EndAlign, "end-align", cfg.EndAlign, "Grid a graph request's end is floored to (start shifted by the same amount, window length kept), so requests within one step share cached upstream results. 0 passes start/end through verbatim.")
+	fs.IntVar(&cfg.MaxInflightBuilds, "max-inflight-builds", cfg.MaxInflightBuilds, "Maximum /v1/* graph requests admitted at once per replica. A request past the bound is answered 503 (reason overloaded, Retry-After: 1) immediately. 0 disables the bound.")
+	fs.DurationVar(&cfg.MaxWindow, "max-window", cfg.MaxWindow, "Longest graph request window (end - start) accepted; a longer one is 400 invalid_range. 0 applies no cap.")
 	fs.StringVar(&cfg.RouteStoreDSN, "route-store-dsn", cfg.RouteStoreDSN, "ClickHouse DSN of the versioned Istio-config store for global-FQDN route resolution (e.g. clickhouse://host:9000/routing). Prefer KSG_ROUTE_STORE_USERNAME / KSG_ROUTE_STORE_PASSWORD for credentials. Empty (default) disables route resolution entirely.")
 	fs.StringVar(&cfg.RouterCheckBin, "router-check-bin", cfg.RouterCheckBin, "Path to the native Envoy router_check_tool binary used by route resolution. Only consulted when --route-store-dsn is set.")
 	fs.DurationVar(&cfg.RouteResolveTimeout, "route-resolve-timeout", cfg.RouteResolveTimeout, "Per-endpoint timeout for each route-engine resolution during a build. 0 inherits the build deadline only.")
@@ -329,6 +346,12 @@ func applyEnv(cfg *Config, lookup LookupEnvFunc) error {
 	if err := getDur("KSG_END_ALIGN", &cfg.EndAlign); err != nil {
 		return err
 	}
+	if err := getInt("KSG_MAX_INFLIGHT_BUILDS", &cfg.MaxInflightBuilds); err != nil {
+		return err
+	}
+	if err := getDur("KSG_MAX_WINDOW", &cfg.MaxWindow); err != nil {
+		return err
+	}
 	getStr("KSG_ROUTE_STORE_DSN", &cfg.RouteStoreDSN)
 	// Env-only by design — no matching flags are registered in Parse
 	// (same rationale as KSG_PROM_USERNAME / KSG_PROM_PASSWORD).
@@ -394,6 +417,12 @@ func (c Config) Validate() error {
 	}
 	if c.APITimeout <= 0 {
 		return errors.New("api-timeout must be positive")
+	}
+	if c.MaxInflightBuilds < 0 {
+		return errors.New("max-inflight-builds must not be negative (0 disables the bound)")
+	}
+	if c.MaxWindow < 0 {
+		return errors.New("max-window must not be negative (0 applies no cap)")
 	}
 	if c.APIKeysReloadInterval < 0 {
 		return errors.New("api-keys-reload-interval must be >= 0 (0 disables hot reload)")
