@@ -28,7 +28,7 @@ import (
 //	@Summary		Get multi-cluster graph (Cytoscape.js)
 //	@Description	Returns the joined multi-cluster pod / node / PVC graph for the supplied `[start, end]` window in Cytoscape.js JSON shape (`{ elements: { nodes:[…], edges:[…] } }`).
 //	@Description
-//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. Only `end > start` is enforced, on the values as sent. The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits.
+//	@Description	**Window**: `start`/`end` accept RFC 3339 or Unix seconds. `end > start` is enforced on the values as sent, and, only when the server runs with `--max-window`, a maximum `end - start` (400 `invalid_range`, checked after every other parameter on all three graph endpoints). The server then floors `end` to its `--end-align` grid (default 30s; 0 = verbatim) and shifts `start` by the same amount, keeping the window length, so requests within one grid step evaluate at one instant. Upstream query results are cached in process per (store, query, instant) for `--query-cache-ttl`; every request still builds its own graph. Bounded query cost is delegated to upstream VictoriaMetrics search limits (`-search.maxQueryDuration`, `-search.maxSamplesPerQuery`). Each of `cluster`, `namespace`, `az` and `env` accepts at most 100 distinct values (400 `invalid_scope`).
 //	@Description
 //	@Description	**Filters** (all repeatable; AND across param names, OR within a single name): `cluster`, `namespace`, `az`, `env`. The withdrawn `name`, `root`, `depth`, `direction` and `edge_type` parameters are ignored without error, whatever value they carry.
 //	@Description
@@ -199,6 +199,9 @@ func (s *Server) handleK8sGraph(c *gin.Context) {
 // between them.
 func (s *Server) serveGraph(c *gin.Context, start, end time.Time, sel promql.Selector, run buildFunc,
 	projectSpan string, project func(*graph.Graph) graph.View) {
+	if !s.windowWithinCap(c, start, end) {
+		return
+	}
 	g, err := s.runBuild(c.Request.Context(), start, end, sel, run)
 	if err != nil {
 		s.mapBuildError(c, err)
@@ -212,6 +215,21 @@ func (s *Server) serveGraph(c *gin.Context, start, end time.Time, sel promql.Sel
 		return cytoscape.Serialise(g, view)
 	}, view)
 	s.writeJSON(c, body, "cytoscape")
+}
+
+// windowWithinCap enforces --max-window on the caller's own start / end, after
+// the endpoint's parser accepted the request (so every parse error wins) and
+// before any query. Alignment preserves the window length, so checking before
+// it is exact. A window equal to the cap passes. It writes the 400 and returns
+// false when the window is too long. The parsers stay config-free, which is why
+// the check lives here and not in kubegraph.
+func (s *Server) windowWithinCap(c *gin.Context, start, end time.Time) bool {
+	if s.cfg.MaxWindow <= 0 || end.Sub(start) <= s.cfg.MaxWindow {
+		return true
+	}
+	writeError(c, http.StatusBadRequest, "invalid_range",
+		"window (end - start) exceeds the maximum of "+s.cfg.MaxWindow.String())
+	return false
 }
 
 // projectWithSpan wraps a projection callback (graph.Project, ProjectStorage
