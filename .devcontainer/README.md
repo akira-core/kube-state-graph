@@ -15,7 +15,7 @@ Works on **macOS** (Docker Desktop) and **Linux** (Docker Engine).
   (copied from `envoyproxy/envoy:tools-v1.34-latest`, the same source the
   production image uses), with `KSG_ROUTER_CHECK_BIN` pre-set — so
   `internal/integration`'s `TestRouteSuite` runs instead of self-skipping.
-- golangci-lint (`v2.11.4`) + govulncheck, installed by `make init` (the repo's
+- golangci-lint (`v2.15.0`) + govulncheck, installed by `make init` (the repo's
   own bootstrap — single source of truth for versions). mockery/swag run via
   `go tool` (go.mod `tool` directives), no install needed.
 - The Go and Docker VS Code extensions.
@@ -92,7 +92,7 @@ Then *Dev Containers: Rebuild Container* in VS Code.
 go version                                   # go1.27.3
 router_check_tool --help                     # binary + glibc/libstdc++ resolve
 docker info                                  # DooD socket works
-make lint                                    # golangci-lint v2.11.4
+make lint                                    # golangci-lint v2.15.0
 
 # ClickHouse-only route store suite (no router_check_tool needed):
 go test ./internal/integration/ -run TestRouteStoreSuite -v -count=1

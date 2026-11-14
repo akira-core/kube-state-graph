@@ -48,8 +48,14 @@ DOCKER_BUILD_ARGS := \
 ## Host-level tools (golangci-lint, govulncheck) live in $(GOBIN). They are
 ## NOT pulled into go.mod and NOT required by CI consumers of the module.
 GOBIN ?= $(shell go env GOPATH)/bin
-GOLANGCI_LINT_VERSION ?= v2.11.4
-GOVULNCHECK_VERSION   ?= latest
+# SINGLE SOURCE of both tool versions: CI reads these two lines (lint: the
+# golangci-lint-action `version` input; vuln: `make vuln`), so local and CI
+# runs cannot drift. Keep the `NAME ?= value` shape — CI seds it. golangci-lint
+# must be >= v2.13.0, the first release that reads go1.27 export data; older
+# ones fail every package with "export data version 5 is greater than maximum
+# supported version 2".
+GOLANGCI_LINT_VERSION ?= v2.15.0
+GOVULNCHECK_VERSION   ?= v1.9.0
 
 init: init-go init-tools
 	@echo ""
@@ -77,14 +83,15 @@ init-tools:
 	@echo ">> ensure $(GOBIN) is on PATH"
 	@case ":$$PATH:" in *":$(GOBIN):"*) ;; *) echo "  WARN: $(GOBIN) not on PATH. Add: export PATH=\"$(GOBIN):\$$PATH\"";; esac
 	@echo ">> golangci-lint $(GOLANGCI_LINT_VERSION)"
-	@if ! command -v golangci-lint >/dev/null 2>&1 || ! golangci-lint --version 2>/dev/null | grep -q "$$(echo $(GOLANGCI_LINT_VERSION) | sed 's/^v//')"; then \
-	    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-	        | sh -s -- -b $(GOBIN) $(GOLANGCI_LINT_VERSION); \
+	@# Built from the tagged module version through the Go module proxy and
+	@# checksum database, never from an unpinned script fetched off a branch.
+	@if ! command -v golangci-lint >/dev/null 2>&1 || ! golangci-lint --version 2>/dev/null | grep -q "version $$(echo $(GOLANGCI_LINT_VERSION) | sed 's/^v//') "; then \
+	    GOBIN=$(GOBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
 	    echo "  already installed: $$(golangci-lint --version)"; \
 	fi
 	@echo ">> govulncheck $(GOVULNCHECK_VERSION)"
-	@if ! command -v govulncheck >/dev/null 2>&1; then \
+	@if ! command -v govulncheck >/dev/null 2>&1 || ! govulncheck -version 2>/dev/null | grep -q "govulncheck@$(GOVULNCHECK_VERSION)$$"; then \
 	    GOBIN=$(GOBIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 	else \
 	    echo "  already installed at $$(command -v govulncheck)"; \
@@ -155,12 +162,10 @@ lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed: https://golangci-lint.run/usage/install/"; exit 1; }
 	golangci-lint run --timeout=5m
 
+## Always the pinned govulncheck (go run caches the build), never whatever
+## happens to be on PATH: CI runs this target, so local and CI scans agree.
 vuln:
-	@if command -v govulncheck >/dev/null 2>&1; then \
-	    govulncheck ./...; \
-	else \
-	    go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...; \
-	fi
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 ## Dependency-containment check:
 ## pkg/build declares only the RouteResolver interface; the heavy engine lives
