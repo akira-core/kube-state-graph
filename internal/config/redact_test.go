@@ -17,6 +17,8 @@ func TestRedactURL(t *testing.T) {
 		{"//ksg:s3cret@vm.example:8428", "//ksg:xxxxx@vm.example:8428"},
 		// Opaque: scheme "ksg", opaque "s3cret@vm.example:8428".
 		{"ksg:s3cret@vm.example:8428", UnparseableURL},
+		// Hostless: a one-slash typo keeps the credentials in the path.
+		{"http:/ksg:s3cret@vm.example:8428", UnparseableURL},
 		// Unparseable: url.Parse fails and its error would quote the input.
 		{"http://ksg:s3cret@vm.example:84x28", UnparseableURL},
 		{"http://ksg:s3%zzcret@vm.example", UnparseableURL},
@@ -34,6 +36,7 @@ func TestValidate_InvalidPromURLErrorIsRedacted(t *testing.T) {
 		"ksg:s3cret@vm.example:8428",          // opaque, no host
 		"http://ksg:s3cret@vm.example:84x28",  // unparseable port
 		"http://ksg:s3cret@",                  // no host
+		"http:/ksg:s3cret@vm.example:8428",    // one slash: credentials in the path
 		"//ksg:s3cret@vm.example:8428/select", // no scheme
 	} {
 		cfg := Defaults()

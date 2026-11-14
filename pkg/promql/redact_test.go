@@ -36,6 +36,7 @@ func TestNewTable_InvalidURLErrorsNeverEchoUserinfo(t *testing.T) {
 		"http://ksg:" + urlSecret + "@vm-a:84x28",  // unparseable port
 		"http://ksg:" + urlSecret + "%zz@vm-a",     // bad escape
 		"http://ksg:" + urlSecret + "@",            // no host
+		"http:/ksg:" + urlSecret + "@vm-a:8428",    // one slash: credentials in the path
 		"ftp://ksg:" + urlSecret + "@vm-a:8428",    // wrong scheme
 		"ksg:" + urlSecret + "@vm-a:8428",          // opaque
 		"//ksg:" + urlSecret + "@vm-a:8428/select", // no scheme

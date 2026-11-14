@@ -10,12 +10,14 @@ const UnparseableURL = "<unparseable url>"
 // any userinfo password replaced (url.URL.Redacted keeps the user name and
 // prints the password as "xxxxx").
 //
-// An input url.Parse rejects is never echoed, nor is an opaque one:
-// "user:pass@host:8428" parses as scheme "user" with opaque
-// "pass@host:8428", which Redacted would print whole.
+// Only a host-bearing URL is echoed. An input url.Parse rejects is not, nor is
+// an opaque one ("user:pass@host:8428" parses as scheme "user" with opaque
+// "pass@host:8428") or a hostless one ("http:/user:pass@host" keeps the
+// credentials in the path): Redacted only rewrites a parsed userinfo, so it
+// would print either whole.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil || u.Opaque != "" {
+	if err != nil || u.Opaque != "" || u.Host == "" {
 		return UnparseableURL
 	}
 	return u.Redacted()

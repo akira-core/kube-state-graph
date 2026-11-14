@@ -104,13 +104,15 @@ func (b Backend) String() string {
 const unparseableURL = "<unparseable url>"
 
 // redactURL renders an endpoint for a log line or an error with any userinfo
-// password replaced (url.URL.Redacted prints it as "xxxxx"). An input
-// url.Parse rejects is never echoed, nor is an opaque one ("user:pass@host"
-// parses as scheme "user" with the rest opaque, which Redacted prints whole).
-// The dial target, Backend.URL, stays raw.
+// password replaced (url.URL.Redacted prints it as "xxxxx"). Only a
+// host-bearing URL is echoed: an input url.Parse rejects is not, nor is an
+// opaque one ("user:pass@host" parses as scheme "user" with the rest opaque)
+// or a hostless one ("http:/user:pass@host" keeps the credentials in the
+// path) — Redacted would print either whole. The dial target, Backend.URL,
+// stays raw.
 func redactURL(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil || u.Opaque != "" {
+	if err != nil || u.Opaque != "" || u.Host == "" {
 		return unparseableURL
 	}
 	return u.Redacted()
@@ -229,7 +231,7 @@ func validateBackendURL(name, raw string) error {
 		return fmt.Errorf("backend %q: url scheme %q is not http or https", name, u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("backend %q: url %s has no host", name, redactURL(raw))
+		return fmt.Errorf("backend %q: url has no host", name)
 	}
 	return nil
 }
