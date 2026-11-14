@@ -75,16 +75,49 @@ func (f *fakeStore) LoadTrafficAt(ctx context.Context, cluster, ip string, _ tim
 	return f.snap, nil
 }
 
+// inflightGauge records the peak number of concurrent calls it saw. Shared by
+// a translator and a matcher, it measures the engine limit's ceiling, which
+// counts both stages together.
+type inflightGauge struct {
+	mu             sync.Mutex
+	inflight, peak int
+}
+
+// enter records one call starting; the returned func records it ending. A nil
+// gauge records nothing.
+func (g *inflightGauge) enter() func() {
+	if g == nil {
+		return func() {}
+	}
+	g.mu.Lock()
+	g.inflight++
+	g.peak = max(g.peak, g.inflight)
+	g.mu.Unlock()
+	return func() {
+		g.mu.Lock()
+		g.inflight--
+		g.mu.Unlock()
+	}
+}
+
+func (g *inflightGauge) max() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.peak
+}
+
 // fakeTranslator returns an RC named exactly as the real translator names it
 // (translate.ListenerFor), so a test can tell which listener was translated.
 type fakeTranslator struct {
 	latency time.Duration
 	calls   atomic.Int64
+	gauge   *inflightGauge
 	hook    func(in translate.ScopedInput) (*envoyroute.RouteConfiguration, error)
 }
 
 func (f *fakeTranslator) Translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
 	f.calls.Add(1)
+	defer f.gauge.enter()()
 	if err := sleepCtx(ctx, f.latency); err != nil {
 		return nil, err
 	}
@@ -102,32 +135,21 @@ type fakeMatcher struct {
 	latency time.Duration
 
 	execs, queries atomic.Int64
-
-	mu       sync.Mutex
-	inflight int
-	peak     int
+	gauge          *inflightGauge
 
 	miss map[string]bool
-	hook func(rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error)
+	hook func(ctx context.Context, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error)
 }
 
 func (f *fakeMatcher) Resolve(ctx context.Context, rc *envoyroute.RouteConfiguration, qs []matchcheck.Query) ([]string, error) {
 	f.execs.Add(1)
 	f.queries.Add(int64(len(qs)))
-	f.mu.Lock()
-	f.inflight++
-	f.peak = max(f.peak, f.inflight)
-	f.mu.Unlock()
-	defer func() {
-		f.mu.Lock()
-		f.inflight--
-		f.mu.Unlock()
-	}()
+	defer f.gauge.enter()()
 	if err := sleepCtx(ctx, f.latency); err != nil {
 		return nil, err
 	}
 	if f.hook != nil {
-		return f.hook(rc, qs)
+		return f.hook(ctx, rc, qs)
 	}
 	out := make([]string, len(qs))
 	for i, q := range qs {
@@ -138,12 +160,6 @@ func (f *fakeMatcher) Resolve(ctx context.Context, rc *envoyroute.RouteConfigura
 		out[i] = "outbound|8080||" + label + ".shop.svc.cluster.local"
 	}
 	return out, nil
-}
-
-func (f *fakeMatcher) peakInflight() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.peak
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

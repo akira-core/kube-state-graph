@@ -102,6 +102,6 @@ func (s *scopedResolver) loadTraffic(ctx context.Context, cluster, ip string, at
 // marshals it).
 func (s *scopedResolver) translate(ctx context.Context, k rcKey, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
 	return s.rcs.do(ctx, k, func(ctx context.Context) (*envoyroute.RouteConfiguration, error) {
-		return s.r.tr.Translate(ctx, in)
+		return s.r.translate(ctx, in) // the engine slot is taken by the leader only
 	})
 }

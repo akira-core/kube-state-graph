@@ -26,6 +26,9 @@ package route
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -40,12 +43,47 @@ import (
 
 // Resolver folds store → snapshot → gwresolve → translate → matchcheck into
 // the build.RouteResolver contract. Safe for concurrent use: the store is a
-// connection pool, the Translator is stateless, and every ResolveRoute call
-// builds its own throwaway snapshot.
+// connection pool, the Translator is stateless, every ResolveRoute call
+// builds its own throwaway snapshot, and the only process-wide state — the
+// engine limit — is a channel.
 type Resolver struct {
 	st  store.Store
 	tr  translator
 	run matcher
+
+	// engine is the process-wide limit on CPU-heavy engine work: every istiod
+	// translation and every router_check_tool invocation, across every
+	// concurrent build, holds one slot for its duration. The per-build
+	// routeResolveConcurrency bounds one build; without this, R concurrent
+	// builds ran up to 4R istiod worlds and 4R child processes.
+	engine chan struct{}
+}
+
+// errEngineSaturated is returned when a caller's context ended before an
+// engine slot freed up. It carries no outcome, so the key degrades to an
+// external node (route_engine_error), is never cached, and never opens the
+// RouteNoGateway-gated LB fallback.
+var errEngineSaturated = errors.New("route engine saturated")
+
+// defaultEngineSlots sizes the engine limit: translation is CPU-bound and
+// router_check_tool is a CPU-bound child process, so more than one per usable
+// CPU only queues inside the scheduler instead of here.
+func defaultEngineSlots() int { return max(1, runtime.GOMAXPROCS(0)) }
+
+// acquireEngine takes an engine slot, waiting at most until ctx ends. The
+// caller MUST call the returned release exactly once. It is only ever called by
+// the caller doing the work — never while waiting on another caller's memo or
+// cache flight — so waiting for a slot cannot deadlock against the limit.
+func (r *Resolver) acquireEngine(ctx context.Context) (release func(), err error) {
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("%w: %w", errEngineSaturated, context.Cause(ctx))
+	}
+	select {
+	case r.engine <- struct{}{}:
+		return func() { <-r.engine }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %w", errEngineSaturated, context.Cause(ctx))
+	}
 }
 
 var _ build.RouteResolver = (*Resolver)(nil)
@@ -74,7 +112,7 @@ func NewResolver(st store.Store, run matchcheck.Runner) *Resolver {
 
 // newResolver is NewResolver over any translator and matcher.
 func newResolver(st store.Store, tr translator, run matcher) *Resolver {
-	return &Resolver{st: st, tr: tr, run: run}
+	return &Resolver{st: st, tr: tr, run: run, engine: make(chan struct{}, defaultEngineSlots())}
 }
 
 // ResolveRoute implements build.RouteResolver. The configuration is evaluated
@@ -85,9 +123,26 @@ func (r *Resolver) ResolveRoute(ctx context.Context, req build.RouteRequest) (bu
 	return r.newScope().resolve(ctx, req)
 }
 
-// match runs one router_check_tool invocation over rc for queries.
+// match runs one router_check_tool invocation over rc for queries, holding an
+// engine slot for its duration.
 func (r *Resolver) match(ctx context.Context, rc *envoyroute.RouteConfiguration, queries []matchcheck.Query) ([]string, error) {
+	release, err := r.acquireEngine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	return r.run.Resolve(ctx, rc, queries)
+}
+
+// translate runs one istiod translation, holding an engine slot for its
+// duration.
+func (r *Resolver) translate(ctx context.Context, in translate.ScopedInput) (*envoyroute.RouteConfiguration, error) {
+	release, err := r.acquireEngine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return r.tr.Translate(ctx, in)
 }
 
 // ParseEnvoyCluster parses an istiod outbound cluster string —
