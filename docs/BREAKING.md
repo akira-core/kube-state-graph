@@ -4,6 +4,8 @@
 
 **What changed.** `pkg/route/translate`'s `(*Translator).Translate(in ScopedInput)` is now `Translate(ctx context.Context, in ScopedInput)`. An ended context returns its cause before any istiod world is built, and ends the wait for the world's config controllers to synchronise, which now backs off from 100 µs to 2 ms instead of polling every 100 µs. The returned RouteConfiguration is unchanged. The HTTP API, flags and response bodies are unchanged.
 
+`--route-resolve-timeout` / `KSG_ROUTE_RESOLVE_TIMEOUT` now bounds each route-engine CALL rather than each endpoint's resolution: a key's preparation gets one budget, and each batched `router_check_tool` run gets one, shared by every key in that batch. The default (`5s`) and `0` (inherit the build deadline) are unchanged. A deployment that lowered the value to fit a single endpoint should re-check it: a batch that exceeds it marks its keys `route_engine_error`.
+
 **Who is affected.** Only in-process embedders that call the istiod translation stage directly. `pkg/route` is linked only by `cmd/kube-state-graph` and by embedders that opt into route resolution; a plain `pkg/kubegraph` embedder never sees the package.
 
 **Migration.** Pass the caller's context: `tr.Translate(ctx, in)`. Rollback is a revert.
