@@ -97,11 +97,15 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// the selector loaded nothing (see below), and prefetching would spend
 	// the most expensive leg of the fan-out on exactly that request.
 	//
-	// The prefetch runs under its own cancel: every path that returns
-	// without the service graph (a topology failure, outside_retention)
-	// cancels it, and its error — context.Canceled included — is read only
-	// on the path that uses its vectors, so a cancellation this build caused
-	// can never be classified as the caller's (499).
+	// The prefetch runs under its own cancel, and its error — context.Canceled
+	// included — is read only on the path that uses its vectors, so a
+	// cancellation this build caused can never be classified as the caller's
+	// (499). A topology failure cancels it: the build has already failed and
+	// must not wait on the slowest store. outside_retention instead lets it
+	// finish (an empty window answers fast): cancelling it would count each
+	// in-flight query in kube_state_graph_upstream_query_failures_total and
+	// log it at Error, on a request that is a client-classifiable 400 —
+	// exactly the signal an operator alerts on.
 	var prefetch *serviceGraphPrefetch
 	if !filtered {
 		prefetch = startServiceGraphPrefetch(ctx, q, window, end)
@@ -155,6 +159,8 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 				"pod_info_query", promql.Render(promql.QPodInfo, window, b.opts.LabelKeys, sel),
 				"node_info_query", promql.Render(promql.QNodeInfo, window, b.opts.LabelKeys, sel),
 			)
+			// Discarded, but not cancelled: see the prefetch comment above.
+			_, _ = prefetch.wait()
 			return nil, err
 		}
 	}

@@ -67,8 +67,9 @@ GET /v1/graph?start=&end=&…
         └─ ReadServiceGraph — 3 queries in parallel
               unfiltered request: issued BESIDE ReadTopology (they depend on
               no topology row; only the parse does) and joined before the
-              parse; cancelled when topology fails or the build is
-              outside_retention.
+              parse; cancelled when topology fails, left to finish and
+              discarded when the build is outside_retention (a cancelled
+              in-flight query would count as an upstream failure on a 400).
               filtered request: issued after ReadTopology, and skipped
               entirely when the selector loaded neither pods nor services
               (those three series are never narrowed by ?cluster= /

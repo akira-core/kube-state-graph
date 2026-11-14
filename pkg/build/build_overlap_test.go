@@ -144,16 +144,23 @@ func TestBuild_UnfilteredServiceGraphOverlapsTopology(t *testing.T) {
 
 // failingTopologyQuerier fails kube_pod_info and answers the service graph
 // only once its context is cancelled (or after fallback), recording which.
+// With sgSeen set, kube_pod_info fails only after a service-graph query has
+// arrived, so the failure lands while the prefetch is provably in flight.
 type failingTopologyQuerier struct {
 	topoErr  error
 	fallback time.Duration
+	sgSeen   chan struct{}
 
+	once               sync.Once
 	mu                 sync.Mutex
 	sgCancelled, sgRan int
 }
 
 func (q *failingTopologyQuerier) Instant(ctx context.Context, name, _ string, _ time.Time) (model.Vector, error) {
 	if strings.HasPrefix(name, "traces_service_graph_") {
+		if q.sgSeen != nil {
+			q.once.Do(func() { close(q.sgSeen) })
+		}
 		select {
 		case <-ctx.Done():
 			q.mu.Lock()
@@ -168,6 +175,12 @@ func (q *failingTopologyQuerier) Instant(ctx context.Context, name, _ string, _ 
 		}
 	}
 	if promql.Query(name) == promql.QPodInfo {
+		if q.sgSeen != nil {
+			select {
+			case <-q.sgSeen:
+			case <-time.After(q.fallback):
+			}
+		}
 		return nil, q.topoErr
 	}
 	return model.Vector{}, nil
@@ -178,7 +191,9 @@ func (q *failingTopologyQuerier) Instant(ctx context.Context, name, _ string, _ 
 // the classification — the build is the upstream failure (502), not a
 // client cancellation (499).
 func TestBuild_TopologyFailureCancelsServiceGraphPrefetch(t *testing.T) {
-	q := &failingTopologyQuerier{topoErr: errors.New("upstream 5xx"), fallback: 3 * time.Second}
+	q := &failingTopologyQuerier{
+		topoErr: errors.New("upstream 5xx"), fallback: 3 * time.Second, sgSeen: make(chan struct{}),
+	}
 
 	start := time.Now()
 	_, err := New(q, Options{}, nil, nil).Build(t.Context(), 5*time.Minute, probeTestEnd, promql.Selector{})
@@ -192,12 +207,16 @@ func TestBuild_TopologyFailureCancelsServiceGraphPrefetch(t *testing.T) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	assert.Zero(t, q.sgRan, "no service-graph query runs to completion after topology failed")
+	assert.Positive(t, q.sgCancelled, "the prefetch was in flight and was cancelled, not merely never started")
 }
 
 // The outside-retention classification is the other path that discards the
-// prefetch: it must still be a 400 outside_retention, never a cancellation.
+// prefetch. It stays a 400 outside_retention, never a cancellation, and the
+// prefetch is left to finish rather than cancelled: a cancelled in-flight
+// query would count as an upstream failure and log at Error on a request
+// that is the client's to fix.
 func TestBuild_OutsideRetentionDiscardsServiceGraphPrefetch(t *testing.T) {
-	q := &failingTopologyQuerier{fallback: 3 * time.Second}
+	q := &failingTopologyQuerier{fallback: 20 * time.Millisecond}
 	upQ := &upAnsweringQuerier{inner: q}
 
 	_, err := New(upQ, Options{}, nil, nil).Build(t.Context(), 5*time.Minute, probeTestEnd, promql.Selector{})
@@ -206,6 +225,10 @@ func TestBuild_OutsideRetentionDiscardsServiceGraphPrefetch(t *testing.T) {
 	be, ok := errors.AsType[*Error](err)
 	require.True(t, ok, "a typed build error, got %v", err)
 	assert.Equal(t, ReasonOutsideRetention, be.Reason)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	assert.Zero(t, q.sgCancelled, "the prefetch is not cancelled on outside_retention")
+	assert.Equal(t, 3, q.sgRan, "all three service-graph queries ran to completion")
 }
 
 // upAnsweringQuerier answers the retention probe as healthy and everything
