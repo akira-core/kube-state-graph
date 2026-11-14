@@ -122,6 +122,14 @@ func exporterEnabled() bool {
 
 // buildResource combines detected SDK / process / host attributes with
 // OTEL_RESOURCE_ATTRIBUTES and the explicit service identity overrides.
+//
+// The process detectors are named one by one rather than through
+// resource.WithProcess(): that aggregate also detects process.command_args,
+// which carries argv — and argv can hold --api-keys or a DSN with userinfo,
+// which would then ride on every exported span and log record. The
+// executable path and the OS owner are left out with it. Naming the detectors
+// is an allowlist, so a detector a later SDK adds to WithProcess() cannot slip
+// in unnoticed.
 func buildResource(ctx context.Context, version string) (*resource.Resource, error) {
 	serviceName := env("OTEL_SERVICE_NAME")
 	if serviceName == "" {
@@ -134,7 +142,11 @@ func buildResource(ctx context.Context, version string) (*resource.Resource, err
 	)
 	detected, err := resource.New(ctx,
 		resource.WithFromEnv(),
-		resource.WithProcess(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
+		resource.WithProcessRuntimeDescription(),
 		resource.WithHost(),
 		resource.WithTelemetrySDK(),
 	)
