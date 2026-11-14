@@ -104,14 +104,17 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	// must not wait on the slowest store. outside_retention instead gives it a
 	// bounded grace to finish (see outsideRetentionPrefetchGrace).
 	//
-	// Cancellation can also arrive from ANOTHER build: these three queries are
-	// identical across every unfiltered build at one aligned instant, so a
-	// guarded store coalesces them into one flight per query, and a flight led
-	// by a build whose topology failed ends in that build's context.Canceled.
-	// The guard retries a waiter once; a second such leader still hands the
-	// waiter a cancellation it did not cause. serviceGraphFrom refetches once
-	// under this build's own context, and classifyReadError maps a Canceled to
-	// 499 only when this build's context is the one that ended.
+	// These three queries are identical across every unfiltered build at one
+	// aligned instant, so a guarded store coalesces them into one flight per
+	// query. That flight is detached from every caller's cancellation and
+	// ends only when its last waiter leaves or the latest waiter deadline
+	// passes (pkg/promql/flight.go), so a build whose topology failed merely
+	// leaves it and no other build is handed its cancellation. A Querier that
+	// shares work WITHOUT that detachment (an embedder's, a mock) can still
+	// hand this build a context.Canceled it did not cause, so serviceGraphFrom
+	// refetches once under this build's own context, and classifyReadError
+	// maps a Canceled to 499 only when this build's context is the one that
+	// ended.
 	var prefetch *serviceGraphPrefetch
 	if !filtered {
 		prefetch = startServiceGraphPrefetch(ctx, q, window, end)
@@ -269,12 +272,12 @@ const outsideRetentionPrefetchGrace = time.Second
 // when there is one, else a fetch issued now.
 //
 // A prefetch that comes back with a context.Canceled — as its error or as a
-// degraded RED companion's — while ctx is still alive was cancelled by another
-// build sharing its flights (see Build), not by this one: its own cancel runs
-// only after Build returns. It is fetched once more under ctx, which a guard
-// hands to a flight this build then leads or joins afresh. Once, not in a
-// loop: a refetch handed a cancellation again surfaces it, and
-// classifyReadError reports it as the upstream failure it is.
+// degraded RED companion's — while ctx is still alive was cancelled by
+// something other than this build — a Querier sharing work across builds (see
+// Build) — because its own cancel runs only after Build returns. It is fetched
+// once more under ctx. Once, not in a loop: a refetch handed a cancellation
+// again surfaces it, and classifyReadError reports it as the upstream failure
+// it is.
 func serviceGraphFrom(ctx context.Context, prefetch *serviceGraphPrefetch, q promql.Querier, window time.Duration, end time.Time) (serviceGraphVectors, error) {
 	if prefetch == nil {
 		return fetchServiceGraph(ctx, q, window, end)

@@ -18,8 +18,10 @@ import (
 
 // foreignCancelQuerier answers every service-graph query with a
 // context.Canceled for its first cancelled calls while the caller's context
-// stays alive — what a promql guard hands a waiter whose shared flights were
-// led, twice, by builds that cancelled their own prefetch.
+// stays alive — what a Querier that shares fetches across builds without
+// detaching them from the starting caller hands a waiter. The promql guard's
+// refcounted flights no longer do this (pkg/promql/flight.go); the build's one
+// refetch stays as a defence for other Queriers.
 type foreignCancelQuerier struct {
 	fixtures map[promql.Query]model.Vector
 	cancels  int // service-graph calls answered with Canceled before answering
