@@ -176,7 +176,7 @@ func TestVolumeHub_SameNamedClaimInAnotherNamespaceIsFiltered(t *testing.T) {
 	topo, err := readTopology(t.Context(), promqlfake.New(fx), time.Minute, vlrEnd, Options{}, promql.Selector{},
 		storagePlan(scope.Roots))
 	require.NoError(t, err)
-	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QPVCBindings)], "the tally counts the rows the reader kept")
+	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QPVCBindings)], "the tally counts what the restriction matched: the shop-only read matched one binding")
 	assert.Equal(t, 1, topo.RawSeriesCount[string(promql.QKubeletVolumeUsedBytes)])
 }
 
