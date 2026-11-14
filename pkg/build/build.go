@@ -88,6 +88,26 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 	)
 	defer span.End()
 
+	// The three service-graph queries depend on nothing the topology read
+	// returns — they take no request matcher and no label keys; only the
+	// parse joins them against topology — so an unfiltered build issues them
+	// beside the topology fan-out instead of after it, and a cold build costs
+	// the longer of the two rather than their sum. A filtered build still
+	// issues them only after topology, because it skips them entirely when
+	// the selector loaded nothing (see below), and prefetching would spend
+	// the most expensive leg of the fan-out on exactly that request.
+	//
+	// The prefetch runs under its own cancel: every path that returns
+	// without the service graph (a topology failure, outside_retention)
+	// cancels it, and its error — context.Canceled included — is read only
+	// on the path that uses its vectors, so a cancellation this build caused
+	// can never be classified as the caller's (499).
+	var prefetch *serviceGraphPrefetch
+	if !filtered {
+		prefetch = startServiceGraphPrefetch(ctx, q, window, end)
+		defer prefetch.stop()
+	}
+
 	topology, err := ReadTopology(ctx, q, window, end, b.opts, sel)
 	if err != nil {
 		return nil, classifyReadError(span, "topology read failed", err)
@@ -159,11 +179,17 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		slog.DebugContext(ctx, "service-graph read skipped: selector matched no topology",
 			"reason", "filtered_empty_topology")
 	} else {
-		sg, err = ReadServiceGraph(ctx, q, window, end, topology,
-			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
+		var vecs serviceGraphVectors
+		if prefetch != nil {
+			vecs, err = prefetch.wait()
+		} else {
+			vecs, err = fetchServiceGraph(ctx, q, window, end)
+		}
 		if err != nil {
 			return nil, classifyReadError(span, "service-graph read failed", err)
 		}
+		sg = resolveServiceGraph(ctx, vecs, end, topology,
+			b.opts.RouteResolver, b.opts.RouteResolveTimeout, filtered)
 	}
 
 	nodes, edges := assemble(topology, sg)
@@ -218,6 +244,43 @@ func (b *Builder) Build(ctx context.Context, window time.Duration, end time.Time
 		attribute.Int("kube_state_graph.cross_cluster_edges", crossCluster),
 	)
 	return g, nil
+}
+
+// serviceGraphPrefetch is a service-graph fetch running beside the topology
+// read. Its context is a child of the build's, so the build timeout and the
+// caller's cancellation reach it unchanged; stop ends it early.
+type serviceGraphPrefetch struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	vecs   serviceGraphVectors
+	err    error
+}
+
+// startServiceGraphPrefetch issues the three service-graph queries on their
+// own goroutine. The caller must call stop on every return path.
+func startServiceGraphPrefetch(ctx context.Context, q promql.Querier, window time.Duration, end time.Time) *serviceGraphPrefetch {
+	pctx, cancel := context.WithCancel(ctx)
+	p := &serviceGraphPrefetch{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(p.done)
+		p.vecs, p.err = fetchServiceGraph(pctx, q, window, end)
+	}()
+	return p
+}
+
+// stop cancels the fetch and waits for its goroutine, so no query of this
+// build outlives Build. A fetch that already returned makes it a no-op.
+func (p *serviceGraphPrefetch) stop() {
+	p.cancel()
+	<-p.done
+}
+
+// wait blocks until the fetch has returned. The fetch observes the build's
+// context, so it returns once that context is done even if an upstream does
+// not answer.
+func (p *serviceGraphPrefetch) wait() (serviceGraphVectors, error) {
+	<-p.done
+	return p.vecs, p.err
 }
 
 // BuildStorage builds the storage-flow graph served by GET /v1/storage-graph.

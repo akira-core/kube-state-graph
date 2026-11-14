@@ -65,10 +65,15 @@ GET /v1/graph?start=&end=&…
         │           (classifies outside_retention vs a genuine empty graph)
         │
         └─ ReadServiceGraph — 3 queries in parallel
-              skipped entirely when the request is filtered AND the selector
-              loaded neither pods nor services (those three series are never
-              narrowed by ?cluster= / ?namespace= / ?az= / ?env=, so a
-              mistyped filter would otherwise scan the whole estate)
+              unfiltered request: issued BESIDE ReadTopology (they depend on
+              no topology row; only the parse does) and joined before the
+              parse; cancelled when topology fails or the build is
+              outside_retention.
+              filtered request: issued after ReadTopology, and skipped
+              entirely when the selector loaded neither pods nor services
+              (those three series are never narrowed by ?cluster= /
+              ?namespace= / ?az= / ?env=, so a mistyped filter would
+              otherwise scan the whole estate)
 ```
 
 When `--app-metadata-metric` is set, `ReadTopology` adds one optional
