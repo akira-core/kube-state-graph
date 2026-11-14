@@ -584,8 +584,9 @@ They are **not** caller filters and are always rendered **before** any
 
 ## kube-state-metrics (22)
 
-20 abort-on-error; `kube_replicaset_annotations` and `kube_job_annotations`
-log-and-continue (accumulating cardinality). Empty vectors
+19 abort-on-error; `kube_replicaset_annotations`, `kube_job_annotations` and
+`kube_pod_container_info` log-and-continue (accumulating or multiplying
+cardinality). Empty vectors
 degrade as in the last column.
 
 | Metric | Graph role | Labels read | Empty vector |
