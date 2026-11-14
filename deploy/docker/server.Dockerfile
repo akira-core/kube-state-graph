@@ -1,4 +1,12 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+# Every image this file names (the frontend above, both FROM images below, and
+# ENVOY_TOOLS_IMAGE) is pinned as `tag@sha256:<index digest>`: the tag says
+# what it is, the digest says exactly which bytes, so a re-pushed tag cannot
+# change the build. Each digest is the multi-arch INDEX (not a per-platform
+# manifest), so multi-platform builds still resolve per platform. Re-pin with
+# `docker buildx imagetools inspect <tag>` (the top-level `Digest:` line);
+# Dependabot's docker ecosystem proposes the bumps.
 
 # Envoy tools image supplying router_check_tool. SINGLE SOURCE of that
 # reference: `make router-check-tool` greps this line so CI installs the exact
@@ -16,7 +24,7 @@ ARG ENVOY_TOOLS_IMAGE=envoyproxy/envoy:tools-v1.34-latest@sha256:74a4aebd5cc9ca0
 # Base image Go must match go.mod's `toolchain` directive (go1.27.4).
 # GOTOOLCHAIN=local turns a drift between the two into a hard build error
 # instead of a silent mid-build toolchain download from dl.google.com.
-FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS build
 ENV GOTOOLCHAIN=local
 
 ARG TARGETOS
@@ -49,7 +57,7 @@ FROM ${ENVOY_TOOLS_IMAGE} AS envoy-tools
 # ---- runtime stage -------------------------------------------------------
 # distroless/cc (not /static): router_check_tool is a dynamically linked C++
 # binary needing glibc + libstdc++. The Go server itself stays CGO_ENABLED=0.
-FROM gcr.io/distroless/cc:nonroot
+FROM gcr.io/distroless/cc:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
 
 ARG VERSION=dev
 ARG COMMIT=unknown
