@@ -72,8 +72,10 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "telemetry init failed (continuing without OTLP exports): %v\n", telErr)
 	}
 
+	// Both sinks read the one level parser, so the OTLP bridge carries exactly
+	// the records the local handler writes.
 	localHandler := observability.NewLogHandler(cfg.LogLevel)
-	logger := slog.New(telemetry.NewSlogHandler(localHandler))
+	logger := slog.New(telemetry.NewSlogHandler(localHandler, observability.ParseLevel(cfg.LogLevel)))
 	slog.SetDefault(logger)
 	logger.Info("starting kube-state-graph",
 		"prom_url", cfg.PromURL,
