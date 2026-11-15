@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	logglobal "go.opentelemetry.io/otel/log/global"
+	"go.opentelemetry.io/otel"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
@@ -46,10 +46,10 @@ func installRecordingLogs(t *testing.T) *recordingLogExporter {
 	t.Helper()
 	exp := &recordingLogExporter{}
 	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(exp)))
-	prev := logglobal.GetLoggerProvider()
-	logglobal.SetLoggerProvider(lp)
+	prev := otel.GetLoggerProvider()
+	otel.SetLoggerProvider(lp)
 	t.Cleanup(func() {
-		logglobal.SetLoggerProvider(prev)
+		otel.SetLoggerProvider(prev)
 		_ = lp.Shutdown(context.Background())
 	})
 	return exp

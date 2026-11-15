@@ -21,7 +21,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otellog "go.opentelemetry.io/otel/log"
-	logglobal "go.opentelemetry.io/otel/log/global"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -92,7 +91,7 @@ func Init(ctx context.Context, version string) (Providers, error) {
 	}
 
 	otel.SetTracerProvider(tp)
-	logglobal.SetLoggerProvider(lp)
+	otel.SetLoggerProvider(lp)
 	setPropagator()
 
 	if len(shutdowns) == 0 {

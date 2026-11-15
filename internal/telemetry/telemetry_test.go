@@ -11,7 +11,6 @@ import (
 	"go.opentelemetry.io/otel"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	logglobal "go.opentelemetry.io/otel/log/global"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 )
 
@@ -25,7 +24,7 @@ func TestInit_DisabledByDefault(t *testing.T) {
 	require.False(t, providers.Enabled, "exporter must be disabled when OTEL_EXPORTER_OTLP_ENDPOINT is unset")
 	_, isNoop := otel.GetTracerProvider().(tracenoop.TracerProvider)
 	require.True(t, isNoop, "global tracer provider must be no-op")
-	_, isLogNoop := logglobal.GetLoggerProvider().(lognoop.LoggerProvider)
+	_, isLogNoop := otel.GetLoggerProvider().(lognoop.LoggerProvider)
 	require.True(t, isLogNoop, "global logger provider must be no-op")
 }
 
