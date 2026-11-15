@@ -1,3 +1,28 @@
+# BREAKING — module requirements raised: `client_golang` v1.25, `otel` v1.47, `istio.io/api` v1.32
+
+*Change: dependency bumps (`prometheus/client_golang`, `prometheus/common`, the OpenTelemetry family, `istio.io/api`).*
+
+**What changed.** The module's `go.mod` now requires:
+
+| module | before | after |
+|---|---|---|
+| `github.com/prometheus/client_golang` | v1.23.2 | **v1.25.0** |
+| `github.com/prometheus/common` | v0.67.5 | v0.73.1 |
+| `go.opentelemetry.io/otel` (and `sdk`, `trace`, the OTLP exporters) | v1.46.0 | v1.47.0 |
+| `go.opentelemetry.io/otel/log`, `sdk/log` | v0.22.0 | v1.47.0 |
+| `istio.io/api` | v1.29.0-alpha (pseudo-version) | v1.32.0 |
+| `golang.org/x/net` | v0.61.0 | v0.62.0 |
+
+Go's minimum-version selection raises an importing module to at least these, whether or not it asks for them. The `go` directive is unchanged (`go 1.26.0`); only the `toolchain` line moved (`go1.27.3` to `go1.27.4`) and it binds this module alone. `pkg/` still builds, vets and tests on Go 1.27.1 (CI job `embedder-go`).
+
+The one source-incompatible step is `client_golang` v1.25: every method of `api/prometheus/v1.API` that returned `(value, Warnings, error)` now returns `(value, Warnings, Infos, error)` — `Query`, `QueryRange`, `LabelNames`, `LabelValues` and `Series`. `Infos` are advisory notes, not truncation; this module drops them, and `Warnings` remains its only partial-result signal.
+
+**Who is affected.** An in-process embedder whose OWN code calls those `v1.API` methods, or implements `v1.API` (a test fake, a wrapper), and so cannot compile once it resolves `client_golang` v1.25. An embedder that only uses `pkg/kubegraph`, `pkg/build`, `pkg/promql` or `pkg/graph` through this module's own API is not affected by the signature change; it only inherits the higher version floors above. `go.opentelemetry.io/otel/log/global`, which an embedder may use to install its own logger provider, is deprecated in v1.47 but still works and shares the provider that `otel.GetLoggerProvider` / `otel.SetLoggerProvider` use.
+
+**Migration.** Add the extra return to each call (`val, warns, _, err := api.Query(...)`) and to any `v1.API` fake, or stay on this module's previous release until you can. `go get github.com/prometheus/client_golang@v1.25.0` in the embedding module to make the floor explicit. Rollback is a revert.
+
+---
+
 # BREAKING — `translate.Translator.Translate` takes a context
 
 *Change: `route-engine-memo-and-cache`.*

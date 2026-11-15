@@ -269,6 +269,8 @@ env:
 
 `pkg/kubegraph.Engine` 執行與 server 相同的 parse → build → project → serialise 流程但不經 HTTP，然而它**不套用預設的建圖期限**，也不套用 server 的任何請求上限（`--build-timeout`、`--max-inflight-builds`、`--max-window` 都位於 HTTP 層）。`Build*` 呼叫會執行到它的 context 允許為止，因此請傳入帶期限的 context（`context.WithTimeout`），並自行限制並行度。`Options.APITimeout` 只約束建圖內的 retention 探針。parser 的上限——每個 selector 參數最多 100 個相異值、root 的 chunk 上限——在 process 內同樣適用。
 
+import 本 module 會把你自己的依賴下限抬高到它的 `go.mod`（`prometheus/client_golang` v1.25、`go.opentelemetry.io/otel` v1.47、`istio.io/api` v1.32）。`go` 指令維持 1.26.0，`pkg/` 仍在 Go 1.27.1 上建置與測試。如果你的程式自己呼叫 Prometheus 的 `v1.API`，請注意 `client_golang` v1.25 讓 `Query`、`QueryRange`、`LabelNames`、`LabelValues`、`Series` 多回傳一個 `Infos`——詳見 [`docs/BREAKING.md`](docs/BREAKING.md)。
+
 ## 文件
 
 - **上游指標目錄（全部 47 條）：** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
