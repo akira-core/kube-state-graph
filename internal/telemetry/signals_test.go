@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
-	logglobal "go.opentelemetry.io/otel/log/global"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -18,10 +17,10 @@ import (
 func restoreGlobals(t *testing.T) {
 	t.Helper()
 	prevTP := otel.GetTracerProvider()
-	prevLP := logglobal.GetLoggerProvider()
+	prevLP := otel.GetLoggerProvider()
 	t.Cleanup(func() {
 		otel.SetTracerProvider(prevTP)
-		logglobal.SetLoggerProvider(prevLP)
+		otel.SetLoggerProvider(prevLP)
 	})
 }
 
@@ -89,8 +88,8 @@ func TestInit_EnablesSignalsIndependently(t *testing.T) {
 			assert.Equal(t, tc.wantTraces, sdkTP, "global tracer provider is the SDK one iff traces are enabled")
 			assert.Equal(t, !tc.wantTraces, noopTP, "global tracer provider is no-op iff traces are disabled")
 
-			_, sdkLP := logglobal.GetLoggerProvider().(*sdklog.LoggerProvider)
-			_, noopLP := logglobal.GetLoggerProvider().(lognoop.LoggerProvider)
+			_, sdkLP := otel.GetLoggerProvider().(*sdklog.LoggerProvider)
+			_, noopLP := otel.GetLoggerProvider().(lognoop.LoggerProvider)
 			assert.Equal(t, tc.wantLogs, sdkLP, "global logger provider is the SDK one iff logs are enabled")
 			assert.Equal(t, !tc.wantLogs, noopLP, "global logger provider is no-op iff logs are disabled")
 
