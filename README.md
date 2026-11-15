@@ -506,6 +506,14 @@ your own concurrency. `Options.APITimeout` bounds only the retention probe
 inside a build. The parser bounds — at most 100 distinct values of each
 selector parameter, the root chunk caps — apply in-process too.
 
+Importing the module raises your own requirements to its `go.mod` floors
+(`prometheus/client_golang` v1.25, `go.opentelemetry.io/otel` v1.47,
+`istio.io/api` v1.32). The `go` directive stays at 1.26.0 and `pkg/` is built
+and tested on Go 1.27.1. If your code calls the Prometheus `v1.API` itself,
+note that `client_golang` v1.25 added an `Infos` return to `Query`,
+`QueryRange`, `LabelNames`, `LabelValues` and `Series` — see
+[`docs/BREAKING.md`](docs/BREAKING.md).
+
 ## Documentation
 
 - **Upstream metrics catalog (all 47 series):** [`docs/upstream-metrics.md`](docs/upstream-metrics.md)
