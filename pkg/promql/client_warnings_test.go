@@ -26,8 +26,8 @@ type fakeAPI struct {
 	err   error
 }
 
-func (f fakeAPI) Query(_ context.Context, _ string, _ time.Time, _ ...v1.Option) (model.Value, v1.Warnings, error) {
-	return f.val, f.warns, f.err
+func (f fakeAPI) Query(_ context.Context, _ string, _ time.Time, _ ...v1.Option) (model.Value, v1.Warnings, v1.Infos, error) {
+	return f.val, f.warns, nil, f.err
 }
 
 // TestInstant_UpstreamWarningsLogged guards the fix for silently discarded

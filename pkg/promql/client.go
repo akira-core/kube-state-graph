@@ -205,7 +205,10 @@ func (c *Client) Instant(ctx context.Context, name, query string, ts time.Time) 
 	if t, ok := evaluationTimeout(deadline, bounded, time.Now()); ok {
 		qopts = append(qopts, v1.WithTimeout(t))
 	}
-	val, warns, err := c.api.Query(ctx, query, ts, qopts...)
+	// The third return is Infos (client_golang v1.25+): advisory notes such as
+	// "metric might not be a counter", not data loss. Warnings stay the signal
+	// for truncation, so Infos are deliberately dropped.
+	val, warns, _, err := c.api.Query(ctx, query, ts, qopts...)
 	if len(warns) > 0 {
 		// VictoriaMetrics signals truncated / partial responses (e.g. a
 		// -search.* limit hit) via the warnings return; dropping them hides
